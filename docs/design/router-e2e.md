@@ -16,7 +16,7 @@ runs determines the trust boundary — not just the deployment target.**
 | New trust party | none | one (must be attested) |
 | Plaintext lands on | the user's own machine | 0G's TEE (in-enclave) |
 | Attestation of the client component | not needed (user owns it) | required (else it degrades to today's plaintext L7 router) |
-| Routing / fallback | driven locally | centralized in the gateway (decrypt + re-seal) — this is Approach B |
+| Routing / fallback | driven locally | centralized in the gateway (decrypt + re-seal) |
 | Best for | clients that can run software; max privacy | clients that cannot (browser / thin / no-install) |
 
 **A cloud gateway does not remove client-side crypto.** The user→gateway hop
@@ -38,8 +38,8 @@ cloud component.
   proxy; user changes only `base_url`. Written once, serves any user language;
   keeps crypto out of the app. Cost: a running process + one localhost hop.
 - **Cloud-TEE gateway (server in a CVM):** the same core wrapped as a server,
-  run in an attested enclave (Approach B). Serves no-install / browser clients;
-  adds one attested trust party.
+  run in an attested enclave. Serves no-install / browser clients; adds one
+  attested trust party.
 
 The sidecar and the gateway are the *same core wrapped as a server*; the
 in-process SDK is that core *without* the server shell.
@@ -149,15 +149,6 @@ Backward compatible; sealed mode is opt-in ("privacy mode").
 ---
 
 ## Alternatives
-
-**B. Router in a TEE.** Keep fallback at the router by running it inside its own
-attested enclave: the client seals to the router-enclave key, the router
-decrypts *inside its TEE*, selects/fails over with full plaintext, and re-seals
-to the chosen broker. Preserves transparent router-side fallback and keeps
-plaintext only inside attested enclaves. Cost: the router must be attested and
-added to the trust chain, and plaintext transits a second enclave (weaker than
-"only the final broker sees it", though no non-TEE component sees it). Choose B
-if moving the fallback loop into the sidecar is undesirable.
 
 **Live fingerprint pinning (rejected as primary).** See #552: fragile under cert
 rotation and CDN multi-cert fronting; only an optional secondary check.

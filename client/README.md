@@ -5,7 +5,7 @@ inference on the 0G Compute Network. It lets you verify that a response really
 came from an attested TEE provider, and — on the router path — keep your prompt
 unreadable to everything between you and the provider enclave.
 
-> Status: early / design-stage. The design lives in [`docs/design`](docs/design)
+> Status: early / design-stage. The design lives in [`docs/design`](../docs/design)
 > (see `router-e2e.md`). Interfaces will change.
 
 ## One core, three forms
@@ -35,10 +35,12 @@ cmd/
 sdk/
   go/            # in-process Go SDK (thin wrapper over core)
   ts/            # (planned) TS / WASM build for the browser
-docs/design/     # design docs (router-e2e.md, architecture.md)
 ```
 
-Depends on **`github.com/0gfoundation/0g-serving-protocol`** — the shared wire
+Design docs live at the repo root under
+[`docs/design`](../docs/design) (currently `router-e2e.md`).
+
+Depends on **`github.com/0gfoundation/0g-pc/protocol`** — the shared wire
 format, verification/sealing crypto, and route-scoring logic used by the broker,
 the router, and this client, so all three agree byte-for-byte.
 
@@ -58,7 +60,8 @@ resp = client.chat.completions.create(model="gpt-4o", messages=[...])
 ```
 
 The sidecar transparently verifies attestation and the per-response signature,
-and (where enabled) seals the request to the provider enclave.
+and (where enabled) seals the sensitive request fields (prompt, tool defs) to the
+provider enclave.
 
 ## What it verifies
 
@@ -66,18 +69,19 @@ and (where enabled) seals the request to the provider enclave.
   expected measurement (anchored on-chain / against a published baseline).
 - **Response authenticity** — each response is signed by the TEE key and the
   signer matches the on-chain `teeSignerAddress`.
-- **Routing / confidentiality** — on the router path, the request body is sealed
-  to the provider enclave so the router sees only routing metadata, not your
-  prompt.
+- **Routing / confidentiality** — on the router path, the sensitive request
+  fields (prompt, tool defs) are sealed to the provider enclave; the router reads
+  only the cleartext fields — routing params (model, sampling) and billing
+  (`usage`, on the response) — not your prompt.
 
-See [`docs/design/router-e2e.md`](docs/design/router-e2e.md) for the full trust
+See [`docs/design/router-e2e.md`](../docs/design/router-e2e.md) for the full trust
 model, the control-plane / data-plane split, and the encryption-key lifecycle.
 
 ## Related repositories & products
 
 | Repo/Product | Role |
-|------|-----------|------|
+|------|------|
 | `0g-pc-client` (this) | user-side sidecar / SDK / gateway |
-| `0g-serving-protocol` | shared wire format + crypto + route logic |
+| `0g-pc/protocol` | shared wire format + crypto + route logic |
 | `0g-serving-broker` | provider-side broker (server) |
 | `Private Computer` | L7 aggregating router (product: Private Computer) |
