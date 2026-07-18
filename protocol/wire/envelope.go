@@ -1,8 +1,12 @@
-// Package wire implements the v1 request envelope (SPEC §5–§6): field-level
-// sealing of an OpenAI-shaped request. The sensitive fields (default: messages,
-// tools) are removed from the JSON and sealed into an `_e2ee` object; every
-// other top-level field stays cleartext so the router can route on it, but is
-// bound as AEAD associated data so the router cannot tamper with it.
+// Package wire implements the v1 envelopes (SPEC §5–§7): field-level sealing of
+// OpenAI-shaped requests and responses. The sensitive fields are removed from
+// the JSON and sealed into an `_e2ee` object; every other top-level field stays
+// cleartext (so the router can route/bill on it) but is bound as AEAD
+// associated data, so an intermediary can read but not tamper.
+//
+//   - Request (§5–§6): client seals messages/tools to the provider enc key.
+//   - Response (§7): the enclave seals choices to the client's ephemeral key,
+//     one frame for non-streaming or a sequence of frames for streaming.
 //
 // Contract: broker <-> client (byte-for-byte, per SPEC.md). All AAD is taken
 // over JCS (RFC 8785) canonical JSON so Go/TS/Rust agree byte-for-byte.
@@ -263,7 +267,7 @@ func (r Request) setE2EE(e E2EE) error {
 // `_e2ee.ciphertext` value removed (§5.2). Sender and receiver call this with
 // the same logical envelope, so — JCS being canonical — they derive identical
 // bytes without depending on field order or whitespace.
-func aadFromEnvelope(env Request) ([]byte, error) {
+func aadFromEnvelope(env map[string]json.RawMessage) ([]byte, error) {
 	out := make(map[string]json.RawMessage, len(env))
 	for k, v := range env {
 		out[k] = v
