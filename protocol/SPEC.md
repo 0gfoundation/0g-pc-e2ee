@@ -174,9 +174,12 @@ The request is the original OpenAI JSON with the **sealed fields removed** and a
 - **Sealed plaintext** = a JSON object holding exactly the sealed fields with
   their original values, in **JCS** form:
   `{"messages": <original>, "tools": <original>}`.
-- v1 default sealed set: **`messages` and `tools`**. On the router path
-  `messages` MUST be sealed (leaving it cleartext defeats the purpose); the
-  broker MUST reject a router-path request whose `sealed_fields` omits `messages`.
+- v1 default sealed set: **`messages` and `tools`**. On the router path a client
+  SHOULD seal `messages` (leaving it cleartext exposes the prompt, defeating the
+  purpose). This is a recommended default, not a protocol-enforced invariant: a
+  broker MAY reject a router-path request whose `sealed_fields` omits `messages`
+  as a deployment policy, but is not required to. (The reference client library
+  defaults to sealing `messages` and may enforce it as a stricter local choice.)
 - A client MAY seal additional fields (e.g. `metadata`, `user`); it declares them
   in `sealed_fields`.
 - **New / unknown fields default to cleartext.** A field only becomes sealed when
