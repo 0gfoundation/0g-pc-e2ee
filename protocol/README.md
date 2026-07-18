@@ -40,6 +40,27 @@ price) and the endpoints stay in the **router** — the router (and the client,
 over the router-returned candidate list) call the *same* scorer so their ordering
 always agrees, without the client needing global data.
 
+### Two contracts, one module (and why `route` stays here)
+
+This module bundles two *orthogonal* contracts, plus their shared types:
+
+| Contract | Binds | Packages |
+|----------|-------|----------|
+| Confidentiality / proof (wire format — one wrong byte breaks security) | **broker ↔ client** | `wire crypto attest proof` |
+| Routing / ranking (both sides run the same algorithm to agree on order) | **router ↔ client** | `route` |
+| Shared foundation | everyone | `types` |
+
+`route` has a *different* consumer pair than the crypto packages, which invites
+splitting it out. We deliberately **keep it in `protocol`**: it is a pure,
+dependency-free function, so a broker that imports the crypto packages carries
+no `route` weight anyway; the **client uses both** contracts, so a split only
+adds a second version to pin; and both contracts share `types`, so a split
+forces a dependency diamond. Keeping one module preserves the core invariant —
+*everyone on `protocol` vX, no drift*. `route` is kept as a clean, self-contained
+package so it can be promoted to its own module later **if** it ever grows heavy
+deps or its release cadence diverges sharply from the audited crypto — neither
+is true today.
+
 ## Layout
 
 ```

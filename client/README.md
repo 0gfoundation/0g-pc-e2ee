@@ -30,12 +30,20 @@ signed — see the design doc).
 ```
 core/            # client core: quote + response-signature verification, seal, pin, fallback, key cache
 cmd/
-  sidecar/       # local sidecar binary (OpenAI-compatible proxy on localhost)
-  gateway/       # cloud-TEE gateway (attested) — same core as a server
+  sidecar/       # local sidecar binary (OpenAI-compatible proxy on localhost) — user-operated, no new trust party
+  gateway/       # cloud-TEE gateway — SAME core, but SERVER-RUN + 0G-operated, runs in an attested CVM (adds one attested trust party)
 sdk/
-  go/            # in-process Go SDK (thin wrapper over core)
-  ts/            # (planned) TS / WASM build for the browser
+  go/            # in-process Go SDK (thin wrapper over core; shares the Go core)
+  ts/            # (planned) TS / WASM build for the browser — aligns to protocol/SPEC.md, does NOT import the Go core
 ```
+
+> **On the layout:** `core/` is the center of gravity — all three forms are thin
+> shells over it and must not reimplement seal/verify. `cmd/sidecar`, `cmd/gateway`
+> and `sdk/go` are Go and share `core/`; `cmd/gateway` is the one form that is
+> **server-run and 0G-operated** (attested), not user-side, despite living here —
+> it runs client-core logic on behalf of browser/thin clients. `sdk/ts` is a
+> separate language stack that cannot share the Go core and stays byte-for-byte
+> aligned only through the frozen wire spec (`protocol/SPEC.md`).
 
 Design docs live at the repo root under
 [`docs/design`](../docs/design) (currently `router-e2e.md`).
