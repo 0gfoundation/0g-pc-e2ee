@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # Both modules pin the same Go; read it from protocol/go.mod.
+          go-version-file: protocol/go.mod
+          cache-dependency-path: protocol/go.sum
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l protocol client)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: vet, build, test (per module)
+        run: |
+          set -e
+          for m in protocol client; do
+            echo "::group::$m"
+            ( cd "$m" && go vet ./... && go build ./... && go test -race ./... )
+            echo "::endgroup::"
+          done
