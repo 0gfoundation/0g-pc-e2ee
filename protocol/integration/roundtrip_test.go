@@ -144,7 +144,9 @@ func TestRoundTripStreaming(t *testing.T) {
 		t.Fatalf("SealRequest: %v", err)
 	}
 	req, clientEphPub := broker.openRequest(t, env)
-	_ = req
+	if !bytes.Contains(req["messages"], []byte("the secret prompt")) {
+		t.Fatalf("broker did not recover the prompt: %s", req["messages"])
+	}
 
 	// broker streams three chunks.
 	deltas := []string{`{"content":"he"}`, `{"content":"ll"}`, `{"content":"o"}`}
@@ -189,6 +191,43 @@ func TestRoundTripStreaming(t *testing.T) {
 	}
 	if content.String() != "hello" {
 		t.Fatalf("reassembled stream = %q, want %q", content.String(), "hello")
+	}
+}
+
+// Streaming frames must be opened in the order they were sealed — the shared
+// HPKE context's AEAD sequence increments per frame, so a reordered or dropped
+// frame fails closed. This nails that property in the broker→client path.
+func TestStreamingOutOfOrderFailsClosed(t *testing.T) {
+	encPriv, encPub, _ := crypto.GenerateRecipientKey()
+	broker := &mockBroker{encPriv: encPriv, signerAddr: brokerSigner}
+	ephPriv, ephPub, _ := crypto.GenerateRecipientKey()
+
+	env, err := wire.SealRequest(encPub, sampleRequest(), nil, brokerSigner, ephPub)
+	if err != nil {
+		t.Fatalf("SealRequest: %v", err)
+	}
+	_, clientEphPub := broker.openRequest(t, env)
+
+	sealer, err := wire.NewResponseSealer(clientEphPub)
+	if err != nil {
+		t.Fatalf("NewResponseSealer: %v", err)
+	}
+	f0, err := sealer.SealFrame(wire.Response{"choices": json.RawMessage(`[{"index":0,"delta":{"content":"a"}}]`)}, nil, false)
+	if err != nil {
+		t.Fatalf("SealFrame 0: %v", err)
+	}
+	f1, err := sealer.SealFrame(wire.Response{"choices": json.RawMessage(`[{"index":0,"delta":{"content":"b"}}]`)}, nil, true)
+	if err != nil {
+		t.Fatalf("SealFrame 1: %v", err)
+	}
+
+	opener, err := wire.NewResponseOpener(ephPriv, f0)
+	if err != nil {
+		t.Fatalf("NewResponseOpener: %v", err)
+	}
+	// Opening the second frame before the first must fail.
+	if _, err := opener.OpenFrame(f1); err == nil {
+		t.Fatal("expected out-of-order OpenFrame to fail, got nil")
 	}
 }
 
