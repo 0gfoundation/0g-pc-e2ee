@@ -81,10 +81,10 @@ func validateSealedFields(fields []string) error {
 type E2EE struct {
 	V            int      `json:"v"`
 	KEMID        string   `json:"kem_id"`
-	KeyID        string   `json:"key_id"`        // base64url(SHA-256(enc_pub)[0:8])
-	ProviderID   string   `json:"provider_id"`   // pinned provider (signer address, 0x…)
+	KeyID        string   `json:"key_id"`         // base64url(SHA-256(enc_pub)[0:8])
+	ProviderID   string   `json:"provider_id"`    // pinned provider (signer address, 0x…)
 	ClientEphPub string   `json:"client_eph_pub"` // base64url X25519, for response sealing
-	Enc          string   `json:"enc"`           // base64url HPKE encapsulated key
+	Enc          string   `json:"enc"`            // base64url HPKE encapsulated key
 	SealedFields []string `json:"sealed_fields"`
 	Ciphertext   string   `json:"ciphertext"` // base64url; excluded from the AAD
 }
