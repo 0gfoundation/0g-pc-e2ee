@@ -19,18 +19,15 @@ import (
 // frame), guarding against an unbounded line.
 const maxSSELine = 4 << 20 // 4 MiB
 
-// streamIdleTimeout aborts a stream that stalls (no new frame) for this long, so
-// a provider that connects then hangs mid-stream cannot hold the call open
-// indefinitely.
-const streamIdleTimeout = 60 * time.Second
-
 // CompleteStream performs a streaming chat completion. It seals req, sends it,
 // then reads the provider's SSE stream of sealed frames, opens each in order,
 // and calls onFrame with the plaintext frame. onFrame returning an error stops
 // the stream and is returned as-is (e.g. a client disconnect).
 //
-// No artificial timeout is imposed: streaming lifetime is governed by ctx (the
-// sidecar passes the request context, cancelled when the user disconnects).
+// No total deadline is imposed (a stream may run long), but two stalls are
+// bounded to match the router: the wait for response headers (the Client's
+// ResponseHeaderTimeout) and the gap between frames (an idle watchdog at
+// providerTimeout). A user disconnect cancels via ctx.
 //
 // The same response-authenticity caveat as Complete applies (see its doc): the
 // frames are confidential but their origin is not yet authenticated.
@@ -70,14 +67,14 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 	}
 
 	// Abort if the provider stalls between frames.
-	idle := time.AfterFunc(streamIdleTimeout, cancel)
+	idle := time.AfterFunc(providerTimeout, cancel)
 	defer idle.Stop()
 
 	sse := newSSEReader(resp.Body)
 	var opener *wire.ResponseOpener
 	sawFinal := false
 	for {
-		idle.Reset(streamIdleTimeout) // time only the provider read...
+		idle.Reset(providerTimeout) // time only the provider read...
 		data, err := sse.next()
 		idle.Stop() // ...not the onFrame write (a slow client is not a provider stall)
 		// Benign, microsecond race: if the timer fires between a successful read

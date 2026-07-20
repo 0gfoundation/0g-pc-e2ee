@@ -14,18 +14,17 @@ import (
 	"github.com/0gfoundation/0g-pc/protocol/wire"
 )
 
-// defaultTimeout bounds one non-streaming request/response to the provider.
-// Chat completions can be slow, so it is generous. It is applied per call via a
-// context deadline (NOT http.Client.Timeout, which would also cut off a long
-// stream); streaming relies on the caller's context instead.
-const defaultTimeout = 120 * time.Second
-
-// responseHeaderTimeout bounds the wait for the provider's response headers
-// (roughly time-to-first-byte). It catches a provider that completes the TCP
-// connection but stalls before sending headers — which the streaming idle
-// watchdog (armed only after headers arrive) cannot — and does NOT cut an
-// already-flowing stream body, so it is safe on both paths.
-const responseHeaderTimeout = 60 * time.Second
+// providerTimeout aligns the client's bounds with the 0G router's upstream
+// timeout: nginx proxy_read_timeout / proxy_send_timeout and the backend
+// write_timeout are all 600s, and the streaming path clears its total deadline
+// so it is bounded by that same 600s read gap. We size to it plus a small margin
+// so the router's own timeout (a clean 504) fires first — the client never cuts
+// a request the router would still allow. Used as:
+//   - the non-streaming context deadline (applied per call, NOT via
+//     http.Client.Timeout, which would also cut a long stream);
+//   - the response-header wait (ResponseHeaderTimeout, both paths); and
+//   - the streaming idle gap between frames.
+const providerTimeout = 10*time.Minute + 30*time.Second
 
 // DefaultProviderURL is where a sealed request is POSTed when Provider.URL is
 // empty: the 0G router's OpenAI chat-completions endpoint. (Provider discovery —
@@ -100,7 +99,7 @@ func New(p Provider, opts ...Option) *Client {
 	// bound the wait for response headers. No blunt http.Client.Timeout: it would
 	// also cut a long stream (see defaultTimeout / responseHeaderTimeout).
 	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.ResponseHeaderTimeout = responseHeaderTimeout
+	tr.ResponseHeaderTimeout = providerTimeout
 	c := &Client{
 		provider:   p,
 		sealFields: wire.DefaultSealedFields(),
@@ -125,7 +124,7 @@ func New(p Provider, opts ...Option) *Client {
 // "verify response signature" step in doc.go) is a later step. Until then this
 // provides confidentiality but NOT response authenticity.
 func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response, error) {
-	ctx, cancel := context.WithTimeout(ctx, defaultTimeout)
+	ctx, cancel := context.WithTimeout(ctx, providerTimeout)
 	defer cancel()
 
 	// Fresh ephemeral keypair per request; the enclave seals the response to the
