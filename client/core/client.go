@@ -20,6 +20,13 @@ import (
 // stream); streaming relies on the caller's context instead.
 const defaultTimeout = 120 * time.Second
 
+// responseHeaderTimeout bounds the wait for the provider's response headers
+// (roughly time-to-first-byte). It catches a provider that completes the TCP
+// connection but stalls before sending headers — which the streaming idle
+// watchdog (armed only after headers arrive) cannot — and does NOT cut an
+// already-flowing stream body, so it is safe on both paths.
+const responseHeaderTimeout = 60 * time.Second
+
 // DefaultProviderURL is where a sealed request is POSTed when Provider.URL is
 // empty: the 0G router's OpenAI chat-completions endpoint. (Provider discovery —
 // the router's GET /v1/providers — is a separate, later concern.)
@@ -89,10 +96,15 @@ func New(p Provider, opts ...Option) *Client {
 	if p.URL == "" {
 		p.URL = DefaultProviderURL
 	}
+	// Clone the default transport (keeps env proxy, dial timeout, keepalives) and
+	// bound the wait for response headers. No blunt http.Client.Timeout: it would
+	// also cut a long stream (see defaultTimeout / responseHeaderTimeout).
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.ResponseHeaderTimeout = responseHeaderTimeout
 	c := &Client{
 		provider:   p,
 		sealFields: wire.DefaultSealedFields(),
-		http:       &http.Client{}, // no blunt Timeout; see defaultTimeout
+		http:       &http.Client{Transport: tr},
 	}
 	for _, o := range opts {
 		o(c)

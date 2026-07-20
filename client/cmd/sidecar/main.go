@@ -202,7 +202,9 @@ func serveStream(w http.ResponseWriter, r *http.Request, c *core.Client, req wir
 		flusher.Flush()
 		return
 	}
-	writeHeader() // handle a (degenerate) empty stream
+	// A successful stream always delivered its final frame, so wroteHeader is
+	// already true here; this is a defensive no-op guard.
+	writeHeader()
 	fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
 }

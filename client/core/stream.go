@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"time"
 
@@ -54,7 +55,10 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 		return &Error{Stage: StageUpstream, Err: fmt.Errorf("post to provider: %w", err)}
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
+	if resp.StatusCode != http.StatusOK {
+		// Like post: the error embeds the raw upstream body (see the TODO(gateway)
+		// on post) — fine for the local sidecar, but the gateway shell must not
+		// echo it back.
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxSSELine))
 		return &Error{Stage: StageUpstream, Status: resp.StatusCode, Err: fmt.Errorf("provider returned %d: %s", resp.StatusCode, body)}
 	}
@@ -76,6 +80,9 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 		idle.Reset(streamIdleTimeout) // time only the provider read...
 		data, err := sse.next()
 		idle.Stop() // ...not the onFrame write (a slow client is not a provider stall)
+		// Benign, microsecond race: if the timer fires between a successful read
+		// and Stop, ctx is cancelled and the *next* read returns "stream aborted".
+		// Only possible if a frame arrives right at the idle boundary; acceptable.
 		if err == io.EOF {
 			// A stream that ends without its final frame was truncated (provider
 			// crash / dropped connection) — not a complete answer.
