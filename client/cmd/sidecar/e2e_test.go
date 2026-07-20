@@ -152,9 +152,37 @@ func TestSidecarSurfacesTamper(t *testing.T) {
 		t.Fatalf("post to sidecar: %v", err)
 	}
 	defer httpResp.Body.Close()
-	// An open failure downstream is an upstream-stage error → 502.
-	if httpResp.StatusCode != http.StatusBadGateway {
-		t.Fatalf("tampered request: got %d, want 502", httpResp.StatusCode)
+	// The broker rejects the tampered request (400); the sidecar surfaces that
+	// upstream status verbatim rather than flattening it.
+	if httpResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("tampered request: got %d, want 400 (broker status passed through)", httpResp.StatusCode)
+	}
+}
+
+// A non-2xx provider status (here 429) is surfaced verbatim, not flattened to
+// 502, so OpenAI clients keep their retry/backoff behavior (429/5xx retry, 4xx
+// fail fast).
+func TestSidecarPassesUpstreamStatus(t *testing.T) {
+	_, encPub, _ := crypto.GenerateRecipientKey()
+	signer := "0x" + strings.Repeat("a", 40)
+
+	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "slow down", http.StatusTooManyRequests)
+	}))
+	defer broker.Close()
+
+	client := core.New(core.Provider{URL: broker.URL, EncPubKey: encPub, SignerAddr: signer})
+	sidecar := httptest.NewServer(newHandler(client))
+	defer sidecar.Close()
+
+	userReq := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	httpResp, err := http.Post(sidecar.URL+"/v1/chat/completions", "application/json", strings.NewReader(userReq))
+	if err != nil {
+		t.Fatalf("post to sidecar: %v", err)
+	}
+	defer httpResp.Body.Close()
+	if httpResp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("got %d, want 429 (upstream status passed through)", httpResp.StatusCode)
 	}
 }
 

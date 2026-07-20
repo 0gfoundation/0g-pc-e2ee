@@ -135,12 +135,16 @@ func streamRequested(req wire.Request) (bool, error) {
 	return stream, nil
 }
 
-// statusFor maps a Complete failure to an HTTP status by its stage: a bad client
-// request is 400, a client-side internal error is 500, and anything upstream (or
-// unclassified) is 502.
+// statusFor maps a Complete failure to an HTTP status. A non-2xx provider status
+// is surfaced verbatim (so OpenAI clients keep their retry/backoff on 429/5xx vs
+// 4xx); otherwise a bad client request is 400, a client-side internal error is
+// 500, and anything upstream (transport failure, bad sealed response) is 502.
 func statusFor(err error) int {
 	var e *core.Error
 	if errors.As(err, &e) {
+		if e.Status != 0 {
+			return e.Status
+		}
 		switch e.Stage {
 		case core.StageRequest:
 			return http.StatusBadRequest

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/0gfoundation/0g-pc/protocol/crypto"
@@ -32,10 +33,12 @@ const (
 	StageInternal = "internal" // client-side internal error
 )
 
-// Error wraps a Complete failure with the Stage it happened at.
+// Error wraps a Complete failure with the Stage it happened at and, when the
+// failure is a non-2xx provider response, the upstream Status to surface as-is.
 type Error struct {
-	Stage string
-	Err   error
+	Stage  string
+	Status int // upstream HTTP status to surface verbatim; 0 = derive from Stage
+	Err    error
 }
 
 func (e *Error) Error() string { return e.Err.Error() }
@@ -66,11 +69,17 @@ type Client struct {
 type Option func(*Client)
 
 // WithSealFields overrides the set of request fields the client seals. Each is
-// sealed only when present in a given request. The set must satisfy
-// wire.ValidateSealedFields (non-empty, no duplicates, includes "messages");
-// validate it before passing it in for a clear up-front error.
+// sealed only when present in a given request.
+//
+// The set must satisfy wire.ValidateSealedFields (non-empty, no duplicates,
+// includes "messages"). It is not validated here: SealRequest enforces it per
+// request, and callers that want an up-front error (the sidecar does) should
+// call wire.ValidateSealedFields before constructing the Client.
+// TODO(sdk): if the in-process SDK form exposes this, validate at construction
+// (New returning an error) so a misconfig fails once, not on every request.
 func WithSealFields(fields []string) Option {
-	return func(c *Client) { c.sealFields = fields }
+	// Clone so a later mutation of the caller's slice cannot alter this config.
+	return func(c *Client) { c.sealFields = slices.Clone(fields) }
 }
 
 // New returns a Client for the given provider. An empty Provider.URL defaults to
@@ -117,9 +126,12 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 		return nil, stageErr(StageRequest, fmt.Errorf("seal request: %w", err))
 	}
 
-	respBody, err := c.post(ctx, sealed)
+	respBody, status, err := c.post(ctx, sealed)
 	if err != nil {
-		return nil, stageErr(StageUpstream, err)
+		// Surface a non-2xx provider status verbatim (status is 0 for a transport
+		// failure, which statusFor maps to 502) so OpenAI clients can key their
+		// retry/backoff on it — 429/5xx retry, 4xx fail fast.
+		return nil, &Error{Stage: StageUpstream, Status: status, Err: err}
 	}
 
 	var sealedResp wire.Response
@@ -133,31 +145,38 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 	return out, nil
 }
 
-func (c *Client) post(ctx context.Context, env wire.Request) ([]byte, error) {
+// post sends the envelope and returns the response body plus, for a non-2xx, the
+// upstream HTTP status (0 for a transport/read failure, which the caller maps to
+// 502). The caller surfaces a non-2xx status verbatim.
+//
+// TODO(gateway): the non-2xx error embeds the raw upstream body, which is fine
+// for a local user-operated sidecar (debugging) but must NOT be echoed back to
+// callers once the cloud-TEE gateway shell reuses this core.
+func (c *Client) post(ctx context.Context, env wire.Request) ([]byte, int, error) {
 	body, err := json.Marshal(env)
 	if err != nil {
-		return nil, fmt.Errorf("marshal envelope: %w", err)
+		return nil, 0, fmt.Errorf("marshal envelope: %w", err)
 	}
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.provider.URL, bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.http.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("post to provider: %w", err)
+		return nil, 0, fmt.Errorf("post to provider: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read provider response: %w", err)
+		return nil, 0, fmt.Errorf("read provider response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("provider returned %d: %s", resp.StatusCode, respBody)
+		return nil, resp.StatusCode, fmt.Errorf("provider returned %d: %s", resp.StatusCode, respBody)
 	}
-	return respBody, nil
+	return respBody, resp.StatusCode, nil
 }
 
 // sealedFieldsFor picks the configured sealed fields that are actually present
