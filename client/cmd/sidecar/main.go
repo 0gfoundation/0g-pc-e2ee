@@ -12,14 +12,19 @@ import (
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/0gfoundation/0g-pc/client/core"
 	"github.com/0gfoundation/0g-pc/protocol/crypto"
 	"github.com/0gfoundation/0g-pc/protocol/wire"
 )
+
+// maxRequestBytes caps the request body the sidecar will read.
+const maxRequestBytes = 10 << 20 // 10 MiB
 
 func main() {
 	listen := flag.String("listen", "localhost:8787", "address to listen on")
@@ -41,8 +46,13 @@ func main() {
 		EncPubKey:  crypto.PublicKey(encPub),
 		SignerAddr: *signer,
 	})
+	srv := &http.Server{
+		Addr:              *listen,
+		Handler:           newHandler(client),
+		ReadHeaderTimeout: 10 * time.Second, // mitigate slow-header (Slowloris) clients
+	}
 	log.Printf("sidecar listening on %s -> %s", *listen, *providerURL)
-	if err := http.ListenAndServe(*listen, newHandler(client)); err != nil {
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -52,8 +62,13 @@ func main() {
 func newHandler(c *core.Client) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(r.Body)
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBytes))
 		if err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+				return
+			}
 			writeError(w, http.StatusBadRequest, "read request body")
 			return
 		}
@@ -62,7 +77,12 @@ func newHandler(c *core.Client) http.Handler {
 			writeError(w, http.StatusBadRequest, "request body is not a JSON object")
 			return
 		}
-		if isStreaming(req) {
+		stream, err := streamRequested(req)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if stream {
 			// Fail loud: a streaming client must not receive a non-SSE body.
 			writeError(w, http.StatusNotImplemented, "streaming (stream: true) is not yet supported")
 			return
@@ -83,14 +103,19 @@ func newHandler(c *core.Client) http.Handler {
 	return mux
 }
 
-// isStreaming reports whether the request asked for a streamed (SSE) response.
-func isStreaming(req wire.Request) bool {
+// streamRequested reports whether the request asked for a streamed (SSE)
+// response. A present-but-non-boolean "stream" is an error, so a malformed value
+// is rejected rather than silently treated as non-streaming.
+func streamRequested(req wire.Request) (bool, error) {
 	raw, ok := req["stream"]
 	if !ok {
-		return false
+		return false, nil
 	}
 	var stream bool
-	return json.Unmarshal(raw, &stream) == nil && stream
+	if err := json.Unmarshal(raw, &stream); err != nil {
+		return false, fmt.Errorf(`field "stream" must be a boolean`)
+	}
+	return stream, nil
 }
 
 // statusFor maps a Complete failure to an HTTP status by its stage: a bad client

@@ -181,6 +181,52 @@ func TestSidecarRejectsStreaming(t *testing.T) {
 	}
 }
 
+// A malformed "stream" value (a string, not a bool) is a client error → 400,
+// not silently treated as non-streaming.
+func TestSidecarRejectsMalformedStream(t *testing.T) {
+	encPriv, encPub, _ := crypto.GenerateRecipientKey()
+	signer := "0x" + strings.Repeat("e", 40)
+	broker := mockBroker(t, encPriv, signer)
+	defer broker.Close()
+
+	client := core.New(core.Provider{URL: broker.URL, EncPubKey: encPub, SignerAddr: signer})
+	sidecar := httptest.NewServer(newHandler(client))
+	defer sidecar.Close()
+
+	userReq := `{"model":"gpt-4o","stream":"true","messages":[{"role":"user","content":"hi"}]}`
+	httpResp, err := http.Post(sidecar.URL+"/v1/chat/completions", "application/json", strings.NewReader(userReq))
+	if err != nil {
+		t.Fatalf("post to sidecar: %v", err)
+	}
+	defer httpResp.Body.Close()
+	if httpResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("malformed stream: got %d, want 400", httpResp.StatusCode)
+	}
+}
+
+// A body over the limit is rejected with 413 rather than read unbounded.
+func TestSidecarRejectsOversizedBody(t *testing.T) {
+	encPriv, encPub, _ := crypto.GenerateRecipientKey()
+	signer := "0x" + strings.Repeat("f", 40)
+	broker := mockBroker(t, encPriv, signer)
+	defer broker.Close()
+
+	client := core.New(core.Provider{URL: broker.URL, EncPubKey: encPub, SignerAddr: signer})
+	sidecar := httptest.NewServer(newHandler(client))
+	defer sidecar.Close()
+
+	huge := `{"model":"gpt-4o","messages":[{"role":"user","content":"` +
+		strings.Repeat("a", (10<<20)+1) + `"}]}`
+	httpResp, err := http.Post(sidecar.URL+"/v1/chat/completions", "application/json", strings.NewReader(huge))
+	if err != nil {
+		t.Fatalf("post to sidecar: %v", err)
+	}
+	defer httpResp.Body.Close()
+	if httpResp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized body: got %d, want 413", httpResp.StatusCode)
+	}
+}
+
 // A request with nothing to seal (no messages) is a client error → 400, not 502.
 func TestSidecarBadRequestIs400(t *testing.T) {
 	encPriv, encPub, _ := crypto.GenerateRecipientKey()

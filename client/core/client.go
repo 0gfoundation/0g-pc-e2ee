@@ -65,6 +65,14 @@ func New(p Provider) *Client {
 // OpenAI-shaped JSON objects; the sensitive fields are sealed on the way out and
 // the sealed response is opened on the way back, so the caller only ever handles
 // plaintext. Failures are wrapped in *Error with a Stage.
+//
+// TODO(attestation): the response is sealed to client_eph_pub, which travels in
+// cleartext in the request envelope. Complete does NOT yet authenticate the
+// response's origin — a middleman could read that key and seal a forged
+// response that OpenResponse accepts as plaintext. Verifying the provider enc
+// key out of an attestation quote (§4) and the TEE response signature (§8; the
+// "verify response signature" step in doc.go) is a later step. Until then this
+// provides confidentiality but NOT response authenticity.
 func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response, error) {
 	// Fresh ephemeral keypair per request; the enclave seals the response to the
 	// public half (§7) and we keep the private half to open it.
@@ -129,7 +137,11 @@ func (c *Client) post(ctx context.Context, env wire.Request) ([]byte, error) {
 // sent) without erroring on a tools-less request, while keeping the default set
 // defined in exactly one place (wire.DefaultSealedFields).
 func sealedFieldsFor(req wire.Request) []string {
-	var fs []string
+	// Non-nil even when empty: SealRequest treats a nil sealedFields as "use the
+	// default set", which would silently mask this presence-filter. An empty
+	// (non-nil) result instead makes SealRequest fail with "no sealed fields" —
+	// the right outcome for a request with nothing sensitive to seal.
+	fs := []string{}
 	for _, f := range wire.DefaultSealedFields() {
 		if _, ok := req[f]; ok {
 			fs = append(fs, f)
