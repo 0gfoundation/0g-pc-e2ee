@@ -1,0 +1,9 @@
+# Keep the Docker build context small. The Dockerfiles only need the two Go
+# module trees (protocol/ and client/); everything below is noise for the build.
+.git
+.github
+docs
+**/*_test.go
+**/testdata
+README.md
+**/README.md
