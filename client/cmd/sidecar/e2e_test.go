@@ -517,6 +517,171 @@ func TestSidecarRejectsOversizedBody(t *testing.T) {
 	}
 }
 
+// The caller's Authorization credential is forwarded verbatim to the provider
+// on both the buffered and streaming paths, and no header is sent when the
+// caller presents none.
+func TestSidecarForwardsCredential(t *testing.T) {
+	encPriv, encPub, _ := crypto.GenerateRecipientKey()
+	signer := "0x" + strings.Repeat("a", 40)
+
+	const wantAuth = "Bearer 0g-secret-key"
+
+	// A broker that records the Authorization header it received, then answers
+	// like the plain mock broker (buffered or SSE, per stream:true).
+	var gotAuth string
+	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		body, _ := io.ReadAll(r.Body)
+		var env wire.Request
+		if err := json.Unmarshal(body, &env); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		e2ee, _ := env.E2EE()
+		req, err := wire.OpenRequest(encPriv, env)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		ephPub, _ := base64.RawURLEncoding.DecodeString(e2ee.ClientEphPub)
+
+		if string(env["stream"]) == "true" {
+			sealer, _ := wire.NewResponseSealer(crypto.PublicKey(ephPub))
+			frame := wire.Response{"choices": json.RawMessage(`[{"index":0,"delta":{"content":"hi"}}]`)}
+			sealed, _ := sealer.SealFrame(frame, nil, true)
+			w.Header().Set("Content-Type", "text/event-stream")
+			flusher := w.(http.Flusher)
+			b, _ := json.Marshal(sealed)
+			_, _ = w.Write([]byte("data: "))
+			_, _ = w.Write(b)
+			_, _ = w.Write([]byte("\n\ndata: [DONE]\n\n"))
+			flusher.Flush()
+			return
+		}
+		resp := wire.Response{
+			"id":      json.RawMessage(`"chatcmpl-mock"`),
+			"model":   req["model"],
+			"choices": json.RawMessage(`[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]`),
+		}
+		sealed, _ := wire.SealResponse(crypto.PublicKey(ephPub), resp, nil)
+		_ = json.NewEncoder(w).Encode(sealed)
+	}))
+	defer broker.Close()
+
+	client := core.New(core.Provider{URL: broker.URL, EncPubKey: encPub, SignerAddr: signer})
+	sidecar := httptest.NewServer(newHandler(client))
+	defer sidecar.Close()
+
+	post := func(t *testing.T, auth, body string) {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodPost, sidecar.URL+"/v1/chat/completions", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post to sidecar: %v", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(resp.Body)
+			t.Fatalf("got %d: %s", resp.StatusCode, b)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+	}
+
+	t.Run("buffered", func(t *testing.T) {
+		gotAuth = ""
+		post(t, wantAuth, `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`)
+		if gotAuth != wantAuth {
+			t.Fatalf("provider saw Authorization %q, want %q", gotAuth, wantAuth)
+		}
+	})
+
+	t.Run("streaming", func(t *testing.T) {
+		gotAuth = ""
+		post(t, wantAuth, `{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+		if gotAuth != wantAuth {
+			t.Fatalf("provider saw Authorization %q, want %q", gotAuth, wantAuth)
+		}
+	})
+
+	t.Run("no credential", func(t *testing.T) {
+		gotAuth = "sentinel"
+		post(t, "", `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`)
+		if gotAuth != "" {
+			t.Fatalf("provider saw Authorization %q, want none forwarded", gotAuth)
+		}
+	})
+}
+
+// The X-0G-* routing directives are forwarded to the provider; any other
+// inbound header (a cookie, an app-custom header) is dropped, not leaked to the
+// router.
+func TestSidecarForwardsRoutingHeaders(t *testing.T) {
+	encPriv, encPub, _ := crypto.GenerateRecipientKey()
+	signer := "0x" + strings.Repeat("a", 40)
+
+	var got http.Header
+	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		body, _ := io.ReadAll(r.Body)
+		var env wire.Request
+		_ = json.Unmarshal(body, &env)
+		e2ee, _ := env.E2EE()
+		if _, err := wire.OpenRequest(encPriv, env); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		ephPub, _ := base64.RawURLEncoding.DecodeString(e2ee.ClientEphPub)
+		resp := wire.Response{
+			"id":      json.RawMessage(`"chatcmpl-mock"`),
+			"choices": json.RawMessage(`[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]`),
+		}
+		sealed, _ := wire.SealResponse(crypto.PublicKey(ephPub), resp, nil)
+		_ = json.NewEncoder(w).Encode(sealed)
+	}))
+	defer broker.Close()
+
+	client := core.New(core.Provider{URL: broker.URL, EncPubKey: encPub, SignerAddr: signer})
+	sidecar := httptest.NewServer(newHandler(client))
+	defer sidecar.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, sidecar.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-0G-Provider-Address", "0x"+strings.Repeat("b", 40))
+	req.Header.Set("X-0G-Provider-Sort", "latency")
+	req.Header.Set("Cookie", "session=leak-me")    // must NOT reach the router
+	req.Header.Set("X-App-Trace", "internal-only") // must NOT reach the router
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post to sidecar: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("got %d: %s", resp.StatusCode, b)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	// HTTP header names are case-insensitive; http.Header.Get canonicalizes, so
+	// these match regardless of the wire casing.
+	if v := got.Get("X-0G-Provider-Address"); v != "0x"+strings.Repeat("b", 40) {
+		t.Errorf("X-0G-Provider-Address = %q, want it forwarded", v)
+	}
+	if v := got.Get("X-0G-Provider-Sort"); v != "latency" {
+		t.Errorf("X-0G-Provider-Sort = %q, want %q", v, "latency")
+	}
+	if v := got.Get("Cookie"); v != "" {
+		t.Errorf("Cookie leaked to provider: %q", v)
+	}
+	if v := got.Get("X-App-Trace"); v != "" {
+		t.Errorf("non-routing header X-App-Trace leaked to provider: %q", v)
+	}
+}
+
 // A request with nothing to seal (no messages) is a client error → 400, not 502.
 func TestSidecarBadRequestIs400(t *testing.T) {
 	encPriv, encPub, _ := crypto.GenerateRecipientKey()

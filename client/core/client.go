@@ -196,6 +196,20 @@ func (c *Client) doRequest(ctx context.Context, env wire.Request) (*http.Respons
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
+	// Copy the caller's forwarded routing headers (the X-0G-* directives the
+	// router consumes) before the credential, so the credential set below always
+	// wins over anything forwarded.
+	for k, vs := range forwardedHeadersFrom(ctx) {
+		for _, v := range vs {
+			httpReq.Header.Add(k, v)
+		}
+	}
+	// Forward the caller's credential (if any) verbatim as the provider's
+	// Authorization header, so the router/broker can authenticate and bill the
+	// request. Empty when the caller set none — the request then goes out unauthed.
+	if cred := credentialFrom(ctx); cred != "" {
+		httpReq.Header.Set("Authorization", cred)
+	}
 	return c.http.Do(httpReq)
 }
 
