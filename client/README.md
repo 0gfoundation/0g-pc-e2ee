@@ -77,6 +77,13 @@ travels in cleartext alongside the other routing/billing fields — it is
 **not** one of the sealed (confidential) fields, since the provider needs it to
 identify the caller. Send no key and the request goes upstream unauthenticated.
 
+Any request header in the **`X-0G-*`** namespace is forwarded verbatim to the
+provider — the router's cleartext routing directives (`X-0G-Provider-Address`
+to pin a provider, `-Sort`, `-Trust-Mode`, `-Allow-Fallbacks`,
+`-Require-Parameters`). No other header is forwarded: arbitrary client headers
+(cookies, app-internal metadata) must not leak to the router, which terminates
+TLS on the router path.
+
 ## What it verifies
 
 - **Attestation** — the provider quote is genuine TEE hardware running the

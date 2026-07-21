@@ -616,6 +616,72 @@ func TestSidecarForwardsCredential(t *testing.T) {
 	})
 }
 
+// The X-0G-* routing directives are forwarded to the provider; any other
+// inbound header (a cookie, an app-custom header) is dropped, not leaked to the
+// router.
+func TestSidecarForwardsRoutingHeaders(t *testing.T) {
+	encPriv, encPub, _ := crypto.GenerateRecipientKey()
+	signer := "0x" + strings.Repeat("a", 40)
+
+	var got http.Header
+	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		body, _ := io.ReadAll(r.Body)
+		var env wire.Request
+		_ = json.Unmarshal(body, &env)
+		e2ee, _ := env.E2EE()
+		if _, err := wire.OpenRequest(encPriv, env); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		ephPub, _ := base64.RawURLEncoding.DecodeString(e2ee.ClientEphPub)
+		resp := wire.Response{
+			"id":      json.RawMessage(`"chatcmpl-mock"`),
+			"choices": json.RawMessage(`[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]`),
+		}
+		sealed, _ := wire.SealResponse(crypto.PublicKey(ephPub), resp, nil)
+		_ = json.NewEncoder(w).Encode(sealed)
+	}))
+	defer broker.Close()
+
+	client := core.New(core.Provider{URL: broker.URL, EncPubKey: encPub, SignerAddr: signer})
+	sidecar := httptest.NewServer(newHandler(client))
+	defer sidecar.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, sidecar.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-0G-Provider-Address", "0x"+strings.Repeat("b", 40))
+	req.Header.Set("X-0G-Provider-Sort", "latency")
+	req.Header.Set("Cookie", "session=leak-me")    // must NOT reach the router
+	req.Header.Set("X-App-Trace", "internal-only") // must NOT reach the router
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post to sidecar: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("got %d: %s", resp.StatusCode, b)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	// HTTP header names are case-insensitive; http.Header.Get canonicalizes, so
+	// these match regardless of the wire casing.
+	if v := got.Get("X-0G-Provider-Address"); v != "0x"+strings.Repeat("b", 40) {
+		t.Errorf("X-0G-Provider-Address = %q, want it forwarded", v)
+	}
+	if v := got.Get("X-0G-Provider-Sort"); v != "latency" {
+		t.Errorf("X-0G-Provider-Sort = %q, want %q", v, "latency")
+	}
+	if v := got.Get("Cookie"); v != "" {
+		t.Errorf("Cookie leaked to provider: %q", v)
+	}
+	if v := got.Get("X-App-Trace"); v != "" {
+		t.Errorf("non-routing header X-App-Trace leaked to provider: %q", v)
+	}
+}
+
 // A request with nothing to seal (no messages) is a client error → 400, not 502.
 func TestSidecarBadRequestIs400(t *testing.T) {
 	encPriv, encPub, _ := crypto.GenerateRecipientKey()

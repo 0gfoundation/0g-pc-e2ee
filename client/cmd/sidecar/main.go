@@ -90,8 +90,11 @@ func newHandler(c *core.Client) http.Handler {
 			return
 		}
 		// Forward the caller's Authorization header (the 0G key an OpenAI SDK sends)
-		// to the provider so it can authenticate and bill. Absent header -> no-op.
+		// so the provider can authenticate and bill, plus the X-0G-* routing
+		// directives the router consumes. Nothing else is forwarded — arbitrary
+		// client headers must not leak to the (untrusted) router.
 		ctx := core.WithCredential(r.Context(), r.Header.Get("Authorization"))
+		ctx = core.WithForwardedHeaders(ctx, routingHeaders(r.Header))
 		if stream {
 			serveStream(ctx, w, c, req)
 			return
@@ -110,6 +113,30 @@ func newHandler(c *core.Client) http.Handler {
 		_, _ = w.Write(out)
 	})
 	return mux
+}
+
+// routingHeaderPrefix is the router-owned namespace of cleartext routing
+// directives (provider pin, sort, trust mode, fallbacks, require-parameters).
+// Only headers in this namespace are forwarded to the provider; matching is
+// case-insensitive since HTTP header names are.
+const routingHeaderPrefix = "x-0g-"
+
+// routingHeaders selects the X-0G-* routing directives from the inbound request
+// to forward upstream. Restricting to this namespace is deliberate: it lets an
+// app steer routing via standard headers without the sidecar leaking arbitrary
+// client headers (cookies, app-internal metadata) to the untrusted router.
+func routingHeaders(h http.Header) http.Header {
+	var out http.Header
+	for k, vs := range h {
+		if !strings.HasPrefix(strings.ToLower(k), routingHeaderPrefix) {
+			continue
+		}
+		if out == nil {
+			out = make(http.Header)
+		}
+		out[k] = vs
+	}
+	return out
 }
 
 // parseCSV splits a comma-separated flag value into trimmed, non-empty parts.
