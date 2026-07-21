@@ -29,6 +29,7 @@ signed — see the design doc).
 
 ```
 core/            # client core: quote + response-signature verification, seal, pin, fallback, key cache
+openaiproxy/     # shared OpenAI-compatible HTTP handler over core (used by both server forms)
 cmd/
   sidecar/       # local sidecar binary (OpenAI-compatible proxy on localhost) — user-operated, no new trust party
   gateway/       # cloud-TEE gateway — SAME core, but SERVER-RUN + 0G-operated, runs in an attested CVM (adds one attested trust party)
@@ -38,12 +39,16 @@ sdk/
 ```
 
 > **On the layout:** `core/` is the center of gravity — all three forms are thin
-> shells over it and must not reimplement seal/verify. `cmd/sidecar`, `cmd/gateway`
-> and `sdk/go` are Go and share `core/`; `cmd/gateway` is the one form that is
-> **server-run and 0G-operated** (attested), not user-side, despite living here —
-> it runs client-core logic on behalf of browser/thin clients. `sdk/ts` is a
-> separate language stack that cannot share the Go core and stays byte-for-byte
-> aligned only through the frozen wire spec (`protocol/SPEC.md`).
+> shells over it and must not reimplement seal/verify. The two server forms
+> (`cmd/sidecar`, `cmd/gateway`) share one more layer: `openaiproxy/`, the
+> OpenAI-compatible HTTP handler over `core` (seal request → open response,
+> buffered and streaming). The sidecar serves it as-is; the gateway serves it
+> plus its own operational routes (`/healthz`, `/quote`). `cmd/sidecar`,
+> `cmd/gateway` and `sdk/go` are Go and share `core/`; `cmd/gateway` is the one
+> form that is **server-run and 0G-operated** (attested), not user-side, despite
+> living here — it runs client-core logic on behalf of browser/thin clients.
+> `sdk/ts` is a separate language stack that cannot share the Go core and stays
+> byte-for-byte aligned only through the frozen wire spec (`protocol/SPEC.md`).
 
 Design docs live at the repo root under
 [`docs/design`](../docs/design) (currently `router-e2e.md`).
