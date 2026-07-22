@@ -1,4 +1,4 @@
-module github.com/0gfoundation/0g-pc/protocol
+module github.com/0gfoundation/0g-pc-e2ee/protocol
 
 go 1.24.0
 

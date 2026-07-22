@@ -10,10 +10,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/0gfoundation/0g-pc/client/core"
-	"github.com/0gfoundation/0g-pc/client/openaiproxy"
-	"github.com/0gfoundation/0g-pc/protocol/crypto"
-	"github.com/0gfoundation/0g-pc/protocol/wire"
+	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
 // mockBroker is an httptest stand-in for the provider enclave: it opens the

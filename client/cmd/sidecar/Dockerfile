@@ -7,7 +7,7 @@
 # module depends on the protocol module through a `replace => ../protocol`
 # directive, so both module trees have to be present at build time:
 #
-#   docker build -f client/cmd/sidecar/Dockerfile -t 0g-pc-sidecar .
+#   docker build -f client/cmd/sidecar/Dockerfile -t 0g-pc-e2ee-sidecar .
 
 FROM golang:1.24-alpine AS build
 WORKDIR /src
@@ -35,9 +35,9 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM gcr.io/distroless/static-debian12:nonroot
 
 # OCI metadata. `image.source` is what binds this image to the repo on GHCR:
-# the registry reads it to link the package to github.com/0gfoundation/0g-pc.
-LABEL org.opencontainers.image.source="https://github.com/0gfoundation/0g-pc"
-LABEL org.opencontainers.image.title="0g-pc-sidecar"
+# the registry reads it to link the package to github.com/0gfoundation/0g-pc-e2ee.
+LABEL org.opencontainers.image.source="https://github.com/0gfoundation/0g-pc-e2ee"
+LABEL org.opencontainers.image.title="0g-pc-e2ee-sidecar"
 LABEL org.opencontainers.image.description="0G Private Computer sidecar — local OpenAI-compatible proxy that seals requests to an attested TEE provider."
 
 COPY --from=build /out/sidecar /usr/local/bin/sidecar

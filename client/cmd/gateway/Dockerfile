@@ -10,7 +10,7 @@
 # Like the sidecar, the build context MUST be the repo root (client depends on
 # protocol via `replace => ../protocol`):
 #
-#   docker build -f client/cmd/gateway/Dockerfile -t 0g-pc-gateway .
+#   docker build -f client/cmd/gateway/Dockerfile -t 0g-pc-e2ee-gateway .
 
 FROM golang:1.24-alpine AS build
 WORKDIR /src
@@ -31,8 +31,8 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 FROM gcr.io/distroless/static-debian12:nonroot
 
-LABEL org.opencontainers.image.source="https://github.com/0gfoundation/0g-pc"
-LABEL org.opencontainers.image.title="0g-pc-gateway"
+LABEL org.opencontainers.image.source="https://github.com/0gfoundation/0g-pc-e2ee"
+LABEL org.opencontainers.image.title="0g-pc-e2ee-gateway"
 LABEL org.opencontainers.image.description="0G Private Computer cloud-TEE gateway — attested, 0G-operated server running the client core for browser/thin clients."
 
 COPY --from=build /out/gateway /usr/local/bin/gateway

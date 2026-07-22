@@ -1,4 +1,4 @@
-# 0g-pc-protocol
+# 0g-pc-e2ee/protocol
 
 The shared **protocol contract** for the 0G Private Computer end-to-end-encrypted
 (E2EE) inference stack. It is the single source of truth that the provider

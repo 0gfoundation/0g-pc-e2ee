@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/0gfoundation/0g-pc/protocol/crypto"
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 )
 
 var benchProviderID = "0x" + strings.Repeat("a", 40)

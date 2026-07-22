@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/0gfoundation/0g-pc/protocol/crypto"
-	"github.com/0gfoundation/0g-pc/protocol/wire"
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
 // maxSSELine caps a single SSE data line read from the provider (one sealed

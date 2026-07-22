@@ -10,8 +10,8 @@ import (
 	"slices"
 	"time"
 
-	"github.com/0gfoundation/0g-pc/protocol/crypto"
-	"github.com/0gfoundation/0g-pc/protocol/wire"
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
 // providerTimeout aligns the client's bounds with the 0G router's upstream

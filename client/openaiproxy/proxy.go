@@ -17,8 +17,8 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/0gfoundation/0g-pc/client/core"
-	"github.com/0gfoundation/0g-pc/protocol/wire"
+	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
 // maxRequestBytes caps the request body the proxy will read.

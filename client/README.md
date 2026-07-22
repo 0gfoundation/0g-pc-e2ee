@@ -1,4 +1,4 @@
-# 0g-pc-client
+# 0g-pc-e2ee/client
 
 Client for **0G Private Computer** — end-to-end-encrypted (E2EE) inference on the
 0G Compute Network. E2EE here is the broad sense, both halves of a secure channel
@@ -62,7 +62,7 @@ sdk/
 Design docs live at the repo root under
 [`docs/design`](../docs/design) (currently `router-e2e.md`).
 
-Depends on **`github.com/0gfoundation/0g-pc/protocol`** — the shared wire
+Depends on **`github.com/0gfoundation/0g-pc-e2ee/protocol`** — the shared wire
 format and verification/sealing crypto used by the broker, the router, and this
 client, so all three agree byte-for-byte. (Provider scoring is not part of the
 protocol; the router owns it and exposes the best provider + fallback list via
@@ -72,7 +72,7 @@ its candidate API.)
 
 ```bash
 # run the sidecar (details TBD)
-0g-pc-sidecar --listen localhost:8787
+0g-pc-e2ee-sidecar --listen localhost:8787
 ```
 
 Point any OpenAI SDK at it:
@@ -116,9 +116,16 @@ model, the control-plane / data-plane split, and the encryption-key lifecycle.
 
 ## Related repositories & products
 
+This repo (**`0g-pc-e2ee`**) holds two Go modules:
+
+| Module (this repo) | Role |
+|------|------|
+| `protocol` | shared wire format + verification/sealing crypto — the E2EE contract |
+| `client` (this) | client core + its forms: sidecar, in-process SDK, and the 0G-operated gateway |
+
+External:
+
 | Repo/Product | Role |
 |------|------|
-| `0g-pc-client` (this) | user-side sidecar / SDK / gateway |
-| `0g-pc/protocol` | shared wire format + crypto + route logic |
 | `0g-serving-broker` | provider-side broker (server) |
 | `Private Computer` | L7 aggregating router (product: Private Computer) |

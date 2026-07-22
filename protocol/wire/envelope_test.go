@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/0gfoundation/0g-pc/protocol/crypto"
-	"github.com/0gfoundation/0g-pc/protocol/wire"
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
 var b64 = base64.RawURLEncoding

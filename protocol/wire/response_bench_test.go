@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/0gfoundation/0g-pc/protocol/crypto"
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 )
 
 // responseOfSize builds a non-streaming response whose `choices` content is
