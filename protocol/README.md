@@ -1,9 +1,14 @@
 # 0g-pc-protocol
 
-The shared **protocol contract** for the 0G Private Computer verifiable-inference
-stack. It is the single source of truth that the provider broker, the router,
-and the client all depend on, so every participant agrees **byte-for-byte** on
-how requests are sealed and how responses are proven.
+The shared **protocol contract** for the 0G Private Computer end-to-end-encrypted
+(E2EE) inference stack. It is the single source of truth that the provider
+broker, the router, and the client all depend on, so every participant agrees
+**byte-for-byte** on how requests are sealed and how responses are proven.
+
+> **"E2EE" here is the broad sense** — both halves of an end-to-end secure
+> channel to an attested provider enclave: **confidentiality** (sealing the
+> prompt/tool defs to the enclave) *and* **authenticity** (attestation binding +
+> response-signature verification). It does **not** mean confidentiality alone.
 
 > Status: early / design-stage. `SPEC.md` is normative; APIs will change.
 

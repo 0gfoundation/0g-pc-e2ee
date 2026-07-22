@@ -1,9 +1,10 @@
 # 0g-pc-client
 
-Client for **0G Private Computer** — verifiable and (optionally) confidential
-inference on the 0G Compute Network. It lets you verify that a response really
-came from an attested TEE provider, and — on the router path — keep your prompt
-unreadable to everything between you and the provider enclave.
+Client for **0G Private Computer** — end-to-end-encrypted (E2EE) inference on the
+0G Compute Network. E2EE here is the broad sense, both halves of a secure channel
+to an attested provider enclave: **authenticity** — verify that a response really
+came from an attested TEE provider — and **confidentiality** — on the router path,
+keep your prompt unreadable to everything between you and the provider enclave.
 
 > Status: early / design-stage. The design lives in [`docs/design`](../docs/design)
 > (see `router-e2e.md`). Interfaces will change.
@@ -24,6 +25,14 @@ Sealing (end-to-end confidentiality) is **required on the router path** (an L7
 reseller router terminates TLS there by design) and **optional on the direct
 path** (direct TLS terminates inside the provider CVM, and every response is
 signed — see the design doc).
+
+> **Scope, stated explicitly.** This client is the **E2EE layer**. On the router
+> path that means both halves — sealing *and* verification. On the direct path
+> with sealing off, confidentiality is already provided by the CVM-terminated
+> TLS, so the client's distinctive job there is **authenticity** (attestation +
+> response-signature verification). A caller who wants *neither* can talk to the
+> provider directly and skip this client entirely — that is a deliberate product
+> boundary (we do not wrap plain, unverified passthrough), not a missing feature.
 
 ## Layout
 

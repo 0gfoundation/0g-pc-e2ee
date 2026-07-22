@@ -1,8 +1,10 @@
 # 0G Private Computer — Protocol Spec
 
-Normative wire spec for the verifiable-inference protocol. Every implementation
-(Go reference here, future TS/WASM, the broker, the router) MUST agree on it.
-Keywords MUST / SHOULD / MAY per RFC 2119.
+Normative wire spec for the 0G Private Computer end-to-end-encrypted (E2EE)
+inference protocol — **confidentiality** (field-level request/response sealing)
+*and* **authenticity** (attestation binding + response-signature verification).
+Every implementation (Go reference here, future TS/WASM, the broker, the router)
+MUST agree on it. Keywords MUST / SHOULD / MAY per RFC 2119.
 
 > Status: draft. This cut covers the **router path**: provider discovery +
 > attestation binding, **field-level request sealing (E2E confidentiality of the
