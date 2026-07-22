@@ -6,10 +6,18 @@
 // sealed response, and plaintext streams back over that same TLS. See
 // docs/design/cloud-gateway.md for the trust model.
 //
-// This is the pin-only phase (design §10 step 1): the gateway serves the shared
-// openaiproxy handler against a single flag-pinned provider. Attestation (the
-// /quote body and per-response signature, protocol/attest / issue #7) and route
-// support are later steps; /quote is a stub until then.
+// The gateway has two provider-selection modes:
+//
+//   - Pin (default): seal every request to one flag-configured provider
+//     (-provider-enc-key / -provider-signer), like the sidecar. Design §10 step
+//     1.
+//   - Route (-route): per request, ask the 0G router which provider to use
+//     (POST /v1/routing/preview) and fetch that provider's enc key from the
+//     broker (GET /v1/e2ee/pubkey), then seal to it — centralizing routing for
+//     0-code clients (design §12 open question 3). See client/route.
+//
+// Attestation (the /quote body and per-response signature, protocol/attest /
+// issue #7) is a later step; /quote is a stub until then.
 package main
 
 import (
@@ -22,35 +30,54 @@ import (
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
+	"github.com/0gfoundation/0g-pc-e2ee/client/route"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
 func main() {
 	listen := flag.String("listen", ":8443", "address to listen on")
-	providerURL := flag.String("provider-url", core.DefaultProviderURL, "provider (router/broker) OpenAI chat-completions endpoint")
-	encPubB64 := flag.String("provider-enc-key", "", "provider HPKE public key, base64url (attestation stub)")
-	signer := flag.String("provider-signer", "", "provider on-chain signer address (0x...)")
+	providerURL := flag.String("provider-url", core.DefaultProviderURL, "pin mode: provider (router/broker) OpenAI chat-completions endpoint")
+	encPubB64 := flag.String("provider-enc-key", "", "pin mode: provider HPKE public key, base64url (attestation stub)")
+	signer := flag.String("provider-signer", "", "pin mode: provider on-chain signer address (0x...)")
+	routeMode := flag.Bool("route", false, "route mode: pick the provider per request via the router's route-preview API instead of pinning one")
+	previewURL := flag.String("router-preview-url", route.DefaultPreviewURL, "route mode: router route-preview endpoint (POST)")
+	routeType := flag.String("route-type", route.DefaultType, "route mode: inference kind sent to the route-preview API")
 	sealFieldsCSV := flag.String("seal-fields", strings.Join(wire.DefaultSealedFields(), ","), "comma-separated request fields to seal (must include \"messages\")")
 	flag.Parse()
 
-	if *encPubB64 == "" || *signer == "" {
-		log.Fatal("provider-enc-key and provider-signer are required")
-	}
-	encPub, err := base64.RawURLEncoding.DecodeString(*encPubB64)
-	if err != nil {
-		log.Fatalf("bad provider-enc-key: %v", err)
-	}
 	sealFields := parseCSV(*sealFieldsCSV)
 	if err := wire.ValidateSealedFields(sealFields); err != nil {
 		log.Fatalf("invalid -seal-fields: %v", err)
 	}
 
-	client := core.New(core.Provider{
-		URL:        *providerURL,
-		EncPubKey:  crypto.PublicKey(encPub),
-		SignerAddr: *signer,
-	}, core.WithSealFields(sealFields))
+	var client *core.Client
+	var target string
+	if *routeMode {
+		// Route mode chooses the provider per request; no provider is pinned. The
+		// router is told to withhold exactly the sealed fields, so the prompt never
+		// reaches it in cleartext even on the control-plane call.
+		router := route.New(*previewURL,
+			route.WithType(*routeType),
+			route.WithSensitiveFields(sealFields),
+		)
+		client = core.NewWithResolver(router, core.WithSealFields(sealFields))
+		target = "route via " + *previewURL
+	} else {
+		if *encPubB64 == "" || *signer == "" {
+			log.Fatal("pin mode requires -provider-enc-key and -provider-signer (or pass -route)")
+		}
+		encPub, err := base64.RawURLEncoding.DecodeString(*encPubB64)
+		if err != nil {
+			log.Fatalf("bad provider-enc-key: %v", err)
+		}
+		client = core.New(core.Provider{
+			URL:        *providerURL,
+			EncPubKey:  crypto.PublicKey(encPub),
+			SignerAddr: *signer,
+		}, core.WithSealFields(sealFields))
+		target = *providerURL
+	}
 
 	srv := &http.Server{
 		Addr:              *listen,
@@ -60,7 +87,7 @@ func main() {
 	// TLS is terminated by the dstack ZT-HTTPS front end inside the enclave, so
 	// the gateway itself serves plaintext HTTP on the socket dstack forwards to;
 	// the enclave boundary, not this listener, is the TLS edge.
-	log.Printf("gateway listening on %s -> %s", *listen, *providerURL)
+	log.Printf("gateway listening on %s -> %s", *listen, target)
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}

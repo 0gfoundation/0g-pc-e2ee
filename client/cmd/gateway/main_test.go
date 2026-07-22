@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/client/route"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
@@ -108,5 +109,80 @@ func TestGatewayProxiesChatCompletions(t *testing.T) {
 	}
 	if !bytes.Contains(body, []byte("mock answer")) {
 		t.Fatalf("user did not get plaintext choices back: %s", body)
+	}
+}
+
+// In route mode the gateway holds no pinned provider: it previews against a
+// router, fetches the chosen provider's key, seals, and streams plaintext back.
+// This confirms the route resolver is wired into the same shared proxy the
+// pin-only path uses; exhaustive route behavior lives in the route package.
+func TestGatewayRouteMode(t *testing.T) {
+	encPriv, encPub, _ := crypto.GenerateRecipientKey()
+	signer := "0x" + strings.Repeat("a", 40)
+
+	// One server plays the provider broker: e2ee pubkey + sealed chat completions.
+	brokerMux := http.NewServeMux()
+	brokerMux.HandleFunc("GET /v1/e2ee/pubkey", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"v":              wire.Version,
+			"kem_id":         wire.KEMID,
+			"enc_pub":        base64.RawURLEncoding.EncodeToString(encPub),
+			"key_id":         "k",
+			"signer_address": signer,
+		})
+	})
+	brokerMux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var env wire.Request
+		_ = json.Unmarshal(body, &env)
+		if _, leaked := env["messages"]; leaked {
+			t.Error("prompt reached the broker in cleartext")
+		}
+		e2ee, _ := env.E2EE()
+		if _, err := wire.OpenRequest(encPriv, env); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		ephPub, _ := base64.RawURLEncoding.DecodeString(e2ee.ClientEphPub)
+		resp := wire.Response{
+			"id":      json.RawMessage(`"chatcmpl-route"`),
+			"choices": json.RawMessage(`[{"index":0,"message":{"role":"assistant","content":"routed answer"},"finish_reason":"stop"}]`),
+		}
+		sealed, _ := wire.SealResponse(crypto.PublicKey(ephPub), resp, nil)
+		_ = json.NewEncoder(w).Encode(sealed)
+	})
+	broker := httptest.NewServer(brokerMux)
+	defer broker.Close()
+
+	// A second server plays the router's route-preview API, pointing at the broker.
+	router := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"object": "routing.preview",
+			"type":   "chat",
+			"providers": []map[string]string{{
+				"address":  signer,
+				"endpoint": broker.URL,
+				"model_id": "gpt-4o",
+			}},
+		})
+	}))
+	defer router.Close()
+
+	client := core.NewWithResolver(route.New(router.URL))
+	gw := httptest.NewServer(newHandler(client))
+	defer gw.Close()
+
+	userReq := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	resp, err := http.Post(gw.URL+"/v1/chat/completions", "application/json", strings.NewReader(userReq))
+	if err != nil {
+		t.Fatalf("post to gateway: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d: %s", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte("routed answer")) {
+		t.Fatalf("user did not get routed plaintext back: %s", body)
 	}
 }

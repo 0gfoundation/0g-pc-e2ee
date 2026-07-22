@@ -37,17 +37,24 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// Pick the provider to seal to (pin-only returns the fixed one; route mode
+	// consults the router/broker — a network call bounded by ctx).
+	provider, err := c.resolver.Resolve(ctx, req)
+	if err != nil {
+		return resolveErr(err)
+	}
+
 	ephPriv, ephPub, err := crypto.GenerateRecipientKey()
 	if err != nil {
 		return stageErr(StageInternal, fmt.Errorf("generate ephemeral key: %w", err))
 	}
 
-	sealed, err := wire.SealRequest(c.provider.EncPubKey, req, c.sealedFieldsFor(req), c.provider.SignerAddr, ephPub)
+	sealed, err := wire.SealRequest(provider.EncPubKey, req, c.sealedFieldsFor(req), provider.SignerAddr, ephPub)
 	if err != nil {
 		return stageErr(StageRequest, fmt.Errorf("seal request: %w", err))
 	}
 
-	resp, err := c.doRequest(ctx, sealed)
+	resp, err := c.doRequest(ctx, provider.URL, sealed)
 	if err != nil {
 		return &Error{Stage: StageUpstream, Err: fmt.Errorf("post to provider: %w", err)}
 	}

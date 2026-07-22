@@ -38,6 +38,7 @@ signed — see the design doc).
 
 ```
 core/            # client core: quote + response-signature verification, seal, pin, fallback, key cache
+route/           # gateway route mode: pick the provider per request via the router's route-preview + broker pubkey APIs
 openaiproxy/     # shared OpenAI-compatible HTTP handler over core (used by both server forms)
 cmd/
   sidecar/       # local sidecar binary (OpenAI-compatible proxy on localhost) — user-operated, no new trust party

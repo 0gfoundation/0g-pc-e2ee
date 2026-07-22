@@ -27,8 +27,11 @@ func WithForwardedHeaders(ctx context.Context, h http.Header) context.Context {
 	return context.WithValue(ctx, forwardHeadersKey{}, h.Clone())
 }
 
-// forwardedHeadersFrom returns the headers carried by ctx, or nil if none.
-func forwardedHeadersFrom(ctx context.Context) http.Header {
+// ForwardedHeadersFrom returns the headers carried by ctx, or nil if none. It
+// is exported so a Resolver (route mode) can forward the same X-0G-* routing
+// directives on its control-plane call to the router. The context key stays
+// unexported, so only WithForwardedHeaders can set it.
+func ForwardedHeadersFrom(ctx context.Context) http.Header {
 	h, _ := ctx.Value(forwardHeadersKey{}).(http.Header)
 	return h
 }

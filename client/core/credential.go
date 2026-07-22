@@ -26,8 +26,12 @@ func WithCredential(ctx context.Context, cred string) context.Context {
 	return context.WithValue(ctx, credentialKey{}, cred)
 }
 
-// credentialFrom returns the credential carried by ctx, or "" if none was set.
-func credentialFrom(ctx context.Context) string {
+// CredentialFrom returns the credential carried by ctx, or "" if none was set.
+// It is exported so a Resolver (route mode) can forward the same credential on
+// its control-plane call to the router, which authenticates and bills it like
+// the sealed request. The context key stays unexported, so only WithCredential
+// can set it.
+func CredentialFrom(ctx context.Context) string {
 	cred, _ := ctx.Value(credentialKey{}).(string)
 	return cred
 }

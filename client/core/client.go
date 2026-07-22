@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -53,6 +54,18 @@ func (e *Error) Unwrap() error { return e.Err }
 
 func stageErr(stage string, err error) error { return &Error{Stage: stage, Err: err} }
 
+// resolveErr maps a Resolver failure onto an *Error. A resolver that already
+// staged its error (route mode wraps its router/broker failures as *Error) is
+// passed through verbatim; anything else is treated as an upstream failure,
+// since provider selection is an outbound dependency, not a client-side bug.
+func resolveErr(err error) error {
+	var e *Error
+	if errors.As(err, &e) {
+		return err
+	}
+	return &Error{Stage: StageUpstream, Err: fmt.Errorf("resolve provider: %w", err)}
+}
+
 // Provider identifies the enclave the client seals to. In production EncPubKey
 // and SignerAddr are extracted from a verified attestation quote; here they are
 // supplied directly — attestation is a later step.
@@ -66,8 +79,13 @@ type Provider struct {
 // the provider, sends the envelope, and opens the sealed response. It holds no
 // server of its own — the sidecar, the cloud-TEE gateway, and the in-process
 // SDK all wrap this. A Client is safe for concurrent use.
+//
+// The provider it seals to is not fixed on the Client: a Resolver picks it per
+// request. New wraps a single flag-configured provider in a static resolver
+// (the pin-only path); NewWithResolver takes a resolver that chooses per request
+// (the gateway's route mode).
 type Client struct {
-	provider   Provider
+	resolver   Resolver
 	sealFields []string
 	http       *http.Client
 }
@@ -89,19 +107,27 @@ func WithSealFields(fields []string) Option {
 	return func(c *Client) { c.sealFields = slices.Clone(fields) }
 }
 
-// New returns a Client for the given provider. An empty Provider.URL defaults to
-// DefaultProviderURL; the sealed-field set defaults to wire.DefaultSealedFields.
+// New returns a Client that seals every request to the given provider (the
+// pin-only path). An empty Provider.URL defaults to DefaultProviderURL; the
+// sealed-field set defaults to wire.DefaultSealedFields.
 func New(p Provider, opts ...Option) *Client {
 	if p.URL == "" {
 		p.URL = DefaultProviderURL
 	}
+	return NewWithResolver(staticResolver{p}, opts...)
+}
+
+// NewWithResolver returns a Client that picks the provider per request via r
+// (the gateway's route mode: ask the router, then fetch the chosen provider's
+// enc key). The sealed-field set defaults to wire.DefaultSealedFields.
+func NewWithResolver(r Resolver, opts ...Option) *Client {
 	// Clone the default transport (keeps env proxy, dial timeout, keepalives) and
 	// bound the wait for response headers via ResponseHeaderTimeout. No blunt
 	// http.Client.Timeout: it would also cut a long stream (see providerTimeout).
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.ResponseHeaderTimeout = providerTimeout
 	c := &Client{
-		provider:   p,
+		resolver:   r,
 		sealFields: wire.DefaultSealedFields(),
 		http:       &http.Client{Transport: tr},
 	}
@@ -127,6 +153,14 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 	ctx, cancel := context.WithTimeout(ctx, providerTimeout)
 	defer cancel()
 
+	// Pick the provider to seal to. The pin-only path returns the fixed provider;
+	// route mode consults the router and fetches the chosen provider's enc key,
+	// so this may make network calls (bounded by the ctx deadline above).
+	provider, err := c.resolver.Resolve(ctx, req)
+	if err != nil {
+		return nil, resolveErr(err)
+	}
+
 	// Fresh ephemeral keypair per request; the enclave seals the response to the
 	// public half (§7) and we keep the private half to open it.
 	ephPriv, ephPub, err := crypto.GenerateRecipientKey()
@@ -134,14 +168,14 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 		return nil, stageErr(StageInternal, fmt.Errorf("generate ephemeral key: %w", err))
 	}
 
-	sealed, err := wire.SealRequest(c.provider.EncPubKey, req, c.sealedFieldsFor(req), c.provider.SignerAddr, ephPub)
+	sealed, err := wire.SealRequest(provider.EncPubKey, req, c.sealedFieldsFor(req), provider.SignerAddr, ephPub)
 	if err != nil {
 		// Given a valid provider config (validated at startup), a seal failure is
 		// a bad request — e.g. no messages to seal.
 		return nil, stageErr(StageRequest, fmt.Errorf("seal request: %w", err))
 	}
 
-	respBody, status, err := c.post(ctx, sealed)
+	respBody, status, err := c.post(ctx, provider.URL, sealed)
 	if err != nil {
 		// Surface a non-2xx provider status verbatim (status is 0 for a transport
 		// failure, which statusFor maps to 502) so OpenAI clients can key their
@@ -167,8 +201,8 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 // TODO(gateway): the non-2xx error embeds the raw upstream body, which is fine
 // for a local user-operated sidecar (debugging) but must NOT be echoed back to
 // callers once the cloud-TEE gateway shell reuses this core.
-func (c *Client) post(ctx context.Context, env wire.Request) ([]byte, int, error) {
-	resp, err := c.doRequest(ctx, env)
+func (c *Client) post(ctx context.Context, url string, env wire.Request) ([]byte, int, error) {
+	resp, err := c.doRequest(ctx, url, env)
 	if err != nil {
 		return nil, 0, fmt.Errorf("post to provider: %w", err)
 	}
@@ -186,12 +220,12 @@ func (c *Client) post(ctx context.Context, env wire.Request) ([]byte, int, error
 
 // doRequest POSTs the sealed envelope and returns the raw response; the caller
 // owns resp.Body. Shared by the buffered (post) and streaming paths.
-func (c *Client) doRequest(ctx context.Context, env wire.Request) (*http.Response, error) {
+func (c *Client) doRequest(ctx context.Context, url string, env wire.Request) (*http.Response, error) {
 	body, err := json.Marshal(env)
 	if err != nil {
 		return nil, fmt.Errorf("marshal envelope: %w", err)
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.provider.URL, bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -199,7 +233,7 @@ func (c *Client) doRequest(ctx context.Context, env wire.Request) (*http.Respons
 	// Copy the caller's forwarded routing headers (the X-0G-* directives the
 	// router consumes) before the credential, so the credential set below always
 	// wins over anything forwarded.
-	for k, vs := range forwardedHeadersFrom(ctx) {
+	for k, vs := range ForwardedHeadersFrom(ctx) {
 		for _, v := range vs {
 			httpReq.Header.Add(k, v)
 		}
@@ -207,7 +241,7 @@ func (c *Client) doRequest(ctx context.Context, env wire.Request) (*http.Respons
 	// Forward the caller's credential (if any) verbatim as the provider's
 	// Authorization header, so the router/broker can authenticate and bill the
 	// request. Empty when the caller set none — the request then goes out unauthed.
-	if cred := credentialFrom(ctx); cred != "" {
+	if cred := CredentialFrom(ctx); cred != "" {
 		httpReq.Header.Set("Authorization", cred)
 	}
 	return c.http.Do(httpReq)

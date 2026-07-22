@@ -8,12 +8,23 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
+// staticProviderURL reads back the URL of the static provider New wrapped, so
+// the default-URL assertions do not depend on the resolver's internals.
+func staticProviderURL(t *testing.T, c *Client) string {
+	t.Helper()
+	sr, ok := c.resolver.(staticResolver)
+	if !ok {
+		t.Fatalf("New should install a staticResolver, got %T", c.resolver)
+	}
+	return sr.provider.URL
+}
+
 func TestNewDefaultsProviderURL(t *testing.T) {
-	if got := New(Provider{}).provider.URL; got != DefaultProviderURL {
+	if got := staticProviderURL(t, New(Provider{})); got != DefaultProviderURL {
 		t.Fatalf("empty URL: got %q, want default %q", got, DefaultProviderURL)
 	}
 	custom := "https://example.test/v1/chat/completions"
-	if got := New(Provider{URL: custom}).provider.URL; got != custom {
+	if got := staticProviderURL(t, New(Provider{URL: custom})); got != custom {
 		t.Fatalf("explicit URL was overridden: got %q", got)
 	}
 }

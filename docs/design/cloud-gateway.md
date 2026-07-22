@@ -274,8 +274,16 @@ does not.
   replicas. **[verify]**
 - Where to publish `measurement ↔ cert` — reuse the on-chain registry the broker
   uses, or a dedicated transparency log?
-- Does the gateway pin one provider per request (like the sidecar) or offer
-  provider selection to the 0-code client via a request field/header?
+- ~~Does the gateway pin one provider per request (like the sidecar) or offer
+  provider selection to the 0-code client via a request field/header?~~
+  **Resolved (initial):** the gateway supports both, chosen at startup. *Pin
+  mode* seals every request to one configured provider (like the sidecar);
+  *route mode* (`-route`, `client/route`) picks a provider per request by asking
+  the router's route-preview API (`POST /v1/routing/preview`) and fetching the
+  chosen provider's enc key from the broker (`GET /v1/e2ee/pubkey`) — the sealed
+  fields are withheld from the preview call, so the prompt stays confidential.
+  Client-side fallback over the remaining candidates, and verifying the enc key
+  out of an attestation quote, remain later steps.
 - Streaming through the in-enclave TLS + L4 LB — confirm no buffering is
   introduced on the dstack path (the sidecar already sets `X-Accel-Buffering:
   no`; the router's nginx sets `proxy_buffering off`).

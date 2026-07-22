@@ -1,0 +1,431 @@
+// Package route resolves, per request, which provider enclave the gateway
+// should seal to — the "route" trust shape from docs/design/cloud-gateway.md
+// (§ open question 3): the gateway centralizes provider selection for a 0-code
+// client instead of pinning one provider up front.
+//
+// A Router implements core.Resolver in two hops:
+//
+//  1. Control plane — POST the routing-relevant fields to the 0G router's
+//     route-preview API (POST /v1/routing/preview). The router ranks its live
+//     fleet and returns an ordered provider list; the Router takes the top one.
+//     The sealed fields (the prompt) are stripped before this call, so the
+//     router still never sees plaintext.
+//  2. Provider identity — GET the chosen provider's HPKE recipient key from the
+//     broker's e2ee pubkey API (…/v1/e2ee/pubkey), yielding the enc key and
+//     signer address the client then seals/pins to (SPEC §4).
+//
+// This is the route analogue of the pin-only flow: it produces the same
+// core.Provider (URL + enc key + signer), just chosen dynamically. As with the
+// pin-only stub, the enc key is trusted as delivered here; verifying it out of
+// an attestation quote (protocol/attest, issue #7) is a later step.
+package route
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
+)
+
+// b64 is base64url without padding — the enc_pub encoding on the wire (SPEC §3),
+// matching how the broker publishes it.
+var b64 = base64.RawURLEncoding
+
+const (
+	// DefaultPreviewURL is the 0G router's route-preview endpoint, sibling of
+	// core.DefaultProviderURL.
+	DefaultPreviewURL = "https://router-api.0g.ai/v1/routing/preview"
+	// DefaultType is the inference kind sent to the preview API for a chat
+	// completion.
+	DefaultType = "chat"
+	// defaultPubkeyTTL bounds how long a fetched provider enc key is reused
+	// before re-fetching, amortizing the extra round trip the route path adds
+	// (docs/design/router-e2e.md "extra round trip"). Providers rotate keys
+	// rarely, so a few minutes is safe; a bad guess only costs a re-seal.
+	defaultPubkeyTTL = 5 * time.Minute
+	// x25519PubLen is the byte length of the HPKE (X25519) recipient key.
+	x25519PubLen = 32
+	// maxControlBodyBytes caps a control-plane response body read (preview /
+	// pubkey), guarding against an unbounded response.
+	maxControlBodyBytes = 1 << 20 // 1 MiB
+)
+
+// Router resolves the provider for each request via the route-preview + pubkey
+// APIs. It is safe for concurrent use.
+type Router struct {
+	previewURL      string
+	reqType         string
+	sensitiveFields map[string]struct{}
+	http            *http.Client
+	cache           *pubkeyCache
+}
+
+// Option customizes a Router.
+type Option func(*Router)
+
+// WithType sets the inference kind sent as the preview request's "type"
+// (default DefaultType, "chat").
+func WithType(t string) Option {
+	return func(r *Router) {
+		if t != "" {
+			r.reqType = t
+		}
+	}
+}
+
+// WithHTTPClient overrides the HTTP client used for the control-plane calls.
+// The default bounds the response-header wait; callers rarely need this.
+func WithHTTPClient(h *http.Client) Option {
+	return func(r *Router) {
+		if h != nil {
+			r.http = h
+		}
+	}
+}
+
+// WithSensitiveFields sets the request fields stripped before the preview call,
+// so they never reach the (untrusted) router in cleartext. Default is
+// wire.DefaultSealedFields; keep it in sync with the client's seal set so
+// exactly the sealed fields are withheld from routing.
+func WithSensitiveFields(fields []string) Option {
+	return func(r *Router) {
+		set := make(map[string]struct{}, len(fields))
+		for _, f := range fields {
+			set[f] = struct{}{}
+		}
+		r.sensitiveFields = set
+	}
+}
+
+// WithPubkeyTTL sets how long a fetched provider enc key is cached and reused.
+// A non-positive TTL disables caching (fetch every request).
+func WithPubkeyTTL(d time.Duration) Option {
+	return func(r *Router) { r.cache = newPubkeyCache(d) }
+}
+
+// New returns a Router that previews against previewURL (empty uses
+// DefaultPreviewURL).
+func New(previewURL string, opts ...Option) *Router {
+	if previewURL == "" {
+		previewURL = DefaultPreviewURL
+	}
+	// A dedicated transport with a bounded header wait, mirroring core.New; the
+	// control-plane calls are short, so no long-stream concern applies.
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.ResponseHeaderTimeout = 30 * time.Second
+	r := &Router{
+		previewURL:      previewURL,
+		reqType:         DefaultType,
+		sensitiveFields: sliceToSet(wire.DefaultSealedFields()),
+		http:            &http.Client{Transport: tr},
+		cache:           newPubkeyCache(defaultPubkeyTTL),
+	}
+	for _, o := range opts {
+		o(r)
+	}
+	return r
+}
+
+// Resolve implements core.Resolver: preview → pubkey → core.Provider.
+func (r *Router) Resolve(ctx context.Context, req wire.Request) (core.Provider, error) {
+	prov, err := r.preview(ctx, req)
+	if err != nil {
+		return core.Provider{}, err
+	}
+	completionsURL, pubkeyURL, err := deriveURLs(prov.Endpoint)
+	if err != nil {
+		return core.Provider{}, upstream(0, fmt.Errorf("provider endpoint: %w", err))
+	}
+
+	encPub, signer, err := r.pubkey(ctx, pubkeyURL)
+	if err != nil {
+		return core.Provider{}, err
+	}
+	// The router's claimed address (control plane) must agree with the broker's
+	// own signer (provider identity). A mismatch means one of them is lying about
+	// which provider this is — fail rather than pin to an inconsistent identity.
+	if prov.Address != "" && !strings.EqualFold(prov.Address, signer) {
+		return core.Provider{}, upstream(0, fmt.Errorf("provider address %s does not match broker signer %s", prov.Address, signer))
+	}
+	return core.Provider{URL: completionsURL, EncPubKey: encPub, SignerAddr: signer}, nil
+}
+
+// previewProvider is one candidate in the route-preview reply.
+type previewProvider struct {
+	Address     string `json:"address"`
+	CanonicalID string `json:"canonical_id"`
+	Endpoint    string `json:"endpoint"`
+	ModelID     string `json:"model_id"`
+}
+
+// previewResponse is the route-preview reply.
+type previewResponse struct {
+	Object    string            `json:"object"`
+	Type      string            `json:"type"`
+	Providers []previewProvider `json:"providers"`
+}
+
+// preview asks the router to rank providers for req and returns the top one. It
+// sends the routing-relevant fields (the request minus the sealed fields) plus
+// the model and type, forwarding the caller's credential and X-0G-* directives
+// so the router authenticates/bills and steers exactly as it would for the
+// sealed request.
+func (r *Router) preview(ctx context.Context, req wire.Request) (previewProvider, error) {
+	model, err := modelOf(req)
+	if err != nil {
+		return previewProvider{}, err
+	}
+
+	payload := make(map[string]json.RawMessage, len(req)+1)
+	for k, v := range req {
+		if _, sensitive := r.sensitiveFields[k]; sensitive {
+			continue
+		}
+		payload[k] = v
+	}
+	// Force the inference kind the gateway is configured for; a chat body carries
+	// no "type" of its own, and the router needs it to route.
+	typeJSON, _ := json.Marshal(r.reqType)
+	payload["type"] = typeJSON
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return previewProvider{}, upstream(0, fmt.Errorf("marshal preview request: %w", err))
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, r.previewURL, bytes.NewReader(body))
+	if err != nil {
+		return previewProvider{}, upstream(0, err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	// Forward routing directives first, then the credential, so the credential
+	// always wins over anything forwarded (mirrors core.doRequest).
+	for k, vs := range core.ForwardedHeadersFrom(ctx) {
+		for _, v := range vs {
+			httpReq.Header.Add(k, v)
+		}
+	}
+	if cred := core.CredentialFrom(ctx); cred != "" {
+		httpReq.Header.Set("Authorization", cred)
+	}
+
+	resp, err := r.http.Do(httpReq)
+	if err != nil {
+		return previewProvider{}, upstream(0, fmt.Errorf("route preview request: %w", err))
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxControlBodyBytes))
+	if err != nil {
+		return previewProvider{}, upstream(0, fmt.Errorf("read route preview response: %w", err))
+	}
+	if resp.StatusCode != http.StatusOK {
+		// Surface the router's status verbatim (401/404/503 are meaningful to the
+		// caller) but not its raw body — this error becomes the gateway's response.
+		return previewProvider{}, upstream(resp.StatusCode, fmt.Errorf("route preview returned %d", resp.StatusCode))
+	}
+
+	var pr previewResponse
+	if err := json.Unmarshal(raw, &pr); err != nil {
+		return previewProvider{}, upstream(0, fmt.Errorf("decode route preview response: %w", err))
+	}
+	if len(pr.Providers) == 0 {
+		return previewProvider{}, upstream(http.StatusServiceUnavailable, fmt.Errorf("no provider available for model %q", model))
+	}
+	// The router returns candidates ranked best-first; take the top one. (A
+	// client-side fallback loop over the rest is a later step — SPEC §4.4.)
+	top := pr.Providers[0]
+	if top.Endpoint == "" {
+		return previewProvider{}, upstream(0, fmt.Errorf("route preview returned a provider with no endpoint"))
+	}
+	return top, nil
+}
+
+// pubkeyResponse is the broker's /v1/e2ee/pubkey reply.
+type pubkeyResponse struct {
+	V             int    `json:"v"`
+	KEMID         string `json:"kem_id"`
+	EncPub        string `json:"enc_pub"`
+	KeyID         string `json:"key_id"`
+	SignerAddress string `json:"signer_address"`
+}
+
+// pubkey returns the provider's HPKE recipient key and signer address, from the
+// cache when fresh or fetched from the broker's e2ee pubkey API.
+func (r *Router) pubkey(ctx context.Context, pubkeyURL string) (crypto.PublicKey, string, error) {
+	if encPub, signer, ok := r.cache.get(pubkeyURL); ok {
+		return encPub, signer, nil
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, pubkeyURL, nil)
+	if err != nil {
+		return nil, "", upstream(0, err)
+	}
+	resp, err := r.http.Do(httpReq)
+	if err != nil {
+		return nil, "", upstream(0, fmt.Errorf("fetch provider pubkey: %w", err))
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxControlBodyBytes))
+	if err != nil {
+		return nil, "", upstream(0, fmt.Errorf("read provider pubkey: %w", err))
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, "", upstream(resp.StatusCode, fmt.Errorf("provider pubkey returned %d", resp.StatusCode))
+	}
+
+	var pk pubkeyResponse
+	if err := json.Unmarshal(raw, &pk); err != nil {
+		return nil, "", upstream(0, fmt.Errorf("decode provider pubkey: %w", err))
+	}
+	encPub, signer, err := validatePubkey(pk)
+	if err != nil {
+		return nil, "", upstream(0, err)
+	}
+	r.cache.put(pubkeyURL, encPub, signer)
+	return encPub, signer, nil
+}
+
+// validatePubkey checks the broker's reply is one this client can seal to and
+// returns the decoded enc key and signer address.
+func validatePubkey(pk pubkeyResponse) (crypto.PublicKey, string, error) {
+	// A mismatched version/KEM means the provider expects a different suite than
+	// wire seals with, so a sealed request could never be opened — reject early.
+	if pk.V != 0 && pk.V != wire.Version {
+		return nil, "", fmt.Errorf("provider pubkey version %d unsupported (want %d)", pk.V, wire.Version)
+	}
+	if pk.KEMID != "" && pk.KEMID != wire.KEMID {
+		return nil, "", fmt.Errorf("provider kem_id %q unsupported (want %q)", pk.KEMID, wire.KEMID)
+	}
+	encPub, err := b64.DecodeString(pk.EncPub)
+	if err != nil {
+		return nil, "", fmt.Errorf("bad enc_pub: %w", err)
+	}
+	if len(encPub) != x25519PubLen {
+		return nil, "", fmt.Errorf("enc_pub must be %d bytes (X25519), got %d", x25519PubLen, len(encPub))
+	}
+	if !isAddress(pk.SignerAddress) {
+		return nil, "", fmt.Errorf("bad signer_address %q (want 0x followed by 40 hex)", pk.SignerAddress)
+	}
+	return crypto.PublicKey(encPub), pk.SignerAddress, nil
+}
+
+// deriveURLs turns a provider endpoint into the chat-completions URL to POST the
+// sealed request to and the broker's e2ee pubkey URL. The endpoint may be a bare
+// origin (https://host[:port]), the /v1 base, or already the full
+// chat-completions URL (…/v1/chat/completions); both paths are resolved against
+// the same /v1 base so all three forms work.
+func deriveURLs(endpoint string) (completions, pubkey string, err error) {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return "", "", fmt.Errorf("%q is not a valid URL: %w", endpoint, err)
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return "", "", fmt.Errorf("%q is not an absolute URL", endpoint)
+	}
+	base := strings.TrimSuffix(u.Path, "/")
+	switch {
+	case strings.HasSuffix(base, "/chat/completions"):
+		base = strings.TrimSuffix(base, "/chat/completions")
+	case strings.HasSuffix(base, "/v1"):
+		// already the /v1 base — leave as-is
+	default:
+		base += "/v1"
+	}
+	origin := u.Scheme + "://" + u.Host
+	return origin + base + "/chat/completions", origin + base + "/e2ee/pubkey", nil
+}
+
+// modelOf extracts the required, non-empty "model" from req.
+func modelOf(req wire.Request) (string, error) {
+	raw, ok := req["model"]
+	if !ok {
+		return "", &core.Error{Stage: core.StageRequest, Err: fmt.Errorf(`request has no "model" to route on`)}
+	}
+	var model string
+	if err := json.Unmarshal(raw, &model); err != nil || model == "" {
+		return "", &core.Error{Stage: core.StageRequest, Err: fmt.Errorf(`"model" must be a non-empty string`)}
+	}
+	return model, nil
+}
+
+// upstream wraps err as a StageUpstream *core.Error, carrying status so the
+// proxy can surface a meaningful router/broker status (401/404/503) verbatim; a
+// status of 0 lets the proxy default it (502).
+func upstream(status int, err error) error {
+	return &core.Error{Stage: core.StageUpstream, Status: status, Err: err}
+}
+
+// isAddress reports whether s is a 0x-prefixed 20-byte hex address (the on-chain
+// signer format, SPEC §4.2). Case-insensitive on the hex body; no EIP-55 check.
+func isAddress(s string) bool {
+	if len(s) != 42 || s[0] != '0' || s[1] != 'x' {
+		return false
+	}
+	for i := 2; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f', c >= 'A' && c <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func sliceToSet(ss []string) map[string]struct{} {
+	m := make(map[string]struct{}, len(ss))
+	for _, s := range ss {
+		m[s] = struct{}{}
+	}
+	return m
+}
+
+// pubkeyCache is a small TTL cache of resolved provider keys, keyed by the
+// broker's pubkey URL. Safe for concurrent use.
+type pubkeyCache struct {
+	ttl time.Duration
+	mu  sync.Mutex
+	m   map[string]pubkeyEntry
+}
+
+type pubkeyEntry struct {
+	encPub crypto.PublicKey
+	signer string
+	exp    time.Time
+}
+
+func newPubkeyCache(ttl time.Duration) *pubkeyCache {
+	return &pubkeyCache{ttl: ttl, m: make(map[string]pubkeyEntry)}
+}
+
+func (c *pubkeyCache) get(key string) (crypto.PublicKey, string, bool) {
+	if c.ttl <= 0 {
+		return nil, "", false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.m[key]
+	if !ok || time.Now().After(e.exp) {
+		return nil, "", false
+	}
+	return e.encPub, e.signer, true
+}
+
+func (c *pubkeyCache) put(key string, encPub crypto.PublicKey, signer string) {
+	if c.ttl <= 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.m[key] = pubkeyEntry{encPub: encPub, signer: signer, exp: time.Now().Add(c.ttl)}
+}
