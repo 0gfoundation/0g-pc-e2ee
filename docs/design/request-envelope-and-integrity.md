@@ -227,6 +227,18 @@ or cap `max_tokens` undetectably. A field the router genuinely *rewrites* today
 listed in `unbound_fields` (low-stakes, untrusted) or — cleaner — set by the
 client up front so no rewrite is needed.
 
+**Explicit declaration vs default policy — keep them separate.** "Marking the
+partition" never goes away: the seal/cleartext split must be declared
+*explicitly and bound* on the wire so the enclave can verify it and no
+intermediary can shift a field across the line. What D6 changes is only *which*
+list is authoritative. Make `visible_fields` the single bound allowlist: the
+sealed set is then "everything present that is not visible (nor `_e2ee`)", so an
+unknown field is sealed (fail-closed). `sealed_fields` is derivable from it
+(= present − visible − unbound) and need not be sent separately — the enclave
+verifies the partition against the bound `visible_fields`. So yes, mark the
+boundary explicitly; just enumerate the *visible* set, because that is the
+enumeration that fails safe.
+
 Secure-default summary — two mirror-image declarations:
 
 | Dimension | Declares | Default | A new/unknown field is |
@@ -279,3 +291,42 @@ Beyond the field model above, these deserve a decision (some already tracked):
 - **Metadata / length leakage.** Cleartext `model`/flags and the **ciphertext
   length** (≈ prompt length) leak to the router/TLS terminator. Padding helps only
   if the router is not the decryptor. Already noted in `router-e2e.md`.
+
+---
+
+## 7. Router-rewrite disposition (D0 follow-up)
+
+The router today rewrites the request and response in many places. Under D0 the
+router may not touch prompt/completion content, and under D2–D6 it may not mutate
+bound fields. Each rewrite therefore needs a new home. This is the executable
+checklist for the D0 follow-up (router repo, not this module).
+
+**Request side (before the provider):**
+
+| Rewrite today | Disposition | Why |
+|---|---|---|
+| Strip `route_options` (address / sort / allow_fallbacks / require_parameters / trust_mode) | Move to `X-0G-*` headers, or client strips pre-seal | Router inputs, never provider body — keep out of the sealed JSON entirely |
+| Strip `plugins` + inject web-search results | Move off router → client or a dedicated attested TEE | Content transform on `messages` — forbidden by D0 |
+| Strip `attachments` + inject file text | Move off router → client or a dedicated attested TEE | Content transform on `messages` — forbidden by D0 |
+| Strip `verify_tee` | Header / client-side directive | Router directive, not a provider input |
+| Rewrite `model` (alias → provider ModelID) | Resolve at an endpoint (D2): client pre-seal, or enclave post-`Open` | `model` stays bound; no router mutation |
+| Force `stream_options.include_usage=true` | Client sets it up front (preferred), else list in `unbound_fields` | Avoid a router mutation of a bound field |
+| Replace auth header | Header layer — unchanged | Not in body AAD |
+
+**Response side (before the client):**
+
+| Rewrite today | Disposition | Why |
+|---|---|---|
+| Rewrite `model` back to the requested name | Enclave emits the requested name, or client maps it | Response content is not router-rewritten under D0 |
+| Inject `x_0g_trace` (billing) | Enclave folds it in before sealing → rides the signed response; otherwise `unbound_fields` + treated as untrusted | Trust via signature, not AAD (D4) |
+| Inject `url_citation` annotations | Enclave (inside the boundary) | Content transform |
+| `reasoning` → `reasoning_content` mirror | Enclave or client normalization | Content transform |
+| Buffer final `usage` chunk to fold in trace | Revisit with response framing / per-frame sealing | Interacts with streaming frame layout |
+| Header rewrites (Content-Type, X-Request-ID, X-Provider, …) | Header layer — unchanged | Not in body AAD |
+
+Pattern: **headers** (routing directives, auth, trace transport) stay at the HTTP
+layer, freely mutable; **content** transforms (search, files, annotations,
+reasoning) move inside the trust boundary; **bound params** (`model`) are resolved
+at an endpoint, never mutated in transit; genuinely intermediary-owned metadata
+(`x_0g_trace`) is either signed by the enclave or declared `unbound` and treated
+as untrusted.
