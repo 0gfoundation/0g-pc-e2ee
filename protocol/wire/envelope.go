@@ -179,9 +179,13 @@ func SealRequest(encPub crypto.PublicKey, req Request, sealedFields []string, pr
 		}
 		sealedObj[f] = v
 	}
-	pt, err := canonicalJSON(sealedObj)
+	// The sealed body needs no canonical form: the AEAD protects its exact
+	// bytes, and the response signature binds the ciphertext, not a re-derived
+	// canonical plaintext (D1 / SPEC §8). Plain Marshal avoids the JCS pass that
+	// profiling showed dominates SealRequest at large payloads.
+	pt, err := json.Marshal(sealedObj)
 	if err != nil {
-		return nil, fmt.Errorf("canonicalize sealed object: %w", err)
+		return nil, fmt.Errorf("marshal sealed object: %w", err)
 	}
 
 	// 2. HPKE setup — enc is needed before the AAD (it lives inside `_e2ee`).

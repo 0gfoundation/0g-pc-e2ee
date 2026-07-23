@@ -101,9 +101,11 @@ func (rs *ResponseSealer) SealFrame(frame Response, sealedFields []string, final
 		}
 		sealedObj[f] = v
 	}
-	pt, err := canonicalJSON(sealedObj)
+	// Sealed body needs no canonical form (D1 / SPEC §8): AEAD protects its
+	// exact bytes and the signature binds the ciphertext, not the plaintext.
+	pt, err := json.Marshal(sealedObj)
 	if err != nil {
-		return nil, fmt.Errorf("canonicalize sealed object: %w", err)
+		return nil, fmt.Errorf("marshal sealed object: %w", err)
 	}
 
 	out := make(Response, len(frame)+1)
