@@ -60,17 +60,17 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		// Like post: the error embeds the raw upstream body (see the TODO(gateway)
-		// on post) — fine for the local sidecar, but the gateway shell must not
-		// echo it back.
+		// The body is untrusted upstream content: carry it as Error.Body for local
+		// debugging (the sidecar can surface it) but keep it out of the message, so
+		// a multi-tenant gateway never echoes it back (see Error.Body).
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxSSELine))
-		return &Error{Stage: StageUpstream, Status: resp.StatusCode, Err: fmt.Errorf("provider returned %d: %s", resp.StatusCode, body)}
+		return &Error{Stage: StageUpstream, Status: resp.StatusCode, Err: fmt.Errorf("provider returned %d", resp.StatusCode), Body: string(body)}
 	}
 	// A 200 that is not an event stream (a provider that ignored stream:true)
 	// would be read as zero frames and silently yield an empty stream; fail loud.
 	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxSSELine))
-		return stageErr(StageUpstream, fmt.Errorf("provider did not stream (content-type %q): %s", ct, body))
+		return &Error{Stage: StageUpstream, Err: fmt.Errorf("provider did not stream (content-type %q)", ct), Body: string(body)}
 	}
 
 	// Abort if the provider stalls between frames.

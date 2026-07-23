@@ -24,20 +24,56 @@ import (
 // maxRequestBytes caps the request body the proxy will read.
 const maxRequestBytes = 10 << 20 // 10 MiB
 
+// Option customizes the proxy's behavior.
+type Option func(*options)
+
+type options struct {
+	verboseUpstreamErrors bool
+}
+
+// WithVerboseUpstreamErrors makes the proxy append the raw upstream response
+// body (core.Error.Body) to the error it returns on an upstream failure. This
+// aids debugging and is appropriate for the single-user, localhost sidecar. The
+// multi-tenant gateway must NOT use it: the upstream body is untrusted content
+// and could expose another tenant's or the provider's internal detail. Off by
+// default, so the safe behavior is the one you get without thinking about it.
+func WithVerboseUpstreamErrors() Option {
+	return func(o *options) { o.verboseUpstreamErrors = true }
+}
+
+// message renders the client-facing error text: just err.Error() (which never
+// contains the upstream body) unless verbose errors are enabled, in which case
+// the carried upstream body is appended.
+func (o options) message(err error) string {
+	msg := err.Error()
+	if !o.verboseUpstreamErrors {
+		return msg
+	}
+	var e *core.Error
+	if errors.As(err, &e) && e.Body != "" {
+		return msg + ": " + e.Body
+	}
+	return msg
+}
+
 // Handler returns the OpenAI-compatible proxy over the client core, mounted at
 // POST /v1/chat/completions. It is the whole request-handling surface both
 // server forms share; callers add their own routes (health, attestation quote)
 // on top of the returned mux.
-func Handler(c *core.Client) http.Handler {
+func Handler(c *core.Client, opts ...Option) http.Handler {
 	mux := http.NewServeMux()
-	Register(mux, c)
+	Register(mux, c, opts...)
 	return mux
 }
 
 // Register mounts the proxy's routes on an existing mux, so a caller can serve
 // the OpenAI endpoint alongside its own (e.g. the gateway's /healthz and
 // /quote) on one server.
-func Register(mux *http.ServeMux, c *core.Client) {
+func Register(mux *http.ServeMux, c *core.Client, opts ...Option) {
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
 	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBytes))
 		if err != nil {
@@ -66,12 +102,12 @@ func Register(mux *http.ServeMux, c *core.Client) {
 		ctx := core.WithCredential(r.Context(), r.Header.Get("Authorization"))
 		ctx = core.WithForwardedHeaders(ctx, routingHeaders(r.Header))
 		if stream {
-			serveStream(ctx, w, c, req)
+			serveStream(ctx, w, c, req, o)
 			return
 		}
 		resp, err := c.Complete(ctx, req)
 		if err != nil {
-			writeError(w, statusFor(err), err.Error())
+			writeError(w, statusFor(err), o.message(err))
 			return
 		}
 		out, err := json.Marshal(resp)
@@ -147,7 +183,7 @@ func statusFor(err error) int {
 // each sealed frame from the core and re-emits it as `data: <json>` to the user,
 // terminating with `data: [DONE]`. Status is only settable before the first
 // frame; once bytes are on the wire an error can only end the stream.
-func serveStream(ctx context.Context, w http.ResponseWriter, c *core.Client, req wire.Request) {
+func serveStream(ctx context.Context, w http.ResponseWriter, c *core.Client, req wire.Request, o options) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeError(w, http.StatusInternalServerError, "streaming not supported by server")
@@ -181,12 +217,12 @@ func serveStream(ctx context.Context, w http.ResponseWriter, c *core.Client, req
 	if err != nil {
 		if !wroteHeader {
 			// Nothing sent yet — a normal error response with a real status.
-			writeError(w, statusFor(err), err.Error())
+			writeError(w, statusFor(err), o.message(err))
 			return
 		}
 		// Mid-stream: surface as a final SSE error event, then stop. Build the
 		// payload with json.Marshal — %q is not JSON-safe for arbitrary bytes.
-		errEvent, _ := json.Marshal(map[string]any{"error": map[string]string{"message": err.Error()}})
+		errEvent, _ := json.Marshal(map[string]any{"error": map[string]string{"message": o.message(err)}})
 		fmt.Fprintf(w, "data: %s\n\n", errEvent)
 		flusher.Flush()
 		return

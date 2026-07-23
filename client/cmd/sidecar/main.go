@@ -47,8 +47,11 @@ func main() {
 		SignerAddr: *signer,
 	}, core.WithSealFields(sealFields))
 	srv := &http.Server{
-		Addr:              *listen,
-		Handler:           openaiproxy.Handler(client),
+		Addr: *listen,
+		// The sidecar is single-user and local, so surfacing the raw upstream body
+		// in errors aids debugging; the gateway deliberately does not (see the
+		// option's doc). Localhost-only, so the body never leaves the user's machine.
+		Handler:           openaiproxy.Handler(client, openaiproxy.WithVerboseUpstreamErrors()),
 		ReadHeaderTimeout: 10 * time.Second, // mitigate slow-header (Slowloris) clients
 	}
 	log.Printf("sidecar listening on %s -> %s", *listen, *providerURL)

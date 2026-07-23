@@ -47,6 +47,12 @@ type Error struct {
 	Stage  string
 	Status int // upstream HTTP status to surface verbatim; 0 = derive from Stage
 	Err    error
+	// Body is the raw upstream response body for a non-2xx provider reply, if
+	// any. It aids local debugging, but it is untrusted upstream content, so it
+	// is deliberately NOT part of Error(): a multi-tenant server (the gateway)
+	// must not echo it to end users, while a single-user sidecar can opt in to
+	// surfacing it (openaiproxy.WithVerboseUpstreamErrors).
+	Body string
 }
 
 func (e *Error) Error() string { return e.Err.Error() }
@@ -179,8 +185,13 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 	if err != nil {
 		// Surface a non-2xx provider status verbatim (status is 0 for a transport
 		// failure, which statusFor maps to 502) so OpenAI clients can key their
-		// retry/backoff on it — 429/5xx retry, 4xx fail fast.
-		return nil, &Error{Stage: StageUpstream, Status: status, Err: err}
+		// retry/backoff on it — 429/5xx retry, 4xx fail fast. For a non-2xx,
+		// respBody is the upstream body; carry it as Body (not in the message).
+		e := &Error{Stage: StageUpstream, Status: status, Err: err}
+		if status != 0 {
+			e.Body = string(respBody)
+		}
+		return nil, e
 	}
 
 	var sealedResp wire.Response
@@ -198,9 +209,9 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 // upstream HTTP status (0 for a transport/read failure, which the caller maps to
 // 502). The caller surfaces a non-2xx status verbatim.
 //
-// TODO(gateway): the non-2xx error embeds the raw upstream body, which is fine
-// for a local user-operated sidecar (debugging) but must NOT be echoed back to
-// callers once the cloud-TEE gateway shell reuses this core.
+// On a non-2xx it returns the raw body alongside the status so the caller can
+// attach it as Error.Body — kept out of the error message so a multi-tenant
+// server never echoes untrusted upstream content (see Error.Body).
 func (c *Client) post(ctx context.Context, url string, env wire.Request) ([]byte, int, error) {
 	resp, err := c.doRequest(ctx, url, env)
 	if err != nil {
@@ -213,7 +224,7 @@ func (c *Client) post(ctx context.Context, url string, env wire.Request) ([]byte
 		return nil, 0, fmt.Errorf("read provider response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, resp.StatusCode, fmt.Errorf("provider returned %d: %s", resp.StatusCode, respBody)
+		return respBody, resp.StatusCode, fmt.Errorf("provider returned %d", resp.StatusCode)
 	}
 	return respBody, resp.StatusCode, nil
 }

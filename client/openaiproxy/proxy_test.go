@@ -187,6 +187,48 @@ func TestProxyPassesUpstreamStatus(t *testing.T) {
 	}
 }
 
+// The raw upstream body is untrusted content. By default (the gateway's mode)
+// the proxy must NOT echo it back; with WithVerboseUpstreamErrors (the sidecar's
+// mode) it may, for local debugging. The status passes through in both cases.
+func TestProxyDoesNotLeakUpstreamBody(t *testing.T) {
+	_, encPub, _ := crypto.GenerateRecipientKey()
+	signer := "0x" + strings.Repeat("a", 40)
+	const secret = "internal-upstream-secret-detail"
+
+	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, secret, http.StatusBadGateway)
+	}))
+	defer broker.Close()
+	client := core.New(core.Provider{URL: broker.URL, EncPubKey: encPub, SignerAddr: signer})
+
+	userReq := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	post := func(h http.Handler) (int, string) {
+		srv := httptest.NewServer(h)
+		defer srv.Close()
+		resp, err := http.Post(srv.URL+"/v1/chat/completions", "application/json", strings.NewReader(userReq))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(b)
+	}
+
+	// Default: body must be hidden.
+	if status, body := post(openaiproxy.Handler(client)); status != http.StatusBadGateway {
+		t.Errorf("default: got status %d, want 502", status)
+	} else if strings.Contains(body, secret) {
+		t.Errorf("default: upstream body leaked to client: %s", body)
+	}
+
+	// Verbose: body may be surfaced (sidecar debugging).
+	if status, body := post(openaiproxy.Handler(client, openaiproxy.WithVerboseUpstreamErrors())); status != http.StatusBadGateway {
+		t.Errorf("verbose: got status %d, want 502", status)
+	} else if !strings.Contains(body, secret) {
+		t.Errorf("verbose: upstream body not surfaced: %s", body)
+	}
+}
+
 // mockStreamingBroker opens the sealed request and streams sealed response
 // frames back as SSE, symmetric with the real broker's streaming path.
 func mockStreamingBroker(t *testing.T, encPriv crypto.PrivateKey, signer string, deltas []string) *httptest.Server {
