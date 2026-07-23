@@ -16,15 +16,19 @@ runs determines the trust boundary — not just the deployment target.**
 | New trust party | none | one (must be attested) |
 | Plaintext lands on | the user's own machine | 0G's TEE (in-enclave) |
 | Attestation of the client component | not needed (user owns it) | required (else it degrades to today's plaintext L7 router) |
+| How plaintext arrives | over localhost (app → sidecar) | over TLS terminated inside the enclave (browser → gateway) |
 | Provider selection | via the 0G router (route-preview), per request | via the 0G router (route-preview), per request |
-| Plaintext handling | seals its own request | decrypts the client's plaintext, then re-seals to the provider |
 | Best for | clients that can run software; max privacy | clients that cannot (browser / thin / no-install) |
 
 > Both server forms are **route-oriented**: they call the router's route-preview
 > to select the provider and fetch its enc key per request (this doc originally
 > envisioned the sidecar routing purely locally; it now uses the same router
-> control plane as the gateway). The difference is *where the plaintext lands*
-> and whether the component must be attested — not who drives routing.
+> control plane as the gateway). And both simply *receive* plaintext and seal it
+> to the provider — the sidecar over localhost, the gateway over in-enclave TLS.
+> The 0-code gateway does **not** unwrap a client-sealed request (a plain browser
+> can't seal); that app-layer "double seal → unwrap → re-seal" is the tier-3 path
+> only (see cloud-gateway.md §5.1). The real difference is *where the plaintext
+> lands* and whether the component must be attested — not who drives routing.
 
 **A cloud gateway does not remove client-side crypto.** The user→gateway hop
 still needs securing (RA-TLS or app-layer seal to the gateway), so the client
