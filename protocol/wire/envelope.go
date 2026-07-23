@@ -86,6 +86,38 @@ func ValidateSealedFields(fields []string) error {
 	return nil
 }
 
+// ValidateUnboundFields enforces the invariants on the unbound (AAD-excluded)
+// set (SPEC §5.2): no empty names, no duplicates, the reserved `_e2ee` key is
+// disallowed, and no overlap with the sealed set — a field cannot be both
+// encrypted and intermediary-mutable.
+//
+// Unlike sealed fields, an unbound field need NOT be present in the message: it
+// may name a slot an intermediary will only fill in later (e.g. a router-injected
+// trace object). An empty set is valid and means "bind everything".
+func ValidateUnboundFields(unbound, sealed []string) error {
+	if len(unbound) == 0 {
+		return nil
+	}
+	sealedSet := toSet(sealed)
+	seen := make(map[string]struct{}, len(unbound))
+	for _, f := range unbound {
+		if f == "" {
+			return fmt.Errorf("empty unbound field name")
+		}
+		if f == e2eeKey {
+			return fmt.Errorf("%q is reserved and cannot be an unbound field", e2eeKey)
+		}
+		if _, dup := seen[f]; dup {
+			return fmt.Errorf("duplicate unbound field %q", f)
+		}
+		seen[f] = struct{}{}
+		if _, both := sealedSet[f]; both {
+			return fmt.Errorf("field %q cannot be both sealed and unbound", f)
+		}
+	}
+	return nil
+}
+
 // E2EE is the sealing-metadata object added to the request under `_e2ee` (§5).
 type E2EE struct {
 	V            int      `json:"v"`
@@ -95,7 +127,12 @@ type E2EE struct {
 	ClientEphPub string   `json:"client_eph_pub"` // base64url X25519, for response sealing
 	Enc          string   `json:"enc"`            // base64url HPKE encapsulated key
 	SealedFields []string `json:"sealed_fields"`
-	Ciphertext   string   `json:"ciphertext"` // base64url; excluded from the AAD
+	// UnboundFields lists cleartext fields excluded from the AAD (SPEC §5.2):
+	// intermediaries may add/modify/remove them. The list itself is bound (it
+	// lives here in `_e2ee`), so it cannot be enlarged in transit. Omitted when
+	// empty, which means "bind everything" (the safe default).
+	UnboundFields []string `json:"unbound_fields,omitempty"`
+	Ciphertext    string   `json:"ciphertext"` // base64url; excluded from the AAD
 }
 
 // Request is a decoded OpenAI-shaped request as an ordered-agnostic field map.
@@ -111,11 +148,16 @@ type Request map[string]json.RawMessage
 //     "messages" is required and each field MUST be present in req.
 //   - providerID:   the pinned provider's on-chain signer address ("0x…")
 //   - clientEphPub: the client's response ephemeral X25519 public key (raw bytes)
-func SealRequest(encPub crypto.PublicKey, req Request, sealedFields []string, providerID string, clientEphPub []byte) (Request, error) {
+//   - unboundFields: optional cleartext fields excluded from the AAD (§5.2), i.e.
+//     ones an intermediary may add/modify. Empty (the default) binds everything.
+func SealRequest(encPub crypto.PublicKey, req Request, sealedFields []string, providerID string, clientEphPub []byte, unboundFields ...string) (Request, error) {
 	if sealedFields == nil {
 		sealedFields = DefaultSealedFields()
 	}
 	if err := ValidateSealedFields(sealedFields); err != nil {
+		return nil, err
+	}
+	if err := ValidateUnboundFields(unboundFields, sealedFields); err != nil {
 		return nil, err
 	}
 	if !isProviderID(providerID) {
@@ -161,13 +203,14 @@ func SealRequest(encPub crypto.PublicKey, req Request, sealedFields []string, pr
 		env[k] = v
 	}
 	e2ee := E2EE{
-		V:            Version,
-		KEMID:        KEMID,
-		KeyID:        b64.EncodeToString(keyID(encPub)),
-		ProviderID:   providerID,
-		ClientEphPub: b64.EncodeToString(clientEphPub),
-		Enc:          b64.EncodeToString(enc),
-		SealedFields: sealedFields,
+		V:             Version,
+		KEMID:         KEMID,
+		KeyID:         b64.EncodeToString(keyID(encPub)),
+		ProviderID:    providerID,
+		ClientEphPub:  b64.EncodeToString(clientEphPub),
+		Enc:           b64.EncodeToString(enc),
+		SealedFields:  sealedFields,
+		UnboundFields: unboundFields, // nil/empty → omitted (bind everything)
 		// Ciphertext filled in after sealing; it is excluded from the AAD.
 	}
 	if err := env.setE2EE(e2ee); err != nil {
@@ -304,6 +347,21 @@ func aadFromEnvelope(env map[string]json.RawMessage) ([]byte, error) {
 	var e2ee map[string]json.RawMessage
 	if err := json.Unmarshal(rawE2EE, &e2ee); err != nil {
 		return nil, fmt.Errorf("decode %q for aad: %w", e2eeKey, err)
+	}
+	// Exclude the intermediary-mutable fields from the AAD (SPEC §5.2). The
+	// `unbound_fields` list itself stays inside `_e2ee` (restored below), so it
+	// remains bound — an attacker cannot enlarge the set without changing the
+	// AAD. Strict (H1): it MUST be a JSON array of strings; anything else (a
+	// string, number, object) fails closed here, before Open. Absent/`null` →
+	// exclude nothing. `_e2ee` itself is never excludable (re-added below).
+	if rawUnbound, ok := e2ee["unbound_fields"]; ok {
+		var unbound []string
+		if err := json.Unmarshal(rawUnbound, &unbound); err != nil {
+			return nil, fmt.Errorf("unbound_fields must be an array of strings: %w", err)
+		}
+		for _, f := range unbound {
+			delete(out, f)
+		}
 	}
 	delete(e2ee, "ciphertext")
 	cleaned, err := json.Marshal(e2ee)

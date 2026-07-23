@@ -23,8 +23,11 @@ type ResponseE2EE struct {
 	V            int      `json:"v,omitempty"`
 	Enc          string   `json:"enc,omitempty"` // base64url; first frame only
 	SealedFields []string `json:"sealed_fields"`
-	Final        bool     `json:"final"`
-	Ciphertext   string   `json:"ciphertext"` // base64url; excluded from the AAD
+	// UnboundFields: cleartext frame fields excluded from the AAD (§5.2 / D5),
+	// e.g. a router-injected `x_0g_trace`. Bound as a list, omitted when empty.
+	UnboundFields []string `json:"unbound_fields,omitempty"`
+	Final         bool     `json:"final"`
+	Ciphertext    string   `json:"ciphertext"` // base64url; excluded from the AAD
 }
 
 // defaultResponseSealedFields is the v1 default set of response fields to seal
@@ -57,19 +60,23 @@ func validateResponseSealedFields(fields []string) error {
 // enclave is the sender, the client's ephemeral key the recipient). Frames MUST
 // be sealed in order; the receiver opens them in the same order.
 type ResponseSealer struct {
-	sealer *crypto.Sealer
-	enc    string // base64url; emitted on the first frame only
-	first  bool
+	sealer  *crypto.Sealer
+	enc     string // base64url; emitted on the first frame only
+	first   bool
+	unbound []string // AAD-excluded fields, applied to every frame
 }
 
 // NewResponseSealer sets up response sealing to the client's ephemeral public
-// key (carried in the request's _e2ee.client_eph_pub).
-func NewResponseSealer(clientEphPub crypto.PublicKey) (*ResponseSealer, error) {
+// key (carried in the request's _e2ee.client_eph_pub). unboundFields are the
+// cleartext frame fields to exclude from the AAD (§5.2 / D5) — the same set is
+// applied to every frame; empty binds everything. They are validated against
+// each frame's sealed set in SealFrame.
+func NewResponseSealer(clientEphPub crypto.PublicKey, unboundFields ...string) (*ResponseSealer, error) {
 	enc, s, err := crypto.SetupSender(clientEphPub, []byte(RespInfo))
 	if err != nil {
 		return nil, err
 	}
-	return &ResponseSealer{sealer: s, enc: b64.EncodeToString(enc), first: true}, nil
+	return &ResponseSealer{sealer: s, enc: b64.EncodeToString(enc), first: true, unbound: unboundFields}, nil
 }
 
 // SealFrame seals one frame: it removes sealedFields (nil → the v1 default,
@@ -80,6 +87,9 @@ func (rs *ResponseSealer) SealFrame(frame Response, sealedFields []string, final
 		sealedFields = defaultResponseSealedFields()
 	}
 	if err := validateResponseSealedFields(sealedFields); err != nil {
+		return nil, err
+	}
+	if err := ValidateUnboundFields(rs.unbound, sealedFields); err != nil {
 		return nil, err
 	}
 
@@ -108,7 +118,7 @@ func (rs *ResponseSealer) SealFrame(frame Response, sealedFields []string, final
 		out[k] = v
 	}
 
-	e2ee := ResponseE2EE{SealedFields: sealedFields, Final: final}
+	e2ee := ResponseE2EE{SealedFields: sealedFields, UnboundFields: rs.unbound, Final: final}
 	if rs.first {
 		e2ee.V = Version
 		e2ee.Enc = rs.enc
@@ -213,8 +223,9 @@ func (ro *ResponseOpener) OpenFrame(frame Response) (Response, error) {
 }
 
 // SealResponse seals a complete non-streaming response as a single final frame.
-func SealResponse(clientEphPub crypto.PublicKey, resp Response, sealedFields []string) (Response, error) {
-	rs, err := NewResponseSealer(clientEphPub)
+// unboundFields are the cleartext fields excluded from the AAD (§5.2 / D5).
+func SealResponse(clientEphPub crypto.PublicKey, resp Response, sealedFields []string, unboundFields ...string) (Response, error) {
+	rs, err := NewResponseSealer(clientEphPub, unboundFields...)
 	if err != nil {
 		return nil, err
 	}
