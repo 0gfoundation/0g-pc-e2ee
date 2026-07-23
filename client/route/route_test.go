@@ -18,7 +18,13 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
-const testSigner = "0xd45b4301940B297F76d6e622c1CeA2AE660617d4"
+const (
+	// testSigner is the broker's signer_address (envelope provider_id / response
+	// signer); testProviderAddr is the router's provider address (routing pin).
+	// They are deliberately different to catch conflating the two.
+	testSigner       = "0xd45b4301940B297F76d6e622c1CeA2AE660617d4"
+	testProviderAddr = "0xC0FFEE0000000000000000000000000000000001"
+)
 
 // mockBroker serves the provider's control-plane e2ee pubkey API only. The
 // data-plane chat request goes through the router (mockRouter), not here. It
@@ -73,7 +79,7 @@ type mockRouter struct {
 
 func newMockRouter(t *testing.T, broker *mockBroker) *mockRouter {
 	t.Helper()
-	m := &mockRouter{previewAddress: testSigner}
+	m := &mockRouter{previewAddress: testProviderAddr}
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /v1/routing/preview", func(w http.ResponseWriter, r *http.Request) {
@@ -122,9 +128,14 @@ func newMockRouter(t *testing.T, broker *mockBroker) *mockRouter {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
+		// The envelope pin is the signer address; the routing pin header is the
+		// provider address — distinct values.
 		if e2ee.ProviderID != testSigner {
-			http.Error(w, "wrong provider pin", http.StatusBadRequest)
+			http.Error(w, "wrong provider pin (provider_id)", http.StatusBadRequest)
 			return
+		}
+		if got := r.Header.Get("X-0G-Provider-Address"); got != testProviderAddr {
+			t.Errorf("routing pin header = %q, want provider address %q", got, testProviderAddr)
 		}
 		if _, err := wire.OpenRequest(broker.encPriv, env); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -185,9 +196,10 @@ func TestResolveEndToEnd(t *testing.T) {
 	}
 
 	// The data-plane chat request went to the router (not the broker) and pinned
-	// the resolved provider so the router forwards to exactly it, fallback off.
-	if got := router.lastChatHeaders.Get("X-0G-Provider-Address"); got != testSigner {
-		t.Errorf("chat pin = %q, want %q", got, testSigner)
+	// the resolved provider (by provider address) so the router forwards to
+	// exactly it, fallback off.
+	if got := router.lastChatHeaders.Get("X-0G-Provider-Address"); got != testProviderAddr {
+		t.Errorf("chat pin = %q, want provider address %q", got, testProviderAddr)
 	}
 	if got := router.lastChatHeaders.Get("X-0G-Allow-Fallbacks"); got != "false" {
 		t.Errorf("chat allow-fallbacks = %q, want \"false\"", got)
@@ -202,13 +214,13 @@ func TestPreviewForwardsRoutingHeaders(t *testing.T) {
 	broker := newMockBroker(t)
 	router := newMockRouter(t, broker)
 
-	pin := http.Header{"X-0g-Provider-Address": []string{testSigner}}
+	pin := http.Header{"X-0g-Provider-Address": []string{testProviderAddr}}
 	ctx := core.WithForwardedHeaders(context.Background(), pin)
 	if _, err := New(router.srv.URL).Resolve(ctx, chatReq()); err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
-	if got := router.lastHeaders.Get("X-0g-Provider-Address"); got != testSigner {
-		t.Errorf("pin header not forwarded to preview: got %q, want %q", got, testSigner)
+	if got := router.lastHeaders.Get("X-0g-Provider-Address"); got != testProviderAddr {
+		t.Errorf("pin header not forwarded to preview: got %q, want %q", got, testProviderAddr)
 	}
 }
 
@@ -222,6 +234,9 @@ func TestResolveProvider(t *testing.T) {
 	}
 	if p.SignerAddr != testSigner {
 		t.Errorf("signer = %q, want %q", p.SignerAddr, testSigner)
+	}
+	if p.Address != testProviderAddr {
+		t.Errorf("address = %q, want %q", p.Address, testProviderAddr)
 	}
 	// URL is the router's completions endpoint (auth/billing), not the provider's.
 	if want := router.srv.URL + "/v1/chat/completions"; p.URL != want {
@@ -289,15 +304,16 @@ func TestResolveNoProvidersIs503(t *testing.T) {
 	assertStageStatus(t, err, core.StageUpstream, http.StatusServiceUnavailable)
 }
 
-func TestResolveRejectsAddressMismatch(t *testing.T) {
+// A provider with no address can't be pinned, so the router could re-route the
+// sealed request to a provider that can't decrypt it — reject up front.
+func TestResolveRejectsMissingAddress(t *testing.T) {
 	broker := newMockBroker(t)
 	router := newMockRouter(t, broker)
-	// Router claims a different provider than the broker signs as.
-	router.previewAddress = "0x" + strings.Repeat("b", 40)
+	router.previewAddress = "" // preview returns a provider with no address
 
 	_, err := New(router.srv.URL).Resolve(context.Background(), chatReq())
-	if err == nil || !strings.Contains(err.Error(), "does not match") {
-		t.Fatalf("want address-mismatch error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "no address") {
+		t.Fatalf("want missing-address error, got %v", err)
 	}
 }
 

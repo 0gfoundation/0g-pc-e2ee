@@ -58,7 +58,8 @@ func TestGatewayQuoteStub(t *testing.T) {
 // pin-only path uses; exhaustive route behavior lives in the route package.
 func TestGatewayRouteMode(t *testing.T) {
 	encPriv, encPub, _ := crypto.GenerateRecipientKey()
-	signer := "0x" + strings.Repeat("a", 40)
+	signer := "0x" + strings.Repeat("a", 40)       // broker signer_address (envelope pin)
+	providerAddr := "0x" + strings.Repeat("c", 40) // router provider address (routing pin)
 
 	// The broker serves only the provider's e2ee pubkey (control plane).
 	brokerMux := http.NewServeMux()
@@ -83,15 +84,16 @@ func TestGatewayRouteMode(t *testing.T) {
 			"object": "routing.preview",
 			"type":   "chat",
 			"providers": []map[string]string{{
-				"address":  signer,
+				"address":  providerAddr,
 				"endpoint": broker.URL,
 				"model_id": "gpt-4o",
 			}},
 		})
 	})
 	routerMux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-0G-Provider-Address") != signer {
-			t.Errorf("chat not pinned to provider: %q", r.Header.Get("X-0G-Provider-Address"))
+		// The routing pin is the provider address, not the signer.
+		if r.Header.Get("X-0G-Provider-Address") != providerAddr {
+			t.Errorf("chat not pinned to provider address: %q", r.Header.Get("X-0G-Provider-Address"))
 		}
 		body, _ := io.ReadAll(r.Body)
 		var env wire.Request

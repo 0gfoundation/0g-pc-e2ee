@@ -11,15 +11,17 @@
 //     The sealed fields (the prompt) are stripped before this call, so the
 //     router still never sees plaintext.
 //  2. Provider identity — GET the chosen provider's HPKE recipient key from the
-//     broker's e2ee pubkey API (…/v1/e2ee/pubkey), yielding the enc key and
-//     signer address the client then seals to and pins (SPEC §4).
+//     broker's e2ee pubkey API (…/v1/e2ee/pubkey), yielding the enc key to seal
+//     to and the signer address sealed into _e2ee.provider_id (SPEC §4).
 //
 // The resulting core.Provider seals to the chosen provider's enc key, but its
 // URL is the *router's* chat-completions endpoint, not the provider's: the
 // sealed request goes through the router (centralized auth/billing), which
-// forwards to the pinned provider (SPEC §4.4). core pins the data-plane request
-// to that provider (X-0G-Provider-Address, fallback off) so the router forwards
-// to exactly the provider whose key the request is sealed to.
+// forwards to the pinned provider (SPEC §4.4). Two distinct pins, which may
+// differ: the signer address is the crypto pin in the envelope, while the
+// preview's provider address is the routing pin core sends as
+// X-0G-Provider-Address (with fallback off) so the router forwards to exactly
+// the provider whose key the request is sealed to.
 //
 // As with the pin-only stub, the enc key is trusted as delivered here; verifying
 // it out of an attestation quote (protocol/attest, issue #7) is a later step.
@@ -181,15 +183,19 @@ func (r *Router) Resolve(ctx context.Context, req wire.Request) (core.Provider, 
 	if err != nil {
 		return core.Provider{}, err
 	}
-	// The router's claimed address (control plane) must agree with the broker's
-	// own signer (provider identity). A mismatch means one of them is lying about
-	// which provider this is — fail rather than pin to an inconsistent identity.
-	if prov.Address != "" && !strings.EqualFold(prov.Address, signer) {
-		return core.Provider{}, upstream(0, fmt.Errorf("provider address %s does not match broker signer %s", prov.Address, signer))
-	}
+	// Two distinct pins, which may differ (so they are NOT cross-checked):
+	//   - SignerAddr (broker's signer_address) → sealed into _e2ee.provider_id,
+	//     the crypto pin the provider enclave verifies and that signs responses.
+	//   - Address (the router's provider address) → the routing pin core sends as
+	//     X-0G-Provider-Address so the router forwards to exactly this provider.
 	// URL is the router's completions endpoint, NOT the provider's: the sealed
-	// request goes through the router for auth/billing, pinned to this signer.
-	return core.Provider{URL: r.completionsURL, EncPubKey: encPub, SignerAddr: signer}, nil
+	// request goes through the router for auth/billing.
+	return core.Provider{
+		URL:        r.completionsURL,
+		EncPubKey:  encPub,
+		SignerAddr: signer,
+		Address:    prov.Address,
+	}, nil
 }
 
 // previewProvider is one candidate in the route-preview reply.
@@ -277,6 +283,12 @@ func (r *Router) preview(ctx context.Context, req wire.Request) (previewProvider
 	top := pr.Providers[0]
 	if top.Endpoint == "" {
 		return previewProvider{}, upstream(0, fmt.Errorf("route preview returned a provider with no endpoint"))
+	}
+	// Address is the routing pin core sends so the router forwards to exactly this
+	// provider; without it the router could re-route to a provider whose key
+	// can't open the sealed request.
+	if top.Address == "" {
+		return previewProvider{}, upstream(0, fmt.Errorf("route preview returned a provider with no address"))
 	}
 	return top, nil
 }

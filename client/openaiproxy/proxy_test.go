@@ -694,7 +694,7 @@ func TestProxyForwardsRoutingHeaders(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodPost, proxy.URL+"/v1/chat/completions",
 		strings.NewReader(`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`))
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-0G-Provider-Address", "0x"+strings.Repeat("b", 40)) // core overrides this with the sealed provider's pin
+	req.Header.Set("X-0G-Provider-Address", "0x"+strings.Repeat("b", 40))
 	req.Header.Set("X-0G-Provider-Sort", "latency")
 	req.Header.Set("Cookie", "session=leak-me")    // must NOT reach the router
 	req.Header.Set("X-App-Trace", "internal-only") // must NOT reach the router
@@ -712,13 +712,14 @@ func TestProxyForwardsRoutingHeaders(t *testing.T) {
 	// HTTP header names are case-insensitive; http.Header.Get canonicalizes, so
 	// these match regardless of the wire casing.
 	//
-	// core pins X-0G-Provider-Address to the provider the request is sealed to,
-	// overriding any client-supplied value — a mismatched pin would route to a
-	// provider that cannot open the envelope. So the user's 0xbb… is replaced by
-	// the sealed provider's signer, and fallback is forced off.
-	if v := got.Get("X-0G-Provider-Address"); v != signer {
-		t.Errorf("X-0G-Provider-Address = %q, want the sealed provider's pin %q", v, signer)
+	// This client is pin-only (core.New, no Provider.Address), so core sets no
+	// routing pin and the client-supplied X-0G-Provider-Address passes through
+	// unchanged. (In route mode, where Provider.Address is set, core would pin it.)
+	if v := got.Get("X-0G-Provider-Address"); v != "0x"+strings.Repeat("b", 40) {
+		t.Errorf("X-0G-Provider-Address = %q, want it forwarded", v)
 	}
+	// Fallback is forced off whenever we seal (a sealed request can be opened only
+	// by the one provider it is sealed to).
 	if v := got.Get("X-0G-Allow-Fallbacks"); v != "false" {
 		t.Errorf("X-0G-Allow-Fallbacks = %q, want %q", v, "false")
 	}

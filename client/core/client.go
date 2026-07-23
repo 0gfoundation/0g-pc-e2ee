@@ -75,10 +75,22 @@ func resolveErr(err error) error {
 // Provider identifies the enclave the client seals to. In production EncPubKey
 // and SignerAddr are extracted from a verified attestation quote; here they are
 // supplied directly — attestation is a later step.
+//
+// SignerAddr and Address are distinct pins for two different layers and may
+// differ:
+//   - SignerAddr is the provider's on-chain TEE signer address. It is sealed
+//     into _e2ee.provider_id (SPEC §4.4) — the crypto pin the provider enclave
+//     checks against its own teeSignerAddress — and identifies the key that
+//     signs responses.
+//   - Address is the router-facing provider address, sent as X-0G-Provider-Address
+//     so a fronting router forwards to exactly this provider (the routing pin).
+//     Empty means "set no routing pin" (e.g. the pin-only sidecar, which does
+//     not select via the router).
 type Provider struct {
 	URL        string           // OpenAI-shaped endpoint (router or broker)
 	EncPubKey  crypto.PublicKey // provider HPKE recipient key
-	SignerAddr string           // provider on-chain signer address; used as the pin
+	SignerAddr string           // on-chain TEE signer; sealed into _e2ee.provider_id, verifies responses
+	Address    string           // router-facing provider address; sent as X-0G-Provider-Address (routing pin)
 }
 
 // Client is the shared client core: it seals a request's sensitive fields to
@@ -233,7 +245,9 @@ func (c *Client) post(ctx context.Context, provider Provider, env wire.Request) 
 // the router, which authenticates/bills and forwards to the provider; these pin
 // the forward to the exact provider the request is sealed to.
 const (
-	// headerProviderPin pins the request to a provider by its signer address.
+	// headerProviderPin pins the request to a provider by its router-facing
+	// provider address (Provider.Address) — distinct from the signer address in
+	// the envelope's provider_id, which is the enclave's crypto identity.
 	headerProviderPin = "X-0G-Provider-Address"
 	// headerAllowFallbacks disables server-side fallback. A sealed request can be
 	// opened only by the provider whose enc key it used, so a fallback to another
@@ -264,12 +278,14 @@ func (c *Client) doRequest(ctx context.Context, provider Provider, env wire.Requ
 	}
 	// Pin the forward to the provider this request is sealed to, and disable
 	// fallback, so a router routes to exactly that provider — never re-routing or
-	// falling back to one whose key cannot open this envelope. When provider.URL
-	// is a provider/broker directly (no router in front), these directives are
-	// simply ignored. Set after the forwarded headers so the resolved provider is
-	// authoritative over any forwarded pin.
-	if provider.SignerAddr != "" {
-		httpReq.Header.Set(headerProviderPin, provider.SignerAddr)
+	// falling back to one whose key cannot open this envelope. The pin is the
+	// router-facing provider address (Address), not the signer. When there is no
+	// routing pin (Address empty — the pin-only sidecar) or provider.URL is a
+	// provider/broker directly, only the fallback directive is set (and a direct
+	// provider ignores it). Set after the forwarded headers so the resolved
+	// provider is authoritative over any forwarded pin.
+	if provider.Address != "" {
+		httpReq.Header.Set(headerProviderPin, provider.Address)
 	}
 	httpReq.Header.Set(headerAllowFallbacks, "false")
 	// Forward the caller's credential (if any) verbatim as the Authorization
