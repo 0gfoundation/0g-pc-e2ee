@@ -54,7 +54,7 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 		return stageErr(StageRequest, fmt.Errorf("seal request: %w", err))
 	}
 
-	resp, err := c.doRequest(ctx, provider.URL, sealed)
+	resp, err := c.doRequest(ctx, provider, sealed)
 	if err != nil {
 		return &Error{Stage: StageUpstream, Err: fmt.Errorf("post to provider: %w", err)}
 	}

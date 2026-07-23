@@ -181,7 +181,7 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 		return nil, stageErr(StageRequest, fmt.Errorf("seal request: %w", err))
 	}
 
-	respBody, status, err := c.post(ctx, provider.URL, sealed)
+	respBody, status, err := c.post(ctx, provider, sealed)
 	if err != nil {
 		// Surface a non-2xx provider status verbatim (status is 0 for a transport
 		// failure, which statusFor maps to 502) so OpenAI clients can key their
@@ -212,8 +212,8 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 // On a non-2xx it returns the raw body alongside the status so the caller can
 // attach it as Error.Body — kept out of the error message so a multi-tenant
 // server never echoes untrusted upstream content (see Error.Body).
-func (c *Client) post(ctx context.Context, url string, env wire.Request) ([]byte, int, error) {
-	resp, err := c.doRequest(ctx, url, env)
+func (c *Client) post(ctx context.Context, provider Provider, env wire.Request) ([]byte, int, error) {
+	resp, err := c.doRequest(ctx, provider, env)
 	if err != nil {
 		return nil, 0, fmt.Errorf("post to provider: %w", err)
 	}
@@ -229,29 +229,52 @@ func (c *Client) post(ctx context.Context, url string, env wire.Request) ([]byte
 	return respBody, resp.StatusCode, nil
 }
 
-// doRequest POSTs the sealed envelope and returns the raw response; the caller
-// owns resp.Body. Shared by the buffered (post) and streaming paths.
-func (c *Client) doRequest(ctx context.Context, url string, env wire.Request) (*http.Response, error) {
+// Router routing directives (SPEC §4.4). The client sends its sealed request to
+// the router, which authenticates/bills and forwards to the provider; these pin
+// the forward to the exact provider the request is sealed to.
+const (
+	// headerProviderPin pins the request to a provider by its signer address.
+	headerProviderPin = "X-0G-Provider-Address"
+	// headerAllowFallbacks disables server-side fallback. A sealed request can be
+	// opened only by the provider whose enc key it used, so a fallback to another
+	// provider would fail to decrypt — the client must pin, not fall back.
+	headerAllowFallbacks = "X-0G-Allow-Fallbacks"
+)
+
+// doRequest POSTs the sealed envelope to provider.URL and returns the raw
+// response; the caller owns resp.Body. Shared by the buffered (post) and
+// streaming paths.
+func (c *Client) doRequest(ctx context.Context, provider Provider, env wire.Request) (*http.Response, error) {
 	body, err := json.Marshal(env)
 	if err != nil {
 		return nil, fmt.Errorf("marshal envelope: %w", err)
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, provider.URL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	// Copy the caller's forwarded routing headers (the X-0G-* directives the
-	// router consumes) before the credential, so the credential set below always
-	// wins over anything forwarded.
+	// router consumes) first, so the pin and credential set below always win over
+	// anything forwarded.
 	for k, vs := range ForwardedHeadersFrom(ctx) {
 		for _, v := range vs {
 			httpReq.Header.Add(k, v)
 		}
 	}
-	// Forward the caller's credential (if any) verbatim as the provider's
-	// Authorization header, so the router/broker can authenticate and bill the
-	// request. Empty when the caller set none — the request then goes out unauthed.
+	// Pin the forward to the provider this request is sealed to, and disable
+	// fallback, so a router routes to exactly that provider — never re-routing or
+	// falling back to one whose key cannot open this envelope. When provider.URL
+	// is a provider/broker directly (no router in front), these directives are
+	// simply ignored. Set after the forwarded headers so the resolved provider is
+	// authoritative over any forwarded pin.
+	if provider.SignerAddr != "" {
+		httpReq.Header.Set(headerProviderPin, provider.SignerAddr)
+	}
+	httpReq.Header.Set(headerAllowFallbacks, "false")
+	// Forward the caller's credential (if any) verbatim as the Authorization
+	// header, so the router/broker can authenticate and bill the request. Empty
+	// when the caller set none — the request then goes out unauthed.
 	if cred := CredentialFrom(ctx); cred != "" {
 		httpReq.Header.Set("Authorization", cred)
 	}

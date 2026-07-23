@@ -12,12 +12,17 @@
 //     router still never sees plaintext.
 //  2. Provider identity — GET the chosen provider's HPKE recipient key from the
 //     broker's e2ee pubkey API (…/v1/e2ee/pubkey), yielding the enc key and
-//     signer address the client then seals/pins to (SPEC §4).
+//     signer address the client then seals to and pins (SPEC §4).
 //
-// This is the route analogue of the pin-only flow: it produces the same
-// core.Provider (URL + enc key + signer), just chosen dynamically. As with the
-// pin-only stub, the enc key is trusted as delivered here; verifying it out of
-// an attestation quote (protocol/attest, issue #7) is a later step.
+// The resulting core.Provider seals to the chosen provider's enc key, but its
+// URL is the *router's* chat-completions endpoint, not the provider's: the
+// sealed request goes through the router (centralized auth/billing), which
+// forwards to the pinned provider (SPEC §4.4). core pins the data-plane request
+// to that provider (X-0G-Provider-Address, fallback off) so the router forwards
+// to exactly the provider whose key the request is sealed to.
+//
+// As with the pin-only stub, the enc key is trusted as delivered here; verifying
+// it out of an attestation quote (protocol/attest, issue #7) is a later step.
 package route
 
 import (
@@ -43,12 +48,18 @@ import (
 var b64 = base64.RawURLEncoding
 
 const (
-	// DefaultRouterURL is the 0G router's base URL. The route-preview path is
-	// appended to it; callers configure the router domain, not the full endpoint.
+	// DefaultRouterURL is the 0G router's base URL. The route-preview and
+	// chat-completions paths are appended to it; callers configure the router
+	// domain, not the full endpoint.
 	DefaultRouterURL = "https://router-api.0g.ai"
 	// previewPath is the router's route-preview endpoint, appended to the router
 	// base URL. It is owned here because this package owns that API contract.
 	previewPath = "/v1/routing/preview"
+	// completionsPath is the router's OpenAI chat-completions endpoint. The sealed
+	// request is POSTed here — to the router, not the provider directly — because
+	// the router is the centralized auth/billing point; it authenticates, then
+	// forwards to the pinned provider (SPEC §4.4).
+	completionsPath = "/v1/chat/completions"
 	// DefaultType is the inference kind sent to the preview API for a chat
 	// completion.
 	DefaultType = "chat"
@@ -68,6 +79,7 @@ const (
 // APIs. It is safe for concurrent use.
 type Router struct {
 	previewURL      string
+	completionsURL  string
 	reqType         string
 	sensitiveFields map[string]struct{}
 	http            *http.Client
@@ -117,21 +129,23 @@ func WithPubkeyTTL(d time.Duration) Option {
 	return func(r *Router) { r.cache = newPubkeyCache(d) }
 }
 
-// New returns a Router that previews against the given router base URL (empty
-// uses DefaultRouterURL). The route-preview path is appended to it, so callers
-// configure only the router domain — a trailing slash and a base path prefix are
-// both respected (e.g. "https://host/api" → "https://host/api/v1/routing/preview").
+// New returns a Router that talks to the given router base URL (empty uses
+// DefaultRouterURL). The route-preview and chat-completions paths are appended
+// to it, so callers configure only the router domain — a trailing slash and a
+// base path prefix are both respected (e.g. "https://host/api" →
+// "https://host/api/v1/routing/preview").
 func New(routerURL string, opts ...Option) *Router {
 	if routerURL == "" {
 		routerURL = DefaultRouterURL
 	}
-	previewURL := strings.TrimRight(routerURL, "/") + previewPath
+	base := strings.TrimRight(routerURL, "/")
 	// A dedicated transport with a bounded header wait, mirroring core.New; the
 	// control-plane calls are short, so no long-stream concern applies.
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.ResponseHeaderTimeout = 30 * time.Second
 	r := &Router{
-		previewURL:      previewURL,
+		previewURL:      base + previewPath,
+		completionsURL:  base + completionsPath,
 		reqType:         DefaultType,
 		sensitiveFields: sliceToSet(wire.DefaultSealedFields()),
 		http:            &http.Client{Transport: tr},
@@ -143,18 +157,22 @@ func New(routerURL string, opts ...Option) *Router {
 	return r
 }
 
-// Resolve implements core.Resolver: preview → pubkey → core.Provider.
+// Resolve implements core.Resolver: preview → pubkey → core.Provider. The
+// returned provider seals to the chosen provider's enc key and pins its signer,
+// but POSTs to the router's chat-completions URL — the router authenticates,
+// bills, and forwards to the pinned provider. core sets the pin header so the
+// router forwards to exactly this provider (see core's data-plane request).
 func (r *Router) Resolve(ctx context.Context, req wire.Request) (core.Provider, error) {
 	prov, err := r.preview(ctx, req)
 	if err != nil {
 		return core.Provider{}, err
 	}
-	// The endpoint is taken as the router returns it. The router is untrusted, so
-	// a compromised one could point this at an endpoint it controls and MITM the
-	// prompt; resolving the endpoint (and on-chain teeSignerAddress) from chain
-	// instead is tracked in issue #18, and full protection needs quote
-	// verification (issue #7).
-	completionsURL, pubkeyURL, err := deriveURLs(prov.Endpoint)
+	// The provider endpoint is used only to fetch its published enc key. It is
+	// taken as the router returns it; the router is untrusted, so a compromised
+	// one could point this at an endpoint it controls and MITM the prompt.
+	// Resolving the endpoint (and on-chain teeSignerAddress) from chain instead is
+	// tracked in issue #18, and full protection needs quote verification (#7).
+	pubkeyURL, err := derivePubkeyURL(prov.Endpoint)
 	if err != nil {
 		return core.Provider{}, upstream(0, fmt.Errorf("provider endpoint: %w", err))
 	}
@@ -169,7 +187,9 @@ func (r *Router) Resolve(ctx context.Context, req wire.Request) (core.Provider, 
 	if prov.Address != "" && !strings.EqualFold(prov.Address, signer) {
 		return core.Provider{}, upstream(0, fmt.Errorf("provider address %s does not match broker signer %s", prov.Address, signer))
 	}
-	return core.Provider{URL: completionsURL, EncPubKey: encPub, SignerAddr: signer}, nil
+	// URL is the router's completions endpoint, NOT the provider's: the sealed
+	// request goes through the router for auth/billing, pinned to this signer.
+	return core.Provider{URL: r.completionsURL, EncPubKey: encPub, SignerAddr: signer}, nil
 }
 
 // previewProvider is one candidate in the route-preview reply.
@@ -330,18 +350,17 @@ func validatePubkey(pk pubkeyResponse) (crypto.PublicKey, string, error) {
 	return crypto.PublicKey(encPub), pk.SignerAddress, nil
 }
 
-// deriveURLs turns a provider endpoint into the chat-completions URL to POST the
-// sealed request to and the broker's e2ee pubkey URL. The endpoint may be a bare
-// origin (https://host[:port]), the /v1 base, or already the full
-// chat-completions URL (…/v1/chat/completions); both paths are resolved against
-// the same /v1 base so all three forms work.
-func deriveURLs(endpoint string) (completions, pubkey string, err error) {
+// derivePubkeyURL turns a provider endpoint into the broker's e2ee pubkey URL.
+// The endpoint may be a bare origin (https://host[:port]), the /v1 base, or the
+// full chat-completions URL (…/v1/chat/completions); all three resolve against
+// the same /v1 base, so the pubkey path hangs off it consistently.
+func derivePubkeyURL(endpoint string) (string, error) {
 	u, err := url.Parse(endpoint)
 	if err != nil {
-		return "", "", fmt.Errorf("%q is not a valid URL: %w", endpoint, err)
+		return "", fmt.Errorf("%q is not a valid URL: %w", endpoint, err)
 	}
 	if u.Scheme == "" || u.Host == "" {
-		return "", "", fmt.Errorf("%q is not an absolute URL", endpoint)
+		return "", fmt.Errorf("%q is not an absolute URL", endpoint)
 	}
 	base := strings.TrimSuffix(u.Path, "/")
 	switch {
@@ -352,8 +371,7 @@ func deriveURLs(endpoint string) (completions, pubkey string, err error) {
 	default:
 		base += "/v1"
 	}
-	origin := u.Scheme + "://" + u.Host
-	return origin + base + "/chat/completions", origin + base + "/e2ee/pubkey", nil
+	return u.Scheme + "://" + u.Host + base + "/e2ee/pubkey", nil
 }
 
 // modelOf extracts the required, non-empty "model" from req.

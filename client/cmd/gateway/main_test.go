@@ -60,7 +60,7 @@ func TestGatewayRouteMode(t *testing.T) {
 	encPriv, encPub, _ := crypto.GenerateRecipientKey()
 	signer := "0x" + strings.Repeat("a", 40)
 
-	// One server plays the provider broker: e2ee pubkey + sealed chat completions.
+	// The broker serves only the provider's e2ee pubkey (control plane).
 	brokerMux := http.NewServeMux()
 	brokerMux.HandleFunc("GET /v1/e2ee/pubkey", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -71,12 +71,33 @@ func TestGatewayRouteMode(t *testing.T) {
 			"signer_address": signer,
 		})
 	})
-	brokerMux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+	broker := httptest.NewServer(brokerMux)
+	defer broker.Close()
+
+	// The router serves route-preview (pointing at the broker) and the chat data
+	// plane — the sealed request goes here, and the router forwards to the pinned
+	// provider (which the mock stands in for by opening the seal).
+	routerMux := http.NewServeMux()
+	routerMux.HandleFunc("POST /v1/routing/preview", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"object": "routing.preview",
+			"type":   "chat",
+			"providers": []map[string]string{{
+				"address":  signer,
+				"endpoint": broker.URL,
+				"model_id": "gpt-4o",
+			}},
+		})
+	})
+	routerMux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-0G-Provider-Address") != signer {
+			t.Errorf("chat not pinned to provider: %q", r.Header.Get("X-0G-Provider-Address"))
+		}
 		body, _ := io.ReadAll(r.Body)
 		var env wire.Request
 		_ = json.Unmarshal(body, &env)
 		if _, leaked := env["messages"]; leaked {
-			t.Error("prompt reached the broker in cleartext")
+			t.Error("prompt reached the router in cleartext")
 		}
 		e2ee, _ := env.E2EE()
 		if _, err := wire.OpenRequest(encPriv, env); err != nil {
@@ -91,21 +112,7 @@ func TestGatewayRouteMode(t *testing.T) {
 		sealed, _ := wire.SealResponse(crypto.PublicKey(ephPub), resp, nil)
 		_ = json.NewEncoder(w).Encode(sealed)
 	})
-	broker := httptest.NewServer(brokerMux)
-	defer broker.Close()
-
-	// A second server plays the router's route-preview API, pointing at the broker.
-	router := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"object": "routing.preview",
-			"type":   "chat",
-			"providers": []map[string]string{{
-				"address":  signer,
-				"endpoint": broker.URL,
-				"model_id": "gpt-4o",
-			}},
-		})
-	}))
+	router := httptest.NewServer(routerMux)
 	defer router.Close()
 
 	client := core.NewWithResolver(route.New(router.URL))

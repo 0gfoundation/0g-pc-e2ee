@@ -281,13 +281,17 @@ does not.
   use, then fetches that provider's enc key **and** signer address from the
   broker (`GET /v1/e2ee/pubkey`) — so nothing about the provider (endpoint, enc
   key, signer) is configured up front. The sealed fields are withheld from the
-  preview call, so the prompt stays confidential. A caller selects a specific
-  provider by setting the `X-0G-Provider-Address` routing header, which the
-  gateway forwards to the router so preview returns that provider (this replaces
-  a separate "pin/direct" mode). Client-side fallback over the remaining
-  candidates, verifying the enc key out of an attestation quote, and resolving
-  the provider **endpoint on chain** rather than trusting the router's reply are
-  later steps (the last tracked in issue #18).
+  preview call, so the prompt stays confidential. The sealed request itself is
+  still POSTed to the **router** (`/v1/chat/completions`, the centralized
+  auth/billing point), pinned to the chosen provider (`X-0G-Provider-Address`,
+  fallback off) so the router forwards to exactly the provider whose key it was
+  sealed to; the provider `endpoint` from preview is used only to fetch the enc
+  key. A caller selects a specific provider by setting `X-0G-Provider-Address`,
+  which the gateway forwards to preview so it returns that provider (this
+  replaces a separate "pin/direct" mode). Client-side fallback over the
+  remaining candidates, verifying the enc key out of an attestation quote, and
+  resolving the provider **endpoint on chain** rather than trusting the router's
+  reply are later steps (the last tracked in issue #18).
 - Streaming through the in-enclave TLS + L4 LB — confirm no buffering is
   introduced on the dstack path (the sidecar already sets `X-Accel-Buffering:
   no`; the router's nginx sets `proxy_buffering off`).
