@@ -2,6 +2,7 @@ package core
 
 import (
 	"encoding/json"
+	"errors"
 	"reflect"
 	"testing"
 
@@ -32,6 +33,24 @@ func TestNewDefaultsProviderURL(t *testing.T) {
 func TestNewDefaultsSealFields(t *testing.T) {
 	if got := New(Provider{}).sealFields; !reflect.DeepEqual(got, wire.DefaultSealedFields()) {
 		t.Fatalf("default seal fields = %v, want %v", got, wire.DefaultSealedFields())
+	}
+}
+
+func TestResolveErr(t *testing.T) {
+	// A plain (non-*Error) resolver failure is wrapped as an upstream error.
+	plain := resolveErr(errors.New("dns boom"))
+	var e *Error
+	if !errors.As(plain, &e) {
+		t.Fatalf("resolveErr did not produce *Error: %v", plain)
+	}
+	if e.Stage != StageUpstream {
+		t.Errorf("stage = %q, want %q", e.Stage, StageUpstream)
+	}
+
+	// An already-staged *Error passes through verbatim (same pointer).
+	staged := &Error{Stage: StageRequest, Err: errors.New("no model")}
+	if got := resolveErr(staged); got != staged {
+		t.Errorf("staged error not passed through: got %v", got)
 	}
 }
 

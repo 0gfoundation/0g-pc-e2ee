@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -32,10 +33,12 @@ const (
 // mock so it can open the sealed chat it "forwards". Counts pubkey hits so
 // caching can be asserted.
 type mockBroker struct {
-	srv        *httptest.Server
-	encPub     crypto.PublicKey
-	encPriv    crypto.PrivateKey
-	pubkeyHits int32
+	srv          *httptest.Server
+	encPub       crypto.PublicKey
+	encPriv      crypto.PrivateKey
+	pubkeyHits   int32
+	pubkeyStatus int    // override pubkey status; 0 = 200
+	pubkeyRaw    string // if set, written verbatim instead of the JSON reply
 }
 
 func newMockBroker(t *testing.T) *mockBroker {
@@ -48,6 +51,14 @@ func newMockBroker(t *testing.T) *mockBroker {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/e2ee/pubkey", func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&b.pubkeyHits, 1)
+		if b.pubkeyStatus != 0 {
+			http.Error(w, "boom", b.pubkeyStatus)
+			return
+		}
+		if b.pubkeyRaw != "" {
+			_, _ = w.Write([]byte(b.pubkeyRaw))
+			return
+		}
 		_ = json.NewEncoder(w).Encode(pubkeyResponse{
 			V:             wire.Version,
 			KEMID:         wire.KEMID,
@@ -142,6 +153,25 @@ func newMockRouter(t *testing.T, broker *mockBroker) *mockRouter {
 			return
 		}
 		ephPub, _ := base64.RawURLEncoding.DecodeString(e2ee.ClientEphPub)
+
+		// Stream sealed SSE frames when the (cleartext) envelope asked for it,
+		// mirroring the real provider's streaming path; otherwise one JSON reply.
+		if string(env["stream"]) == "true" {
+			sealer, _ := wire.NewResponseSealer(crypto.PublicKey(ephPub))
+			w.Header().Set("Content-Type", "text/event-stream")
+			flusher := w.(http.Flusher)
+			deltas := []string{`{"content":"routed "}`, `{"content":"answer"}`}
+			for i, d := range deltas {
+				frame := wire.Response{"choices": json.RawMessage(`[{"index":0,"delta":` + d + `}]`)}
+				sealed, _ := sealer.SealFrame(frame, nil, i == len(deltas)-1)
+				b, _ := json.Marshal(sealed)
+				fmt.Fprintf(w, "data: %s\n\n", b)
+				flusher.Flush()
+			}
+			fmt.Fprint(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			return
+		}
 		resp := wire.Response{
 			"id":      json.RawMessage(`"chatcmpl-route"`),
 			"choices": json.RawMessage(`[{"index":0,"message":{"role":"assistant","content":"routed answer"},"finish_reason":"stop"}]`),
@@ -222,6 +252,77 @@ func TestPreviewForwardsRoutingHeaders(t *testing.T) {
 	if got := router.lastHeaders.Get("X-0g-Provider-Address"); got != testProviderAddr {
 		t.Errorf("pin header not forwarded to preview: got %q, want %q", got, testProviderAddr)
 	}
+}
+
+// Route mode also streams: preview + pubkey resolve, then the sealed request
+// streams SSE frames back through the router, which the client opens in order.
+func TestResolveStreamingEndToEnd(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+
+	client := core.NewWithResolver(New(router.srv.URL))
+	req := wire.Request{
+		"model":    json.RawMessage(`"gpt-4o"`),
+		"messages": json.RawMessage(`[{"role":"user","content":"the secret prompt"}]`),
+		"stream":   json.RawMessage(`true`),
+	}
+	var got strings.Builder
+	err := client.CompleteStream(context.Background(), req, func(frame wire.Response) error {
+		got.Write(frame["choices"])
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("CompleteStream: %v", err)
+	}
+	if !strings.Contains(got.String(), "routed ") || !strings.Contains(got.String(), "answer") {
+		t.Fatalf("did not reassemble streamed deltas: %s", got.String())
+	}
+}
+
+// WithSensitiveFields controls what the preview call withholds: the configured
+// fields (here a custom one) are stripped, other fields pass through for routing.
+func TestWithSensitiveFieldsStripsFromPreview(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	r := New(router.srv.URL, WithSensitiveFields([]string{"messages", "secret_field"}))
+
+	req := wire.Request{
+		"model":        json.RawMessage(`"gpt-4o"`),
+		"messages":     json.RawMessage(`[{"role":"user","content":"hi"}]`),
+		"secret_field": json.RawMessage(`"top secret"`),
+		"temperature":  json.RawMessage(`0.5`),
+	}
+	if _, err := r.Resolve(context.Background(), req); err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if _, leaked := router.lastPreview["messages"]; leaked {
+		t.Error("messages leaked to preview")
+	}
+	if _, leaked := router.lastPreview["secret_field"]; leaked {
+		t.Error("custom sensitive field leaked to preview")
+	}
+	if _, ok := router.lastPreview["temperature"]; !ok {
+		t.Error("non-sensitive field should be forwarded for routing")
+	}
+}
+
+func TestResolvePubkeyNon200(t *testing.T) {
+	broker := newMockBroker(t)
+	broker.pubkeyStatus = http.StatusNotFound
+	router := newMockRouter(t, broker)
+
+	_, err := New(router.srv.URL).Resolve(context.Background(), chatReq())
+	assertStageStatus(t, err, core.StageUpstream, http.StatusNotFound)
+}
+
+func TestResolvePubkeyMalformed(t *testing.T) {
+	broker := newMockBroker(t)
+	broker.pubkeyRaw = "not json at all"
+	router := newMockRouter(t, broker)
+
+	// A decode failure is an upstream error with no meaningful status (→ 502).
+	_, err := New(router.srv.URL).Resolve(context.Background(), chatReq())
+	assertStageStatus(t, err, core.StageUpstream, 0)
 }
 
 func TestResolveProvider(t *testing.T) {
