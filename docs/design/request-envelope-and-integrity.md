@@ -330,3 +330,48 @@ reasoning) move inside the trust boundary; **bound params** (`model`) are resolv
 at an endpoint, never mutated in transit; genuinely intermediary-owned metadata
 (`x_0g_trace`) is either signed by the enclave or declared `unbound` and treated
 as untrusted.
+
+---
+
+## 8. Implementation hardening — strict parsing (review items)
+
+Two rules that are **safe by construction** in the model above but depend on
+strict, *identical* parsing across implementations (Go / TS / Rust). Both are
+mandatory; a lenient parser reintroduces the hole. Neither is an attack the
+crypto misses — the risk is implementation divergence.
+
+### H1 — `unbound_fields` is a control field; parse it strictly
+`unbound_fields` steers the AAD computation itself (it decides what is *excluded*
+from the bound bytes), so every implementation must interpret it identically or
+the byte-for-byte AAD agreement silently desynchronizes.
+
+- It **MUST** be a JSON array of strings. A non-array (`null`, string, number,
+  object) → **fail-closed reject before unsealing**; no implicit coercion.
+- **Absent or `[]` → exclude nothing** (bind everything). `null` MUST be treated
+  as absent, never as "exclude something."
+- Each entry **MUST** name a present top-level cleartext field; the recipient
+  **MAY reject** an envelope that lists a field it requires to stay bound (e.g.
+  `model`) — the broker's minimum-binding policy (D4).
+- *Why this is otherwise safe:* the `unbound_fields` **list value is itself
+  bound** (it lives in `_e2ee`, inside the AAD); only the *values of the fields it
+  names* are excluded. An attacker cannot enlarge the set — changing the list
+  changes the AAD and `Open` fails closed. H1 closes the remaining gap, which is
+  not the attacker but a **loose extractor** on one side excluding a field the
+  other side bound.
+
+### H2 — reconstruct by strict disjoint union, never override
+After `Open`, the request is rebuilt as `cleartext ∪ decrypted`. This merge
+**MUST** be a **disjoint union, fatal on overlap** — never a last-writer-wins
+assign (`Object.assign` / spread), or a decrypted field could shadow an
+AAD-bound cleartext field (e.g. inject a second `model`) or the `_e2ee` object
+itself.
+
+- Decrypted keys **MUST equal `sealed_fields`** exactly (already specified).
+- Decrypted payload **MUST NOT contain `_e2ee`**, nor **any** key present in the
+  outer cleartext → fatal reject.
+  - *Concrete gap to close:* the Go reference rejects cleartext collisions, but
+    builds the output with `_e2ee` pre-excluded, so a decrypted `_e2ee` key would
+    slip past the collision check. Add an explicit `_e2ee` guard, and mandate the
+    whole rule for non-reference implementations (dynamic languages especially).
+- Constrain the decrypted payload to its expected shape; unexpected top-level
+  keys → reject rather than pass upstream.
