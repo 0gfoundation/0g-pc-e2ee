@@ -225,23 +225,35 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 		if err != nil {
 			// Surface a non-2xx provider status verbatim (status is 0 for a transport
 			// failure, which statusFor maps to 502) so OpenAI clients can key their
-			// retry/backoff on it — 429/5xx retry, 4xx fail fast. For a non-2xx,
-			// respBody is the upstream body; carry it as Body (not in the message).
+			// retry/backoff on it. For a non-2xx, respBody is the upstream body; carry
+			// it as Body (not in the message).
 			e := &Error{Stage: StageUpstream, Status: status, Err: err}
 			if status != 0 {
 				e.Body = string(respBody)
 			}
 			lastErr = e
-			continue
+			// Fall back only on a transient provider failure (429 / 5xx). A 4xx
+			// (client fault) or a transport failure (status 0 — the same router
+			// fronts every candidate, so it recurs) would repeat on the next
+			// candidate; surface it immediately.
+			if retryableStatus(status) {
+				continue
+			}
+			return nil, e
 		}
 
 		var sealedResp wire.Response
 		if err := json.Unmarshal(respBody, &sealedResp); err != nil {
-			return nil, stageErr(StageUpstream, fmt.Errorf("decode sealed response: %w", err))
+			// A 2xx whose body will not decode/open is a provider fault with nothing
+			// yet returned to the caller — fall back to the next candidate (as the
+			// streaming path does before its first frame).
+			lastErr = stageErr(StageUpstream, fmt.Errorf("decode sealed response: %w", err))
+			continue
 		}
 		out, err := wire.OpenResponse(ephPriv, sealedResp)
 		if err != nil {
-			return nil, stageErr(StageUpstream, fmt.Errorf("open response: %w", err))
+			lastErr = stageErr(StageUpstream, fmt.Errorf("open response: %w", err))
+			continue
 		}
 		return out, nil
 	}
@@ -276,6 +288,16 @@ func (c *Client) post(ctx context.Context, provider Provider, env wire.Request) 
 		return respBody, resp.StatusCode, fmt.Errorf("provider returned %d", resp.StatusCode)
 	}
 	return respBody, resp.StatusCode, nil
+}
+
+// retryableStatus reports whether a provider (data-plane) HTTP status is worth
+// falling back to the next candidate for. A rate limit (429) or a server error
+// (5xx) is transient and provider-specific, so another provider may succeed. A
+// 4xx (a client fault: bad request, auth, not found) and a transport failure
+// (status 0 — the same router fronts every candidate, so it recurs) are not, and
+// fail fast. A 2xx never reaches here (it is a success at the HTTP layer).
+func retryableStatus(status int) bool {
+	return status == http.StatusTooManyRequests || (status >= 500 && status <= 599)
 }
 
 // Router routing directives (SPEC §4.4). The client sends its sealed request to

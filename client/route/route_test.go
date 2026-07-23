@@ -88,7 +88,9 @@ type mockRouter struct {
 	noProviders     bool              // preview returns no providers
 	previewAddress  string            // head provider's address in preview (default testProviderAddr)
 	extra           []previewProvider // extra candidates appended after the head
-	failPin         string            // data plane returns 503 for this X-0G-Provider-Address pin
+	failPin         string            // data plane fails for this X-0G-Provider-Address pin
+	failStatus      int               // status returned for failPin (0 = 503)
+	badBodyPin      string            // data plane returns 200 with an unopenable body for this pin
 }
 
 func newMockRouter(t *testing.T, broker *mockBroker) *mockRouter {
@@ -127,10 +129,22 @@ func newMockRouter(t *testing.T, broker *mockBroker) *mockRouter {
 	// key and seals a canned answer back.
 	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
 		m.lastChatHeaders = r.Header.Clone()
-		// Simulate a provider the router can't serve: the client should re-seal to
-		// the next candidate and retry (client-side fallback).
-		if m.failPin != "" && r.Header.Get("X-0G-Provider-Address") == m.failPin {
-			http.Error(w, "provider unavailable", http.StatusServiceUnavailable)
+		pin := r.Header.Get("X-0G-Provider-Address")
+		// Simulate a provider failure at the data plane: on a retryable status the
+		// client should re-seal to the next candidate; on a 4xx it should fail fast.
+		if m.failPin != "" && pin == m.failPin {
+			status := m.failStatus
+			if status == 0 {
+				status = http.StatusServiceUnavailable
+			}
+			http.Error(w, "provider failure", status)
+			return
+		}
+		// Simulate a 200 whose sealed body cannot be opened: the client should fall
+		// back (nothing was delivered to the caller yet).
+		if m.badBodyPin != "" && pin == m.badBodyPin {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"not":"a sealed response"}`))
 			return
 		}
 		body, _ := io.ReadAll(r.Body)
@@ -342,6 +356,77 @@ func TestCompleteFallsBackToNextCandidate(t *testing.T) {
 	}
 	if router.lastChatModel != "canon-2" {
 		t.Errorf("data-plane model = %q, want fallback canonical_id \"canon-2\"", router.lastChatModel)
+	}
+}
+
+// A 4xx from the head provider is a client fault that would recur on every
+// candidate, so the client fails fast and does NOT fall back.
+func TestCompleteDoesNotFallBackOn4xx(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	secondAddr := "0xC0FFEE0000000000000000000000000000000002"
+	router.extra = []previewProvider{{
+		Address:     secondAddr,
+		CanonicalID: "canon-2",
+		Endpoint:    broker.srv.URL,
+		ModelID:     "gpt-4o@v2",
+	}}
+	router.failPin = testProviderAddr
+	router.failStatus = http.StatusBadRequest
+
+	client := core.NewWithResolver(New(router.srv.URL))
+	_, err := client.Complete(context.Background(), chatReq())
+	// The 400 is surfaced verbatim; a fallback would have hit the (healthy) second
+	// candidate and returned success instead.
+	assertStageStatus(t, err, core.StageUpstream, http.StatusBadRequest)
+	if got := router.lastChatHeaders.Get("X-0G-Provider-Address"); got != testProviderAddr {
+		t.Errorf("stopped at pin %q, want head %q (no fallback)", got, testProviderAddr)
+	}
+}
+
+// A 200 whose sealed body cannot be opened is a provider fault with nothing yet
+// returned to the caller, so the client falls back to the next candidate.
+func TestCompleteFallsBackOnUnopenableResponse(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	secondAddr := "0xC0FFEE0000000000000000000000000000000002"
+	router.extra = []previewProvider{{
+		Address:     secondAddr,
+		CanonicalID: "canon-2",
+		Endpoint:    broker.srv.URL,
+		ModelID:     "gpt-4o@v2",
+	}}
+	router.badBodyPin = testProviderAddr // head returns a 200 that won't open
+
+	client := core.NewWithResolver(New(router.srv.URL))
+	resp, err := client.Complete(context.Background(), chatReq())
+	if err != nil {
+		t.Fatalf("Complete should have fallen back after an unopenable response: %v", err)
+	}
+	choices, _ := json.Marshal(resp["choices"])
+	if !strings.Contains(string(choices), "routed answer") {
+		t.Fatalf("did not get plaintext back after fallback: %s", choices)
+	}
+	if got := router.lastChatHeaders.Get("X-0G-Provider-Address"); got != secondAddr {
+		t.Errorf("succeeded pin = %q, want fallback address %q", got, secondAddr)
+	}
+}
+
+// A candidate with an empty canonical_id can't name the model in the sealed
+// request — a router contract violation the client rejects (so core skips it).
+func TestResolveRejectsMissingCanonicalID(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	cands, err := New(router.srv.URL).Resolve(context.Background(), chatReq())
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	// Blank the head's canonical_id after the fact by re-driving through a router
+	// that returns one; simplest is a direct check on materialization.
+	rc := cands.(*routeCandidates)
+	rc.providers[0].CanonicalID = ""
+	if _, err := rc.Provider(context.Background(), 0); err == nil || !strings.Contains(err.Error(), "canonical_id") {
+		t.Fatalf("want missing-canonical_id error, got %v", err)
 	}
 }
 

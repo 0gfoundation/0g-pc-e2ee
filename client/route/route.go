@@ -202,6 +202,13 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 	if prov.Endpoint == "" {
 		return core.Provider{}, upstream(0, fmt.Errorf("route preview candidate has no endpoint"))
 	}
+	// canonical_id is the cleartext model the sealed request must name (each
+	// candidate serves its own — the list is heterogeneous when the caller omits
+	// "model"). The router contract always provides it; an empty one is a contract
+	// violation this client cannot seal a correct request for, so reject it.
+	if prov.CanonicalID == "" {
+		return core.Provider{}, upstream(0, fmt.Errorf("route preview candidate has no canonical_id"))
+	}
 	// The candidate endpoint is used only to fetch its published enc key. It is
 	// taken as the router returns it; the router is untrusted, so a compromised
 	// one could point this at an endpoint it controls and MITM the prompt.
