@@ -170,12 +170,16 @@ The request is the original OpenAI JSON with the **sealed fields removed** and a
   AAD-protected `_e2ee`, so the router cannot swap it (that would break `Open`).
 - `provider_id` is the pinned provider (§4.4); the enclave rejects a request
   whose `provider_id` != its own `teeSignerAddress`.
+- `unbound_fields` (optional, omitted when empty) lists cleartext fields
+  **excluded from the AAD** — intermediary-mutable metadata; see §5.2.
 
 ### 5.1 Sealed-field set
 
 - **Sealed plaintext** = a JSON object holding exactly the sealed fields with
-  their original values, in **JCS** form:
-  `{"messages": <original>, "tools": <original>}`.
+  their original values, **serialized as JSON**. Canonicalization is **not**
+  required here: the AEAD binds the exact ciphertext bytes and the §8 signature
+  binds the ciphertext, so the pre-encryption byte layout is irrelevant.
+  Example: `{"messages": <original>, "tools": <original>}`.
 - v1 default sealed set: **`messages` and `tools`**. On the router path a client
   SHOULD seal `messages` (leaving it cleartext exposes the prompt, defeating the
   purpose). This is a recommended default, not a protocol-enforced invariant: a
@@ -197,13 +201,25 @@ Cleartext fields are **authenticated, not encrypted**, so the router can read bu
 not tamper (e.g. downgrade `model`, inflate `max_tokens`, flip `sealed_fields`).
 
 ```
-aad = JCS( envelope_json with _e2ee.ciphertext removed )
+aad = JCS( envelope_json with _e2ee.ciphertext AND every field named in
+           _e2ee.unbound_fields removed )
 ```
 
-i.e. canonicalize the entire transmitted object minus the `ciphertext` value.
-This binds every cleartext field and every `_e2ee` metadata field. The enclave
-recomputes `aad` the same way over what it received; any tampered cleartext byte
-makes `Open` fail-closed.
+i.e. canonicalize the entire transmitted object minus the `ciphertext` value and
+minus the intermediary-mutable fields. This binds every remaining cleartext
+field and every `_e2ee` metadata field. The enclave recomputes `aad` the same
+way over what it received; any tampered **bound** byte makes `Open` fail-closed.
+
+**`unbound_fields`** is a denylist (default: empty = bind everything) of cleartext
+fields an intermediary may add/modify/remove:
+- The list **itself** stays in `_e2ee` and is therefore bound — an attacker
+  cannot enlarge it (that changes the AAD and `Open` fails), so it cannot free a
+  field the client bound.
+- It MUST be a JSON **array of strings**; any other type (or a non-array) is
+  rejected **before** unsealing. Absent/`null` means exclude nothing.
+- It MUST be disjoint from `sealed_fields` and MUST NOT name `_e2ee`.
+- Values in unbound fields are **unauthenticated**: nothing may trust them (see
+  §8 — the signature covers only non-unbound content).
 
 - HPKE `info` MUST be `"0g-pc/v1/seal"` (ASCII), domain-separating this usage.
 
@@ -212,10 +228,10 @@ makes `Open` fail-closed.
 **Seal (client):**
 ```
 sealed_obj = { field: original_value  for field in sealed_fields }
-pt         = JCS(sealed_obj)
+pt         = serialize(sealed_obj)          // JSON; canonicalization NOT required (§5.1)
 (enc, ctx) = HPKE.SetupBaseS(enc_pub, info="0g-pc/v1/seal")
 // build _e2ee with everything except ciphertext, drop sealed fields from the body
-aad        = JCS(envelope_without_ciphertext)
+aad        = JCS(envelope_without_ciphertext_and_without_unbound_fields)
 ciphertext = ctx.Seal(aad, pt)
 ```
 The client MUST retain the ephemeral private key behind `client_eph_pub` to open
@@ -224,10 +240,10 @@ the response (§7).
 **Open (enclave):**
 ```
 select enc_key by key_id; verify v, kem_id
-aad = JCS(received_envelope_without_ciphertext)
+aad = JCS(received_envelope_without_ciphertext_and_without_unbound_fields)
 ctx = HPKE.SetupBaseR(enc, enc_priv, info="0g-pc/v1/seal")
 pt  = ctx.Open(aad, ciphertext)          // MUST fail-closed on error
-verify keys(pt) == sealed_fields; no collision with cleartext; provider_id == teeSignerAddress
+verify keys(pt) == sealed_fields; pt has no _e2ee key; no collision with cleartext; provider_id == teeSignerAddress
 reconstruct request = cleartext_fields ∪ pt
 ```
 If `key_id` matches no current enc key, `Open` fails, or any check fails, the
@@ -253,9 +269,15 @@ sequence increments per `Seal`, so frames MUST be opened in order).
 (resp_enc, resp_ctx) = HPKE.SetupBaseS(client_eph_pub, info="0g-pc/v1/resp")
 // per frame, in order:
 sealed_obj = { field: value  for field in sealed_fields }   // e.g. { "choices": [...] }
-aad        = JCS(frame_json without _e2ee.ciphertext)
-ciphertext = resp_ctx.Seal(aad, JCS(sealed_obj))
+aad        = JCS(frame_json without _e2ee.ciphertext and without _e2ee.unbound_fields)
+ciphertext = resp_ctx.Seal(aad, serialize(sealed_obj))       // no JCS on the body (§5.1)
 ```
+
+Response frames may also carry `unbound_fields` (same semantics as §5.2): the
+denylist of cleartext frame fields an intermediary may inject/modify — e.g. a
+router that folds a trace object into the final frame. Such fields are excluded
+from the AAD and, per §8, are **not** covered by the signature, so nothing may
+trust them.
 
 **Non-streaming** — the response body is one frame:
 ```json
@@ -291,20 +313,29 @@ and MUST be rejected. `final` is in the AAD, so a flipped flag is detected.
 
 ## 8. Response signature (unchanged, referenced here)
 
-Each response carries a TEE signature the client verifies **over the decrypted
-content**:
+Each response carries a TEE signature the client verifies **over the request and
+response content**:
 1. Fetch the `ChatSignature { text, signature, signing_address }` (cleartext).
 2. Recompute the content binding — the SHA-256 halves in `text` MUST equal the
-   client's own request/response hashes, taken over the **JCS-canonical**
-   reconstructed request and the decrypted response.
+   client's own request/response hashes. Those hashes are taken over the **on-wire
+   byte artifacts** the client already holds: the request `aad ‖ ciphertext` and
+   the response `aad ‖ ciphertext`. Hashing the ciphertext (not a re-derived
+   canonical plaintext) means **no canonicalization of the sealed content is
+   needed** for the binding — both sides hash identical bytes — and it is why the
+   sealed body is not JCS'd (§5.1). The AEAD transitively binds ciphertext↔plaintext.
 3. Recover the signer: `addr = ecrecover(EIP191(text), signature)`.
 4. **Accept only if `addr == on-chain teeSignerAddress`** — never the
    self-reported `signing_address`.
 
-The signed `text` MUST also cover the **cleartext response fields** (`usage` and
-the other §7 cleartext fields), so the router can verify the signature and trust
-`usage` for billing without decrypting `choices`, and the client detects any
-mismatch between billed `usage` and the sealed content.
+**Invariant: the signature covers exactly the non-`unbound_fields` content.**
+`aad` is the cleartext manifest minus the unbound set, and `ciphertext` is the
+sealed content — together, everything except the intermediary-mutable fields.
+The router can therefore verify the signature and trust `usage` (a bound
+cleartext field) for billing without decrypting `choices`. **Corollary:** any
+value that must be cryptographically trusted MUST NOT be `unbound` — e.g. a
+billing/trace object is only trustworthy if the enclave produces it inside the
+signed content, not if a router injects it as an unbound field (in which case
+trust must come from elsewhere, e.g. on-chain settlement).
 
 Verification MUST be fail-closed. (Detailed proof-text format and the routing-proof
 evolution are tracked in `0g-serving-broker` #552, specified later.)
