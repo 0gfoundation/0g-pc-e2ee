@@ -14,21 +14,22 @@ and is a companion to [`router-e2e.md`](./router-e2e.md) (which covers the
 | # | Decision | Status |
 |---|---|---|
 | **D0** | Router blind to prompt/completion; seal boundary is client↔provider | ✅ decided (§7 relocation is follow-up work) |
-| **D1** | §8 content hash binds produced/decrypted bytes, not a re-derived canonical form | ✅ decided → implement with §8 |
-| **D2** | `model` stays bound; alias resolution at an endpoint (client pre-seal / enclave post-open) | ✅ decided |
-| **D3** | AAD binds all except a declared `unbound_fields` denylist (fail-closed) | ✅ decided |
-| **D4** | `unbound_fields` is authenticated; unbound field values are untrusted (trust via signature) | ✅ decided |
-| **D5** | Response envelope mirrors D3/D4 | ✅ decided |
+| **D1** | Sealed body is not JCS'd; §8 content hash binds the on-wire bytes (`aad ‖ ciphertext`), not a re-derived canonical form | ✅ **implemented** (SPEC §6–§8; `wire`) — §8 signing itself lives in the broker |
+| **D2** | `model` stays bound; alias resolution at an endpoint (client pre-seal / enclave post-open) | ✅ decided (endpoint work is follow-up) |
+| **D3** | AAD binds all except a declared `unbound_fields` denylist (fail-closed) | ✅ **implemented** (`wire`, SPEC §5.2) |
+| **D4** | `unbound_fields` is authenticated; unbound field values are untrusted (trust via signature) | ✅ **implemented** |
+| **D5** | Response envelope mirrors D3/D4 | ✅ **implemented** |
 | **D6** | Sealing stays a `sealed_fields` allowlist; fail-open on new fields accepted | ✅ decided |
+| **H2** | Reserved `_e2ee` key rejected in sealed content | ✅ **implemented** (`wire`) |
+| — | `x_0g_trace`: router-injected, `unbound`, **unsigned/untrusted** — billing trust comes from on-chain settlement, not the signature | ✅ resolved (option B) |
 | — | Request↔response binding (§8 covers the request hash) | ✅ confirmed present |
 | — | Forward secrecy: enc key lives only in the TEE, re-derived per enclave lifecycle → de-facto FS; no static long-lived key | ✅ resolved |
 | — | Replay / freshness (server-side timestamp/nonce beyond the client nonce) | 🕗 TODO, not urgent |
 | — | Metadata / length leakage (cleartext params + ciphertext length ≈ prompt length) | 📌 accepted limitation |
 
 Follow-up execution (decided, not yet built): relocate the router's
-content-touching features off the routing layer (§7); implement §8 with D1;
-add the Go-reference `_e2ee` collision guard + H1/H2 strict parsing (§8); fold
-all of this into `protocol/SPEC.md §5–§6`.
+content-touching features off the routing layer (§7); implement the §8 signature
+in the broker per D1; resolve `model` aliases at an endpoint (D2).
 
 ---
 
