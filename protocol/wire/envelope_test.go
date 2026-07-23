@@ -84,8 +84,8 @@ func TestSealRequestRemovesSensitiveFieldsAndDoesNotLeak(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read _e2ee: %v", err)
 	}
-	if e2ee.ProviderID != testProvider {
-		t.Fatalf("provider_id not readable: %q", e2ee.ProviderID)
+	if e2ee.SignerAddr != testProvider {
+		t.Fatalf("signer_addr not readable: %q", e2ee.SignerAddr)
 	}
 	if !reflect.DeepEqual(e2ee.SealedFields, []string{"messages", "tools"}) {
 		t.Fatalf("sealed_fields = %v", e2ee.SealedFields)
@@ -197,13 +197,13 @@ func TestSealRequestRejectsBadEphKey(t *testing.T) {
 	}
 }
 
-func TestSealRequestRejectsBadProviderID(t *testing.T) {
+func TestSealRequestRejectsBadSignerAddr(t *testing.T) {
 	_, pub, _ := crypto.GenerateRecipientKey()
 	req := mustReq(t, sampleReq)
 	bad := []string{"", "0xabc", strings.Repeat("a", 42), "0x" + strings.Repeat("z", 40)}
 	for _, p := range bad {
 		if _, err := wire.SealRequest(pub, req, nil, p, validEph); err == nil {
-			t.Fatalf("expected error for provider_id %q, got nil", p)
+			t.Fatalf("expected error for signer_addr %q, got nil", p)
 		}
 	}
 }

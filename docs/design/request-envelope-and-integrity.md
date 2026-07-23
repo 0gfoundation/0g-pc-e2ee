@@ -115,7 +115,7 @@ by the transport crypto — so nothing security-relevant may depend on them.
     "v": 1,
     "kem_id": "0x0020",
     "key_id": "9Qk2…",
-    "provider_id": "0x992e6396157Dc4f22E74F2231235D7DE62696db5",
+    "signer_addr": "0x992e6396157Dc4f22E74F2231235D7DE62696db5",
     "client_eph_pub": "Uj3f…",
     "enc": "b0aZ…",
     "sealed_fields": ["messages","tools"],
@@ -132,7 +132,7 @@ by the transport crypto — so nothing security-relevant may depend on them.
 | `v` | Envelope version (`1`). Defines the whole byte contract. | Changing its semantics is a **breaking** bump (v2), coordinated across broker+client — even if wire bytes look unchanged. |
 | `kem_id` | HPKE KEM id. `0x0020` = DHKEM(X25519, HKDF-SHA256). | Pins the suite on the wire; unknown → reject (anti-downgrade). |
 | `key_id` | `base64url(SHA-256(enc_pub)[0:8])`. **Selector** for which recipient key this is sealed to. | Lets the recipient pick the right private key across rotation. Not secret. |
-| `provider_id` | The pinned recipient's on-chain signer address (`0x…`). Client asserts "I sealed to *this* provider/gateway." | Recipient checks `provider_id == self`; a router cannot silently reroute to another provider. **Bound.** |
+| `signer_addr` | The pinned recipient's on-chain TEE signer address (`0x…`). Client asserts "I sealed to *this* provider/gateway." | Recipient checks `signer_addr == self`; a router cannot silently reroute to another provider. **Bound.** |
 | `client_eph_pub` | Client's **ephemeral** X25519 public key; the enclave seals the **response** to it (§7). | Stored at request time, used at response time. **Must be bound** — else a MITM swaps its own key and reads the response. |
 | `enc` | HPKE **encapsulated key** (sender's ephemeral KEM output). Recipient derives the shared secret from `enc` + its private key. | **Bound.** |
 | `sealed_fields` | **Allowlist** of which fields were encrypted ({`messages`, `tools`} by default). After `Open`, decrypted keys must equal this set exactly; must include `messages`. | **Bound** — prevents lying about what was sealed. Fail-open on unknown fields is accepted (D6). |
@@ -270,7 +270,7 @@ Two declarations, deliberately **asymmetric** defaults:
 3. `SetupReceiver(enc, priv)` then `Open(ciphertext, aad)` — any tampered **bound**
    field fails closed here.
 4. Check decrypted keys == `sealed_fields`, no collision with cleartext names.
-5. Check `provider_id == self` (recipient policy; `OpenRequest` leaves this to the
+5. Check `signer_addr == self` (recipient policy; `OpenRequest` leaves this to the
    broker deliberately).
 6. Reconstruct request = cleartext ∪ decrypted; resolve the `model` alias here
    (post-`Open`, inside the boundary).

@@ -40,7 +40,7 @@ func mockBroker(t *testing.T, encPriv crypto.PrivateKey, signer string) *httptes
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if e2ee.ProviderID != signer {
+		if e2ee.SignerAddr != signer {
 			http.Error(w, "wrong provider pin", http.StatusBadRequest)
 			return
 		}

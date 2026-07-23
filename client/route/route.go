@@ -12,7 +12,7 @@
 //     router still never sees plaintext.
 //  2. Provider identity — GET the chosen provider's HPKE recipient key from the
 //     broker's e2ee pubkey API (…/v1/e2ee/pubkey), yielding the enc key to seal
-//     to and the signer address sealed into _e2ee.provider_id (SPEC §4).
+//     to and the signer address sealed into _e2ee.signer_addr (SPEC §4).
 //
 // The resulting core.Provider seals to the chosen provider's enc key, but its
 // URL is the *router's* chat-completions endpoint, not the provider's: the
@@ -184,7 +184,7 @@ func (r *Router) Resolve(ctx context.Context, req wire.Request) (core.Provider, 
 		return core.Provider{}, err
 	}
 	// Two distinct pins, which may differ (so they are NOT cross-checked):
-	//   - SignerAddr (broker's signer_address) → sealed into _e2ee.provider_id,
+	//   - SignerAddr (broker's signer_address) → sealed into _e2ee.signer_addr,
 	//     the crypto pin the provider enclave verifies and that signs responses.
 	//   - Address (the router's provider address) → the routing pin core sends as
 	//     X-0G-Provider-Address so the router forwards to exactly this provider.

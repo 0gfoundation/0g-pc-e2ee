@@ -9,7 +9,7 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 )
 
-var benchProviderID = "0x" + strings.Repeat("a", 40)
+var benchSignerAddr = "0x" + strings.Repeat("a", 40)
 
 // benchBodySizes are approximate sizes for the sensitive body (`messages` /
 // `choices`): a short prompt up through a large multi-turn context. The wire
@@ -62,7 +62,7 @@ func BenchmarkSealRequest(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				if _, err := SealRequest(encPub, req, nil, benchProviderID, ephPub); err != nil {
+				if _, err := SealRequest(encPub, req, nil, benchSignerAddr, ephPub); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -83,7 +83,7 @@ func BenchmarkOpenRequest(b *testing.B) {
 		b.Fatal(err)
 	}
 	for _, n := range benchBodySizes {
-		env, err := SealRequest(encPub, requestOfSize(n), nil, benchProviderID, ephPub)
+		env, err := SealRequest(encPub, requestOfSize(n), nil, benchSignerAddr, ephPub)
 		if err != nil {
 			b.Fatal(err)
 		}

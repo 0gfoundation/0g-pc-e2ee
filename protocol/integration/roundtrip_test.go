@@ -24,7 +24,7 @@ type mockBroker struct {
 
 // openRequest opens the sealed request and returns the reconstructed OpenAI
 // request plus the client's response ephemeral key (which the client placed in
-// the sealed-and-bound _e2ee). It enforces the provider_id pin, the one policy
+// the sealed-and-bound _e2ee). It enforces the signer_addr pin, the one policy
 // check wire deliberately leaves to the broker.
 func (b *mockBroker) openRequest(t *testing.T, env wire.Request) (wire.Request, crypto.PublicKey) {
 	t.Helper()
@@ -32,8 +32,8 @@ func (b *mockBroker) openRequest(t *testing.T, env wire.Request) (wire.Request, 
 	if err != nil {
 		t.Fatalf("read _e2ee: %v", err)
 	}
-	if e2ee.ProviderID != b.signerAddr {
-		t.Fatalf("provider_id %q is not this broker %q", e2ee.ProviderID, b.signerAddr)
+	if e2ee.SignerAddr != b.signerAddr {
+		t.Fatalf("signer_addr %q is not this broker %q", e2ee.SignerAddr, b.signerAddr)
 	}
 	req, err := wire.OpenRequest(b.encPriv, env)
 	if err != nil {

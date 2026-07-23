@@ -123,7 +123,7 @@ type E2EE struct {
 	V            int      `json:"v"`
 	KEMID        string   `json:"kem_id"`
 	KeyID        string   `json:"key_id"`         // base64url(SHA-256(enc_pub)[0:8])
-	ProviderID   string   `json:"provider_id"`    // pinned provider (signer address, 0x…)
+	SignerAddr   string   `json:"signer_addr"`    // provider TEE signer address (teeSignerAddress, 0x…); the pin
 	ClientEphPub string   `json:"client_eph_pub"` // base64url X25519, for response sealing
 	Enc          string   `json:"enc"`            // base64url HPKE encapsulated key
 	SealedFields []string `json:"sealed_fields"`
@@ -146,11 +146,11 @@ type Request map[string]json.RawMessage
 //   - encPub:       the provider enc key (verified out of a quote by the caller)
 //   - sealedFields: fields to seal; nil uses the v1 default (messages, tools).
 //     "messages" is required and each field MUST be present in req.
-//   - providerID:   the pinned provider's on-chain signer address ("0x…")
+//   - signerAddr:   the provider's on-chain TEE signer address ("0x…"), the pin
 //   - clientEphPub: the client's response ephemeral X25519 public key (raw bytes)
 //   - unboundFields: optional cleartext fields excluded from the AAD (§5.2), i.e.
 //     ones an intermediary may add/modify. Empty (the default) binds everything.
-func SealRequest(encPub crypto.PublicKey, req Request, sealedFields []string, providerID string, clientEphPub []byte, unboundFields ...string) (Request, error) {
+func SealRequest(encPub crypto.PublicKey, req Request, sealedFields []string, signerAddr string, clientEphPub []byte, unboundFields ...string) (Request, error) {
 	if sealedFields == nil {
 		sealedFields = DefaultSealedFields()
 	}
@@ -160,8 +160,8 @@ func SealRequest(encPub crypto.PublicKey, req Request, sealedFields []string, pr
 	if err := ValidateUnboundFields(unboundFields, sealedFields); err != nil {
 		return nil, err
 	}
-	if !isProviderID(providerID) {
-		return nil, fmt.Errorf("invalid provider_id %q (want 0x followed by 40 hex)", providerID)
+	if !isSignerAddr(signerAddr) {
+		return nil, fmt.Errorf("invalid signer_addr %q (want 0x followed by 40 hex)", signerAddr)
 	}
 	// clientEphPub is stored, not used, at seal time — the enclave seals the
 	// response to it (§7). Reject a malformed key here rather than emit an
@@ -210,7 +210,7 @@ func SealRequest(encPub crypto.PublicKey, req Request, sealedFields []string, pr
 		V:             Version,
 		KEMID:         KEMID,
 		KeyID:         b64.EncodeToString(keyID(encPub)),
-		ProviderID:    providerID,
+		SignerAddr:    signerAddr,
 		ClientEphPub:  b64.EncodeToString(clientEphPub),
 		Enc:           b64.EncodeToString(enc),
 		SealedFields:  sealedFields,
@@ -243,7 +243,7 @@ func SealRequest(encPub crypto.PublicKey, req Request, sealedFields []string, pr
 // recomputes the AAD, opens the sealed object, checks the decrypted keys equal
 // sealed_fields and do not collide with cleartext fields, and returns the
 // reconstructed original request (cleartext ∪ decrypted). It does NOT enforce
-// provider_id == the enclave's own signer address; that policy check belongs to
+// signer_addr == the enclave's own signer address; that policy check belongs to
 // the caller (the broker), which knows its own identity — read it via E2EE().
 func OpenRequest(priv crypto.PrivateKey, env Request) (Request, error) {
 	e2ee, err := env.E2EE()
@@ -391,10 +391,10 @@ func keyID(encPub crypto.PublicKey) []byte {
 	return h[:8]
 }
 
-// isProviderID reports whether s is a 0x-prefixed 20-byte hex address — the
+// isSignerAddr reports whether s is a 0x-prefixed 20-byte hex address — the
 // on-chain signer address format (§4.2). Case-insensitive on the hex body; the
 // checksum (EIP-55) is not verified here.
-func isProviderID(s string) bool {
+func isSignerAddr(s string) bool {
 	if len(s) != 42 || s[0] != '0' || s[1] != 'x' {
 		return false
 	}

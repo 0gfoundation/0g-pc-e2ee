@@ -32,7 +32,7 @@ func TestRequestUnboundFieldMutableInTransit(t *testing.T) {
 		"messages":   json.RawMessage(`[{"role":"user","content":"secret"}]`),
 		"x_0g_trace": json.RawMessage(`{"cost":1}`),
 	}
-	env, err := SealRequest(pub, req, []string{"messages"}, guardProviderID, []byte(ephPub), "x_0g_trace")
+	env, err := SealRequest(pub, req, []string{"messages"}, guardSignerAddr, []byte(ephPub), "x_0g_trace")
 	if err != nil {
 		t.Fatalf("SealRequest: %v", err)
 	}
@@ -59,7 +59,7 @@ func TestRequestBoundFieldStillProtectedWithUnbound(t *testing.T) {
 		"messages":   json.RawMessage(`[{"role":"user","content":"secret"}]`),
 		"x_0g_trace": json.RawMessage(`{"cost":1}`),
 	}
-	env, err := SealRequest(pub, req, []string{"messages"}, guardProviderID, []byte(ephPub), "x_0g_trace")
+	env, err := SealRequest(pub, req, []string{"messages"}, guardSignerAddr, []byte(ephPub), "x_0g_trace")
 	if err != nil {
 		t.Fatalf("SealRequest: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestRequestEnlargingUnboundListFailsClosed(t *testing.T) {
 		"messages":   json.RawMessage(`[{"role":"user","content":"secret"}]`),
 		"x_0g_trace": json.RawMessage(`{"cost":1}`),
 	}
-	env, err := SealRequest(pub, req, []string{"messages"}, guardProviderID, []byte(ephPub), "x_0g_trace")
+	env, err := SealRequest(pub, req, []string{"messages"}, guardSignerAddr, []byte(ephPub), "x_0g_trace")
 	if err != nil {
 		t.Fatalf("SealRequest: %v", err)
 	}
@@ -110,7 +110,7 @@ func TestMalformedUnboundFieldsFailsClosed(t *testing.T) {
 		"model":    json.RawMessage(`"m"`),
 		"messages": json.RawMessage(`[{"role":"user","content":"secret"}]`),
 	}
-	env, err := SealRequest(pub, req, []string{"messages"}, guardProviderID, []byte(ephPub))
+	env, err := SealRequest(pub, req, []string{"messages"}, guardSignerAddr, []byte(ephPub))
 	if err != nil {
 		t.Fatalf("SealRequest: %v", err)
 	}

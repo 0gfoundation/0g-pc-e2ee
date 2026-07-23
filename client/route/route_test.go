@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	// testSigner is the broker's signer_address (envelope provider_id / response
+	// testSigner is the broker's signer_address (envelope signer_addr / response
 	// signer); testProviderAddr is the router's provider address (routing pin).
 	// They are deliberately different to catch conflating the two.
 	testSigner       = "0xd45b4301940B297F76d6e622c1CeA2AE660617d4"
@@ -141,8 +141,8 @@ func newMockRouter(t *testing.T, broker *mockBroker) *mockRouter {
 		}
 		// The envelope pin is the signer address; the routing pin header is the
 		// provider address — distinct values.
-		if e2ee.ProviderID != testSigner {
-			http.Error(w, "wrong provider pin (provider_id)", http.StatusBadRequest)
+		if e2ee.SignerAddr != testSigner {
+			http.Error(w, "wrong provider pin (signer_addr)", http.StatusBadRequest)
 			return
 		}
 		if got := r.Header.Get("X-0G-Provider-Address"); got != testProviderAddr {

@@ -37,7 +37,7 @@ func TestValidateResponseSealedFieldsRejectsReservedAndEmpty(t *testing.T) {
 	}
 }
 
-var guardProviderID = "0x" + strings.Repeat("b", 40)
+var guardSignerAddr = "0x" + strings.Repeat("b", 40)
 
 // OpenRequest must reject an envelope whose decrypted object contains `_e2ee`,
 // even when the (malicious/non-conformant) sealer declared it in sealed_fields
@@ -71,7 +71,7 @@ func TestOpenRequestRejectsDecryptedE2EE(t *testing.T) {
 		V:            Version,
 		KEMID:        KEMID,
 		KeyID:        b64.EncodeToString(keyID(pub)),
-		ProviderID:   guardProviderID,
+		SignerAddr:   guardSignerAddr,
 		ClientEphPub: b64.EncodeToString(ephPub),
 		Enc:          b64.EncodeToString(enc),
 		SealedFields: []string{"messages", e2eeKey},

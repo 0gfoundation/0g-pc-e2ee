@@ -127,7 +127,7 @@ MUST:
 3. Confirm `signer_addr` equals the provider's on-chain `teeSignerAddress`.
 
 Only then is `enc_pub` trusted as the HPKE recipient. The client seals (§6) and
-sets `_e2ee.provider_id = signer_addr` (the pin) and a fresh ephemeral key for the
+sets `_e2ee.signer_addr` (the pin) and a fresh ephemeral key for the
 response (§7).
 
 **Data plane.** The client sends the JSON to the router; the router reads the
@@ -156,7 +156,7 @@ The request is the original OpenAI JSON with the **sealed fields removed** and a
     "v": 1,
     "kem_id": "0x0020",
     "key_id": "<base64url, 8 bytes>",
-    "provider_id": "0x<40 hex>",
+    "signer_addr": "0x<40 hex>",
     "client_eph_pub": "<base64url, 32 bytes>",
     "enc": "<base64url, 32 bytes: HPKE encapsulated key>",
     "sealed_fields": ["messages", "tools"],
@@ -168,8 +168,8 @@ The request is the original OpenAI JSON with the **sealed fields removed** and a
 - Every original top-level field **not** in `sealed_fields` stays cleartext.
 - `client_eph_pub` is where the enclave seals the response (§7). It lives in the
   AAD-protected `_e2ee`, so the router cannot swap it (that would break `Open`).
-- `provider_id` is the pinned provider (§4.4); the enclave rejects a request
-  whose `provider_id` != its own `teeSignerAddress`.
+- `signer_addr` is the pinned provider's TEE signer address (§4.4); the enclave rejects a request
+  whose `signer_addr` != its own `teeSignerAddress`.
 - `unbound_fields` (optional, omitted when empty) lists cleartext fields
   **excluded from the AAD** — intermediary-mutable metadata; see §5.2.
 
@@ -243,7 +243,7 @@ select enc_key by key_id; verify v, kem_id
 aad = JCS(received_envelope_without_ciphertext_and_without_unbound_fields)
 ctx = HPKE.SetupBaseR(enc, enc_priv, info="0g-pc/v1/seal")
 pt  = ctx.Open(aad, ciphertext)          // MUST fail-closed on error
-verify keys(pt) == sealed_fields; pt has no _e2ee key; no collision with cleartext; provider_id == teeSignerAddress
+verify keys(pt) == sealed_fields; pt has no _e2ee key; no collision with cleartext; signer_addr == teeSignerAddress
 reconstruct request = cleartext_fields ∪ pt
 ```
 If `key_id` matches no current enc key, `Open` fails, or any check fails, the
