@@ -221,7 +221,7 @@ func SealRequest(encPub crypto.PublicKey, req Request, sealedFields []string, si
 		return nil, err
 	}
 
-	// 4. aad = JCS(envelope without _e2ee.ciphertext).
+	// 4. aad = JCS(envelope without _e2ee.ciphertext and the unbound fields).
 	aad, err := aadFromEnvelope(env)
 	if err != nil {
 		return nil, err
@@ -336,9 +336,10 @@ func (r Request) setE2EE(e E2EE) error {
 }
 
 // aadFromEnvelope computes the AAD: JCS of the whole envelope with the
-// `_e2ee.ciphertext` value removed (§5.2). Sender and receiver call this with
-// the same logical envelope, so — JCS being canonical — they derive identical
-// bytes without depending on field order or whitespace.
+// `_e2ee.ciphertext` value and any fields named in `_e2ee.unbound_fields`
+// removed (§5.2). Sender and receiver call this with the same logical envelope,
+// so — JCS being canonical — they derive identical bytes without depending on
+// field order or whitespace.
 func aadFromEnvelope(env map[string]json.RawMessage) ([]byte, error) {
 	out := make(map[string]json.RawMessage, len(env))
 	for k, v := range env {
