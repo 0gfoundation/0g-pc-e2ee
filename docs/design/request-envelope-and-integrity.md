@@ -9,6 +9,27 @@ and is a companion to [`router-e2e.md`](./router-e2e.md) (which covers the
 > discussion that are **not yet in `SPEC.md` or the code**; everything else
 > describes what exists today. `SPEC.md` remains normative once these land.
 
+## Decision log
+
+| # | Decision | Status |
+|---|---|---|
+| **D0** | Router blind to prompt/completion; seal boundary is client↔provider | ✅ decided (§7 relocation is follow-up work) |
+| **D1** | §8 content hash binds produced/decrypted bytes, not a re-derived canonical form | ✅ decided → implement with §8 |
+| **D2** | `model` stays bound; alias resolution at an endpoint (client pre-seal / enclave post-open) | ✅ decided |
+| **D3** | AAD binds all except a declared `unbound_fields` denylist (fail-closed) | ✅ decided |
+| **D4** | `unbound_fields` is authenticated; unbound field values are untrusted (trust via signature) | ✅ decided |
+| **D5** | Response envelope mirrors D3/D4 | ✅ decided |
+| **D6** | Sealing stays a `sealed_fields` allowlist; fail-open on new fields accepted | ✅ decided |
+| — | Request↔response binding (§8 covers the request hash) | ✅ confirmed present |
+| — | Forward secrecy: enc key lives only in the TEE, re-derived per enclave lifecycle → de-facto FS; no static long-lived key | ✅ resolved |
+| — | Replay / freshness (server-side timestamp/nonce beyond the client nonce) | 🕗 TODO, not urgent |
+| — | Metadata / length leakage (cleartext params + ciphertext length ≈ prompt length) | 📌 accepted limitation |
+
+Follow-up execution (decided, not yet built): relocate the router's
+content-touching features off the routing layer (§7); implement §8 with D1;
+add the Go-reference `_e2ee` collision guard + H1/H2 strict parsing (§8); fold
+all of this into `protocol/SPEC.md §5–§6`.
+
 ---
 
 ## 0. Background: what the AAD actually protects
@@ -264,17 +285,16 @@ Beyond the field model above, these deserve a decision (some already tracked):
   *relocating* the router's content-touching features (search/file injection,
   response content rewrites) off the routing layer — to the client or a dedicated
   attested TEE node. Tracked as follow-up work, not a protocol-format question.
-- **Forward secrecy of requests — reduces to enc-key rotation cadence.** Only the
-  *sender* is ephemeral per request; the request is sealed to the provider's
-  *recipient* enc key, so `shared = DH(client_eph, provider_enc)`. If that
-  recipient key later leaks, an attacker who captured `{ciphertext, enc}` recovers
-  every past request — the per-request client ephemeral does not help (its public
-  half is `enc`, on the wire). (The **response** direction *is* forward-secret:
-  both sides are ephemeral there.) **But** if the provider enc key lives only
-  inside the TEE, is never persisted, and is re-derived per enclave lifecycle
-  (measurement-tied), it is not a long-lived static key — compromising it means
-  breaking a live TEE, already outside the trust model. So this is not a gap to
-  close with a new handshake; it is a **rotation-cadence / TTL decision**. Pick one.
+- **Forward secrecy of requests — RESOLVED.** Only the *sender* is ephemeral per
+  request; the request is sealed to the provider's *recipient* enc key, so
+  `shared = DH(client_eph, provider_enc)`, and the per-request client ephemeral
+  alone would not give FS (its public half is `enc`, on the wire). But the
+  provider **enc key lives only inside the TEE, is never persisted, and is
+  re-derived per enclave lifecycle** — so it is not a long-lived static key, and
+  recovering a captured request means breaking a live TEE, already outside the
+  trust model. That yields de-facto forward secrecy across enclave restarts; no
+  ephemeral-ephemeral handshake is needed. (The **response** direction is
+  ephemeral-ephemeral and forward-secret independently.)
 - **Sealing default is fail-*open* — DECIDED (D6): accepted.** Sealing keeps the
   `sealed_fields` allowlist; unknown/new fields stay cleartext. Accepted because
   the sensitive fields it would catch (`user`, `metadata`) are developer-added,
@@ -283,9 +303,10 @@ Beyond the field model above, these deserve a decision (some already tracked):
   covers the request hash (not just the response), so a router cannot splice a
   different or stale response. `client_eph_pub` additionally scopes
   decryptability per request.
-- **Replay / freshness.** Already tracked in `router-e2e.md` "Limitations": a
-  per-request nonce in the body (its hash is signed) defeats client-side replay; a
-  server timestamp/nonce is the belt-and-suspenders fix. Relevant to billing.
+- **Replay / freshness — TODO (not urgent).** The client-side per-request nonce
+  (its hash is signed) defeats basic replay; a server-side timestamp/nonce in the
+  signed text is the belt-and-suspenders addition, deferred. Relevant to billing.
+  Also tracked in `router-e2e.md` "Limitations".
 - **Metadata / length leakage.** Cleartext `model`/flags and the **ciphertext
   length** (≈ prompt length) leak to the router/TLS terminator. Padding helps only
   if the router is not the decryptor. Already noted in `router-e2e.md`.
