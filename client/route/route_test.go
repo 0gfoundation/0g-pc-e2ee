@@ -91,6 +91,7 @@ type mockRouter struct {
 	failPin         string            // data plane fails for this X-0G-Provider-Address pin
 	failStatus      int               // status returned for failPin (0 = 503)
 	badBodyPin      string            // data plane returns 200 with an unopenable body for this pin
+	truncBodyPin    string            // data plane returns 200 then truncates the body mid-read for this pin
 }
 
 func newMockRouter(t *testing.T, broker *mockBroker) *mockRouter {
@@ -145,6 +146,16 @@ func newMockRouter(t *testing.T, broker *mockBroker) *mockRouter {
 		if m.badBodyPin != "" && pin == m.badBodyPin {
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"not":"a sealed response"}`))
+			return
+		}
+		// Simulate a 200 whose body drops mid-read: promise more bytes than we send,
+		// then return so the connection closes — the client's read fails with an
+		// unexpected EOF and should fall back.
+		if m.truncBodyPin != "" && pin == m.truncBodyPin {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Content-Length", "4096")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"partial":`))
 			return
 		}
 		body, _ := io.ReadAll(r.Body)
@@ -402,6 +413,34 @@ func TestCompleteFallsBackOnUnopenableResponse(t *testing.T) {
 	resp, err := client.Complete(context.Background(), chatReq())
 	if err != nil {
 		t.Fatalf("Complete should have fallen back after an unopenable response: %v", err)
+	}
+	choices, _ := json.Marshal(resp["choices"])
+	if !strings.Contains(string(choices), "routed answer") {
+		t.Fatalf("did not get plaintext back after fallback: %s", choices)
+	}
+	if got := router.lastChatHeaders.Get("X-0G-Provider-Address"); got != secondAddr {
+		t.Errorf("succeeded pin = %q, want fallback address %q", got, secondAddr)
+	}
+}
+
+// A response whose body drops mid-read is a provider-side failure with nothing
+// delivered to the caller, so the client falls back to the next candidate.
+func TestCompleteFallsBackOnBodyReadFailure(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	secondAddr := "0xC0FFEE0000000000000000000000000000000002"
+	router.extra = []previewProvider{{
+		Address:     secondAddr,
+		CanonicalID: "canon-2",
+		Endpoint:    broker.srv.URL,
+		ModelID:     "gpt-4o@v2",
+	}}
+	router.truncBodyPin = testProviderAddr // head's body drops mid-read
+
+	client := core.NewWithResolver(New(router.srv.URL))
+	resp, err := client.Complete(context.Background(), chatReq())
+	if err != nil {
+		t.Fatalf("Complete should have fallen back after a truncated body: %v", err)
 	}
 	choices, _ := json.Marshal(resp["choices"])
 	if !strings.Contains(string(choices), "routed answer") {

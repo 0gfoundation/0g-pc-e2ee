@@ -179,13 +179,11 @@ func NewWithResolver(r Resolver, opts ...Option) *Client {
 // "verify response signature" step in doc.go) is a later step. Until then this
 // provides confidentiality but NOT response authenticity.
 func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response, error) {
-	ctx, cancel := context.WithTimeout(ctx, providerTimeout)
-	defer cancel()
-
 	// Pick the candidates to seal to, best first. A static resolver returns one
 	// fixed provider; the route resolver consults the router and returns the
-	// fallback chain, so this may make network calls (bounded by the ctx deadline
-	// above).
+	// fallback chain — a control-plane call bounded by the resolver's own HTTP
+	// client (route.New sets ResponseHeaderTimeout), not by a request deadline
+	// here; the per-attempt data-plane deadline is applied inside completeOnce.
 	cands, err := c.resolver.Resolve(ctx, req)
 	if err != nil {
 		return nil, resolveErr(err)
@@ -200,8 +198,8 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 		return nil, stageErr(StageInternal, fmt.Errorf("generate ephemeral key: %w", err))
 	}
 
-	// Fall back down the candidate chain: seal to a candidate and post; on a
-	// provider failure re-seal to the next and retry (SPEC §4.4). lastErr holds
+	// Fall back down the candidate chain: attempt a candidate and, on a retryable
+	// provider failure, re-seal to the next and retry (SPEC §4.4). lastErr holds
 	// the most recent failure so a fully exhausted chain surfaces a real cause.
 	var lastErr error
 	for i := 0; i < cands.Len(); i++ {
@@ -213,49 +211,15 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 			continue
 		}
 
-		sealed, err := c.seal(provider, req, ephPub)
-		if err != nil {
-			// A seal failure depends on the request, not the provider (e.g. no
-			// messages to seal), so it would fail identically for every candidate —
-			// fail fast rather than retry the chain.
-			return nil, stageErr(StageRequest, fmt.Errorf("seal request: %w", err))
+		out, retry, err := c.completeOnce(ctx, provider, req, ephPub, ephPriv)
+		if err == nil {
+			return out, nil
 		}
-
-		respBody, status, err := c.post(ctx, provider, sealed)
-		if err != nil {
-			// Surface a non-2xx provider status verbatim (status is 0 for a transport
-			// failure, which statusFor maps to 502) so OpenAI clients can key their
-			// retry/backoff on it. For a non-2xx, respBody is the upstream body; carry
-			// it as Body (not in the message).
-			e := &Error{Stage: StageUpstream, Status: status, Err: err}
-			if status != 0 {
-				e.Body = string(respBody)
-			}
-			lastErr = e
-			// Fall back only on a transient provider failure (429 / 5xx). A 4xx
-			// (client fault) or a transport failure (status 0 — the same router
-			// fronts every candidate, so it recurs) would repeat on the next
-			// candidate; surface it immediately.
-			if retryableStatus(status) {
-				continue
-			}
-			return nil, e
-		}
-
-		var sealedResp wire.Response
-		if err := json.Unmarshal(respBody, &sealedResp); err != nil {
-			// A 2xx whose body will not decode/open is a provider fault with nothing
-			// yet returned to the caller — fall back to the next candidate (as the
-			// streaming path does before its first frame).
-			lastErr = stageErr(StageUpstream, fmt.Errorf("decode sealed response: %w", err))
+		lastErr = err
+		if retry {
 			continue
 		}
-		out, err := wire.OpenResponse(ephPriv, sealedResp)
-		if err != nil {
-			lastErr = stageErr(StageUpstream, fmt.Errorf("open response: %w", err))
-			continue
-		}
-		return out, nil
+		return nil, err
 	}
 
 	// The chain was exhausted without a success. lastErr is set whenever Len() > 0
@@ -266,36 +230,70 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 	return nil, lastErr
 }
 
-// post sends the envelope and returns the response body plus, for a non-2xx, the
-// upstream HTTP status (0 for a transport/read failure, which the caller maps to
-// 502). The caller surfaces a non-2xx status verbatim.
-//
-// On a non-2xx it returns the raw body alongside the status so the caller can
-// attach it as Error.Body — kept out of the error message so a multi-tenant
-// server never echoes untrusted upstream content (see Error.Body).
-func (c *Client) post(ctx context.Context, provider Provider, env wire.Request) ([]byte, int, error) {
-	resp, err := c.doRequest(ctx, provider, env)
+// completeOnce runs one non-streaming attempt against a single provider under
+// its own per-attempt deadline (providerTimeout), so each candidate gets a full
+// budget rather than sharing one across the whole fallback chain. retry reports
+// whether the caller may fall back to the next candidate:
+//   - false (terminal): a request-level seal failure, a 4xx (client fault), or a
+//     transport failure that never reached the provider (the same router fronts
+//     every candidate, so it recurs).
+//   - true (fall back): a transient status (429 / 5xx), a response whose body
+//     dropped mid-read, or a 2xx whose sealed body will not decode/open — all
+//     provider-side failures with nothing yet returned to the caller.
+func (c *Client) completeOnce(ctx context.Context, provider Provider, req wire.Request, ephPub []byte, ephPriv crypto.PrivateKey) (wire.Response, bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, providerTimeout)
+	defer cancel()
+
+	sealed, err := c.seal(provider, req, ephPub)
 	if err != nil {
-		return nil, 0, fmt.Errorf("post to provider: %w", err)
+		// A seal failure depends on the request, not the provider (e.g. no messages
+		// to seal), so it would fail identically for every candidate — terminal.
+		return nil, false, stageErr(StageRequest, fmt.Errorf("seal request: %w", err))
+	}
+
+	resp, err := c.doRequest(ctx, provider, sealed)
+	if err != nil {
+		// Never reached the provider (transport failure); the same router fronts
+		// every candidate, so it recurs — terminal.
+		return nil, false, &Error{Stage: StageUpstream, Err: fmt.Errorf("post to provider: %w", err)}
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, 0, fmt.Errorf("read provider response: %w", err)
+		// A response began but the body dropped mid-read: a provider-side failure
+		// with nothing delivered to the caller — fall back to the next candidate.
+		return nil, true, stageErr(StageUpstream, fmt.Errorf("read provider response: %w", err))
 	}
 	if resp.StatusCode != http.StatusOK {
-		return respBody, resp.StatusCode, fmt.Errorf("provider returned %d", resp.StatusCode)
+		// Surface the provider status verbatim so OpenAI clients can key their
+		// retry/backoff on it; respBody is untrusted upstream content, carried as
+		// Body (not in the message) so a multi-tenant gateway never echoes it (see
+		// Error.Body). Fall back only on a transient status (429 / 5xx).
+		e := &Error{Stage: StageUpstream, Status: resp.StatusCode, Err: fmt.Errorf("provider returned %d", resp.StatusCode), Body: string(respBody)}
+		return nil, retryableStatus(resp.StatusCode), e
 	}
-	return respBody, resp.StatusCode, nil
+
+	var sealedResp wire.Response
+	if err := json.Unmarshal(respBody, &sealedResp); err != nil {
+		// A 2xx whose body will not decode/open is a provider fault with nothing
+		// yet returned to the caller — fall back (as the streaming path does before
+		// its first frame).
+		return nil, true, stageErr(StageUpstream, fmt.Errorf("decode sealed response: %w", err))
+	}
+	out, err := wire.OpenResponse(ephPriv, sealedResp)
+	if err != nil {
+		return nil, true, stageErr(StageUpstream, fmt.Errorf("open response: %w", err))
+	}
+	return out, false, nil
 }
 
 // retryableStatus reports whether a provider (data-plane) HTTP status is worth
 // falling back to the next candidate for. A rate limit (429) or a server error
-// (5xx) is transient and provider-specific, so another provider may succeed. A
-// 4xx (a client fault: bad request, auth, not found) and a transport failure
-// (status 0 — the same router fronts every candidate, so it recurs) are not, and
-// fail fast. A 2xx never reaches here (it is a success at the HTTP layer).
+// (5xx) is transient and provider-specific, so another provider may succeed; a
+// 4xx (a client fault: bad request, auth, not found) is not and fails fast. It
+// is only called with a real response status — transport failures (no response)
+// and unusable-body failures are classified at their own call sites.
 func retryableStatus(status int) bool {
 	return status == http.StatusTooManyRequests || (status >= 500 && status <= 599)
 }
