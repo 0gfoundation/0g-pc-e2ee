@@ -340,6 +340,73 @@ func TestProxyStreaming(t *testing.T) {
 	}
 }
 
+// A streaming request has stream_options.include_usage forced true by the client
+// before sealing, so the provider always emits a final usage frame even when the
+// caller omitted stream_options entirely. The broker asserts on the opened
+// (decrypted) request to prove the flag survived to the provider as a bound field.
+func TestProxyStreamingForcesIncludeUsage(t *testing.T) {
+	encPriv, encPub, _ := crypto.GenerateRecipientKey()
+	signer := "0x" + strings.Repeat("d", 40)
+
+	gotOpts := make(chan json.RawMessage, 1)
+	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var env wire.Request
+		if err := json.Unmarshal(body, &env); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		e2ee, _ := env.E2EE()
+		out, err := wire.OpenRequest(encPriv, env)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		gotOpts <- out["stream_options"]
+
+		ephPub, _ := base64.RawURLEncoding.DecodeString(e2ee.ClientEphPub)
+		sealer, err := wire.NewResponseSealer(crypto.PublicKey(ephPub))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		frame := wire.Response{"choices": json.RawMessage(`[{"index":0,"delta":{"content":"x"}}]`)}
+		sealed, _ := sealer.SealFrame(frame, nil, true)
+		b, _ := json.Marshal(sealed)
+		_, _ = w.Write([]byte("data: "))
+		_, _ = w.Write(b)
+		_, _ = w.Write([]byte("\n\n"))
+		flusher.Flush()
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		flusher.Flush()
+	}))
+	defer broker.Close()
+
+	client := core.New(core.Provider{URL: broker.URL, EncPubKey: encPub, SignerAddr: signer})
+	proxy := httptest.NewServer(openaiproxy.Handler(client))
+	defer proxy.Close()
+
+	// Caller sets stream:true but no stream_options; the client must add it.
+	userReq := `{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	httpResp, err := http.Post(proxy.URL+"/v1/chat/completions", "application/json", strings.NewReader(userReq))
+	if err != nil {
+		t.Fatalf("post to proxy: %v", err)
+	}
+	defer httpResp.Body.Close()
+	if httpResp.StatusCode != http.StatusOK {
+		t.Fatalf("stream: got %d", httpResp.StatusCode)
+	}
+	_, _ = io.Copy(io.Discard, httpResp.Body) // drain so the handler completes
+
+	// Status 200 means Open succeeded and the handler sent on the buffered channel.
+	opts := <-gotOpts
+	if string(opts) != `{"include_usage":true}` {
+		t.Fatalf("stream_options seen by provider = %s, want {\"include_usage\":true}", opts)
+	}
+}
+
 // WithSealFields lets the operator seal an extra field (here "metadata"); it
 // must reach the broker sealed, not in cleartext, and be recovered on open.
 func TestProxySealsConfiguredExtraField(t *testing.T) {
