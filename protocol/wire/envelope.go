@@ -63,6 +63,12 @@ func DefaultSealedFields() []string {
 // the model actually served comes from the TEE response signature (D4), never
 // from the AAD. The unbound_fields list itself stays bound (it lives in _e2ee),
 // so an intermediary cannot enlarge it to free other fields.
+//
+// TODO(model-binding): including "model" here is a TEMPORARY measure. The 0G
+// router still rewrites "model" in transit, so binding it would fail Open. Once
+// the router stops modifying "model", REVERT this to an empty set (bind
+// everything) so "model" is tamper-evident on the wire again — restoring the
+// original D2 decision (see docs/design/request-envelope-and-integrity.md).
 func DefaultUnboundFields() []string {
 	return []string{"model"}
 }

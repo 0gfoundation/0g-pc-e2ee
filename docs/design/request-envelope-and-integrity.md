@@ -185,12 +185,18 @@ the AEAD) instead of an independently re-canonicalized form, the expensive body
 pass disappears. **Get this right now (pre-launch) — defining it wrong and fixing
 later is a v2 break.** The AAD over the cleartext manifest is unaffected and stays.
 
-### D2 — `model` is unbound by default; trust the served model via the response signature 🆕 (reversed)
+### D2 — `model` is unbound by default (TEMPORARY); trust the served model via the response signature 🆕 (reversed)
+> **Temporary measure.** This reverses the original D2 only because the 0G router
+> currently still rewrites `model` in transit — binding it would fail `Open`.
+> Once the router stops modifying `model`, revert `wire.DefaultUnboundFields` to
+> an empty set so `model` becomes bound (tamper-evident) again, restoring the
+> original decision below.
+
 Originally `model` was kept **bound** so a compromised router could not silently
-downgrade the served model on the wire. That is now **reversed**: `model` ships in
-`wire.DefaultUnboundFields`, so the router may rewrite it in transit (alias
-resolution `glm-5.1` → a provider's canonical id, or picking a fallback candidate)
-without breaking `Open`.
+downgrade the served model on the wire. For now that is **reversed**: `model`
+ships in `wire.DefaultUnboundFields`, so the router may rewrite it in transit
+(alias resolution `glm-5.1` → a provider's canonical id, or picking a fallback
+candidate) without breaking `Open`.
 
 The tradeoff is explicit: an unbound `model` is **not** tamper-evident on the wire
 — the AAD no longer covers it. Trust in the model that actually ran therefore
