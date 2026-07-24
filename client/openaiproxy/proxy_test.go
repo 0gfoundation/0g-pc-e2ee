@@ -117,20 +117,22 @@ func TestProxyEndToEnd(t *testing.T) {
 	}
 }
 
-// A tampered cleartext field (a router downgrading the model) must make the
-// whole call fail rather than silently reach the model.
+// A tampered BOUND cleartext field (here a router altering sampling params) must
+// make the whole call fail rather than silently reach the model. "model" is
+// unbound by default (wire.DefaultUnboundFields) so it is intentionally NOT the
+// field to test here — "temperature" stays bound and remains tamper-evident.
 func TestProxySurfacesTamper(t *testing.T) {
 	encPriv, encPub, _ := crypto.GenerateRecipientKey()
 	signer := "0x" + strings.Repeat("b", 40)
 
-	// A broker in front of which a "router" flips the model after sealing.
+	// A broker in front of which a "router" flips a bound field after sealing.
 	inner := mockBroker(t, encPriv, signer)
 	defer inner.Close()
 	tamperer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		var env wire.Request
 		_ = json.Unmarshal(body, &env)
-		env["model"] = json.RawMessage(`"cheaper-model"`) // tamper in transit
+		env["temperature"] = json.RawMessage(`0.01`) // tamper a bound field in transit
 		b, _ := json.Marshal(env)
 		resp, err := http.Post(inner.URL, "application/json", bytes.NewReader(b))
 		if err != nil {
@@ -147,7 +149,7 @@ func TestProxySurfacesTamper(t *testing.T) {
 	proxy := httptest.NewServer(openaiproxy.Handler(client))
 	defer proxy.Close()
 
-	userReq := `{"model":"gpt-4o","messages":[{"role":"user","content":"the secret prompt"}]}`
+	userReq := `{"model":"gpt-4o","temperature":0.7,"messages":[{"role":"user","content":"the secret prompt"}]}`
 	httpResp, err := http.Post(proxy.URL+"/v1/chat/completions", "application/json", strings.NewReader(userReq))
 	if err != nil {
 		t.Fatalf("post to proxy: %v", err)
@@ -335,6 +337,73 @@ func TestProxyStreaming(t *testing.T) {
 	}
 	if !sawDone {
 		t.Fatal("stream did not end with [DONE]")
+	}
+}
+
+// A streaming request has stream_options.include_usage forced true by the client
+// before sealing, so the provider always emits a final usage frame even when the
+// caller omitted stream_options entirely. The broker asserts on the opened
+// (decrypted) request to prove the flag survived to the provider as a bound field.
+func TestProxyStreamingForcesIncludeUsage(t *testing.T) {
+	encPriv, encPub, _ := crypto.GenerateRecipientKey()
+	signer := "0x" + strings.Repeat("d", 40)
+
+	gotOpts := make(chan json.RawMessage, 1)
+	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var env wire.Request
+		if err := json.Unmarshal(body, &env); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		e2ee, _ := env.E2EE()
+		out, err := wire.OpenRequest(encPriv, env)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		gotOpts <- out["stream_options"]
+
+		ephPub, _ := base64.RawURLEncoding.DecodeString(e2ee.ClientEphPub)
+		sealer, err := wire.NewResponseSealer(crypto.PublicKey(ephPub))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher := w.(http.Flusher)
+		frame := wire.Response{"choices": json.RawMessage(`[{"index":0,"delta":{"content":"x"}}]`)}
+		sealed, _ := sealer.SealFrame(frame, nil, true)
+		b, _ := json.Marshal(sealed)
+		_, _ = w.Write([]byte("data: "))
+		_, _ = w.Write(b)
+		_, _ = w.Write([]byte("\n\n"))
+		flusher.Flush()
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		flusher.Flush()
+	}))
+	defer broker.Close()
+
+	client := core.New(core.Provider{URL: broker.URL, EncPubKey: encPub, SignerAddr: signer})
+	proxy := httptest.NewServer(openaiproxy.Handler(client))
+	defer proxy.Close()
+
+	// Caller sets stream:true but no stream_options; the client must add it.
+	userReq := `{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	httpResp, err := http.Post(proxy.URL+"/v1/chat/completions", "application/json", strings.NewReader(userReq))
+	if err != nil {
+		t.Fatalf("post to proxy: %v", err)
+	}
+	defer httpResp.Body.Close()
+	if httpResp.StatusCode != http.StatusOK {
+		t.Fatalf("stream: got %d", httpResp.StatusCode)
+	}
+	_, _ = io.Copy(io.Discard, httpResp.Body) // drain so the handler completes
+
+	// Status 200 means Open succeeded and the handler sent on the buffered channel.
+	opts := <-gotOpts
+	if string(opts) != `{"include_usage":true}` {
+		t.Fatalf("stream_options seen by provider = %s, want {\"include_usage\":true}", opts)
 	}
 }
 

@@ -36,6 +36,19 @@ func TestNewDefaultsSealFields(t *testing.T) {
 	}
 }
 
+func TestNewDefaultsUnboundFields(t *testing.T) {
+	if got := New(Provider{}).unboundFields; !reflect.DeepEqual(got, wire.DefaultUnboundFields()) {
+		t.Fatalf("default unbound fields = %v, want %v", got, wire.DefaultUnboundFields())
+	}
+}
+
+func TestWithUnboundFieldsOverrides(t *testing.T) {
+	c := New(Provider{}, WithUnboundFields([]string{"x_0g_trace"}))
+	if got := c.unboundFields; !reflect.DeepEqual(got, []string{"x_0g_trace"}) {
+		t.Fatalf("unbound fields = %v, want [x_0g_trace]", got)
+	}
+}
+
 func TestResolveErr(t *testing.T) {
 	// A plain (non-*Error) resolver failure is wrapped as an upstream error.
 	plain := resolveErr(errors.New("dns boom"))
@@ -51,6 +64,69 @@ func TestResolveErr(t *testing.T) {
 	staged := &Error{Stage: StageRequest, Err: errors.New("no model")}
 	if got := resolveErr(staged); got != staged {
 		t.Errorf("staged error not passed through: got %v", got)
+	}
+}
+
+func TestWithStreamUsage(t *testing.T) {
+	cases := []struct {
+		name string
+		req  wire.Request
+		want string // expected stream_options JSON, "" = field must be absent
+	}{
+		{
+			name: "no stream field",
+			req:  wire.Request{"messages": json.RawMessage(`[]`)},
+			want: "",
+		},
+		{
+			name: "stream false",
+			req:  wire.Request{"stream": json.RawMessage(`false`)},
+			want: "",
+		},
+		{
+			name: "non-boolean stream left alone",
+			req:  wire.Request{"stream": json.RawMessage(`"yes"`)},
+			want: "",
+		},
+		{
+			name: "stream true adds options",
+			req:  wire.Request{"stream": json.RawMessage(`true`)},
+			want: `{"include_usage":true}`,
+		},
+		{
+			name: "existing options preserved, include_usage forced",
+			req: wire.Request{
+				"stream":         json.RawMessage(`true`),
+				"stream_options": json.RawMessage(`{"include_usage":false,"foo":1}`),
+			},
+			want: `{"foo":1,"include_usage":true}`, // map marshal sorts keys
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := withStreamUsage(tc.req)
+			got, present := out["stream_options"]
+			if tc.want == "" {
+				if present {
+					t.Fatalf("stream_options should be absent, got %s", got)
+				}
+				return
+			}
+			if !present {
+				t.Fatalf("stream_options missing, want %s", tc.want)
+			}
+			if string(got) != tc.want {
+				t.Fatalf("stream_options = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWithStreamUsageDoesNotMutateCaller(t *testing.T) {
+	req := wire.Request{"stream": json.RawMessage(`true`)}
+	_ = withStreamUsage(req)
+	if _, present := req["stream_options"]; present {
+		t.Fatal("withStreamUsage mutated the caller's request")
 	}
 }
 

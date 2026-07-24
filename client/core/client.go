@@ -112,9 +112,10 @@ type Provider struct {
 // gateway. New wraps a single fixed provider in a static resolver, the low-level
 // case for a caller that already holds a provider identity.
 type Client struct {
-	resolver   Resolver
-	sealFields []string
-	http       *http.Client
+	resolver      Resolver
+	sealFields    []string
+	unboundFields []string
+	http          *http.Client
 }
 
 // Option customizes a Client.
@@ -134,11 +135,26 @@ func WithSealFields(fields []string) Option {
 	return func(c *Client) { c.sealFields = slices.Clone(fields) }
 }
 
+// WithUnboundFields overrides the set of cleartext request fields excluded from
+// the AAD (SPEC §5.2) — the fields an intermediary may add, modify, or remove in
+// transit without breaking Open. Their values are NOT authenticated by the
+// transport crypto (D4); trust must come from elsewhere (the TEE signature).
+//
+// The set must satisfy wire.ValidateUnboundFields (no duplicates, no reserved
+// _e2ee key, disjoint from the sealed set). It is not validated here: SealRequest
+// enforces it per request. Pass an empty (non-nil) slice to bind every cleartext
+// field. Defaults to wire.DefaultUnboundFields when unset.
+func WithUnboundFields(fields []string) Option {
+	// Clone so a later mutation of the caller's slice cannot alter this config.
+	return func(c *Client) { c.unboundFields = slices.Clone(fields) }
+}
+
 // New returns a Client that seals every request to one fixed provider — the
 // low-level static case (tests, or direct-seal to a provider already known and
 // verified). The shipped server forms use NewWithResolver with the route
 // resolver instead. An empty Provider.URL defaults to DefaultProviderURL; the
-// sealed-field set defaults to wire.DefaultSealedFields.
+// sealed-field set defaults to wire.DefaultSealedFields and the unbound-field set
+// to wire.DefaultUnboundFields.
 func New(p Provider, opts ...Option) *Client {
 	if p.URL == "" {
 		p.URL = DefaultProviderURL
@@ -148,7 +164,8 @@ func New(p Provider, opts ...Option) *Client {
 
 // NewWithResolver returns a Client that picks the provider per request via r
 // (the gateway's route mode: ask the router, then fetch the chosen provider's
-// enc key). The sealed-field set defaults to wire.DefaultSealedFields.
+// enc key). The sealed-field set defaults to wire.DefaultSealedFields and the
+// unbound-field set to wire.DefaultUnboundFields.
 func NewWithResolver(r Resolver, opts ...Option) *Client {
 	// Clone the default transport (keeps env proxy, dial timeout, keepalives) and
 	// bound the wait for response headers via ResponseHeaderTimeout. No blunt
@@ -156,9 +173,10 @@ func NewWithResolver(r Resolver, opts ...Option) *Client {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.ResponseHeaderTimeout = providerTimeout
 	c := &Client{
-		resolver:   r,
-		sealFields: wire.DefaultSealedFields(),
-		http:       &http.Client{Transport: tr},
+		resolver:      r,
+		sealFields:    wire.DefaultSealedFields(),
+		unboundFields: wire.DefaultUnboundFields(),
+		http:          &http.Client{Transport: tr},
 	}
 	for _, o := range opts {
 		o(c)
@@ -356,12 +374,59 @@ func (c *Client) doRequest(ctx context.Context, provider Provider, env wire.Requ
 
 // seal builds the sealed envelope for one provider: it writes the provider's
 // canonical model into the cleartext "model" (so the request names the model
-// this specific candidate serves — the preview chain is heterogeneous), then
-// seals the sensitive fields to the provider's enc key. Called once per fallback
-// attempt because the canonical model and enc key differ per candidate.
+// this specific candidate serves — the preview chain is heterogeneous), forces
+// usage reporting on a streaming request, then seals the sensitive fields to the
+// provider's enc key. Called once per fallback attempt because the canonical
+// model and enc key differ per candidate.
 func (c *Client) seal(provider Provider, req wire.Request, ephPub []byte) (wire.Request, error) {
 	req = withModel(req, provider.Model)
-	return wire.SealRequest(provider.EncPubKey, req, c.sealedFieldsFor(req), provider.SignerAddr, ephPub)
+	req = withStreamUsage(req)
+	return wire.SealRequest(provider.EncPubKey, req, c.sealedFieldsFor(req), provider.SignerAddr, ephPub, c.unboundFields...)
+}
+
+// withStreamUsage forces "stream_options":{"include_usage":true} on a streaming
+// request (one with "stream": true), so the provider emits a final usage frame —
+// the token counts the caller needs for billing/metrics, which OpenAI otherwise
+// omits from a stream. It is a no-op when the request is not streaming.
+//
+// Setting it client-side before sealing keeps "stream_options" a bound field
+// (tamper-evident), the approach preferred over listing it as unbound. Any other
+// keys the caller put in "stream_options" are preserved; only include_usage is
+// overridden. The map is shallow-copied (like withModel) so the caller's request
+// is never mutated across fallback attempts.
+func withStreamUsage(req wire.Request) wire.Request {
+	// Only act on a streaming request. A present-but-non-boolean "stream" is left
+	// for the proxy/provider to reject; treat it as non-streaming here so a
+	// malformed value never gets usage options grafted onto it.
+	raw, ok := req["stream"]
+	if !ok {
+		return req
+	}
+	var stream bool
+	if err := json.Unmarshal(raw, &stream); err != nil || !stream {
+		return req
+	}
+
+	// Merge onto any existing stream_options, overriding include_usage to true. A
+	// malformed stream_options unmarshals to an empty map and is replaced — the
+	// forced flag still lands, and the provider would have rejected it anyway.
+	opts := map[string]json.RawMessage{}
+	if rawOpts, ok := req["stream_options"]; ok {
+		_ = json.Unmarshal(rawOpts, &opts)
+	}
+	opts["include_usage"] = json.RawMessage(`true`)
+	merged, err := json.Marshal(opts)
+	if err != nil {
+		// These values always marshal; treat the impossible case as "leave as-is".
+		return req
+	}
+
+	out := make(wire.Request, len(req)+1)
+	for k, v := range req {
+		out[k] = v
+	}
+	out["stream_options"] = merged
+	return out
 }
 
 // withModel returns req with its cleartext "model" set to model, leaving req
