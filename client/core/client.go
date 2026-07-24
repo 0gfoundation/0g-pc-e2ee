@@ -374,12 +374,59 @@ func (c *Client) doRequest(ctx context.Context, provider Provider, env wire.Requ
 
 // seal builds the sealed envelope for one provider: it writes the provider's
 // canonical model into the cleartext "model" (so the request names the model
-// this specific candidate serves — the preview chain is heterogeneous), then
-// seals the sensitive fields to the provider's enc key. Called once per fallback
-// attempt because the canonical model and enc key differ per candidate.
+// this specific candidate serves — the preview chain is heterogeneous), forces
+// usage reporting on a streaming request, then seals the sensitive fields to the
+// provider's enc key. Called once per fallback attempt because the canonical
+// model and enc key differ per candidate.
 func (c *Client) seal(provider Provider, req wire.Request, ephPub []byte) (wire.Request, error) {
 	req = withModel(req, provider.Model)
+	req = withStreamUsage(req)
 	return wire.SealRequest(provider.EncPubKey, req, c.sealedFieldsFor(req), provider.SignerAddr, ephPub, c.unboundFields...)
+}
+
+// withStreamUsage forces "stream_options":{"include_usage":true} on a streaming
+// request (one with "stream": true), so the provider emits a final usage frame —
+// the token counts the caller needs for billing/metrics, which OpenAI otherwise
+// omits from a stream. It is a no-op when the request is not streaming.
+//
+// Setting it client-side before sealing keeps "stream_options" a bound field
+// (tamper-evident), the approach preferred over listing it as unbound. Any other
+// keys the caller put in "stream_options" are preserved; only include_usage is
+// overridden. The map is shallow-copied (like withModel) so the caller's request
+// is never mutated across fallback attempts.
+func withStreamUsage(req wire.Request) wire.Request {
+	// Only act on a streaming request. A present-but-non-boolean "stream" is left
+	// for the proxy/provider to reject; treat it as non-streaming here so a
+	// malformed value never gets usage options grafted onto it.
+	raw, ok := req["stream"]
+	if !ok {
+		return req
+	}
+	var stream bool
+	if err := json.Unmarshal(raw, &stream); err != nil || !stream {
+		return req
+	}
+
+	// Merge onto any existing stream_options, overriding include_usage to true. A
+	// malformed stream_options unmarshals to an empty map and is replaced — the
+	// forced flag still lands, and the provider would have rejected it anyway.
+	opts := map[string]json.RawMessage{}
+	if rawOpts, ok := req["stream_options"]; ok {
+		_ = json.Unmarshal(rawOpts, &opts)
+	}
+	opts["include_usage"] = json.RawMessage(`true`)
+	merged, err := json.Marshal(opts)
+	if err != nil {
+		// These values always marshal; treat the impossible case as "leave as-is".
+		return req
+	}
+
+	out := make(wire.Request, len(req)+1)
+	for k, v := range req {
+		out[k] = v
+	}
+	out["stream_options"] = merged
+	return out
 }
 
 // withModel returns req with its cleartext "model" set to model, leaving req

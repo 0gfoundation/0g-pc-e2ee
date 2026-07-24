@@ -67,6 +67,69 @@ func TestResolveErr(t *testing.T) {
 	}
 }
 
+func TestWithStreamUsage(t *testing.T) {
+	cases := []struct {
+		name string
+		req  wire.Request
+		want string // expected stream_options JSON, "" = field must be absent
+	}{
+		{
+			name: "no stream field",
+			req:  wire.Request{"messages": json.RawMessage(`[]`)},
+			want: "",
+		},
+		{
+			name: "stream false",
+			req:  wire.Request{"stream": json.RawMessage(`false`)},
+			want: "",
+		},
+		{
+			name: "non-boolean stream left alone",
+			req:  wire.Request{"stream": json.RawMessage(`"yes"`)},
+			want: "",
+		},
+		{
+			name: "stream true adds options",
+			req:  wire.Request{"stream": json.RawMessage(`true`)},
+			want: `{"include_usage":true}`,
+		},
+		{
+			name: "existing options preserved, include_usage forced",
+			req: wire.Request{
+				"stream":         json.RawMessage(`true`),
+				"stream_options": json.RawMessage(`{"include_usage":false,"foo":1}`),
+			},
+			want: `{"foo":1,"include_usage":true}`, // map marshal sorts keys
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := withStreamUsage(tc.req)
+			got, present := out["stream_options"]
+			if tc.want == "" {
+				if present {
+					t.Fatalf("stream_options should be absent, got %s", got)
+				}
+				return
+			}
+			if !present {
+				t.Fatalf("stream_options missing, want %s", tc.want)
+			}
+			if string(got) != tc.want {
+				t.Fatalf("stream_options = %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestWithStreamUsageDoesNotMutateCaller(t *testing.T) {
+	req := wire.Request{"stream": json.RawMessage(`true`)}
+	_ = withStreamUsage(req)
+	if _, present := req["stream_options"]; present {
+		t.Fatal("withStreamUsage mutated the caller's request")
+	}
+}
+
 func TestSealedFieldsForFiltersByPresence(t *testing.T) {
 	c := New(Provider{}, WithSealFields([]string{"messages", "tools", "metadata"}))
 	req := wire.Request{
