@@ -143,6 +143,34 @@ controlled only by that enclave?"**
 
 ### 6.1 Mechanism
 
+> **Deployment decision (resolved).** The cert binding that point 2 asks for is
+> **supplied by dstack-ingress's `/evidences`, not by a self-issued gateway
+> quote.** The gateway runs in one dstack app (one CVM) behind dstack-ingress
+> (see `deploy/phala/docker-compose.yml`), whose `/evidences` quote has
+> `report_data = SHA-256(sha256sum.txt)` covering the served certificate, and an
+> RTMR chain committing to `app_id = SHA-256(the whole app-compose)` — recovered
+> by replaying the event log against the verified quote, per §4's note in
+> `protocol/attest/dstack.go`, *not* read out of a measurement register. Because
+> `app_id` covers the whole compose, it attests **both** containers (ingress +
+> gateway) at once.
+>
+> What that quote proves is "a CVM running exactly this app-compose obtained this
+> certificate inside the TEE". Getting from there to "the endpoint I am talking to
+> is that CVM" needs one step the quote cannot carry: the verifier's own handshake
+> with the domain, compared against `cert-<DOMAIN>.pem` in the bundle (the CAA
+> record dstack-ingress pins to its own ACME account is what stops a third party
+> obtaining a different cert for the name). So this closes point 2 and moves point
+> 1 rather than deleting it: the artifact exists, but it is **not** consumable by
+> §4's `protocol/attest` path as written. That parser expects
+> `enc_pub‖signer_addr‖version` in `report_data` and fails closed on anything
+> else, so verifying `/evidences` needs a second verifier, which is still to be
+> written.
+>
+> The gateway therefore needs no cert-binding quote of its own; its `/quote` route
+> remains a 501 stub (issue #19). A gateway quote is still required if it ever
+> binds a *distinct* value the cert quote cannot carry — e.g. its own per-response
+> signing key (point 5 below).
+
 1. **Quote API** (like the broker's): the gateway exposes its attestation quote
    / RA report. Reuses the §4 (`protocol/attest`, issue #7) verification path.
 2. **Bind the TLS cert key into the quote**: put a hash of the enclave's TLS
@@ -188,10 +216,20 @@ TEE-controlled, keeping the key in the enclave, doing this across a scaled fleet
 — are exactly what **dstack** (the runtime the broker already uses) provides as
 managed features:
 
-- **ZT-HTTPS / Zero-Trust TLS**: dstack-gateway terminates TLS inside a TEE,
-  auto-provisions ACME certs, and cryptographically proves the cert is
-  controlled only by the verified TEE app; the private key never leaves the TEE
-  (keys derived via dstack-kms). **[verify]**
+- **ZT-HTTPS / Zero-Trust TLS**: dstack-gateway terminates TLS inside a TEE and
+  auto-provisions ACME certs, on the platform hostname
+  `<app-id>-<port>.<base_domain>`. **Verified, with a caveat that decided the
+  deployment:** the cert it serves is a *shared cluster wildcard*
+  (`CN=*.<base_domain>`), so it proves the **gateway app** controls it — nothing
+  about *our* app. The only link from the TLS session to our measured code is that
+  the hostname carries our `app_id` and the gateway routes by it, i.e. trust in
+  the platform's routing rather than a cryptographic binding.
+- **What we deploy instead**: dstack-ingress inside our own CVM, on our own
+  domain, with dstack-gateway doing **L4 passthrough** (the `…-<port>s` form, and
+  the default for any SNI the gateway holds no cert for). TLS then terminates in
+  *our* enclave and the cert is bound to *our* `app_id` (§6.1). One platform-side
+  prerequisite: the host front end forwards only SNI suffixes Phala has
+  allowlisted. See `deploy/phala/README.md`.
 - **Fleet + LB**: dstack load-balances across replicas by app id, with TLS
   passthrough available — so the "which instance holds the key" routing problem
   is handled by the runtime rather than by us. **[verify]**
@@ -228,7 +266,8 @@ tier 2.5. So:
   remaining value is centralizing routing or reachability (e.g. browsers that
   cannot reach provider endpoints directly due to CORS / network).
 - **Client is a plain browser and tier 2.5 is acceptable** → the gateway is
-  worth it, and this design (dstack ZT-HTTPS + out-of-band validation) is how.
+  worth it, and this design (in-CVM TLS via dstack-ingress on our own domain, §7,
+  + out-of-band validation) is how.
 
 Do not host the gateway expecting it to *increase* privacy over direct-seal; it
 does not.
@@ -239,19 +278,26 @@ does not.
   gateway→provider hop.
 - Reuses **`protocol/wire`** for sealing to the provider and opening the sealed
   response.
-- Depends on **`protocol/attest`** (issue #7) for the quote the gateway exposes
-  and (for tier-3 clients) for verifying it.
+- Depends on **`protocol/attest`** (issue #7) for quote verification on the
+  gateway→provider hop. The gateway's *own* cert-binding quote comes from
+  dstack-ingress's `/evidences` (§6.1), whose `report_data` layout `attest` does
+  not currently parse; that verifier is still to be written.
 - The **router** must accept the sealed request (0g-router#618) regardless of
   which client form produced it; the gateway is just another such client.
 
 ## 10. Phasing
 
-1. **Gateway = the shared sidecar handler (`openaiproxy`) in a dstack CVM** with
-   ZT-HTTPS (TLS in the TEE). 0-code inference works; validation not yet
-   published. (Tier "2, un-auditable" — internal / testing only.)
-2. **Quote API + cert-key binding in `report_data` + per-request response
-   signature.** An operator/CLI can now validate out of band, and each response
-   is individually auditable. (Tier 2.5.)
+1. **Gateway = the shared sidecar handler (`openaiproxy`) in a dstack CVM**, TLS
+   terminated in that CVM by dstack-ingress on our own domain (§7,
+   `deploy/phala/`). 0-code inference works, and the cert-binding quote is already
+   published at `/evidences/` — but nothing consumes it yet, so validation is
+   still manual. (Tier "2, un-auditable" until step 2 — internal / testing only.)
+2. **A verifier for that quote + per-request response signature.** The cert
+   binding itself is done (§6.1); what is missing is code that checks it —
+   DCAP-verify `/evidences/quote.json`, recompute `report_data`, and compare the
+   served cert against the bundle — plus the gateway's own signing key, which
+   *does* need a quote of its own. An operator/CLI can then validate out of band
+   and each response is individually auditable. (Tier 2.5.)
 3. **Publish `measurement ↔ cert` (transparency log / on-chain) + monitoring**,
    so cheating is publicly detectable without per-user effort.
 4. **Optional tier-3 path**: a WASM verify+seal SDK for clients that want
