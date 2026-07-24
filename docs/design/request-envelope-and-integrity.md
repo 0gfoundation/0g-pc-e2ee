@@ -15,7 +15,7 @@ and is a companion to [`router-e2e.md`](./router-e2e.md) (which covers the
 |---|---|---|
 | **D0** | Router blind to prompt/completion; seal boundary is client↔provider | ✅ decided (§7 relocation is follow-up work) |
 | **D1** | Sealed body is not JCS'd; §8 content hash binds the on-wire bytes (`aad ‖ ciphertext`), not a re-derived canonical form | ✅ **implemented** (SPEC §6–§8; `wire`) — §8 signing itself lives in the broker |
-| **D2** | `model` stays bound; alias resolution at an endpoint (client pre-seal / enclave post-open) | ✅ decided (endpoint work is follow-up) |
+| **D2** | ~~`model` stays bound~~ → **`model` is unbound by default** (`wire.DefaultUnboundFields`): the router may rewrite it (alias resolution / fallback) in transit; trust in the served model comes from the TEE response signature (D4), not the AAD. A deployment can re-bind it via `core.WithUnboundFields`. | ✅ **implemented** (reversed) |
 | **D3** | AAD binds all except a declared `unbound_fields` denylist (fail-closed) | ✅ **implemented** (`wire`, SPEC §5.2) |
 | **D4** | `unbound_fields` is authenticated; unbound field values are untrusted (trust via signature) | ✅ **implemented** |
 | **D5** | Response envelope mirrors D3/D4 | ✅ **implemented** |
@@ -77,11 +77,16 @@ only Go ships today.
 | Category | Examples | Router can read? | Router can modify? | Who trusts the value |
 |---|---|---|---|---|
 | **① Sealed** (encrypted) | `messages`, `tools` | no (only after `Open`) | no — tamper → tag fails | fully trusted |
-| **② Cleartext + bound** (default) | `model`, `temperature`, `max_tokens`, `stream` | yes (routing / billing) | no — tamper → AAD fails closed | fully trusted |
-| **③ Cleartext + unbound** 🆕 (listed in `unbound_fields`) | `x_0g_trace`, `route_options` | yes | **yes** — freely | **not trusted** — trust must come from elsewhere (the TEE signature), never from the AAD |
+| **② Cleartext + bound** (default) | `temperature`, `max_tokens`, `stream` | yes (routing / billing) | no — tamper → AAD fails closed | fully trusted |
+| **③ Cleartext + unbound** 🆕 (listed in `unbound_fields`) | `model`, `x_0g_trace`, `route_options` | yes | **yes** — freely | **not trusted** — trust must come from elsewhere (the TEE signature), never from the AAD |
 
-`model` stays in **②** (see D2): the router may *read* it to route but not
-rewrite it; alias resolution moves to an endpoint inside the trust boundary.
+`model` is in **③** by default (`wire.DefaultUnboundFields`): the router may both
+*read* it to route and *rewrite* it in transit — resolving an alias or picking a
+fallback candidate — without breaking `Open`. Because it is unbound it is
+**untrusted by the transport crypto**; trust in the model actually served comes
+from the TEE response signature (D4), never from the AAD. A deployment that needs
+`model` tamper-evident on the wire can bind it by dropping it from the unbound set
+(`core.WithUnboundFields`).
 
 Category ③ is the new construct. Its members are, by definition, unauthenticated
 by the transport crypto — so nothing security-relevant may depend on them.
@@ -180,12 +185,19 @@ the AEAD) instead of an independently re-canonicalized form, the expensive body
 pass disappears. **Get this right now (pre-launch) — defining it wrong and fixing
 later is a v2 break.** The AAD over the cleartext manifest is unaffected and stays.
 
-### D2 — `model` stays bound; alias resolution moves to an endpoint 🆕
-Letting the router rewrite `model` would let a compromised router silently
-downgrade the served model, undetectably — fatal for a verifiable-inference
-product. Keep `model` in category ②. Resolve aliases (`glm-5.1` → provider's
-canonical model id) **client-side before sealing** or **in the enclave after
-`Open`**, never at the router. The response signature attests what actually ran.
+### D2 — `model` is unbound by default; trust the served model via the response signature 🆕 (reversed)
+Originally `model` was kept **bound** so a compromised router could not silently
+downgrade the served model on the wire. That is now **reversed**: `model` ships in
+`wire.DefaultUnboundFields`, so the router may rewrite it in transit (alias
+resolution `glm-5.1` → a provider's canonical id, or picking a fallback candidate)
+without breaking `Open`.
+
+The tradeoff is explicit: an unbound `model` is **not** tamper-evident on the wire
+— the AAD no longer covers it. Trust in the model that actually ran therefore
+comes **only** from the TEE response signature (D4), which attests what the
+enclave executed; it must never be inferred from the request's cleartext `model`.
+A deployment that wants `model` bound on the wire re-binds it by dropping it from
+the unbound set (`core.WithUnboundFields`, or the `-unbound-fields` flag).
 
 ### D3 — AAD binds everything except a declared unbound set (denylist, not allowlist) 🆕
 Choose **bind-all-except** over **bind-only-these**. Rationale:

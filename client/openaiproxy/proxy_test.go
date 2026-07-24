@@ -117,20 +117,22 @@ func TestProxyEndToEnd(t *testing.T) {
 	}
 }
 
-// A tampered cleartext field (a router downgrading the model) must make the
-// whole call fail rather than silently reach the model.
+// A tampered BOUND cleartext field (here a router altering sampling params) must
+// make the whole call fail rather than silently reach the model. "model" is
+// unbound by default (wire.DefaultUnboundFields) so it is intentionally NOT the
+// field to test here — "temperature" stays bound and remains tamper-evident.
 func TestProxySurfacesTamper(t *testing.T) {
 	encPriv, encPub, _ := crypto.GenerateRecipientKey()
 	signer := "0x" + strings.Repeat("b", 40)
 
-	// A broker in front of which a "router" flips the model after sealing.
+	// A broker in front of which a "router" flips a bound field after sealing.
 	inner := mockBroker(t, encPriv, signer)
 	defer inner.Close()
 	tamperer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		var env wire.Request
 		_ = json.Unmarshal(body, &env)
-		env["model"] = json.RawMessage(`"cheaper-model"`) // tamper in transit
+		env["temperature"] = json.RawMessage(`0.01`) // tamper a bound field in transit
 		b, _ := json.Marshal(env)
 		resp, err := http.Post(inner.URL, "application/json", bytes.NewReader(b))
 		if err != nil {
@@ -147,7 +149,7 @@ func TestProxySurfacesTamper(t *testing.T) {
 	proxy := httptest.NewServer(openaiproxy.Handler(client))
 	defer proxy.Close()
 
-	userReq := `{"model":"gpt-4o","messages":[{"role":"user","content":"the secret prompt"}]}`
+	userReq := `{"model":"gpt-4o","temperature":0.7,"messages":[{"role":"user","content":"the secret prompt"}]}`
 	httpResp, err := http.Post(proxy.URL+"/v1/chat/completions", "application/json", strings.NewReader(userReq))
 	if err != nil {
 		t.Fatalf("post to proxy: %v", err)

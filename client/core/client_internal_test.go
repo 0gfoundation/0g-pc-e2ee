@@ -36,6 +36,19 @@ func TestNewDefaultsSealFields(t *testing.T) {
 	}
 }
 
+func TestNewDefaultsUnboundFields(t *testing.T) {
+	if got := New(Provider{}).unboundFields; !reflect.DeepEqual(got, wire.DefaultUnboundFields()) {
+		t.Fatalf("default unbound fields = %v, want %v", got, wire.DefaultUnboundFields())
+	}
+}
+
+func TestWithUnboundFieldsOverrides(t *testing.T) {
+	c := New(Provider{}, WithUnboundFields([]string{"x_0g_trace"}))
+	if got := c.unboundFields; !reflect.DeepEqual(got, []string{"x_0g_trace"}) {
+		t.Fatalf("unbound fields = %v, want [x_0g_trace]", got)
+	}
+}
+
 func TestResolveErr(t *testing.T) {
 	// A plain (non-*Error) resolver failure is wrapped as an upstream error.
 	plain := resolveErr(errors.New("dns boom"))

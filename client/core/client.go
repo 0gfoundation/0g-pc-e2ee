@@ -112,9 +112,10 @@ type Provider struct {
 // gateway. New wraps a single fixed provider in a static resolver, the low-level
 // case for a caller that already holds a provider identity.
 type Client struct {
-	resolver   Resolver
-	sealFields []string
-	http       *http.Client
+	resolver      Resolver
+	sealFields    []string
+	unboundFields []string
+	http          *http.Client
 }
 
 // Option customizes a Client.
@@ -134,11 +135,26 @@ func WithSealFields(fields []string) Option {
 	return func(c *Client) { c.sealFields = slices.Clone(fields) }
 }
 
+// WithUnboundFields overrides the set of cleartext request fields excluded from
+// the AAD (SPEC §5.2) — the fields an intermediary may add, modify, or remove in
+// transit without breaking Open. Their values are NOT authenticated by the
+// transport crypto (D4); trust must come from elsewhere (the TEE signature).
+//
+// The set must satisfy wire.ValidateUnboundFields (no duplicates, no reserved
+// _e2ee key, disjoint from the sealed set). It is not validated here: SealRequest
+// enforces it per request. Pass an empty (non-nil) slice to bind every cleartext
+// field. Defaults to wire.DefaultUnboundFields when unset.
+func WithUnboundFields(fields []string) Option {
+	// Clone so a later mutation of the caller's slice cannot alter this config.
+	return func(c *Client) { c.unboundFields = slices.Clone(fields) }
+}
+
 // New returns a Client that seals every request to one fixed provider — the
 // low-level static case (tests, or direct-seal to a provider already known and
 // verified). The shipped server forms use NewWithResolver with the route
 // resolver instead. An empty Provider.URL defaults to DefaultProviderURL; the
-// sealed-field set defaults to wire.DefaultSealedFields.
+// sealed-field set defaults to wire.DefaultSealedFields and the unbound-field set
+// to wire.DefaultUnboundFields.
 func New(p Provider, opts ...Option) *Client {
 	if p.URL == "" {
 		p.URL = DefaultProviderURL
@@ -148,7 +164,8 @@ func New(p Provider, opts ...Option) *Client {
 
 // NewWithResolver returns a Client that picks the provider per request via r
 // (the gateway's route mode: ask the router, then fetch the chosen provider's
-// enc key). The sealed-field set defaults to wire.DefaultSealedFields.
+// enc key). The sealed-field set defaults to wire.DefaultSealedFields and the
+// unbound-field set to wire.DefaultUnboundFields.
 func NewWithResolver(r Resolver, opts ...Option) *Client {
 	// Clone the default transport (keeps env proxy, dial timeout, keepalives) and
 	// bound the wait for response headers via ResponseHeaderTimeout. No blunt
@@ -156,9 +173,10 @@ func NewWithResolver(r Resolver, opts ...Option) *Client {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.ResponseHeaderTimeout = providerTimeout
 	c := &Client{
-		resolver:   r,
-		sealFields: wire.DefaultSealedFields(),
-		http:       &http.Client{Transport: tr},
+		resolver:      r,
+		sealFields:    wire.DefaultSealedFields(),
+		unboundFields: wire.DefaultUnboundFields(),
+		http:          &http.Client{Transport: tr},
 	}
 	for _, o := range opts {
 		o(c)
@@ -361,7 +379,7 @@ func (c *Client) doRequest(ctx context.Context, provider Provider, env wire.Requ
 // attempt because the canonical model and enc key differ per candidate.
 func (c *Client) seal(provider Provider, req wire.Request, ephPub []byte) (wire.Request, error) {
 	req = withModel(req, provider.Model)
-	return wire.SealRequest(provider.EncPubKey, req, c.sealedFieldsFor(req), provider.SignerAddr, ephPub)
+	return wire.SealRequest(provider.EncPubKey, req, c.sealedFieldsFor(req), provider.SignerAddr, ephPub, c.unboundFields...)
 }
 
 // withModel returns req with its cleartext "model" set to model, leaving req

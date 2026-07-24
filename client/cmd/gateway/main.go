@@ -38,11 +38,16 @@ func main() {
 	listen := flag.String("listen", ":8443", "address to listen on")
 	routerURL := flag.String("router-url", route.DefaultRouterURL, "0G router base URL/domain (the route-preview path is appended)")
 	sealFieldsCSV := flag.String("seal-fields", strings.Join(wire.DefaultSealedFields(), ","), "comma-separated request fields to seal (must include \"messages\")")
+	unboundFieldsCSV := flag.String("unbound-fields", strings.Join(wire.DefaultUnboundFields(), ","), "comma-separated cleartext fields excluded from the AAD (intermediary-mutable, untrusted); empty binds everything")
 	flag.Parse()
 
 	sealFields := parseCSV(*sealFieldsCSV)
 	if err := wire.ValidateSealedFields(sealFields); err != nil {
 		log.Fatalf("invalid -seal-fields: %v", err)
+	}
+	unboundFields := parseCSV(*unboundFieldsCSV)
+	if err := wire.ValidateUnboundFields(unboundFields, sealFields); err != nil {
+		log.Fatalf("invalid -unbound-fields: %v", err)
 	}
 
 	// The gateway holds no pinned provider: it routes per request and derives the
@@ -54,7 +59,7 @@ func main() {
 	router := route.New(*routerURL,
 		route.WithSensitiveFields(sealFields),
 	)
-	client := core.NewWithResolver(router, core.WithSealFields(sealFields))
+	client := core.NewWithResolver(router, core.WithSealFields(sealFields), core.WithUnboundFields(unboundFields))
 
 	srv := &http.Server{
 		Addr:              *listen,
