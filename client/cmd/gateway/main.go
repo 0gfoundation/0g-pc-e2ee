@@ -14,23 +14,27 @@
 // X-0G-Provider-Address routing header, which the gateway forwards to the router
 // so preview returns that provider.
 //
-// Attestation (the /quote body and per-response signature; issue #19, on
-// protocol/attest / issue #7) and multi-tenant concerns (auth, billing, rate
-// limiting; issue #20) are later steps; /quote is a stub until then. Trusting
-// the router's returned endpoint (vs resolving it on chain) is tracked in
-// issue #18.
+// The gateway also exposes its own attestation quote at GET /quote (design §6,
+// phase 2) so an out-of-band validator can confirm the endpoint is a genuine
+// enclave. Per-response signatures (issue #19) and multi-tenant concerns (auth,
+// billing, rate limiting; issue #20) are later steps. Trusting the router's
+// returned endpoint (vs resolving it on chain) is tracked in issue #18.
 package main
 
 import (
+	"crypto/x509"
+	"encoding/pem"
 	"flag"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 	"github.com/0gfoundation/0g-pc-e2ee/client/route"
+	"github.com/0gfoundation/0g-pc-e2ee/client/tee"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
@@ -39,6 +43,9 @@ func main() {
 	routerURL := flag.String("router-url", route.DefaultRouterURL, "0G router base URL/domain (the route-preview path is appended)")
 	routeType := flag.String("route-type", route.DefaultType, "inference kind sent to the route-preview API")
 	sealFieldsCSV := flag.String("seal-fields", strings.Join(wire.DefaultSealedFields(), ","), "comma-separated request fields to seal (must include \"messages\")")
+	teeMode := flag.String("tee", "", `attestor for GET /quote (required): "dstack" (in-enclave tappd socket) or "mock" (dev only, INSECURE fake quotes)`)
+	dstackSocket := flag.String("dstack-socket", tee.DefaultDstackSocket, "dstack tappd unix socket (tee=dstack)")
+	tlsCertPath := flag.String("tls-cert", "", "PEM file of the enclave TLS certificate to bind into the quote's report_data (design §6.1.2)")
 	flag.Parse()
 
 	sealFields := parseCSV(*sealFieldsCSV)
@@ -56,9 +63,14 @@ func main() {
 	)
 	client := core.NewWithResolver(router, core.WithSealFields(sealFields))
 
+	quote, err := newQuoteHandler(*teeMode, *dstackSocket, *tlsCertPath)
+	if err != nil {
+		log.Fatalf("attestation: %v", err)
+	}
+
 	srv := &http.Server{
 		Addr:              *listen,
-		Handler:           newHandler(client),
+		Handler:           newHandler(client, quote),
 		ReadHeaderTimeout: 10 * time.Second, // mitigate slow-header (Slowloris) clients
 	}
 	// TLS is terminated by the dstack ZT-HTTPS front end inside the enclave, so
@@ -73,22 +85,71 @@ func main() {
 // newHandler mounts the shared OpenAI proxy plus the gateway-only operational
 // routes (health, attestation quote). It is split out from main so tests can
 // drive it with httptest.
-func newHandler(c *core.Client) http.Handler {
+func newHandler(c *core.Client, quote http.Handler) http.Handler {
 	mux := http.NewServeMux()
 	openaiproxy.Register(mux, c)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte("ok\n"))
 	})
-	// /quote will expose the enclave's attestation quote (with the TLS cert key
-	// bound into report_data) once the gateway attestation work lands (issue #19,
-	// on protocol/attest / issue #7); until then it advertises the endpoint but is
-	// Not Implemented, so a validator gets a clear signal rather than a 404.
-	mux.HandleFunc("GET /quote", func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "attestation quote not yet implemented", http.StatusNotImplemented)
-	})
+	// /quote serves the enclave's attestation quote for download, so an
+	// out-of-band validator (or a tier-3 client) can verify the endpoint is a
+	// genuine enclave running the expected measurement (design §6).
+	mux.Handle("GET /quote", quote)
 	return mux
 }
+
+// newQuoteHandler selects the attestor for the chosen mode and binds the
+// report_data (the TLS cert public key, from -tls-cert), returning the ready
+// /quote handler. It fails closed: an unset/unknown -tee, or -tee=dstack without
+// a cert to bind, is an error rather than a silently-insecure or empty quote.
+func newQuoteHandler(mode, socket, tlsCertPath string) (*tee.Handler, error) {
+	var attestor tee.Attestor
+	switch mode {
+	case "dstack":
+		attestor = &tee.Dstack{Socket: socket}
+	case "mock":
+		attestor = tee.Mock{}
+		log.Print("attestation: tee=mock — quotes are INSECURE fakes, for development only")
+	default:
+		// No default: an unset/unknown -tee fails closed rather than silently
+		// selecting an insecure attestor.
+		return nil, &badFlag{"tee", mode + ` (want "dstack" or "mock")`}
+	}
+
+	var reportData []byte
+	if tlsCertPath != "" {
+		cert, err := loadCert(tlsCertPath)
+		if err != nil {
+			return nil, err
+		}
+		reportData = tee.ReportDataForCert(cert)
+	} else if mode == "dstack" {
+		// A dstack quote with no cert binding attests the measurement but binds
+		// nothing to the TLS endpoint (design §6.1.2) — a genuine but meaningless
+		// quote. Refuse to serve one: fail closed rather than warn.
+		return nil, &badFlag{"tls-cert", `required with -tee=dstack (bind the enclave TLS cert into the quote)`}
+	}
+
+	return tee.NewHandler(attestor, reportData), nil
+}
+
+// loadCert reads the first CERTIFICATE block from a PEM file.
+func loadCert(path string) (*x509.Certificate, error) {
+	pemBytes, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	block, _ := pem.Decode(pemBytes)
+	if block == nil || block.Type != "CERTIFICATE" {
+		return nil, &badFlag{"tls-cert", path + " (no CERTIFICATE PEM block)"}
+	}
+	return x509.ParseCertificate(block.Bytes)
+}
+
+type badFlag struct{ name, value string }
+
+func (e *badFlag) Error() string { return "invalid -" + e.name + ": " + e.value }
 
 // parseCSV splits a comma-separated flag value into trimmed, non-empty parts.
 func parseCSV(s string) []string {

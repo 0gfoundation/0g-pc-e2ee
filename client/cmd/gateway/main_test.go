@@ -12,6 +12,7 @@ import (
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/route"
+	"github.com/0gfoundation/0g-pc-e2ee/client/tee"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
@@ -22,8 +23,30 @@ func routeClient() *core.Client {
 	return core.NewWithResolver(route.New("http://router.unused"))
 }
 
+// testQuoteHandler is a mock /quote handler wired the way newQuoteHandler would,
+// for exercising the gateway routes without a TEE.
+func testQuoteHandler() http.Handler { return tee.NewHandler(tee.Mock{}, nil) }
+
+// newQuoteHandler must fail closed: an unset/unknown -tee never silently selects
+// an attestor, and -tee=dstack refuses to run without a cert to bind (a quote
+// binding nothing is worse than none).
+func TestNewQuoteHandlerFailsClosed(t *testing.T) {
+	if _, err := newQuoteHandler("", tee.DefaultDstackSocket, ""); err == nil {
+		t.Error("unset -tee should be rejected, not defaulted")
+	}
+	if _, err := newQuoteHandler("bogus", tee.DefaultDstackSocket, ""); err == nil {
+		t.Error("unknown -tee should be rejected")
+	}
+	if _, err := newQuoteHandler("dstack", tee.DefaultDstackSocket, ""); err == nil {
+		t.Error("-tee=dstack without -tls-cert should be rejected")
+	}
+	if _, err := newQuoteHandler("mock", "", ""); err != nil {
+		t.Errorf("-tee=mock should be allowed for dev: %v", err)
+	}
+}
+
 func TestGatewayHealthz(t *testing.T) {
-	gw := httptest.NewServer(newHandler(routeClient()))
+	gw := httptest.NewServer(newHandler(routeClient(), testQuoteHandler()))
 	defer gw.Close()
 
 	resp, err := http.Get(gw.URL + "/healthz")
@@ -36,10 +59,10 @@ func TestGatewayHealthz(t *testing.T) {
 	}
 }
 
-// /quote is still a stub: it must answer 501 (Not Implemented), not 404, so a
-// validator can tell the endpoint exists but attestation is not wired yet.
-func TestGatewayQuoteStub(t *testing.T) {
-	gw := httptest.NewServer(newHandler(routeClient()))
+// /quote serves the enclave attestation quote for download: 200 with the JSON
+// quote body. (Verifying the quote is the downloader's job, out of scope here.)
+func TestGatewayQuoteServed(t *testing.T) {
+	gw := httptest.NewServer(newHandler(routeClient(), testQuoteHandler()))
 	defer gw.Close()
 
 	resp, err := http.Get(gw.URL + "/quote")
@@ -47,15 +70,23 @@ func TestGatewayQuoteStub(t *testing.T) {
 		t.Fatalf("get /quote: %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNotImplemented {
-		t.Fatalf("/quote: got %d, want 501", resp.StatusCode)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/quote: got %d, want 200", resp.StatusCode)
+	}
+	var q tee.Quote
+	if err := json.NewDecoder(resp.Body).Decode(&q); err != nil {
+		t.Fatalf("decode quote: %v", err)
+	}
+	if !strings.HasPrefix(q.Quote, "mock-quote:") {
+		t.Fatalf("unexpected quote body %q", q.Quote)
 	}
 }
 
 // In route mode the gateway holds no pinned provider: it previews against a
 // router, fetches the chosen provider's key, seals, and streams plaintext back.
-// This confirms the route resolver is wired into the same shared proxy the
-// pin-only path uses; exhaustive route behavior lives in the route package.
+// This confirms the route resolver is wired into the same shared proxy, and that
+// the quote service coexists with it; exhaustive route behavior lives in the
+// route package.
 func TestGatewayRouteMode(t *testing.T) {
 	encPriv, encPub, _ := crypto.GenerateRecipientKey()
 	signer := "0x" + strings.Repeat("a", 40)       // broker signer_address (envelope pin)
@@ -118,7 +149,7 @@ func TestGatewayRouteMode(t *testing.T) {
 	defer router.Close()
 
 	client := core.NewWithResolver(route.New(router.URL))
-	gw := httptest.NewServer(newHandler(client))
+	gw := httptest.NewServer(newHandler(client, testQuoteHandler()))
 	defer gw.Close()
 
 	userReq := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`
