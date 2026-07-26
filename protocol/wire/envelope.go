@@ -50,6 +50,29 @@ func DefaultSealedFields() []string {
 	return []string{"messages", "tools"}
 }
 
+// DefaultUnboundFields is the v1 default set of cleartext request fields excluded
+// from the AAD (SPEC §5.2) — the "unbound" denylist a client applies when the
+// caller does not override it. Like DefaultSealedFields it returns a fresh slice,
+// so a caller may append to it (e.g. "x_0g_trace", "route_options") without
+// mutating the shared default. The default lives here in exactly one place;
+// clients reference it rather than re-listing the names.
+//
+// "model" is unbound so an intermediary (router/broker) may rewrite it in transit
+// — e.g. resolving an alias or picking a fallback candidate — without breaking
+// Open. An unbound value is NOT authenticated by the transport crypto: trust in
+// the model actually served comes from the TEE response signature (D4), never
+// from the AAD. The unbound_fields list itself stays bound (it lives in _e2ee),
+// so an intermediary cannot enlarge it to free other fields.
+//
+// TODO(model-binding): including "model" here is a TEMPORARY measure. The 0G
+// router still rewrites "model" in transit, so binding it would fail Open. Once
+// the router stops modifying "model", REVERT this to an empty set (bind
+// everything) so "model" is tamper-evident on the wire again — restoring the
+// original D2 decision (see docs/design/request-envelope-and-integrity.md).
+func DefaultUnboundFields() []string {
+	return []string{"model"}
+}
+
 // ValidateSealedFields enforces the invariants on a sealed-field set: non-empty,
 // no duplicates, and "messages" present. Leaving the prompt cleartext defeats
 // the purpose, so any sealed envelope MUST cover "messages".

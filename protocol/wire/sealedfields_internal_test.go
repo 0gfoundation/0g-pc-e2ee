@@ -36,3 +36,18 @@ func TestDefaultSealedFieldsIsValidAndFresh(t *testing.T) {
 		t.Fatalf("default set was mutated across calls: %v", b)
 	}
 }
+
+func TestDefaultUnboundFieldsIsValidAndFresh(t *testing.T) {
+	// The default unbound set must satisfy ValidateUnboundFields against the
+	// default sealed set — the two defaults ship together and must be disjoint.
+	if err := ValidateUnboundFields(DefaultUnboundFields(), DefaultSealedFields()); err != nil {
+		t.Fatalf("default unbound set fails validation: %v", err)
+	}
+	// Returns a fresh slice each call, so mutating one result cannot corrupt the
+	// shared default.
+	a := DefaultUnboundFields()
+	a[0] = "tampered"
+	if b := DefaultUnboundFields(); b[0] != "model" {
+		t.Fatalf("default set was mutated across calls: %v", b)
+	}
+}
