@@ -194,6 +194,111 @@ func TestRoundTripStreaming(t *testing.T) {
 	}
 }
 
+// In streaming mode the final frame carries usage (as stream_options.include_usage
+// asks the provider to emit). choices is the only sealed field (the v1 default),
+// so usage rides CLEARTEXT: a router on the return path bills on it without the
+// client's ephemeral key. Cleartext is not a leak of the completion (choices stays
+// encrypted) and not a trust hole (usage is bound in the AAD, so an inflated value
+// is caught on Open). This nails all three properties.
+func TestStreamingUsageIsRouterVisibleCleartext(t *testing.T) {
+	encPriv, encPub, _ := crypto.GenerateRecipientKey()
+	broker := &mockBroker{encPriv: encPriv, signerAddr: brokerSigner}
+	ephPriv, ephPub, _ := crypto.GenerateRecipientKey()
+
+	env, err := wire.SealRequest(encPub, sampleRequest(), nil, brokerSigner, ephPub)
+	if err != nil {
+		t.Fatalf("SealRequest: %v", err)
+	}
+	_, clientEphPub := broker.openRequest(t, env)
+
+	// broker streams one content frame, then a final frame carrying usage.
+	usage := json.RawMessage(`{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}`)
+	sealer, err := wire.NewResponseSealer(clientEphPub)
+	if err != nil {
+		t.Fatalf("NewResponseSealer: %v", err)
+	}
+	f0, err := sealer.SealFrame(wire.Response{
+		"model":   json.RawMessage(`"gpt-4o"`),
+		"choices": json.RawMessage(`[{"index":0,"delta":{"content":"hi"}}]`),
+	}, nil, false)
+	if err != nil {
+		t.Fatalf("SealFrame 0: %v", err)
+	}
+	final, err := sealer.SealFrame(wire.Response{
+		"model":   json.RawMessage(`"gpt-4o"`),
+		"usage":   usage,
+		"choices": json.RawMessage(`[{"index":0,"delta":{},"finish_reason":"stop"}]`),
+	}, nil, true)
+	if err != nil {
+		t.Fatalf("SealFrame final: %v", err)
+	}
+
+	// --- 1. router-visible: usage is cleartext on the transmitted final frame,
+	//        readable and parseable by an intermediary that holds NO client key. ---
+	rawUsage, ok := final["usage"]
+	if !ok {
+		t.Fatal("usage is not cleartext on the final frame — router cannot bill without decrypting")
+	}
+	if !bytes.Equal(rawUsage, usage) {
+		t.Fatalf("cleartext usage = %s, want %s", rawUsage, usage)
+	}
+	var billed struct {
+		TotalTokens int `json:"total_tokens"`
+	}
+	if err := json.Unmarshal(rawUsage, &billed); err != nil {
+		t.Fatalf("router cannot parse usage: %v", err)
+	}
+	if billed.TotalTokens != 12 {
+		t.Fatalf("router read total_tokens = %d, want 12", billed.TotalTokens)
+	}
+
+	// --- 2. not a leak: the generated content is NOT cleartext on the wire. ---
+	if _, leaked := final["choices"]; leaked {
+		t.Fatal("choices is cleartext on the final frame — completion leaked to the router")
+	}
+	wireBytes, _ := json.Marshal(final)
+	if bytes.Contains(wireBytes, []byte("finish_reason")) {
+		t.Fatalf("sealed content leaked onto the wire: %s", wireBytes)
+	}
+
+	// --- 3. not a trust hole: usage is bound in the AAD, so a router that
+	//        inflates it to overbill is caught when the client opens. ---
+	tampered := make(wire.Response, len(final))
+	for k, v := range final {
+		tampered[k] = v
+	}
+	tampered["usage"] = json.RawMessage(`{"prompt_tokens":10,"completion_tokens":9999,"total_tokens":10009}`)
+	tamperOpener, err := wire.NewResponseOpener(ephPriv, f0)
+	if err != nil {
+		t.Fatalf("NewResponseOpener (tamper): %v", err)
+	}
+	if _, err := tamperOpener.OpenFrame(f0); err != nil { // advance to the final frame's sequence
+		t.Fatalf("OpenFrame 0 (tamper): %v", err)
+	}
+	if _, err := tamperOpener.OpenFrame(tampered); err == nil {
+		t.Fatal("expected inflated usage to fail Open (usage is bound in the AAD), got nil")
+	}
+
+	// --- happy path: an untouched usage passes through, choices decrypts. ---
+	opener, err := wire.NewResponseOpener(ephPriv, f0)
+	if err != nil {
+		t.Fatalf("NewResponseOpener: %v", err)
+	}
+	if _, err := opener.OpenFrame(f0); err != nil {
+		t.Fatalf("OpenFrame 0: %v", err)
+	}
+	got, err := opener.OpenFrame(final)
+	if err != nil {
+		t.Fatalf("OpenFrame final: %v", err)
+	}
+	if !bytes.Equal(got["usage"], usage) {
+		t.Fatalf("client usage = %s, want %s", got["usage"], usage)
+	}
+	if !bytes.Contains([]byte(got["choices"]), []byte("finish_reason")) {
+		t.Fatalf("client did not recover choices: %s", got["choices"])
+	}
+}
+
 // Streaming frames must be opened in the order they were sealed — the shared
 // HPKE context's AEAD sequence increments per frame, so a reordered or dropped
 // frame fails closed. This nails that property in the broker→client path.
