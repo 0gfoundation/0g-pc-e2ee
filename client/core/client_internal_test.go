@@ -1,11 +1,15 @@
 package core
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"log"
 	"reflect"
+	"strings"
 	"testing"
 
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
@@ -128,6 +132,46 @@ func TestWithStreamUsageDoesNotMutateCaller(t *testing.T) {
 	if _, present := req["stream_options"]; present {
 		t.Fatal("withStreamUsage mutated the caller's request")
 	}
+}
+
+func TestLogOpenFailureDiagnosticAndRedacted(t *testing.T) {
+	_, pub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	// A frame whose sealed choices hold a secret the log must never carry.
+	resp := wire.Response{
+		"id":      json.RawMessage(`"chatcmpl-1"`),
+		"model":   json.RawMessage(`"gpt-4o"`),
+		"choices": json.RawMessage(`[{"index":0,"message":{"role":"assistant","content":"the secret answer"}}]`),
+	}
+	sealed, err := wire.SealResponse(pub, resp, nil)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+
+	var buf bytes.Buffer
+	c := New(Provider{}, WithDebugLogger(log.New(&buf, "", 0)))
+	c.logOpenFailure(3, sealed, errors.New("chacha20poly1305: message authentication failed"))
+
+	out := buf.String()
+	// The frame ordinal (first vs later frame) and the underlying cause must be
+	// present — that ordinal is what separates a setup/key/AAD failure from a
+	// dropped or reordered later frame.
+	for _, want := range []string{"frame=3", "cleartext_keys=[id model]", "sealed_fields=[choices]", "message authentication failed"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("debug log missing %q, got: %s", want, out)
+		}
+	}
+	// Redaction: never the sealed plaintext.
+	if strings.Contains(out, "secret answer") {
+		t.Fatalf("debug log leaked sealed plaintext: %s", out)
+	}
+}
+
+func TestLogOpenFailureNilLoggerIsNoop(t *testing.T) {
+	// No debug logger configured: must not panic, even on a malformed frame.
+	New(Provider{}).logOpenFailure(0, wire.Response{}, errors.New("boom"))
 }
 
 func TestSealedFieldsForFiltersByPresence(t *testing.T) {

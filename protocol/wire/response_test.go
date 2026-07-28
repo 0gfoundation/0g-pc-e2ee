@@ -3,6 +3,7 @@ package wire_test
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
 	"testing"
 
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
@@ -191,5 +192,62 @@ func TestResponseWrongClientKeyFailsOpen(t *testing.T) {
 	}
 	if _, err := wire.OpenResponse(wrongPriv, env); err == nil {
 		t.Fatal("expected Open to fail with the wrong client key, got nil")
+	}
+}
+
+func TestFrameDebugSummarizesSealedFrame(t *testing.T) {
+	_, pub := clientEph(t)
+	env, err := wire.SealResponse(pub, mustResp(t, sampleResp), nil)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+
+	d := env.Debug()
+
+	// First (and only) frame carries v and enc and is final.
+	if !d.HasEnc || d.Version != wire.Version || !d.Final {
+		t.Fatalf("first frame summary wrong: %+v", d)
+	}
+	if !reflect.DeepEqual(d.SealedFields, []string{"choices"}) {
+		t.Errorf("sealed_fields = %v, want [choices]", d.SealedFields)
+	}
+	if d.CiphertextLen <= 0 {
+		t.Errorf("ct len = %d, want > 0", d.CiphertextLen)
+	}
+	// Cleartext keys are the frame's non-sealed fields, sorted, with choices (sealed
+	// away) and _e2ee (the envelope) both excluded.
+	wantKeys := []string{"created", "id", "model", "usage"}
+	if !reflect.DeepEqual(d.CleartextKeys, wantKeys) {
+		t.Errorf("cleartext_keys = %v, want %v", d.CleartextKeys, wantKeys)
+	}
+
+	// Redaction: the summary must never carry the sealed plaintext.
+	blob, _ := json.Marshal(d)
+	if bytes.Contains(blob, []byte("secret answer")) {
+		t.Fatalf("FrameDebug leaked sealed plaintext: %s", blob)
+	}
+}
+
+func TestFrameDebugFlagsLaterFrameAndBadMetadata(t *testing.T) {
+	_, pub := clientEph(t)
+	sealer, _ := wire.NewResponseSealer(pub)
+	_, _ = sealer.SealFrame(mustResp(t, `{"choices":[{"index":0,"delta":{"content":"a"}}]}`), nil, false)
+	f1, _ := sealer.SealFrame(mustResp(t, `{"choices":[{"index":0,"delta":{"content":"b"}}]}`), nil, true)
+
+	// A non-first frame carries neither v nor enc — the signal that separates a
+	// first-frame setup failure from a later-frame ordering failure.
+	if d := f1.Debug(); d.HasEnc || d.Version != 0 {
+		t.Errorf("later frame should carry no enc/v: %+v", d)
+	}
+
+	// A frame with no _e2ee at all still yields its cleartext keys, with the
+	// reason the metadata was unreadable recorded rather than panicking.
+	bare := mustResp(t, `{"id":"x","model":"gpt-4o"}`)
+	d := bare.Debug()
+	if d.E2EEErr == "" {
+		t.Error("missing _e2ee should be reported in E2EEErr")
+	}
+	if !reflect.DeepEqual(d.CleartextKeys, []string{"id", "model"}) {
+		t.Errorf("cleartext_keys = %v, want [id model]", d.CleartextKeys)
 	}
 }

@@ -3,6 +3,7 @@ package wire
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 )
@@ -254,6 +255,57 @@ func (r Response) E2EE() (ResponseE2EE, error) {
 		return ResponseE2EE{}, fmt.Errorf("decode %q: %w", e2eeKey, err)
 	}
 	return e, nil
+}
+
+// FrameDebug is a redaction-safe structural summary of a response frame, for
+// diagnosing an open (AEAD) failure. It carries field NAMES and byte lengths
+// only — never plaintext, ciphertext bytes, or key material — so it is safe to
+// write to an operator log even on the multi-tenant gateway.
+//
+// It exists because every distinct cause of a frame open failure surfaces as
+// the same opaque "chacha20poly1305: message authentication failed": a
+// first-frame key/enc/AAD mismatch, a dropped or reordered later frame, or an
+// intermediary that mutated a cleartext field not listed in unbound_fields
+// (so it stays bound in the AAD). The structure here tells them apart — chiefly
+// whether the failure is on the first frame vs a later one, and which cleartext
+// fields the frame actually carried (revealing a router-injected bound field).
+type FrameDebug struct {
+	Version       int      // _e2ee.v (first frame only; 0 elsewhere or if unreadable)
+	HasEnc        bool     // _e2ee.enc present (a well-formed first frame carries it)
+	Final         bool     // _e2ee.final
+	SealedFields  []string // _e2ee.sealed_fields
+	UnboundFields []string // _e2ee.unbound_fields (AAD-excluded, intermediary-mutable)
+	CleartextKeys []string // top-level frame keys except _e2ee, sorted; a key here that the sealer did not emit points at an intermediary-injected bound field
+	CiphertextLen int      // decoded ciphertext length in bytes; -1 if absent/undecodable
+	E2EEErr       string   // why _e2ee could not be read, if it could not
+}
+
+// Debug returns a redaction-safe structural summary of the frame (see
+// FrameDebug). It never returns an error: a frame whose _e2ee is missing or
+// malformed still yields its cleartext key set, with E2EEErr explaining the gap.
+func (r Response) Debug() FrameDebug {
+	d := FrameDebug{CiphertextLen: -1}
+	for k := range r {
+		if k == e2eeKey {
+			continue
+		}
+		d.CleartextKeys = append(d.CleartextKeys, k)
+	}
+	sort.Strings(d.CleartextKeys) // stable order so log lines are comparable
+	e2ee, err := r.E2EE()
+	if err != nil {
+		d.E2EEErr = err.Error()
+		return d
+	}
+	d.Version = e2ee.V
+	d.HasEnc = e2ee.Enc != ""
+	d.Final = e2ee.Final
+	d.SealedFields = e2ee.SealedFields
+	d.UnboundFields = e2ee.UnboundFields
+	if ct, err := b64.DecodeString(e2ee.Ciphertext); err == nil {
+		d.CiphertextLen = len(ct)
+	}
+	return d
 }
 
 func setResponseE2EE(r Response, e ResponseE2EE) error {

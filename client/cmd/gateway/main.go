@@ -59,7 +59,16 @@ func main() {
 	router := route.New(*routerURL,
 		route.WithSensitiveFields(sealFields),
 	)
-	client := core.NewWithResolver(router, core.WithSealFields(sealFields), core.WithUnboundFields(unboundFields))
+	// Log a redaction-safe summary of any response open (AEAD) failure to the
+	// enclave's process log. This is operator-only diagnostics (field names and
+	// byte lengths, no plaintext or key material; see core.WithDebugLogger) and is
+	// distinct from the client-facing upstream-error detail the gateway still
+	// withholds — it never echoes anything to the end user.
+	client := core.NewWithResolver(router,
+		core.WithSealFields(sealFields),
+		core.WithUnboundFields(unboundFields),
+		core.WithDebugLogger(log.Default()),
+	)
 
 	srv := &http.Server{
 		Addr:              *listen,
