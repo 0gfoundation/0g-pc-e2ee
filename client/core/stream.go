@@ -138,6 +138,12 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 	// (the stream cannot be restarted on another provider), so retry = !committed.
 	committed := false
 	sawFinal := false
+	// frameIdx is the 0-based ordinal of the sealed frame being processed (blank
+	// SSE events and [DONE] do not count). It rides in the per-frame error text so
+	// a decode/open failure names its frame: index 0 points at a setup/key/AAD
+	// mismatch, index >0 at a dropped or reordered later frame (the AEAD sequence
+	// increments per frame, so one lost frame fails every frame after it).
+	frameIdx := 0
 	for {
 		idle.Reset(providerTimeout) // time only the provider read...
 		data, err := sse.next()
@@ -174,22 +180,24 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 
 		var frame wire.Response
 		if err := json.Unmarshal(data, &frame); err != nil {
-			return !committed, stageErr(StageUpstream, fmt.Errorf("decode stream frame: %w", err))
+			return !committed, stageErr(StageUpstream, fmt.Errorf("decode stream frame %d: %w", frameIdx, err))
 		}
 		fe, err := frame.E2EE()
 		if err != nil {
-			return !committed, stageErr(StageUpstream, fmt.Errorf("read frame metadata: %w", err))
+			return !committed, stageErr(StageUpstream, fmt.Errorf("read metadata of stream frame %d: %w", frameIdx, err))
 		}
 		if opener == nil {
 			// The first frame carries enc; it sets up the shared HPKE context.
 			opener, err = wire.NewResponseOpener(ephPriv, frame)
 			if err != nil {
-				return !committed, stageErr(StageUpstream, fmt.Errorf("stream setup: %w", err))
+				c.logOpenFailure(frameIdx, frame, err)
+				return !committed, stageErr(StageUpstream, fmt.Errorf("stream setup on frame %d: %w", frameIdx, err))
 			}
 		}
 		out, err := opener.OpenFrame(frame)
 		if err != nil {
-			return !committed, stageErr(StageUpstream, fmt.Errorf("open stream frame: %w", err))
+			c.logOpenFailure(frameIdx, frame, err)
+			return !committed, stageErr(StageUpstream, fmt.Errorf("open stream frame %d: %w", frameIdx, err))
 		}
 		// From here the caller receives bytes: the stream is committed to this
 		// provider and can no longer be retried on another.
@@ -200,6 +208,7 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 		if fe.Final {
 			sawFinal = true
 		}
+		frameIdx++
 	}
 }
 

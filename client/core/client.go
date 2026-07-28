@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"slices"
 	"time"
@@ -116,6 +117,7 @@ type Client struct {
 	sealFields    []string
 	unboundFields []string
 	http          *http.Client
+	debug         *log.Logger // nil = off; see WithDebugLogger
 }
 
 // Option customizes a Client.
@@ -147,6 +149,39 @@ func WithSealFields(fields []string) Option {
 func WithUnboundFields(fields []string) Option {
 	// Clone so a later mutation of the caller's slice cannot alter this config.
 	return func(c *Client) { c.unboundFields = slices.Clone(fields) }
+}
+
+// WithDebugLogger enables redaction-safe diagnostics for response open (AEAD)
+// failures, written to l. When a sealed response frame fails to open — the
+// opaque "chacha20poly1305: message authentication failed" — the client logs a
+// structural summary of the offending frame (see logOpenFailure and
+// wire.FrameDebug): the frame's ordinal, its cleartext field names, and byte
+// lengths, never plaintext, ciphertext, or key material. That summary tells
+// apart the causes that all share that one message — a first-frame key/enc/AAD
+// mismatch, a dropped or reordered later frame, or an intermediary-injected
+// bound field — which the client-facing error alone cannot.
+//
+// It is safe on the multi-tenant gateway (it logs no tenant content), but off
+// (nil) by default so the quiet behavior is the one you get without thinking
+// about it. Both shipped server forms enable it against their process logger.
+func WithDebugLogger(l *log.Logger) Option {
+	return func(c *Client) { c.debug = l }
+}
+
+// logOpenFailure records a redaction-safe structural summary of a frame whose
+// AEAD open failed, at frame index frameIdx (0-based; 0 for a non-streaming
+// single frame). It is the operator-only counterpart to the opaque client-facing
+// error: the summary is what distinguishes a first-frame setup/key/AAD mismatch
+// (frame=0) from a dropped or reordered later frame (frame>0, ordering desync),
+// and surfaces the cleartext field set so an intermediary-injected bound field
+// shows up. No-op when no debug logger is configured.
+func (c *Client) logOpenFailure(frameIdx int, frame wire.Response, err error) {
+	if c.debug == nil {
+		return
+	}
+	d := frame.Debug()
+	c.debug.Printf("e2ee open failed: frame=%d final=%t has_enc=%t v=%d sealed_fields=%v unbound_fields=%v cleartext_keys=%v ct_bytes=%d e2ee_err=%q err=%v",
+		frameIdx, d.Final, d.HasEnc, d.Version, d.SealedFields, d.UnboundFields, d.CleartextKeys, d.CiphertextLen, d.E2EEErr, err)
 }
 
 // New returns a Client that seals every request to one fixed provider — the
@@ -301,6 +336,7 @@ func (c *Client) completeOnce(ctx context.Context, provider Provider, req wire.R
 	}
 	out, err := wire.OpenResponse(ephPriv, sealedResp)
 	if err != nil {
+		c.logOpenFailure(0, sealedResp, err)
 		return nil, true, stageErr(StageUpstream, fmt.Errorf("open response: %w", err))
 	}
 	return out, false, nil

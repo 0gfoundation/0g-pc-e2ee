@@ -49,7 +49,15 @@ func main() {
 	router := route.New(*routerURL,
 		route.WithSensitiveFields(sealFields),
 	)
-	client := core.NewWithResolver(router, core.WithSealFields(sealFields), core.WithUnboundFields(unboundFields))
+	// Log a redaction-safe summary of any response open (AEAD) failure to the
+	// process log — the operator-only counterpart to the opaque
+	// "message authentication failed" the caller sees (field names/lengths only,
+	// no plaintext or key material; see core.WithDebugLogger).
+	client := core.NewWithResolver(router,
+		core.WithSealFields(sealFields),
+		core.WithUnboundFields(unboundFields),
+		core.WithDebugLogger(log.Default()),
+	)
 
 	srv := &http.Server{
 		Addr: *listen,
