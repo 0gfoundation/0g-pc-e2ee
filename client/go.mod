@@ -8,11 +8,16 @@ toolchain go1.24.7
 // replace for multi-module development in this repo until protocol is tagged.
 require github.com/0gfoundation/0g-pc-e2ee/protocol v0.0.0
 
+require github.com/google/go-tdx-guest v0.3.1
+
 require (
 	github.com/cloudflare/circl v1.6.4 // indirect
+	github.com/google/logger v1.1.1 // indirect
 	github.com/gowebpki/jcs v1.0.1 // indirect
+	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/crypto v0.45.0 // indirect
 	golang.org/x/sys v0.38.0 // indirect
+	google.golang.org/protobuf v1.31.0 // indirect
 )
 
 replace github.com/0gfoundation/0g-pc-e2ee/protocol => ../protocol
