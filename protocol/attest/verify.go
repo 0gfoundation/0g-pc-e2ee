@@ -39,15 +39,39 @@ func notConfigured([]byte) (Measurement, [64]byte, error) {
 	return Measurement{}, [64]byte{}, ErrQuoteVerifierNotConfigured
 }
 
+// MeasurementMode selects what Verify does when an authenticated quote's
+// measurement is NOT in the Policy allowlist. Quote authenticity (genuine TDX +
+// signature) and report_data binding are ALWAYS enforced regardless of mode;
+// this knob only governs the measurement-allowlist decision.
+type MeasurementMode int
+
+const (
+	// ModeEnforce (the zero value, and the secure default) rejects a quote whose
+	// measurement is not allowlisted: the enclave runs unaudited code.
+	ModeEnforce MeasurementMode = iota
+	// ModeWarn accepts such a quote but marks Verified.MeasurementTrusted false,
+	// leaving it to the caller to log and decide. Use it as a rollout bridge
+	// before the audited-image allowlist is finalized — never as a silent accept.
+	ModeWarn
+)
+
 // Verifier verifies provider quotes against a fixed Policy. It is immutable
 // after New and safe for concurrent use.
 type Verifier struct {
 	policy Policy
 	parse  quoteParser
+	mode   MeasurementMode
 }
 
 // Option customizes a Verifier.
 type Option func(*Verifier)
+
+// WithMeasurementMode sets how an out-of-allowlist measurement is handled
+// (default ModeEnforce). It does not affect quote-authenticity or report_data
+// checks, which are always enforced.
+func WithMeasurementMode(m MeasurementMode) Option {
+	return func(v *Verifier) { v.mode = m }
+}
 
 // WithQuoteParser installs the TDX quote parser/verifier. Without it the
 // Verifier is fail-closed (every Verify returns ErrQuoteVerifierNotConfigured).
@@ -82,19 +106,26 @@ type Verified struct {
 	// teeSignerAddress before pinning (SPEC §4.4 step 3; issue #18) — this
 	// package returns it but does not know the chain.
 	SignerAddr string
-	// Measurement is the accepted measurement, surfaced for logging/audit.
+	// Measurement is the quote's measurement, surfaced for logging/audit.
 	Measurement Measurement
+	// MeasurementTrusted reports whether Measurement is in the Policy allowlist.
+	// It is always true under ModeEnforce (a false would have errored). Under
+	// ModeWarn it may be false: the quote is genuine and EncPub/SignerAddr are
+	// safely bound, but the enclave runs code the client has not audited — the
+	// caller MUST log this before proceeding.
+	MeasurementTrusted bool
 }
 
 // Verify runs the full SPEC §4.4 pre-seal check on a raw provider quote:
 //
 //  1. parse — verify it is a genuine, signed TDX quote and extract its
 //     measurement + report_data (the quoteParser seam).
-//  2. allowlist — the measurement MUST be one the client audited (Policy).
+//  2. allowlist — the measurement MUST be one the client audited (Policy);
+//     under ModeWarn a miss is tolerated and flagged instead (see MeasurementMode).
 //  3. binding — decode report_data (§4.2) for enc_pub + signer_addr.
 //
-// Every step is fail-closed: any failure returns an error and no Verified, so a
-// candidate that does not fully verify is never sealed to.
+// Steps 1 and 3 are always fail-closed: any failure returns an error and no
+// Verified. Only step 2's allowlist decision is softened by ModeWarn.
 func (v *Verifier) Verify(rawQuote []byte) (Verified, error) {
 	if len(rawQuote) == 0 {
 		return Verified{}, fmt.Errorf("attest: empty quote")
@@ -107,21 +138,26 @@ func (v *Verifier) Verify(rawQuote []byte) (Verified, error) {
 	}
 
 	// 2. Measurement allowlist — the load-bearing defense against a router that
-	// routes to an enclave running unaudited (malicious) code. Checked before
-	// trusting any key the quote carries.
-	if !v.policy.permits(measurement) {
+	// routes to an enclave running unaudited (malicious) code. Under ModeEnforce
+	// a miss is fatal (checked before trusting any key the quote carries); under
+	// ModeWarn it is recorded on the result for the caller to log and decide.
+	trusted := v.policy.permits(measurement)
+	if !trusted && v.mode == ModeEnforce {
 		return Verified{}, ErrUntrustedMeasurement
 	}
 
-	// 3. Bind the keys out of the verified report_data.
+	// 3. Bind the keys out of the verified report_data. This is enforced in every
+	// mode — ModeWarn relaxes only the allowlist decision, never report_data
+	// validity.
 	rd, err := ParseReportData(reportData[:])
 	if err != nil {
 		return Verified{}, err
 	}
 
 	return Verified{
-		EncPub:      rd.EncPub,
-		SignerAddr:  rd.SignerAddr,
-		Measurement: measurement,
+		EncPub:             rd.EncPub,
+		SignerAddr:         rd.SignerAddr,
+		Measurement:        measurement,
+		MeasurementTrusted: trusted,
 	}, nil
 }

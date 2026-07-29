@@ -20,8 +20,10 @@ import (
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/client/dcap"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 	"github.com/0gfoundation/0g-pc-e2ee/client/route"
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
@@ -30,6 +32,8 @@ func main() {
 	routerURL := flag.String("router-url", route.DefaultRouterURL, "0G router base URL/domain (the route-preview path is appended)")
 	sealFieldsCSV := flag.String("seal-fields", strings.Join(wire.DefaultSealedFields(), ","), "comma-separated request fields to seal (must include \"messages\")")
 	unboundFieldsCSV := flag.String("unbound-fields", strings.Join(wire.DefaultUnboundFields(), ","), "comma-separated cleartext fields excluded from the AAD (intermediary-mutable, untrusted); empty binds everything")
+	attestOn := flag.Bool("attest", false, "DCAP-verify each provider's TDX quote and seal only to the verified enc key (instead of trusting the router-supplied pubkey endpoint)")
+	attestEnforce := flag.Bool("attest-enforce", false, "with -attest, reject a provider whose measurement is not in the allowlist instead of only warning; the audited-image allowlist is not wired yet (empty), so enforce currently rejects all providers")
 	flag.Parse()
 
 	sealFields := parseCSV(*sealFieldsCSV)
@@ -40,15 +44,22 @@ func main() {
 	if err := wire.ValidateUnboundFields(unboundFields, sealFields); err != nil {
 		log.Fatalf("invalid -unbound-fields: %v", err)
 	}
+	// Fail loudly rather than silently give NO attestation when the operator asked
+	// for the strictest mode: -attest-enforce is meaningless without -attest.
+	if *attestEnforce && !*attestOn {
+		log.Fatalf("-attest-enforce requires -attest")
+	}
 
 	// Route per request: pick the provider via the router and derive its enc key
 	// from the broker. The router is told to withhold exactly the sealed fields,
 	// so the prompt never reaches it in cleartext on the preview call.
 	// The sidecar serves only chat completions, so the route service type is fixed
 	// (route.New defaults to "chatbot"); it is not a startup choice.
-	router := route.New(*routerURL,
-		route.WithSensitiveFields(sealFields),
-	)
+	routeOpts := []route.Option{route.WithSensitiveFields(sealFields)}
+	if *attestOn {
+		routeOpts = append(routeOpts, route.WithQuoteVerification(newVerifier(*attestEnforce), nil))
+	}
+	router := route.New(*routerURL, routeOpts...)
 	// Log a redaction-safe summary of any response open (AEAD) failure to the
 	// process log — the operator-only counterpart to the opaque
 	// "message authentication failed" the caller sees (field names/lengths only,
@@ -71,6 +82,24 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// newVerifier builds the per-request TDX quote verifier. Quote authenticity
+// (genuine TDX + TCB UpToDate + report_data binding) is always enforced; only
+// the measurement-allowlist decision is governed by enforce vs warn. The audited
+// broker-image allowlist is not wired yet (empty), so warn is the usable interim
+// (log an out-of-allowlist measurement but proceed) and enforce rejects all.
+func newVerifier(enforce bool) *attest.Verifier {
+	mode := attest.ModeWarn
+	if enforce {
+		mode = attest.ModeEnforce
+	}
+	log.Printf("sidecar: TDX quote verification enabled (measurement enforce=%v, allowlist empty)", enforce)
+	return attest.New(
+		attest.Policy{}, // TODO: load the audited broker-image measurement allowlist
+		attest.WithQuoteParser(dcap.NewQuoteParser(dcap.Config{})),
+		attest.WithMeasurementMode(mode),
+	)
 }
 
 // parseCSV splits a comma-separated flag value into trimmed, non-empty parts.
