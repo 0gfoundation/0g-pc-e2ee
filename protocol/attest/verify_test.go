@@ -96,3 +96,51 @@ func TestVerify_MeasurementCheckedBeforeBinding(t *testing.T) {
 		t.Errorf("err = %v, want ErrUntrustedMeasurement (measurement checked first)", err)
 	}
 }
+
+func TestVerify_WarnMode_AcceptsUntrustedMeasurement(t *testing.T) {
+	served := mkMeasurement(0xbb) // genuine quote, unaudited code
+	rd := makeReportData(sampleEncPub(), sampleSigner(), ReportDataVersion, [reservedLen]byte{})
+	v := New(Policy{Allowed: []Measurement{mkMeasurement(0xaa)}},
+		WithQuoteParser(fakeParser(served, rd, nil)), WithMeasurementMode(ModeWarn))
+
+	got, err := v.Verify([]byte("raw-quote"))
+	if err != nil {
+		t.Fatalf("warn mode should not error on measurement miss: %v", err)
+	}
+	if got.MeasurementTrusted {
+		t.Error("MeasurementTrusted = true, want false (measurement not in allowlist)")
+	}
+	// Keys are still bound from the genuine, verified quote.
+	if want := sampleEncPub(); !bytes.Equal(got.EncPub, want[:]) {
+		t.Errorf("EncPub not bound in warn mode: %x", got.EncPub)
+	}
+}
+
+func TestVerify_WarnMode_TrustedWhenAllowlisted(t *testing.T) {
+	good := mkMeasurement(0xaa)
+	rd := makeReportData(sampleEncPub(), sampleSigner(), ReportDataVersion, [reservedLen]byte{})
+	v := New(Policy{Allowed: []Measurement{good}},
+		WithQuoteParser(fakeParser(good, rd, nil)), WithMeasurementMode(ModeWarn))
+	got, err := v.Verify([]byte("raw-quote"))
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if !got.MeasurementTrusted {
+		t.Error("MeasurementTrusted = false, want true (measurement allowlisted)")
+	}
+}
+
+// Warn mode must NOT relax quote authenticity or report_data validity.
+func TestVerify_WarnMode_StillEnforcesAuthenticityAndBinding(t *testing.T) {
+	sentinel := errors.New("bad TDX signature")
+	vAuth := New(Policy{}, WithQuoteParser(fakeParser(Measurement{}, nil, sentinel)), WithMeasurementMode(ModeWarn))
+	if _, err := vAuth.Verify([]byte("raw-quote")); !errors.Is(err, sentinel) {
+		t.Errorf("warn mode must still fail on bad quote: %v", err)
+	}
+
+	badRD := makeReportData(sampleEncPub(), sampleSigner(), ReportDataVersion+1, [reservedLen]byte{})
+	vBind := New(Policy{}, WithQuoteParser(fakeParser(mkMeasurement(0xbb), badRD, nil)), WithMeasurementMode(ModeWarn))
+	if _, err := vBind.Verify([]byte("raw-quote")); !errors.Is(err, ErrMalformedReportData) {
+		t.Errorf("warn mode must still fail on malformed report_data: %v", err)
+	}
+}

@@ -36,6 +36,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -43,6 +44,7 @@ import (
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
@@ -91,6 +93,12 @@ type Router struct {
 	sensitiveFields map[string]struct{}
 	http            *http.Client
 	cache           *pubkeyCache
+	// verifier, when non-nil, switches candidate materialization from trusting
+	// the router-supplied pubkey endpoint to fetching and DCAP-verifying the
+	// provider's attestation quote, sourcing enc_pub/signer from the verified
+	// report_data. Nil keeps the legacy pubkey-endpoint behavior.
+	verifier *attest.Verifier
+	logger   *slog.Logger
 }
 
 // Option customizes a Router.
@@ -136,6 +144,30 @@ func WithSensitiveFields(fields []string) Option {
 // A non-positive TTL disables caching (fetch every request).
 func WithPubkeyTTL(d time.Duration) Option {
 	return func(r *Router) { r.cache = newPubkeyCache(d) }
+}
+
+// WithQuoteVerification makes the Router obtain each candidate's enc_pub and
+// signer from a DCAP-verified attestation quote instead of the router-supplied
+// pubkey endpoint: it GETs the provider's /v1/quote, runs v.Verify (genuine TDX
+// + measurement policy + report_data binding), and seals only to the verified
+// enc_pub. This is what stops a compromised router from pointing the client at a
+// key it controls. Without this option the Router keeps the legacy behavior of
+// trusting the pubkey endpoint.
+//
+// logger receives a warning whenever a genuine quote's measurement is not in the
+// verifier's allowlist (only reachable when v uses attest.ModeWarn); nil uses
+// slog.Default().
+func WithQuoteVerification(v *attest.Verifier, logger *slog.Logger) Option {
+	return func(r *Router) {
+		if v == nil {
+			return
+		}
+		if logger == nil {
+			logger = slog.Default()
+		}
+		r.verifier = v
+		r.logger = logger
+	}
 }
 
 // New returns a Router that talks to the given router base URL (empty uses
@@ -209,16 +241,28 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 	if prov.CanonicalID == "" {
 		return core.Provider{}, upstream(0, fmt.Errorf("route preview candidate has no canonical_id"))
 	}
-	// The candidate endpoint is used only to fetch its published enc key. It is
-	// taken as the router returns it; the router is untrusted, so a compromised
-	// one could point this at an endpoint it controls and MITM the prompt.
-	// Resolving the endpoint (and on-chain teeSignerAddress) from chain instead is
-	// tracked in issue #18, and full protection needs quote verification (#7).
-	pubkeyURL, err := derivePubkeyURL(prov.Endpoint)
-	if err != nil {
-		return core.Provider{}, upstream(0, fmt.Errorf("provider endpoint: %w", err))
+	// Obtain the enc key + signer this candidate will be sealed to. With quote
+	// verification configured, they come from a DCAP-verified attestation quote
+	// (trustworthy even though the untrusted router chose the endpoint). Without
+	// it, the legacy path trusts the router-supplied pubkey endpoint — a
+	// compromised router could point that at a key it controls and MITM the
+	// prompt (the reason quote verification exists).
+	var (
+		encPub crypto.PublicKey
+		signer string
+		err    error
+	)
+	if c.router.verifier != nil {
+		encPub, signer, err = c.router.verifiedKeys(ctx, prov.Endpoint)
+	} else {
+		var pubkeyURL string
+		pubkeyURL, err = derivePubkeyURL(prov.Endpoint)
+		if err == nil {
+			encPub, signer, err = c.router.pubkey(ctx, pubkeyURL)
+		} else {
+			err = upstream(0, fmt.Errorf("provider endpoint: %w", err))
+		}
 	}
-	encPub, signer, err := c.router.pubkey(ctx, pubkeyURL)
 	if err != nil {
 		return core.Provider{}, err
 	}
@@ -239,6 +283,60 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 		Address:    prov.Address,
 		Model:      prov.CanonicalID,
 	}, nil
+}
+
+// verifiedKeys fetches the candidate's attestation quote from its endpoint,
+// DCAP-verifies it, and returns the enc_pub + signer bound into the verified
+// report_data. Because the keys come out of a genuine, signed quote, it does not
+// matter that the untrusted router chose the endpoint: a substituted endpoint
+// serving an attacker key would fail verification. On a warn-mode measurement
+// miss it logs but still returns the (genuine) keys.
+func (r *Router) verifiedKeys(ctx context.Context, endpoint string) (crypto.PublicKey, string, error) {
+	quoteURL, err := deriveQuoteURL(endpoint)
+	if err != nil {
+		return nil, "", upstream(0, fmt.Errorf("provider endpoint: %w", err))
+	}
+	raw, err := r.fetchQuote(ctx, quoteURL)
+	if err != nil {
+		return nil, "", err
+	}
+	verified, err := r.verifier.Verify(raw)
+	if err != nil {
+		return nil, "", upstream(0, fmt.Errorf("provider quote: %w", err))
+	}
+	if !verified.MeasurementTrusted {
+		r.logger.Warn("sealing to provider whose measurement is not in the allowlist (attest warn mode)",
+			"endpoint", endpoint,
+			"mrtd", fmt.Sprintf("%x", verified.Measurement.MRTD[:]),
+			"signer_addr", verified.SignerAddr)
+	}
+	return verified.EncPub, verified.SignerAddr, nil
+}
+
+// fetchQuote GETs and decodes a provider's /v1/quote reply into raw TDX quote
+// bytes (unverified — the caller verifies).
+func (r *Router) fetchQuote(ctx context.Context, quoteURL string) ([]byte, error) {
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, quoteURL, nil)
+	if err != nil {
+		return nil, upstream(0, err)
+	}
+	resp, err := r.http.Do(httpReq)
+	if err != nil {
+		return nil, upstream(0, fmt.Errorf("fetch provider quote: %w", err))
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxControlBodyBytes))
+	if err != nil {
+		return nil, upstream(0, fmt.Errorf("read provider quote: %w", err))
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, upstream(resp.StatusCode, fmt.Errorf("provider quote returned %d", resp.StatusCode))
+	}
+	raw, err := attest.DecodeQuoteResponse(body)
+	if err != nil {
+		return nil, upstream(0, err)
+	}
+	return raw, nil
 }
 
 // previewProvider is one candidate in the route-preview reply.
@@ -397,11 +495,11 @@ func validatePubkey(pk pubkeyResponse) (crypto.PublicKey, string, error) {
 	return crypto.PublicKey(encPub), pk.SignerAddress, nil
 }
 
-// derivePubkeyURL turns a provider endpoint into the broker's e2ee pubkey URL.
+// deriveV1Base resolves a provider endpoint to its "scheme://host/…/v1" base.
 // The endpoint may be a bare origin (https://host[:port]), the /v1 base, or the
-// full chat-completions URL (…/v1/chat/completions); all three resolve against
-// the same /v1 base, so the pubkey path hangs off it consistently.
-func derivePubkeyURL(endpoint string) (string, error) {
+// full chat-completions URL (…/v1/chat/completions); all three resolve to the
+// same /v1 base, so the pubkey and quote paths hang off it consistently.
+func deriveV1Base(endpoint string) (string, error) {
 	u, err := url.Parse(endpoint)
 	if err != nil {
 		return "", fmt.Errorf("%q is not a valid URL: %w", endpoint, err)
@@ -418,7 +516,27 @@ func derivePubkeyURL(endpoint string) (string, error) {
 	default:
 		base += "/v1"
 	}
-	return u.Scheme + "://" + u.Host + base + "/e2ee/pubkey", nil
+	return u.Scheme + "://" + u.Host + base, nil
+}
+
+// derivePubkeyURL turns a provider endpoint into the broker's e2ee pubkey URL.
+func derivePubkeyURL(endpoint string) (string, error) {
+	base, err := deriveV1Base(endpoint)
+	if err != nil {
+		return "", err
+	}
+	return base + "/e2ee/pubkey", nil
+}
+
+// deriveQuoteURL turns a provider endpoint into its DCAP quote URL. legacy=false
+// requests the SPEC §4.2 report_data layout (enc_pub‖signer_addr‖version‖reserved),
+// the layout attest.ParseReportData decodes.
+func deriveQuoteURL(endpoint string) (string, error) {
+	base, err := deriveV1Base(endpoint)
+	if err != nil {
+		return "", err
+	}
+	return base + "/quote?legacy=false", nil
 }
 
 // modelDesc describes what was previewed for a "no provider available" error.
