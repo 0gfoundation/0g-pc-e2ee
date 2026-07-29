@@ -330,7 +330,7 @@ func (r *Router) fetchQuote(ctx context.Context, quoteURL string) ([]byte, error
 		return nil, upstream(0, fmt.Errorf("read provider quote: %w", err))
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, upstream(resp.StatusCode, fmt.Errorf("provider quote returned %d", resp.StatusCode))
+		return nil, upstreamBody(resp.StatusCode, body, fmt.Errorf("provider quote returned %d", resp.StatusCode))
 	}
 	raw, err := attest.DecodeQuoteResponse(body)
 	if err != nil {
@@ -407,9 +407,11 @@ func (r *Router) preview(ctx context.Context, req wire.Request) ([]previewProvid
 		return nil, upstream(0, fmt.Errorf("read route preview response: %w", err))
 	}
 	if resp.StatusCode != http.StatusOK {
-		// Surface the router's status verbatim (401/404/503 are meaningful to the
-		// caller) but not its raw body — this error becomes the gateway's response.
-		return nil, upstream(resp.StatusCode, fmt.Errorf("route preview returned %d", resp.StatusCode))
+		// Surface the router's status verbatim (401/404/503 are meaningful) and carry
+		// its body as Error.Body; the proxy decides whether to pass the router's
+		// client-facing error through (sidecar / structured passthrough) or withhold
+		// it (see openaiproxy.errorEnvelope).
+		return nil, upstreamBody(resp.StatusCode, raw, fmt.Errorf("route preview returned %d", resp.StatusCode))
 	}
 
 	var pr previewResponse
@@ -456,7 +458,7 @@ func (r *Router) pubkey(ctx context.Context, pubkeyURL string) (crypto.PublicKey
 		return nil, "", upstream(0, fmt.Errorf("read provider pubkey: %w", err))
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, "", upstream(resp.StatusCode, fmt.Errorf("provider pubkey returned %d", resp.StatusCode))
+		return nil, "", upstreamBody(resp.StatusCode, raw, fmt.Errorf("provider pubkey returned %d", resp.StatusCode))
 	}
 
 	var pk pubkeyResponse
@@ -560,6 +562,15 @@ func modelDesc(req wire.Request) string {
 // status of 0 lets the proxy default it (502).
 func upstream(status int, err error) error {
 	return &core.Error{Stage: core.StageUpstream, Status: status, Err: err}
+}
+
+// upstreamBody is upstream() carrying the raw upstream response body — used for a
+// non-2xx control-plane reply (route-preview / pubkey / quote) so the router's or
+// broker's own client-facing error travels as core.Error.Body. Like the data
+// plane, the body is untrusted content held out of Error() (the proxy decides
+// whether to surface it; see openaiproxy).
+func upstreamBody(status int, body []byte, err error) error {
+	return &core.Error{Stage: core.StageUpstream, Status: status, Err: err, Body: string(body)}
 }
 
 // isAddress reports whether s is a 0x-prefixed 20-byte hex address (the on-chain

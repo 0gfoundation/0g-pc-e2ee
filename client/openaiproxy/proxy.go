@@ -41,19 +41,76 @@ func WithVerboseUpstreamErrors() Option {
 	return func(o *options) { o.verboseUpstreamErrors = true }
 }
 
-// message renders the client-facing error text: just err.Error() (which never
-// contains the upstream body) unless verbose errors are enabled, in which case
-// the carried upstream body is appended.
-func (o options) message(err error) string {
-	msg := err.Error()
-	if !o.verboseUpstreamErrors {
-		return msg
-	}
+// maxEchoBodyBytes caps the raw upstream body echoed under verbose errors.
+const maxEchoBodyBytes = 8 << 10 // 8 KiB
+
+// errorEnvelope builds the JSON response body for a failed request:
+//
+//	{"error": <object>, "_0g": {"source": ..., "upstream_status": ...}}
+//
+// When the failure carried a well-formed upstream error object (the router's or
+// broker's own client-facing {"error": {...}}), that object is passed through
+// VERBATIM — so a client keying off its message/type/code sees exactly what a
+// direct call would, restoring the transparency the gateway hop would otherwise
+// swallow. Otherwise `error` is a synthesized gateway/sidecar object.
+//
+// Attribution lives in the sibling `_0g` block, never inside `error`, so it can
+// never collide with or overwrite an upstream field (source = gateway|upstream,
+// plus the verbatim upstream_status when there was one). The raw upstream body is
+// echoed only under verbose errors (the single-user sidecar): a well-formed
+// upstream error is already client-facing, but an unparseable/non-JSON body may
+// be transport noise or internal detail a multi-tenant gateway must not leak.
+func (o options) errorEnvelope(err error) map[string]any {
 	var e *core.Error
-	if errors.As(err, &e) && e.Body != "" {
-		return msg + ": " + e.Body
+	if !errors.As(err, &e) {
+		return map[string]any{
+			"error": map[string]any{"message": err.Error(), "type": "gateway_error"},
+			"_0g":   map[string]any{"source": "gateway"},
+		}
 	}
-	return msg
+	attribution := map[string]any{"source": e.Source()}
+	if e.Status != 0 {
+		attribution["upstream_status"] = e.Status
+	}
+	if e.Stage == core.StageUpstream {
+		if obj, ok := parseUpstreamErrorObject(e.Body); ok {
+			return map[string]any{"error": obj, "_0g": attribution}
+		}
+	}
+	if o.verboseUpstreamErrors && e.Body != "" {
+		attribution["upstream_body"] = truncate(e.Body, maxEchoBodyBytes)
+	}
+	return map[string]any{
+		"error": map[string]any{"message": e.Error(), "type": e.Source() + "_error"},
+		"_0g":   attribution,
+	}
+}
+
+// parseUpstreamErrorObject returns the upstream reply's `error` object when the
+// body is a well-formed OpenAI-shaped error ({"error": {"message": ...}}), so it
+// can be passed through verbatim. Returns ok=false for an empty, non-JSON, or
+// message-less body.
+func parseUpstreamErrorObject(body string) (map[string]any, bool) {
+	if body == "" {
+		return nil, false
+	}
+	var wrapper struct {
+		Error map[string]any `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(body), &wrapper); err != nil || wrapper.Error == nil {
+		return nil, false
+	}
+	if msg, ok := wrapper.Error["message"].(string); !ok || msg == "" {
+		return nil, false
+	}
+	return wrapper.Error, true
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…(truncated)"
 }
 
 // Handler returns the OpenAI-compatible proxy over the client core, mounted at
@@ -79,20 +136,20 @@ func Register(mux *http.ServeMux, c *core.Client, opts ...Option) {
 		if err != nil {
 			var tooLarge *http.MaxBytesError
 			if errors.As(err, &tooLarge) {
-				writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
+				writeGatewayError(w, http.StatusRequestEntityTooLarge, "request body too large")
 				return
 			}
-			writeError(w, http.StatusBadRequest, "read request body")
+			writeGatewayError(w, http.StatusBadRequest, "read request body")
 			return
 		}
 		var req wire.Request
 		if err := json.Unmarshal(body, &req); err != nil {
-			writeError(w, http.StatusBadRequest, "request body is not a JSON object")
+			writeGatewayError(w, http.StatusBadRequest, "request body is not a JSON object")
 			return
 		}
 		stream, err := streamRequested(req)
 		if err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
+			writeGatewayError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		// Forward the caller's Authorization header (the 0G key an OpenAI SDK sends)
@@ -107,12 +164,12 @@ func Register(mux *http.ServeMux, c *core.Client, opts ...Option) {
 		}
 		resp, err := c.Complete(ctx, req)
 		if err != nil {
-			writeError(w, statusFor(err), o.message(err))
+			o.writeError(w, err)
 			return
 		}
 		out, err := json.Marshal(resp)
 		if err != nil {
-			writeError(w, http.StatusInternalServerError, "encode response")
+			writeGatewayError(w, http.StatusInternalServerError, "encode response")
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -186,7 +243,7 @@ func statusFor(err error) int {
 func serveStream(ctx context.Context, w http.ResponseWriter, c *core.Client, req wire.Request, o options) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		writeError(w, http.StatusInternalServerError, "streaming not supported by server")
+		writeGatewayError(w, http.StatusInternalServerError, "streaming not supported by server")
 		return
 	}
 
@@ -217,12 +274,12 @@ func serveStream(ctx context.Context, w http.ResponseWriter, c *core.Client, req
 	if err != nil {
 		if !wroteHeader {
 			// Nothing sent yet — a normal error response with a real status.
-			writeError(w, statusFor(err), o.message(err))
+			o.writeError(w, err)
 			return
 		}
 		// Mid-stream: surface as a final SSE error event, then stop. Build the
 		// payload with json.Marshal — %q is not JSON-safe for arbitrary bytes.
-		errEvent, _ := json.Marshal(map[string]any{"error": map[string]string{"message": o.message(err)}})
+		errEvent, _ := json.Marshal(o.errorEnvelope(err))
 		fmt.Fprintf(w, "data: %s\n\n", errEvent)
 		flusher.Flush()
 		return
@@ -234,11 +291,25 @@ func serveStream(ctx context.Context, w http.ResponseWriter, c *core.Client, req
 	flusher.Flush()
 }
 
-// writeError emits an OpenAI-shaped error object.
-func writeError(w http.ResponseWriter, code int, msg string) {
+// writeErrorObject emits a JSON error response body at the given status.
+func writeErrorObject(w http.ResponseWriter, code int, body map[string]any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"error": map[string]string{"message": msg},
+	_ = json.NewEncoder(w).Encode(body)
+}
+
+// writeGatewayError emits a gateway-origin error — a fault in this proxy itself,
+// before or around the core call (bad request, encode failure) — attributed to
+// source "gateway".
+func writeGatewayError(w http.ResponseWriter, code int, msg string) {
+	writeErrorObject(w, code, map[string]any{
+		"error": map[string]any{"message": msg, "type": "gateway_error"},
+		"_0g":   map[string]any{"source": "gateway"},
 	})
+}
+
+// writeError emits a core.Error (or any error) as the attributed envelope, with
+// the upstream status surfaced verbatim (statusFor).
+func (o options) writeError(w http.ResponseWriter, err error) {
+	writeErrorObject(w, statusFor(err), o.errorEnvelope(err))
 }
