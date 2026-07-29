@@ -33,6 +33,12 @@ const providerTimeout = 10*time.Minute + 30*time.Second
 // the router's GET /v1/providers — is a separate, later concern.)
 const DefaultProviderURL = "https://router-api.0g.ai/v1/chat/completions"
 
+// maxUpstreamErrorBytes bounds a non-2xx provider response body read (it is
+// surfaced as Error.Body / passed through), so a broken or hostile upstream
+// cannot force an unbounded read. A 2xx sealed response is read unbounded — a
+// completion can legitimately be large.
+const maxUpstreamErrorBytes = 1 << 20 // 1 MiB
+
 // Stage names where a Complete call failed, so callers (the sidecar) can map it
 // to an HTTP status: a bad client request vs an upstream/provider failure vs a
 // client-side internal error.
@@ -58,6 +64,18 @@ type Error struct {
 
 func (e *Error) Error() string { return e.Err.Error() }
 func (e *Error) Unwrap() error { return e.Err }
+
+// Source classifies where the failure originated, for the error envelope's
+// attribution field: "upstream" for anything from the router/provider chain
+// (StageUpstream), "gateway" for a fault in this client itself (a bad request it
+// built, or an internal error). It lets a caller tell a gateway/sidecar bug
+// apart from a router/provider one without parsing the message.
+func (e *Error) Source() string {
+	if e.Stage == StageUpstream {
+		return "upstream"
+	}
+	return "gateway"
+}
 
 func stageErr(stage string, err error) error { return &Error{Stage: stage, Err: err} }
 
@@ -312,19 +330,25 @@ func (c *Client) completeOnce(ctx context.Context, provider Provider, req wire.R
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		// Surface the provider status verbatim so OpenAI clients can key their
+		// retry/backoff on it; the body is untrusted upstream content, carried as
+		// Body (not in the message) so a multi-tenant gateway never echoes it (see
+		// Error.Body). Read it BOUNDED: an error body should be small, and it is now
+		// surfaced to the caller (Body / passthrough), so a broken or hostile
+		// upstream must not force an unbounded read. (The 2xx sealed body below is
+		// intentionally unbounded — a completion can legitimately be large.) Fall
+		// back only on a transient status (429 / 5xx).
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBytes))
+		e := &Error{Stage: StageUpstream, Status: resp.StatusCode, Err: fmt.Errorf("provider returned %d", resp.StatusCode), Body: string(body)}
+		return nil, retryableStatus(resp.StatusCode), e
+	}
+
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		// A response began but the body dropped mid-read: a provider-side failure
 		// with nothing delivered to the caller — fall back to the next candidate.
 		return nil, true, stageErr(StageUpstream, fmt.Errorf("read provider response: %w", err))
-	}
-	if resp.StatusCode != http.StatusOK {
-		// Surface the provider status verbatim so OpenAI clients can key their
-		// retry/backoff on it; respBody is untrusted upstream content, carried as
-		// Body (not in the message) so a multi-tenant gateway never echoes it (see
-		// Error.Body). Fall back only on a transient status (429 / 5xx).
-		e := &Error{Stage: StageUpstream, Status: resp.StatusCode, Err: fmt.Errorf("provider returned %d", resp.StatusCode), Body: string(respBody)}
-		return nil, retryableStatus(resp.StatusCode), e
 	}
 
 	var sealedResp wire.Response
