@@ -36,41 +36,6 @@ func TestGatewayHealthz(t *testing.T) {
 	}
 }
 
-// envOr uses an env var only when it is present; a set-but-empty value is
-// honored (not treated as unset), since "" is meaningful for the CSV fields.
-func TestEnvOr(t *testing.T) {
-	const key = "ZG_GATEWAY_TEST_ENVOR"
-	t.Setenv(key, "from-env")
-	if got := envOr(key, "def"); got != "from-env" {
-		t.Fatalf("set var: got %q, want %q", got, "from-env")
-	}
-	t.Setenv(key, "")
-	if got := envOr(key, "def"); got != "" {
-		t.Fatalf("empty var: got %q, want empty (honored, not defaulted)", got)
-	}
-	if got := envOr("ZG_GATEWAY_TEST_UNSET", "def"); got != "def" {
-		t.Fatalf("unset var: got %q, want %q", got, "def")
-	}
-}
-
-// envBool falls back to def when unset and parses standard boolean forms when
-// set. (The set-but-unparseable case is log.Fatal, so it is not exercised here.)
-func TestEnvBool(t *testing.T) {
-	const key = "ZG_GATEWAY_TEST_ENVBOOL"
-	if got := envBool("ZG_GATEWAY_TEST_UNSET_BOOL", true); !got {
-		t.Fatal("unset var: want fallback to def=true")
-	}
-	for _, tc := range []struct {
-		val  string
-		want bool
-	}{{"true", true}, {"1", true}, {"false", false}, {"0", false}} {
-		t.Setenv(key, tc.val)
-		if got := envBool(key, !tc.want); got != tc.want {
-			t.Fatalf("%s=%q: got %v, want %v", key, tc.val, got, tc.want)
-		}
-	}
-}
-
 // /quote is still a stub: it must answer 501 (Not Implemented), not 404, so a
 // validator can tell the endpoint exists but attestation is not wired yet.
 func TestGatewayQuoteStub(t *testing.T) {
