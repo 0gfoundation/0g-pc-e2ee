@@ -142,7 +142,16 @@ type Flags struct {
 	onchainEnforce   *bool
 	chainRPCURL      *string
 	servingContract  *string
+	warmOn           *bool
+	warmInterval     *time.Duration
 }
+
+// defaultWarmInterval is the refresh-ahead period the background quote-cache
+// warmer uses when -warm is set without an explicit -warm-interval. It sits
+// under the route package's quote-cache TTL (5m) so a cached entry is
+// re-verified before it expires and requests keep hitting a warm cache (see
+// route.RunWarmer).
+const defaultWarmInterval = 4 * time.Minute
 
 // RegisterFlags declares the shared startup flags on fs and returns a Flags
 // whose pointers are filled by fs.Parse. envPrefix (e.g. "ZG_GATEWAY",
@@ -172,7 +181,26 @@ func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen string) *Flags {
 			fmt.Sprintf("0G chain JSON-RPC endpoint for on-chain signer lookups; must be a source trusted independently of the router (defaults to 0G mainnet) (env %s)", env("CHAIN_RPC_URL"))),
 		servingContract: fs.String("serving-contract", envOr(env("SERVING_CONTRACT"), chain.DefaultInferenceServingAddress),
 			fmt.Sprintf("InferenceServing contract address for on-chain signer lookups (env %s)", env("SERVING_CONTRACT"))),
+		warmOn: fs.Bool("warm", envBool(env("WARM"), false),
+			fmt.Sprintf("run a background warmer that pre-verifies every provider's quote and refreshes it ahead of expiry, so requests hit a warm cache instead of paying the DCAP verify inline; requires -attest and -onchain (env %s)", env("WARM"))),
+		warmInterval: fs.Duration("warm-interval", envDuration(env("WARM_INTERVAL"), defaultWarmInterval),
+			fmt.Sprintf("with -warm, how often to re-verify each provider (should be under the ~5m quote-cache TTL for refresh-ahead) (env %s)", env("WARM_INTERVAL"))),
 	}
+}
+
+// Built is the wired client core plus the handles a caller needs to run the
+// background quote-cache warmer. Client is the OpenAI-proxy core both binaries
+// serve. The remaining fields are warmer wiring, populated only when -warm is
+// set (nil/zero otherwise): router is the resolver whose cache is warmed, and
+// resolver is the CONCRETE on-chain registry (not the caching SignerRegistry
+// wrapper), because the warmer needs its ServiceInfo method to resolve each
+// provider's endpoint from chain. Callers pass the whole struct to StartWarmer;
+// only Client is needed to serve requests.
+type Built struct {
+	Client       *core.Client
+	router       *route.Router
+	resolver     route.EndpointResolver
+	warmInterval time.Duration
 }
 
 // Build validates the parsed flags and constructs the wired client core: a
@@ -183,12 +211,16 @@ func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen string) *Flags {
 // attached (field names and byte lengths only, never plaintext or key
 // material); it writes to the process log and never reaches the end user.
 //
+// It returns a *Built: the client core to serve, plus (when -warm is set) the
+// router and concrete on-chain resolver StartWarmer needs to run the background
+// quote-cache warmer.
+//
 // It exits the process via os.Exit(1) (after logging through logger) on an
 // invalid flag combination — the same fail-loud behavior both mains had inline —
 // so a misconfigured proxy never starts with, say, an unsealed "messages" field
 // or attestation silently off. logger is also attached as the core's debug
 // logger, so open-failure diagnostics share the binary's format and sink.
-func (f *Flags) Build(label string, logger *slog.Logger) *core.Client {
+func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 	sealFields := parseCSV(*f.sealFieldsCSV)
 	if err := wire.ValidateSealedFields(sealFields); err != nil {
 		logger.Error("invalid -seal-fields", "err", err)
@@ -219,6 +251,17 @@ func (f *Flags) Build(label string, logger *slog.Logger) *core.Client {
 		logger.Error("-onchain requires -chain-rpc-url")
 		os.Exit(1)
 	}
+	// The warmer pre-verifies quotes (needs -attest) and resolves each provider's
+	// endpoint from the on-chain registry (needs -onchain, which builds it). Fail
+	// loud rather than start a warmer that would silently no-op.
+	if *f.warmOn && (!*f.attestOn || !*f.onchainOn) {
+		logger.Error("-warm requires -attest and -onchain")
+		os.Exit(1)
+	}
+	if *f.warmOn && *f.warmInterval <= 0 {
+		logger.Error("-warm requires a positive -warm-interval")
+		os.Exit(1)
+	}
 
 	// Route per request: pick the provider via the router and derive its enc key +
 	// signer from the broker, so no provider key is pinned up front. The router is
@@ -229,22 +272,73 @@ func (f *Flags) Build(label string, logger *slog.Logger) *core.Client {
 	if *f.attestOn {
 		routeOpts = append(routeOpts, route.WithQuoteVerification(newVerifier(label, *f.attestEnforce, logger), logger))
 	}
+	// resolver is the CONCRETE on-chain registry the warmer uses to resolve each
+	// provider's endpoint via ServiceInfo. The route's grounding uses the caching
+	// wrapper (chain.Cached) instead — it only needs AcknowledgedSigner — so the
+	// two are deliberately different values off the same underlying registry.
+	var resolver route.EndpointResolver
 	if *f.onchainOn {
 		reg, err := chain.NewOnChainRegistry(chain.Config{RPCURL: *f.chainRPCURL, ContractAddress: *f.servingContract})
 		if err != nil {
 			logger.Error("on-chain registry", "err", err)
 			os.Exit(1)
 		}
+		resolver = reg
 		routeOpts = append(routeOpts, route.WithOnChainVerification(chain.Cached(reg, onchainCacheTTL), *f.onchainEnforce, logger))
 		logger.Info("on-chain signer grounding enabled", "label", label, "enforce", *f.onchainEnforce, "contract", *f.servingContract)
 	}
 	router := route.New(*f.RouterURL, routeOpts...)
-	return core.NewWithResolver(router,
+	client := core.NewWithResolver(router,
 		core.WithSealFields(sealFields),
 		core.WithUnboundFields(unboundFields),
 		core.WithDebugLogger(logger),
 	)
+	b := &Built{Client: client, router: router}
+	if *f.warmOn {
+		b.resolver = resolver
+		b.warmInterval = *f.warmInterval
+	}
+	return b
 }
+
+// StartWarmer launches the background quote-cache warmer in a goroutine and
+// returns a stop function the caller defers (or calls before exit) to halt the
+// loop and wait for it to drain on shutdown. When -warm was not configured it
+// is a no-op that returns a no-op stop, so callers can wire it unconditionally.
+// The warmer re-verifies every provider's quote on a refresh-ahead interval so
+// requests hit a warm cache; a per-provider failure is logged and skipped, and
+// shutdown (stop) cancels the loop without evicting still-good entries.
+func (b *Built) StartWarmer(logger *slog.Logger) (stop func()) {
+	if b.warmInterval <= 0 || b.resolver == nil || b.router == nil {
+		return func() {}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.router.RunWarmer(ctx, b.warmInterval, b.resolver)
+	}()
+	logger.Info("quote-cache warmer started", "interval", b.warmInterval)
+	return func() {
+		cancel()
+		// Wait for the loop to unwind, but only briefly: an in-flight refresh runs
+		// on a detached context (route.quoteVerifyTimeout, ~60s) that cancel() does
+		// not abort, and holding up process exit that long would blow the shutdown
+		// grace. Its cache write is harmless — the process is exiting — so cap the
+		// wait and let the goroutine finish on its own if it is mid-verify.
+		select {
+		case <-done:
+		case <-time.After(warmerStopGrace):
+			logger.Warn("quote-cache warmer still draining at shutdown; exiting anyway")
+		}
+	}
+}
+
+// warmerStopGrace bounds how long StartWarmer's stop waits for the warmer loop
+// to unwind at shutdown before letting the process exit regardless. Kept small
+// so a warmer mid-verify (on its own detached, ~60s-bounded context) never
+// stretches shutdown past the orchestrator's stop grace.
+const warmerStopGrace = 2 * time.Second
 
 // newVerifier builds the per-request TDX quote verifier. Quote authenticity
 // (genuine TDX + TCB UpToDate + report_data binding) is always enforced; only
@@ -290,6 +384,22 @@ func envBool(key string, def bool) bool {
 		log.Fatalf("invalid %s=%q: must be a boolean (true/false)", key, v)
 	}
 	return b
+}
+
+// envDuration parses a duration environment variable (Go duration syntax, e.g.
+// "4m", "90s"). An unset variable falls back to def; a set-but-unparseable value
+// is fatal rather than silently defaulting, so a typo like ZG_GATEWAY_WARM_INTERVAL=4
+// (missing unit) cannot quietly change the refresh cadence.
+func envDuration(key string, def time.Duration) time.Duration {
+	v, ok := os.LookupEnv(key)
+	if !ok {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		log.Fatalf("invalid %s=%q: must be a Go duration (e.g. 4m, 90s)", key, v)
+	}
+	return d
 }
 
 // parseCSV splits a comma-separated flag value into trimmed, non-empty parts.

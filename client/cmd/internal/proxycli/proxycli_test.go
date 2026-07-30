@@ -133,6 +133,30 @@ func TestEnvBool(t *testing.T) {
 	}
 }
 
+// envDuration falls back to def when unset and parses Go duration syntax when
+// set. (The set-but-unparseable case is log.Fatal, so it is not exercised here.)
+func TestEnvDuration(t *testing.T) {
+	const key = "ZG_PROXYCLI_TEST_ENVDUR"
+	if got := envDuration("ZG_PROXYCLI_TEST_UNSET_DUR", 4*time.Minute); got != 4*time.Minute {
+		t.Fatalf("unset var: got %v, want fallback 4m", got)
+	}
+	t.Setenv(key, "90s")
+	if got := envDuration(key, time.Minute); got != 90*time.Second {
+		t.Fatalf("%s=90s: got %v, want 90s", key, got)
+	}
+}
+
+// StartWarmer is a no-op that returns a safe-to-call stop when warming was not
+// configured (the common case: -warm off leaves warmInterval zero and resolver
+// nil), so the mains can wire it unconditionally.
+func TestStartWarmerNoopWhenOff(t *testing.T) {
+	stop := (&Built{}).StartWarmer(testLogger())
+	if stop == nil {
+		t.Fatal("StartWarmer returned a nil stop func")
+	}
+	stop() // must not panic or block
+}
+
 // parseCSV trims each element and drops empty ones, so surrounding spaces and a
 // trailing comma do not produce blank fields.
 func TestParseCSV(t *testing.T) {
