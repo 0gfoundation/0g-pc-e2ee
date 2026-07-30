@@ -129,15 +129,47 @@ func NewOnChainRegistry(cfg Config) (*OnChainRegistry, error) {
 // AcknowledgedSigner reads getService(providerAddr) and returns its
 // teeSignerAddress and teeSignerAcknowledged.
 func (r *OnChainRegistry) AcknowledgedSigner(ctx context.Context, providerAddr string) (string, bool, error) {
-	if !isHexAddress(providerAddr) {
-		return "", false, fmt.Errorf("chain: bad provider address %q (want 0x + 40 hex)", providerAddr)
-	}
-	calldata := "0x" + getServiceSelector + leftPad32(providerAddr)
-	raw, err := r.ethCall(ctx, calldata)
+	raw, err := r.getServiceRaw(ctx, providerAddr)
 	if err != nil {
 		return "", false, err
 	}
 	return decodeService(raw)
+}
+
+// ServiceInfo is the subset of a provider's on-chain Service a caller needs to
+// both locate it (URL — the serving endpoint, e.g. where its /quote lives) and
+// trust its signer (Signer + Acknowledged, the hop-5 fields).
+type ServiceInfo struct {
+	URL          string
+	Signer       string
+	Acknowledged bool
+}
+
+// ServiceInfo reads getService(providerAddr) and returns the provider's serving
+// URL alongside its teeSignerAddress and teeSignerAcknowledged, from one call.
+// The signer fields decode from fixed static offsets (same as AcknowledgedSigner,
+// fail-closed); the URL is a best-effort read of a dynamic string and is left
+// empty rather than erroring, since it is informational, not security-critical.
+func (r *OnChainRegistry) ServiceInfo(ctx context.Context, providerAddr string) (ServiceInfo, error) {
+	raw, err := r.getServiceRaw(ctx, providerAddr)
+	if err != nil {
+		return ServiceInfo{}, err
+	}
+	signer, acknowledged, err := decodeService(raw)
+	if err != nil {
+		return ServiceInfo{}, err
+	}
+	url, _ := decodeServiceURL(raw) // best-effort; informational only
+	return ServiceInfo{URL: url, Signer: signer, Acknowledged: acknowledged}, nil
+}
+
+// getServiceRaw builds and sends the getService(provider) eth_call, returning the
+// raw ABI return bytes.
+func (r *OnChainRegistry) getServiceRaw(ctx context.Context, providerAddr string) ([]byte, error) {
+	if !isHexAddress(providerAddr) {
+		return nil, fmt.Errorf("chain: bad provider address %q (want 0x + 40 hex)", providerAddr)
+	}
+	return r.ethCall(ctx, "0x"+getServiceSelector+leftPad32(providerAddr))
 }
 
 // jsonRPCRequest / jsonRPCResponse model the subset of JSON-RPC eth_call used.
@@ -259,6 +291,50 @@ func decodeService(raw []byte) (string, bool, error) {
 		}
 	}
 	return signer, acknowledged, nil
+}
+
+// decodeServiceURL extracts Service.url (field index 2, a dynamic string) from a
+// getService return. Unlike decodeService this reads a dynamic field, so it must
+// follow the head-slot offset to the string tail: head slot 2 holds the string's
+// offset relative to the struct base, and there sit a length word then the UTF-8
+// bytes. It is informational only (it tells a caller where to fetch a quote), so
+// callers treat any error as "no URL on chain" rather than a hard failure.
+func decodeServiceURL(raw []byte) (string, error) {
+	const word = 32
+	base, ok := readWordUint(raw, 0)
+	if !ok {
+		return "", errors.New("chain: getService return too short for offset")
+	}
+	rel, ok := readWordUint(raw, base+2*word) // head slot 2 = url offset
+	if !ok {
+		return "", errors.New("chain: getService return too short for url slot")
+	}
+	strStart := base + rel
+	n, ok := readWordUint(raw, strStart) // string length
+	if !ok {
+		return "", errors.New("chain: getService url length out of range")
+	}
+	dataStart := strStart + word
+	end := dataStart + n
+	if end < dataStart || uint64(len(raw)) < end {
+		return "", errors.New("chain: getService url data truncated")
+	}
+	return string(raw[dataStart:end]), nil
+}
+
+// readWordUint reads the 32-byte big-endian word at byte offset off as a uint64,
+// reporting ok=false if the word is out of bounds or does not fit in uint64.
+func readWordUint(raw []byte, off uint64) (uint64, bool) {
+	const word = 32
+	end := off + word
+	if end < off || uint64(len(raw)) < end {
+		return 0, false
+	}
+	v := new(big.Int).SetBytes(raw[off:end])
+	if !v.IsUint64() {
+		return 0, false
+	}
+	return v.Uint64(), true
 }
 
 // isHexAddress reports whether s is a 0x-prefixed 20-byte hex address.

@@ -177,3 +177,11 @@ wired. The one remaining piece is *populating* the measurement allowlist (hop 3)
 which is empty today — until it is filled, hop 3 runs in warn mode (or enforce
 rejects all). Hop 5 turns "an attested enclave" into "the **expected** attested
 enclave."
+
+**Checking a provider (`client/cmd/pcverify`).** A read-only diagnostic walks
+hops 2–5 for one provider in a single command — DCAP-verify its quote (genuine
+TDX + measurement + report_data) and cross-check the quote-bound signer against
+its acknowledged on-chain `teeSignerAddress`. Use it as the pre-enable gate
+before flipping the sidecar/gateway into `-attest` / `-onchain`. The provider's
+endpoint is read from the chain (`Service.url`), so only `-provider` is required.
+`-no-quote` restricts the run to the on-chain hop.
