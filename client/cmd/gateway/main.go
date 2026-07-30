@@ -56,11 +56,16 @@ func main() {
 	// forms don't drift (see proxycli.NewLogger). dstack/Phala captures stdout as
 	// line records; a later GCP move can swap the handler in one place.
 	logger := proxycli.NewLogger()
-	client := f.Build("gateway", logger)
+	built := f.Build("gateway", logger)
+
+	// Start the background quote-cache warmer (a no-op unless -warm is set) so
+	// requests hit a warm cache instead of paying the DCAP verify inline; stop it
+	// on shutdown before the process exits.
+	stopWarmer := built.StartWarmer(logger)
 
 	srv := &http.Server{
 		Addr:              *f.Listen,
-		Handler:           newHandler(client, logger),
+		Handler:           newHandler(built.Client, logger),
 		ReadHeaderTimeout: 10 * time.Second, // mitigate slow-header (Slowloris) clients
 	}
 	// TLS is terminated by the dstack ZT-HTTPS front end inside the enclave, so
@@ -71,7 +76,9 @@ func main() {
 	// dstack/Phala deployment sends it on every redeploy). ListenAndServe's clean
 	// shutdown is folded into a nil return; only a real listen failure is an error.
 	logger.Info("gateway listening", "listen", *f.Listen, "router_url", *f.RouterURL)
-	if err := proxycli.Serve(srv, logger); err != nil {
+	err := proxycli.Serve(srv, logger)
+	stopWarmer()
+	if err != nil {
 		logger.Error("gateway server exited", "err", err)
 		os.Exit(1)
 	}

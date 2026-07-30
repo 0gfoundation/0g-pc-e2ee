@@ -40,13 +40,18 @@ func main() {
 	// caller sees (field names/lengths only, no plaintext or key material).
 	logger := proxycli.NewLogger()
 	// "sidecar" only labels the attestation log line.
-	client := f.Build("sidecar", logger)
+	built := f.Build("sidecar", logger)
+
+	// Start the background quote-cache warmer (a no-op unless -warm is set) so
+	// requests hit a warm cache instead of paying the DCAP verify inline; stop it
+	// on shutdown before the process exits.
+	stopWarmer := built.StartWarmer(logger)
 
 	// Single-user and local, so surfacing the raw upstream body in errors aids
 	// debugging and never leaves the user's machine (localhost); the gateway
 	// deliberately does not do this. The access-log middleware is the same one the
 	// gateway runs — no reason for the local form to log differently.
-	handler := openaiproxy.LogRequests(logger, openaiproxy.Handler(client, openaiproxy.WithVerboseUpstreamErrors()))
+	handler := openaiproxy.LogRequests(logger, openaiproxy.Handler(built.Client, openaiproxy.WithVerboseUpstreamErrors()))
 	srv := &http.Server{
 		Addr:              *f.Listen,
 		Handler:           handler,
@@ -56,7 +61,9 @@ func main() {
 	// (shared with the gateway so both forms handle SIGINT/SIGTERM identically). A
 	// clean shutdown returns nil; only a real listen failure is a fatal error.
 	logger.Info("sidecar listening", "listen", *f.Listen, "router_url", *f.RouterURL)
-	if err := proxycli.Serve(srv, logger); err != nil {
+	err := proxycli.Serve(srv, logger)
+	stopWarmer()
+	if err != nil {
 		logger.Error("sidecar server exited", "err", err)
 		os.Exit(1)
 	}
