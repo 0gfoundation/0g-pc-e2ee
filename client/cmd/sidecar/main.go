@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/dcap"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
@@ -27,6 +28,11 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
+// onchainCacheTTL bounds how long an on-chain teeSignerAddress lookup is reused.
+// A provider's acknowledged signer changes only on re-registration, so a few
+// minutes trades a stale-signer window for far fewer chain RPCs per request.
+const onchainCacheTTL = 5 * time.Minute
+
 func main() {
 	listen := flag.String("listen", "localhost:8787", "address to listen on")
 	routerURL := flag.String("router-url", route.DefaultRouterURL, "0G router base URL/domain (the route-preview path is appended)")
@@ -34,6 +40,10 @@ func main() {
 	unboundFieldsCSV := flag.String("unbound-fields", strings.Join(wire.DefaultUnboundFields(), ","), "comma-separated cleartext fields excluded from the AAD (intermediary-mutable, untrusted); empty binds everything")
 	attestOn := flag.Bool("attest", false, "DCAP-verify each provider's TDX quote and seal only to the verified enc key (instead of trusting the router-supplied pubkey endpoint)")
 	attestEnforce := flag.Bool("attest-enforce", false, "with -attest, reject a provider whose measurement is not in the allowlist instead of only warning; the audited-image allowlist is not wired yet (empty), so enforce currently rejects all providers")
+	onchainOn := flag.Bool("onchain", false, "cross-check each provider's quote-bound TEE signer against its acknowledged on-chain teeSignerAddress in the InferenceServing registry (SPEC §4.4 step 3); requires -attest")
+	onchainEnforce := flag.Bool("onchain-enforce", false, "with -onchain, skip a provider whose on-chain signer is missing/unacknowledged/mismatched instead of only warning")
+	chainRPCURL := flag.String("chain-rpc-url", "", "0G chain JSON-RPC endpoint for on-chain signer lookups; must be a source trusted independently of the router (required with -onchain)")
+	servingContract := flag.String("serving-contract", chain.DefaultInferenceServingAddress, "InferenceServing contract address for on-chain signer lookups")
 	flag.Parse()
 
 	sealFields := parseCSV(*sealFieldsCSV)
@@ -49,6 +59,17 @@ func main() {
 	if *attestEnforce && !*attestOn {
 		log.Fatalf("-attest-enforce requires -attest")
 	}
+	// On-chain grounding needs a quote-bound signer to check (so -attest), a
+	// stricter mode needs the check on (so -onchain), and the check needs an RPC.
+	if *onchainEnforce && !*onchainOn {
+		log.Fatalf("-onchain-enforce requires -onchain")
+	}
+	if *onchainOn && !*attestOn {
+		log.Fatalf("-onchain requires -attest (the signer must come from a verified quote)")
+	}
+	if *onchainOn && strings.TrimSpace(*chainRPCURL) == "" {
+		log.Fatalf("-onchain requires -chain-rpc-url")
+	}
 
 	// Route per request: pick the provider via the router and derive its enc key
 	// from the broker. The router is told to withhold exactly the sealed fields,
@@ -58,6 +79,14 @@ func main() {
 	routeOpts := []route.Option{route.WithSensitiveFields(sealFields)}
 	if *attestOn {
 		routeOpts = append(routeOpts, route.WithQuoteVerification(newVerifier(*attestEnforce), nil))
+	}
+	if *onchainOn {
+		reg, err := chain.NewOnChainRegistry(chain.Config{RPCURL: *chainRPCURL, ContractAddress: *servingContract})
+		if err != nil {
+			log.Fatalf("on-chain registry: %v", err)
+		}
+		routeOpts = append(routeOpts, route.WithOnChainVerification(chain.Cached(reg, onchainCacheTTL), *onchainEnforce, nil))
+		log.Printf("sidecar: on-chain signer grounding enabled (enforce=%v, contract=%s)", *onchainEnforce, *servingContract)
 	}
 	router := route.New(*routerURL, routeOpts...)
 	// Log a redaction-safe summary of any response open (AEAD) failure to the

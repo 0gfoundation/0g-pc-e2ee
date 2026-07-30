@@ -103,8 +103,9 @@ type Verified struct {
 	EncPub crypto.PublicKey
 	// SignerAddr is the provider's TEE signer address from report_data. The
 	// caller MUST still confirm it equals the provider's on-chain
-	// teeSignerAddress before pinning (SPEC §4.4 step 3; issue #18) — this
-	// package returns it but does not know the chain.
+	// teeSignerAddress before pinning (SPEC §4.4 step 3) — this package returns
+	// it but does not know the chain; the route resolver does that check (see
+	// client/route WithOnChainVerification).
 	SignerAddr string
 	// Measurement is the quote's measurement, surfaced for logging/audit.
 	Measurement Measurement

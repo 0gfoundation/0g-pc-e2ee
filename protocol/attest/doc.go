@@ -18,7 +18,8 @@
 // Step 3 of §4.4 — confirming signer_addr equals the provider's on-chain
 // teeSignerAddress — is deliberately NOT done here: it belongs to the caller
 // (the route resolver), which knows the on-chain identity. Verify returns the
-// bound signer_addr for the caller to cross-check (issue #18).
+// bound signer_addr; the route resolver cross-checks it against the on-chain
+// registry (client/route WithOnChainVerification, client/chain).
 //
 // # What is real vs. deferred in this skeleton
 //

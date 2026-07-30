@@ -58,5 +58,14 @@ services:
       # wired yet (empty), so enforce currently rejects all providers. Defaults to
       # off; uncomment to enable.
       # - "ZG_GATEWAY_ATTEST_ENFORCE=true"
+      # Cross-check each provider's quote-bound TEE signer against its acknowledged
+      # on-chain teeSignerAddress (InferenceServing registry). Requires
+      # ZG_GATEWAY_ATTEST and a client-trusted chain RPC. Defaults to off.
+      # - "ZG_GATEWAY_ONCHAIN=true"
+      # - "ZG_GATEWAY_CHAIN_RPC_URL=<0G chain JSON-RPC endpoint>"
+      # - "ZG_GATEWAY_SERVING_CONTRACT=0x47340d900bdFec2BD393c626E12ea0656F938d84"
+      # With ZG_GATEWAY_ONCHAIN, skip a provider whose on-chain signer is
+      # missing/unacknowledged/mismatched instead of only warning. Defaults to off.
+      # - "ZG_GATEWAY_ONCHAIN_ENFORCE=true"
     # No secrets or volumes: the gateway holds no pinned provider key, and TLS
     # material is managed by dstack-kms inside the enclave, never by this file.

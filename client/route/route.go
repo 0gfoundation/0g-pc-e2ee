@@ -34,6 +34,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -43,6 +44,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
@@ -99,6 +101,12 @@ type Router struct {
 	// report_data. Nil keeps the legacy pubkey-endpoint behavior.
 	verifier *attest.Verifier
 	logger   *slog.Logger
+	// registry, when non-nil, grounds the quote-bound signer in the on-chain
+	// InferenceServing registry (SPEC §4.4 step 3 / trust-chain hop 5): the signer
+	// must equal the provider's acknowledged teeSignerAddress. onchainEnforce
+	// makes a negative result fail-closed (skip the candidate) instead of a warn.
+	registry       chain.SignerRegistry
+	onchainEnforce bool
 }
 
 // Option customizes a Router.
@@ -167,6 +175,37 @@ func WithQuoteVerification(v *attest.Verifier, logger *slog.Logger) Option {
 		}
 		r.verifier = v
 		r.logger = logger
+	}
+}
+
+// WithOnChainVerification makes the Router cross-check each candidate's
+// quote-bound signer against the provider's acknowledged teeSignerAddress in the
+// on-chain InferenceServing registry (SPEC §4.4 step 3 / trust-chain hop 5). DCAP
+// quote verification (WithQuoteVerification) proves the signer belongs to a
+// genuine, audited enclave, but not that it is the *expected* provider — a
+// look-alike enclave running the same image passes the quote check. Grounding the
+// signer in the chain — a source the untrusted router cannot forge — closes that
+// gap. This option is meaningful only alongside WithQuoteVerification (otherwise
+// the signer comes from the router-supplied pubkey endpoint, not a quote).
+//
+// enforce=false is observe-only: a missing/unacknowledged/mismatched on-chain
+// signer (or an RPC failure) is logged and the candidate is still used, mirroring
+// attest warn mode for staged rollout. enforce=true is fail-closed: any negative
+// skips the candidate so core falls back to the next. logger nil uses
+// slog.Default() (or the logger a prior WithQuoteVerification set).
+func WithOnChainVerification(reg chain.SignerRegistry, enforce bool, logger *slog.Logger) Option {
+	return func(r *Router) {
+		if reg == nil {
+			return
+		}
+		r.registry = reg
+		r.onchainEnforce = enforce
+		if r.logger == nil {
+			if logger == nil {
+				logger = slog.Default()
+			}
+			r.logger = logger
+		}
 	}
 }
 
@@ -266,6 +305,17 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 	if err != nil {
 		return core.Provider{}, err
 	}
+	// Ground the quote-bound signer in the on-chain registry (SPEC §4.4 step 3 /
+	// trust-chain hop 5): it must equal this provider's acknowledged
+	// teeSignerAddress. This is what distinguishes the *expected* provider from a
+	// look-alike enclave running the same audited image (both pass the quote
+	// check). Keyed on prov.Address (the provider's on-chain account), whose
+	// Address→teeSigner mapping the untrusted router cannot forge.
+	if c.router.registry != nil {
+		if err := c.router.groundSignerOnChain(ctx, prov.Address, signer); err != nil {
+			return core.Provider{}, err
+		}
+	}
 	// Two distinct pins, which may differ (so they are NOT cross-checked):
 	//   - SignerAddr (broker's signer_address) → sealed into _e2ee.signer_addr,
 	//     the crypto pin the provider enclave verifies and that signs responses.
@@ -311,6 +361,45 @@ func (r *Router) verifiedKeys(ctx context.Context, endpoint string) (crypto.Publ
 			"signer_addr", verified.SignerAddr)
 	}
 	return verified.EncPub, verified.SignerAddr, nil
+}
+
+// groundSignerOnChain enforces SPEC §4.4 step 3 / trust-chain hop 5: the signer
+// bound into the (DCAP-verified) quote must equal the provider's acknowledged
+// teeSignerAddress in the on-chain InferenceServing registry. Enforce mode is
+// fail-closed on every negative — lookup error, unacknowledged signer, or
+// mismatch — so the candidate is skipped and core falls back. Warn mode is
+// observe-only (log and proceed), mirroring attest warn mode for staged rollout.
+func (r *Router) groundSignerOnChain(ctx context.Context, providerAddr, signer string) error {
+	onchain, acknowledged, err := r.registry.AcknowledgedSigner(ctx, providerAddr)
+	if err != nil {
+		return r.onchainFail(fmt.Sprintf("on-chain signer lookup for provider %s failed", providerAddr), err)
+	}
+	if !acknowledged {
+		return r.onchainFail(fmt.Sprintf("provider %s has no acknowledged on-chain TEE signer", providerAddr), nil)
+	}
+	if !strings.EqualFold(strings.TrimSpace(onchain), strings.TrimSpace(signer)) {
+		return r.onchainFail(fmt.Sprintf(
+			"quote signer %s does not match on-chain teeSignerAddress %s for provider %s",
+			signer, onchain, providerAddr), nil)
+	}
+	return nil
+}
+
+// onchainFail turns a failed on-chain signer check into either a fail-closed
+// skip (enforce) or an observe-only warning (warn), per onchainEnforce.
+func (r *Router) onchainFail(msg string, cause error) error {
+	if r.onchainEnforce {
+		if cause != nil {
+			return upstream(0, fmt.Errorf("%s: %w", msg, cause))
+		}
+		return upstream(0, errors.New(msg))
+	}
+	if cause != nil {
+		r.logger.Warn("on-chain signer check failed; proceeding (onchain warn mode)", "detail", msg, "err", cause)
+	} else {
+		r.logger.Warn("on-chain signer check failed; proceeding (onchain warn mode)", "detail", msg)
+	}
+	return nil
 }
 
 // fetchQuote GETs and decodes a provider's /v1/quote reply into raw TDX quote
