@@ -6,16 +6,27 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
 )
 
-type stubRegistry struct {
-	signer string
-	ack    bool
-	err    error
+type stubService struct {
+	info chain.ServiceInfo
+	err  error
 }
 
-func (s stubRegistry) AcknowledgedSigner(context.Context, string) (string, bool, error) {
-	return s.signer, s.ack, s.err
+func (s stubService) ServiceInfo(context.Context, string) (chain.ServiceInfo, error) {
+	return s.info, s.err
+}
+
+type stubQuote struct {
+	v   attest.Verified
+	err error
+}
+
+func (s stubQuote) FetchAndVerify(context.Context, string) (attest.Verified, error) {
+	return s.v, s.err
 }
 
 const (
@@ -23,38 +34,102 @@ const (
 	signer = "0x99887766554433221100ffeeddccbbaa99887766"
 )
 
-func TestReport(t *testing.T) {
+// On-chain-only (qc == nil): the earlier tool's behavior.
+func TestReport_OnChainOnly(t *testing.T) {
 	cases := []struct {
 		name         string
-		reg          stubRegistry
+		svc          stubService
 		expectSigner string
 		wantCode     int
-		wantContains string
 	}{
-		{"acknowledged, no expected", stubRegistry{signer: signer, ack: true}, "", 0, "PASS"},
-		{"acknowledged, expected matches", stubRegistry{signer: signer, ack: true}, strings.ToUpper(signer), 0, "PASS"},
-		{"acknowledged, expected mismatches", stubRegistry{signer: signer, ack: true}, "0x0000000000000000000000000000000000000001", 1, "FAIL"},
-		{"unacknowledged", stubRegistry{signer: signer, ack: false}, "", 1, "FAIL"},
-		{"lookup error", stubRegistry{err: errors.New("rpc down")}, "", 1, "FAIL"},
+		{"acknowledged", stubService{info: chain.ServiceInfo{Signer: signer, Acknowledged: true}}, "", 0},
+		{"expected matches", stubService{info: chain.ServiceInfo{Signer: signer, Acknowledged: true}}, strings.ToUpper(signer), 0},
+		{"expected mismatch", stubService{info: chain.ServiceInfo{Signer: signer, Acknowledged: true}}, "0x0000000000000000000000000000000000000001", 1},
+		{"unacknowledged", stubService{info: chain.ServiceInfo{Signer: signer, Acknowledged: false}}, "", 1},
+		{"lookup error", stubService{err: errors.New("rpc down")}, "", 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var out bytes.Buffer
-			code := report(context.Background(), &out, tc.reg, prov, "0xcontract", tc.expectSigner)
+			code := report(context.Background(), &out, tc.svc, nil, prov, "0xcontract", "", tc.expectSigner)
 			if code != tc.wantCode {
-				t.Errorf("exit code = %d, want %d (out: %s)", code, tc.wantCode, out.String())
-			}
-			if !strings.Contains(out.String(), tc.wantContains) {
-				t.Errorf("output missing %q:\n%s", tc.wantContains, out.String())
+				t.Errorf("code = %d, want %d\n%s", code, tc.wantCode, out.String())
 			}
 		})
 	}
 }
 
+// With a quote checker: full chain including hop-5 cross-check.
+func TestReport_WithQuote(t *testing.T) {
+	acked := chain.ServiceInfo{URL: "https://prov.example/v1", Signer: signer, Acknowledged: true}
+	cases := []struct {
+		name     string
+		svc      stubService
+		qc       stubQuote
+		wantCode int
+		contains string
+	}{
+		{"all pass", stubService{info: acked}, stubQuote{v: attest.Verified{SignerAddr: signer}}, 0, "PASS"},
+		{"quote signer mismatch", stubService{info: acked},
+			stubQuote{v: attest.Verified{SignerAddr: "0x0000000000000000000000000000000000000002"}}, 1, "FAIL"},
+		{"quote fetch/verify error", stubService{info: acked}, stubQuote{err: errors.New("not a genuine TDX quote")}, 1, "FAIL"},
+		{"no endpoint on chain", stubService{info: chain.ServiceInfo{Signer: signer, Acknowledged: true}},
+			stubQuote{v: attest.Verified{SignerAddr: signer}}, 1, "no endpoint"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			code := report(context.Background(), &out, tc.svc, tc.qc, prov, "0xcontract", "", "")
+			if code != tc.wantCode {
+				t.Errorf("code = %d, want %d\n%s", code, tc.wantCode, out.String())
+			}
+			if !strings.Contains(out.String(), tc.contains) {
+				t.Errorf("output missing %q:\n%s", tc.contains, out.String())
+			}
+		})
+	}
+}
+
+// -endpoint overrides the on-chain URL.
+func TestReport_EndpointOverride(t *testing.T) {
+	var out bytes.Buffer
+	svc := stubService{info: chain.ServiceInfo{URL: "https://from-chain/v1", Signer: signer, Acknowledged: true}}
+	code := report(context.Background(), &out, svc, stubQuote{v: attest.Verified{SignerAddr: signer}}, prov, "0xc", "https://override/v1", "")
+	if code != 0 {
+		t.Fatalf("code = %d, want 0\n%s", code, out.String())
+	}
+	if !strings.Contains(out.String(), "https://override/v1 (from -endpoint)") {
+		t.Errorf("expected endpoint override in output:\n%s", out.String())
+	}
+}
+
 func TestRun_MissingProvider(t *testing.T) {
 	var out bytes.Buffer
-	// No -provider: must fail with usage exit 2 before touching the network.
-	if code := run(context.Background(), &out, []string{"-chain-rpc-url", "http://127.0.0.1:0"}); code != 2 {
+	if code := run(context.Background(), &out, []string{"-no-quote", "-chain-rpc-url", "http://127.0.0.1:0"}); code != 2 {
 		t.Errorf("missing -provider: exit = %d, want 2", code)
+	}
+}
+
+func TestQuoteURLFromEndpoint(t *testing.T) {
+	cases := map[string]string{
+		"https://h/v1":                  "https://h/v1/quote?legacy=false",
+		"https://h":                     "https://h/v1/quote?legacy=false",
+		"https://h/v1/chat/completions": "https://h/v1/quote?legacy=false",
+		"http://h:8080/":                "http://h:8080/v1/quote?legacy=false",
+	}
+	for in, want := range cases {
+		got, err := quoteURLFromEndpoint(in)
+		if err != nil {
+			t.Errorf("%q: %v", in, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("%q: got %q, want %q", in, got, want)
+		}
+	}
+	for _, bad := range []string{"", "ftp://h", "not a url", "https://"} {
+		if _, err := quoteURLFromEndpoint(bad); err == nil {
+			t.Errorf("%q: want error", bad)
+		}
 	}
 }

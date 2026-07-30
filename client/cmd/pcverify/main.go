@@ -1,23 +1,22 @@
 // Command pcverify is a read-only diagnostic that checks a provider against the
-// 0G trust chain (docs/design/trust-chain.md), one hop at a time. This first cut
-// covers the on-chain hop — SPEC §4.4 step 3 / trust-chain hop 5: it reads the
-// provider's acknowledged teeSignerAddress from the on-chain InferenceServing
-// registry and, when given a signer to expect (e.g. a provider's self-reported
-// signer, or a quote's signer once TDX verification lands here), asserts they
-// match. TDX quote verification is a planned follow-up that wires client/dcap +
-// protocol/attest into this same tool.
+// 0G trust chain (docs/design/trust-chain.md) in one shot: it DCAP-verifies the
+// provider's TDX quote (hops 2–4 — genuine TDX, measurement, report_data) and
+// grounds the quote-bound signer in the on-chain InferenceServing registry
+// (hop 5 — SPEC §4.4 step 3). It is the pre-enable gate for the sidecar/gateway
+// -onchain / -attest modes: run it against the chain and provider you will point
+// them at to confirm the whole chain lines up before flipping on enforcement.
 //
-// It is a pre-enable gate: run it against the chain you will point -onchain at
-// before flipping the sidecar/gateway into enforce, to confirm the on-chain read
-// and decode line up with reality. It makes NO changes and sends NOTHING to any
-// provider — it only reads the chain over the RPC you give it. Exit code is
-// non-zero on any failed check, so it drops into CI or a deploy gate.
+// It makes NO changes and sends NOTHING beyond a read of the chain RPC and a GET
+// of the provider's public /quote (plus the DCAP collateral fetch the verifier
+// does). Exit code is non-zero on any failed check, so it drops into CI or a
+// deploy gate.
 //
-//	pcverify -provider 0x... -chain-rpc-url https://... [-serving-contract 0x...] [-expect-signer 0x...]
+//	pcverify -provider 0x... [-chain-rpc-url ...] [-serving-contract 0x...]
+//	         [-endpoint https://...] [-expect-signer 0x...] [-no-quote]
 //
-// The provider's serving endpoint is itself on chain (Service.url), so a future
-// quote check can default its endpoint from the same getService read rather than
-// taking it as a flag.
+// The provider's serving endpoint is read from the chain (Service.url), so
+// -endpoint is only needed to override it. -no-quote restricts the run to the
+// on-chain hop (no provider contact), matching the earlier on-chain-only tool.
 package main
 
 import (
@@ -25,15 +24,33 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
+	"github.com/0gfoundation/0g-pc-e2ee/client/dcap"
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
 )
+
+// maxQuoteBodyBytes bounds the provider /quote response read.
+const maxQuoteBodyBytes = 1 << 20
 
 func main() {
 	os.Exit(run(context.Background(), os.Stdout, os.Args[1:]))
+}
+
+// serviceReader reads a provider's on-chain Service info (URL + signer + ack).
+type serviceReader interface {
+	ServiceInfo(ctx context.Context, provider string) (chain.ServiceInfo, error)
+}
+
+// quoteChecker fetches a provider's TDX quote from its endpoint and DCAP-verifies
+// it. nil disables the quote hops (on-chain only).
+type quoteChecker interface {
+	FetchAndVerify(ctx context.Context, endpoint string) (attest.Verified, error)
 }
 
 func run(ctx context.Context, out io.Writer, args []string) int {
@@ -42,8 +59,10 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 	provider := fs.String("provider", "", "provider on-chain account address (0x + 40 hex, required)")
 	chainRPCURL := fs.String("chain-rpc-url", chain.DefaultChainRPCURL, "0G chain JSON-RPC endpoint; a source trusted independently of the router (defaults to 0G mainnet)")
 	servingContract := fs.String("serving-contract", chain.DefaultInferenceServingAddress, "InferenceServing contract address")
-	expectSigner := fs.String("expect-signer", "", "if set, require the on-chain teeSignerAddress to equal this (e.g. a quote's signer)")
-	timeout := fs.Duration("timeout", 15*time.Second, "overall timeout for the chain read")
+	endpoint := fs.String("endpoint", "", "provider serving endpoint for the quote fetch (default: read from chain, Service.url)")
+	expectSigner := fs.String("expect-signer", "", "if set, require the on-chain teeSignerAddress to equal this")
+	noQuote := fs.Bool("no-quote", false, "skip the TDX quote hops; check only the on-chain signer (no provider contact)")
+	timeout := fs.Duration("timeout", 30*time.Second, "overall timeout")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -59,31 +78,65 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 		return 2
 	}
 
+	var qc quoteChecker
+	if !*noQuote {
+		qc = newDCAPChecker()
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
-	return report(ctx, out, reg, *provider, *servingContract, *expectSigner)
+	return report(ctx, out, reg, qc, *provider, *servingContract, *endpoint, *expectSigner)
 }
 
-// report runs the on-chain hop and prints a per-check result, returning the
-// process exit code (0 pass, 1 failed check). It takes the SignerRegistry
-// interface so tests can drive it without a live chain.
-func report(ctx context.Context, out io.Writer, reg chain.SignerRegistry, provider, contract, expectSigner string) int {
+// report runs the checks and prints a per-hop result, returning the process exit
+// code (0 pass, 1 failed check). It takes interfaces so tests drive it without a
+// live chain or provider.
+func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecker, provider, contract, endpointOverride, expectSigner string) int {
 	fmt.Fprintf(out, "provider           %s\n", provider)
 	fmt.Fprintf(out, "contract           %s\n", contract)
 
-	signer, acknowledged, err := reg.AcknowledgedSigner(ctx, provider)
+	info, err := sr.ServiceInfo(ctx, provider)
 	if err != nil {
 		fmt.Fprintf(out, "%s on-chain lookup    %v\n", mark(false), err)
-		fmt.Fprintln(out, "\nFAIL")
-		return 1
+		return fail(out)
 	}
-	fmt.Fprintf(out, "  teeSignerAddress %s\n", signer)
-	fmt.Fprintf(out, "%s acknowledged     %v\n", mark(acknowledged), acknowledged)
+	fmt.Fprintf(out, "  teeSignerAddress %s\n", info.Signer)
+	fmt.Fprintf(out, "%s acknowledged     %v\n", mark(info.Acknowledged), info.Acknowledged)
+	ok := info.Acknowledged
 
-	ok := acknowledged
 	if strings.TrimSpace(expectSigner) != "" {
-		match := strings.EqualFold(strings.TrimSpace(signer), strings.TrimSpace(expectSigner))
+		match := strings.EqualFold(strings.TrimSpace(info.Signer), strings.TrimSpace(expectSigner))
 		fmt.Fprintf(out, "%s matches expected %s\n", mark(match), expectSigner)
+		ok = ok && match
+	}
+
+	if qc != nil {
+		endpoint, src := endpointOverride, "from -endpoint"
+		if strings.TrimSpace(endpoint) == "" {
+			endpoint, src = info.URL, "from chain (Service.url)"
+		}
+		if strings.TrimSpace(endpoint) == "" {
+			fmt.Fprintf(out, "%s quote            no endpoint (not on chain; pass -endpoint or -no-quote)\n", mark(false))
+			return fail(out)
+		}
+		fmt.Fprintf(out, "endpoint           %s (%s)\n", endpoint, src)
+
+		v, err := qc.FetchAndVerify(ctx, endpoint)
+		if err != nil {
+			fmt.Fprintf(out, "%s quote            %v\n", mark(false), err)
+			return fail(out)
+		}
+		fmt.Fprintf(out, "%s quote            genuine TDX (DCAP verified)\n", mark(true))
+		fmt.Fprintf(out, "  measurement MRTD %x\n", v.Measurement.MRTD[:])
+		if !v.MeasurementTrusted {
+			fmt.Fprintf(out, "  note             measurement not in allowlist (none configured)\n")
+		}
+		fmt.Fprintf(out, "  report_data enc  %x\n", v.EncPub)
+		fmt.Fprintf(out, "  report_data sgnr %s\n", v.SignerAddr)
+
+		// hop 5: the signer bound in the (genuine) quote must equal the on-chain one.
+		match := strings.EqualFold(strings.TrimSpace(v.SignerAddr), strings.TrimSpace(info.Signer))
+		fmt.Fprintf(out, "%s quote signer == on-chain signer\n", mark(match))
 		ok = ok && match
 	}
 
@@ -91,13 +144,94 @@ func report(ctx context.Context, out io.Writer, reg chain.SignerRegistry, provid
 		fmt.Fprintln(out, "\nPASS")
 		return 0
 	}
+	return fail(out)
+}
+
+func fail(out io.Writer) int {
 	fmt.Fprintln(out, "\nFAIL")
 	return 1
 }
 
 func mark(ok bool) string {
 	if ok {
-		return "✓" // ✓
+		return "✓"
 	}
-	return "✗" // ✗
+	return "✗"
+}
+
+// dcapChecker is the real quoteChecker: it GETs the provider's /quote and
+// DCAP-verifies it (genuine TDX + TCB + report_data binding). Measurement runs in
+// warn mode so the tool reports an out-of-allowlist measurement rather than
+// erroring — the allowlist is not yet populated (see proxycli/newVerifier).
+type dcapChecker struct {
+	http     *http.Client
+	verifier *attest.Verifier
+}
+
+func newDCAPChecker() *dcapChecker {
+	return &dcapChecker{
+		http: &http.Client{Timeout: 20 * time.Second},
+		verifier: attest.New(
+			attest.Policy{},
+			attest.WithQuoteParser(dcap.NewQuoteParser(dcap.Config{})),
+			attest.WithMeasurementMode(attest.ModeWarn),
+		),
+	}
+}
+
+func (c *dcapChecker) FetchAndVerify(ctx context.Context, endpoint string) (attest.Verified, error) {
+	raw, err := c.fetchQuote(ctx, endpoint)
+	if err != nil {
+		return attest.Verified{}, err
+	}
+	return c.verifier.Verify(raw)
+}
+
+func (c *dcapChecker) fetchQuote(ctx context.Context, endpoint string) ([]byte, error) {
+	quoteURL, err := quoteURLFromEndpoint(endpoint)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, quoteURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch quote: %w", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxQuoteBodyBytes))
+	if err != nil {
+		return nil, fmt.Errorf("read quote: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("quote endpoint returned %d", resp.StatusCode)
+	}
+	return attest.DecodeQuoteResponse(body)
+}
+
+// quoteURLFromEndpoint turns a provider endpoint into its DCAP quote URL,
+// mirroring client/route: normalize to the /v1 base, then /quote?legacy=false.
+func quoteURLFromEndpoint(endpoint string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(endpoint))
+	if err != nil {
+		return "", fmt.Errorf("%q is not a valid URL: %w", endpoint, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return "", fmt.Errorf("%q is not an http(s) URL", endpoint)
+	}
+	if u.Host == "" {
+		return "", fmt.Errorf("%q has no host", endpoint)
+	}
+	base := strings.TrimSuffix(u.Path, "/")
+	switch {
+	case strings.HasSuffix(base, "/chat/completions"):
+		base = strings.TrimSuffix(base, "/chat/completions")
+	case strings.HasSuffix(base, "/v1"):
+		// already the /v1 base
+	default:
+		base += "/v1"
+	}
+	return u.Scheme + "://" + u.Host + base + "/quote?legacy=false", nil
 }
