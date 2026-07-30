@@ -12,6 +12,11 @@ broker, the router, and the client all depend on, so every participant agrees
 
 > Status: early / design-stage. `SPEC.md` is normative; APIs will change.
 
+> **New to the trust model?** Start with the end-to-end
+> [**trust chain**](../docs/design/trust-chain.md) — one diagram of every hop and
+> where its trust bottoms out (hardware / code / on-chain roots), plus what is
+> *not* covered and which links are implemented vs. spec'd.
+
 ## Why this exists
 
 - **One implementation of security-critical crypto.** Sealing, response-signature
