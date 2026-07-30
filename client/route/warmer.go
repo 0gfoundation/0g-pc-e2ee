@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
@@ -33,6 +34,13 @@ type providerListResponse struct {
 // catalog (GET /v1/providers?service_type=…) for the Router's configured service
 // type. The addresses are the only thing taken from the router here; each
 // provider's endpoint is resolved from chain (see WarmOnce).
+//
+// The catalog is per-(provider, model), so a provider serving several models
+// appears once per model — the same address (and endpoint) repeated. A quote is
+// per-enclave, not per-model, so the returned list is de-duplicated by address
+// (case-insensitively, since the catalog may use EIP-55 or lowercase) to avoid
+// verifying the same provider once per model. First-seen order and casing are
+// preserved so downstream on-chain lookups get the address as the router sent it.
 func (r *Router) listProviderAddrs(ctx context.Context) ([]string, error) {
 	u := r.providersURL + "?service_type=" + url.QueryEscape(r.serviceType)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -56,10 +64,17 @@ func (r *Router) listProviderAddrs(ctx context.Context) ([]string, error) {
 		return nil, fmt.Errorf("decode providers list: %w", err)
 	}
 	addrs := make([]string, 0, len(pl.Data))
+	seen := make(map[string]bool, len(pl.Data))
 	for _, p := range pl.Data {
-		if p.Address != "" {
-			addrs = append(addrs, p.Address)
+		if p.Address == "" {
+			continue
 		}
+		key := strings.ToLower(p.Address)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		addrs = append(addrs, p.Address)
 	}
 	return addrs, nil
 }
