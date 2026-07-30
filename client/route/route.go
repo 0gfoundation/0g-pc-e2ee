@@ -64,6 +64,10 @@ const (
 	// previewPath is the router's route-preview endpoint, appended to the router
 	// base URL. It is owned here because this package owns that API contract.
 	previewPath = "/v1/routing/preview"
+	// providersPath is the router's provider-catalog endpoint. The warmer GETs it
+	// (with ?service_type=) to enumerate provider on-chain addresses; the serving
+	// endpoint itself is resolved from chain, not from this list.
+	providersPath = "/v1/providers"
 	// completionsPath is the router's OpenAI chat-completions endpoint. The sealed
 	// request is POSTed here — to the router, not the provider directly — because
 	// the router is the centralized auth/billing point; it authenticates, then
@@ -100,6 +104,7 @@ const (
 type Router struct {
 	previewURL      string
 	completionsURL  string
+	providersURL    string
 	serviceType     string
 	sensitiveFields map[string]struct{}
 	http            *http.Client
@@ -249,6 +254,7 @@ func New(routerURL string, opts ...Option) *Router {
 	r := &Router{
 		previewURL:      base + previewPath,
 		completionsURL:  base + completionsPath,
+		providersURL:    base + providersPath,
 		serviceType:     DefaultServiceType,
 		sensitiveFields: sliceToSet(wire.DefaultSealedFields()),
 		http:            &http.Client{Transport: tr},
@@ -366,52 +372,65 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 // rate-limit-sensitive) via singleflight; the rest share the result. Errors are
 // not cached, so a transient failure is retried on the next request.
 func (r *Router) verifiedKeys(ctx context.Context, endpoint string) (crypto.PublicKey, string, error) {
-	if encPub, signer, ok := r.quoteCache.get(endpoint); ok {
-		return encPub, signer, nil
-	}
-	// The shared verification runs under a context DETACHED from the caller that
-	// happened to lead (context.WithoutCancel keeps its values, drops its
-	// cancellation), so one caller disconnecting or timing out cannot fail the
-	// verification for the others coalesced onto it. It is still bounded by
-	// quoteVerifyTimeout so a hung upstream can't leak the in-flight call. Each
-	// caller then waits via DoChan and honors ITS OWN context — a caller whose
-	// request is canceled returns immediately without dooming the rest.
-	ch := r.quoteSF.DoChan(endpoint, func() (any, error) {
-		vctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), quoteVerifyTimeout)
-		defer cancel()
-		encPub, signer, err := r.verifyQuote(vctx, endpoint)
-		if err != nil {
-			return nil, err
-		}
-		r.quoteCache.put(endpoint, encPub, signer)
-		return quoteResult{encPub: encPub, signer: signer}, nil
-	})
-	select {
-	case <-ctx.Done():
-		// This caller gave up; the shared verification continues for the others
-		// (and warms the cache).
-		return nil, "", upstream(0, fmt.Errorf("provider quote verification: %w", ctx.Err()))
-	case res := <-ch:
-		if res.Err != nil {
-			return nil, "", res.Err
-		}
-		out := res.Val.(quoteResult)
-		return out.encPub, out.signer, nil
-	}
-}
-
-// verifyQuote is the uncached work behind verifiedKeys: fetch the candidate's
-// attestation quote from its endpoint and DCAP-verify it, returning the enc_pub +
-// signer bound into the verified report_data. Because the keys come out of a
-// genuine, signed quote, it does not matter that the untrusted router chose the
-// endpoint: a substituted endpoint serving an attacker key would fail
-// verification. On a warn-mode measurement miss it logs but still returns the
-// (genuine) keys.
-func (r *Router) verifyQuote(ctx context.Context, endpoint string) (crypto.PublicKey, string, error) {
+	// Key the cache + singleflight by the DERIVED quote URL, not the raw endpoint,
+	// so different endpoint spellings for the same provider (bare origin, /v1, full
+	// chat URL, trailing slash) — and, importantly, the warmer's chain-sourced URL
+	// vs a request's router-supplied endpoint — coincide when they name the same
+	// host. Deriving up front also fails a malformed endpoint before any lookup.
 	quoteURL, err := deriveQuoteURL(endpoint)
 	if err != nil {
 		return nil, "", upstream(0, fmt.Errorf("provider endpoint: %w", err))
 	}
+	if encPub, signer, ok := r.quoteCache.get(quoteURL); ok {
+		return encPub, signer, nil
+	}
+	res, err := r.verifyAndCache(ctx, quoteURL)
+	if err != nil {
+		return nil, "", err
+	}
+	return res.encPub, res.signer, nil
+}
+
+// verifyAndCache runs (or joins, via singleflight) the verification for quoteURL
+// and caches a success. It does NOT consult the cache first — that is the
+// caller's choice (verifiedKeys reads cache-first; the warmer forces a refresh).
+//
+// The shared verification runs under a context DETACHED from the caller that
+// happened to lead (context.WithoutCancel keeps its values, drops its
+// cancellation), so one caller disconnecting or timing out cannot fail the
+// verification for the others coalesced onto it; it is still bounded by
+// quoteVerifyTimeout so a hung upstream can't leak the in-flight call. Each
+// caller waits via DoChan and honors ITS OWN context — a caller whose request is
+// canceled returns immediately without dooming the rest.
+func (r *Router) verifyAndCache(ctx context.Context, quoteURL string) (quoteResult, error) {
+	ch := r.quoteSF.DoChan(quoteURL, func() (any, error) {
+		vctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), quoteVerifyTimeout)
+		defer cancel()
+		encPub, signer, err := r.verifyQuoteAt(vctx, quoteURL)
+		if err != nil {
+			return nil, err
+		}
+		r.quoteCache.put(quoteURL, encPub, signer)
+		return quoteResult{encPub: encPub, signer: signer}, nil
+	})
+	select {
+	case <-ctx.Done():
+		return quoteResult{}, upstream(0, fmt.Errorf("provider quote verification: %w", ctx.Err()))
+	case res := <-ch:
+		if res.Err != nil {
+			return quoteResult{}, res.Err
+		}
+		return res.Val.(quoteResult), nil
+	}
+}
+
+// verifyQuoteAt is the uncached work behind verifiedKeys: fetch the attestation
+// quote from quoteURL and DCAP-verify it, returning the enc_pub + signer bound
+// into the verified report_data. Because the keys come out of a genuine, signed
+// quote, it does not matter that the untrusted router chose the endpoint: a
+// substituted endpoint serving an attacker key would fail verification. On a
+// warn-mode measurement miss it logs but still returns the (genuine) keys.
+func (r *Router) verifyQuoteAt(ctx context.Context, quoteURL string) (crypto.PublicKey, string, error) {
 	raw, err := r.fetchQuote(ctx, quoteURL)
 	if err != nil {
 		return nil, "", err
@@ -422,7 +441,7 @@ func (r *Router) verifyQuote(ctx context.Context, endpoint string) (crypto.Publi
 	}
 	if !verified.MeasurementTrusted {
 		r.logger.Warn("sealing to provider whose measurement is not in the allowlist (attest warn mode)",
-			"endpoint", endpoint,
+			"quote_url", quoteURL,
 			"mrtd", fmt.Sprintf("%x", verified.Measurement.MRTD[:]),
 			"signer_addr", verified.SignerAddr)
 	}
