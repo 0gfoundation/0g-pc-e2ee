@@ -1,0 +1,233 @@
+// Package metrics defines the Prometheus instrumentation shared by the two
+// client-core proxy forms and exposes the /metrics handler the gateway serves.
+//
+// The collectors are process-global and registered once here; every proxy form
+// that (transitively) imports this package increments them, but only the
+// gateway mounts Handler() — on a SEPARATE internal listener that is not
+// published through the dstack tproxy ingress — so the local sidecar carries the
+// instrumentation without ever exposing or shipping it (cmd/sidecar starts no
+// metrics server).
+//
+// Redaction discipline (load-bearing): the gateway is a confidential-TEE enclave
+// (docs/design/cloud-gateway.md), so its operator-visible metrics must not become
+// a side channel for the plaintext the E2EE seal protects — the same constraint
+// openaiproxy.LogRequests keeps for the access log. Every label defined here is
+// low-cardinality and content-free: route templates, HTTP methods, status codes,
+// and fixed outcome enums. A provider address, endpoint URL, request id, model
+// name, or any other caller-supplied value must NEVER become a label value.
+package metrics
+
+import (
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+)
+
+// namespace/subsystem prefix every metric with zg_gateway_ (the scraped form is
+// always the gateway; the sidecar shares the code but is never scraped).
+const (
+	namespace = "zg"
+	subsystem = "gateway"
+)
+
+// registry is a dedicated registry rather than the global default: it keeps the
+// exposition to exactly the collectors registered here (plus Go/process), and
+// avoids cross-test double-registration panics on the global default.
+var registry = prometheus.NewRegistry()
+
+// verifyBuckets sizes latency histograms for the DCAP verify + collateral paths,
+// which range from a warm-cache few milliseconds to multi-second cold fetches —
+// wider and longer-tailed than the default HTTP buckets.
+var verifyBuckets = []float64{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60}
+
+var (
+	// HTTP layer (openaiproxy.LogRequests) — the RED signals for every request.
+	httpRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "http_requests_total",
+		Help: "Total HTTP requests handled, by route template, method, and status code.",
+	}, []string{"route", "method", "status"})
+	httpDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "http_request_duration_seconds",
+		Help: "HTTP request handling latency, by route template.", Buckets: prometheus.DefBuckets,
+	}, []string{"route"})
+	httpInFlight = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "http_requests_in_flight",
+		Help: "HTTP requests currently being served.",
+	})
+
+	// Completion outcome (openaiproxy) — attributes each chat completion to where
+	// a failure originated (core.Error.Source/Stage), so a gateway-side fault is
+	// distinguishable from a router/provider one without parsing logs.
+	completions = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "completions_total",
+		Help: "Chat completions by result (success|error), originating source, and stage.",
+	}, []string{"result", "source", "stage"})
+
+	// E2EE open failures (core.logOpenFailure) — an AEAD open failure is a
+	// security-relevant signal (key/enc/AAD mismatch, dropped/reordered frame, or
+	// an intermediary-injected bound field); a rising rate is worth alerting on.
+	openFailures = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "response_open_failures_total",
+		Help: "Sealed-response frames that failed to open (AEAD authentication failure).",
+	})
+
+	// Attestation / quote verification (route) — the trust-model core.
+	quoteVerify = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "quote_verifications_total",
+		Help: "DCAP quote verifications actually performed (cache misses), by result.",
+	}, []string{"result"})
+	quoteVerifyDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "quote_verification_duration_seconds",
+		Help: "Latency of a performed DCAP quote verification (quote fetch + verify).", Buckets: verifyBuckets,
+	})
+	quoteCache = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "quote_cache_lookups_total",
+		Help: "Quote-cache lookups by result (hit|miss); the warmer exists to keep hit high.",
+	}, []string{"result"})
+	measurementUntrusted = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "quote_measurement_untrusted_total",
+		Help: "Genuine quotes whose measurement was not in the allowlist (attest warn mode).",
+	})
+
+	// Warmer (route/warmer.go) — the background sweep keeping the quote cache hot.
+	warmerSweeps = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "warmer_sweeps_total",
+		Help: "Warmer sweeps by result (ok|list_failed).",
+	}, []string{"result"})
+	warmerProviderRefresh = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "warmer_provider_refreshes_total",
+		Help: "Per-provider warmer refreshes by result (ok|endpoint_failed|verify_failed).",
+	}, []string{"result"})
+	warmerLastSuccess = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "warmer_last_success_timestamp_seconds",
+		Help: "Unix time of the last completed warmer sweep; alert if it stops advancing.",
+	})
+
+	// DCAP collateral fetch/cache (dcap/collateral.go) — the Intel PCS / PCCS
+	// dependency and the dedup cache that shields it (quantifies #44).
+	collateralCache = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "collateral_cache_lookups_total",
+		Help: "DCAP collateral cache lookups by result (hit|miss).",
+	}, []string{"result"})
+	collateralFetch = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "collateral_fetches_total",
+		Help: "DCAP collateral fetches to the upstream (PCCS/Intel PCS) by result.",
+	}, []string{"result"})
+	collateralFetchDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "collateral_fetch_duration_seconds",
+		Help: "Latency of an upstream DCAP collateral fetch (cache miss).", Buckets: verifyBuckets,
+	})
+)
+
+func init() {
+	registry.MustRegister(
+		collectors.NewGoCollector(),
+		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+		httpRequests, httpDuration, httpInFlight,
+		completions, openFailures,
+		quoteVerify, quoteVerifyDuration, quoteCache, measurementUntrusted,
+		warmerSweeps, warmerProviderRefresh, warmerLastSuccess,
+		collateralCache, collateralFetch, collateralFetchDuration,
+	)
+}
+
+// Handler returns the HTTP handler that serves the Prometheus exposition format.
+// The gateway mounts it on a separate internal listener that is NOT published
+// through the dstack tproxy ingress, so the metrics stay reachable only from the
+// CVM-internal docker network (the co-located Prometheus-agent scraper), never
+// the public endpoint.
+func Handler() http.Handler {
+	return promhttp.HandlerFor(registry, promhttp.HandlerOpts{})
+}
+
+// RouteLabel maps a request path to a bounded route-template label, so the raw
+// path (which could carry caller-controlled, high-cardinality, or sensitive
+// content on an unexpected route) never becomes a label value. Only the fixed
+// served routes get their own label; everything else collapses to "other".
+func RouteLabel(path string) string {
+	switch path {
+	case "/v1/chat/completions", "/quote", "/healthz":
+		return path
+	default:
+		return "other"
+	}
+}
+
+// HTTPRequest records one completed HTTP request: its count (by route/method/
+// status) and its handling latency (by route).
+func HTTPRequest(route, method string, status int, dur time.Duration) {
+	httpRequests.WithLabelValues(route, method, strconv.Itoa(status)).Inc()
+	httpDuration.WithLabelValues(route).Observe(dur.Seconds())
+}
+
+// IncInFlight / DecInFlight bracket a request for the in-flight gauge.
+func IncInFlight() { httpInFlight.Inc() }
+func DecInFlight() { httpInFlight.Dec() }
+
+// Completion records one chat-completion outcome. For a success, source and
+// stage are "none"; for a failure they carry core.Error.Source()/Stage.
+func Completion(result, source, stage string) {
+	completions.WithLabelValues(result, source, stage).Inc()
+}
+
+// ResponseOpenFailure counts one sealed-response frame that failed to open.
+func ResponseOpenFailure() { openFailures.Inc() }
+
+// QuoteVerification records one performed (cache-miss) DCAP verification and its
+// latency; ok distinguishes a successful verify from a failed one.
+func QuoteVerification(ok bool, dur time.Duration) {
+	quoteVerify.WithLabelValues(result(ok)).Inc()
+	quoteVerifyDuration.Observe(dur.Seconds())
+}
+
+// QuoteCacheLookup records a quote-cache lookup outcome (hit or miss).
+func QuoteCacheLookup(hit bool) { quoteCache.WithLabelValues(hitMiss(hit)).Inc() }
+
+// MeasurementUntrusted counts a genuine quote whose measurement was not in the
+// allowlist (only reachable in attest warn mode; enforce fails the verify).
+func MeasurementUntrusted() { measurementUntrusted.Inc() }
+
+// WarmerSweep records the outcome of one warmer sweep.
+func WarmerSweep(result string) { warmerSweeps.WithLabelValues(result).Inc() }
+
+// WarmerProviderRefresh records one provider's refresh outcome within a sweep.
+func WarmerProviderRefresh(result string) { warmerProviderRefresh.WithLabelValues(result).Inc() }
+
+// WarmerSweepSucceeded stamps the last-completed-sweep gauge to now.
+func WarmerSweepSucceeded() { warmerLastSuccess.SetToCurrentTime() }
+
+// CollateralCacheLookup records a DCAP collateral cache lookup outcome.
+func CollateralCacheLookup(hit bool) { collateralCache.WithLabelValues(hitMiss(hit)).Inc() }
+
+// CollateralFetch records one upstream collateral fetch (cache miss) and its
+// latency; ok distinguishes a successful fetch from a failed one.
+func CollateralFetch(ok bool, dur time.Duration) {
+	collateralFetch.WithLabelValues(result(ok)).Inc()
+	collateralFetchDuration.Observe(dur.Seconds())
+}
+
+// CoreMetrics adapts this package to core.MetricsHook, so core can report
+// redaction-safe counters without importing the Prometheus client itself
+// (matching how core takes a *slog.Logger rather than a concrete sink).
+type CoreMetrics struct{}
+
+// ResponseOpenFailure implements core.MetricsHook.
+func (CoreMetrics) ResponseOpenFailure() { ResponseOpenFailure() }
+
+func result(ok bool) string {
+	if ok {
+		return "success"
+	}
+	return "error"
+}
+
+func hitMiss(hit bool) string {
+	if hit {
+		return "hit"
+	}
+	return "miss"
+}

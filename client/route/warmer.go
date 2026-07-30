@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
+	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 )
 
 // EndpointResolver resolves a provider's serving endpoint by its on-chain
@@ -114,20 +115,27 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 	}
 	addrs, err := r.listProviderAddrs(ctx)
 	if err != nil {
+		metrics.WarmerSweep("list_failed")
 		r.logger.Warn("warmer: list providers failed", "err", err)
 		return
 	}
 	for _, addr := range addrs {
 		if ctx.Err() != nil {
+			// A cancelled sweep is neither a success nor a provider failure; leave the
+			// sweep counters untouched and let the next tick record a clean outcome.
 			return
 		}
 		info, err := endpoints.ServiceInfo(ctx, addr)
 		if err != nil || info.URL == "" {
+			metrics.WarmerProviderRefresh("endpoint_failed")
 			r.logger.Warn("warmer: resolve endpoint failed", "provider", addr, "err", err)
 			continue
 		}
 		if err := r.refreshQuote(ctx, info.URL); err != nil {
+			metrics.WarmerProviderRefresh("verify_failed")
 			r.logger.Warn("warmer: verify failed", "provider", addr, "endpoint", info.URL, "err", err)
+		} else {
+			metrics.WarmerProviderRefresh("ok")
 		}
 		// Warm the on-chain signer-grounding cache too (when configured), so the
 		// first real request pays neither the DCAP verify nor the registry RPC.
@@ -138,6 +146,10 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 			}
 		}
 	}
+	// The sweep ran to completion (individual provider failures are counted above,
+	// not fatal); stamp the liveness gauge so an alert can fire if sweeps stall.
+	metrics.WarmerSweep("ok")
+	metrics.WarmerSweepSucceeded()
 }
 
 // RunWarmer warms once immediately, then re-warms every interval until ctx is

@@ -175,6 +175,24 @@ func TestLogOpenFailureNilLoggerIsNoop(t *testing.T) {
 	New(Provider{}).logOpenFailure(0, wire.Response{}, errors.New("boom"))
 }
 
+// countingHook is a MetricsHook that records how many open failures it saw.
+type countingHook struct{ n int }
+
+func (h *countingHook) ResponseOpenFailure() { h.n++ }
+
+// The metrics hook must fire on every open failure and, critically, independently
+// of the debug logger — the counter is a security signal the gateway alerts on,
+// so it must not be gated on the (optional) debug diagnostics being enabled.
+func TestLogOpenFailureFiresMetricsWithoutDebugLogger(t *testing.T) {
+	h := &countingHook{}
+	c := New(Provider{}, WithMetrics(h)) // no WithDebugLogger
+	c.logOpenFailure(0, wire.Response{}, errors.New("boom"))
+	c.logOpenFailure(1, wire.Response{}, errors.New("boom"))
+	if h.n != 2 {
+		t.Fatalf("metrics hook fired %d times, want 2", h.n)
+	}
+}
+
 func TestSealedFieldsForFiltersByPresence(t *testing.T) {
 	c := New(Provider{}, WithSealFields([]string{"messages", "tools", "metadata"}))
 	req := wire.Request{

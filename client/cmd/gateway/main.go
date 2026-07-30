@@ -30,6 +30,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log/slog"
 	"net/http"
@@ -38,11 +39,22 @@ import (
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/cmd/internal/proxycli"
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 )
 
 func main() {
 	f := proxycli.RegisterFlags(flag.CommandLine, "ZG_GATEWAY", ":8443")
+	// Prometheus /metrics is a gateway-only concern (the sidecar shares the
+	// instrumentation but never exposes it), so its listen address is registered
+	// here rather than in the shared proxycli flags. Empty (the default) disables
+	// the endpoint entirely; the TEE deployment sets it to an internal address
+	// (e.g. 0.0.0.0:9464) that the compose does NOT publish through the dstack
+	// tproxy ingress, so /metrics is reachable only from the CVM-internal docker
+	// network (the co-located Prometheus-agent scraper), never the public URL.
+	metricsListen := flag.String("metrics-listen", os.Getenv("ZG_GATEWAY_METRICS_LISTEN"),
+		"address to serve Prometheus /metrics on; empty disables it. Bind an INTERNAL "+
+			"address never published through the public ingress (env ZG_GATEWAY_METRICS_LISTEN)")
 	flag.Parse()
 
 	// Build validates the flags and wires the route-and-seal client core (shared
@@ -63,6 +75,13 @@ func main() {
 	// on shutdown before the process exits.
 	stopWarmer := built.StartWarmer(logger)
 
+	// Serve Prometheus /metrics on its own internal listener (a no-op unless
+	// -metrics-listen is set). It is deliberately a separate server from the public
+	// one: the metrics address is bound to a port the compose does not publish, so
+	// it never rides the same ingress as the OpenAI API surface. stopMetrics shuts
+	// it down alongside the main server on a signal.
+	stopMetrics := startMetrics(*metricsListen, logger)
+
 	srv := &http.Server{
 		Addr:              *f.Listen,
 		Handler:           newHandler(built.Client, logger),
@@ -78,9 +97,41 @@ func main() {
 	logger.Info("gateway listening", "listen", *f.Listen, "router_url", *f.RouterURL)
 	err := proxycli.Serve(srv, logger)
 	stopWarmer()
+	stopMetrics()
 	if err != nil {
 		logger.Error("gateway server exited", "err", err)
 		os.Exit(1)
+	}
+}
+
+// startMetrics serves the Prometheus /metrics endpoint on its own internal
+// listener and returns a stop function the caller runs at shutdown. When listen
+// is empty the endpoint is disabled and stop is a no-op, so main can wire it
+// unconditionally. A listen failure is logged but never fatal: metrics are
+// operational telemetry, so the gateway keeps serving requests even if its
+// metrics port cannot bind, rather than the observability path taking down the
+// data path.
+func startMetrics(listen string, logger *slog.Logger) (stop func()) {
+	if listen == "" {
+		return func() {}
+	}
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", metrics.Handler())
+	srv := &http.Server{
+		Addr:              listen,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second, // mitigate slow-header (Slowloris) clients
+	}
+	go func() {
+		logger.Info("metrics listening", "listen", listen)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("metrics server exited", "err", err)
+		}
+	}()
+	return func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
 	}
 }
 

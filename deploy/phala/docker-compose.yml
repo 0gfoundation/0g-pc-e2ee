@@ -38,6 +38,14 @@ services:
       # Bind to all interfaces (the binary defaults to localhost, which would be
       # container-local only) so dstack can forward to it.
       - "ZG_GATEWAY_LISTEN=0.0.0.0:8443"
+      # Serve Prometheus /metrics on a SEPARATE internal listener. Note this port
+      # is deliberately NOT in the `ports:` block above, so dstack tproxy never
+      # maps it to a public URL — it is reachable only over the CVM-internal docker
+      # network, i.e. by the prometheus-agent sidecar below (which scrapes
+      # `gateway:9464`). Binding 0.0.0.0 is what lets that co-located container
+      # reach it; publishing is what would make it public, and we don't publish it.
+      # Empty/unset disables the endpoint entirely.
+      - "ZG_GATEWAY_METRICS_LISTEN=0.0.0.0:9464"
       # The gateway routes per request and derives each provider's enc key +
       # signer from the broker, so no provider/key is configured up front. It
       # defaults to the 0G router; uncomment to override.
@@ -92,3 +100,73 @@ services:
       # - "ZG_GATEWAY_WARM_INTERVAL=4m"
     # No secrets or volumes: the gateway holds no pinned provider key, and TLS
     # material is managed by dstack-kms inside the enclave, never by this file.
+
+  # prometheus-agent scrapes the gateway's internal /metrics over the CVM docker
+  # network and remote_writes the samples to the central store (the same pattern
+  # other 0G services use: a co-located Prometheus that scrapes locally and pushes
+  # out). It runs in AGENT MODE (--enable-feature=agent): no local TSDB, no query
+  # API — this CVM is ephemeral, the durable copy lives in the remote store — it
+  # only scrapes and forwards. It exposes no public port (nothing in `ports:`), so
+  # like the metrics endpoint it is CVM-internal only.
+  prometheus-agent:
+    # Same image the other deployments pin; prefer an immutable digest here too so
+    # the measured compose does not drift (see the gateway image note above).
+    image: prom/prometheus:v2.55.1
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/agent.yml"
+      - "--enable-feature=agent"
+    volumes:
+      - prom-agent-config:/etc/prometheus
+    depends_on:
+      # The config-init below materializes agent.yml (with the remote_write
+      # credentials) into the shared volume before the agent starts.
+      prom-config-init:
+        condition: service_completed_successfully
+
+  # prom-config-init writes the agent config into the shared volume from a
+  # base64-encoded blob. The config carries the remote_write endpoint and its
+  # basic_auth password, so the blob is a SECRET: it must be injected via dstack's
+  # encrypted-secrets / KMS mechanism, NOT pasted into this measured compose in
+  # cleartext (the `environment:` block here is measured into the CVM attestation
+  # and is readable by anyone who can read the compose). Populate
+  # ZG_PROM_AGENT_CONFIG_B64 from a dstack secret at deploy time.
+  #
+  # The decoded agent.yml should look like (targets use docker service names on the
+  # CVM network; the gateway target is the internal metrics port above, and the
+  # agent self-scrapes so remote_write health — queue length, failures — is visible
+  # even though the CVM has no local query API):
+  #
+  #   global:
+  #     scrape_interval: 15s
+  #     external_labels: { service: "0g-pc-gateway" }
+  #   scrape_configs:
+  #     - job_name: "gateway"
+  #       static_configs:
+  #         - targets: ["gateway:9464"]
+  #     - job_name: "prometheus-agent"          # self-scrape (remote_write health)
+  #       static_configs:
+  #         - targets: ["localhost:9090"]
+  #   remote_write:
+  #     - url: https://<your-prometheus>/api/v1/write
+  #       basic_auth:
+  #         username: "<user>"
+  #         password: "<from dstack secret>"
+  prom-config-init:
+    image: alpine:3.20
+    restart: "no"
+    environment:
+      # Injected from a dstack secret — see the note above. Never inline the
+      # decoded config (or the password) into this measured file.
+      - "ZG_PROM_AGENT_CONFIG_B64=${ZG_PROM_AGENT_CONFIG_B64}"
+    volumes:
+      - prom-agent-config:/etc/prometheus
+    command:
+      - "sh"
+      - "-c"
+      - 'echo "$${ZG_PROM_AGENT_CONFIG_B64}" | base64 -d > /etc/prometheus/agent.yml'
+
+volumes:
+  # Holds the agent config written by prom-config-init and read by the agent. No
+  # TSDB volume is needed — agent mode keeps only a short write-ahead buffer.
+  prom-agent-config:

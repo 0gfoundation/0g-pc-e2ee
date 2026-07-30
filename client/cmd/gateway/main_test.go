@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/route"
@@ -219,6 +220,43 @@ func TestGatewayAccessLog(t *testing.T) {
 		if _, ok := rec[field]; !ok {
 			t.Errorf("log line missing field %q: %s", field, lines[0])
 		}
+	}
+}
+
+// An empty metrics address disables the endpoint; the returned stop must still
+// be a safe no-op the caller can defer unconditionally.
+func TestStartMetricsDisabled(t *testing.T) {
+	stop := startMetrics("", discardLogger())
+	stop()
+}
+
+// TestMetricsEndpointServes binds the metrics server to a concrete loopback port
+// and confirms /metrics answers 200 with the exposition format.
+func TestMetricsEndpointServes(t *testing.T) {
+	const addr = "127.0.0.1:19464"
+	stop := startMetrics(addr, discardLogger())
+	defer stop()
+
+	// The listener starts in a goroutine; retry briefly until it is accepting.
+	var resp *http.Response
+	var err error
+	for i := 0; i < 50; i++ {
+		resp, err = http.Get("http://" + addr + "/metrics")
+		if err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("get /metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/metrics: got %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !bytes.Contains(body, []byte("go_goroutines")) {
+		t.Fatalf("/metrics did not serve the exposition format:\n%s", body)
 	}
 }
 

@@ -34,6 +34,7 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/dcap"
+	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/0gfoundation/0g-pc-e2ee/client/route"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
@@ -309,6 +310,12 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 		core.WithSealFields(sealFields),
 		core.WithUnboundFields(unboundFields),
 		core.WithDebugLogger(logger),
+		// Meter response-open failures. The counter lives in client/metrics and is
+		// only exported by the gateway's /metrics listener; the sidecar increments it
+		// harmlessly but never serves it. The route/dcap layers meter themselves by
+		// importing client/metrics directly (they already pull heavy deps); core stays
+		// metrics-library-free via this hook, mirroring WithDebugLogger.
+		core.WithMetrics(metrics.CoreMetrics{}),
 	)
 	b := &Built{Client: client, router: router}
 	if *f.warmOn {

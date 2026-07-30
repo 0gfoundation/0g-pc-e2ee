@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 )
 
 // requestIDHeader is the correlation id the proxy honors on the way in and
@@ -56,6 +58,14 @@ func LogRequests(logger *slog.Logger, h http.Handler) http.Handler {
 			return
 		}
 
+		// Metric and log the same requests, from the same wrapper, so the two never
+		// drift; health probes are excluded above (they carry no per-request signal
+		// and would swamp both). The route label is a bounded template, never the raw
+		// path (see metrics.RouteLabel) — the same redaction discipline as the log.
+		route := metrics.RouteLabel(r.URL.Path)
+		metrics.IncInFlight()
+		defer metrics.DecInFlight()
+
 		id := requestID(r)
 		w.Header().Set(requestIDHeader, id)
 
@@ -63,6 +73,8 @@ func LogRequests(logger *slog.Logger, h http.Handler) http.Handler {
 		start := time.Now()
 		h.ServeHTTP(rec, r)
 		dur := time.Since(start)
+
+		metrics.HTTPRequest(route, r.Method, rec.status, dur)
 
 		// Level tracks status so a fronting log system (Phala today, GCP Cloud
 		// Logging later) maps 5xx to error and 4xx to warning severity for free.

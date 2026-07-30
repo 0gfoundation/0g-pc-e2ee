@@ -136,6 +136,17 @@ type Client struct {
 	unboundFields []string
 	http          *http.Client
 	debug         *slog.Logger // nil = off; see WithDebugLogger
+	metrics       MetricsHook  // nil = off; see WithMetrics
+}
+
+// MetricsHook receives redaction-safe counters for core events, letting a caller
+// (the gateway) meter them without core depending on any metrics library — the
+// same decoupling as WithDebugLogger's *slog.Logger. Implementations must be
+// safe for concurrent use and cheap (they run on the request path). nil is off.
+type MetricsHook interface {
+	// ResponseOpenFailure is called once per sealed-response frame whose AEAD
+	// open failed (streaming counts each failed frame), alongside the debug log.
+	ResponseOpenFailure()
 }
 
 // Option customizes a Client.
@@ -188,6 +199,15 @@ func WithDebugLogger(l *slog.Logger) Option {
 	return func(c *Client) { c.debug = l }
 }
 
+// WithMetrics attaches a MetricsHook so the client reports redaction-safe
+// counters (currently response-open failures) to m. Off (nil) by default, and
+// independent of WithDebugLogger: the gateway enables both, so an open failure
+// both increments a counter and writes its structural debug line. core does not
+// import any metrics library; m is satisfied by client/metrics.CoreMetrics.
+func WithMetrics(m MetricsHook) Option {
+	return func(c *Client) { c.metrics = m }
+}
+
 // logOpenFailure records a redaction-safe structural summary of a frame whose
 // AEAD open failed, at frame index frameIdx (0-based; 0 for a non-streaming
 // single frame). It is the operator-only counterpart to the opaque client-facing
@@ -196,6 +216,12 @@ func WithDebugLogger(l *slog.Logger) Option {
 // and surfaces the cleartext field set so an intermediary-injected bound field
 // shows up. No-op when no debug logger is configured.
 func (c *Client) logOpenFailure(frameIdx int, frame wire.Response, err error) {
+	// Count every open failure, independent of the debug logger: the metric is a
+	// security signal the gateway alerts on, while the debug line is operator
+	// diagnostics either form may leave off.
+	if c.metrics != nil {
+		c.metrics.ResponseOpenFailure()
+	}
 	if c.debug == nil {
 		return
 	}
