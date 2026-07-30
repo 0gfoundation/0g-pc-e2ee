@@ -84,6 +84,10 @@ const (
 	// (not permanent) so a TCB downgrade, collateral expiry, revocation, or enc-key
 	// rotation is re-checked promptly; the warmer refreshes ahead of it.
 	defaultQuoteTTL = 5 * time.Minute
+	// quoteVerifyTimeout bounds a single (de-duplicated) quote verification, which
+	// runs under a context detached from any one caller (so no caller's
+	// cancellation kills the shared work); this caps a hung upstream instead.
+	quoteVerifyTimeout = 60 * time.Second
 	// x25519PubLen is the byte length of the HPKE (X25519) recipient key.
 	x25519PubLen = 32
 	// maxControlBodyBytes caps a control-plane response body read (preview /
@@ -365,22 +369,35 @@ func (r *Router) verifiedKeys(ctx context.Context, endpoint string) (crypto.Publ
 	if encPub, signer, ok := r.quoteCache.get(endpoint); ok {
 		return encPub, signer, nil
 	}
-	// The verification runs under the leading caller's ctx; followers share its
-	// result (or error). A short verification bounded by the HTTP client timeout
-	// makes the shared-cancellation caveat acceptable.
-	v, err, _ := r.quoteSF.Do(endpoint, func() (any, error) {
-		encPub, signer, err := r.verifyQuote(ctx, endpoint)
+	// The shared verification runs under a context DETACHED from the caller that
+	// happened to lead (context.WithoutCancel keeps its values, drops its
+	// cancellation), so one caller disconnecting or timing out cannot fail the
+	// verification for the others coalesced onto it. It is still bounded by
+	// quoteVerifyTimeout so a hung upstream can't leak the in-flight call. Each
+	// caller then waits via DoChan and honors ITS OWN context — a caller whose
+	// request is canceled returns immediately without dooming the rest.
+	ch := r.quoteSF.DoChan(endpoint, func() (any, error) {
+		vctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), quoteVerifyTimeout)
+		defer cancel()
+		encPub, signer, err := r.verifyQuote(vctx, endpoint)
 		if err != nil {
 			return nil, err
 		}
 		r.quoteCache.put(endpoint, encPub, signer)
 		return quoteResult{encPub: encPub, signer: signer}, nil
 	})
-	if err != nil {
-		return nil, "", err
+	select {
+	case <-ctx.Done():
+		// This caller gave up; the shared verification continues for the others
+		// (and warms the cache).
+		return nil, "", upstream(0, fmt.Errorf("provider quote verification: %w", ctx.Err()))
+	case res := <-ch:
+		if res.Err != nil {
+			return nil, "", res.Err
+		}
+		out := res.Val.(quoteResult)
+		return out.encPub, out.signer, nil
 	}
-	res := v.(quoteResult)
-	return res.encPub, res.signer, nil
 }
 
 // verifyQuote is the uncached work behind verifiedKeys: fetch the candidate's

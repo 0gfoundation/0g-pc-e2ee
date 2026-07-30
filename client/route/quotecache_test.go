@@ -2,6 +2,7 @@ package route
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
@@ -127,5 +129,67 @@ func TestQuoteCache_SingleflightCollapsesConcurrentMisses(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&hits); got != 1 {
 		t.Errorf("quote fetched %d times, want 1 (singleflight should collapse concurrent misses)", got)
+	}
+}
+
+// TestQuoteCache_CallerCancelDoesNotPoisonOthers verifies the DoChan fix: one
+// coalesced caller cancelling its context must return promptly for THAT caller
+// without failing the shared verification for the others.
+func TestQuoteCache_CallerCancelDoesNotPoisonOthers(t *testing.T) {
+	var hits int32
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	srv := countingQVServer(t, &hits, entered, release)
+	r := New(srv.URL, WithQuoteVerification(qvVerifier(t), nil))
+
+	type result struct {
+		enc crypto.PublicKey
+		err error
+	}
+	// Caller A leads the verification (it enters the blocked quote handler first).
+	ctxA, cancelA := context.WithCancel(context.Background())
+	aCh := make(chan result, 1)
+	go func() {
+		enc, _, err := r.verifiedKeys(ctxA, srv.URL)
+		aCh <- result{enc, err}
+	}()
+	<-entered // A is now in-flight (handler blocked on release)
+
+	// Caller B (independent, live context) coalesces onto the same verification.
+	bCh := make(chan result, 1)
+	go func() {
+		enc, _, err := r.verifiedKeys(context.Background(), srv.URL)
+		bCh <- result{enc, err}
+	}()
+	time.Sleep(50 * time.Millisecond) // let B join the in-flight Do
+
+	// Cancel A: it must return promptly with an error, WITHOUT releasing the
+	// handler — the shared verification is still blocked.
+	cancelA()
+	select {
+	case a := <-aCh:
+		if a.err == nil {
+			t.Error("caller A: want cancellation error, got nil")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("caller A did not return on its own context cancellation (poisoned by shared work)")
+	}
+
+	// A's cancellation must NOT have killed the shared verification: release it and
+	// B must still succeed with the genuine keys.
+	close(release)
+	select {
+	case b := <-bCh:
+		if b.err != nil {
+			t.Fatalf("caller B failed after A cancelled: %v", b.err)
+		}
+		if hex.EncodeToString(b.enc) != qvEncPubHex {
+			t.Errorf("caller B enc_pub = %x, want %s", b.enc, qvEncPubHex)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("caller B did not complete (shared work was killed by A's cancel)")
+	}
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Errorf("quote fetched %d times, want 1", got)
 	}
 }
