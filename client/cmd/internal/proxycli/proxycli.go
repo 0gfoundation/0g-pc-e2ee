@@ -35,12 +35,12 @@ import (
 // by flag.Parse after RegisterFlags. Callers read Listen to bind their server
 // and pass the rest to Build.
 type Flags struct {
-	Listen         *string
-	RouterURL      *string
-	sealFieldsCSV  *string
-	unbndFieldsCSV *string
-	attestOn       *bool
-	attestEnforce  *bool
+	Listen           *string
+	RouterURL        *string
+	sealFieldsCSV    *string
+	unboundFieldsCSV *string
+	attestOn         *bool
+	attestEnforce    *bool
 }
 
 // RegisterFlags declares the six shared startup flags on fs and returns a Flags
@@ -56,7 +56,7 @@ func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen string) *Flags {
 		RouterURL: fs.String("router-url", envOr(env("ROUTER_URL"), route.DefaultRouterURL), fmt.Sprintf("0G router base URL/domain (the route-preview path is appended) (env %s)", env("ROUTER_URL"))),
 		sealFieldsCSV: fs.String("seal-fields", envOr(env("SEAL_FIELDS"), strings.Join(wire.DefaultSealedFields(), ",")),
 			fmt.Sprintf("comma-separated request fields to seal (must include \"messages\") (env %s)", env("SEAL_FIELDS"))),
-		unbndFieldsCSV: fs.String("unbound-fields", envOr(env("UNBOUND_FIELDS"), strings.Join(wire.DefaultUnboundFields(), ",")),
+		unboundFieldsCSV: fs.String("unbound-fields", envOr(env("UNBOUND_FIELDS"), strings.Join(wire.DefaultUnboundFields(), ",")),
 			fmt.Sprintf("comma-separated cleartext fields excluded from the AAD (intermediary-mutable, untrusted); empty binds everything (env %s)", env("UNBOUND_FIELDS"))),
 		attestOn: fs.Bool("attest", envBool(env("ATTEST"), false),
 			fmt.Sprintf("DCAP-verify each provider's TDX quote and seal only to the verified enc key (instead of trusting the router-supplied pubkey endpoint) (env %s)", env("ATTEST"))),
@@ -81,7 +81,7 @@ func (f *Flags) Build(label string) *core.Client {
 	if err := wire.ValidateSealedFields(sealFields); err != nil {
 		log.Fatalf("invalid -seal-fields: %v", err)
 	}
-	unboundFields := parseCSV(*f.unbndFieldsCSV)
+	unboundFields := parseCSV(*f.unboundFieldsCSV)
 	if err := wire.ValidateUnboundFields(unboundFields, sealFields); err != nil {
 		log.Fatalf("invalid -unbound-fields: %v", err)
 	}
