@@ -30,17 +30,33 @@ services:
       # host:container — dstack tproxy forwards the public ingress to the host
       # side, so this port is what appears as `<app-id>-8443.<base_domain>`.
       - "8443:8443"
-    # Every startup parameter also reads from an OG_GATEWAY_* environment
+    # Every startup parameter also reads from a ZG_GATEWAY_* environment
     # variable (precedence: command-line flag > env var > built-in default), so
     # it can be set here in the measured `environment:` block instead of via
     # `command:`. This block is what dstack measures into the CVM attestation.
     environment:
       # Bind to all interfaces (the binary defaults to localhost, which would be
       # container-local only) so dstack can forward to it.
-      - "OG_GATEWAY_LISTEN=0.0.0.0:8443"
+      - "ZG_GATEWAY_LISTEN=0.0.0.0:8443"
       # The gateway routes per request and derives each provider's enc key +
       # signer from the broker, so no provider/key is configured up front. It
       # defaults to the 0G router; uncomment to override.
-      # - "OG_GATEWAY_ROUTER_URL=https://router-api.0g.ai"
+      # - "ZG_GATEWAY_ROUTER_URL=https://router-api.0g.ai"
+      # Request fields sealed end-to-end to the provider (must include
+      # "messages"). Defaults to the binary's built-in set; uncomment to override.
+      # - "ZG_GATEWAY_SEAL_FIELDS=messages"
+      # Cleartext fields excluded from the AAD (intermediary-mutable, untrusted);
+      # an empty value binds everything. Defaults to the built-in set; uncomment
+      # to override.
+      # - "ZG_GATEWAY_UNBOUND_FIELDS="
+      # DCAP-verify each provider's TDX quote and seal only to the verified enc
+      # key, instead of trusting the router-supplied pubkey endpoint. Defaults to
+      # off; uncomment to enable.
+      # - "ZG_GATEWAY_ATTEST=true"
+      # With ZG_GATEWAY_ATTEST, reject a provider whose measurement is not in the
+      # allowlist instead of only warning. The audited-image allowlist is not
+      # wired yet (empty), so enforce currently rejects all providers. Defaults to
+      # off; uncomment to enable.
+      # - "ZG_GATEWAY_ATTEST_ENFORCE=true"
     # No secrets or volumes: the gateway holds no pinned provider key, and TLS
     # material is managed by dstack-kms inside the enclave, never by this file.

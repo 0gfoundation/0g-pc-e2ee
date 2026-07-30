@@ -1,0 +1,2 @@
+# Go build output (e.g. `go build ./cmd/gateway/` drops the binary here)
+/client/gateway
