@@ -63,3 +63,12 @@ func (c *quoteCache) put(key string, encPub crypto.PublicKey, signer string) {
 	defer c.mu.Unlock()
 	c.m[key] = quoteEntry{encPub: encPub, signer: signer, exp: time.Now().Add(c.ttl)}
 }
+
+// del removes a cached entry. The warmer calls it when a refresh re-verification
+// fails, so a provider that has gone bad (TCB downgrade, unreachable, revoked) is
+// dropped immediately rather than served from a still-unexpired entry until TTL.
+func (c *quoteCache) del(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.m, key)
+}
