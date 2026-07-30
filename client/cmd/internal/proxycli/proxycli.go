@@ -144,6 +144,8 @@ type Flags struct {
 	servingContract  *string
 	warmOn           *bool
 	warmInterval     *time.Duration
+	pccsURL          *string
+	collateralTTL    *time.Duration
 }
 
 // defaultWarmInterval is the refresh-ahead period the background quote-cache
@@ -153,13 +155,23 @@ type Flags struct {
 // route.RunWarmer).
 const defaultWarmInterval = 4 * time.Minute
 
+// defaultCollateralTTL is how long DCAP collateral (TCB Info / QE Identity /
+// CRLs) is memoized by URL when -attest is on, so the verify path does not
+// re-fetch the same collateral for every provider and every warmer sweep. It is
+// deliberately bounded: a cached CRL delays observing a fresh revocation until it
+// expires, so this is the accepted revocation-lag window — long enough to dedup
+// across a warmer cycle and the ~dozens of providers, far under collateral's
+// nextUpdate. Tunable via -collateral-ttl (0 disables the cache).
+const defaultCollateralTTL = time.Hour
+
 // RegisterFlags declares the shared startup flags on fs and returns a Flags
 // whose pointers are filled by fs.Parse. envPrefix (e.g. "ZG_GATEWAY",
 // "ZG_SIDECAR") selects the environment variables consulted for each flag's
 // default: <envPrefix>_LISTEN, _ROUTER_URL, _SEAL_FIELDS, _UNBOUND_FIELDS,
 // _ATTEST, _ATTEST_ENFORCE, _ONCHAIN, _ONCHAIN_ENFORCE, _CHAIN_RPC_URL,
-// _SERVING_CONTRACT. defaultListen is the built-in listen address used when
-// neither the flag nor <envPrefix>_LISTEN is set.
+// _SERVING_CONTRACT, _WARM, _WARM_INTERVAL, _PCCS_URL, _COLLATERAL_TTL.
+// defaultListen is the built-in listen address used when neither the flag nor
+// <envPrefix>_LISTEN is set.
 func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen string) *Flags {
 	env := func(name string) string { return envPrefix + "_" + name }
 	return &Flags{
@@ -185,6 +197,10 @@ func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen string) *Flags {
 			fmt.Sprintf("run a background warmer that pre-verifies every provider's quote and refreshes it ahead of expiry, so requests hit a warm cache instead of paying the DCAP verify inline; requires -attest and -onchain (env %s)", env("WARM"))),
 		warmInterval: fs.Duration("warm-interval", envDuration(env("WARM_INTERVAL"), defaultWarmInterval),
 			fmt.Sprintf("with -warm, how often to re-verify each provider (should be under the ~5m quote-cache TTL for refresh-ahead) (env %s)", env("WARM_INTERVAL"))),
+		pccsURL: fs.String("pccs-url", envOr(env("PCCS_URL"), ""),
+			fmt.Sprintf("with -attest, fetch Intel PCS collateral (TCB Info, QE Identity, PCK CRL) from this PCCS base (e.g. https://pccs.phala.network) instead of api.trustedservices.intel.com; the root-CA CRL still comes from Intel (env %s)", env("PCCS_URL"))),
+		collateralTTL: fs.Duration("collateral-ttl", envDuration(env("COLLATERAL_TTL"), defaultCollateralTTL),
+			fmt.Sprintf("with -attest, how long to memoize DCAP collateral by URL so it is not re-fetched per provider/sweep; bounds revocation lag, 0 disables (env %s)", env("COLLATERAL_TTL"))),
 	}
 }
 
@@ -270,7 +286,8 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 	// (route.New defaults to "chatbot"); it is not a startup choice.
 	routeOpts := []route.Option{route.WithSensitiveFields(sealFields)}
 	if *f.attestOn {
-		routeOpts = append(routeOpts, route.WithQuoteVerification(newVerifier(label, *f.attestEnforce, logger), logger))
+		routeOpts = append(routeOpts, route.WithQuoteVerification(
+			newVerifier(label, *f.attestEnforce, *f.pccsURL, *f.collateralTTL, logger), logger))
 	}
 	// resolver is the CONCRETE on-chain registry the warmer uses to resolve each
 	// provider's endpoint via ServiceInfo. The route's grounding uses the caching
@@ -345,17 +362,36 @@ const warmerStopGrace = 2 * time.Second
 // the measurement-allowlist decision is governed by enforce vs warn. The audited
 // broker-image allowlist is not wired yet (empty), so warn is the usable interim
 // (log an out-of-allowlist measurement but proceed) and enforce rejects all.
-func newVerifier(label string, enforce bool, logger *slog.Logger) *attest.Verifier {
+//
+// pccsURL (when non-empty) points DCAP collateral fetches at a PCCS mirror
+// instead of Intel PCS, and collateralTTL (when positive) memoizes that
+// collateral by URL so it is not re-fetched for every provider and warmer sweep.
+// Both are shared once across all verifications (the caching getter's memo lives
+// for the process lifetime), so they dedup across the whole provider fleet.
+func newVerifier(label string, enforce bool, pccsURL string, collateralTTL time.Duration, logger *slog.Logger) *attest.Verifier {
 	mode := attest.ModeWarn
 	if enforce {
 		mode = attest.ModeEnforce
 	}
-	logger.Info("TDX quote verification enabled", "label", label, "enforce", enforce, "allowlist", "empty")
+	logger.Info("TDX quote verification enabled", "label", label, "enforce", enforce, "allowlist", "empty",
+		"collateral_source", collateralSource(pccsURL), "collateral_ttl", collateralTTL)
 	return attest.New(
 		attest.Policy{}, // TODO: load the audited broker-image measurement allowlist
-		attest.WithQuoteParser(dcap.NewQuoteParser(dcap.Config{})),
+		attest.WithQuoteParser(dcap.NewQuoteParser(dcap.Config{
+			PCCSBaseURL:   pccsURL,
+			CollateralTTL: collateralTTL,
+		})),
 		attest.WithMeasurementMode(mode),
 	)
+}
+
+// collateralSource names where DCAP collateral is fetched from, for the startup
+// log line: the configured PCCS mirror, or Intel PCS when none is set.
+func collateralSource(pccsURL string) string {
+	if strings.TrimSpace(pccsURL) != "" {
+		return pccsURL
+	}
+	return "intel-pcs"
 }
 
 // envOr returns the value of environment variable key, or def if it is unset.

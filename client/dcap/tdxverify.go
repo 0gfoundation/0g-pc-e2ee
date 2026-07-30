@@ -45,6 +45,22 @@ type Config struct {
 	// for an environment that genuinely cannot reach the CRLs, accepting that
 	// revoked platforms would then verify.
 	SkipRevocation bool
+	// PCCSBaseURL, when set, rewrites Intel PCS collateral URLs to this PCCS base
+	// (e.g. "https://pccs.phala.network") so collateral is fetched from a mirror
+	// instead of api.trustedservices.intel.com — for a deployment that cannot or
+	// prefers not to reach Intel PCS directly. Only the host is swapped; the path
+	// and query (FMSPC, ca, encoding) are preserved. It covers the TCB Info, QE
+	// Identity, and PCK CRL; the root-CA CRL is fetched from a different Intel host
+	// and is not rewritten (see pccsRewriteGetter). Empty fetches from Intel PCS.
+	PCCSBaseURL string
+	// CollateralTTL, when positive, memoizes successful collateral fetches by URL
+	// for this long, so the DCAP path does not re-fetch the same TCB Info / QE
+	// Identity / CRLs for every provider and every warmer sweep (dedup is by URL,
+	// which is by FMSPC for the platform-specific TCB Info). It is bounded because
+	// collateral is time-sensitive — most sharply, a cached CRL delays observing a
+	// fresh revocation until the entry expires — so this is the accepted
+	// revocation-lag window. Zero disables caching (fetch every verification).
+	CollateralTTL time.Duration
 }
 
 // NewQuoteParser returns a parser for protocol/attest.WithQuoteParser: it
@@ -52,12 +68,16 @@ type Config struct {
 // report_data. Collateral fetching is always enabled — the QE-identity and TCB
 // checks require it — so a Getter (network or fixture) must be able to serve it.
 func NewQuoteParser(cfg Config) func([]byte) (attest.Measurement, [64]byte, error) {
+	// Build the collateral getter ONCE, outside the closure, so a caching getter's
+	// memo persists across every parse call — that is what dedups collateral across
+	// providers and warmer sweeps. nil means "use go-tdx-guest's default getter".
+	getter := cfg.effectiveGetter()
 	return func(raw []byte) (attest.Measurement, [64]byte, error) {
 		opts := verify.DefaultOptions()
 		opts.GetCollateral = true
 		opts.CheckRevocations = !cfg.SkipRevocation
-		if cfg.Getter != nil {
-			opts.Getter = cfg.Getter
+		if getter != nil {
+			opts.Getter = getter
 		}
 		if !cfg.Now.IsZero() {
 			opts.Now = cfg.Now
