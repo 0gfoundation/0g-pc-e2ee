@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"slices"
 	"time"
@@ -135,7 +135,7 @@ type Client struct {
 	sealFields    []string
 	unboundFields []string
 	http          *http.Client
-	debug         *log.Logger // nil = off; see WithDebugLogger
+	debug         *slog.Logger // nil = off; see WithDebugLogger
 }
 
 // Option customizes a Client.
@@ -181,8 +181,10 @@ func WithUnboundFields(fields []string) Option {
 //
 // It is safe on the multi-tenant gateway (it logs no tenant content), but off
 // (nil) by default so the quiet behavior is the one you get without thinking
-// about it. Both shipped server forms enable it against their process logger.
-func WithDebugLogger(l *log.Logger) Option {
+// about it. Both shipped server forms enable it against their process logger —
+// the same *slog.Logger they use for startup and access logs, so every line the
+// binary emits shares one format and sink (see proxycli.NewLogger).
+func WithDebugLogger(l *slog.Logger) Option {
 	return func(c *Client) { c.debug = l }
 }
 
@@ -198,8 +200,18 @@ func (c *Client) logOpenFailure(frameIdx int, frame wire.Response, err error) {
 		return
 	}
 	d := frame.Debug()
-	c.debug.Printf("e2ee open failed: frame=%d final=%t has_enc=%t v=%d sealed_fields=%v unbound_fields=%v cleartext_keys=%v ct_bytes=%d e2ee_err=%q err=%v",
-		frameIdx, d.Final, d.HasEnc, d.Version, d.SealedFields, d.UnboundFields, d.CleartextKeys, d.CiphertextLen, d.E2EEErr, err)
+	c.debug.LogAttrs(context.Background(), slog.LevelWarn, "e2ee open failed",
+		slog.Int("frame", frameIdx),
+		slog.Bool("final", d.Final),
+		slog.Bool("has_enc", d.HasEnc),
+		slog.Int("v", d.Version),
+		slog.Any("sealed_fields", d.SealedFields),
+		slog.Any("unbound_fields", d.UnboundFields),
+		slog.Any("cleartext_keys", d.CleartextKeys),
+		slog.Int("ct_bytes", d.CiphertextLen),
+		slog.String("e2ee_err", d.E2EEErr),
+		slog.Any("err", err),
+	)
 }
 
 // New returns a Client that seals every request to one fixed provider — the

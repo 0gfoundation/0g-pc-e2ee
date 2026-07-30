@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"reflect"
 	"strings"
 	"testing"
@@ -151,14 +151,15 @@ func TestLogOpenFailureDiagnosticAndRedacted(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	c := New(Provider{}, WithDebugLogger(log.New(&buf, "", 0)))
+	c := New(Provider{}, WithDebugLogger(slog.New(slog.NewTextHandler(&buf, nil))))
 	c.logOpenFailure(3, sealed, errors.New("chacha20poly1305: message authentication failed"))
 
 	out := buf.String()
 	// The frame ordinal (first vs later frame) and the underlying cause must be
 	// present — that ordinal is what separates a setup/key/AAD failure from a
-	// dropped or reordered later frame.
-	for _, want := range []string{"frame=3", "cleartext_keys=[id model]", "sealed_fields=[choices]", "message authentication failed"} {
+	// dropped or reordered later frame. Fields are now slog attributes, so a
+	// value containing spaces (the key list) is rendered quoted.
+	for _, want := range []string{"frame=3", `cleartext_keys="[id model]"`, "sealed_fields=[choices]", "message authentication failed"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("debug log missing %q, got: %s", want, out)
 		}

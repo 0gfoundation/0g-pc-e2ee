@@ -50,13 +50,14 @@ services:
       # to override.
       # - "ZG_GATEWAY_UNBOUND_FIELDS="
       # DCAP-verify each provider's TDX quote and seal only to the verified enc
-      # key, instead of trusting the router-supplied pubkey endpoint. Defaults to
-      # off; uncomment to enable.
-      # - "ZG_GATEWAY_ATTEST=true"
+      # key, instead of trusting the router-supplied pubkey endpoint. Enabled
+      # here: quote authenticity (genuine TDX, TCB up to date, report_data
+      # binding) is enforced per request; a provider that fails it is rejected.
+      - "ZG_GATEWAY_ATTEST=true"
       # With ZG_GATEWAY_ATTEST, reject a provider whose measurement is not in the
       # allowlist instead of only warning. The audited-image allowlist is not
-      # wired yet (empty), so enforce currently rejects all providers. Defaults to
-      # off; uncomment to enable.
+      # wired yet (empty), so enforce currently rejects ALL providers — leave it
+      # off until the allowlist lands, so ATTEST runs in verify-and-warn mode.
       # - "ZG_GATEWAY_ATTEST_ENFORCE=true"
       # Cross-check each provider's quote-bound TEE signer against its acknowledged
       # on-chain teeSignerAddress (InferenceServing registry). Requires

@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -22,8 +23,14 @@ func routeClient() *core.Client {
 	return core.NewWithResolver(route.New("http://router.unused"))
 }
 
+// discardLogger is a logger the operational-route tests hand to newHandler when
+// they don't assert on the access log; TestGatewayAccessLog uses its own buffer.
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewJSONHandler(io.Discard, nil))
+}
+
 func TestGatewayHealthz(t *testing.T) {
-	gw := httptest.NewServer(newHandler(routeClient()))
+	gw := httptest.NewServer(newHandler(routeClient(), discardLogger()))
 	defer gw.Close()
 
 	resp, err := http.Get(gw.URL + "/healthz")
@@ -39,7 +46,7 @@ func TestGatewayHealthz(t *testing.T) {
 // /quote is still a stub: it must answer 501 (Not Implemented), not 404, so a
 // validator can tell the endpoint exists but attestation is not wired yet.
 func TestGatewayQuoteStub(t *testing.T) {
-	gw := httptest.NewServer(newHandler(routeClient()))
+	gw := httptest.NewServer(newHandler(routeClient(), discardLogger()))
 	defer gw.Close()
 
 	resp, err := http.Get(gw.URL + "/quote")
@@ -119,7 +126,7 @@ func TestGatewayRouteMode(t *testing.T) {
 	defer router.Close()
 
 	client := core.NewWithResolver(route.New(router.URL))
-	gw := httptest.NewServer(newHandler(client))
+	gw := httptest.NewServer(newHandler(client, discardLogger()))
 	defer gw.Close()
 
 	userReq := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`
@@ -135,4 +142,93 @@ func TestGatewayRouteMode(t *testing.T) {
 	if !bytes.Contains(body, []byte("routed answer")) {
 		t.Fatalf("user did not get routed plaintext back: %s", body)
 	}
+}
+
+// TestGatewayAccessLog covers the middleware's contract: health probes are not
+// logged (they would drown real traffic), every other request emits one
+// structured line with the expected metadata fields, a caller-supplied request
+// id is honored and echoed back, and — the security-critical part — no
+// credential or request content leaks into the log line.
+func TestGatewayAccessLog(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&buf, nil))
+	gw := httptest.NewServer(newHandler(routeClient(), logger))
+	defer gw.Close()
+
+	// A health probe must not produce a log line.
+	if resp, err := http.Get(gw.URL + "/healthz"); err != nil {
+		t.Fatalf("get /healthz: %v", err)
+	} else {
+		resp.Body.Close()
+	}
+
+	// A real request carrying a secret Authorization header and a forwarded
+	// request id. /quote is a convenient non-health route (it answers 501).
+	const secret = "Bearer super-secret-token"
+	const callerID = "caller-req-123"
+	req, _ := http.NewRequest(http.MethodGet, gw.URL+"/quote", nil)
+	req.Header.Set("Authorization", secret)
+	req.Header.Set("X-Request-Id", callerID)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get /quote: %v", err)
+	}
+	resp.Body.Close()
+
+	if got := resp.Header.Get("X-Request-Id"); got != callerID {
+		t.Fatalf("X-Request-Id not echoed: got %q, want %q", got, callerID)
+	}
+
+	// Close synchronizes: after Close returns the server goroutine has finished
+	// ServeHTTP, so the access-log line is fully written to buf.
+	gw.Close()
+
+	if strings.Contains(buf.String(), "super-secret-token") {
+		t.Fatalf("access log leaked the Authorization credential:\n%s", buf.String())
+	}
+
+	lines := splitLogLines(buf.String())
+	if len(lines) != 1 {
+		t.Fatalf("want exactly 1 log line (health probe must be skipped), got %d:\n%s", len(lines), buf.String())
+	}
+	var rec map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &rec); err != nil {
+		t.Fatalf("log line is not JSON: %v\n%s", err, lines[0])
+	}
+	if rec["msg"] != "request" {
+		t.Errorf("msg: got %v, want %q", rec["msg"], "request")
+	}
+	if rec["path"] != "/quote" {
+		t.Errorf("path: got %v, want %q", rec["path"], "/quote")
+	}
+	if rec["method"] != http.MethodGet {
+		t.Errorf("method: got %v, want %q", rec["method"], http.MethodGet)
+	}
+	if rec["request_id"] != callerID {
+		t.Errorf("request_id: got %v, want %q", rec["request_id"], callerID)
+	}
+	if rec["status"] != float64(http.StatusNotImplemented) {
+		t.Errorf("status: got %v, want %d", rec["status"], http.StatusNotImplemented)
+	}
+	// 501 is a server error, so the line's severity must be ERROR (Cloud Logging
+	// keys alerts off this).
+	if rec["level"] != "ERROR" {
+		t.Errorf("level: got %v, want ERROR for a 5xx", rec["level"])
+	}
+	for _, field := range []string{"duration_ms", "bytes_out", "provider_pinned", "stream"} {
+		if _, ok := rec[field]; !ok {
+			t.Errorf("log line missing field %q: %s", field, lines[0])
+		}
+	}
+}
+
+// splitLogLines returns the non-empty lines of s, each one JSON log record.
+func splitLogLines(s string) []string {
+	var out []string
+	for _, ln := range strings.Split(strings.TrimSpace(s), "\n") {
+		if strings.TrimSpace(ln) != "" {
+			out = append(out, ln)
+		}
+	}
+	return out
 }

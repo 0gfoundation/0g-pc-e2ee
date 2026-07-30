@@ -20,8 +20,8 @@ package main
 
 import (
 	"flag"
-	"log"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/cmd/internal/proxycli"
@@ -32,24 +32,29 @@ func main() {
 	f := proxycli.RegisterFlags(flag.CommandLine, "ZG_SIDECAR", "localhost:8787")
 	flag.Parse()
 
-	// Build validates the flags and wires the route-and-seal client core (shared
-	// with the gateway). "sidecar" only labels the attestation log line. The debug
-	// logger it attaches records a redaction-safe summary of any response open
-	// (AEAD) failure to the process log — the operator-only counterpart to the
-	// opaque "message authentication failed" the caller sees (field names/lengths
-	// only, no plaintext or key material).
-	client := f.Build("sidecar")
+	// One shared logger for startup, per-request, and the core's open-failure
+	// diagnostics — the same text-to-stdout logger the gateway uses, so the two
+	// forms don't drift (see proxycli.NewLogger). The debug logger it attaches
+	// records a redaction-safe summary of any response open (AEAD) failure — the
+	// operator-only counterpart to the opaque "message authentication failed" the
+	// caller sees (field names/lengths only, no plaintext or key material).
+	logger := proxycli.NewLogger()
+	// "sidecar" only labels the attestation log line.
+	client := f.Build("sidecar", logger)
 
+	// Single-user and local, so surfacing the raw upstream body in errors aids
+	// debugging and never leaves the user's machine (localhost); the gateway
+	// deliberately does not do this. The access-log middleware is the same one the
+	// gateway runs — no reason for the local form to log differently.
+	handler := openaiproxy.LogRequests(logger, openaiproxy.Handler(client, openaiproxy.WithVerboseUpstreamErrors()))
 	srv := &http.Server{
-		Addr: *f.Listen,
-		// Single-user and local, so surfacing the raw upstream body in errors aids
-		// debugging and never leaves the user's machine (localhost); the gateway
-		// deliberately does not do this.
-		Handler:           openaiproxy.Handler(client, openaiproxy.WithVerboseUpstreamErrors()),
+		Addr:              *f.Listen,
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second, // mitigate slow-header (Slowloris) clients
 	}
-	log.Printf("sidecar listening on %s -> route via %s", *f.Listen, *f.RouterURL)
+	logger.Info("sidecar listening", "listen", *f.Listen, "router_url", *f.RouterURL)
 	if err := srv.ListenAndServe(); err != nil {
-		log.Fatal(err)
+		logger.Error("sidecar server exited", "err", err)
+		os.Exit(1)
 	}
 }

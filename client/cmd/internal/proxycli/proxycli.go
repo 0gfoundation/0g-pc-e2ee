@@ -20,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -37,6 +38,16 @@ import (
 // A provider's acknowledged signer changes only on re-registration, so a few
 // minutes trades a stale-signer window for far fewer chain RPCs per request.
 const onchainCacheTTL = 5 * time.Minute
+
+// NewLogger builds the process logger both proxy binaries share: human-readable
+// text records to stdout, at Info and above. Centralizing it here keeps the
+// sidecar and gateway on one format, level, and sink so their logs don't drift.
+// It is handed to Build (so the core's redaction-safe open-failure diagnostics
+// use it too) and to each binary's access-log middleware, so every line a proxy
+// emits — startup, per-request, and AEAD-failure — shares the same shape.
+func NewLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+}
 
 // Flags holds the startup parameters common to both proxy binaries, populated
 // by flag.Parse after RegisterFlags. Callers read Listen to bind their server
@@ -93,33 +104,41 @@ func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen string) *Flags {
 // attached (field names and byte lengths only, never plaintext or key
 // material); it writes to the process log and never reaches the end user.
 //
-// It exits the process via log.Fatal on an invalid flag combination — the same
-// fail-loud behavior both mains had inline — so a misconfigured proxy never
-// starts with, say, an unsealed "messages" field or attestation silently off.
-func (f *Flags) Build(label string) *core.Client {
+// It exits the process via os.Exit(1) (after logging through logger) on an
+// invalid flag combination — the same fail-loud behavior both mains had inline —
+// so a misconfigured proxy never starts with, say, an unsealed "messages" field
+// or attestation silently off. logger is also attached as the core's debug
+// logger, so open-failure diagnostics share the binary's format and sink.
+func (f *Flags) Build(label string, logger *slog.Logger) *core.Client {
 	sealFields := parseCSV(*f.sealFieldsCSV)
 	if err := wire.ValidateSealedFields(sealFields); err != nil {
-		log.Fatalf("invalid -seal-fields: %v", err)
+		logger.Error("invalid -seal-fields", "err", err)
+		os.Exit(1)
 	}
 	unboundFields := parseCSV(*f.unboundFieldsCSV)
 	if err := wire.ValidateUnboundFields(unboundFields, sealFields); err != nil {
-		log.Fatalf("invalid -unbound-fields: %v", err)
+		logger.Error("invalid -unbound-fields", "err", err)
+		os.Exit(1)
 	}
 	// Fail loudly rather than silently give NO attestation when the operator asked
 	// for the strictest mode: -attest-enforce is meaningless without -attest.
 	if *f.attestEnforce && !*f.attestOn {
-		log.Fatalf("-attest-enforce requires -attest")
+		logger.Error("-attest-enforce requires -attest")
+		os.Exit(1)
 	}
 	// On-chain grounding needs a quote-bound signer to check (so -attest), a
 	// stricter mode needs the check on (so -onchain), and the check needs an RPC.
 	if *f.onchainEnforce && !*f.onchainOn {
-		log.Fatalf("-onchain-enforce requires -onchain")
+		logger.Error("-onchain-enforce requires -onchain")
+		os.Exit(1)
 	}
 	if *f.onchainOn && !*f.attestOn {
-		log.Fatalf("-onchain requires -attest (the signer must come from a verified quote)")
+		logger.Error("-onchain requires -attest (the signer must come from a verified quote)")
+		os.Exit(1)
 	}
 	if *f.onchainOn && strings.TrimSpace(*f.chainRPCURL) == "" {
-		log.Fatalf("-onchain requires -chain-rpc-url")
+		logger.Error("-onchain requires -chain-rpc-url")
+		os.Exit(1)
 	}
 
 	// Route per request: pick the provider via the router and derive its enc key +
@@ -129,21 +148,22 @@ func (f *Flags) Build(label string) *core.Client {
 	// (route.New defaults to "chatbot"); it is not a startup choice.
 	routeOpts := []route.Option{route.WithSensitiveFields(sealFields)}
 	if *f.attestOn {
-		routeOpts = append(routeOpts, route.WithQuoteVerification(newVerifier(label, *f.attestEnforce), nil))
+		routeOpts = append(routeOpts, route.WithQuoteVerification(newVerifier(label, *f.attestEnforce, logger), logger))
 	}
 	if *f.onchainOn {
 		reg, err := chain.NewOnChainRegistry(chain.Config{RPCURL: *f.chainRPCURL, ContractAddress: *f.servingContract})
 		if err != nil {
-			log.Fatalf("on-chain registry: %v", err)
+			logger.Error("on-chain registry", "err", err)
+			os.Exit(1)
 		}
-		routeOpts = append(routeOpts, route.WithOnChainVerification(chain.Cached(reg, onchainCacheTTL), *f.onchainEnforce, nil))
-		log.Printf("%s: on-chain signer grounding enabled (enforce=%v, contract=%s)", label, *f.onchainEnforce, *f.servingContract)
+		routeOpts = append(routeOpts, route.WithOnChainVerification(chain.Cached(reg, onchainCacheTTL), *f.onchainEnforce, logger))
+		logger.Info("on-chain signer grounding enabled", "label", label, "enforce", *f.onchainEnforce, "contract", *f.servingContract)
 	}
 	router := route.New(*f.RouterURL, routeOpts...)
 	return core.NewWithResolver(router,
 		core.WithSealFields(sealFields),
 		core.WithUnboundFields(unboundFields),
-		core.WithDebugLogger(log.Default()),
+		core.WithDebugLogger(logger),
 	)
 }
 
@@ -152,12 +172,12 @@ func (f *Flags) Build(label string) *core.Client {
 // the measurement-allowlist decision is governed by enforce vs warn. The audited
 // broker-image allowlist is not wired yet (empty), so warn is the usable interim
 // (log an out-of-allowlist measurement but proceed) and enforce rejects all.
-func newVerifier(label string, enforce bool) *attest.Verifier {
+func newVerifier(label string, enforce bool, logger *slog.Logger) *attest.Verifier {
 	mode := attest.ModeWarn
 	if enforce {
 		mode = attest.ModeEnforce
 	}
-	log.Printf("%s: TDX quote verification enabled (measurement enforce=%v, allowlist empty)", label, enforce)
+	logger.Info("TDX quote verification enabled", "label", label, "enforce", enforce, "allowlist", "empty")
 	return attest.New(
 		attest.Policy{}, // TODO: load the audited broker-image measurement allowlist
 		attest.WithQuoteParser(dcap.NewQuoteParser(dcap.Config{})),

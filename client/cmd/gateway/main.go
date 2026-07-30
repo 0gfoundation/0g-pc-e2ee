@@ -31,8 +31,9 @@ package main
 
 import (
 	"flag"
-	"log"
+	"log/slog"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/cmd/internal/proxycli"
@@ -50,26 +51,33 @@ func main() {
 	// (AEAD) failure to the enclave's process log — operator-only diagnostics
 	// (field names and byte lengths, no plaintext or key material), distinct from
 	// the client-facing upstream-error detail the gateway still withholds.
-	client := f.Build("gateway")
+	// One shared logger for startup, per-request, and the core's open-failure
+	// diagnostics: text records to stdout, identical to the sidecar's, so the two
+	// forms don't drift (see proxycli.NewLogger). dstack/Phala captures stdout as
+	// line records; a later GCP move can swap the handler in one place.
+	logger := proxycli.NewLogger()
+	client := f.Build("gateway", logger)
 
 	srv := &http.Server{
 		Addr:              *f.Listen,
-		Handler:           newHandler(client),
+		Handler:           newHandler(client, logger),
 		ReadHeaderTimeout: 10 * time.Second, // mitigate slow-header (Slowloris) clients
 	}
 	// TLS is terminated by the dstack ZT-HTTPS front end inside the enclave, so
 	// the gateway itself serves plaintext HTTP on the socket dstack forwards to;
 	// the enclave boundary, not this listener, is the TLS edge.
-	log.Printf("gateway listening on %s -> route via %s", *f.Listen, *f.RouterURL)
+	logger.Info("gateway listening", "listen", *f.Listen, "router_url", *f.RouterURL)
 	if err := srv.ListenAndServe(); err != nil {
-		log.Fatal(err)
+		logger.Error("gateway server exited", "err", err)
+		os.Exit(1)
 	}
 }
 
 // newHandler mounts the shared OpenAI proxy plus the gateway-only operational
-// routes (health, attestation quote). It is split out from main so tests can
-// drive it with httptest.
-func newHandler(c *core.Client) http.Handler {
+// routes (health, attestation quote), wrapped in the access-log middleware so
+// every request emits one redaction-safe structured line. It is split out from
+// main so tests can drive it with httptest.
+func newHandler(c *core.Client, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	openaiproxy.Register(mux, c)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -83,5 +91,5 @@ func newHandler(c *core.Client) http.Handler {
 	mux.HandleFunc("GET /quote", func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "attestation quote not yet implemented", http.StatusNotImplemented)
 	})
-	return mux
+	return openaiproxy.LogRequests(logger, mux)
 }
