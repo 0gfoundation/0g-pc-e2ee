@@ -129,7 +129,8 @@ is a legitimate provider:
   prompts**. The client trusts it only as a correct, tamper-evident
   `identity → address` lookup — a far weaker assumption than trusting the router.
 
-It is enforced at two points: **hop 5** (seal the prompt only to a registered
+It is anchored at two points (see [Implementation status](#implementation-status)
+for the current wiring state): **hop 5** (seal the prompt only to a registered
 provider) and **hop 11** (accept a response signature only from that provider's
 registered address).
 
@@ -157,19 +158,21 @@ Honest gaps — half the value of this diagram is marking them (see
 
 ## Implementation status
 
-The chain is fully *specified*; parts are not yet *wired*. Two links are marked
-here because reading the code alone could suggest end-to-end coverage that does
-not exist yet:
+The chain is fully *specified*; most links are now *wired*, with the identity
+grounding still incomplete. Two links are called out because the code and the
+spec do not line up one-to-one — reading either alone can mislead.
 
 | Link | Status | Where |
 |------|--------|-------|
-| Hop 2 — TDX quote signature-chain verification | **Spec'd, not yet wired.** `attest/verify.go` uses a fail-closed `quoteParser` seam (default `notConfigured` rejects everything). | issue #7 |
-| Hop 3 — measurement allowlist | **Implemented.** `Verifier.Verify` checks the measurement against `Policy`. | `attest/verify.go` |
+| Hop 2 — TDX quote signature-chain verification | **Implemented.** A real go-tdx-guest DCAP verifier (quote chain → Intel root + QE identity + TCB status) fills the `WithQuoteParser` seam, wired into the sidecar, gateway, and route resolver. The seam stays in `protocol/attest` by design (keeps `protocol` lean/portable); the heavy verifier lives in the client. | `client/dcap/tdxverify.go`, `client/cmd/{sidecar,gateway}/main.go`, #29 / #31 |
+| Hop 3 — measurement allowlist | **Implemented, with a gap.** `Verifier.Verify` checks the measurement against `Policy` in enforce/warn modes (`-attest-enforce`). **The audited-image allowlist is still empty**, so warn mode proceeds on any measurement and enforce rejects every provider — populating the allowlist is the remaining work. | `attest/verify.go`, `client/cmd/gateway/main.go`, #31 |
 | Hop 4 — `report_data` → `enc_pub`/`signer_addr` | **Implemented.** `ParseReportData` (SPEC §4.2 layout). | `attest/reportdata.go` |
-| Hop 5 — `signer_addr == on-chain teeSignerAddress` | **Spec'd, not yet wired.** `Verify` returns `SignerAddr` but does not consult the chain; the caller must. | issue #18 |
+| Hop 5 — `signer_addr == on-chain teeSignerAddress` | **Not yet wired — the open gap.** The signer is now bound into a **DCAP-verified** quote, so a router cannot substitute an *unattested* key. But nothing yet cross-checks that attested signer against an **independent on-chain registry**, so a *genuine* enclave running audited code but operated by an unregistered party is not caught — exactly the case in [Why the on-chain root exists](#why-the-on-chain-root-exists). `Verify` returns `SignerAddr`; the route resolver trusts it without a chain lookup. | issue #18 |
 | Hops 6–9 — HPKE seal/open, AAD binding | **Implemented.** | `crypto/`, `wire/` |
-| Hop 11 — signature verify against on-chain address | **Spec'd.** Recovery exists; the on-chain comparison depends on the #18 wiring. | `crypto/`, issue #18 |
+| Hop 11 — signature verify against signer | **Implemented against the quote-bound signer.** Recovery + accept-only-that-address exists and anchors on the *attested* signer, so it inherits hop 5's gap — full strength needs the #18 on-chain comparison. | `crypto/`, issue #18 |
 
-So today the chain is **closed by design, with hops 2 and 5 (both on-chain/
-hardware identity anchoring) still to be implemented** before it is end-to-end
-enforceable.
+So today the chain is **closed by design and largely enforced**: the hardware and
+code roots (hops 2–4) are wired. The remaining gaps are both about *identity
+grounding* — populating the measurement allowlist (hop 3) and the on-chain
+`teeSignerAddress` cross-check (hop 5 / #18) — the latter being the one link that
+turns "an attested enclave" into "the **expected** attested enclave."
