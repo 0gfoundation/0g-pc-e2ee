@@ -75,6 +75,27 @@ func TestWarmer_ListProviderAddrs(t *testing.T) {
 	}
 }
 
+func TestWarmer_ListProviderAddrsDedup(t *testing.T) {
+	var hits, status int32
+	// A provider serving several models appears once per model — the same address
+	// repeated, in mixed casing. listProviderAddrs must collapse those to one,
+	// case-insensitively, keeping first-seen order and the original casing.
+	srv := warmerServer(t, &hits, []string{"0xa", "0xB", "0xa", "0xc", "0xA", "0xb"}, &status)
+	addrs, err := New(srv.URL).listProviderAddrs(context.Background())
+	if err != nil {
+		t.Fatalf("listProviderAddrs: %v", err)
+	}
+	want := []string{"0xa", "0xB", "0xc"}
+	if len(addrs) != len(want) {
+		t.Fatalf("addrs = %v, want %v", addrs, want)
+	}
+	for i := range want {
+		if addrs[i] != want[i] {
+			t.Errorf("addrs[%d] = %q, want %q (full: %v)", i, addrs[i], want[i], addrs)
+		}
+	}
+}
+
 func TestWarmer_WarmThenServeFromCacheThenRefresh(t *testing.T) {
 	var hits, status int32
 	srv := warmerServer(t, &hits, []string{"0xa"}, &status)
