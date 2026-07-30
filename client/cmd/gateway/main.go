@@ -66,8 +66,12 @@ func main() {
 	// TLS is terminated by the dstack ZT-HTTPS front end inside the enclave, so
 	// the gateway itself serves plaintext HTTP on the socket dstack forwards to;
 	// the enclave boundary, not this listener, is the TLS edge.
+	// Serve until a shutdown signal, then drain in-flight requests gracefully
+	// (shared with the sidecar so both forms handle SIGTERM identically — the
+	// dstack/Phala deployment sends it on every redeploy). ListenAndServe's clean
+	// shutdown is folded into a nil return; only a real listen failure is an error.
 	logger.Info("gateway listening", "listen", *f.Listen, "router_url", *f.RouterURL)
-	if err := srv.ListenAndServe(); err != nil {
+	if err := proxycli.Serve(srv, logger); err != nil {
 		logger.Error("gateway server exited", "err", err)
 		os.Exit(1)
 	}

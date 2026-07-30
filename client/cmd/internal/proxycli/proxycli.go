@@ -17,13 +17,18 @@
 package proxycli
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"log/slog"
+	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
@@ -33,6 +38,80 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
+
+// ShutdownTimeout bounds how long Serve waits for in-flight requests to drain
+// after a shutdown signal before it forces the listener closed. It is sized to a
+// typical orchestrator stop grace (Docker defaults to 10s, Kubernetes to 30s; the
+// dstack/Phala deployment sends SIGTERM on stop), so ordinary buffered
+// completions finish cleanly while a long-lived SSE stream — which can otherwise
+// run up to the core's providerTimeout (~10m) — is cut rather than stalling the
+// redeploy. A cut stream is unavoidable on any bounded-grace shutdown; the
+// alternative (waiting out the stream) would make every deploy hang for minutes.
+const ShutdownTimeout = 30 * time.Second
+
+// Serve runs srv until an interrupt or termination signal (SIGINT / SIGTERM)
+// arrives, then shuts it down gracefully: it stops accepting new connections and
+// waits up to ShutdownTimeout for in-flight requests to finish before forcing the
+// listener closed. Both proxy binaries call it so their lifecycle — signal
+// handling, drain window, and the ErrServerClosed vs real-error distinction —
+// stays identical instead of being re-implemented in each main.
+//
+// It returns nil once a signal-triggered shutdown completes (whether the drain
+// finished or timed out and was forced), and a non-nil error only when
+// ListenAndServe fails for a reason other than the expected http.ErrServerClosed
+// (e.g. the listen address is already bound). The caller logs it and sets the
+// process exit code.
+func Serve(srv *http.Server, logger *slog.Logger) error {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	return serve(srv, logger, sigCh)
+}
+
+// serve is the signal-source-independent core of Serve. It takes the trigger
+// channel as a parameter so a test can drive the drain path deterministically
+// without sending a real process signal (which would race every other test in
+// the binary). Production always feeds it an os/signal-backed channel via Serve.
+func serve(srv *http.Server, logger *slog.Logger, sigCh <-chan os.Signal) error {
+	// ListenAndServe blocks until Shutdown/Close, so run it in a goroutine and
+	// report its outcome here. A clean shutdown surfaces as ErrServerClosed, which
+	// is normal (not an error); anything else is a genuine listen/serve failure
+	// that the select below returns to the caller synchronously.
+	errCh := make(chan error, 1)
+	go func() {
+		err := srv.ListenAndServe()
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		}
+		errCh <- err
+	}()
+
+	select {
+	case err := <-errCh:
+		// The server exited before any signal — a bind/listen failure. Return it;
+		// there is nothing to drain.
+		return err
+	case sig := <-sigCh:
+		logger.Info("shutdown signal received, draining in-flight requests",
+			"signal", sig.String(), "grace", ShutdownTimeout)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), ShutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(ctx); err != nil {
+		// The grace window elapsed with requests still in flight (typically a
+		// long-lived SSE stream). Force the listener and idle connections closed so
+		// the process can exit promptly; the stream is cut, which is inherent to a
+		// bounded-grace shutdown.
+		logger.Warn("graceful shutdown timed out, forcing close", "err", err)
+		_ = srv.Close()
+	} else {
+		logger.Info("graceful shutdown complete")
+	}
+	// Wait for ListenAndServe to return (it now yields ErrServerClosed → nil) so we
+	// don't race the goroutine as the process exits.
+	return <-errCh
+}
 
 // onchainCacheTTL bounds how long an on-chain teeSignerAddress lookup is reused.
 // A provider's acknowledged signer changes only on re-registration, so a few
