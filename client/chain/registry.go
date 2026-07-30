@@ -33,9 +33,20 @@ import (
 	"time"
 )
 
-// DefaultInferenceServingAddress is the InferenceServing contract address the
-// broker defaults to (0g-serving-broker api/inference/config default). Callers
-// SHOULD set it explicitly for their target chain rather than rely on this.
+// DefaultInferenceServingAddress is the InferenceServing proxy on 0G mainnet
+// (0g-serving-contract deployments/zgMainnet). Callers SHOULD set the address
+// explicitly for their target chain rather than rely on this — e.g. testnet-V4
+// is 0xa79F4c8311FF93C06b8CfB403690cc987c93F91E and testnet-dev is
+// 0x41bD7Ac5c19000A974D5c192bcd5FB67b56C85c5.
+//
+// This is a beacon-proxy address: it is stable across implementation upgrades
+// (the impl is swapped behind a fixed proxy). So a contract upgrade does NOT
+// change the address — meaning a change to the Service struct layout that
+// decodeService depends on can ship WITHOUT an address change to signal it. That
+// is safe here only because such a mismatch fails closed (see decodeService): a
+// misaligned decode rejects the candidate, it never accepts a wrong signer. A
+// Service-struct change is therefore a coordinated migration that must update
+// decodeService's offsets (and its KAT).
 const DefaultInferenceServingAddress = "0x47340d900bdFec2BD393c626E12ea0656F938d84"
 
 // getServiceSelector is the 4-byte selector for getService(address) on the
