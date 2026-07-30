@@ -69,5 +69,26 @@ services:
       # With ZG_GATEWAY_ONCHAIN, skip a provider whose on-chain signer is
       # missing/unacknowledged/mismatched instead of only warning. Defaults to off.
       # - "ZG_GATEWAY_ONCHAIN_ENFORCE=true"
+      # Fetch Intel PCS collateral (TCB Info, QE Identity, PCK CRL) from Phala's
+      # hosted PCCS instead of api.trustedservices.intel.com. This CVM runs on
+      # Phala infrastructure, so its own PCCS is the closest, most reliable source
+      # (Intel PCS is reachable but historically rate-limited/flaky). Only the host
+      # is swapped and collateral is Intel-signed regardless of where it is served,
+      # so this is a transport choice, not a trust one; the SGX root-CA CRL still
+      # comes from Intel (a different host). Requires ZG_GATEWAY_ATTEST.
+      - "ZG_GATEWAY_PCCS_URL=https://pccs.phala.network"
+      # How long DCAP collateral is memoized by URL, so it is not re-fetched for
+      # every provider and every warmer sweep. Bounds revocation lag (a cached CRL
+      # delays seeing a fresh revocation until it expires); defaults to 1h, set 0
+      # to disable. Uncomment to override.
+      # - "ZG_GATEWAY_COLLATERAL_TTL=1h"
+      # Run a background warmer that pre-verifies every provider's quote and
+      # refreshes it ahead of expiry, so requests hit a warm cache instead of
+      # paying the DCAP verify (quote fetch + collateral) inline. Requires
+      # ZG_GATEWAY_ATTEST and ZG_GATEWAY_ONCHAIN (the endpoint is resolved on
+      # chain). Defaults to off; the interval defaults to 4m (under the ~5m
+      # quote-cache TTL). Uncomment both to enable.
+      # - "ZG_GATEWAY_WARM=true"
+      # - "ZG_GATEWAY_WARM_INTERVAL=4m"
     # No secrets or volumes: the gateway holds no pinned provider key, and TLS
     # material is managed by dstack-kms inside the enclave, never by this file.
