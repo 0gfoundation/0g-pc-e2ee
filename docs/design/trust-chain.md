@@ -158,21 +158,22 @@ Honest gaps — half the value of this diagram is marking them (see
 
 ## Implementation status
 
-The chain is fully *specified*; most links are now *wired*, with the identity
-grounding still incomplete. Two links are called out because the code and the
-spec do not line up one-to-one — reading either alone can mislead.
+The chain is fully *specified* and now largely *wired*, including the on-chain
+identity grounding (hop 5). One link is called out because the code and the spec
+do not line up one-to-one — reading either alone can mislead.
 
 | Link | Status | Where |
 |------|--------|-------|
 | Hop 2 — TDX quote signature-chain verification | **Implemented.** A real go-tdx-guest DCAP verifier (quote chain → Intel root + QE identity + TCB status) fills the `WithQuoteParser` seam, wired into the sidecar, gateway, and route resolver. The seam stays in `protocol/attest` by design (keeps `protocol` lean/portable); the heavy verifier lives in the client. | `client/dcap/tdxverify.go`, `client/cmd/{sidecar,gateway}/main.go`, #29 / #31 |
 | Hop 3 — measurement allowlist | **Implemented, with a gap.** `Verifier.Verify` checks the measurement against `Policy` in enforce/warn modes (`-attest-enforce`). **The audited-image allowlist is still empty**, so warn mode proceeds on any measurement and enforce rejects every provider — populating the allowlist is the remaining work. | `attest/verify.go`, `client/cmd/gateway/main.go`, #31 |
 | Hop 4 — `report_data` → `enc_pub`/`signer_addr` | **Implemented.** `ParseReportData` (SPEC §4.2 layout). | `attest/reportdata.go` |
-| Hop 5 — `signer_addr == on-chain teeSignerAddress` | **Not yet wired — the open gap.** The signer is now bound into a **DCAP-verified** quote, so a router cannot substitute an *unattested* key. But nothing yet cross-checks that attested signer against an **independent on-chain registry**, so a *genuine* enclave running audited code but operated by an unregistered party is not caught — exactly the case in [Why the on-chain root exists](#why-the-on-chain-root-exists). `Verify` returns `SignerAddr`; the route resolver trusts it without a chain lookup. | issue #18 |
+| Hop 5 — `signer_addr == on-chain teeSignerAddress` | **Implemented (warn/enforce).** The route resolver cross-checks the DCAP-quote-bound signer against the provider's *acknowledged* `teeSignerAddress` read from the on-chain InferenceServing registry (`getService`), keyed on the provider's on-chain account — a mapping the untrusted router cannot forge. This is what catches a *genuine* enclave running audited code but operated by an unregistered party ([Why the on-chain root exists](#why-the-on-chain-root-exists)). Enforce skips a missing/unacknowledged/mismatched candidate; warn observes only. Reads the chain over a client-trusted RPC (`-onchain`, `-chain-rpc-url`), not the router. | `client/chain/registry.go`, `client/route` `WithOnChainVerification`, #18 |
 | Hops 6–9 — HPKE seal/open, AAD binding | **Implemented.** | `crypto/`, `wire/` |
-| Hop 11 — signature verify against signer | **Implemented against the quote-bound signer.** Recovery + accept-only-that-address exists and anchors on the *attested* signer, so it inherits hop 5's gap — full strength needs the #18 on-chain comparison. | `crypto/`, issue #18 |
+| Hop 11 — signature verify against signer | **Implemented.** Recovery + accept-only-that-address anchors on the attested signer; with `-onchain` enabled that signer is itself grounded on-chain (hop 5), so response authenticity chains to the on-chain identity. | `crypto/`, `client/chain` |
 
-So today the chain is **closed by design and largely enforced**: the hardware and
-code roots (hops 2–4) are wired. The remaining gaps are both about *identity
-grounding* — populating the measurement allowlist (hop 3) and the on-chain
-`teeSignerAddress` cross-check (hop 5 / #18) — the latter being the one link that
-turns "an attested enclave" into "the **expected** attested enclave."
+So today the chain is **closed by design and enforced end-to-end** when `-attest`
++ `-onchain` are on: the hardware, code, and on-chain roots (hops 2–5) are all
+wired. The one remaining piece is *populating* the measurement allowlist (hop 3),
+which is empty today — until it is filled, hop 3 runs in warn mode (or enforce
+rejects all). Hop 5 turns "an attested enclave" into "the **expected** attested
+enclave."

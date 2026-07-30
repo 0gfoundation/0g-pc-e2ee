@@ -39,7 +39,8 @@ var ErrMalformedReportData = errors.New("attest: malformed report_data")
 // ReportData is the decoded §4.2 report_data: the two keys a verified quote
 // binds, plus the layout version. EncPub is the HPKE recipient the client seals
 // to; SignerAddr is the provider's TEE signer, which the caller cross-checks
-// against the on-chain teeSignerAddress (SPEC §4.4 step 3; issue #18).
+// against the on-chain teeSignerAddress (SPEC §4.4 step 3; done by the route
+// resolver — see client/route WithOnChainVerification).
 type ReportData struct {
 	EncPub     crypto.PublicKey // 32-byte X25519 recipient key
 	SignerAddr string           // "0x" + 40 lowercase hex (the 20 raw bytes formatted)

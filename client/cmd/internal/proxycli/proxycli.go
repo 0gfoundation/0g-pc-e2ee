@@ -23,13 +23,20 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/dcap"
 	"github.com/0gfoundation/0g-pc-e2ee/client/route"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
+
+// onchainCacheTTL bounds how long an on-chain teeSignerAddress lookup is reused.
+// A provider's acknowledged signer changes only on re-registration, so a few
+// minutes trades a stale-signer window for far fewer chain RPCs per request.
+const onchainCacheTTL = 5 * time.Minute
 
 // Flags holds the startup parameters common to both proxy binaries, populated
 // by flag.Parse after RegisterFlags. Callers read Listen to bind their server
@@ -41,14 +48,19 @@ type Flags struct {
 	unboundFieldsCSV *string
 	attestOn         *bool
 	attestEnforce    *bool
+	onchainOn        *bool
+	onchainEnforce   *bool
+	chainRPCURL      *string
+	servingContract  *string
 }
 
-// RegisterFlags declares the six shared startup flags on fs and returns a Flags
+// RegisterFlags declares the shared startup flags on fs and returns a Flags
 // whose pointers are filled by fs.Parse. envPrefix (e.g. "ZG_GATEWAY",
 // "ZG_SIDECAR") selects the environment variables consulted for each flag's
 // default: <envPrefix>_LISTEN, _ROUTER_URL, _SEAL_FIELDS, _UNBOUND_FIELDS,
-// _ATTEST, _ATTEST_ENFORCE. defaultListen is the built-in listen address used
-// when neither the flag nor <envPrefix>_LISTEN is set.
+// _ATTEST, _ATTEST_ENFORCE, _ONCHAIN, _ONCHAIN_ENFORCE, _CHAIN_RPC_URL,
+// _SERVING_CONTRACT. defaultListen is the built-in listen address used when
+// neither the flag nor <envPrefix>_LISTEN is set.
 func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen string) *Flags {
 	env := func(name string) string { return envPrefix + "_" + name }
 	return &Flags{
@@ -62,6 +74,14 @@ func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen string) *Flags {
 			fmt.Sprintf("DCAP-verify each provider's TDX quote and seal only to the verified enc key (instead of trusting the router-supplied pubkey endpoint) (env %s)", env("ATTEST"))),
 		attestEnforce: fs.Bool("attest-enforce", envBool(env("ATTEST_ENFORCE"), false),
 			fmt.Sprintf("with -attest, reject a provider whose measurement is not in the allowlist instead of only warning; the audited-image allowlist is not wired yet (empty), so enforce currently rejects all providers (env %s)", env("ATTEST_ENFORCE"))),
+		onchainOn: fs.Bool("onchain", envBool(env("ONCHAIN"), false),
+			fmt.Sprintf("cross-check each provider's quote-bound TEE signer against its acknowledged on-chain teeSignerAddress in the InferenceServing registry (SPEC §4.4 step 3); requires -attest (env %s)", env("ONCHAIN"))),
+		onchainEnforce: fs.Bool("onchain-enforce", envBool(env("ONCHAIN_ENFORCE"), false),
+			fmt.Sprintf("with -onchain, skip a provider whose on-chain signer is missing/unacknowledged/mismatched instead of only warning (env %s)", env("ONCHAIN_ENFORCE"))),
+		chainRPCURL: fs.String("chain-rpc-url", envOr(env("CHAIN_RPC_URL"), chain.DefaultChainRPCURL),
+			fmt.Sprintf("0G chain JSON-RPC endpoint for on-chain signer lookups; must be a source trusted independently of the router (defaults to 0G mainnet) (env %s)", env("CHAIN_RPC_URL"))),
+		servingContract: fs.String("serving-contract", envOr(env("SERVING_CONTRACT"), chain.DefaultInferenceServingAddress),
+			fmt.Sprintf("InferenceServing contract address for on-chain signer lookups (env %s)", env("SERVING_CONTRACT"))),
 	}
 }
 
@@ -90,6 +110,17 @@ func (f *Flags) Build(label string) *core.Client {
 	if *f.attestEnforce && !*f.attestOn {
 		log.Fatalf("-attest-enforce requires -attest")
 	}
+	// On-chain grounding needs a quote-bound signer to check (so -attest), a
+	// stricter mode needs the check on (so -onchain), and the check needs an RPC.
+	if *f.onchainEnforce && !*f.onchainOn {
+		log.Fatalf("-onchain-enforce requires -onchain")
+	}
+	if *f.onchainOn && !*f.attestOn {
+		log.Fatalf("-onchain requires -attest (the signer must come from a verified quote)")
+	}
+	if *f.onchainOn && strings.TrimSpace(*f.chainRPCURL) == "" {
+		log.Fatalf("-onchain requires -chain-rpc-url")
+	}
 
 	// Route per request: pick the provider via the router and derive its enc key +
 	// signer from the broker, so no provider key is pinned up front. The router is
@@ -99,6 +130,14 @@ func (f *Flags) Build(label string) *core.Client {
 	routeOpts := []route.Option{route.WithSensitiveFields(sealFields)}
 	if *f.attestOn {
 		routeOpts = append(routeOpts, route.WithQuoteVerification(newVerifier(label, *f.attestEnforce), nil))
+	}
+	if *f.onchainOn {
+		reg, err := chain.NewOnChainRegistry(chain.Config{RPCURL: *f.chainRPCURL, ContractAddress: *f.servingContract})
+		if err != nil {
+			log.Fatalf("on-chain registry: %v", err)
+		}
+		routeOpts = append(routeOpts, route.WithOnChainVerification(chain.Cached(reg, onchainCacheTTL), *f.onchainEnforce, nil))
+		log.Printf("%s: on-chain signer grounding enabled (enforce=%v, contract=%s)", label, *f.onchainEnforce, *f.servingContract)
 	}
 	router := route.New(*f.RouterURL, routeOpts...)
 	return core.NewWithResolver(router,
