@@ -60,9 +60,10 @@ services:
       # - "ZG_GATEWAY_ATTEST_ENFORCE=true"
       # Cross-check each provider's quote-bound TEE signer against its acknowledged
       # on-chain teeSignerAddress (InferenceServing registry). Requires
-      # ZG_GATEWAY_ATTEST and a client-trusted chain RPC. Defaults to off.
+      # ZG_GATEWAY_ATTEST. Defaults to off. The RPC + contract default to 0G
+      # mainnet; override both together for testnet or your own node.
       # - "ZG_GATEWAY_ONCHAIN=true"
-      # - "ZG_GATEWAY_CHAIN_RPC_URL=<0G chain JSON-RPC endpoint>"
+      # - "ZG_GATEWAY_CHAIN_RPC_URL=https://evmrpc.0g.ai"
       # - "ZG_GATEWAY_SERVING_CONTRACT=0x47340d900bdFec2BD393c626E12ea0656F938d84"
       # With ZG_GATEWAY_ONCHAIN, skip a provider whose on-chain signer is
       # missing/unacknowledged/mismatched instead of only warning. Defaults to off.

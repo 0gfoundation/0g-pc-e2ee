@@ -51,9 +51,10 @@ func TestReport(t *testing.T) {
 	}
 }
 
-func TestRun_MissingRequiredFlags(t *testing.T) {
+func TestRun_MissingProvider(t *testing.T) {
 	var out bytes.Buffer
-	if code := run(context.Background(), &out, []string{"-provider", prov}); code != 2 {
-		t.Errorf("missing -chain-rpc-url: exit = %d, want 2", code)
+	// No -provider: must fail with usage exit 2 before touching the network.
+	if code := run(context.Background(), &out, []string{"-chain-rpc-url", "http://127.0.0.1:0"}); code != 2 {
+		t.Errorf("missing -provider: exit = %d, want 2", code)
 	}
 }

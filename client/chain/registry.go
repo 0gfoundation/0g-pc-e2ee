@@ -49,6 +49,12 @@ import (
 // decodeService's offsets (and its KAT).
 const DefaultInferenceServingAddress = "0x47340d900bdFec2BD393c626E12ea0656F938d84"
 
+// DefaultChainRPCURL is the 0G mainnet JSON-RPC endpoint, a convenient default
+// that pairs with DefaultInferenceServingAddress (also mainnet). It MUST be a
+// source trusted independently of the router; override it (with a matching
+// -serving-contract) for testnet or to point at your own node.
+const DefaultChainRPCURL = "https://evmrpc.0g.ai"
+
 // getServiceSelector is the 4-byte selector for getService(address) on the
 // InferenceServing contract (abigen binding: method 0x15a52302). Hard-coding it
 // avoids a keccak dependency; a KAT locks it against drift.

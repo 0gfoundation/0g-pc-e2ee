@@ -40,15 +40,15 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 	fs := flag.NewFlagSet("pcverify", flag.ContinueOnError)
 	fs.SetOutput(out)
 	provider := fs.String("provider", "", "provider on-chain account address (0x + 40 hex, required)")
-	chainRPCURL := fs.String("chain-rpc-url", "", "0G chain JSON-RPC endpoint; a source trusted independently of the router (required)")
+	chainRPCURL := fs.String("chain-rpc-url", chain.DefaultChainRPCURL, "0G chain JSON-RPC endpoint; a source trusted independently of the router (defaults to 0G mainnet)")
 	servingContract := fs.String("serving-contract", chain.DefaultInferenceServingAddress, "InferenceServing contract address")
 	expectSigner := fs.String("expect-signer", "", "if set, require the on-chain teeSignerAddress to equal this (e.g. a quote's signer)")
 	timeout := fs.Duration("timeout", 15*time.Second, "overall timeout for the chain read")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if strings.TrimSpace(*provider) == "" || strings.TrimSpace(*chainRPCURL) == "" {
-		fmt.Fprintln(out, "pcverify: -provider and -chain-rpc-url are required")
+	if strings.TrimSpace(*provider) == "" {
+		fmt.Fprintln(out, "pcverify: -provider is required")
 		fs.Usage()
 		return 2
 	}

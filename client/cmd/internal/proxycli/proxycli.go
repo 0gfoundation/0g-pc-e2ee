@@ -78,8 +78,8 @@ func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen string) *Flags {
 			fmt.Sprintf("cross-check each provider's quote-bound TEE signer against its acknowledged on-chain teeSignerAddress in the InferenceServing registry (SPEC §4.4 step 3); requires -attest (env %s)", env("ONCHAIN"))),
 		onchainEnforce: fs.Bool("onchain-enforce", envBool(env("ONCHAIN_ENFORCE"), false),
 			fmt.Sprintf("with -onchain, skip a provider whose on-chain signer is missing/unacknowledged/mismatched instead of only warning (env %s)", env("ONCHAIN_ENFORCE"))),
-		chainRPCURL: fs.String("chain-rpc-url", envOr(env("CHAIN_RPC_URL"), ""),
-			fmt.Sprintf("0G chain JSON-RPC endpoint for on-chain signer lookups; must be a source trusted independently of the router (required with -onchain) (env %s)", env("CHAIN_RPC_URL"))),
+		chainRPCURL: fs.String("chain-rpc-url", envOr(env("CHAIN_RPC_URL"), chain.DefaultChainRPCURL),
+			fmt.Sprintf("0G chain JSON-RPC endpoint for on-chain signer lookups; must be a source trusted independently of the router (defaults to 0G mainnet) (env %s)", env("CHAIN_RPC_URL"))),
 		servingContract: fs.String("serving-contract", envOr(env("SERVING_CONTRACT"), chain.DefaultInferenceServingAddress),
 			fmt.Sprintf("InferenceServing contract address for on-chain signer lookups (env %s)", env("SERVING_CONTRACT"))),
 	}
