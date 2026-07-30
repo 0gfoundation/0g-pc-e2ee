@@ -49,6 +49,7 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
+	"golang.org/x/sync/singleflight"
 )
 
 // b64 is base64url without padding — the enc_pub encoding on the wire (SPEC §3),
@@ -79,6 +80,14 @@ const (
 	// (docs/design/router-e2e.md "extra round trip"). Providers rotate keys
 	// rarely, so a few minutes is safe; a bad guess only costs a re-seal.
 	defaultPubkeyTTL = 5 * time.Minute
+	// defaultQuoteTTL bounds how long a DCAP-verified result is reused. Kept short
+	// (not permanent) so a TCB downgrade, collateral expiry, revocation, or enc-key
+	// rotation is re-checked promptly; the warmer refreshes ahead of it.
+	defaultQuoteTTL = 5 * time.Minute
+	// quoteVerifyTimeout bounds a single (de-duplicated) quote verification, which
+	// runs under a context detached from any one caller (so no caller's
+	// cancellation kills the shared work); this caps a hung upstream instead.
+	quoteVerifyTimeout = 60 * time.Second
 	// x25519PubLen is the byte length of the HPKE (X25519) recipient key.
 	x25519PubLen = 32
 	// maxControlBodyBytes caps a control-plane response body read (preview /
@@ -107,6 +116,12 @@ type Router struct {
 	// makes a negative result fail-closed (skip the candidate) instead of a warn.
 	registry       chain.SignerRegistry
 	onchainEnforce bool
+	// quoteCache memoizes DCAP-verified results (enc_pub/signer) per endpoint, and
+	// quoteSF collapses concurrent misses for the same endpoint into a single
+	// verification so a cold/expired key can't stampede the expensive quote+
+	// collateral path. Used only on the quote-verification path (verifier != nil).
+	quoteCache *quoteCache
+	quoteSF    singleflight.Group
 }
 
 // Option customizes a Router.
@@ -152,6 +167,14 @@ func WithSensitiveFields(fields []string) Option {
 // A non-positive TTL disables caching (fetch every request).
 func WithPubkeyTTL(d time.Duration) Option {
 	return func(r *Router) { r.cache = newPubkeyCache(d) }
+}
+
+// WithQuoteTTL sets how long a DCAP-verified result (enc_pub/signer) is cached
+// and reused on the quote-verification path. A non-positive TTL disables
+// caching (verify every request). Keep it short — it bounds how long a TCB
+// downgrade / revocation / key rotation goes unnoticed.
+func WithQuoteTTL(d time.Duration) Option {
+	return func(r *Router) { r.quoteCache = newQuoteCache(d) }
 }
 
 // WithQuoteVerification makes the Router obtain each candidate's enc_pub and
@@ -230,6 +253,7 @@ func New(routerURL string, opts ...Option) *Router {
 		sensitiveFields: sliceToSet(wire.DefaultSealedFields()),
 		http:            &http.Client{Transport: tr},
 		cache:           newPubkeyCache(defaultPubkeyTTL),
+		quoteCache:      newQuoteCache(defaultQuoteTTL),
 	}
 	for _, o := range opts {
 		o(r)
@@ -335,13 +359,55 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 	}, nil
 }
 
-// verifiedKeys fetches the candidate's attestation quote from its endpoint,
-// DCAP-verifies it, and returns the enc_pub + signer bound into the verified
-// report_data. Because the keys come out of a genuine, signed quote, it does not
-// matter that the untrusted router chose the endpoint: a substituted endpoint
-// serving an attacker key would fail verification. On a warn-mode measurement
-// miss it logs but still returns the (genuine) keys.
+// verifiedKeys returns the DCAP-verified enc_pub + signer for a candidate
+// endpoint, from the cache when fresh, otherwise by verifying its quote. It
+// collapses concurrent misses for the same endpoint into ONE verification
+// (quote fetch + go-tdx-guest + Intel PCS collateral is expensive and
+// rate-limit-sensitive) via singleflight; the rest share the result. Errors are
+// not cached, so a transient failure is retried on the next request.
 func (r *Router) verifiedKeys(ctx context.Context, endpoint string) (crypto.PublicKey, string, error) {
+	if encPub, signer, ok := r.quoteCache.get(endpoint); ok {
+		return encPub, signer, nil
+	}
+	// The shared verification runs under a context DETACHED from the caller that
+	// happened to lead (context.WithoutCancel keeps its values, drops its
+	// cancellation), so one caller disconnecting or timing out cannot fail the
+	// verification for the others coalesced onto it. It is still bounded by
+	// quoteVerifyTimeout so a hung upstream can't leak the in-flight call. Each
+	// caller then waits via DoChan and honors ITS OWN context — a caller whose
+	// request is canceled returns immediately without dooming the rest.
+	ch := r.quoteSF.DoChan(endpoint, func() (any, error) {
+		vctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), quoteVerifyTimeout)
+		defer cancel()
+		encPub, signer, err := r.verifyQuote(vctx, endpoint)
+		if err != nil {
+			return nil, err
+		}
+		r.quoteCache.put(endpoint, encPub, signer)
+		return quoteResult{encPub: encPub, signer: signer}, nil
+	})
+	select {
+	case <-ctx.Done():
+		// This caller gave up; the shared verification continues for the others
+		// (and warms the cache).
+		return nil, "", upstream(0, fmt.Errorf("provider quote verification: %w", ctx.Err()))
+	case res := <-ch:
+		if res.Err != nil {
+			return nil, "", res.Err
+		}
+		out := res.Val.(quoteResult)
+		return out.encPub, out.signer, nil
+	}
+}
+
+// verifyQuote is the uncached work behind verifiedKeys: fetch the candidate's
+// attestation quote from its endpoint and DCAP-verify it, returning the enc_pub +
+// signer bound into the verified report_data. Because the keys come out of a
+// genuine, signed quote, it does not matter that the untrusted router chose the
+// endpoint: a substituted endpoint serving an attacker key would fail
+// verification. On a warn-mode measurement miss it logs but still returns the
+// (genuine) keys.
+func (r *Router) verifyQuote(ctx context.Context, endpoint string) (crypto.PublicKey, string, error) {
 	quoteURL, err := deriveQuoteURL(endpoint)
 	if err != nil {
 		return nil, "", upstream(0, fmt.Errorf("provider endpoint: %w", err))
