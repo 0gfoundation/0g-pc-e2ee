@@ -52,8 +52,11 @@ func main() {
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second, // mitigate slow-header (Slowloris) clients
 	}
+	// Serve until a shutdown signal, then drain in-flight requests gracefully
+	// (shared with the gateway so both forms handle SIGINT/SIGTERM identically). A
+	// clean shutdown returns nil; only a real listen failure is a fatal error.
 	logger.Info("sidecar listening", "listen", *f.Listen, "router_url", *f.RouterURL)
-	if err := srv.ListenAndServe(); err != nil {
+	if err := proxycli.Serve(srv, logger); err != nil {
 		logger.Error("sidecar server exited", "err", err)
 		os.Exit(1)
 	}
