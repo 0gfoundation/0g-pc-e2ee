@@ -30,13 +30,17 @@ services:
       # host:container — dstack tproxy forwards the public ingress to the host
       # side, so this port is what appears as `<app-id>-8443.<base_domain>`.
       - "8443:8443"
-    command:
+    # Every startup parameter also reads from an OG_GATEWAY_* environment
+    # variable (precedence: command-line flag > env var > built-in default), so
+    # it can be set here in the measured `environment:` block instead of via
+    # `command:`. This block is what dstack measures into the CVM attestation.
+    environment:
       # Bind to all interfaces (the binary defaults to localhost, which would be
       # container-local only) so dstack can forward to it.
-      - "--listen=0.0.0.0:8443"
+      - "OG_GATEWAY_LISTEN=0.0.0.0:8443"
       # The gateway routes per request and derives each provider's enc key +
       # signer from the broker, so no provider/key is configured up front. It
       # defaults to the 0G router; uncomment to override.
-      # - "--router-url=https://router-api.0g.ai"
+      # - "OG_GATEWAY_ROUTER_URL=https://router-api.0g.ai"
     # No secrets or volumes: the gateway holds no pinned provider key, and TLS
     # material is managed by dstack-kms inside the enclave, never by this file.
