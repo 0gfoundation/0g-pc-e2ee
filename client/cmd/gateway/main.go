@@ -39,19 +39,19 @@ import (
 )
 
 // Every startup parameter can be set two ways: an explicit command-line flag or
-// an OG_GATEWAY_* environment variable. The env value is used only as the flag's
+// a ZG_GATEWAY_* environment variable. The env value is used only as the flag's
 // default, so precedence is: explicit flag > environment variable > built-in
 // default. Env config is the primary path for the TEE/dstack deployment, where
 // the compose file's `environment:` block is measured into the CVM attestation
 // (see deploy/phala/docker-compose.yml), while flags stay convenient for local
 // runs and one-off overrides.
 func main() {
-	listen := flag.String("listen", envOr("OG_GATEWAY_LISTEN", ":8443"), "address to listen on (env OG_GATEWAY_LISTEN)")
-	routerURL := flag.String("router-url", envOr("OG_GATEWAY_ROUTER_URL", route.DefaultRouterURL), "0G router base URL/domain (the route-preview path is appended) (env OG_GATEWAY_ROUTER_URL)")
-	sealFieldsCSV := flag.String("seal-fields", envOr("OG_GATEWAY_SEAL_FIELDS", strings.Join(wire.DefaultSealedFields(), ",")), "comma-separated request fields to seal (must include \"messages\") (env OG_GATEWAY_SEAL_FIELDS)")
-	unboundFieldsCSV := flag.String("unbound-fields", envOr("OG_GATEWAY_UNBOUND_FIELDS", strings.Join(wire.DefaultUnboundFields(), ",")), "comma-separated cleartext fields excluded from the AAD (intermediary-mutable, untrusted); empty binds everything (env OG_GATEWAY_UNBOUND_FIELDS)")
-	attestOn := flag.Bool("attest", envBool("OG_GATEWAY_ATTEST", false), "DCAP-verify each provider's TDX quote and seal only to the verified enc key (instead of trusting the router-supplied pubkey endpoint) (env OG_GATEWAY_ATTEST)")
-	attestEnforce := flag.Bool("attest-enforce", envBool("OG_GATEWAY_ATTEST_ENFORCE", false), "with -attest, reject a provider whose measurement is not in the allowlist instead of only warning; the audited-image allowlist is not wired yet (empty), so enforce currently rejects all providers (env OG_GATEWAY_ATTEST_ENFORCE)")
+	listen := flag.String("listen", envOr("ZG_GATEWAY_LISTEN", ":8443"), "address to listen on (env ZG_GATEWAY_LISTEN)")
+	routerURL := flag.String("router-url", envOr("ZG_GATEWAY_ROUTER_URL", route.DefaultRouterURL), "0G router base URL/domain (the route-preview path is appended) (env ZG_GATEWAY_ROUTER_URL)")
+	sealFieldsCSV := flag.String("seal-fields", envOr("ZG_GATEWAY_SEAL_FIELDS", strings.Join(wire.DefaultSealedFields(), ",")), "comma-separated request fields to seal (must include \"messages\") (env ZG_GATEWAY_SEAL_FIELDS)")
+	unboundFieldsCSV := flag.String("unbound-fields", envOr("ZG_GATEWAY_UNBOUND_FIELDS", strings.Join(wire.DefaultUnboundFields(), ",")), "comma-separated cleartext fields excluded from the AAD (intermediary-mutable, untrusted); empty binds everything (env ZG_GATEWAY_UNBOUND_FIELDS)")
+	attestOn := flag.Bool("attest", envBool("ZG_GATEWAY_ATTEST", false), "DCAP-verify each provider's TDX quote and seal only to the verified enc key (instead of trusting the router-supplied pubkey endpoint) (env ZG_GATEWAY_ATTEST)")
+	attestEnforce := flag.Bool("attest-enforce", envBool("ZG_GATEWAY_ATTEST_ENFORCE", false), "with -attest, reject a provider whose measurement is not in the allowlist instead of only warning; the audited-image allowlist is not wired yet (empty), so enforce currently rejects all providers (env ZG_GATEWAY_ATTEST_ENFORCE)")
 	flag.Parse()
 
 	sealFields := parseCSV(*sealFieldsCSV)
@@ -143,7 +143,7 @@ func newHandler(c *core.Client) http.Handler {
 }
 
 // envOr returns the value of environment variable key, or def if it is unset.
-// An explicitly-set-but-empty variable (e.g. OG_GATEWAY_UNBOUND_FIELDS=) is
+// An explicitly-set-but-empty variable (e.g. ZG_GATEWAY_UNBOUND_FIELDS=) is
 // honored as empty, which for CSV fields is a meaningful value (bind everything),
 // so we branch on presence via LookupEnv rather than treating "" as unset.
 func envOr(key, def string) string {
@@ -156,7 +156,7 @@ func envOr(key, def string) string {
 // envBool parses a boolean environment variable (accepting the same forms as
 // the -flag=bool syntax: 1/t/T/TRUE/true, 0/f/F/FALSE/false, etc.). An unset
 // variable falls back to def; a set-but-unparseable value is fatal rather than
-// silently defaulting, so a typo like OG_GATEWAY_ATTEST=yes cannot quietly leave
+// silently defaulting, so a typo like ZG_GATEWAY_ATTEST=yes cannot quietly leave
 // attestation off.
 func envBool(key string, def bool) bool {
 	v, ok := os.LookupEnv(key)
