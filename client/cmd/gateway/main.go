@@ -31,8 +31,9 @@ package main
 
 import (
 	"flag"
-	"log"
+	"log/slog"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/cmd/internal/proxycli"
@@ -52,24 +53,32 @@ func main() {
 	// the client-facing upstream-error detail the gateway still withholds.
 	client := f.Build("gateway")
 
+	// Structured JSON logs to stdout: dstack/Phala captures the container's stdout
+	// as line-oriented records today, and GCP Cloud Logging (a likely later home)
+	// parses the same JSON lines into queryable fields — one emitter, both targets,
+	// no code change. Every line stays metadata-only (see accessLog).
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
 	srv := &http.Server{
 		Addr:              *f.Listen,
-		Handler:           newHandler(client),
+		Handler:           newHandler(client, logger),
 		ReadHeaderTimeout: 10 * time.Second, // mitigate slow-header (Slowloris) clients
 	}
 	// TLS is terminated by the dstack ZT-HTTPS front end inside the enclave, so
 	// the gateway itself serves plaintext HTTP on the socket dstack forwards to;
 	// the enclave boundary, not this listener, is the TLS edge.
-	log.Printf("gateway listening on %s -> route via %s", *f.Listen, *f.RouterURL)
+	logger.Info("gateway listening", "listen", *f.Listen, "router_url", *f.RouterURL)
 	if err := srv.ListenAndServe(); err != nil {
-		log.Fatal(err)
+		logger.Error("gateway server exited", "err", err)
+		os.Exit(1)
 	}
 }
 
 // newHandler mounts the shared OpenAI proxy plus the gateway-only operational
-// routes (health, attestation quote). It is split out from main so tests can
-// drive it with httptest.
-func newHandler(c *core.Client) http.Handler {
+// routes (health, attestation quote), wrapped in the access-log middleware so
+// every request emits one redaction-safe structured line. It is split out from
+// main so tests can drive it with httptest.
+func newHandler(c *core.Client, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	openaiproxy.Register(mux, c)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -83,5 +92,5 @@ func newHandler(c *core.Client) http.Handler {
 	mux.HandleFunc("GET /quote", func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "attestation quote not yet implemented", http.StatusNotImplemented)
 	})
-	return mux
+	return accessLog(logger, mux)
 }
