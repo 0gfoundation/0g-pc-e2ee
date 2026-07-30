@@ -1,4 +1,4 @@
-package main
+package openaiproxy
 
 import (
 	"crypto/rand"
@@ -8,21 +8,22 @@ import (
 	"time"
 )
 
-// requestIDHeader is the correlation id the gateway honors on the way in and
+// requestIDHeader is the correlation id the proxy honors on the way in and
 // echoes on the way out, so one request can be stitched across a fronting proxy,
-// the gateway's own access log, and (later) a provider's logs. A caller or
-// dstack ingress may supply one; absent or malformed, the gateway mints its own.
+// the proxy's own access log, and (later) a provider's logs. A caller or ingress
+// may supply one; absent or malformed, the proxy mints its own.
 const requestIDHeader = "X-Request-Id"
 
 // providerPinHeader is the routing directive a caller sets to pin a specific
-// provider (openaiproxy forwards it to the router). The access log records only
-// whether it was present — a boolean, never the address — as a cheap signal for
+// provider (routingHeaders forwards it to the router). The access log records
+// only whether it was present — a boolean, never the address — as a cheap signal
 // distinguishing pinned from router-chosen traffic.
 const providerPinHeader = "X-0G-Provider-Address"
 
-// healthzPath is skipped by the access log: dstack/orchestrator liveness probes
+// healthzPath is skipped by the access log: an orchestrator's liveness probes
 // hit it continuously and would otherwise drown the log in noise that carries no
-// per-request information.
+// per-request information. Only the gateway mounts it; the sidecar never serves
+// this path, so the skip is a harmless no-op there.
 const healthzPath = "/healthz"
 
 // maxForwardedRequestIDLen bounds a caller-supplied request id. A longer (or
@@ -30,20 +31,25 @@ const healthzPath = "/healthz"
 // rather than truncated — a truncated id is not the caller's id.
 const maxForwardedRequestIDLen = 128
 
-// accessLog wraps h so every request (except health probes) emits exactly one
-// structured, redaction-safe log line when it completes: HTTP metadata only —
-// method, path, status, latency, response byte count, and whether the caller
-// pinned a provider — and never request or response content, credentials, or key
-// material. That discipline is deliberate: the gateway is a confidential enclave
-// (docs/design/cloud-gateway.md), so its operator-visible logs must not become a
-// side channel for the very plaintext the E2EE seal protects. It is the
-// request-level counterpart to the core's open-failure debug logger, which is
-// likewise metadata-only.
+// LogRequests wraps h so every request (health probes excepted) emits exactly
+// one structured, redaction-safe log line when it completes: HTTP metadata only
+// — request id, method, path, status, latency, response byte count, whether the
+// caller pinned a provider, and whether the response was streamed — and never
+// request or response content, credentials, or key material. Both proxy forms
+// share it so their logs don't drift.
+//
+// The discipline is load-bearing for the cloud-TEE gateway: it is a confidential
+// enclave (docs/design/cloud-gateway.md), so its operator-visible logs must not
+// become a side channel for the plaintext the E2EE seal protects. The local
+// sidecar has no such constraint, but there is no reason for it to log
+// differently, so it runs the same middleware. This is the request-level
+// counterpart to the core's open-failure debug logger, which is likewise
+// metadata-only.
 //
 // The wrapper preserves http.Flusher so the streaming (SSE) path keeps flushing
 // frame by frame; a ResponseWriter that silently dropped Flush would buffer the
 // whole stream into one delivery.
-func accessLog(logger *slog.Logger, h http.Handler) http.Handler {
+func LogRequests(logger *slog.Logger, h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == healthzPath {
 			h.ServeHTTP(w, r)
@@ -98,7 +104,7 @@ func requestID(r *http.Request) string {
 
 // validForwardedID accepts a caller id only if it is non-empty, within the
 // length bound, and printable ASCII — enough to keep log lines clean without
-// trusting the value's meaning (the slog JSON handler already escapes it safely).
+// trusting the value's meaning (the slog handler already escapes it safely).
 func validForwardedID(v string) bool {
 	if v == "" || len(v) > maxForwardedRequestIDLen {
 		return false
@@ -139,9 +145,9 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 	return n, err
 }
 
-// Flush forwards to the underlying writer's Flush so openaiproxy.serveStream can
-// push each SSE frame immediately; without it, wrapping the writer would silently
-// turn a streamed response into a buffered one.
+// Flush forwards to the underlying writer's Flush so serveStream can push each
+// SSE frame immediately; without it, wrapping the writer would silently turn a
+// streamed response into a buffered one.
 func (s *statusRecorder) Flush() {
 	if f, ok := s.ResponseWriter.(http.Flusher); ok {
 		s.wroteHeader = true

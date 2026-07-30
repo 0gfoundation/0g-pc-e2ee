@@ -51,13 +51,12 @@ func main() {
 	// (AEAD) failure to the enclave's process log — operator-only diagnostics
 	// (field names and byte lengths, no plaintext or key material), distinct from
 	// the client-facing upstream-error detail the gateway still withholds.
-	client := f.Build("gateway")
-
-	// Structured JSON logs to stdout: dstack/Phala captures the container's stdout
-	// as line-oriented records today, and GCP Cloud Logging (a likely later home)
-	// parses the same JSON lines into queryable fields — one emitter, both targets,
-	// no code change. Every line stays metadata-only (see accessLog).
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	// One shared logger for startup, per-request, and the core's open-failure
+	// diagnostics: text records to stdout, identical to the sidecar's, so the two
+	// forms don't drift (see proxycli.NewLogger). dstack/Phala captures stdout as
+	// line records; a later GCP move can swap the handler in one place.
+	logger := proxycli.NewLogger()
+	client := f.Build("gateway", logger)
 
 	srv := &http.Server{
 		Addr:              *f.Listen,
@@ -92,5 +91,5 @@ func newHandler(c *core.Client, logger *slog.Logger) http.Handler {
 	mux.HandleFunc("GET /quote", func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "attestation quote not yet implemented", http.StatusNotImplemented)
 	})
-	return accessLog(logger, mux)
+	return openaiproxy.LogRequests(logger, mux)
 }
