@@ -196,12 +196,11 @@ services:
   # scrapes and forwards. It has neither `ports:` nor `expose:`, so like the
   # gateway's metrics port it is reachable only from within the compose network.
   #
-  # Config comes from a compose `config` (agent.yml, below) and the remote_write
-  # password from a compose `secret` — no init container. Prometheus does not
-  # expand env vars in its own config, so the config's remote_write URL/username
-  # are interpolated by COMPOSE from the deploy env (the measured file text keeps
-  # only the ${VAR} references), and the password is mounted as a file the config
-  # points at via `password_file`.
+  # Config comes from a compose `config` (agent.yml, below) — no init container.
+  # Prometheus does not expand env vars in its own config, so the remote_write
+  # url/username/password are ${VAR} interpolated by COMPOSE from the deploy env
+  # (the Phala env file). The measured compose text keeps only the ${VAR}
+  # references, never the values, so nothing sensitive enters the attestation.
   prometheus-agent:
     # Prefer an immutable digest here too so the measured compose does not drift
     # (see the gateway image note above).
@@ -214,9 +213,6 @@ services:
       # Compose mounts this 0444, so the agent (uid 65534/nobody) can read it.
       - source: prom_agent_config
         target: /etc/prometheus/agent.yml
-    secrets:
-      - source: prom_remote_write_password
-        target: prom_remote_write_password # -> /run/secrets/prom_remote_write_password
 
 volumes:
   cert-data: # SECRET: holds the TLS private key and the ACME account key
@@ -224,10 +220,14 @@ volumes:
 
 configs:
   # agent.yml, rendered by COMPOSE (not Prometheus): the ${...} refs below are
-  # interpolated from the deploy env at parse time, so the measured compose text
-  # holds only the references, never the values. ZG_PROM_REMOTE_WRITE_URL and
-  # ZG_PROM_REMOTE_WRITE_USERNAME are not secret (the password is a `secret:`
-  # below); all must be listed in the app's allowed_envs or dstack drops them.
+  # interpolated from the deploy env (the Phala env file) at parse time, so the
+  # measured compose text holds only the references, never the values. All three
+  # vars must be listed in the app's allowed_envs or dstack drops them. Phala's
+  # env injection is encrypted to the enclave, and the password only ever lives
+  # inside this CVM's own config — adequate for a single-tenant enclave and a
+  # write-only metrics credential (a docker `secret` would only narrow in-CVM
+  # exposure, not worth the extra compose dependency here).
+  #
   # Targets use docker service names on the CVM network: `gateway:9464` for the
   # app, `localhost:9090` for the agent's own metrics (self-scrape surfaces
   # remote_write health — queue length, send failures — which is otherwise hard to
@@ -249,12 +249,4 @@ configs:
         - url: "${ZG_PROM_REMOTE_WRITE_URL:?set the remote_write endpoint, e.g. https://prometheus.example.com/api/v1/write}"
           basic_auth:
             username: "${ZG_PROM_REMOTE_WRITE_USERNAME:?set the remote_write basic_auth username}"
-            password_file: /run/secrets/prom_remote_write_password
-
-secrets:
-  # The remote_write password, sourced straight from the deploy env — its VALUE
-  # never appears in the compose text (measured) and never lands in any container's
-  # environment; it is materialized only as a file the agent reads. Must be in the
-  # app's allowed_envs.
-  prom_remote_write_password:
-    environment: ZG_PROM_REMOTE_WRITE_PASSWORD
+            password: "${ZG_PROM_REMOTE_WRITE_PASSWORD:?set the remote_write basic_auth password}"

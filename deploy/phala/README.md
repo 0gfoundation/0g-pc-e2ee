@@ -235,28 +235,30 @@ You pass three values, not a hand-built config:
 | `ZG_PROM_REMOTE_WRITE_USERNAME` | no | `0g-pc-gateway` |
 | `ZG_PROM_REMOTE_WRITE_PASSWORD` | **yes** | — |
 
-Set them in the CVM's **encrypted environment** (same channel as
-`CLOUDFLARE_API_TOKEN`) and list all three in the app's `allowed_envs`, or dstack
-drops them. Only `${VAR}` *references* live in the measured compose text, never
-the values. Prometheus does not expand env vars in its own config, so the wiring
-is done at the compose layer rather than by Prometheus:
+Set all three in the CVM's **encrypted environment** — the Phala env file, the
+same channel as `CLOUDFLARE_API_TOKEN` — and list them in the app's
+`allowed_envs`, or dstack drops them. Only `${VAR}` *references* live in the
+measured compose text, never the values, so nothing sensitive enters the
+attestation.
 
-- The `agent.yml` is a compose **`config`** whose `remote_write` URL and username
-  are `${VAR}` — interpolated by **compose** from the deploy env when it renders,
-  then mounted read-only (0444, so the agent's `nobody` user can read it).
-- The password is a compose **`secret`** sourced from
-  `ZG_PROM_REMOTE_WRITE_PASSWORD` (`secrets: { …: { environment: … } }`). Its
-  value never appears in the compose text and never lands in any container's
-  environment — it is materialized only as `/run/secrets/…`, which the config
-  points at via `basic_auth.password_file`.
+Prometheus does not expand env vars in its own config, so `agent.yml` is a
+compose **`config`** whose `remote_write` url/username/password are `${VAR}` —
+interpolated by **compose** from the env file when it renders, then mounted
+read-only (0444, so the agent's `nobody` user can read it). No init container and
+no docker `secret`: Phala's env injection is already encrypted to the enclave,
+and the rendered password only ever lives inside this single-tenant CVM's own
+config — adequate for a write-only metrics credential. (A docker `secret` would
+only narrow in-CVM exposure — keep the value out of the container env and out of
+the config file — which is not worth an extra compose dependency here.)
 
 Scrape targets use docker **service names** on the compose network: `gateway:9464`
 for the app and `localhost:9090` for the agent's own metrics.
 
-> Requires a compose runtime that supports top-level `configs:`/`secrets:` (with
-> an `environment` secret source) — standard on recent dstack/Docker Compose. On
-> an older runtime that lacks it, render `agent.yml` with a small init container
-> instead (write the password to a file, point `password_file` at it).
+> This uses top-level `configs:`, standard in Docker Compose / recent dstack. If
+> your runtime rejects it, render `agent.yml` with a small init container instead
+> (write it from the same env vars to a shared volume before the agent starts).
+> A password containing YAML-special characters (`"` or `\`) also wants the
+> init-container form (or a `password_file`) rather than the inline value.
 
 ### Metric hygiene
 
