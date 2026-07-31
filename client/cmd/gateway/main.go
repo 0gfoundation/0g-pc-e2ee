@@ -1,10 +1,11 @@
 // Command gateway is the cloud-TEE gateway form: the SAME client core wrapped
 // as a server, but SERVER-RUN and 0G-operated — it runs inside an attested CVM
 // and adds one attested trust party. It serves no-install / browser / thin
-// clients that cannot run a sidecar: TLS terminates inside the enclave (dstack
-// ZT-HTTPS), the gateway seals each request to the routed provider and opens the
-// sealed response, and plaintext streams back over that same TLS. See
-// docs/design/cloud-gateway.md for the trust model.
+// clients that cannot run a sidecar: TLS terminates inside the enclave (in the
+// deployed form, dstack-ingress in the same CVM — see deploy/phala/), the gateway
+// seals each request to the routed provider and opens the sealed response, and
+// plaintext streams back over that same TLS. See docs/design/cloud-gateway.md for
+// the trust model.
 //
 // The gateway always routes: per request it asks the 0G router which provider to
 // use (POST /v1/routing/preview), fetches that provider's enc key and signer
@@ -49,9 +50,9 @@ func main() {
 	// instrumentation but never exposes it), so its listen address is registered
 	// here rather than in the shared proxycli flags. Empty (the default) disables
 	// the endpoint entirely; the TEE deployment sets it to an internal address
-	// (e.g. 0.0.0.0:9464) that the compose does NOT publish through the dstack
-	// tproxy ingress, so /metrics is reachable only from the CVM-internal docker
-	// network (the co-located Prometheus-agent scraper), never the public URL.
+	// (e.g. 0.0.0.0:9464) that the compose neither publishes to the host nor fronts
+	// with dstack-ingress, so /metrics is reachable only over the CVM-internal
+	// compose network (the co-located Prometheus-agent scraper), never publicly.
 	metricsListen := flag.String("metrics-listen", os.Getenv("ZG_GATEWAY_METRICS_LISTEN"),
 		"address to serve Prometheus /metrics on; empty disables it. Bind an INTERNAL "+
 			"address never published through the public ingress (env ZG_GATEWAY_METRICS_LISTEN)")
@@ -87,9 +88,10 @@ func main() {
 		Handler:           newHandler(built.Client, logger),
 		ReadHeaderTimeout: 10 * time.Second, // mitigate slow-header (Slowloris) clients
 	}
-	// TLS is terminated by the dstack ZT-HTTPS front end inside the enclave, so
-	// the gateway itself serves plaintext HTTP on the socket dstack forwards to;
-	// the enclave boundary, not this listener, is the TLS edge.
+	// TLS is terminated ahead of this listener, inside the same enclave
+	// (dstack-ingress, over the CVM-internal network — see deploy/phala/), so the
+	// gateway itself serves plaintext HTTP; the enclave boundary, not this
+	// listener, is the TLS edge.
 	// Serve until a shutdown signal, then drain in-flight requests gracefully
 	// (shared with the sidecar so both forms handle SIGTERM identically — the
 	// dstack/Phala deployment sends it on every redeploy). ListenAndServe's clean
