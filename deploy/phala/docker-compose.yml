@@ -256,9 +256,9 @@ services:
             static_configs:
               - targets: ["localhost:9090"]
         remote_write:
-          - url: $${ZG_PROM_REMOTE_WRITE_URL}
+          - url: "$${ZG_PROM_REMOTE_WRITE_URL}"
             basic_auth:
-              username: $${ZG_PROM_REMOTE_WRITE_USERNAME}
+              username: "$${ZG_PROM_REMOTE_WRITE_USERNAME}"
               password_file: /etc/prometheus/rw_password
         EOF
         # The prom/prometheus image runs as nobody (uid 65534); hand it ownership so
