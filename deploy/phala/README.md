@@ -227,9 +227,7 @@ store — but in **agent mode**:
 
 ### Configuring remote_write
 
-You pass three values, not a hand-built config — the `prom-config-init` container
-renders `agent.yml` from them at boot (Prometheus does not expand env vars in its
-config, so an init container does it):
+You pass three values, not a hand-built config:
 
 | Variable | Secret? | Example |
 |---|---|---|
@@ -239,12 +237,26 @@ config, so an init container does it):
 
 Set them in the CVM's **encrypted environment** (same channel as
 `CLOUDFLARE_API_TOKEN`) and list all three in the app's `allowed_envs`, or dstack
-drops them. They are declared `${VAR:?…}` in the compose, so a missing one fails
-the deploy loudly; only the `${VAR}` *references* live in the measured compose
-text, never the values. The password is written to a file and referenced via
-`basic_auth.password_file`, so it never lands in the rendered config text. Scrape
-targets use docker **service names** on the compose network: `gateway:9464` for
-the app and `localhost:9090` for the agent's own metrics.
+drops them. Only `${VAR}` *references* live in the measured compose text, never
+the values. Prometheus does not expand env vars in its own config, so the wiring
+is done at the compose layer rather than by Prometheus:
+
+- The `agent.yml` is a compose **`config`** whose `remote_write` URL and username
+  are `${VAR}` — interpolated by **compose** from the deploy env when it renders,
+  then mounted read-only (0444, so the agent's `nobody` user can read it).
+- The password is a compose **`secret`** sourced from
+  `ZG_PROM_REMOTE_WRITE_PASSWORD` (`secrets: { …: { environment: … } }`). Its
+  value never appears in the compose text and never lands in any container's
+  environment — it is materialized only as `/run/secrets/…`, which the config
+  points at via `basic_auth.password_file`.
+
+Scrape targets use docker **service names** on the compose network: `gateway:9464`
+for the app and `localhost:9090` for the agent's own metrics.
+
+> Requires a compose runtime that supports top-level `configs:`/`secrets:` (with
+> an `environment` secret source) — standard on recent dstack/Docker Compose. On
+> an older runtime that lacks it, render `agent.yml` with a small init container
+> instead (write the password to a file, point `password_file` at it).
 
 ### Metric hygiene
 

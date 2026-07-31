@@ -195,6 +195,13 @@ services:
   # this CVM is ephemeral, the durable copy lives in the remote store — it only
   # scrapes and forwards. It has neither `ports:` nor `expose:`, so like the
   # gateway's metrics port it is reachable only from within the compose network.
+  #
+  # Config comes from a compose `config` (agent.yml, below) and the remote_write
+  # password from a compose `secret` — no init container. Prometheus does not
+  # expand env vars in its own config, so the config's remote_write URL/username
+  # are interpolated by COMPOSE from the deploy env (the measured file text keeps
+  # only the ${VAR} references), and the password is mounted as a file the config
+  # points at via `password_file`.
   prometheus-agent:
     # Prefer an immutable digest here too so the measured compose does not drift
     # (see the gateway image note above).
@@ -203,71 +210,51 @@ services:
     command:
       - "--config.file=/etc/prometheus/agent.yml"
       - "--enable-feature=agent"
-    volumes:
-      - prom-agent-config:/etc/prometheus
-    depends_on:
-      # prom-config-init renders agent.yml + the password file into the shared
-      # volume before the agent starts.
-      prom-config-init:
-        condition: service_completed_successfully
-
-  # prom-config-init renders the agent config from three deploy-time variables, so
-  # you pass a plain remote_write URL / username / password rather than a hand-built
-  # config blob. Prometheus does not expand env vars in its config, so this init
-  # container does the rendering: it writes the password to a file and points
-  # basic_auth at it via `password_file`, keeping the secret out of the config text.
-  #
-  # Only ZG_PROM_REMOTE_WRITE_PASSWORD is sensitive. Declaring these in the
-  # `environment:` block does NOT put their values in the measured compose — the
-  # file text holds only the `${VAR:?…}` references (what app_id commits to); the
-  # values come from the CVM's encrypted environment at boot, exactly like
-  # dstack-ingress's CLOUDFLARE_API_TOKEN above. They must be listed in the app's
-  # allowed_envs, or dstack drops them. The command reads them as `$$VAR` so compose
-  # does not interpolate the values into the process args (they stay in the env).
-  prom-config-init:
-    image: alpine:3.20
-    restart: "no"
-    environment:
-      - ZG_PROM_REMOTE_WRITE_URL=${ZG_PROM_REMOTE_WRITE_URL:?set the remote_write endpoint, e.g. https://prometheus.example.com/api/v1/write}
-      - ZG_PROM_REMOTE_WRITE_USERNAME=${ZG_PROM_REMOTE_WRITE_USERNAME:?set the remote_write basic_auth username}
-      - ZG_PROM_REMOTE_WRITE_PASSWORD=${ZG_PROM_REMOTE_WRITE_PASSWORD:?set the remote_write basic_auth password (a secret)}
-    volumes:
-      - prom-agent-config:/etc/prometheus
-    command:
-      - "sh"
-      - "-euc"
-      - |
-        umask 077
-        printf '%s' "$$ZG_PROM_REMOTE_WRITE_PASSWORD" > /etc/prometheus/rw_password
-        cat > /etc/prometheus/agent.yml <<EOF
-        global:
-          scrape_interval: 15s
-          external_labels:
-            service: 0g-pc-gateway
-        scrape_configs:
-          # The gateway's internal metrics port (docker service name on the CVM net).
-          - job_name: gateway
-            static_configs:
-              - targets: ["gateway:9464"]
-          # Self-scrape, so remote_write health (queue length, send failures) is
-          # visible even though this CVM has no local query API — an outbound break
-          # inside the enclave is otherwise hard to see.
-          - job_name: prometheus-agent
-            static_configs:
-              - targets: ["localhost:9090"]
-        remote_write:
-          - url: "$${ZG_PROM_REMOTE_WRITE_URL}"
-            basic_auth:
-              username: "$${ZG_PROM_REMOTE_WRITE_USERNAME}"
-              password_file: /etc/prometheus/rw_password
-        EOF
-        # The prom/prometheus image runs as nobody (uid 65534); hand it ownership so
-        # it can read the 0600 config and password this root init container wrote.
-        chown -R 65534:65534 /etc/prometheus
+    configs:
+      # Compose mounts this 0444, so the agent (uid 65534/nobody) can read it.
+      - source: prom_agent_config
+        target: /etc/prometheus/agent.yml
+    secrets:
+      - source: prom_remote_write_password
+        target: prom_remote_write_password # -> /run/secrets/prom_remote_write_password
 
 volumes:
   cert-data: # SECRET: holds the TLS private key and the ACME account key
   evidences: # public evidence bundle served at /evidences/
-  # Holds the agent config + password file written by prom-config-init and read by
-  # the agent. No TSDB volume is needed — agent mode keeps only a short WAL buffer.
-  prom-agent-config:
+
+configs:
+  # agent.yml, rendered by COMPOSE (not Prometheus): the ${...} refs below are
+  # interpolated from the deploy env at parse time, so the measured compose text
+  # holds only the references, never the values. ZG_PROM_REMOTE_WRITE_URL and
+  # ZG_PROM_REMOTE_WRITE_USERNAME are not secret (the password is a `secret:`
+  # below); all must be listed in the app's allowed_envs or dstack drops them.
+  # Targets use docker service names on the CVM network: `gateway:9464` for the
+  # app, `localhost:9090` for the agent's own metrics (self-scrape surfaces
+  # remote_write health — queue length, send failures — which is otherwise hard to
+  # see from outside the enclave).
+  prom_agent_config:
+    content: |
+      global:
+        scrape_interval: 15s
+        external_labels:
+          service: 0g-pc-gateway
+      scrape_configs:
+        - job_name: gateway
+          static_configs:
+            - targets: ["gateway:9464"]
+        - job_name: prometheus-agent
+          static_configs:
+            - targets: ["localhost:9090"]
+      remote_write:
+        - url: "${ZG_PROM_REMOTE_WRITE_URL:?set the remote_write endpoint, e.g. https://prometheus.example.com/api/v1/write}"
+          basic_auth:
+            username: "${ZG_PROM_REMOTE_WRITE_USERNAME:?set the remote_write basic_auth username}"
+            password_file: /run/secrets/prom_remote_write_password
+
+secrets:
+  # The remote_write password, sourced straight from the deploy env — its VALUE
+  # never appears in the compose text (measured) and never lands in any container's
+  # environment; it is materialized only as a file the agent reads. Must be in the
+  # app's allowed_envs.
+  prom_remote_write_password:
+    environment: ZG_PROM_REMOTE_WRITE_PASSWORD
