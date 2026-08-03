@@ -39,6 +39,13 @@ type mockBroker struct {
 	pubkeyHits   int32
 	pubkeyStatus int    // override pubkey status; 0 = 200
 	pubkeyRaw    string // if set, written verbatim instead of the JSON reply
+	// Direct-mode data plane (POST /v1/proxy/chat/completions): the broker's own
+	// chat endpoint under its "/v1/proxy" service prefix. Populated so direct-mode
+	// tests can assert the sealed request landed on the right path with no router
+	// pin. chatHits counts hits; lastChatPin records the X-0G-Provider-Address the
+	// request carried (must be empty in direct mode).
+	chatHits    int32
+	lastChatPin string
 }
 
 func newMockBroker(t *testing.T) *mockBroker {
@@ -66,6 +73,41 @@ func newMockBroker(t *testing.T) *mockBroker {
 			KeyID:         "8RpY-WKSX_U",
 			SignerAddress: testSigner,
 		})
+	})
+	// Direct-mode data plane: the broker's own chat endpoint under "/v1/proxy"
+	// (what the router would otherwise forward to). Opens the seal with encPriv and
+	// seals a canned answer back — the direct client POSTs straight here, so a wrong
+	// derived path (e.g. the router's /v1/chat/completions) would simply 404.
+	mux.HandleFunc("POST /v1/proxy/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&b.chatHits, 1)
+		b.lastChatPin = r.Header.Get("X-0G-Provider-Address")
+		body, _ := io.ReadAll(r.Body)
+		var env wire.Request
+		if err := json.Unmarshal(body, &env); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if _, leaked := env["messages"]; leaked {
+			t.Error("prompt reached the broker in cleartext")
+			http.Error(w, "prompt not sealed", http.StatusBadRequest)
+			return
+		}
+		e2ee, err := env.E2EE()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if _, err := wire.OpenRequest(b.encPriv, env); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		ephPub, _ := base64.RawURLEncoding.DecodeString(e2ee.ClientEphPub)
+		resp := wire.Response{
+			"id":      json.RawMessage(`"chatcmpl-direct"`),
+			"choices": json.RawMessage(`[{"index":0,"message":{"role":"assistant","content":"direct answer"},"finish_reason":"stop"}]`),
+		}
+		sealed, _ := wire.SealResponse(crypto.PublicKey(ephPub), resp, nil)
+		_ = json.NewEncoder(w).Encode(sealed)
 	})
 	b.srv = httptest.NewServer(mux)
 	t.Cleanup(b.srv.Close)
