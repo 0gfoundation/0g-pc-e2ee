@@ -24,6 +24,23 @@ import (
 // maxRequestBytes caps the request body the proxy will read.
 const maxRequestBytes = 10 << 20 // 10 MiB
 
+// headerResKey mirrors the provider's ZG-Res-Key response header. The proxy
+// re-emits the handle the core captured under the same name, so the front end's
+// user gets the same handle a direct call would — to fetch and independently
+// audit the §8 signature from the broker. It is a lookup handle, not key
+// material, so re-exposing it is safe on both server forms.
+const headerResKey = "ZG-Res-Key"
+
+// setResKey re-emits the ZG-Res-Key handle the core captured for this response,
+// when the provider sent one. It must be called before the response header is
+// written (before WriteHeader or the first body byte), or it is a no-op that Go
+// discards with a "superfluous WriteHeader" warning.
+func setResKey(w http.ResponseWriter, meta *core.ResponseMeta) {
+	if meta != nil && meta.ResKey != "" {
+		w.Header().Set(headerResKey, meta.ResKey)
+	}
+}
+
 // Option customizes the proxy's behavior.
 type Option func(*options)
 
@@ -158,8 +175,12 @@ func Register(mux *http.ServeMux, c *core.Client, opts ...Option) {
 		// client headers must not leak to the (untrusted) router.
 		ctx := core.WithCredential(r.Context(), r.Header.Get("Authorization"))
 		ctx = core.WithForwardedHeaders(ctx, routingHeaders(r.Header))
+		// Collect the response's ZG-Res-Key handle so we can re-expose it to our own
+		// user, who can fetch and audit the §8 signature from the broker.
+		meta := &core.ResponseMeta{}
+		ctx = core.WithResponseMeta(ctx, meta)
 		if stream {
-			serveStream(ctx, w, c, req, o)
+			serveStream(ctx, w, c, req, o, meta)
 			return
 		}
 		resp, err := c.Complete(ctx, req)
@@ -172,6 +193,7 @@ func Register(mux *http.ServeMux, c *core.Client, opts ...Option) {
 			writeGatewayError(w, http.StatusInternalServerError, "encode response")
 			return
 		}
+		setResKey(w, meta)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(out)
 	})
@@ -240,7 +262,7 @@ func statusFor(err error) int {
 // each sealed frame from the core and re-emits it as `data: <json>` to the user,
 // terminating with `data: [DONE]`. Status is only settable before the first
 // frame; once bytes are on the wire an error can only end the stream.
-func serveStream(ctx context.Context, w http.ResponseWriter, c *core.Client, req wire.Request, o options) {
+func serveStream(ctx context.Context, w http.ResponseWriter, c *core.Client, req wire.Request, o options, meta *core.ResponseMeta) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeGatewayError(w, http.StatusInternalServerError, "streaming not supported by server")
@@ -252,6 +274,9 @@ func serveStream(ctx context.Context, w http.ResponseWriter, c *core.Client, req
 		if wroteHeader {
 			return
 		}
+		// The core records the handle at stream commit, before the first frame
+		// reaches this callback, so it is available here before we write headers.
+		setResKey(w, meta)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("X-Accel-Buffering", "no") // ask a fronting proxy (nginx) not to buffer
