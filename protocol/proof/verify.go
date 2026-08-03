@@ -62,12 +62,12 @@ func (sig ChatSignature) verify(want, wantScheme, expectedSigner string, recover
 	}
 
 	// Reject an unknown/mismatched scheme before anything else (SPEC §9).
-	got, err := parseText(sig.Text)
+	scheme, err := parseScheme(sig.Text)
 	if err != nil {
 		return err
 	}
-	if got.scheme != wantScheme {
-		return fmt.Errorf("proof: unexpected scheme %q (want %q)", got.scheme, wantScheme)
+	if scheme != wantScheme {
+		return fmt.Errorf("proof: unexpected scheme %q (want %q)", scheme, wantScheme)
 	}
 
 	// Content binding: the recomputed text (scheme + both hashes) must match the

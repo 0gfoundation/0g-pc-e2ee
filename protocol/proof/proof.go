@@ -110,7 +110,6 @@ func SignedTextE2EEStream(reqEnv map[string]json.RawMessage, respFrames []map[st
 type StreamBinder struct {
 	reqH [32]byte
 	agg  []byte // concatenation of each frame's 32-byte BindingHash, in order
-	n    int
 }
 
 // NewStreamBinder starts a streaming binder over the sealed request envelope.
@@ -129,7 +128,6 @@ func (s *StreamBinder) AddFrame(frameEnv map[string]json.RawMessage) error {
 		return err
 	}
 	s.agg = append(s.agg, h[:]...)
-	s.n++
 	return nil
 }
 
@@ -146,41 +144,21 @@ func formatText(scheme string, reqH, respH [32]byte) string {
 	return scheme + ":" + hex.EncodeToString(reqH[:]) + ":" + hex.EncodeToString(respH[:])
 }
 
-// parsedText is a signed text split into its scheme and two 32-byte hashes.
-type parsedText struct {
-	scheme      string
-	reqH, respH [32]byte
-}
-
-// parseText splits "<scheme>:<reqHhex>:<respHhex>" and validates both hex halves
-// are 32 bytes. The scheme itself contains no ':' (only '/'), so a 3-way split is
-// unambiguous. Unknown scheme is NOT judged here — the caller checks it against
-// the scheme it expects.
-func parseText(text string) (parsedText, error) {
+// parseScheme extracts the scheme from "<scheme>:<reqHhex>:<respHhex>" and
+// confirms both hash halves are 32-byte hex, so a malformed signed text is
+// rejected fail-closed before the caller compares it against its recomputed
+// binding. The scheme itself contains no ':' (only '/'), so a 3-way split is
+// unambiguous. Whether the scheme is one the caller accepts is judged by the
+// caller.
+func parseScheme(text string) (string, error) {
 	parts := strings.SplitN(text, ":", 3)
 	if len(parts) != 3 {
-		return parsedText{}, fmt.Errorf("proof: malformed signed text %q", text)
+		return "", fmt.Errorf("proof: malformed signed text %q", text)
 	}
-	reqH, err := decodeHash(parts[1])
-	if err != nil {
-		return parsedText{}, fmt.Errorf("proof: request hash: %w", err)
+	for _, h := range parts[1:] {
+		if b, err := hex.DecodeString(h); err != nil || len(b) != 32 {
+			return "", fmt.Errorf("proof: hash half %q is not 32-byte hex", h)
+		}
 	}
-	respH, err := decodeHash(parts[2])
-	if err != nil {
-		return parsedText{}, fmt.Errorf("proof: response hash: %w", err)
-	}
-	return parsedText{scheme: parts[0], reqH: reqH, respH: respH}, nil
-}
-
-func decodeHash(h string) ([32]byte, error) {
-	b, err := hex.DecodeString(h)
-	if err != nil {
-		return [32]byte{}, fmt.Errorf("not hex: %w", err)
-	}
-	if len(b) != 32 {
-		return [32]byte{}, fmt.Errorf("want 32 bytes, got %d", len(b))
-	}
-	var out [32]byte
-	copy(out[:], b)
-	return out, nil
+	return parts[0], nil
 }
