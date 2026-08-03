@@ -5,6 +5,8 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+
+	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 )
 
 // newRouterProxy builds the gateway's catch-all: a reverse proxy that forwards
@@ -39,13 +41,19 @@ func newRouterProxy(target *url.URL, logger *slog.Logger) http.Handler {
 			pr.SetURL(target)
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			// A transport-level failure reaching the router (the default handler would
-			// log to a std logger the gateway doesn't use). Emit one redaction-safe
-			// line — method and path only, no headers or body — and return a plain 502;
-			// the sealed path's richer error envelope lives in openaiproxy and does not
-			// apply to this passthrough.
+			// A transport-level failure reaching the router — this fires only when the
+			// round trip never produced a response (connection refused, TLS, timeout); a
+			// router that answers with its own 4xx/5xx is a successful proxy round trip
+			// and passes through verbatim, never reaching here. The default handler logs
+			// to a std logger the gateway doesn't use, so emit one redaction-safe line
+			// (method and path only, no headers or body) and return 502 as the SAME JSON
+			// envelope the sealed path uses, so a thin client parses errors identically
+			// across both paths. The message is generic (the transport err — which can
+			// carry the router host/port — goes only to the enclave log), and the source
+			// is "upstream": like the sealed path, a failure reaching the router is
+			// attributed upstream, not to a fault in this proxy.
 			logger.Error("router passthrough failed", "method", r.Method, "path", r.URL.Path, "err", err)
-			http.Error(w, "bad gateway", http.StatusBadGateway)
+			openaiproxy.WriteError(w, http.StatusBadGateway, "upstream", "upstream request failed")
 		},
 	}
 }

@@ -211,9 +211,10 @@ func TestGatewayRoutesOtherRequestsToRouter(t *testing.T) {
 }
 
 // TestGatewayRouterPassthroughUnreachable covers the catch-all's ErrorHandler:
-// when the router is unreachable, the passthrough must fail closed with a plain
-// 502 (not hang or leak a transport-level error), so a thin client sees a clean
-// bad-gateway rather than the mux's 404 or a stack detail.
+// when the router is unreachable, the passthrough must fail closed with a 502
+// carrying the SAME JSON error envelope the sealed path uses (so a thin client
+// parses errors identically on both paths), and must NOT leak the transport-level
+// error detail (router host/port) into the client-facing body.
 func TestGatewayRouterPassthroughUnreachable(t *testing.T) {
 	// Point the catch-all at a server we immediately close, so a connection to it
 	// is refused — a deterministic transport failure without depending on a
@@ -232,6 +233,37 @@ func TestGatewayRouterPassthroughUnreachable(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Fatalf("unreachable router: got %d, want 502", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type: got %q, want application/json", ct)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	// The envelope's canonical shape: a client-facing error object plus the _0g
+	// attribution, source "upstream" (a failure reaching the router), never the
+	// raw transport error.
+	var env struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+		ZG struct {
+			Source string `json:"source"`
+		} `json:"_0g"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("502 body is not JSON: %v\n%s", err, body)
+	}
+	if env.ZG.Source != "upstream" {
+		t.Errorf("_0g.source: got %q, want upstream", env.ZG.Source)
+	}
+	if env.Error.Type != "upstream_error" {
+		t.Errorf("error.type: got %q, want upstream_error", env.Error.Type)
+	}
+	if env.Error.Message == "" {
+		t.Error("error.message is empty")
+	}
+	if bytes.Contains(body, []byte(mustURL(t, deadURL).Host)) {
+		t.Errorf("502 body leaked the router host: %s", body)
 	}
 }
 
