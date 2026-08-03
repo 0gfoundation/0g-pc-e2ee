@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/proof"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
@@ -106,10 +107,16 @@ func resolveErr(err error) error {
 //     Empty means "set no routing pin" (a static provider that does not select
 //     via the router).
 type Provider struct {
-	URL        string           // OpenAI-shaped endpoint (router or broker)
+	URL        string           // OpenAI-shaped endpoint (router or broker) the sealed request POSTs to
 	EncPubKey  crypto.PublicKey // provider HPKE recipient key
 	SignerAddr string           // on-chain TEE signer; sealed into _e2ee.signer_addr, verifies responses
 	Address    string           // router-facing provider address; sent as X-0G-Provider-Address (routing pin)
+	// Endpoint is the provider's OWN serving URL (the broker, ultimately the
+	// on-chain Service.url), distinct from URL when a router fronts the chat POST.
+	// The §8 response signature is fetched directly from here — the router does
+	// not proxy /v1/proxy/signature/{chatKey}. Empty disables direct fetch (a
+	// static provider that is itself the endpoint may set URL only).
+	Endpoint string
 	// Model is the provider's canonical model id (the route preview's
 	// canonical_id). Each candidate may serve a different model — the preview
 	// list is heterogeneous when the caller omits "model" — so the client writes
@@ -136,6 +143,10 @@ type Client struct {
 	unboundFields []string
 	http          *http.Client
 	debug         *slog.Logger // nil = off; see WithDebugLogger
+	// Response-signature verification (hop 11), off unless both are set via
+	// WithResponseVerification. See verify.go.
+	sigFetcher SignatureFetcher
+	recover    proof.RecoverFunc
 }
 
 // Option customizes a Client.
@@ -374,6 +385,15 @@ func (c *Client) completeOnce(ctx context.Context, provider Provider, req wire.R
 	if err != nil {
 		c.logOpenFailure(0, sealedResp, err)
 		return nil, true, stageErr(StageUpstream, fmt.Errorf("open response: %w", err))
+	}
+	// Response-signature verification (hop 11), fail-closed. A response that
+	// opened but fails the §8 signature is an integrity/authenticity failure of
+	// this provider — terminal, not a fall-back to another candidate (which would
+	// mask a bad provider). Nothing is returned to the caller on failure.
+	if c.verifyEnabled() {
+		if err := c.verifyNonStream(ctx, provider, resp.Header, sealed, sealedResp); err != nil {
+			return nil, false, stageErr(StageUpstream, err)
+		}
 	}
 	return out, false, nil
 }

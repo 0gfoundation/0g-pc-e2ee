@@ -258,8 +258,10 @@ on them. Cleartext response fields (`usage`, `model`, `id`, `created`,
 `system_fingerprint`) are:
 - **readable** by the router (no decryption needed),
 - **bound in the seal AAD**, so the client detects any tampering, and
-- **covered by the TEE signature** (§8), so the router can trust `usage` for
-  billing **without** decrypting — a lying router/provider is caught at verify.
+- **covered by the TEE signature** (§8), so `usage` is authenticated to the
+  client/auditor without decrypting `choices` — a lying provider is caught at
+  verify. (Fee **settlement** itself is anchored by a separate on-chain-verified
+  signature over the fee tuple, not by this response signature — see §8.2.)
 
 Sealing is a **fresh HPKE setup**, enclave as sender, `client_eph_pub` as
 recipient. Streaming frames are sealed under one response context (its internal
@@ -311,53 +313,123 @@ with the cleartext fields. The client MUST receive a frame with `"final": true`
 before treating the response as complete — a missing final frame is a truncation
 and MUST be rejected. `final` is in the AAD, so a flipped flag is detected.
 
-## 8. Response signature (unchanged, referenced here)
+## 8. Response signature
 
-Each response carries a TEE signature the client verifies **over the request and
-response content**:
-1. Fetch the `ChatSignature { text, signature, signing_address }` (cleartext).
-2. Recompute the content binding — the SHA-256 halves in `text` MUST equal the
-   client's own request/response hashes. Those hashes are taken over the **on-wire
-   byte artifacts** the client already holds: the request `aad ‖ ciphertext` and
-   the response `aad ‖ ciphertext`. Hashing the ciphertext (not a re-derived
-   canonical plaintext) means **no canonicalization of the sealed content is
-   needed** for the binding — both sides hash identical bytes — and it is why the
-   sealed body is not JCS'd (§5.1). The AEAD transitively binds ciphertext↔plaintext.
-3. Recover the signer: `addr = ecrecover(EIP191(text), signature)`.
-4. **Accept only if `addr == on-chain teeSignerAddress`** — never the
-   self-reported `signing_address`.
+Each response carries a TEE signature that authenticates it as the enclave's
+output for this exact request. It is a standalone artifact, fetched separately
+from the response body: the response carries a `ZG-Res-Key: <chatKey>` header,
+and the client GETs `<provider>/v1/proxy/signature/{chatKey}` **directly from the
+provider's broker endpoint** (the router does not proxy this path). Because the
+signature is content-bound and anchored on-chain, fetching it over an untrusted
+path is safe — a forged or absent reply fails verification fail-closed.
 
-**Invariant: the signature covers exactly the non-`unbound_fields` content.**
-`aad` is the cleartext manifest minus the unbound set, and `ciphertext` is the
-sealed content — together, everything except the intermediary-mutable fields.
-The router can therefore verify the signature and trust `usage` (a bound
-cleartext field) for billing without decrypting `choices`. **Corollary:** any
-value that must be cryptographically trusted MUST NOT be `unbound` — e.g. a
-billing/trace object is only trustworthy if the enclave produces it inside the
-signed content, not if a router injects it as an unbound field (in which case
-trust must come from elsewhere, e.g. on-chain settlement).
+The fetched `ChatSignature { text, signature, signing_address, signing_algo }`
+is verified as:
+1. **Parse the scheme** — `text = "<scheme>:<reqH>:<respH>"`. The scheme tag is
+   inside the signed text (it cannot be relabeled by an intermediary). An
+   implementation MUST reject a scheme it does not implement (fail-closed, §9).
+2. **Recompute the content binding** — `reqH`/`respH` MUST equal the client's own
+   hashes, computed by mode (below).
+3. **Recover the signer** — `addr = ecrecover(EIP191(text), signature)` (ECDSA
+   secp256k1, personal_sign).
+4. **Accept only if `addr == on-chain teeSignerAddress`** — the quote-bound
+   signer, grounded on-chain (§4.4 / hop 5); **never** the self-reported
+   `signing_address` (a hint only).
 
-Verification MUST be fail-closed. (Detailed proof-text format and the routing-proof
-evolution are tracked in `0g-serving-broker` #552, specified later.)
+### 8.1 Binding by transport mode
+
+The binding hashes different artifacts depending on how the response travelled.
+Every `‖` below joins only **fixed-width 32-byte** values (each variable-length
+input is hashed first), so concatenation is injective — no separators, no length
+prefixes. Define `H(aad, ct) = sha256( sha256(aad) ‖ sha256(ct) )`.
+
+**E2EE (ciphertext binding)** — schemes `zg-sig-v1/e2ee-ct` (non-stream) and
+`zg-sig-v1/e2ee-ct-stream` (streaming). The verifier hashes the **on-wire
+artifacts it already holds** — `aad` (the JCS'd cleartext manifest minus
+`unbound_fields`, §5.2) and `ciphertext` — with **no decryption and no
+canonicalization of the sealed content** (both sides hash identical bytes; this
+is why the sealed body is not JCS'd, §5.1; the AEAD transitively binds
+ciphertext↔plaintext):
+
+```
+reqH  = H(aad_req,  ct_req)                          # request half, both modes
+respH = H(aad_resp, ct_resp)                         # non-stream
+respH = sha256( H(f_0) ‖ H(f_1) ‖ … ‖ H(f_{n-1}) )  # streaming, frames in send order, final last
+        where H(f_i) = H(aad_i, ct_i)
+```
+
+The streaming `respH` is order-, count- and truncation-sensitive: a dropped,
+reordered, or missing-final frame changes it (double-covering the §7 "final frame
+required" rule).
+
+**Plaintext (plaintext binding)** — scheme `zg-sig-v1/plain`, for a plaintext
+(non-E2EE) exchange (e.g. a browser directly to the broker). There is no
+ciphertext, so the binding is over the plaintext, one hash per half:
+
+```
+reqH = sha256( JCS(req) )     respH = sha256( JCS(resp) )
+```
+
+This is verified **out of band** by an auditor after the fact — a plaintext-mode
+response never traverses the E2EE client — so its verifier is not part of the
+E2EE client. (Streaming plaintext binding is owned by the broker/audit side.)
+
+### 8.2 Invariant and trust
+
+**The signature covers exactly the non-`unbound_fields` content.** `aad` is the
+cleartext manifest minus the unbound set, and `ciphertext` is the sealed content
+— together, everything except the intermediary-mutable fields. A party holding
+only the on-wire artifacts (e.g. the router) can therefore verify an E2EE
+signature and read a bound cleartext field like `usage` **without decrypting**
+`choices`. **Corollary:** any value that must be cryptographically trusted MUST
+NOT be `unbound` — a router-injected `x_0g_trace` is unauthenticated by
+construction. Note that **response billing does not rely on this signature**: fee
+settlement uses a separate on-chain-verified TEE signature over the fee tuple
+(`0g-serving-broker` settlement path), so §8 exists for response authenticity and
+the client/auditor's content check, not for the router to bill on.
+
+Verification MUST be fail-closed. The signed-text format and binding are defined
+once, byte-for-byte, in the shared `protocol/proof` package (imported by both the
+broker signer and the client verifier) and locked by the §10 KATs.
 
 ## 9. Versioning
 
-- `_e2ee.v`, the response `v`, and the `report_data` `version` are independent and
-  each bumped on a breaking change to their format.
+- `_e2ee.v`, the response `v`, the `report_data` `version`, and the signature
+  **scheme tag** (§8, e.g. `zg-sig-v1/…`) are independent and each bumped on a
+  breaking change to their format.
 - A new HPKE suite, a new AAD/`info` rule, or a new `report_data` layout MUST bump
   the relevant version; implementations MUST reject versions they do not implement.
-- **Adding a routing field or a new sealed field is NOT a version bump** — cleartext
-  fields are additive (unknown keys ignored by the router) and `sealed_fields` is
-  self-describing. Only the crypto/format envelope is versioned.
+- The signature scheme tag is a self-describing **profile** carried inside the
+  signed text: one tag pins {algo, hash, canonicalization, binding}. A breaking
+  change to any of those (a different hash, the concat convention, the binding
+  artifacts) bumps the profile version (`zg-sig-v1/…` → `zg-sig-v2/…`); a verifier
+  MUST reject an unknown scheme fail-closed.
+- **Adding a routing field or a new sealed/unbound field is NOT a version bump** —
+  cleartext fields are additive (unknown keys ignored by the router), `sealed_fields`
+  is self-describing, and unbound fields are outside the signature anyway. Only the
+  crypto/format envelope and the signature profile are versioned.
 - Consumers (broker, router, client) update in lockstep with a version bump.
 
 ## 10. Test vectors
 
-TODO. Each release MUST ship KATs: fixed `enc_priv`/`enc_pub`, a fixed
-`eph_priv`/`client_eph_pub`, a fixed original request, the expected **JCS** of the
-sealed object and of the AAD, the expected `_e2ee` (incl. `ciphertext`), and fixed
-response chunks with expected `resp_enc` + frame bytes — so Go/TS/Rust match
-byte-for-byte. KATs MUST pin the JCS output to lock canonicalization.
+Each release MUST ship KATs so Go/TS/Rust — and the broker signer — match
+byte-for-byte.
+
+**Envelope KATs:** fixed `enc_priv`/`enc_pub`, a fixed `eph_priv`/`client_eph_pub`,
+a fixed original request, the expected **JCS** of the sealed object and of the AAD,
+the expected `_e2ee` (incl. `ciphertext`), and fixed response chunks with expected
+`resp_enc` + frame bytes. KATs MUST pin the JCS output to lock canonicalization.
+
+**Signature KATs (§8):** for the fixed request and response above, pin every
+intermediate so the binding cannot drift between implementations — `aad`/`ct` per
+sealed envelope, each `sha256(aad)` and `sha256(ct)`, `H(aad,ct)`, the per-frame
+`H(f_i)` and the aggregate `respH` for streaming, the final signed `text` (incl.
+its scheme tag), a broker-produced `signature` (EIP-191), and the recovered
+`teeSignerAddress`. A shared fixture must exercise a known-answer recovery so the
+client verifier and the broker signer are proven interoperable, not merely
+self-consistent. (An initial recovery KAT against a broker go-ethereum signature
+is already in `client/sig`; the full shared fixture is tracked with
+`0g-serving-broker` #615.)
 
 ## 11. Replay & out of scope
 
