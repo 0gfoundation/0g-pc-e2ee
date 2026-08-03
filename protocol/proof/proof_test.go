@@ -116,14 +116,14 @@ func TestStreamAggregation_MatchesManual(t *testing.T) {
 	// Manual: respH = sha256( H(f0) ‖ H(f1) ‖ H(f2) ).
 	var agg []byte
 	for _, f := range frames {
-		h, err := frameBindingHash(f)
+		h, err := FrameBindingHash(f)
 		if err != nil {
 			t.Fatal(err)
 		}
 		agg = append(agg, h[:]...)
 	}
 	respH := sha256.Sum256(agg)
-	reqH, _ := frameBindingHash(req)
+	reqH, _ := FrameBindingHash(req)
 	want := formatText(SchemeE2EECiphertextStream, reqH, respH)
 	if text != want {
 		t.Fatalf("stream text = %q, want %q", text, want)
@@ -243,5 +243,61 @@ func TestVerifyE2EEStream_OK(t *testing.T) {
 	err := fakeSig(text).VerifyE2EEStream(req, frames[:2], testSigner, stubRecover(testSigner))
 	if err == nil || !strings.Contains(err.Error(), "content-binding mismatch") {
 		t.Fatalf("want mismatch on dropped frame, got %v", err)
+	}
+}
+
+// --- from-hash entry points (broker flow: reqH computed early, envelope dropped) ---
+
+func TestSignedTextE2EEFromHashes_MatchesEnvelope(t *testing.T) {
+	_, ephPub, _ := crypto.GenerateRecipientKey()
+	req := sealReq(t, ephPub)
+	resp := sealFrames(t, ephPub, 1)[0]
+
+	// Broker: hash the request at unseal time, keep only the 32 bytes.
+	reqH, err := FrameBindingHash(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	respH, err := FrameBindingHash(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fromHashes := SignedTextE2EEFromHashes(reqH, respH)
+
+	envelope, err := SignedTextE2EE(req, resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fromHashes != envelope {
+		t.Fatalf("from-hashes %q != envelope %q", fromHashes, envelope)
+	}
+}
+
+func TestNewStreamBinderFromReqHash_MatchesEnvelope(t *testing.T) {
+	_, ephPub, _ := crypto.GenerateRecipientKey()
+	req := sealReq(t, ephPub)
+	frames := sealFrames(t, ephPub, 3)
+
+	reqH, err := FrameBindingHash(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := NewStreamBinderFromReqHash(reqH)
+	for _, f := range frames {
+		if err := b.AddFrame(f); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fromHash, err := b.Text()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	envelope, err := SignedTextE2EEStream(req, frames)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fromHash != envelope {
+		t.Fatalf("from-reqHash %q != envelope %q", fromHash, envelope)
 	}
 }

@@ -59,10 +59,17 @@ func BindingHash(aad, ct []byte) [32]byte {
 	return sha256.Sum256(buf[:])
 }
 
-// frameBindingHash applies BindingHash to a sealed envelope's on-wire artifacts,
+// FrameBindingHash applies BindingHash to a sealed envelope's on-wire artifacts,
 // reusing wire.FrameBinding so the AAD/JCS computation is shared code, not a
-// reimplementation.
-func frameBindingHash(env map[string]json.RawMessage) ([32]byte, error) {
+// reimplementation. It is the per-envelope 32-byte hash both halves of the
+// binding are built from.
+//
+// It is exported for signers that cannot retain the sealed envelope until
+// signing time: the broker replaces the sealed request with its plaintext before
+// forwarding, so it must compute reqH here at unseal time and stash the 32 bytes,
+// then combine it with the response hash later via SignedTextE2EEFromHashes /
+// NewStreamBinderFromReqHash.
+func FrameBindingHash(env map[string]json.RawMessage) ([32]byte, error) {
 	aad, ct, err := wire.FrameBinding(env)
 	if err != nil {
 		return [32]byte{}, err
@@ -72,19 +79,29 @@ func frameBindingHash(env map[string]json.RawMessage) ([32]byte, error) {
 
 // SignedTextE2EE returns the exact text signed (and verified) for a non-stream
 // E2EE exchange: "<scheme>:<reqH>:<respH>". reqEnv is the sealed request
-// envelope; respEnv is the single sealed response frame. This is the one place
-// the non-stream binding is assembled — the broker imports it to SIGN, the
-// client calls it to recompute, so the signed bytes cannot diverge.
+// envelope; respEnv is the single sealed response frame. The client (which holds
+// both envelopes at verify time) uses this; a signer that no longer holds the
+// request envelope uses SignedTextE2EEFromHashes instead. Both funnel through the
+// same assembly, so the signed bytes cannot diverge.
 func SignedTextE2EE(reqEnv, respEnv map[string]json.RawMessage) (string, error) {
-	reqH, err := frameBindingHash(reqEnv)
+	reqH, err := FrameBindingHash(reqEnv)
 	if err != nil {
 		return "", fmt.Errorf("proof: request binding: %w", err)
 	}
-	respH, err := frameBindingHash(respEnv)
+	respH, err := FrameBindingHash(respEnv)
 	if err != nil {
 		return "", fmt.Errorf("proof: response binding: %w", err)
 	}
-	return formatText(SchemeE2EECiphertext, reqH, respH), nil
+	return SignedTextE2EEFromHashes(reqH, respH), nil
+}
+
+// SignedTextE2EEFromHashes assembles the non-stream signed text from
+// already-computed binding hashes (each a FrameBindingHash of its sealed
+// envelope). This is the broker's entry point: it computes reqH at unseal time,
+// respH after sealing the response, and never has to retain the request envelope.
+// formatText remains the single place the text is assembled (no drift).
+func SignedTextE2EEFromHashes(reqH, respH [32]byte) string {
+	return formatText(SchemeE2EECiphertext, reqH, respH)
 }
 
 // SignedTextE2EEStream is the streaming variant. respFrames are the sealed
@@ -114,16 +131,24 @@ type StreamBinder struct {
 
 // NewStreamBinder starts a streaming binder over the sealed request envelope.
 func NewStreamBinder(reqEnv map[string]json.RawMessage) (*StreamBinder, error) {
-	reqH, err := frameBindingHash(reqEnv)
+	reqH, err := FrameBindingHash(reqEnv)
 	if err != nil {
 		return nil, fmt.Errorf("proof: request binding: %w", err)
 	}
-	return &StreamBinder{reqH: reqH}, nil
+	return NewStreamBinderFromReqHash(reqH), nil
+}
+
+// NewStreamBinderFromReqHash starts a streaming binder from an already-computed
+// request binding hash (FrameBindingHash of the sealed request). This is the
+// broker's entry point: it stashes reqH at unseal time and folds response frames
+// as it seals them, without retaining the request envelope.
+func NewStreamBinderFromReqHash(reqH [32]byte) *StreamBinder {
+	return &StreamBinder{reqH: reqH}
 }
 
 // AddFrame folds one sealed response frame into the aggregate, in delivery order.
 func (s *StreamBinder) AddFrame(frameEnv map[string]json.RawMessage) error {
-	h, err := frameBindingHash(frameEnv)
+	h, err := FrameBindingHash(frameEnv)
 	if err != nil {
 		return err
 	}
