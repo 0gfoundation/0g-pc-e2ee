@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/proof"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
@@ -138,6 +139,15 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 	// (the stream cannot be restarted on another provider), so retry = !committed.
 	committed := false
 	sawFinal := false
+	// If response verification is on, fold each sealed frame into a binder so the
+	// stream can be verified after the final frame without buffering it (hop 11).
+	var binder *proof.StreamBinder
+	if c.verifyEnabled() {
+		var berr error
+		if binder, berr = proof.NewStreamBinder(sealed); berr != nil {
+			return false, stageErr(StageInternal, fmt.Errorf("start response binding: %w", berr))
+		}
+	}
 	// frameIdx is the 0-based ordinal of the sealed frame being processed (blank
 	// SSE events and [DONE] do not count). It rides in the per-frame error text so
 	// a decode/open failure names its frame: index 0 points at a setup/key/AAD
@@ -157,6 +167,11 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 			if !sawFinal {
 				return !committed, stageErr(StageUpstream, fmt.Errorf("stream ended before the final frame (truncated)"))
 			}
+			if binder != nil {
+				if verr := c.verifyStream(ctx, provider, resp.Header, binder); verr != nil {
+					return false, stageErr(StageUpstream, verr)
+				}
+			}
 			return false, nil
 		}
 		if err != nil {
@@ -174,6 +189,11 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 		if bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]")) {
 			if !sawFinal {
 				return !committed, stageErr(StageUpstream, fmt.Errorf("stream reached [DONE] before the final frame (truncated)"))
+			}
+			if binder != nil {
+				if verr := c.verifyStream(ctx, provider, resp.Header, binder); verr != nil {
+					return false, stageErr(StageUpstream, verr)
+				}
 			}
 			return false, nil
 		}
@@ -198,6 +218,13 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 		if err != nil {
 			c.logOpenFailure(frameIdx, frame, err)
 			return !committed, stageErr(StageUpstream, fmt.Errorf("open stream frame %d: %w", frameIdx, err))
+		}
+		// Bind the sealed frame (not the opened plaintext) for §8 verification, in
+		// delivery order. frame is unchanged by OpenFrame (which builds a new map).
+		if binder != nil {
+			if err := binder.AddFrame(frame); err != nil {
+				return !committed, stageErr(StageUpstream, fmt.Errorf("bind stream frame %d: %w", frameIdx, err))
+			}
 		}
 		// From here the caller receives bytes: the stream is committed to this
 		// provider and can no longer be retried on another.

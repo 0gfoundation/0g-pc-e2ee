@@ -41,6 +41,14 @@ func (sig ChatSignature) VerifyE2EEStream(reqEnv map[string]json.RawMessage, res
 	return sig.verify(want, SchemeE2EECiphertextStream, expectedSigner, recover)
 }
 
+// VerifyBoundText verifies a signature whose content binding the caller has
+// already recomputed into want (e.g. a streaming client that folded frames
+// through a StreamBinder and took its Text()). wantScheme is the scheme want must
+// carry. Same fail-closed guarantees as VerifyE2EE.
+func (sig ChatSignature) VerifyBoundText(want, wantScheme, expectedSigner string, recover RecoverFunc) error {
+	return sig.verify(want, wantScheme, expectedSigner, recover)
+}
+
 // verify compares the signature's text against the locally recomputed want,
 // checks the scheme, then recovers and anchors the signer on expectedSigner. It
 // takes want (already assembled by the caller) so the content-binding is

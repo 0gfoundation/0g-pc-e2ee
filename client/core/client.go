@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/proof"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
@@ -136,6 +137,10 @@ type Client struct {
 	unboundFields []string
 	http          *http.Client
 	debug         *slog.Logger // nil = off; see WithDebugLogger
+	// Response-signature verification (hop 11), off unless both are set via
+	// WithResponseVerification. See verify.go.
+	sigFetcher SignatureFetcher
+	recover    proof.RecoverFunc
 }
 
 // Option customizes a Client.
@@ -374,6 +379,15 @@ func (c *Client) completeOnce(ctx context.Context, provider Provider, req wire.R
 	if err != nil {
 		c.logOpenFailure(0, sealedResp, err)
 		return nil, true, stageErr(StageUpstream, fmt.Errorf("open response: %w", err))
+	}
+	// Response-signature verification (hop 11), fail-closed. A response that
+	// opened but fails the §8 signature is an integrity/authenticity failure of
+	// this provider — terminal, not a fall-back to another candidate (which would
+	// mask a bad provider). Nothing is returned to the caller on failure.
+	if c.verifyEnabled() {
+		if err := c.verifyNonStream(ctx, provider, resp.Header, sealed, sealedResp); err != nil {
+			return nil, false, stageErr(StageUpstream, err)
+		}
 	}
 	return out, false, nil
 }
