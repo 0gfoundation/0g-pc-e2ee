@@ -228,7 +228,14 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 		}
 		// From here the caller receives bytes: the stream is committed to this
 		// provider and can no longer be retried on another.
-		committed = true
+		if !committed {
+			committed = true
+			// Once committed, no fallback can change which provider answered, so this
+			// is the handle for the response the caller receives; surface it for a
+			// caller that asked (WithResponseMeta). Recorded before the first onFrame
+			// so a front end can set the header before it writes response headers.
+			recordResKey(ctx, resp.Header)
+		}
 		if err := onFrame(out); err != nil {
 			return false, err
 		}

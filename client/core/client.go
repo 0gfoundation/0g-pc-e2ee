@@ -395,6 +395,11 @@ func (c *Client) completeOnce(ctx context.Context, provider Provider, req wire.R
 			return nil, false, stageErr(StageUpstream, err)
 		}
 	}
+	// Surface this response's ZG-Res-Key handle to a caller that asked for it
+	// (WithResponseMeta), so a front end can re-expose it for independent §8 audit.
+	// Recorded only here, on the success path, so a discarded fallback attempt
+	// never leaves a stale handle behind.
+	recordResKey(ctx, resp.Header)
 	return out, false, nil
 }
 

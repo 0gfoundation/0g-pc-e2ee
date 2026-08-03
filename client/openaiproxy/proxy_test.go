@@ -803,6 +803,105 @@ func TestProxyForwardsRoutingHeaders(t *testing.T) {
 	}
 }
 
+// The provider's ZG-Res-Key handle is re-emitted to the proxy's own user on both
+// the buffered and streaming paths, so the user can fetch and audit the §8
+// signature from the broker. When the provider sends no such header, the proxy
+// emits none either (absence is "no handle", not an empty value).
+func TestProxyPassesResKey(t *testing.T) {
+	encPriv, encPub, _ := crypto.GenerateRecipientKey()
+	signer := "0x" + strings.Repeat("a", 40)
+	const wantResKey = "chatkey-abc123"
+
+	// A broker that sets ZG-Res-Key only when told to (via a request header the
+	// test flips), so one server exercises both the present and absent cases. It
+	// answers buffered or SSE per stream:true, like the plain mock broker.
+	newBroker := func(setResKey bool) *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			var env wire.Request
+			if err := json.Unmarshal(body, &env); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			e2ee, _ := env.E2EE()
+			if _, err := wire.OpenRequest(encPriv, env); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			ephPub, _ := base64.RawURLEncoding.DecodeString(e2ee.ClientEphPub)
+			if setResKey {
+				w.Header().Set("ZG-Res-Key", wantResKey)
+			}
+			if string(env["stream"]) == "true" {
+				sealer, _ := wire.NewResponseSealer(crypto.PublicKey(ephPub))
+				frame := wire.Response{"choices": json.RawMessage(`[{"index":0,"delta":{"content":"hi"}}]`)}
+				sealed, _ := sealer.SealFrame(frame, nil, true)
+				w.Header().Set("Content-Type", "text/event-stream")
+				flusher := w.(http.Flusher)
+				b, _ := json.Marshal(sealed)
+				_, _ = w.Write([]byte("data: "))
+				_, _ = w.Write(b)
+				_, _ = w.Write([]byte("\n\ndata: [DONE]\n\n"))
+				flusher.Flush()
+				return
+			}
+			resp := wire.Response{
+				"id":      json.RawMessage(`"chatcmpl-mock"`),
+				"choices": json.RawMessage(`[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]`),
+			}
+			sealed, _ := wire.SealResponse(crypto.PublicKey(ephPub), resp, nil)
+			_ = json.NewEncoder(w).Encode(sealed)
+		}))
+	}
+
+	post := func(t *testing.T, broker *httptest.Server, body string) *http.Response {
+		t.Helper()
+		client := core.New(core.Provider{URL: broker.URL, EncPubKey: encPub, SignerAddr: signer})
+		proxy := httptest.NewServer(openaiproxy.Handler(client))
+		t.Cleanup(proxy.Close)
+		resp, err := http.Post(proxy.URL+"/v1/chat/completions", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatalf("post to proxy: %v", err)
+		}
+		t.Cleanup(func() { resp.Body.Close() })
+		if resp.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(resp.Body)
+			t.Fatalf("got %d: %s", resp.StatusCode, b)
+		}
+		return resp
+	}
+
+	t.Run("buffered present", func(t *testing.T) {
+		broker := newBroker(true)
+		defer broker.Close()
+		resp := post(t, broker, `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`)
+		_, _ = io.Copy(io.Discard, resp.Body)
+		if got := resp.Header.Get("ZG-Res-Key"); got != wantResKey {
+			t.Fatalf("ZG-Res-Key = %q, want %q", got, wantResKey)
+		}
+	})
+
+	t.Run("streaming present", func(t *testing.T) {
+		broker := newBroker(true)
+		defer broker.Close()
+		resp := post(t, broker, `{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+		_, _ = io.Copy(io.Discard, resp.Body)
+		if got := resp.Header.Get("ZG-Res-Key"); got != wantResKey {
+			t.Fatalf("streaming ZG-Res-Key = %q, want %q", got, wantResKey)
+		}
+	})
+
+	t.Run("absent when provider sends none", func(t *testing.T) {
+		broker := newBroker(false)
+		defer broker.Close()
+		resp := post(t, broker, `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`)
+		_, _ = io.Copy(io.Discard, resp.Body)
+		if _, ok := resp.Header["Zg-Res-Key"]; ok {
+			t.Fatalf("ZG-Res-Key set with value %q, want header absent", resp.Header.Get("ZG-Res-Key"))
+		}
+	})
+}
+
 // A request with nothing to seal (no messages) is a client error → 400, not 502.
 func TestProxyBadRequestIs400(t *testing.T) {
 	encPriv, encPub, _ := crypto.GenerateRecipientKey()
