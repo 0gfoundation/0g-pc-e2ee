@@ -1,6 +1,7 @@
 package proxycli
 
 import (
+	"flag"
 	"io"
 	"log/slog"
 	"net"
@@ -170,4 +171,26 @@ func TestParseCSV(t *testing.T) {
 			t.Fatalf("index %d: got %q, want %q", i, got[i], want[i])
 		}
 	}
+}
+
+// TestBuildDirectMode: -provider-url selects direct-broker mode — Build wires a
+// working client with no router (so no warmer), and -verify-responses is allowed
+// without -attest (in direct mode the signer comes from the broker the operator
+// pointed at, not an untrusted router). Exercises the direct branch via the real
+// flag path; a valid combination never hits Build's os.Exit.
+func TestBuildDirectMode(t *testing.T) {
+	fs := flag.NewFlagSet("t", flag.ContinueOnError)
+	f := RegisterFlags(fs, "ZG_TEST", ":0")
+	if err := fs.Parse([]string{"-provider-url", "https://broker.example/v1", "-verify-responses"}); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	built := f.Build("test", testLogger())
+	if built.Client == nil {
+		t.Fatal("direct mode should build a client")
+	}
+	if built.router != nil {
+		t.Error("direct mode should not build a router")
+	}
+	// No warmer in direct mode: StartWarmer must be a no-op that returns cleanly.
+	built.StartWarmer(testLogger())()
 }

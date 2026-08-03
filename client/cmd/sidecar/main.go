@@ -4,12 +4,20 @@
 // request fields to the chosen provider, and opens the sealed response, so your
 // app keeps talking plain OpenAI.
 //
-// Like the gateway, the sidecar is route-oriented: per request it asks the
-// router which provider to use (POST /v1/routing/preview) and fetches that
+// Like the gateway, the sidecar is route-oriented by default: per request it asks
+// the router which provider to use (POST /v1/routing/preview) and fetches that
 // provider's enc key + signer from the broker (GET /v1/e2ee/pubkey), so no
 // provider key is configured up front. Unlike the gateway it runs on the user's
 // own machine (no new trust party) and surfaces upstream error detail for local
 // debugging.
+//
+// It also supports a direct-broker mode for an environment that has a broker but
+// no centralized router (dev): set -provider-url (ZG_SIDECAR_PROVIDER_URL) to a
+// provider endpoint and the sidecar skips route-preview, fetches that provider's
+// enc key + signer from its broker's /v1/e2ee/pubkey, and POSTs the sealed request
+// straight to the provider's own /v1/chat/completions. -verify-responses works in
+// this mode without -attest (the signer comes from the broker you pointed at, not
+// an untrusted router); on-chain grounding and the warmer are router-only.
 //
 // Startup wiring (flags, env-var defaults, route/seal plumbing) is shared with
 // the gateway via client/cmd/internal/proxycli; the sidecar keeps only its own
