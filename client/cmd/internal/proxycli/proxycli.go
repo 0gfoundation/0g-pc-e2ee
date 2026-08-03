@@ -255,6 +255,23 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 		logger.Error("invalid -unbound-fields", "err", err)
 		os.Exit(1)
 	}
+	// Direct-broker mode (-provider-url set) skips the router and seals straight to
+	// one fixed provider — for an environment with a broker but no centralized
+	// router (dev). It reuses the pubkey/quote fetch but not the router-only steps:
+	// on-chain grounding needs the provider's on-chain address the router preview
+	// would supply, and the warmer enumerates providers via the router — so both are
+	// rejected. These checks come before the router-mode interdependency checks
+	// below so a direct-mode operator gets the direct-mode message (not, say,
+	// "-onchain requires -attest") for the same flag combination.
+	directMode := strings.TrimSpace(*f.providerURL) != ""
+	if directMode && *f.onchainOn {
+		logger.Error("-onchain is not supported in direct-broker mode (-provider-url); run without -provider-url to route through the router")
+		os.Exit(1)
+	}
+	if directMode && *f.warmOn {
+		logger.Error("-warm is not supported in direct-broker mode (-provider-url); the warmer enumerates providers via the router")
+		os.Exit(1)
+	}
 	// Fail loudly rather than silently give NO attestation when the operator asked
 	// for the strictest mode: -attest-enforce is meaningless without -attest.
 	if *f.attestEnforce && !*f.attestOn {
@@ -273,21 +290,6 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 	}
 	if *f.onchainOn && strings.TrimSpace(*f.chainRPCURL) == "" {
 		logger.Error("-onchain requires -chain-rpc-url")
-		os.Exit(1)
-	}
-	// Direct-broker mode (-provider-url set) skips the router and seals straight to
-	// one fixed provider — for an environment with a broker but no centralized
-	// router (dev). It reuses the pubkey/quote fetch but not the router-only steps:
-	// on-chain grounding needs the provider's on-chain address the router preview
-	// would supply, and the warmer enumerates providers via the router — so both are
-	// rejected here rather than silently no-op'ing.
-	directMode := strings.TrimSpace(*f.providerURL) != ""
-	if directMode && *f.onchainOn {
-		logger.Error("-onchain is not supported in direct-broker mode (-provider-url); run without -provider-url to route through the router")
-		os.Exit(1)
-	}
-	if directMode && *f.warmOn {
-		logger.Error("-warm is not supported in direct-broker mode (-provider-url); the warmer enumerates providers via the router")
 		os.Exit(1)
 	}
 	// Response verification anchors on the provider's signer. In router mode that
@@ -356,13 +358,13 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 	// preview. The warmer stays off (no provider list to enumerate), so Built holds
 	// only the client.
 	if directMode {
-		resolver, err := route.NewDirect(*f.providerURL, routeOpts...)
+		directRes, err := route.NewDirect(*f.providerURL, routeOpts...)
 		if err != nil {
 			logger.Error("invalid -provider-url", "url", *f.providerURL, "err", err)
 			os.Exit(1)
 		}
 		logger.Info("direct-broker mode enabled (no router)", "label", label, "provider_url", *f.providerURL, "attest", *f.attestOn)
-		return &Built{Client: core.NewWithResolver(resolver, coreOpts...)}
+		return &Built{Client: core.NewWithResolver(directRes, coreOpts...)}
 	}
 
 	router := route.New(*f.RouterURL, routeOpts...)
