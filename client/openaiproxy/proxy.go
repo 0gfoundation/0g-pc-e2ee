@@ -298,14 +298,30 @@ func writeErrorObject(w http.ResponseWriter, code int, body map[string]any) {
 	_ = json.NewEncoder(w).Encode(body)
 }
 
+// WriteError emits the proxy's canonical JSON error envelope — the same shape
+// errorEnvelope produces — at the given status:
+//
+//	{"error": {"message": msg, "type": source+"_error"}, "_0g": {"source": source}}
+//
+// It is exported so a caller mounting its own routes on the shared mux (the
+// gateway's catch-all reverse proxy to the router) can fail with the same
+// structured body a thin client already parses on the sealed path, instead of a
+// bespoke plaintext error. source is the attribution: "gateway" for a fault in
+// the proxy itself, "upstream" for a failure reaching or among the
+// router/provider. Pass a generic msg — never a raw transport error — so a
+// multi-tenant gateway does not leak internal detail (router host, key material).
+func WriteError(w http.ResponseWriter, status int, source, msg string) {
+	writeErrorObject(w, status, map[string]any{
+		"error": map[string]any{"message": msg, "type": source + "_error"},
+		"_0g":   map[string]any{"source": source},
+	})
+}
+
 // writeGatewayError emits a gateway-origin error — a fault in this proxy itself,
 // before or around the core call (bad request, encode failure) — attributed to
 // source "gateway".
 func writeGatewayError(w http.ResponseWriter, code int, msg string) {
-	writeErrorObject(w, code, map[string]any{
-		"error": map[string]any{"message": msg, "type": "gateway_error"},
-		"_0g":   map[string]any{"source": "gateway"},
-	})
+	WriteError(w, code, "gateway", msg)
 }
 
 // writeError emits a core.Error (or any error) as the attributed envelope, with
