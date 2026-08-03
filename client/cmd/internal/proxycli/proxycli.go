@@ -35,6 +35,7 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/dcap"
 	"github.com/0gfoundation/0g-pc-e2ee/client/route"
+	"github.com/0gfoundation/0g-pc-e2ee/client/sig"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
@@ -140,6 +141,7 @@ type Flags struct {
 	attestEnforce    *bool
 	onchainOn        *bool
 	onchainEnforce   *bool
+	verifyResponses  *bool
 	chainRPCURL      *string
 	servingContract  *string
 	warmOn           *bool
@@ -189,6 +191,8 @@ func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen string) *Flags {
 			fmt.Sprintf("cross-check each provider's quote-bound TEE signer against its acknowledged on-chain teeSignerAddress in the InferenceServing registry (SPEC §4.4 step 3); requires -attest (env %s)", env("ONCHAIN"))),
 		onchainEnforce: fs.Bool("onchain-enforce", envBool(env("ONCHAIN_ENFORCE"), false),
 			fmt.Sprintf("with -onchain, skip a provider whose on-chain signer is missing/unacknowledged/mismatched instead of only warning (env %s)", env("ONCHAIN_ENFORCE"))),
+		verifyResponses: fs.Bool("verify-responses", envBool(env("VERIFY_RESPONSES"), false),
+			fmt.Sprintf("verify each response's §8 TEE signature (trust-chain hop 11), fetched directly from the provider's broker endpoint, fail-closed against the quote-bound signer; requires -attest, and -onchain additionally grounds that signer on-chain (env %s)", env("VERIFY_RESPONSES"))),
 		chainRPCURL: fs.String("chain-rpc-url", envOr(env("CHAIN_RPC_URL"), chain.DefaultChainRPCURL),
 			fmt.Sprintf("0G chain JSON-RPC endpoint for on-chain signer lookups; must be a source trusted independently of the router (defaults to 0G mainnet) (env %s)", env("CHAIN_RPC_URL"))),
 		servingContract: fs.String("serving-contract", envOr(env("SERVING_CONTRACT"), chain.DefaultInferenceServingAddress),
@@ -267,6 +271,13 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 		logger.Error("-onchain requires -chain-rpc-url")
 		os.Exit(1)
 	}
+	// Response verification anchors on the provider's signer; that signer is only
+	// trustworthy when it came from a verified quote (so -attest), and -onchain
+	// additionally grounds it in the registry (hop 11 → hop 5). Require -attest.
+	if *f.verifyResponses && !*f.attestOn {
+		logger.Error("-verify-responses requires -attest (the signer must come from a verified quote)")
+		os.Exit(1)
+	}
 	// The warmer pre-verifies quotes (needs -attest) and resolves each provider's
 	// endpoint from the on-chain registry (needs -onchain, which builds it). Fail
 	// loud rather than start a warmer that would silently no-op.
@@ -305,11 +316,19 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 		logger.Info("on-chain signer grounding enabled", "label", label, "enforce", *f.onchainEnforce, "contract", *f.servingContract)
 	}
 	router := route.New(*f.RouterURL, routeOpts...)
-	client := core.NewWithResolver(router,
+	coreOpts := []core.Option{
 		core.WithSealFields(sealFields),
 		core.WithUnboundFields(unboundFields),
 		core.WithDebugLogger(logger),
-	)
+	}
+	if *f.verifyResponses {
+		// Fetch the signature straight from the provider's broker endpoint (the
+		// router does not proxy /v1/proxy/signature); verify fail-closed against the
+		// resolver-grounded signer via the shared proof contract.
+		coreOpts = append(coreOpts, core.WithResponseVerification(route.NewSignatureFetcher(nil), sig.Recover))
+		logger.Info("response signature verification enabled", "label", label, "onchain_grounded", *f.onchainOn)
+	}
+	client := core.NewWithResolver(router, coreOpts...)
 	b := &Built{Client: client, router: router}
 	if *f.warmOn {
 		b.resolver = resolver

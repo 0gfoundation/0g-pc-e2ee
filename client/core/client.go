@@ -107,10 +107,16 @@ func resolveErr(err error) error {
 //     Empty means "set no routing pin" (a static provider that does not select
 //     via the router).
 type Provider struct {
-	URL        string           // OpenAI-shaped endpoint (router or broker)
+	URL        string           // OpenAI-shaped endpoint (router or broker) the sealed request POSTs to
 	EncPubKey  crypto.PublicKey // provider HPKE recipient key
 	SignerAddr string           // on-chain TEE signer; sealed into _e2ee.signer_addr, verifies responses
 	Address    string           // router-facing provider address; sent as X-0G-Provider-Address (routing pin)
+	// Endpoint is the provider's OWN serving URL (the broker, ultimately the
+	// on-chain Service.url), distinct from URL when a router fronts the chat POST.
+	// The §8 response signature is fetched directly from here — the router does
+	// not proxy /v1/proxy/signature/{chatKey}. Empty disables direct fetch (a
+	// static provider that is itself the endpoint may set URL only).
+	Endpoint string
 	// Model is the provider's canonical model id (the route preview's
 	// canonical_id). Each candidate may serve a different model — the preview
 	// list is heterogeneous when the caller omits "model" — so the client writes
