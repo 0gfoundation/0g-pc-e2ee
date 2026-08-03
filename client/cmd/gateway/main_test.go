@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -29,8 +30,20 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewJSONHandler(io.Discard, nil))
 }
 
+// mustURL parses a router base URL for newHandler's catch-all, failing the test
+// on a malformed one. The operational-route tests point it at an unused host;
+// only the tests that exercise the catch-all point it at a live router.
+func mustURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse router url %q: %v", raw, err)
+	}
+	return u
+}
+
 func TestGatewayHealthz(t *testing.T) {
-	gw := httptest.NewServer(newHandler(routeClient(), discardLogger()))
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), discardLogger()))
 	defer gw.Close()
 
 	resp, err := http.Get(gw.URL + "/healthz")
@@ -46,7 +59,7 @@ func TestGatewayHealthz(t *testing.T) {
 // /quote is still a stub: it must answer 501 (Not Implemented), not 404, so a
 // validator can tell the endpoint exists but attestation is not wired yet.
 func TestGatewayQuoteStub(t *testing.T) {
-	gw := httptest.NewServer(newHandler(routeClient(), discardLogger()))
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), discardLogger()))
 	defer gw.Close()
 
 	resp, err := http.Get(gw.URL + "/quote")
@@ -126,7 +139,7 @@ func TestGatewayRouteMode(t *testing.T) {
 	defer router.Close()
 
 	client := core.NewWithResolver(route.New(router.URL))
-	gw := httptest.NewServer(newHandler(client, discardLogger()))
+	gw := httptest.NewServer(newHandler(client, mustURL(t, router.URL), discardLogger()))
 	defer gw.Close()
 
 	userReq := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`
@@ -144,6 +157,59 @@ func TestGatewayRouteMode(t *testing.T) {
 	}
 }
 
+// TestGatewayRoutesOtherRequestsToRouter covers the catch-all: a path the mux
+// has no specific route for — the router's non-sealed OpenAI surface, e.g.
+// GET /v1/models — is reverse-proxied to the router as-is (path, query, and a
+// Host header rewritten to the router), and its response comes straight back.
+// This is the cleartext passthrough; it must never carry a prompt (see
+// newRouterProxy), which the sealed chat route — exercised by
+// TestGatewayRouteMode — continues to own.
+func TestGatewayRoutesOtherRequestsToRouter(t *testing.T) {
+	var gotPath, gotQuery, gotHost, gotAuth string
+	routerMux := http.NewServeMux()
+	routerMux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotQuery, gotHost, gotAuth = r.URL.Path, r.URL.RawQuery, r.Host, r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-4o"}]}`))
+	})
+	router := httptest.NewServer(routerMux)
+	defer router.Close()
+
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, router.URL), discardLogger()))
+	defer gw.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, gw.URL+"/v1/models?limit=1", nil)
+	req.Header.Set("Authorization", "Bearer user-key")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get /v1/models: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d: %s", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte(`"gpt-4o"`)) {
+		t.Fatalf("router response not passed through: %s", body)
+	}
+	if gotPath != "/v1/models" {
+		t.Errorf("router saw path %q, want /v1/models", gotPath)
+	}
+	if gotQuery != "limit=1" {
+		t.Errorf("router saw query %q, want limit=1", gotQuery)
+	}
+	// The Host header must be the router's, not the gateway's listen host, so the
+	// router's TLS/vhost routing resolves correctly.
+	if want := mustURL(t, router.URL).Host; gotHost != want {
+		t.Errorf("router saw Host %q, want %q", gotHost, want)
+	}
+	// The passthrough forwards the request verbatim, so the caller's credential
+	// reaches the router (which is the auth/billing point) unchanged.
+	if gotAuth != "Bearer user-key" {
+		t.Errorf("router saw Authorization %q, want the forwarded credential", gotAuth)
+	}
+}
+
 // TestGatewayAccessLog covers the middleware's contract: health probes are not
 // logged (they would drown real traffic), every other request emits one
 // structured line with the expected metadata fields, a caller-supplied request
@@ -152,7 +218,7 @@ func TestGatewayRouteMode(t *testing.T) {
 func TestGatewayAccessLog(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, nil))
-	gw := httptest.NewServer(newHandler(routeClient(), logger))
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), logger))
 	defer gw.Close()
 
 	// A health probe must not produce a log line.

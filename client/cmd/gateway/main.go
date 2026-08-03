@@ -34,6 +34,7 @@ import (
 	"flag"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"time"
 
@@ -59,6 +60,16 @@ func main() {
 	logger := proxycli.NewLogger()
 	built := f.Build("gateway", logger)
 
+	// Parse the router base URL once, up front, so a malformed -router-url fails
+	// loud at startup (like Build's other validation) instead of surfacing as a
+	// broken catch-all on the first non-chat request. The catch-all reverse-proxies
+	// every otherwise-unmatched path to this router (see newRouterProxy).
+	routerTarget, err := url.Parse(*f.RouterURL)
+	if err != nil || routerTarget.Scheme == "" || routerTarget.Host == "" {
+		logger.Error("invalid -router-url", "url", *f.RouterURL, "err", err)
+		os.Exit(1)
+	}
+
 	// Start the background quote-cache warmer (a no-op unless -warm is set) so
 	// requests hit a warm cache instead of paying the DCAP verify inline; stop it
 	// on shutdown before the process exits.
@@ -66,7 +77,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              *f.Listen,
-		Handler:           newHandler(built.Client, logger),
+		Handler:           newHandler(built.Client, routerTarget, logger),
 		ReadHeaderTimeout: 10 * time.Second, // mitigate slow-header (Slowloris) clients
 	}
 	// TLS is terminated ahead of this listener, inside the same enclave
@@ -78,7 +89,7 @@ func main() {
 	// dstack/Phala deployment sends it on every redeploy). ListenAndServe's clean
 	// shutdown is folded into a nil return; only a real listen failure is an error.
 	logger.Info("gateway listening", "listen", *f.Listen, "router_url", *f.RouterURL)
-	err := proxycli.Serve(srv, logger)
+	err = proxycli.Serve(srv, logger)
 	stopWarmer()
 	if err != nil {
 		logger.Error("gateway server exited", "err", err)
@@ -86,11 +97,12 @@ func main() {
 	}
 }
 
-// newHandler mounts the shared OpenAI proxy plus the gateway-only operational
-// routes (health, attestation quote), wrapped in the access-log middleware so
+// newHandler mounts the shared OpenAI proxy, the gateway-only operational routes
+// (health, attestation quote), and a catch-all that reverse-proxies every other
+// path to the router (routerTarget), all wrapped in the access-log middleware so
 // every request emits one redaction-safe structured line. It is split out from
 // main so tests can drive it with httptest.
-func newHandler(c *core.Client, logger *slog.Logger) http.Handler {
+func newHandler(c *core.Client, routerTarget *url.URL, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	openaiproxy.Register(mux, c)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -104,5 +116,12 @@ func newHandler(c *core.Client, logger *slog.Logger) http.Handler {
 	mux.HandleFunc("GET /quote", func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "attestation quote not yet implemented", http.StatusNotImplemented)
 	})
+	// Everything else — the router's non-sealed OpenAI surface (model catalog,
+	// discovery) a thin client needs — is reverse-proxied to the router as-is. The
+	// sealed chat route, /healthz, and /quote are more specific patterns, so Go's
+	// ServeMux keeps serving them; only unmatched paths fall through here. This is a
+	// cleartext passthrough — safe for metadata, never for sealed content (see
+	// newRouterProxy).
+	mux.Handle("/", newRouterProxy(routerTarget, logger))
 	return openaiproxy.LogRequests(logger, mux)
 }
