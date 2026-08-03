@@ -301,3 +301,33 @@ func TestNewStreamBinderFromReqHash_MatchesEnvelope(t *testing.T) {
 		t.Fatalf("from-reqHash %q != envelope %q", fromHash, envelope)
 	}
 }
+
+// --- error branches & VerifyBoundText -------------------------------------
+
+func TestSignedText_BadEnvelope(t *testing.T) {
+	bad := map[string]json.RawMessage{"model": json.RawMessage(`"x"`)} // no _e2ee
+	if _, err := SignedTextE2EE(bad, bad); err == nil {
+		t.Fatal("SignedTextE2EE: want error for envelope without _e2ee")
+	}
+	if _, err := SignedTextE2EEStream(bad, []map[string]json.RawMessage{bad}); err == nil {
+		t.Fatal("SignedTextE2EEStream: want error for bad envelope")
+	}
+	if _, err := NewStreamBinder(bad); err == nil {
+		t.Fatal("NewStreamBinder: want error for bad request envelope")
+	}
+}
+
+func TestVerifyBoundText_Direct(t *testing.T) {
+	_, ephPub, _ := crypto.GenerateRecipientKey()
+	req := sealReq(t, ephPub)
+	frames := sealFrames(t, ephPub, 2)
+	text, _ := SignedTextE2EEStream(req, frames)
+
+	if err := fakeSig(text).VerifyBoundText(text, SchemeE2EECiphertextStream, testSigner, stubRecover(testSigner)); err != nil {
+		t.Fatalf("VerifyBoundText OK path: %v", err)
+	}
+	// wantScheme mismatch → reject.
+	if err := fakeSig(text).VerifyBoundText(text, SchemeE2EECiphertext, testSigner, stubRecover(testSigner)); err == nil {
+		t.Fatal("want scheme mismatch")
+	}
+}
