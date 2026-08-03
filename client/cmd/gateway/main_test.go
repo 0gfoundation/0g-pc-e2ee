@@ -210,6 +210,31 @@ func TestGatewayRoutesOtherRequestsToRouter(t *testing.T) {
 	}
 }
 
+// TestGatewayRouterPassthroughUnreachable covers the catch-all's ErrorHandler:
+// when the router is unreachable, the passthrough must fail closed with a plain
+// 502 (not hang or leak a transport-level error), so a thin client sees a clean
+// bad-gateway rather than the mux's 404 or a stack detail.
+func TestGatewayRouterPassthroughUnreachable(t *testing.T) {
+	// Point the catch-all at a server we immediately close, so a connection to it
+	// is refused — a deterministic transport failure without depending on a
+	// hard-coded unused port.
+	dead := httptest.NewServer(http.NotFoundHandler())
+	deadURL := dead.URL
+	dead.Close()
+
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, deadURL), discardLogger()))
+	defer gw.Close()
+
+	resp, err := http.Get(gw.URL + "/v1/models")
+	if err != nil {
+		t.Fatalf("get /v1/models: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("unreachable router: got %d, want 502", resp.StatusCode)
+	}
+}
+
 // TestGatewayAccessLog covers the middleware's contract: health probes are not
 // logged (they would drown real traffic), every other request emits one
 // structured line with the expected metadata fields, a caller-supplied request
