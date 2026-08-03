@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
@@ -71,5 +72,45 @@ func TestFetchSignature_Errors(t *testing.T) {
 	_, err := NewSignatureFetcher(notFound.Client()).FetchSignature(context.Background(), core.Provider{Endpoint: notFound.URL}, "ck-1")
 	if err == nil || !strings.Contains(err.Error(), "404") {
 		t.Fatalf("want 404 error, got %v", err)
+	}
+}
+
+func TestFetchSignature_RetriesThenSucceeds(t *testing.T) {
+	var n int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&n, 1) < 3 { // 404 twice (broker not-yet-cached), then serve
+			http.Error(w, `{"error":"chat_id_not_found"}`, http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte(`{"text":"zg-sig-v1/e2ee-ct:aa:bb","signature":"0x1c","signing_address":"0xabc","signing_algo":"ecdsa"}`))
+	}))
+	defer srv.Close()
+
+	sig, err := NewSignatureFetcher(srv.Client()).FetchSignature(context.Background(), core.Provider{Endpoint: srv.URL}, "ck-1")
+	if err != nil {
+		t.Fatalf("expected success after transient 404s: %v", err)
+	}
+	if sig.Text == "" {
+		t.Fatal("empty signature after retry")
+	}
+	if got := atomic.LoadInt32(&n); got != 3 {
+		t.Fatalf("expected 3 attempts, got %d", got)
+	}
+}
+
+func TestFetchSignature_NoRetryOn4xx(t *testing.T) {
+	var n int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&n, 1)
+		http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	_, err := NewSignatureFetcher(srv.Client()).FetchSignature(context.Background(), core.Provider{Endpoint: srv.URL}, "ck-1")
+	if err == nil {
+		t.Fatal("want error for 400")
+	}
+	if got := atomic.LoadInt32(&n); got != 1 {
+		t.Fatalf("a 400 must not be retried, got %d attempts", got)
 	}
 }

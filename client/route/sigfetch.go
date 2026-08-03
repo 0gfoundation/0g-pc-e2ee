@@ -17,6 +17,16 @@ import (
 // few hundred bytes, so this defends against a hostile/misconfigured endpoint.
 const maxSignatureBytes = 64 << 10
 
+// Bounded retry for the fetch only (never for a verification mismatch, which
+// does not reach this package). It absorbs the benign race where the broker has
+// not yet cached the signature (a 404, since the cache is written at
+// end-of-response) or a transient transport / 5xx hiccup. Total added latency is
+// capped at sigFetchBackoff·(1+2) ≈ 600ms, and every wait honors ctx.
+const (
+	sigFetchAttempts = 3
+	sigFetchBackoff  = 200 * time.Millisecond
+)
+
 // validChatKey mirrors the broker's allowlist (image_store.go): a chatKey is a
 // UUID-shaped identifier. The value arrives in a response header from an
 // untrusted hop, so it is validated before being placed in a URL path — a proven
@@ -46,8 +56,10 @@ func NewSignatureFetcher(hc *http.Client) *SignatureFetcher {
 var _ core.SignatureFetcher = (*SignatureFetcher)(nil)
 
 // FetchSignature GETs <endpoint>/v1/proxy/signature/{chatKey} and decodes the
-// ChatSignature. A non-200 (e.g. 404 when nothing was cached) is an error, so
-// verification fails closed rather than silently skipping.
+// ChatSignature, with a bounded retry on transient failures (transport error,
+// 404-not-yet-cached, 5xx). A definitive failure (other 4xx, decode error, or the
+// last retry) is returned, so verification fails closed rather than silently
+// skipping.
 func (f *SignatureFetcher) FetchSignature(ctx context.Context, provider core.Provider, chatKey string) (proof.ChatSignature, error) {
 	if provider.Endpoint == "" {
 		return proof.ChatSignature{}, fmt.Errorf("no provider endpoint to fetch the response signature from")
@@ -56,23 +68,51 @@ func (f *SignatureFetcher) FetchSignature(ctx context.Context, provider core.Pro
 	if err != nil {
 		return proof.ChatSignature{}, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+
+	var lastErr error
+	for attempt := 0; attempt < sigFetchAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return proof.ChatSignature{}, ctx.Err()
+			case <-time.After(sigFetchBackoff << (attempt - 1)):
+			}
+		}
+		sig, retryable, err := f.fetchOnce(ctx, u)
+		if err == nil {
+			return sig, nil
+		}
+		lastErr = err
+		if !retryable {
+			return proof.ChatSignature{}, err
+		}
+	}
+	return proof.ChatSignature{}, fmt.Errorf("after %d attempts: %w", sigFetchAttempts, lastErr)
+}
+
+// fetchOnce performs a single GET. retryable is true only for a transient failure
+// worth another attempt — a transport error, a 404 (the broker caches the
+// signature at end-of-response, so a just-finished response can momentarily miss),
+// or a 5xx — and false for a definitive one (other 4xx, decode error).
+func (f *SignatureFetcher) fetchOnce(ctx context.Context, url string) (proof.ChatSignature, bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return proof.ChatSignature{}, err
+		return proof.ChatSignature{}, false, err
 	}
 	resp, err := f.http.Do(req)
 	if err != nil {
-		return proof.ChatSignature{}, fmt.Errorf("get signature: %w", err)
+		return proof.ChatSignature{}, true, fmt.Errorf("get signature: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return proof.ChatSignature{}, fmt.Errorf("signature endpoint returned %d", resp.StatusCode)
+		retryable := resp.StatusCode == http.StatusNotFound || (resp.StatusCode >= 500 && resp.StatusCode <= 599)
+		return proof.ChatSignature{}, retryable, fmt.Errorf("signature endpoint returned %d", resp.StatusCode)
 	}
 	var sig proof.ChatSignature
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxSignatureBytes)).Decode(&sig); err != nil {
-		return proof.ChatSignature{}, fmt.Errorf("decode signature: %w", err)
+		return proof.ChatSignature{}, false, fmt.Errorf("decode signature: %w", err)
 	}
-	return sig, nil
+	return sig, false, nil
 }
 
 // deriveSignatureURL builds <v1-base>/proxy/signature/{chatKey} from a provider
