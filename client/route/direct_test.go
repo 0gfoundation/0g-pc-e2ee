@@ -3,8 +3,10 @@ package route
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"testing"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
@@ -25,7 +27,8 @@ func TestNewDirect_RejectsMalformedURL(t *testing.T) {
 
 // TestDirect_ResolveSealsStraightToBroker: the direct resolver returns a single
 // candidate whose key + signer come from the broker's pubkey endpoint, whose URL
-// is the provider's OWN chat endpoint (no router), whose Endpoint carries the
+// is the broker's OWN /v1/proxy/chat/completions (its "/v1/proxy" service prefix,
+// NOT the router's top-level /v1/chat/completions), whose Endpoint carries the
 // provider base for the §8 signature fetch, and whose Address / Model are left
 // empty (no routing pin, caller's model passes through).
 func TestDirect_ResolveSealsStraightToBroker(t *testing.T) {
@@ -47,8 +50,8 @@ func TestDirect_ResolveSealsStraightToBroker(t *testing.T) {
 		t.Fatalf("Provider: %v", err)
 	}
 
-	if want := broker.srv.URL + "/v1/chat/completions"; prov.URL != want {
-		t.Errorf("chat URL: got %q, want %q (direct to the broker, not a router)", prov.URL, want)
+	if want := broker.srv.URL + "/v1/proxy/chat/completions"; prov.URL != want {
+		t.Errorf("chat URL: got %q, want %q (broker's /v1/proxy prefix, not a router)", prov.URL, want)
 	}
 	if prov.Endpoint != broker.srv.URL {
 		t.Errorf("endpoint: got %q, want %q (for the §8 signature fetch)", prov.Endpoint, broker.srv.URL)
@@ -64,6 +67,47 @@ func TestDirect_ResolveSealsStraightToBroker(t *testing.T) {
 	}
 	if prov.Model != "" {
 		t.Errorf("model: got %q, want empty (caller's model passes through)", prov.Model)
+	}
+}
+
+// TestDirect_RoundTripHitsBrokerProxyPath: a core client on the direct resolver
+// seals a request, POSTs it straight to the broker's /v1/proxy/chat/completions
+// (its "/v1/proxy" prefix — a router-style /v1/chat/completions path would 404),
+// and opens the sealed answer, with the prompt never leaving cleartext and no
+// router pin set. This is the guard the URL string alone can't give: it exercises
+// the actual POST path end to end.
+func TestDirect_RoundTripHitsBrokerProxyPath(t *testing.T) {
+	broker := newMockBroker(t)
+
+	res, err := NewDirect(broker.srv.URL)
+	if err != nil {
+		t.Fatalf("NewDirect: %v", err)
+	}
+	client := core.NewWithResolver(res)
+
+	out, err := client.Complete(context.Background(), chatReq())
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if broker.chatHits != 1 {
+		t.Fatalf("broker /v1/proxy/chat/completions hits: got %d, want 1 (wrong derived path?)", broker.chatHits)
+	}
+	if broker.lastChatPin != "" {
+		t.Errorf("direct mode set a router pin X-0G-Provider-Address=%q, want none", broker.lastChatPin)
+	}
+	var got struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	raw, _ := json.Marshal(out)
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("decode opened response: %v", err)
+	}
+	if len(got.Choices) != 1 || got.Choices[0].Message.Content != "direct answer" {
+		t.Errorf("opened content: got %+v, want \"direct answer\"", got.Choices)
 	}
 }
 

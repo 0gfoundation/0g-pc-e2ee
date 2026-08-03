@@ -13,10 +13,12 @@ import (
 // directResolver seals every request to ONE fixed provider, skipping the
 // router's route-preview hop entirely. It is the dev/test posture for an
 // environment that has a broker but no centralized router: the sealed request is
-// POSTed straight to the provider's own /v1/chat/completions, and the provider's
-// enc key + signer are fetched from its broker's /v1/e2ee/pubkey (the same fetch
-// the routed path uses, reused here) — or from a DCAP-verified /v1/quote when the
-// underlying Router has quote verification configured.
+// POSTed straight to the broker's own /v1/proxy/chat/completions (the endpoint
+// the router would otherwise forward to — the broker serves its proxied inference
+// surface under ServicePrefix "/v1/proxy", same as /v1/proxy/signature), and the
+// provider's enc key + signer are fetched from its broker's /v1/e2ee/pubkey (the
+// same fetch the routed path uses, reused here) — or from a DCAP-verified
+// /v1/quote when the underlying Router has quote verification configured.
 //
 // Two things the routed path does are intentionally absent, because there is no
 // router in the path: no X-0G-Provider-Address routing pin (Provider.Address is
@@ -29,9 +31,11 @@ import (
 type directResolver struct {
 	router      *Router
 	providerURL string
-	// chatURL is the provider's own OpenAI chat-completions endpoint, derived from
-	// providerURL once at construction so a malformed URL fails loud up front. The
-	// sealed request POSTs here directly (no router completions hop).
+	// chatURL is the broker's own chat-completions endpoint under its "/v1/proxy"
+	// service prefix (…/v1/proxy/chat/completions — the path the router would
+	// forward a sealed request to, NOT the router's own /v1/chat/completions),
+	// derived from providerURL once at construction so a malformed URL fails loud up
+	// front. The sealed request POSTs here directly (no router completions hop).
 	chatURL string
 }
 
@@ -44,8 +48,9 @@ type directResolver struct {
 //
 // providerURL may be a bare origin (https://host[:port]), the /v1 base, or the
 // full chat-completions URL; all resolve to the same /v1 base, off which the
-// pubkey, quote, signature, and chat paths hang (see deriveV1Base). A malformed or
-// empty URL is a construction error, not a per-request one.
+// pubkey (/v1/e2ee/pubkey), quote (/v1/quote), signature (/v1/proxy/signature),
+// and chat (/v1/proxy/chat/completions) paths hang (see deriveV1Base). A malformed
+// or empty URL is a construction error, not a per-request one.
 func NewDirect(providerURL string, opts ...Option) (core.Resolver, error) {
 	if strings.TrimSpace(providerURL) == "" {
 		return nil, fmt.Errorf("direct provider URL is required")
@@ -60,7 +65,10 @@ func NewDirect(providerURL string, opts ...Option) (core.Resolver, error) {
 	return &directResolver{
 		router:      New(providerURL, opts...),
 		providerURL: providerURL,
-		chatURL:     base + "/chat/completions",
+		// The broker serves chat completions under its "/v1/proxy" prefix
+		// (mirroring /v1/proxy/signature), NOT at the router's top-level
+		// /v1/chat/completions — POST the sealed request there directly.
+		chatURL: base + "/proxy/chat/completions",
 	}, nil
 }
 
@@ -79,9 +87,10 @@ func (c directCandidates) Len() int { return 1 }
 
 // Provider materializes the fixed provider, fetching its enc key + signer from
 // the broker (pubkey endpoint, or a DCAP-verified quote when configured). URL is
-// the provider's OWN chat endpoint (direct, no router), Endpoint carries the same
-// base so the §8 response signature can be fetched direct from it, and Address /
-// Model are left empty (no routing pin, caller's model passes through).
+// the broker's OWN /v1/proxy/chat/completions (direct, no router), Endpoint
+// carries the same base so the §8 response signature can be fetched direct from
+// it, and Address / Model are left empty (no routing pin, caller's model passes
+// through).
 func (c directCandidates) Provider(ctx context.Context, _ int) (core.Provider, error) {
 	d := c.d
 	var (

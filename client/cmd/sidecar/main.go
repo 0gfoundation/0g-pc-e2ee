@@ -15,9 +15,9 @@
 // no centralized router (dev): set -provider-url (ZG_SIDECAR_PROVIDER_URL) to a
 // provider endpoint and the sidecar skips route-preview, fetches that provider's
 // enc key + signer from its broker's /v1/e2ee/pubkey, and POSTs the sealed request
-// straight to the provider's own /v1/chat/completions. -verify-responses works in
-// this mode without -attest (the signer comes from the broker you pointed at, not
-// an untrusted router); on-chain grounding and the warmer are router-only.
+// straight to the broker's own /v1/proxy/chat/completions. -verify-responses works
+// in this mode without -attest (the signer comes from the broker you pointed at,
+// not an untrusted router); on-chain grounding and the warmer are router-only.
 //
 // Startup wiring (flags, env-var defaults, route/seal plumbing) is shared with
 // the gateway via client/cmd/internal/proxycli; the sidecar keeps only its own
