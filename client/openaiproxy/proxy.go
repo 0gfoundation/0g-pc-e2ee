@@ -190,8 +190,8 @@ func Handler(c *core.Client, opts ...Option) http.Handler {
 }
 
 // Register mounts the proxy's routes on an existing mux, so a caller can serve
-// the OpenAI endpoint alongside its own (e.g. the gateway's /healthz and
-// /quote) on one server.
+// the OpenAI endpoint alongside its own (e.g. the gateway's /healthz) on one
+// server.
 func Register(mux *http.ServeMux, c *core.Client, opts ...Option) {
 	var o options
 	for _, opt := range opts {
