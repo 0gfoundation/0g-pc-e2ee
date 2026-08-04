@@ -50,9 +50,11 @@ func (c *Client) verifyEnabled() bool {
 func (c *Client) verifyNonStream(ctx context.Context, provider Provider, header http.Header, reqEnv wire.Request, respFrame wire.Response) error {
 	sig, err := c.fetchSig(ctx, provider, header)
 	if err != nil {
+		c.metricVerifyFail("fetch")
 		return err
 	}
 	if err := sig.VerifyE2EE(reqEnv, respFrame, provider.SignerAddr, c.recover); err != nil {
+		c.metricVerifyFail("signature")
 		return fmt.Errorf("response signature: %w", err)
 	}
 	return nil
@@ -67,12 +69,23 @@ func (c *Client) verifyStream(ctx context.Context, provider Provider, header htt
 	}
 	sig, err := c.fetchSig(ctx, provider, header)
 	if err != nil {
+		c.metricVerifyFail("fetch")
 		return err
 	}
 	if err := sig.VerifyBoundText(want, proof.SchemeE2EECiphertextStream, provider.SignerAddr, c.recover); err != nil {
+		c.metricVerifyFail("signature")
 		return fmt.Errorf("response signature: %w", err)
 	}
 	return nil
+}
+
+// metricVerifyFail reports one response-verification failure to the metrics hook
+// (no-op when unset), matching logOpenFailure's independence from the debug
+// logger. reason is a fixed low-cardinality label ("fetch" or "signature").
+func (c *Client) metricVerifyFail(reason string) {
+	if c.metrics != nil {
+		c.metrics.ResponseVerificationFailure(reason)
+	}
 }
 
 // fetchSig reads the chatKey handle and fetches the signature. A missing header

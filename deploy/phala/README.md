@@ -215,12 +215,39 @@ docker buildx imagetools inspect ghcr.io/0gfoundation/0g-pc-e2ee-gateway:latest
 Changing either digest changes `app_id`, which is the point: it is a new
 deployment, and verifiers have to re-audit it.
 
+## Metrics (Prometheus)
+
+The gateway exports Prometheus metrics, but **not on the public endpoint**. It
+serves `/metrics` on a separate internal listener (`ZG_GATEWAY_METRICS_LISTEN`,
+set to `0.0.0.0:9464` in the compose). That port is never published to the host
+and dstack-ingress does not front it, so — like the gateway's `:8443` — it is
+reachable only over the compose network. This keeps operational telemetry off the
+same edge as the OpenAI API and avoids adding a side channel to the confidential
+enclave.
+
+Shipping the samples out — a co-located Prometheus-agent sidecar that scrapes
+`gateway:9464` and `remote_write`s to a central store — is added **separately**,
+since it touches the measured compose and depends on your deploy-side store and
+runtime. This PR only exposes the endpoint; nothing scrapes it yet. Until the
+scraper lands you can still read it from inside the CVM network
+(`curl http://gateway:9464/metrics`).
+
+### Metric hygiene
+
+Labels are deliberately low-cardinality and content-free (route templates, HTTP
+methods, status codes, fixed outcome enums) — the same redaction discipline the
+access log keeps, so metrics never leak the plaintext the E2EE seal protects. See
+[`client/metrics`](../../client/metrics) for the full metric set (HTTP RED,
+completion outcome by source/stage, E2EE open failures, §8 response-signature
+verification failures, quote verify latency, quote/collateral cache hit ratios,
+and warmer liveness).
+
 ## Notes
 
-- **Secrets.** The Cloudflare token is the only secret to supply, but the
-  `cert-data` volume holds material just as sensitive — the TLS private key and
-  the ACME account key. It never leaves the CVM; do not snapshot or export it.
-  The `evidences` volume is public by design.
+- **Secrets.** The Cloudflare token is the secret to supply, but the `cert-data`
+  volume holds material just as sensitive — the TLS private key and the ACME
+  account key. It never leaves the CVM; do not snapshot or export it. The
+  `evidences` volume is public by design.
 - **Attestation** comes entirely from dstack-ingress's `/evidences/`. The gateway
   exposes no attestation endpoint of its own and signs no responses of its own:
   its `app_id`-covered image is already attested by the ingress cert-binding

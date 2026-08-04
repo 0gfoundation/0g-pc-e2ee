@@ -46,6 +46,7 @@ import (
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
@@ -386,8 +387,10 @@ func (r *Router) verifiedKeys(ctx context.Context, endpoint string) (crypto.Publ
 		return nil, "", upstream(0, fmt.Errorf("provider endpoint: %w", err))
 	}
 	if encPub, signer, ok := r.quoteCache.get(quoteURL); ok {
+		metrics.QuoteCacheLookup(true)
 		return encPub, signer, nil
 	}
+	metrics.QuoteCacheLookup(false)
 	res, err := r.verifyAndCache(ctx, quoteURL)
 	if err != nil {
 		return nil, "", err
@@ -434,7 +437,14 @@ func (r *Router) verifyAndCache(ctx context.Context, quoteURL string) (quoteResu
 // quote, it does not matter that the untrusted router chose the endpoint: a
 // substituted endpoint serving an attacker key would fail verification. On a
 // warn-mode measurement miss it logs but still returns the (genuine) keys.
-func (r *Router) verifyQuoteAt(ctx context.Context, quoteURL string) (crypto.PublicKey, string, error) {
+func (r *Router) verifyQuoteAt(ctx context.Context, quoteURL string) (encPub crypto.PublicKey, signer string, err error) {
+	// Meter the actually-performed verification (this runs only on a cache miss)
+	// and its latency, so the histogram measures the expensive path — quote fetch
+	// + go-tdx-guest signature/TCB checks + any collateral fetch — that the warmer
+	// and the quote cache exist to keep off the request path.
+	start := time.Now()
+	defer func() { metrics.QuoteVerification(err == nil, time.Since(start)) }()
+
 	raw, err := r.fetchQuote(ctx, quoteURL)
 	if err != nil {
 		return nil, "", err
@@ -444,6 +454,7 @@ func (r *Router) verifyQuoteAt(ctx context.Context, quoteURL string) (crypto.Pub
 		return nil, "", upstream(0, fmt.Errorf("provider quote: %w", err))
 	}
 	if !verified.MeasurementTrusted {
+		metrics.MeasurementUntrusted()
 		r.logger.Warn("sealing to provider whose measurement is not in the allowlist (attest warn mode)",
 			"quote_url", quoteURL,
 			"mrtd", fmt.Sprintf("%x", verified.Measurement.MRTD[:]),

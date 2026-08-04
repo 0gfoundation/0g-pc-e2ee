@@ -122,6 +122,7 @@ services:
     # recreated with a new address, restart dstack-ingress too.
     expose:
       - "8443"
+      - "9464" # internal Prometheus /metrics (see ZG_GATEWAY_METRICS_LISTEN below)
     # The gateway serves GET /healthz ("ok"); the image is distroless (no shell,
     # no curl), so the probe is the gateway binary itself — `gateway -health`
     # does one GET /healthz to its own ZG_GATEWAY_LISTEN port and exits 0/1. This
@@ -145,6 +146,14 @@ services:
       # localhost bind (as the sidecar uses) would be unreachable across the
       # compose network.
       - "ZG_GATEWAY_LISTEN=0.0.0.0:8443"
+      # Serve Prometheus /metrics on a SEPARATE internal listener. Like the gateway
+      # itself this port is never published to the host and dstack-ingress does not
+      # front it, so it is reachable only over the compose network — by a co-located
+      # Prometheus-agent scraper (added separately, which scrapes `gateway:9464`).
+      # Binding 0.0.0.0 is what lets that scraper reach it across the compose network
+      # (a localhost bind would be container-local). Empty/unset disables the
+      # endpoint entirely; the sidecar binary leaves it unset.
+      - "ZG_GATEWAY_METRICS_LISTEN=0.0.0.0:9464"
       # The gateway routes per request and derives each provider's enc key +
       # signer from the broker, so no provider/key is configured up front. The
       # router base URL is deploy-time injectable so staging and prod can share
@@ -227,6 +236,10 @@ services:
     # The gateway itself holds no secret: no pinned provider key, and no TLS
     # material — the cert and its key belong to dstack-ingress above, generated
     # in-enclave via ACME and kept in the cert-data volume.
+    #
+    # The gateway serves Prometheus /metrics on the internal 9464 above; a
+    # co-located Prometheus-agent sidecar that scrapes it and remote_writes to a
+    # central store is added separately (it depends only on this exposed port).
 
 volumes:
   cert-data: # SECRET: holds the TLS private key and the ACME account key

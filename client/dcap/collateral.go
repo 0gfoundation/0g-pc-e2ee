@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/google/go-tdx-guest/verify/trust"
 )
 
@@ -87,6 +88,7 @@ func (g *cachingGetter) Get(u string) (map[string][]string, []byte, error) {
 	g.mu.Lock()
 	if e, ok := g.m[u]; ok && time.Now().Before(e.exp) {
 		g.mu.Unlock()
+		metrics.CollateralCacheLookup(true)
 		// Hand back a copy of the body: the same entry is shared by every caller, so
 		// returning the stored slice directly would let one caller's mutation poison
 		// the collateral another verification reads. (go-tdx-guest treats it as
@@ -94,11 +96,16 @@ func (g *cachingGetter) Get(u string) (map[string][]string, []byte, error) {
 		return e.header, append([]byte(nil), e.body...), nil
 	}
 	g.mu.Unlock()
+	metrics.CollateralCacheLookup(false)
 
 	// Miss (or expired): fetch. Two callers can race the same URL here and both
 	// fetch; that is a harmless duplicate — the fetch is an idempotent GET and both
-	// store the same value — so no singleflight is warranted for this path.
+	// store the same value — so no singleflight is warranted for this path. The
+	// fetch latency and outcome are metered (this is the Intel PCS / PCCS dependency
+	// the cache shields).
+	start := time.Now()
 	header, body, err := g.inner.Get(u)
+	metrics.CollateralFetch(err == nil, time.Since(start))
 	if err != nil {
 		return nil, nil, err
 	}

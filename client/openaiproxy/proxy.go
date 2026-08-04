@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
@@ -234,6 +235,7 @@ func Register(mux *http.ServeMux, c *core.Client, opts ...Option) {
 			return
 		}
 		resp, err := c.Complete(ctx, req)
+		recordCompletion(err)
 		if err != nil {
 			o.writeError(w, err)
 			return
@@ -324,6 +326,24 @@ func streamRequested(req wire.Request) (bool, error) {
 	return stream, nil
 }
 
+// recordCompletion meters one chat-completion outcome (streaming or buffered),
+// attributing a failure to where it originated via core.Error.Source/Stage so a
+// gateway-side fault is countable apart from a router/provider one. A success
+// carries neutral source/stage; a non-core error (should not occur on this path)
+// is attributed to the gateway with an "unknown" stage rather than dropped.
+func recordCompletion(err error) {
+	if err == nil {
+		metrics.Completion("success", "none", "none")
+		return
+	}
+	var e *core.Error
+	if errors.As(err, &e) {
+		metrics.Completion("error", e.Source(), e.Stage)
+		return
+	}
+	metrics.Completion("error", "gateway", "unknown")
+}
+
 // statusFor maps a Complete failure to an HTTP status. A non-2xx provider status
 // is surfaced verbatim (so OpenAI clients keep their retry/backoff on 429/5xx vs
 // 4xx); otherwise a bad client request is 400, a client-side internal error is
@@ -383,6 +403,7 @@ func serveStream(ctx context.Context, w http.ResponseWriter, c *core.Client, req
 		flusher.Flush()
 		return nil
 	})
+	recordCompletion(err)
 	if err != nil {
 		if !wroteHeader {
 			// Nothing sent yet — a normal error response with a real status.
