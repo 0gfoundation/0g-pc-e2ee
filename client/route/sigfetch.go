@@ -106,7 +106,7 @@ func (f *SignatureFetcher) fetchOnce(ctx context.Context, url string) (proof.Cha
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		retryable := resp.StatusCode == http.StatusNotFound || (resp.StatusCode >= 500 && resp.StatusCode <= 599)
-		return proof.ChatSignature{}, retryable, fmt.Errorf("signature endpoint returned %d", resp.StatusCode)
+		return proof.ChatSignature{}, retryable, fmt.Errorf("signature endpoint %s returned %d", url, resp.StatusCode)
 	}
 	var sig proof.ChatSignature
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxSignatureBytes)).Decode(&sig); err != nil {
