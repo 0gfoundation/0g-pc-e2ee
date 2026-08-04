@@ -41,6 +41,55 @@ func setResKey(w http.ResponseWriter, meta *core.ResponseMeta) {
 	}
 }
 
+// passthroughResponseHeaders is the curated set of upstream (router) response
+// headers the gateway surfaces back to its own user. All are non-sensitive
+// operational metadata a thin client needs to behave correctly: the broker's
+// fault attribution (and its legacy alias), the served-provider address, the
+// per-IP rate-limit counters with their reset/Retry-After hints, and the
+// request-correlation id for bug reports. ZG-Res-Key is deliberately absent —
+// setResKey surfaces it separately. Everything not on this list stays inside the
+// gateway, so an upstream header can never leak untrusted or identifying detail
+// to the user by default.
+var passthroughResponseHeaders = []string{
+	"ZG-Failure-Source",
+	"X-ZG-Failure-Source",
+	"X-Provider",
+	"Retry-After",
+	"X-Request-ID",
+	"X-RateLimit-Limit-Requests",
+	"X-RateLimit-Remaining-Requests",
+	"X-RateLimit-Reset-Requests",
+	"X-RateLimit-Limit-Day",
+	"X-RateLimit-Remaining-Day",
+	"X-RateLimit-Reset-Day",
+}
+
+// setPassthrough re-emits the curated subset of an upstream response header
+// block (src) onto the front-end response — used on both the success path
+// (core.ResponseMeta.Header) and the error path (core.Error.Header, so a 429's
+// Retry-After and rate-limit counters reach the caller). Like setResKey it must
+// run before WriteHeader or the first body byte. A nil src or a header the
+// upstream did not send is skipped, so nothing is fabricated; multi-valued
+// headers are preserved entry-for-entry.
+func setPassthrough(w http.ResponseWriter, src http.Header) {
+	for _, name := range passthroughResponseHeaders {
+		for _, v := range src.Values(name) {
+			w.Header().Add(name, v)
+		}
+	}
+}
+
+// upstreamHeader returns the upstream response header block carried by a
+// core.Error (a non-2xx or malformed upstream reply), or nil for a transport
+// failure or any non-core error — nothing to surface in those cases.
+func upstreamHeader(err error) http.Header {
+	var e *core.Error
+	if errors.As(err, &e) {
+		return e.Header
+	}
+	return nil
+}
+
 // Option customizes the proxy's behavior.
 type Option func(*options)
 
@@ -169,11 +218,12 @@ func Register(mux *http.ServeMux, c *core.Client, opts ...Option) {
 			writeGatewayError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		// Forward the caller's Authorization header (the 0G key an OpenAI SDK sends)
-		// so the provider can authenticate and bill, plus the X-0G-* routing
-		// directives the router consumes. Nothing else is forwarded — arbitrary
-		// client headers must not leak to the (untrusted) router.
-		ctx := core.WithCredential(r.Context(), r.Header.Get("Authorization"))
+		// Forward the caller's 0G key (an OpenAI SDK sends it as Authorization, an
+		// Anthropic SDK as x-api-key) so the provider can authenticate and bill, plus
+		// the X-0G-* routing directives and the app-attribution headers the router
+		// consumes. Nothing else is forwarded — arbitrary client headers must not
+		// leak to the (untrusted) router.
+		ctx := core.WithCredential(r.Context(), credential(r))
 		ctx = core.WithForwardedHeaders(ctx, routingHeaders(r.Header))
 		// Collect the response's ZG-Res-Key handle so we can re-expose it to our own
 		// user, who can fetch and audit the §8 signature from the broker.
@@ -193,6 +243,7 @@ func Register(mux *http.ServeMux, c *core.Client, opts ...Option) {
 			writeGatewayError(w, http.StatusInternalServerError, "encode response")
 			return
 		}
+		setPassthrough(w, meta.Header)
 		setResKey(w, meta)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(out)
@@ -205,14 +256,31 @@ func Register(mux *http.ServeMux, c *core.Client, opts ...Option) {
 // case-insensitive since HTTP header names are.
 const routingHeaderPrefix = "x-0g-"
 
-// routingHeaders selects the X-0G-* routing directives from the inbound request
-// to forward upstream. Restricting to this namespace is deliberate: it lets an
-// app steer routing via standard headers without the proxy leaking arbitrary
-// client headers (cookies, app-internal metadata) to the untrusted router.
+// attributionHeaders are the request headers the router also consumes for
+// traffic attribution but which sit outside the X-0G-* namespace: the
+// OpenRouter-convention app identity (HTTP-Referer is intentionally the
+// misspelled form the router matches; X-Title is the app title). They are the
+// same self-reported, unauthenticated class as X-0G-Source-Id — the router
+// drops unknown values — so forwarding them keeps partner/app attribution
+// working when traffic enters at the gateway instead of the router, without
+// widening the leak surface beyond metadata that carries no prompt content.
+// Keys are lower-cased for the case-insensitive match.
+var attributionHeaders = map[string]bool{
+	"http-referer": true,
+	"x-title":      true,
+}
+
+// routingHeaders selects the headers the router legitimately consumes — the
+// X-0G-* routing directives and the app-attribution headers — from the inbound
+// request to forward upstream. Restricting to this set is deliberate: it lets an
+// app steer routing and report attribution via standard headers without the
+// proxy leaking arbitrary client headers (cookies, app-internal metadata) to the
+// untrusted router.
 func routingHeaders(h http.Header) http.Header {
 	var out http.Header
 	for k, vs := range h {
-		if !strings.HasPrefix(strings.ToLower(k), routingHeaderPrefix) {
+		lk := strings.ToLower(k)
+		if !strings.HasPrefix(lk, routingHeaderPrefix) && !attributionHeaders[lk] {
 			continue
 		}
 		if out == nil {
@@ -221,6 +289,24 @@ func routingHeaders(h http.Header) http.Header {
 		out[k] = vs
 	}
 	return out
+}
+
+// credential extracts the caller's 0G key as an Authorization value for the
+// provider request. It prefers the Authorization header verbatim (an OpenAI SDK
+// sends `Bearer <key>`); absent that it accepts the Anthropic-convention
+// x-api-key header and wraps it as a bearer credential — the router's
+// Authorization parse requires the `Bearer ` prefix, while x-api-key is sent
+// raw, so the raw key must be wrapped rather than passed through as-is. Returns
+// "" when neither is present, which leaves the provider request unauthenticated
+// (the core sets no Authorization for an empty credential).
+func credential(r *http.Request) string {
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		return auth
+	}
+	if apiKey := r.Header.Get("x-api-key"); apiKey != "" {
+		return "Bearer " + apiKey
+	}
+	return ""
 }
 
 // streamRequested reports whether the request asked for a streamed (SSE)
@@ -274,8 +360,9 @@ func serveStream(ctx context.Context, w http.ResponseWriter, c *core.Client, req
 		if wroteHeader {
 			return
 		}
-		// The core records the handle at stream commit, before the first frame
+		// The core records the metadata at stream commit, before the first frame
 		// reaches this callback, so it is available here before we write headers.
+		setPassthrough(w, meta.Header)
 		setResKey(w, meta)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
@@ -350,7 +437,11 @@ func writeGatewayError(w http.ResponseWriter, code int, msg string) {
 }
 
 // writeError emits a core.Error (or any error) as the attributed envelope, with
-// the upstream status surfaced verbatim (statusFor).
+// the upstream status surfaced verbatim (statusFor). It first re-emits the
+// curated upstream response headers (Retry-After / rate-limit on a 429, the
+// broker's fault attribution), which must be set before writeErrorObject writes
+// the status line.
 func (o options) writeError(w http.ResponseWriter, err error) {
+	setPassthrough(w, upstreamHeader(err))
 	writeErrorObject(w, statusFor(err), o.errorEnvelope(err))
 }

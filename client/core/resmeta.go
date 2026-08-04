@@ -24,6 +24,17 @@ type ResponseMeta struct {
 	// Empty when the provider sent none (e.g. a provider that does not cache a §8
 	// signature), which the caller treats as "no handle", not an error.
 	ResKey string
+
+	// Header is a clone of the upstream response's header block — the router's
+	// response, since the sealed request goes through the router for auth/billing.
+	// The core captures it verbatim and takes no view on which entries are safe to
+	// surface; a front end decides that (the gateway re-emits a curated,
+	// non-sensitive subset — rate-limit counters, Retry-After, the broker's
+	// fault-attribution and the request-correlation id — back to its own user).
+	// Nil when no response was received (a failed attempt); recorded only on the
+	// path that produced the delivered response, so it never reflects a discarded
+	// fallback attempt.
+	Header http.Header
 }
 
 // WithResponseMeta returns a context carrying a sink the core fills with
@@ -36,16 +47,18 @@ func WithResponseMeta(ctx context.Context, m *ResponseMeta) context.Context {
 	return context.WithValue(ctx, responseMetaKey{}, m)
 }
 
-// recordResKey stores the ZG-Res-Key handle from a provider response header into
-// the sink carried by ctx, if one is attached. It is called only on the path
-// that produces the response the caller receives — the successful non-stream
-// attempt, or a committed stream — so the recorded handle always matches the
-// delivered response and is never left stale by a discarded fallback attempt. A
-// missing header records the empty string. Independent of verification: the
-// handle is surfaced even when §8 verification is off, precisely so a caller can
-// fetch and check the signature out of band.
-func recordResKey(ctx context.Context, header http.Header) {
+// recordMeta stores per-response metadata from an upstream response header into
+// the sink carried by ctx, if one is attached: the ZG-Res-Key handle and a clone
+// of the full header block for a front end to surface a curated subset. It is
+// called only on the path that produces the response the caller receives — the
+// successful non-stream attempt, or a committed stream — so the recorded data
+// always matches the delivered response and is never left stale by a discarded
+// fallback attempt. A missing ZG-Res-Key records the empty string. Independent
+// of verification: the handle is surfaced even when §8 verification is off,
+// precisely so a caller can fetch and check the signature out of band.
+func recordMeta(ctx context.Context, header http.Header) {
 	if m, ok := ctx.Value(responseMetaKey{}).(*ResponseMeta); ok {
 		m.ResKey = header.Get(headerResKey)
+		m.Header = header.Clone()
 	}
 }

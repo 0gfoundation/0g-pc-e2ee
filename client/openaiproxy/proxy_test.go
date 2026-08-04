@@ -189,6 +189,45 @@ func TestProxyPassesUpstreamStatus(t *testing.T) {
 	}
 }
 
+// A non-2xx upstream reply must carry its operational headers back to the caller
+// — Retry-After and the rate-limit counters a client needs to back off — while
+// non-allowlisted upstream headers stay inside the gateway.
+func TestProxySurfacesErrorResponseHeaders(t *testing.T) {
+	_, encPub, _ := crypto.GenerateRecipientKey()
+	signer := "0x" + strings.Repeat("a", 40)
+
+	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "42")
+		w.Header().Set("X-RateLimit-Remaining-Requests", "0")
+		w.Header().Set("X-Router-Internal", "do-not-surface") // not allowlisted
+		http.Error(w, "slow down", http.StatusTooManyRequests)
+	}))
+	defer broker.Close()
+
+	client := core.New(core.Provider{URL: broker.URL, EncPubKey: encPub, SignerAddr: signer})
+	proxy := httptest.NewServer(openaiproxy.Handler(client))
+	defer proxy.Close()
+
+	userReq := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`
+	httpResp, err := http.Post(proxy.URL+"/v1/chat/completions", "application/json", strings.NewReader(userReq))
+	if err != nil {
+		t.Fatalf("post to proxy: %v", err)
+	}
+	defer httpResp.Body.Close()
+	if httpResp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("got %d, want 429", httpResp.StatusCode)
+	}
+	if got := httpResp.Header.Get("Retry-After"); got != "42" {
+		t.Errorf("Retry-After = %q, want 42 (surfaced on the error path)", got)
+	}
+	if got := httpResp.Header.Get("X-RateLimit-Remaining-Requests"); got != "0" {
+		t.Errorf("X-RateLimit-Remaining-Requests = %q, want 0", got)
+	}
+	if got := httpResp.Header.Get("X-Router-Internal"); got != "" {
+		t.Errorf("non-allowlisted upstream header leaked: %q", got)
+	}
+}
+
 // The raw upstream body is untrusted content. By default (the gateway's mode)
 // the proxy must NOT echo it back; with WithVerboseUpstreamErrors (the sidecar's
 // mode) it may, for local debugging. The status passes through in both cases.
