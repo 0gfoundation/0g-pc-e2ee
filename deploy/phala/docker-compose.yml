@@ -118,9 +118,21 @@ services:
       # compose network.
       - "ZG_GATEWAY_LISTEN=0.0.0.0:8443"
       # The gateway routes per request and derives each provider's enc key +
-      # signer from the broker, so no provider/key is configured up front. It
-      # defaults to the 0G router; uncomment to override.
-      # - "ZG_GATEWAY_ROUTER_URL=https://router-api.0g.ai"
+      # signer from the broker, so no provider/key is configured up front. The
+      # router base URL is deploy-time injectable so staging and prod can share
+      # this file: the value below is the measured text, but the ${...} form lets
+      # an encrypted-env override win at boot. Unset (prod) → the 0G production
+      # router; set ZG_GATEWAY_ROUTER_URL in the CVM's encrypted environment
+      # (staging) → that URL. The interpolation happens INSIDE the CVM, so the
+      # variable must also be listed in the app's allowed_envs — dstack drops any
+      # encrypted var that is not, surfacing only as a boot-time interpolation
+      # error. Because the measured text is the ${...} form (identical for both),
+      # staging and prod share app_id: attestation does NOT distinguish which
+      # router was used. That is acceptable here only because the router is
+      # untrusted by construction — every provider is verified by TDX quote and
+      # on-chain signer (ATTEST/ONCHAIN below), so a swapped router cannot forge a
+      # provider; the blast radius is routing/availability, not confidentiality.
+      - "ZG_GATEWAY_ROUTER_URL=${ZG_GATEWAY_ROUTER_URL:-https://router-api.0g.ai}"
       # Request fields sealed end-to-end to the provider (must include
       # "messages"). Defaults to the binary's built-in set; uncomment to override.
       # - "ZG_GATEWAY_SEAL_FIELDS=messages"

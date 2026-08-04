@@ -211,8 +211,14 @@ deployment, and verifiers have to re-audit it.
   `/quote` route is a 501 stub pending issue #19; it is not part of this
   deployment's trust story and is not needed for the certificate binding.
 - The gateway holds no pinned provider key: it routes per request and derives
-  each provider's enc key + signer from the broker. It defaults to the 0G router;
-  override with `ZG_GATEWAY_ROUTER_URL`.
+  each provider's enc key + signer from the broker. The router base URL is
+  `${ZG_GATEWAY_ROUTER_URL:-https://router-api.0g.ai}` — unset it (production) to
+  use the 0G production router, or inject `ZG_GATEWAY_ROUTER_URL` via the CVM's
+  **encrypted environment** (staging) to point at a different router. The
+  variable must be listed in the app's `allowed_envs` for the override to reach
+  the container. Since the *measured* text is the `${…}` form, staging and
+  production share `app_id`; that is safe only because the router is untrusted by
+  construction (see the provider-verification note below).
 - **Provider verification** is on in verify-and-warn mode. Each provider's TDX
   quote is DCAP-verified (`ZG_GATEWAY_ATTEST`), its quote-bound signer is
   cross-checked against the on-chain `teeSignerAddress`
