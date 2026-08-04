@@ -50,7 +50,7 @@ property (validate the endpoint out of band).
                           └───────────────────────────────────────────────────────────┘
         ▲
         │  (separate, out-of-band)
-   validation step  ──▶  quote API + cert-binding + transparency log  ──▶  "endpoint == attested measurement X"
+   validation step  ──▶  cert-binding quote (dstack-ingress) + transparency log  ──▶  "endpoint == attested measurement X"
 ```
 
 - **Data plane**: browser → TLS (terminated in the enclave) → gateway does the
@@ -90,8 +90,9 @@ HTTP handler.
 `client/openaiproxy`); `cmd/sidecar` and `cmd/gateway` both mount it. The gateway
 adds only what the sidecar lacks:
 
-- **attestation** — derive the enclave enc/signing keys and expose the quote API
-  (§6);
+- **attestation** — the CVM's cert-binding quote, supplied by dstack-ingress
+  (§6/§7), not a gateway-issued quote API; the gateway adds no attestation
+  surface of its own;
 - **multi-tenant concerns** — auth, per-user billing attribution, rate limiting,
   abuse handling, and logging that never records plaintext (the sidecar is
   single-user and needs none of these);
@@ -166,28 +167,23 @@ controlled only by that enclave?"**
 > else, so verifying `/evidences` needs a second verifier, which is still to be
 > written.
 >
-> The gateway therefore needs no cert-binding quote of its own; its `/quote` route
-> remains a 501 stub (issue #19). A gateway quote is still required if it ever
-> binds a *distinct* value the cert quote cannot carry — e.g. its own per-response
-> signing key (point 5 below).
+> The gateway therefore needs no quote of its own and exposes **no `/quote`
+> route**. The only thing that could have required a distinct gateway quote — a
+> value the cert quote cannot carry — was a gateway-issued per-response signature
+> binding its own signing key; we have **decided not to add gateway response
+> signing** (see §6.2), so no gateway quote is needed at all. Inference
+> authenticity rides the provider's own SPEC §8 signature instead.
 
-1. **Quote API** (like the broker's): the gateway exposes its attestation quote
-   / RA report. Reuses the §4 (`protocol/attest`, issue #7) verification path.
-2. **Bind the TLS cert key into the quote**: put a hash of the enclave's TLS
-   certificate public key in the quote's `report_data`, so the quote proves
-   "measurement X controls *this* cert".
+1. **Cert-binding quote**: a TDX quote from inside the CVM that commits to the
+   served cert and to `app_id`. Emitted by **dstack-ingress** (`/evidences`, see
+   the decision box above), not by a gateway-issued quote API.
+2. **Bind the TLS cert into that quote**: dstack-ingress puts
+   `SHA-256(sha256sum.txt)` (which covers the served cert) in the quote's
+   `report_data`, so the quote proves "measurement X controls *this* cert".
 3. **Publish `measurement X ↔ cert fingerprint`** in a transparency log / on
    chain, and rely on **Certificate Transparency** for the cert itself.
 4. **Continuous monitoring** (ideally run by 0G and/or a third party), so the
    guarantee is not left solely to end users.
-5. **Per-request response signature** (like the broker's, SPEC §8): the gateway
-   signs each response with its enclave key. A plain browser **cannot verify it
-   live** — verifying a signature is crypto, i.e. client code — but the signature
-   makes each response **individually auditable out of band** (verify later, by a
-   tool / extension / monitor) and is **forward-compatible**: a client that later
-   runs a little code verifies the *same* signature live (tier 3). It only
-   *complements* — does not replace — the one-time attestation that vouches for
-   the signing key (broker model = attest the key once + sign every response).
 
 ### 6.2 What it proves / does not prove
 
@@ -198,12 +194,16 @@ controlled only by that enclave?"**
 - **Does not prove**: that *this specific browser request* went to that enclave.
   A plain browser only checks WebPKI, so the binding between "what the auditor
   validated" and "what the user connected to" is **detected, not enforced**.
-- **On per-request signatures**: a *gateway* signature attests "the attested
-  gateway enclave handled this response", not "the inference is genuine" — the
-  gateway relays, it does not run the model. For inference authenticity, carry
-  the *broker's* signature (SPEC §8) through to the client. Verifying either is
-  client code, so for a 0-code browser both are out-of-band / after-the-fact
-  artifacts, not live checks.
+- **On response signatures**: the gateway signs **no** response of its own. A
+  gateway signature would only attest "the attested gateway enclave handled this
+  response", not "the inference is genuine" — the gateway relays, it does not run
+  the model — and endpoint identity is already covered by the cert binding, so it
+  would add only a transferable, after-the-fact proof (a tier-3 nicety) at the
+  cost of a second enclave key to attest. We skip it. Inference authenticity comes
+  from the **provider's** own SPEC §8 signature, which the gateway verifies
+  (`ZG_GATEWAY_VERIFY_RESPONSES`) and can carry through to the client; verifying
+  that is client code, an out-of-band / after-the-fact check for a 0-code browser,
+  not a live one.
 
 Closing the "which endpoint did my request hit" gap is exactly what tier 3
 (client code) does; by choosing "0 client code" we accept detection instead of
@@ -292,12 +292,12 @@ does not.
    `deploy/phala/`). 0-code inference works, and the cert-binding quote is already
    published at `/evidences/` — but nothing consumes it yet, so validation is
    still manual. (Tier "2, un-auditable" until step 2 — internal / testing only.)
-2. **A verifier for that quote + per-request response signature.** The cert
-   binding itself is done (§6.1); what is missing is code that checks it —
-   DCAP-verify `/evidences/quote.json`, recompute `report_data`, and compare the
-   served cert against the bundle — plus the gateway's own signing key, which
-   *does* need a quote of its own. An operator/CLI can then validate out of band
-   and each response is individually auditable. (Tier 2.5.)
+2. **A verifier for that cert-binding quote.** The cert binding itself is done
+   (§6.1); what is missing is code that checks it — DCAP-verify
+   `/evidences/quote.json`, recompute `report_data`, and compare the served cert
+   against the bundle. An operator/CLI can then validate out of band. Inference
+   authenticity is the provider's SPEC §8 signature, verified independently on the
+   gateway→provider hop; the gateway issues no signature of its own. (Tier 2.5.)
 3. **Publish `measurement ↔ cert` (transparency log / on-chain) + monitoring**,
    so cheating is publicly detectable without per-user effort.
 4. **Optional tier-3 path**: a WASM verify+seal SDK for clients that want

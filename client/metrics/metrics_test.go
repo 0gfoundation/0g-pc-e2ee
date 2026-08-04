@@ -17,8 +17,8 @@ import (
 func TestRouteLabel(t *testing.T) {
 	cases := map[string]string{
 		"/v1/chat/completions":       "/v1/chat/completions",
-		"/quote":                     "/quote",
 		"/healthz":                   "/healthz",
+		"/quote":                     "other", // no longer a gateway route (#59); proxied to router
 		"/v1/models":                 "other",
 		"/../etc/passwd":             "other",
 		"/v1/chat/completions/extra": "other",

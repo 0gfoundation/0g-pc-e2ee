@@ -150,11 +150,12 @@ func Handler() http.Handler {
 
 // RouteLabel maps a request path to a bounded route-template label, so the raw
 // path (which could carry caller-controlled, high-cardinality, or sensitive
-// content on an unexpected route) never becomes a label value. Only the fixed
-// served routes get their own label; everything else collapses to "other".
+// content on an unexpected route) never becomes a label value. Only the routes
+// the gateway serves itself get their own label; everything else — including the
+// paths the gateway reverse-proxies to the router — collapses to "other".
 func RouteLabel(path string) string {
 	switch path {
-	case "/v1/chat/completions", "/quote", "/healthz":
+	case "/v1/chat/completions", "/healthz":
 		return path
 	default:
 		return "other"

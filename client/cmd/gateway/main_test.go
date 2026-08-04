@@ -94,22 +94,6 @@ func TestGatewayHealthProbe(t *testing.T) {
 	}
 }
 
-// /quote is still a stub: it must answer 501 (Not Implemented), not 404, so a
-// validator can tell the endpoint exists but attestation is not wired yet.
-func TestGatewayQuoteStub(t *testing.T) {
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), discardLogger()))
-	defer gw.Close()
-
-	resp, err := http.Get(gw.URL + "/quote")
-	if err != nil {
-		t.Fatalf("get /quote: %v", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNotImplemented {
-		t.Fatalf("/quote: got %d, want 501", resp.StatusCode)
-	}
-}
-
 // In route mode the gateway holds no pinned provider: it previews against a
 // router, fetches the chosen provider's key, seals, and streams plaintext back.
 // This confirms the route resolver is wired into the same shared proxy the
@@ -313,7 +297,17 @@ func TestGatewayRouterPassthroughUnreachable(t *testing.T) {
 func TestGatewayAccessLog(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, nil))
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), logger))
+
+	// A stand-in router that answers a non-health path with a 5xx, so the log line
+	// exercises the error-severity mapping. A router 5xx is a successful proxy
+	// round trip, passed through verbatim as one logged request; the catch-all's
+	// ErrorHandler (which would add a second line) fires only on a transport
+	// failure — see newRouterProxy.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "nope", http.StatusNotImplemented)
+	}))
+	defer upstream.Close()
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, upstream.URL), logger))
 	defer gw.Close()
 
 	// A health probe must not produce a log line.
@@ -324,15 +318,16 @@ func TestGatewayAccessLog(t *testing.T) {
 	}
 
 	// A real request carrying a secret Authorization header and a forwarded
-	// request id. /quote is a convenient non-health route (it answers 501).
+	// request id, reverse-proxied to the router as a non-sealed metadata path.
 	const secret = "Bearer super-secret-token"
 	const callerID = "caller-req-123"
-	req, _ := http.NewRequest(http.MethodGet, gw.URL+"/quote", nil)
+	const reqPath = "/v1/models"
+	req, _ := http.NewRequest(http.MethodGet, gw.URL+reqPath, nil)
 	req.Header.Set("Authorization", secret)
 	req.Header.Set("X-Request-Id", callerID)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("get /quote: %v", err)
+		t.Fatalf("get %s: %v", reqPath, err)
 	}
 	resp.Body.Close()
 
@@ -359,8 +354,8 @@ func TestGatewayAccessLog(t *testing.T) {
 	if rec["msg"] != "request" {
 		t.Errorf("msg: got %v, want %q", rec["msg"], "request")
 	}
-	if rec["path"] != "/quote" {
-		t.Errorf("path: got %v, want %q", rec["path"], "/quote")
+	if rec["path"] != reqPath {
+		t.Errorf("path: got %v, want %q", rec["path"], reqPath)
 	}
 	if rec["method"] != http.MethodGet {
 		t.Errorf("method: got %v, want %q", rec["method"], http.MethodGet)

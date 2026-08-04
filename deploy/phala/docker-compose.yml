@@ -27,8 +27,9 @@
 # whoever holds the DNS token, which is why the comparison above is the check
 # that matters.
 #
-# This is why the gateway needs no cert-binding quote of its own — its own
-# /quote route is an unrelated 501 stub (issue #19).
+# This is why the gateway needs no quote of its own: app_id already attests its
+# image, so the gateway exposes no attestation endpoint and signs no responses of
+# its own (inference authenticity rides each provider's SPEC §8 signature).
 #
 # Deploy: reference this compose file from the Phala Cloud dashboard, or via the
 # Phala CLI, with the environment and DNS records in README "Serving domain".
