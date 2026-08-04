@@ -36,6 +36,7 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/client/dcap"
 	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/0gfoundation/0g-pc-e2ee/client/route"
+	"github.com/0gfoundation/0g-pc-e2ee/client/sig"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
@@ -135,12 +136,14 @@ func NewLogger() *slog.Logger {
 type Flags struct {
 	Listen           *string
 	RouterURL        *string
+	providerURL      *string
 	sealFieldsCSV    *string
 	unboundFieldsCSV *string
 	attestOn         *bool
 	attestEnforce    *bool
 	onchainOn        *bool
 	onchainEnforce   *bool
+	verifyResponses  *bool
 	chainRPCURL      *string
 	servingContract  *string
 	warmOn           *bool
@@ -168,9 +171,10 @@ const defaultCollateralTTL = time.Hour
 // RegisterFlags declares the shared startup flags on fs and returns a Flags
 // whose pointers are filled by fs.Parse. envPrefix (e.g. "ZG_GATEWAY",
 // "ZG_SIDECAR") selects the environment variables consulted for each flag's
-// default: <envPrefix>_LISTEN, _ROUTER_URL, _SEAL_FIELDS, _UNBOUND_FIELDS,
-// _ATTEST, _ATTEST_ENFORCE, _ONCHAIN, _ONCHAIN_ENFORCE, _CHAIN_RPC_URL,
-// _SERVING_CONTRACT, _WARM, _WARM_INTERVAL, _PCCS_URL, _COLLATERAL_TTL.
+// default: <envPrefix>_LISTEN, _ROUTER_URL, _PROVIDER_URL, _SEAL_FIELDS,
+// _UNBOUND_FIELDS, _ATTEST, _ATTEST_ENFORCE, _ONCHAIN, _ONCHAIN_ENFORCE,
+// _CHAIN_RPC_URL, _SERVING_CONTRACT, _WARM, _WARM_INTERVAL, _PCCS_URL,
+// _COLLATERAL_TTL.
 // defaultListen is the built-in listen address used when neither the flag nor
 // <envPrefix>_LISTEN is set.
 func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen string) *Flags {
@@ -178,6 +182,8 @@ func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen string) *Flags {
 	return &Flags{
 		Listen:    fs.String("listen", envOr(env("LISTEN"), defaultListen), fmt.Sprintf("address to listen on (env %s)", env("LISTEN"))),
 		RouterURL: fs.String("router-url", envOr(env("ROUTER_URL"), route.DefaultRouterURL), fmt.Sprintf("0G router base URL/domain (the route-preview path is appended) (env %s)", env("ROUTER_URL"))),
+		providerURL: fs.String("provider-url", envOr(env("PROVIDER_URL"), ""),
+			fmt.Sprintf("direct-broker mode: seal each request straight to this provider endpoint, skipping the router's route-preview (for an environment with a broker but no centralized router, e.g. dev); the provider's enc key + signer are fetched from its broker's /v1/e2ee/pubkey. Empty keeps the default router mode (env %s)", env("PROVIDER_URL"))),
 		sealFieldsCSV: fs.String("seal-fields", envOr(env("SEAL_FIELDS"), strings.Join(wire.DefaultSealedFields(), ",")),
 			fmt.Sprintf("comma-separated request fields to seal (must include \"messages\") (env %s)", env("SEAL_FIELDS"))),
 		unboundFieldsCSV: fs.String("unbound-fields", envOr(env("UNBOUND_FIELDS"), strings.Join(wire.DefaultUnboundFields(), ",")),
@@ -190,6 +196,8 @@ func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen string) *Flags {
 			fmt.Sprintf("cross-check each provider's quote-bound TEE signer against its acknowledged on-chain teeSignerAddress in the InferenceServing registry (SPEC §4.4 step 3); requires -attest (env %s)", env("ONCHAIN"))),
 		onchainEnforce: fs.Bool("onchain-enforce", envBool(env("ONCHAIN_ENFORCE"), false),
 			fmt.Sprintf("with -onchain, skip a provider whose on-chain signer is missing/unacknowledged/mismatched instead of only warning (env %s)", env("ONCHAIN_ENFORCE"))),
+		verifyResponses: fs.Bool("verify-responses", envBool(env("VERIFY_RESPONSES"), false),
+			fmt.Sprintf("verify each response's §8 TEE signature (trust-chain hop 11), fetched directly from the provider's broker endpoint, fail-closed against the quote-bound signer; requires -attest, and -onchain additionally grounds that signer on-chain (env %s)", env("VERIFY_RESPONSES"))),
 		chainRPCURL: fs.String("chain-rpc-url", envOr(env("CHAIN_RPC_URL"), chain.DefaultChainRPCURL),
 			fmt.Sprintf("0G chain JSON-RPC endpoint for on-chain signer lookups; must be a source trusted independently of the router (defaults to 0G mainnet) (env %s)", env("CHAIN_RPC_URL"))),
 		servingContract: fs.String("serving-contract", envOr(env("SERVING_CONTRACT"), chain.DefaultInferenceServingAddress),
@@ -248,6 +256,23 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 		logger.Error("invalid -unbound-fields", "err", err)
 		os.Exit(1)
 	}
+	// Direct-broker mode (-provider-url set) skips the router and seals straight to
+	// one fixed provider — for an environment with a broker but no centralized
+	// router (dev). It reuses the pubkey/quote fetch but not the router-only steps:
+	// on-chain grounding needs the provider's on-chain address the router preview
+	// would supply, and the warmer enumerates providers via the router — so both are
+	// rejected. These checks come before the router-mode interdependency checks
+	// below so a direct-mode operator gets the direct-mode message (not, say,
+	// "-onchain requires -attest") for the same flag combination.
+	directMode := strings.TrimSpace(*f.providerURL) != ""
+	if directMode && *f.onchainOn {
+		logger.Error("-onchain is not supported in direct-broker mode (-provider-url); run without -provider-url to route through the router")
+		os.Exit(1)
+	}
+	if directMode && *f.warmOn {
+		logger.Error("-warm is not supported in direct-broker mode (-provider-url); the warmer enumerates providers via the router")
+		os.Exit(1)
+	}
 	// Fail loudly rather than silently give NO attestation when the operator asked
 	// for the strictest mode: -attest-enforce is meaningless without -attest.
 	if *f.attestEnforce && !*f.attestOn {
@@ -266,6 +291,16 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 	}
 	if *f.onchainOn && strings.TrimSpace(*f.chainRPCURL) == "" {
 		logger.Error("-onchain requires -chain-rpc-url")
+		os.Exit(1)
+	}
+	// Response verification anchors on the provider's signer. In router mode that
+	// signer is only trustworthy when it came from a verified quote (the router is
+	// untrusted), so -verify-responses requires -attest. In direct-broker mode there
+	// is no router in the path: the signer comes from the broker the operator pointed
+	// at directly (-provider-url), so verifying responses against it is meaningful
+	// without -attest.
+	if *f.verifyResponses && !*f.attestOn && !directMode {
+		logger.Error("-verify-responses requires -attest (the signer must come from a verified quote)")
 		os.Exit(1)
 	}
 	// The warmer pre-verifies quotes (needs -attest) and resolves each provider's
@@ -305,8 +340,7 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 		routeOpts = append(routeOpts, route.WithOnChainVerification(chain.Cached(reg, onchainCacheTTL), *f.onchainEnforce, logger))
 		logger.Info("on-chain signer grounding enabled", "label", label, "enforce", *f.onchainEnforce, "contract", *f.servingContract)
 	}
-	router := route.New(*f.RouterURL, routeOpts...)
-	client := core.NewWithResolver(router,
+	coreOpts := []core.Option{
 		core.WithSealFields(sealFields),
 		core.WithUnboundFields(unboundFields),
 		core.WithDebugLogger(logger),
@@ -316,7 +350,32 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 		// importing client/metrics directly (they already pull heavy deps); core stays
 		// metrics-library-free via this hook, mirroring WithDebugLogger.
 		core.WithMetrics(metrics.CoreMetrics{}),
-	)
+	}
+	if *f.verifyResponses {
+		// Fetch the signature straight from the provider's broker endpoint (the
+		// router does not proxy /v1/proxy/signature); verify fail-closed against the
+		// resolver-grounded signer via the shared proof contract. The same fetcher
+		// works in direct-broker mode — it already talks to Provider.Endpoint, which
+		// the direct resolver sets to the provider URL.
+		coreOpts = append(coreOpts, core.WithResponseVerification(route.NewSignatureFetcher(nil), sig.Recover))
+		logger.Info("response signature verification enabled", "label", label, "direct", directMode, "onchain_grounded", *f.onchainOn)
+	}
+
+	// Direct-broker mode: seal straight to the one configured provider, no router
+	// preview. The warmer stays off (no provider list to enumerate), so Built holds
+	// only the client.
+	if directMode {
+		directRes, err := route.NewDirect(*f.providerURL, routeOpts...)
+		if err != nil {
+			logger.Error("invalid -provider-url", "url", *f.providerURL, "err", err)
+			os.Exit(1)
+		}
+		logger.Info("direct-broker mode enabled (no router)", "label", label, "provider_url", *f.providerURL, "attest", *f.attestOn)
+		return &Built{Client: core.NewWithResolver(directRes, coreOpts...)}
+	}
+
+	router := route.New(*f.RouterURL, routeOpts...)
+	client := core.NewWithResolver(router, coreOpts...)
 	b := &Built{Client: client, router: router}
 	if *f.warmOn {
 		b.resolver = resolver

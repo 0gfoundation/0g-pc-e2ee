@@ -363,6 +363,10 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 		SignerAddr: signer,
 		Address:    prov.Address,
 		Model:      prov.CanonicalID,
+		// The provider's own endpoint (where its enc key / quote were fetched) is
+		// also where its §8 response signature is served — the router does not
+		// proxy /v1/proxy/signature. Carry it so verification can fetch direct.
+		Endpoint: prov.Endpoint,
 	}, nil
 }
 

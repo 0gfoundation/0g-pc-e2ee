@@ -9,8 +9,10 @@ toolchain go1.24.7
 require github.com/0gfoundation/0g-pc-e2ee/protocol v0.0.0
 
 require (
-	github.com/google/go-tdx-guest v0.3.1
+	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0
+	github.com/google/go-tdx-guest v0.3.2-0.20260730200302-2108462acb71
 	github.com/prometheus/client_golang v1.20.5
+	golang.org/x/crypto v0.45.0
 	golang.org/x/sync v0.10.0
 )
 
@@ -27,7 +29,6 @@ require (
 	github.com/prometheus/common v0.55.0 // indirect
 	github.com/prometheus/procfs v0.15.1 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	golang.org/x/crypto v0.45.0 // indirect
 	golang.org/x/sys v0.38.0 // indirect
 	google.golang.org/protobuf v1.34.2 // indirect
 )

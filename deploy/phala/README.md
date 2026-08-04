@@ -26,6 +26,13 @@ client ──TLS──> platform host front end ──> dstack gateway ──pas
   TCP through, so **plaintext never exists outside our own enclave**.
 - The gateway therefore serves **plaintext HTTP** on `:8443` and does no TLS. It
   is not published to the host — only dstack-ingress is reachable from outside.
+- The gateway has a Docker **healthcheck** (`gateway -health`, which probes its
+  own `/healthz` — the image is distroless, so the binary is its own probe), and
+  dstack-ingress `depends_on` it with `condition: service_healthy`. So ingress
+  only comes up once the gateway is actually serving, closing the first-boot race
+  where HAProxy resolves the `gateway` backend before it exists. (A *later*
+  recreation of the gateway with a new address still needs an ingress restart —
+  `depends_on` covers startup only.)
 - dstack-ingress serves `/evidences/` (`quote.json`, `cert-<DOMAIN>.pem`,
   `acme-account.json`, `sha256sum.txt`). The quote's `report_data` holds
   `SHA-256(sha256sum.txt)`, and `sha256sum.txt` covers the served certificate;
@@ -185,11 +192,18 @@ attestation above applies. Development only.
 
 ## Pin the image digest
 
+> **Development phase:** the checked-in compose currently references the gateway
+> as `ghcr.io/0gfoundation/0g-pc-e2ee-gateway:latest` so a fresh build is picked
+> up on redeploy without editing the file. This intentionally **breaks the
+> attestation guarantee below** and must be reverted to a digest pin before any
+> attested / production deploy. dstack-ingress stays digest-pinned throughout.
+
 `app_id` hashes the app-compose manifest, which embeds this compose file
 verbatim — so a floating `:latest` tag keeps the attestation identical while the
 code underneath changes, and anyone who can push to the registry could swap the
 gateway binary inside an "attested" CVM undetectably. Both images are therefore
-pinned by digest, and both have to be re-pinned deliberately on upgrade:
+pinned by digest for production, and both have to be re-pinned deliberately on
+upgrade:
 
 ```sh
 # what :latest points at RIGHT NOW — compare it with the digest in the compose
@@ -279,7 +293,24 @@ quote/collateral cache hit ratios, and warmer liveness).
   `/quote` route is a 501 stub pending issue #19; it is not part of this
   deployment's trust story and is not needed for the certificate binding.
 - The gateway holds no pinned provider key: it routes per request and derives
-  each provider's enc key + signer from the broker. It defaults to the 0G router;
-  override with `ZG_GATEWAY_ROUTER_URL`.
+  each provider's enc key + signer from the broker. The router base URL is
+  `${ZG_GATEWAY_ROUTER_URL:-https://router-api.0g.ai}` — unset it (production) to
+  use the 0G production router, or inject `ZG_GATEWAY_ROUTER_URL` via the CVM's
+  **encrypted environment** (staging) to point at a different router. The
+  variable must be listed in the app's `allowed_envs` for the override to reach
+  the container. Since the *measured* text is the `${…}` form, staging and
+  production share `app_id`; that is safe only because the router is untrusted by
+  construction (see the provider-verification note below).
+- **Provider verification** is on in verify-and-warn mode. Each provider's TDX
+  quote is DCAP-verified (`ZG_GATEWAY_ATTEST`), its quote-bound signer is
+  cross-checked against the on-chain `teeSignerAddress`
+  (`ZG_GATEWAY_ONCHAIN`), and each response's §8 TEE signature is verified
+  fail-closed against that signer (`ZG_GATEWAY_VERIFY_RESPONSES`). A background
+  warmer (`ZG_GATEWAY_WARM`) pre-verifies quotes so requests hit a warm cache.
+  The measurement and on-chain-signer checks only *warn* on a mismatch rather
+  than reject, because their enforce switches (`ZG_GATEWAY_ATTEST_ENFORCE`,
+  `ZG_GATEWAY_ONCHAIN_ENFORCE`) are off — the audited-image allowlist is not
+  wired yet, so enforcing measurements would reject every provider. Response
+  signatures are always fail-closed.
 - If the gateway container is recreated with a new address, restart
   dstack-ingress too — HAProxy resolves the backend name once, at startup.
