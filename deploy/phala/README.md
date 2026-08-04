@@ -26,6 +26,13 @@ client ──TLS──> platform host front end ──> dstack gateway ──pas
   TCP through, so **plaintext never exists outside our own enclave**.
 - The gateway therefore serves **plaintext HTTP** on `:8443` and does no TLS. It
   is not published to the host — only dstack-ingress is reachable from outside.
+- The gateway has a Docker **healthcheck** (`gateway -health`, which probes its
+  own `/healthz` — the image is distroless, so the binary is its own probe), and
+  dstack-ingress `depends_on` it with `condition: service_healthy`. So ingress
+  only comes up once the gateway is actually serving, closing the first-boot race
+  where HAProxy resolves the `gateway` backend before it exists. (A *later*
+  recreation of the gateway with a new address still needs an ingress restart —
+  `depends_on` covers startup only.)
 - dstack-ingress serves `/evidences/` (`quote.json`, `cert-<DOMAIN>.pem`,
   `acme-account.json`, `sha256sum.txt`). The quote's `report_data` holds
   `SHA-256(sha256sum.txt)`, and `sha256sum.txt` covers the served certificate;
@@ -185,11 +192,18 @@ attestation above applies. Development only.
 
 ## Pin the image digest
 
+> **Development phase:** the checked-in compose currently references the gateway
+> as `ghcr.io/0gfoundation/0g-pc-e2ee-gateway:latest` so a fresh build is picked
+> up on redeploy without editing the file. This intentionally **breaks the
+> attestation guarantee below** and must be reverted to a digest pin before any
+> attested / production deploy. dstack-ingress stays digest-pinned throughout.
+
 `app_id` hashes the app-compose manifest, which embeds this compose file
 verbatim — so a floating `:latest` tag keeps the attestation identical while the
 code underneath changes, and anyone who can push to the registry could swap the
 gateway binary inside an "attested" CVM undetectably. Both images are therefore
-pinned by digest, and both have to be re-pinned deliberately on upgrade:
+pinned by digest for production, and both have to be re-pinned deliberately on
+upgrade:
 
 ```sh
 # what :latest points at RIGHT NOW — compare it with the digest in the compose
