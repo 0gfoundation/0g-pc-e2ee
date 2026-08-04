@@ -61,6 +61,13 @@ type Error struct {
 	// must not echo it to end users, while a single-user sidecar can opt in to
 	// surfacing it (openaiproxy.WithVerboseUpstreamErrors).
 	Body string
+	// Header is the upstream (router) response header block for a reply built from
+	// a real upstream response — non-2xx or a malformed 2xx. Nil for a transport
+	// failure that never produced a response. Like the success-path
+	// ResponseMeta.Header it is carried verbatim; a front end surfaces only a
+	// curated, non-sensitive subset (e.g. Retry-After and the rate-limit counters
+	// on a 429), never the whole block.
+	Header http.Header
 }
 
 func (e *Error) Error() string { return e.Err.Error() }
@@ -363,7 +370,7 @@ func (c *Client) completeOnce(ctx context.Context, provider Provider, req wire.R
 		// intentionally unbounded — a completion can legitimately be large.) Fall
 		// back only on a transient status (429 / 5xx).
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBytes))
-		e := &Error{Stage: StageUpstream, Status: resp.StatusCode, Err: fmt.Errorf("provider returned %d", resp.StatusCode), Body: string(body)}
+		e := &Error{Stage: StageUpstream, Status: resp.StatusCode, Err: fmt.Errorf("provider returned %d", resp.StatusCode), Body: string(body), Header: resp.Header.Clone()}
 		return nil, retryableStatus(resp.StatusCode), e
 	}
 

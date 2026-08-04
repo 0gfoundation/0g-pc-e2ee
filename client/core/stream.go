@@ -119,14 +119,14 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 		// a multi-tenant gateway never echoes it back (see Error.Body). Fall back
 		// only on a transient provider status (429 / 5xx).
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxSSELine))
-		return retryableStatus(resp.StatusCode), &Error{Stage: StageUpstream, Status: resp.StatusCode, Err: fmt.Errorf("provider returned %d", resp.StatusCode), Body: string(body)}
+		return retryableStatus(resp.StatusCode), &Error{Stage: StageUpstream, Status: resp.StatusCode, Err: fmt.Errorf("provider returned %d", resp.StatusCode), Body: string(body), Header: resp.Header.Clone()}
 	}
 	// A 200 that is not an event stream (a provider that ignored stream:true) would
 	// be read as zero frames and silently yield an empty stream; fail loud. Nothing
 	// was delivered, so fall back to the next candidate.
 	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxSSELine))
-		return true, &Error{Stage: StageUpstream, Err: fmt.Errorf("provider did not stream (content-type %q)", ct), Body: string(body)}
+		return true, &Error{Stage: StageUpstream, Err: fmt.Errorf("provider did not stream (content-type %q)", ct), Body: string(body), Header: resp.Header.Clone()}
 	}
 
 	// Abort if the provider stalls between frames.

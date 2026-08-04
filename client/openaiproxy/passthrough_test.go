@@ -1,6 +1,7 @@
 package openaiproxy
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -70,16 +71,16 @@ func TestCredential(t *testing.T) {
 // re-emitted, absent ones are skipped, non-allowlisted ones stay inside the
 // gateway, and multi-valued headers survive.
 func TestSetPassthrough(t *testing.T) {
-	meta := &core.ResponseMeta{Header: http.Header{
+	src := http.Header{
 		"X-Provider":                {"0xprovider"},
 		"Zg-Failure-Source":         {"upstream"},
 		"Retry-After":               {"30"},
 		"X-Ratelimit-Remaining-Day": {"5", "5"},
 		"Content-Type":              {"application/json"}, // not allowlisted
 		"X-Router-Internal":         {"do-not-surface"},   // not allowlisted
-	}}
+	}
 	rec := httptest.NewRecorder()
-	setPassthrough(rec, meta)
+	setPassthrough(rec, src)
 	got := rec.Header()
 
 	if got.Get("X-Provider") != "0xprovider" {
@@ -101,9 +102,25 @@ func TestSetPassthrough(t *testing.T) {
 	}
 }
 
-// TestSetPassthrough_NilSafe guards the no-response case: a nil meta or nil
-// header must be a no-op, not a panic.
+// TestSetPassthrough_NilSafe guards the no-response case: a nil source header
+// must be a no-op, not a panic.
 func TestSetPassthrough_NilSafe(t *testing.T) {
 	setPassthrough(httptest.NewRecorder(), nil)
-	setPassthrough(httptest.NewRecorder(), &core.ResponseMeta{})
+	setPassthrough(httptest.NewRecorder(), http.Header{})
+}
+
+// TestUpstreamHeader checks the error-path source: a core.Error carries its
+// upstream header block, while a transport failure or non-core error yields nil
+// (nothing to surface).
+func TestUpstreamHeader(t *testing.T) {
+	h := http.Header{"Retry-After": {"30"}}
+	if got := upstreamHeader(&core.Error{Header: h}); got.Get("Retry-After") != "30" {
+		t.Errorf("upstreamHeader(core.Error) did not return the carried header: %v", got)
+	}
+	if got := upstreamHeader(&core.Error{}); got != nil {
+		t.Errorf("upstreamHeader with no header should be nil, got %v", got)
+	}
+	if got := upstreamHeader(errors.New("plain")); got != nil {
+		t.Errorf("upstreamHeader(non-core err) should be nil, got %v", got)
+	}
 }

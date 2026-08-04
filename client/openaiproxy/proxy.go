@@ -64,20 +64,30 @@ var passthroughResponseHeaders = []string{
 	"X-RateLimit-Reset-Day",
 }
 
-// setPassthrough re-emits the curated subset of upstream response headers the
-// core captured (meta.Header) onto the front-end response. Like setResKey it
-// must run before WriteHeader or the first body byte. A header the upstream did
-// not send is skipped, so nothing is fabricated; multi-valued headers are
-// preserved entry-for-entry.
-func setPassthrough(w http.ResponseWriter, meta *core.ResponseMeta) {
-	if meta == nil || meta.Header == nil {
-		return
-	}
+// setPassthrough re-emits the curated subset of an upstream response header
+// block (src) onto the front-end response — used on both the success path
+// (core.ResponseMeta.Header) and the error path (core.Error.Header, so a 429's
+// Retry-After and rate-limit counters reach the caller). Like setResKey it must
+// run before WriteHeader or the first body byte. A nil src or a header the
+// upstream did not send is skipped, so nothing is fabricated; multi-valued
+// headers are preserved entry-for-entry.
+func setPassthrough(w http.ResponseWriter, src http.Header) {
 	for _, name := range passthroughResponseHeaders {
-		for _, v := range meta.Header.Values(name) {
+		for _, v := range src.Values(name) {
 			w.Header().Add(name, v)
 		}
 	}
+}
+
+// upstreamHeader returns the upstream response header block carried by a
+// core.Error (a non-2xx or malformed upstream reply), or nil for a transport
+// failure or any non-core error — nothing to surface in those cases.
+func upstreamHeader(err error) http.Header {
+	var e *core.Error
+	if errors.As(err, &e) {
+		return e.Header
+	}
+	return nil
 }
 
 // Option customizes the proxy's behavior.
@@ -233,7 +243,7 @@ func Register(mux *http.ServeMux, c *core.Client, opts ...Option) {
 			writeGatewayError(w, http.StatusInternalServerError, "encode response")
 			return
 		}
-		setPassthrough(w, meta)
+		setPassthrough(w, meta.Header)
 		setResKey(w, meta)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(out)
@@ -352,7 +362,7 @@ func serveStream(ctx context.Context, w http.ResponseWriter, c *core.Client, req
 		}
 		// The core records the metadata at stream commit, before the first frame
 		// reaches this callback, so it is available here before we write headers.
-		setPassthrough(w, meta)
+		setPassthrough(w, meta.Header)
 		setResKey(w, meta)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
@@ -427,7 +437,11 @@ func writeGatewayError(w http.ResponseWriter, code int, msg string) {
 }
 
 // writeError emits a core.Error (or any error) as the attributed envelope, with
-// the upstream status surfaced verbatim (statusFor).
+// the upstream status surfaced verbatim (statusFor). It first re-emits the
+// curated upstream response headers (Retry-After / rate-limit on a 429, the
+// broker's fault attribution), which must be set before writeErrorObject writes
+// the status line.
 func (o options) writeError(w http.ResponseWriter, err error) {
+	setPassthrough(w, upstreamHeader(err))
 	writeErrorObject(w, statusFor(err), o.errorEnvelope(err))
 }
