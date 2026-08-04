@@ -231,10 +231,10 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 		if !committed {
 			committed = true
 			// Once committed, no fallback can change which provider answered, so this
-			// is the handle for the response the caller receives; surface it for a
+			// is the metadata for the response the caller receives; surface it for a
 			// caller that asked (WithResponseMeta). Recorded before the first onFrame
-			// so a front end can set the header before it writes response headers.
-			recordResKey(ctx, resp.Header)
+			// so a front end can set the headers before it writes response headers.
+			recordMeta(ctx, resp.Header)
 		}
 		if err := onFrame(out); err != nil {
 			return false, err
