@@ -118,9 +118,21 @@ services:
       # compose network.
       - "ZG_GATEWAY_LISTEN=0.0.0.0:8443"
       # The gateway routes per request and derives each provider's enc key +
-      # signer from the broker, so no provider/key is configured up front. It
-      # defaults to the 0G router; uncomment to override.
-      # - "ZG_GATEWAY_ROUTER_URL=https://router-api.0g.ai"
+      # signer from the broker, so no provider/key is configured up front. The
+      # router base URL is deploy-time injectable so staging and prod can share
+      # this file: the value below is the measured text, but the ${...} form lets
+      # an encrypted-env override win at boot. Unset (prod) → the 0G production
+      # router; set ZG_GATEWAY_ROUTER_URL in the CVM's encrypted environment
+      # (staging) → that URL. The interpolation happens INSIDE the CVM, so the
+      # variable must also be listed in the app's allowed_envs — dstack drops any
+      # encrypted var that is not, surfacing only as a boot-time interpolation
+      # error. Because the measured text is the ${...} form (identical for both),
+      # staging and prod share app_id: attestation does NOT distinguish which
+      # router was used. That is acceptable here only because the router is
+      # untrusted by construction — every provider is verified by TDX quote and
+      # on-chain signer (ATTEST/ONCHAIN below), so a swapped router cannot forge a
+      # provider; the blast radius is routing/availability, not confidentiality.
+      - "ZG_GATEWAY_ROUTER_URL=${ZG_GATEWAY_ROUTER_URL:-https://router-api.0g.ai}"
       # Request fields sealed end-to-end to the provider (must include
       # "messages"). Defaults to the binary's built-in set; uncomment to override.
       # - "ZG_GATEWAY_SEAL_FIELDS=messages"
@@ -140,14 +152,23 @@ services:
       # - "ZG_GATEWAY_ATTEST_ENFORCE=true"
       # Cross-check each provider's quote-bound TEE signer against its acknowledged
       # on-chain teeSignerAddress (InferenceServing registry). Requires
-      # ZG_GATEWAY_ATTEST. Defaults to off. The RPC + contract default to 0G
-      # mainnet; override both together for testnet or your own node.
-      # - "ZG_GATEWAY_ONCHAIN=true"
+      # ZG_GATEWAY_ATTEST. Enabled here. The RPC + contract default to 0G mainnet
+      # (evmrpc.0g.ai / 0x47340d900bdFec2BD393c626E12ea0656F938d84), so they stay
+      # implicit; uncomment and override BOTH together for testnet or your own node.
+      - "ZG_GATEWAY_ONCHAIN=true"
       # - "ZG_GATEWAY_CHAIN_RPC_URL=https://evmrpc.0g.ai"
       # - "ZG_GATEWAY_SERVING_CONTRACT=0x47340d900bdFec2BD393c626E12ea0656F938d84"
       # With ZG_GATEWAY_ONCHAIN, skip a provider whose on-chain signer is
-      # missing/unacknowledged/mismatched instead of only warning. Defaults to off.
+      # missing/unacknowledged/mismatched instead of only warning. Left OFF: ONCHAIN
+      # runs in verify-and-warn mode, so a provider with incomplete on-chain data is
+      # logged but still served. Flip to true to reject those providers outright.
       # - "ZG_GATEWAY_ONCHAIN_ENFORCE=true"
+      # Verify each response's §8 TEE signature (trust-chain hop 11): fetch the
+      # signature straight from the provider's broker and check it fail-closed
+      # against the quote-bound signer, which ZG_GATEWAY_ONCHAIN additionally
+      # grounds on chain. Requires ZG_GATEWAY_ATTEST. Enabled here, so a response
+      # whose signature does not verify is rejected rather than returned.
+      - "ZG_GATEWAY_VERIFY_RESPONSES=true"
       # Fetch Intel PCS collateral (TCB Info, QE Identity, PCK CRL) from Phala's
       # hosted PCCS instead of api.trustedservices.intel.com. This CVM runs on
       # Phala infrastructure, so its own PCCS is the closest, most reliable source
@@ -169,11 +190,11 @@ services:
       # refreshes it ahead of expiry, so requests hit a warm cache instead of
       # paying the DCAP verify (quote fetch + collateral) inline. Requires
       # ZG_GATEWAY_ATTEST and ZG_GATEWAY_ONCHAIN (the endpoint is resolved on
-      # chain) — those are enforced at startup, so enabling the warmer WITHOUT
-      # uncommenting ZG_GATEWAY_ONCHAIN above exits(1) into a restart loop, with
-      # the ingress up and healthy in front of it. Defaults to off; the interval
-      # defaults to 4m, under the ~5m quote-cache TTL.
-      # - "ZG_GATEWAY_WARM=true"
+      # chain) — both are on above, so this starts cleanly; enabling it while
+      # ZG_GATEWAY_ONCHAIN was off would exit(1) into a restart loop, with the
+      # ingress up and healthy in front of it. Enabled here. The interval is left
+      # implicit at its 4m default, under the ~5m quote-cache TTL.
+      - "ZG_GATEWAY_WARM=true"
       # - "ZG_GATEWAY_WARM_INTERVAL=4m" # optional; 4m is already the default
     # The gateway itself holds no secret: no pinned provider key, and no TLS
     # material — the cert and its key belong to dstack-ingress above, generated
