@@ -225,12 +225,54 @@ reachable only over the compose network. This keeps operational telemetry off th
 same edge as the OpenAI API and avoids adding a side channel to the confidential
 enclave.
 
-Shipping the samples out — a co-located Prometheus-agent sidecar that scrapes
-`gateway:9464` and `remote_write`s to a central store — is added **separately**,
-since it touches the measured compose and depends on your deploy-side store and
-runtime. This PR only exposes the endpoint; nothing scrapes it yet. Until the
-scraper lands you can still read it from inside the CVM network
-(`curl http://gateway:9464/metrics`).
+Shipping the samples out follows the same shape other 0G services use — a
+co-located Prometheus that scrapes locally and `remote_write`s to a central
+store — but in **agent mode**:
+
+- A `prometheus-agent` container (`prom/prometheus --enable-feature=agent`)
+  scrapes `gateway:9464` over the compose network and `remote_write`s to your
+  central Prometheus (or any `remote_write`-compatible store). Agent mode keeps
+  no local TSDB and no query API — this CVM is ephemeral; the durable copy lives
+  in the remote store. A self-hosted Prometheus receiving `remote_write` must run
+  with `--web.enable-remote-write-receiver`.
+- The agent also **self-scrapes**, so `remote_write` health (queue length, send
+  failures) is visible even though the CVM has no local query API — important
+  because an outbound break inside the enclave is otherwise hard to see.
+
+### Configuring remote_write
+
+You pass three values, not a hand-built config:
+
+| Variable | Secret? | Example |
+|---|---|---|
+| `ZG_PROM_REMOTE_WRITE_URL` | no | `https://prometheus.example.com/api/v1/write` |
+| `ZG_PROM_REMOTE_WRITE_USERNAME` | no | `0g-pc-gateway` |
+| `ZG_PROM_REMOTE_WRITE_PASSWORD` | **yes** | — |
+
+Set all three in the CVM's **encrypted environment** — the Phala env file, the
+same channel as `CLOUDFLARE_API_TOKEN` — and list them in the app's
+`allowed_envs`, or dstack drops them. Only `${VAR}` *references* live in the
+measured compose text, never the values, so nothing sensitive enters the
+attestation.
+
+Prometheus does not expand env vars in its own config, so `agent.yml` is a
+compose **`config`** whose `remote_write` url/username/password are `${VAR}` —
+interpolated by **compose** from the env file when it renders, then mounted
+read-only (0444, so the agent's `nobody` user can read it). No init container and
+no docker `secret`: Phala's env injection is already encrypted to the enclave,
+and the rendered password only ever lives inside this single-tenant CVM's own
+config — adequate for a write-only metrics credential. (A docker `secret` would
+only narrow in-CVM exposure — keep the value out of the container env and out of
+the config file — which is not worth an extra compose dependency here.)
+
+Scrape targets use docker **service names** on the compose network: `gateway:9464`
+for the app and `localhost:9090` for the agent's own metrics.
+
+> This uses top-level `configs:`, standard in Docker Compose / recent dstack. If
+> your runtime rejects it, render `agent.yml` with a small init container instead
+> (write it from the same env vars to a shared volume before the agent starts).
+> A password containing YAML-special characters (`"` or `\`) also wants the
+> init-container form (or a `password_file`) rather than the inline value.
 
 ### Metric hygiene
 
@@ -244,10 +286,10 @@ and warmer liveness).
 
 ## Notes
 
-- **Secrets.** The Cloudflare token is the secret to supply, but the `cert-data`
-  volume holds material just as sensitive — the TLS private key and the ACME
-  account key. It never leaves the CVM; do not snapshot or export it. The
-  `evidences` volume is public by design.
+- **Secrets.** The Cloudflare token and the `remote_write` password (see Metrics)
+  are the secrets to supply, but the `cert-data` volume holds material just as
+  sensitive — the TLS private key and the ACME account key. It never leaves the
+  CVM; do not snapshot or export it. The `evidences` volume is public by design.
 - **Attestation** comes entirely from dstack-ingress's `/evidences/`. The gateway
   exposes no attestation endpoint of its own and signs no responses of its own:
   its `app_id`-covered image is already attested by the ingress cert-binding
