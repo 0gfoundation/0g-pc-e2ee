@@ -215,3 +215,7 @@ deployment, and verifiers have to re-audit it.
   override with `ZG_GATEWAY_ROUTER_URL`.
 - If the gateway container is recreated with a new address, restart
   dstack-ingress too — HAProxy resolves the backend name once, at startup.
+- **Zero-downtime upgrades.** A new gateway image is a new `app_id` (above), i.e.
+  a separate CVM. To roll one out without downtime and with instant rollback, run
+  the old and new builds as two sides and flip a single DNS pointer between them
+  — see [`blue-green.md`](./blue-green.md) and [`switch.sh`](./switch.sh).
