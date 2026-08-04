@@ -11,7 +11,7 @@ import (
 
 // newRouterProxy builds the gateway's catch-all: a reverse proxy that forwards
 // every request NOT matched by a more specific route (the sealed
-// POST /v1/chat/completions, plus /healthz and /quote) straight to the 0G
+// POST /v1/chat/completions, plus /healthz) straight to the 0G
 // router. Go's ServeMux serves the most specific pattern, so mounting this at
 // "/" only ever catches otherwise-unmatched paths — it never shadows the sealed
 // chat route. It lets a no-install / browser / thin client reach the router's

@@ -221,9 +221,12 @@ deployment, and verifiers have to re-audit it.
   `cert-data` volume holds material just as sensitive — the TLS private key and
   the ACME account key. It never leaves the CVM; do not snapshot or export it.
   The `evidences` volume is public by design.
-- **Attestation** comes from dstack-ingress's `/evidences/`. The gateway's own
-  `/quote` route is a 501 stub pending issue #19; it is not part of this
-  deployment's trust story and is not needed for the certificate binding.
+- **Attestation** comes entirely from dstack-ingress's `/evidences/`. The gateway
+  exposes no attestation endpoint of its own and signs no responses of its own:
+  its `app_id`-covered image is already attested by the ingress cert-binding
+  quote, and inference authenticity rides each provider's own SPEC §8 signature
+  (verified via `ZG_GATEWAY_VERIFY_RESPONSES`). See
+  [`cloud-gateway.md`](../../docs/design/cloud-gateway.md) §6.
 - The gateway holds no pinned provider key: it routes per request and derives
   each provider's enc key + signer from the broker. The router base URL is
   `${ZG_GATEWAY_ROUTER_URL:-https://router-api.0g.ai}` — unset it (production) to

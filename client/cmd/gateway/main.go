@@ -23,11 +23,16 @@
 // TEE/dstack deployment, where the compose file's `environment:` block is
 // measured into the CVM attestation (see deploy/phala/docker-compose.yml).
 //
-// Attestation (the /quote body and per-response signature; issue #19, on
-// protocol/attest / issue #7) and multi-tenant concerns (auth, billing, rate
-// limiting; issue #20) are later steps; /quote is a stub until then. Trusting
-// the router's returned endpoint (vs resolving it on chain) is tracked in
-// issue #18.
+// The gateway emits no attestation quote and signs no responses of its own.
+// Endpoint/code identity comes from the in-CVM cert-binding attestation that
+// dstack-ingress publishes at /evidences — its quote commits to app_id, which
+// covers this gateway image too (see deploy/phala/ and
+// docs/design/cloud-gateway.md §6). Inference authenticity rides the provider's
+// own SPEC §8 response signature, which the gateway verifies
+// (ZG_GATEWAY_VERIFY_RESPONSES). So the gateway exposes no /quote route. Multi-
+// tenant concerns (auth, billing, rate limiting; issue #20) are a later step.
+// Trusting the router's returned endpoint (vs resolving it on chain) is tracked
+// in issue #18.
 package main
 
 import (
@@ -164,9 +169,9 @@ func runHealthCheck(listen string) int {
 	return 0
 }
 
-// newHandler mounts the shared OpenAI proxy, the gateway-only operational routes
-// (health, attestation quote), and a catch-all that reverse-proxies every other
-// path to the router (routerTarget), all wrapped in the access-log middleware so
+// newHandler mounts the shared OpenAI proxy, the gateway-only operational route
+// (health), and a catch-all that reverse-proxies every other path to the router
+// (routerTarget), all wrapped in the access-log middleware so
 // every request emits one redaction-safe structured line. It is split out from
 // main so tests can drive it with httptest.
 func newHandler(c *core.Client, routerTarget *url.URL, logger *slog.Logger) http.Handler {
@@ -176,16 +181,14 @@ func newHandler(c *core.Client, routerTarget *url.URL, logger *slog.Logger) http
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte("ok\n"))
 	})
-	// /quote will expose the enclave's attestation quote (with the TLS cert key
-	// bound into report_data) once the gateway attestation work lands (issue #19,
-	// on protocol/attest / issue #7); until then it advertises the endpoint but is
-	// Not Implemented, so a validator gets a clear signal rather than a 404.
-	mux.HandleFunc("GET /quote", func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "attestation quote not yet implemented", http.StatusNotImplemented)
-	})
+	// The gateway exposes no /quote route: it emits no attestation quote of its
+	// own. Endpoint/code identity comes from dstack-ingress's in-CVM cert-binding
+	// attestation (/evidences, which commits to app_id and so covers this image);
+	// see docs/design/cloud-gateway.md §6.
+	//
 	// Everything else — the router's non-sealed OpenAI surface (model catalog,
 	// discovery) a thin client needs — is reverse-proxied to the router as-is. The
-	// sealed chat route, /healthz, and /quote are more specific patterns, so Go's
+	// sealed chat route and /healthz are more specific patterns, so Go's
 	// ServeMux keeps serving them; only unmatched paths fall through here. This is a
 	// cleartext passthrough — safe for metadata, never for sealed content (see
 	// newRouterProxy).
