@@ -213,5 +213,16 @@ deployment, and verifiers have to re-audit it.
 - The gateway holds no pinned provider key: it routes per request and derives
   each provider's enc key + signer from the broker. It defaults to the 0G router;
   override with `ZG_GATEWAY_ROUTER_URL`.
+- **Provider verification** is on in verify-and-warn mode. Each provider's TDX
+  quote is DCAP-verified (`ZG_GATEWAY_ATTEST`), its quote-bound signer is
+  cross-checked against the on-chain `teeSignerAddress`
+  (`ZG_GATEWAY_ONCHAIN`), and each response's §8 TEE signature is verified
+  fail-closed against that signer (`ZG_GATEWAY_VERIFY_RESPONSES`). A background
+  warmer (`ZG_GATEWAY_WARM`) pre-verifies quotes so requests hit a warm cache.
+  The measurement and on-chain-signer checks only *warn* on a mismatch rather
+  than reject, because their enforce switches (`ZG_GATEWAY_ATTEST_ENFORCE`,
+  `ZG_GATEWAY_ONCHAIN_ENFORCE`) are off — the audited-image allowlist is not
+  wired yet, so enforcing measurements would reject every provider. Response
+  signatures are always fail-closed.
 - If the gateway container is recreated with a new address, restart
   dstack-ingress too — HAProxy resolves the backend name once, at startup.
