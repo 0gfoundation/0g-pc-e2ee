@@ -100,6 +100,24 @@ func TestCoreMetricsOpenFailure(t *testing.T) {
 	}
 }
 
+func TestVerificationFailureByReason(t *testing.T) {
+	fetch := verificationFailures.WithLabelValues("fetch")
+	sig := verificationFailures.WithLabelValues("signature")
+	fetchBefore, sigBefore := testutil.ToFloat64(fetch), testutil.ToFloat64(sig)
+
+	// Exercise both the package helper and the core adapter — they must land on
+	// the same reason-labelled series.
+	ResponseVerificationFailure("fetch")
+	CoreMetrics{}.ResponseVerificationFailure("signature")
+
+	if got := testutil.ToFloat64(fetch) - fetchBefore; got != 1 {
+		t.Errorf("fetch-reason delta = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(sig) - sigBefore; got != 1 {
+		t.Errorf("signature-reason delta = %v, want 1", got)
+	}
+}
+
 // Handler serves the exposition format over the dedicated registry, including a
 // metric a caller just incremented.
 func TestHandlerServesExposition(t *testing.T) {

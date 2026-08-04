@@ -1158,7 +1158,7 @@
       "gridPos": {
         "x": 0,
         "y": 37,
-        "w": 12,
+        "w": 8,
         "h": 8
       },
       "targets": [
@@ -1237,6 +1237,87 @@
     },
     {
       "id": 20,
+      "type": "timeseries",
+      "title": "Response verification failures by reason",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 37,
+        "w": 8,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (reason) (rate(zg_gateway_response_verification_failures_total{service=~\"$service\"}[$__rate_interval]))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{reason}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.001
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 21,
       "type": "stat",
       "title": "Untrusted measurements (rate)",
       "datasource": {
@@ -1244,9 +1325,9 @@
         "uid": "${datasource}"
       },
       "gridPos": {
-        "x": 12,
+        "x": 16,
         "y": 37,
-        "w": 6,
+        "w": 4,
         "h": 8
       },
       "targets": [
@@ -1299,7 +1380,7 @@
       }
     },
     {
-      "id": 21,
+      "id": 22,
       "type": "stat",
       "title": "E2EE open failures (rate)",
       "datasource": {
@@ -1307,9 +1388,9 @@
         "uid": "${datasource}"
       },
       "gridPos": {
-        "x": 18,
+        "x": 20,
         "y": 37,
-        "w": 6,
+        "w": 4,
         "h": 8
       },
       "targets": [
@@ -1362,7 +1443,7 @@
       }
     },
     {
-      "id": 22,
+      "id": 23,
       "type": "row",
       "title": "Warmer & DCAP collateral",
       "collapsed": false,
@@ -1375,7 +1456,7 @@
       "panels": []
     },
     {
-      "id": 23,
+      "id": 24,
       "type": "stat",
       "title": "Warmer last success age",
       "datasource": {
@@ -1442,7 +1523,7 @@
       }
     },
     {
-      "id": 24,
+      "id": 25,
       "type": "timeseries",
       "title": "Warmer sweeps & provider refreshes",
       "datasource": {
@@ -1530,7 +1611,7 @@
       }
     },
     {
-      "id": 25,
+      "id": 26,
       "type": "timeseries",
       "title": "Collateral cache & fetches",
       "datasource": {
@@ -1618,7 +1699,7 @@
       }
     },
     {
-      "id": 26,
+      "id": 27,
       "type": "timeseries",
       "title": "Collateral fetch latency (upstream)",
       "datasource": {
@@ -1706,7 +1787,7 @@
       }
     },
     {
-      "id": 27,
+      "id": 28,
       "type": "row",
       "title": "Process runtime",
       "collapsed": false,
@@ -1719,7 +1800,7 @@
       "panels": []
     },
     {
-      "id": 28,
+      "id": 29,
       "type": "timeseries",
       "title": "Goroutines",
       "datasource": {
@@ -1796,7 +1877,7 @@
       }
     },
     {
-      "id": 29,
+      "id": 30,
       "type": "timeseries",
       "title": "Resident memory",
       "datasource": {
@@ -1873,7 +1954,7 @@
       }
     },
     {
-      "id": 30,
+      "id": 31,
       "type": "timeseries",
       "title": "CPU",
       "datasource": {

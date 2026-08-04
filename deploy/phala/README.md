@@ -280,8 +280,9 @@ Labels are deliberately low-cardinality and content-free (route templates, HTTP
 methods, status codes, fixed outcome enums) — the same redaction discipline the
 access log keeps, so metrics never leak the plaintext the E2EE seal protects. See
 [`client/metrics`](../../client/metrics) for the full metric set (HTTP RED,
-completion outcome by source/stage, E2EE open failures, quote verify latency,
-quote/collateral cache hit ratios, and warmer liveness).
+completion outcome by source/stage, E2EE open failures, §8 response-signature
+verification failures, quote verify latency, quote/collateral cache hit ratios,
+and warmer liveness).
 
 ## Notes
 

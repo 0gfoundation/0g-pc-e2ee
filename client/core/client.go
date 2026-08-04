@@ -165,6 +165,13 @@ type MetricsHook interface {
 	// ResponseOpenFailure is called once per sealed-response frame whose AEAD
 	// open failed (streaming counts each failed frame), alongside the debug log.
 	ResponseOpenFailure()
+	// ResponseVerificationFailure is called once per §8 response-signature
+	// verification failure, with a low-cardinality reason: "fetch" when the
+	// signature could not be retrieved (missing handle / fetch error, an
+	// operational fault) and "signature" when it was retrieved but did not verify
+	// against the grounded signer (an integrity/authenticity failure of the
+	// provider — the alarming case).
+	ResponseVerificationFailure(reason string)
 }
 
 // Option customizes a Client.

@@ -2,14 +2,17 @@ package core
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/proof"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
@@ -175,10 +178,20 @@ func TestLogOpenFailureNilLoggerIsNoop(t *testing.T) {
 	New(Provider{}).logOpenFailure(0, wire.Response{}, errors.New("boom"))
 }
 
-// countingHook is a MetricsHook that records how many open failures it saw.
-type countingHook struct{ n int }
+// countingHook is a MetricsHook that records how many open failures it saw, plus
+// verification failures by reason.
+type countingHook struct {
+	n      int
+	verify map[string]int
+}
 
 func (h *countingHook) ResponseOpenFailure() { h.n++ }
+func (h *countingHook) ResponseVerificationFailure(reason string) {
+	if h.verify == nil {
+		h.verify = map[string]int{}
+	}
+	h.verify[reason]++
+}
 
 // The metrics hook must fire on every open failure and, critically, independently
 // of the debug logger — the counter is a security signal the gateway alerts on,
@@ -190,6 +203,32 @@ func TestLogOpenFailureFiresMetricsWithoutDebugLogger(t *testing.T) {
 	c.logOpenFailure(1, wire.Response{}, errors.New("boom"))
 	if h.n != 2 {
 		t.Fatalf("metrics hook fired %d times, want 2", h.n)
+	}
+}
+
+// stubFetcher is a SignatureFetcher that should never be reached in the
+// missing-header path below (fetchSig fails before calling it).
+type stubFetcher struct{}
+
+func (stubFetcher) FetchSignature(ctx context.Context, p Provider, chatKey string) (proof.ChatSignature, error) {
+	return proof.ChatSignature{}, errors.New("should not be called")
+}
+
+// A verification that cannot even fetch its proof (here: no ZG-Res-Key handle on
+// the response) must count as reason "fetch" — the operational bucket, distinct
+// from a signature that was fetched but did not verify.
+func TestVerifyNonStreamMetersFetchFailure(t *testing.T) {
+	h := &countingHook{}
+	c := New(Provider{},
+		WithMetrics(h),
+		WithResponseVerification(stubFetcher{}, func(text string, sig []byte) (string, error) { return "", nil }),
+	)
+	err := c.verifyNonStream(context.Background(), Provider{}, http.Header{}, wire.Request{}, wire.Response{})
+	if err == nil {
+		t.Fatal("verifyNonStream with no ZG-Res-Key header should fail closed")
+	}
+	if h.verify["fetch"] != 1 || h.verify["signature"] != 0 {
+		t.Fatalf("verify metrics = %v, want fetch=1 signature=0", h.verify)
 	}
 }
 

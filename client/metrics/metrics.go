@@ -74,6 +74,10 @@ var (
 		Namespace: namespace, Subsystem: subsystem, Name: "response_open_failures_total",
 		Help: "Sealed-response frames that failed to open (AEAD authentication failure).",
 	})
+	verificationFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "response_verification_failures_total",
+		Help: "§8 response-signature verification failures by reason (fetch|signature).",
+	}, []string{"reason"})
 
 	// Attestation / quote verification (route) — the trust-model core.
 	quoteVerify = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -128,7 +132,7 @@ func init() {
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		httpRequests, httpDuration, httpInFlight,
-		completions, openFailures,
+		completions, openFailures, verificationFailures,
 		quoteVerify, quoteVerifyDuration, quoteCache, measurementUntrusted,
 		warmerSweeps, warmerProviderRefresh, warmerLastSuccess,
 		collateralCache, collateralFetch, collateralFetchDuration,
@@ -177,6 +181,12 @@ func Completion(result, source, stage string) {
 // ResponseOpenFailure counts one sealed-response frame that failed to open.
 func ResponseOpenFailure() { openFailures.Inc() }
 
+// ResponseVerificationFailure counts one §8 response-signature verification
+// failure, by reason ("fetch" or "signature").
+func ResponseVerificationFailure(reason string) {
+	verificationFailures.WithLabelValues(reason).Inc()
+}
+
 // QuoteVerification records one performed (cache-miss) DCAP verification and its
 // latency; ok distinguishes a successful verify from a failed one.
 func QuoteVerification(ok bool, dur time.Duration) {
@@ -217,6 +227,9 @@ type CoreMetrics struct{}
 
 // ResponseOpenFailure implements core.MetricsHook.
 func (CoreMetrics) ResponseOpenFailure() { ResponseOpenFailure() }
+
+// ResponseVerificationFailure implements core.MetricsHook.
+func (CoreMetrics) ResponseVerificationFailure(reason string) { ResponseVerificationFailure(reason) }
 
 func result(ok bool) string {
 	if ok {

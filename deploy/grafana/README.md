@@ -32,7 +32,8 @@ screen:
 2. **Completions**: outcome by result, and errors broken down by
    `source`/`stage` (gateway fault vs router/provider).
 3. **Attestation & E2EE**: quote-cache hit ratio, verifications by result, verify
-   latency, untrusted-measurement rate, open failures.
+   latency, response-signature verification failures by reason (fetch vs
+   signature), untrusted-measurement rate, E2EE open failures.
 4. **Warmer & DCAP collateral**: warmer last-success age (with alert-colored
    thresholds), sweep/provider outcomes, collateral cache + fetch latency.
 5. **Process runtime**: goroutines, resident memory, CPU.
@@ -44,6 +45,10 @@ highest-signal ones:
 
 - `rate(zg_gateway_response_open_failures_total[5m]) > 0` — sustained E2EE open
   failures (key/enc/AAD mismatch or frame tampering).
+- `rate(zg_gateway_response_verification_failures_total{reason="signature"}[5m]) > 0`
+  — a response failed §8 signature verification against the grounded signer: an
+  integrity/authenticity failure of a provider (the `reason="fetch"` bucket is
+  the softer, operational proof-retrieval failure).
 - `time() - max(zg_gateway_warmer_last_success_timestamp_seconds) > 900` — the
   warmer has stalled (only meaningful when `-warm` is enabled).
 - quote-cache hit ratio falling toward 0, or `quote_verification` errors rising —
