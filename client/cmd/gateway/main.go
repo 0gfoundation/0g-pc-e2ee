@@ -31,8 +31,11 @@
 package main
 
 import (
+	"context"
 	"flag"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -45,7 +48,18 @@ import (
 
 func main() {
 	f := proxycli.RegisterFlags(flag.CommandLine, "ZG_GATEWAY", ":8443")
+	// -health turns the binary into its OWN container health probe: it makes one
+	// GET /healthz to the -listen port, prints the result, and exits 0 (healthy)
+	// or 1 — it starts no server. The image is distroless (no shell, no curl,
+	// see cmd/gateway/Dockerfile), so the compose healthcheck runs THIS instead
+	// of a shell one-liner (deploy/phala/docker-compose.yml). Reusing -listen /
+	// $ZG_GATEWAY_LISTEN keeps the probe and the server on the same port.
+	health := flag.Bool("health", false, "probe GET /healthz on the -listen port and exit 0 (healthy) or 1; starts no server, for container healthchecks")
 	flag.Parse()
+
+	if *health {
+		os.Exit(runHealthCheck(*f.Listen))
+	}
 
 	// Build validates the flags and wires the route-and-seal client core (shared
 	// with the sidecar). "gateway" only labels the attestation log line. The debug
@@ -95,6 +109,59 @@ func main() {
 		logger.Error("gateway server exited", "err", err)
 		os.Exit(1)
 	}
+}
+
+// healthURLFromListen turns a -listen value (":8443", "0.0.0.0:8443", …) into the
+// loopback /healthz URL the -health probe hits. The server may bind all
+// interfaces, but the probe runs INSIDE the same container, so it always dials
+// 127.0.0.1 on the listen port: that keeps probe and server on one port via
+// $ZG_GATEWAY_LISTEN, whatever interface the server bound.
+func healthURLFromListen(listen string) (string, error) {
+	_, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return "", fmt.Errorf("cannot derive port from listen %q: %w", listen, err)
+	}
+	if port == "" {
+		return "", fmt.Errorf("no port in listen %q", listen)
+	}
+	return "http://127.0.0.1:" + port + "/healthz", nil
+}
+
+// probeHealth makes one GET to url and returns nil only on a 200 — the body of
+// the -health container probe (see runHealthCheck). Split out so a test can drive
+// it against an httptest server without spawning a process.
+func probeHealth(url string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("GET %s -> %s", url, resp.Status)
+	}
+	return nil
+}
+
+// runHealthCheck is the -health path: resolve the loopback /healthz URL from
+// -listen, probe it, and return a process exit code (0 healthy, 1 not). Because
+// the image is distroless, this IS the compose healthcheck (deploy/phala/).
+func runHealthCheck(listen string) int {
+	url, err := healthURLFromListen(listen)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "health: %v\n", err)
+		return 1
+	}
+	if err := probeHealth(url, 3*time.Second); err != nil {
+		fmt.Fprintf(os.Stderr, "health: %v\n", err)
+		return 1
+	}
+	return 0
 }
 
 // newHandler mounts the shared OpenAI proxy, the gateway-only operational routes

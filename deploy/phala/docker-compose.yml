@@ -40,6 +40,15 @@ services:
     # Docker Hub; pinned by digest so app_id commits to this exact image.
     image: dstacktee/dstack-ingress:2.3@sha256:527c53523b9226782a11dbd800a3ff55e8a1f0b88e6224e8f7e4db7419769fbe
     restart: unless-stopped
+    # Start after the gateway is HEALTHY, not merely created: HAProxy resolves the
+    # `gateway` backend name once at startup (see the gateway's expose note), so
+    # bringing it up before the gateway serves risks a dead backend on first boot.
+    # This closes the startup race only — it does NOT cover the gateway being
+    # recreated with a new address later; that still needs an ingress restart (see
+    # the gateway note). depends_on is part of the measured compose text (app_id).
+    depends_on:
+      gateway:
+        condition: service_healthy
     ports:
       # Publishes 443 on the CVM so the dstack gateway can reach HAProxy in here.
       # The gateway passes any SNI it holds no wildcard cert for straight through
@@ -90,13 +99,17 @@ services:
       - evidences:/evidences
 
   gateway:
-    # Published by .github/workflows/docker.yml to GHCR, and pinned by digest
-    # (this is what `:latest` resolved to when it was pinned). app_id hashes the
-    # app-compose manifest, which embeds this file verbatim — so a floating tag
-    # would keep app_id, and therefore the attestation, identical while the code
-    # that sees plaintext user prompts changes underneath it. Re-pin deliberately
-    # on every gateway upgrade; see README "Pin the image digest".
-    image: ghcr.io/0gfoundation/0g-pc-e2ee-gateway@sha256:18e78717954d02f821d91292d86e611fe5cd31836360fe2fce233369cf987072
+    # Published by .github/workflows/docker.yml to GHCR.
+    #
+    # DEVELOPMENT: floating `:latest` so a fresh build is picked up on redeploy
+    # without editing this file. This DEFEATS the attestation story and MUST be
+    # re-pinned before any attested / production deploy: app_id hashes the
+    # app-compose manifest, which embeds this file verbatim, so a floating tag
+    # keeps app_id — and therefore the quote — identical while the code that sees
+    # plaintext user prompts changes underneath it. Restore the digest pin
+    # (`ghcr.io/0gfoundation/0g-pc-e2ee-gateway@sha256:<digest>`) and re-pin it
+    # deliberately on every upgrade; see README "Pin the image digest".
+    image: ghcr.io/0gfoundation/0g-pc-e2ee-gateway:latest
     restart: unless-stopped
     # Deliberately NOT published to the host: a published 8443 would also be
     # served at `<app-id>-8443.<base_domain>`, where the dstack gateway (not this
@@ -108,6 +121,20 @@ services:
     # recreated with a new address, restart dstack-ingress too.
     expose:
       - "8443"
+    # The gateway serves GET /healthz ("ok"); the image is distroless (no shell,
+    # no curl), so the probe is the gateway binary itself — `gateway -health`
+    # does one GET /healthz to its own ZG_GATEWAY_LISTEN port and exits 0/1. This
+    # is what lets dstack-ingress gate on `condition: service_healthy` below, so
+    # it does not resolve/forward to the gateway until the gateway is actually
+    # serving. Part of the measured compose text (app_id).
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/gateway", "-health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      # Grace before failures count: the gateway must parse config, dial the
+      # router, and (with -warm) prime the quote cache before it is "up".
+      start_period: 30s
     # Same env-var contract as the sidecar (flag > env var > default). This block
     # is part of the compose text app_id commits to.
     environment:

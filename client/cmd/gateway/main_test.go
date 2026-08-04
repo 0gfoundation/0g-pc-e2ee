@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/route"
@@ -53,6 +54,43 @@ func TestGatewayHealthz(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("/healthz: got %d, want 200", resp.StatusCode)
+	}
+}
+
+// The -health probe (used as the container healthcheck, since the distroless
+// image has no shell or curl) must return nil against a live /healthz and an
+// error against an unreachable one, and it must derive the port from the same
+// -listen value the server binds.
+func TestGatewayHealthProbe(t *testing.T) {
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), discardLogger()))
+	defer gw.Close()
+
+	// Healthy: probe the live server's /healthz directly.
+	if err := probeHealth(gw.URL+"/healthz", 3*time.Second); err != nil {
+		t.Fatalf("probeHealth against a live gateway: %v", err)
+	}
+
+	// Unreachable: a server we immediately close refuses the connection, so the
+	// probe must fail (this is what a down gateway looks like to the healthcheck).
+	dead := httptest.NewServer(http.NotFoundHandler())
+	deadURL := dead.URL
+	dead.Close()
+	if err := probeHealth(deadURL+"/healthz", 3*time.Second); err == nil {
+		t.Fatal("probeHealth against a closed gateway: got nil, want an error")
+	}
+
+	// Port derivation: the probe URL must target loopback on the -listen port,
+	// whatever interface the server binds.
+	url, err := healthURLFromListen("0.0.0.0:8443")
+	if err != nil {
+		t.Fatalf("healthURLFromListen: %v", err)
+	}
+	if url != "http://127.0.0.1:8443/healthz" {
+		t.Fatalf("healthURLFromListen: got %q, want loopback on port 8443", url)
+	}
+	// A -listen with no port is a configuration error, not a silent no-probe.
+	if _, err := healthURLFromListen("8443"); err == nil {
+		t.Fatal("healthURLFromListen(\"8443\"): got nil, want an error")
 	}
 }
 
