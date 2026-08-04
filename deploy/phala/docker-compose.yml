@@ -148,11 +148,11 @@ services:
       - "ZG_GATEWAY_LISTEN=0.0.0.0:8443"
       # Serve Prometheus /metrics on a SEPARATE internal listener. Like the gateway
       # itself this port is never published to the host and dstack-ingress does not
-      # front it, so it is reachable only over the compose network — by the
-      # prometheus-agent sidecar below (which scrapes `gateway:9464`). Binding
-      # 0.0.0.0 is what lets that co-located container reach it across the compose
-      # network (a localhost bind would be container-local). Empty/unset disables
-      # the endpoint entirely; the sidecar binary leaves it unset.
+      # front it, so it is reachable only over the compose network — by a co-located
+      # Prometheus-agent scraper (added separately, which scrapes `gateway:9464`).
+      # Binding 0.0.0.0 is what lets that scraper reach it across the compose network
+      # (a localhost bind would be container-local). Empty/unset disables the
+      # endpoint entirely; the sidecar binary leaves it unset.
       - "ZG_GATEWAY_METRICS_LISTEN=0.0.0.0:9464"
       # The gateway routes per request and derives each provider's enc key +
       # signer from the broker, so no provider/key is configured up front. The
@@ -236,66 +236,11 @@ services:
     # The gateway itself holds no secret: no pinned provider key, and no TLS
     # material — the cert and its key belong to dstack-ingress above, generated
     # in-enclave via ACME and kept in the cert-data volume.
-
-  # prometheus-agent scrapes the gateway's internal /metrics over the CVM docker
-  # network and remote_writes the samples to a central store (the same shape other
-  # 0G services use: a co-located Prometheus that scrapes locally and pushes out).
-  # It runs in AGENT MODE (--enable-feature=agent): no local TSDB, no query API —
-  # this CVM is ephemeral, the durable copy lives in the remote store — it only
-  # scrapes and forwards. It has neither `ports:` nor `expose:`, so like the
-  # gateway's metrics port it is reachable only from within the compose network.
-  #
-  # Config comes from a compose `config` (agent.yml, below) — no init container.
-  # Prometheus does not expand env vars in its own config, so the remote_write
-  # url/username/password are ${VAR} interpolated by COMPOSE from the deploy env
-  # (the Phala env file). The measured compose text keeps only the ${VAR}
-  # references, never the values, so nothing sensitive enters the attestation.
-  prometheus-agent:
-    # Prefer an immutable digest here too so the measured compose does not drift
-    # (see the gateway image note above).
-    image: prom/prometheus:v2.55.1
-    restart: unless-stopped
-    command:
-      - "--config.file=/etc/prometheus/agent.yml"
-      - "--enable-feature=agent"
-    configs:
-      # Compose mounts this 0444, so the agent (uid 65534/nobody) can read it.
-      - source: prom_agent_config
-        target: /etc/prometheus/agent.yml
+    #
+    # The gateway serves Prometheus /metrics on the internal 9464 above; a
+    # co-located Prometheus-agent sidecar that scrapes it and remote_writes to a
+    # central store is added separately (it depends only on this exposed port).
 
 volumes:
   cert-data: # SECRET: holds the TLS private key and the ACME account key
   evidences: # public evidence bundle served at /evidences/
-
-configs:
-  # agent.yml, rendered by COMPOSE (not Prometheus): the ${...} refs below are
-  # interpolated from the deploy env (the Phala env file) at parse time, so the
-  # measured compose text holds only the references, never the values. All three
-  # vars must be listed in the app's allowed_envs or dstack drops them. Phala's
-  # env injection is encrypted to the enclave, and the password only ever lives
-  # inside this CVM's own config — adequate for a single-tenant enclave and a
-  # write-only metrics credential (a docker `secret` would only narrow in-CVM
-  # exposure, not worth the extra compose dependency here).
-  #
-  # Targets use docker service names on the CVM network: `gateway:9464` for the
-  # app, `localhost:9090` for the agent's own metrics (self-scrape surfaces
-  # remote_write health — queue length, send failures — which is otherwise hard to
-  # see from outside the enclave).
-  prom_agent_config:
-    content: |
-      global:
-        scrape_interval: 15s
-        external_labels:
-          service: 0g-pc-gateway
-      scrape_configs:
-        - job_name: gateway
-          static_configs:
-            - targets: ["gateway:9464"]
-        - job_name: prometheus-agent
-          static_configs:
-            - targets: ["localhost:9090"]
-      remote_write:
-        - url: "${ZG_PROM_REMOTE_WRITE_URL:?set the remote_write endpoint, e.g. https://prometheus.example.com/api/v1/write}"
-          basic_auth:
-            username: "${ZG_PROM_REMOTE_WRITE_USERNAME:?set the remote_write basic_auth username}"
-            password: "${ZG_PROM_REMOTE_WRITE_PASSWORD:?set the remote_write basic_auth password}"
