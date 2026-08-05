@@ -14,7 +14,7 @@ const (
 	mgmtKeyPrefix      = "mk-" // management key — rejected on the inference path
 )
 
-// RequireCredential is the gateway's front-door auth gate for the sealed
+// RequireInferenceCredential is the gateway's front-door auth gate for the sealed
 // inference path. It is a cheap presence/shape check, NOT authentication: the
 // router remains the authoritative auth/billing point (docs/design/cloud-gateway.md
 // §12) and re-validates every credential the gateway forwards. This gate's only
@@ -23,7 +23,7 @@ const (
 //
 //   - no credential          -> 401 (missing key)
 //   - management key (mk-…)   -> 403 (mgmt keys cannot do inference; mirrors the
-//                               router's RejectMgmtKey)
+//     router's RejectMgmtKey)
 //   - everything else         -> forwarded to the wrapped handler
 //
 // Inference keys (sk-…) pass on their prefix alone: the key body's length has
@@ -36,7 +36,7 @@ const (
 //
 // It is mounted only by the gateway. The sidecar shares this package but is
 // single-user and needs no auth, so it never wraps its handler with this.
-func RequireCredential(h http.Handler) http.Handler {
+func RequireInferenceCredential(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		tok := bearerToken(r)
 		if tok == "" {

@@ -16,7 +16,7 @@ func okHandler(passed *bool) http.Handler {
 	})
 }
 
-func TestRequireCredential(t *testing.T) {
+func TestRequireInferenceCredential(t *testing.T) {
 	tests := []struct {
 		name       string
 		headers    map[string]string
@@ -39,7 +39,7 @@ func TestRequireCredential(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			var passed bool
-			h := RequireCredential(okHandler(&passed))
+			h := RequireInferenceCredential(okHandler(&passed))
 
 			r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 			for k, v := range tc.headers {

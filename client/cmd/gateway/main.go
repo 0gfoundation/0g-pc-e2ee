@@ -31,7 +31,7 @@
 // own SPEC §8 response signature, which the gateway verifies
 // (ZG_GATEWAY_VERIFY_RESPONSES). So the gateway exposes no /quote route. The
 // sealed inference path carries a front-door credential gate
-// (openaiproxy.RequireCredential in newHandler): a cheap presence/shape check
+// (openaiproxy.RequireInferenceCredential in newHandler): a cheap presence/shape check
 // that sheds missing-credential and mgmt-key traffic before the seal/route work,
 // while the router stays the authoritative auth/billing point and re-validates
 // every forwarded credential. The remaining multi-tenant concerns (per-user
@@ -238,7 +238,7 @@ func newHandler(c *core.Client, routerTarget *url.URL, logger *slog.Logger) http
 	// and the catch-all metadata passthrough below is discovery the router already
 	// governs. The sidecar shares openaiproxy but is single-user, so it never
 	// mounts this gate.
-	mux.Handle("POST /v1/chat/completions", openaiproxy.RequireCredential(openaiproxy.Handler(c)))
+	mux.Handle("POST /v1/chat/completions", openaiproxy.RequireInferenceCredential(openaiproxy.Handler(c)))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte("ok\n"))

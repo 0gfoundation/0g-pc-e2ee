@@ -58,7 +58,7 @@ func TestGatewayHealthz(t *testing.T) {
 }
 
 // TestGatewayAuthGateWiring confirms the front-door credential gate
-// (openaiproxy.RequireCredential) is mounted on the sealed inference route and
+// (openaiproxy.RequireInferenceCredential) is mounted on the sealed inference route and
 // only there: a credential-less or mgmt-key request to /v1/chat/completions is
 // rejected at the gate (before any seal/route work — the router URL here is
 // unreachable, so reaching the core would surface as a 502, not the 401/403 the
@@ -213,7 +213,7 @@ func TestGatewayRouteMode(t *testing.T) {
 
 	userReq := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`
 	// Carry an inference key: the sealed path is now behind the front-door
-	// credential gate (openaiproxy.RequireCredential), which rejects a
+	// credential gate (openaiproxy.RequireInferenceCredential), which rejects a
 	// credential-less request before it ever reaches the seal/route path.
 	req, err := http.NewRequest(http.MethodPost, gw.URL+"/v1/chat/completions", strings.NewReader(userReq))
 	if err != nil {
