@@ -70,6 +70,23 @@ services:
       - DELEGATION_ZONE=${DELEGATION_ZONE:?set DELEGATION_ZONE, the zone this container may write}
       - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:?set CLOUDFLARE_API_TOKEN, scoped to DELEGATION_ZONE only}
       - TARGET_ENDPOINT=gateway:8443 # forward decrypted traffic to the gateway
+      # DNS setup pre-check mode. Default `wait`: block on boot until the served
+      # CNAMEs resolve to `<name>.<DOMAIN>.<DELEGATION_ZONE>` (a strict, one-hop
+      # match), then proceed. That is correct for a single instance whose served
+      # CNAMEs point straight at its own delegation zone.
+      #
+      # Blue/green (deploy/phala/blue-green.md) runs each side under its OWN
+      # sub-zone (DELEGATION_ZONE=a.<zone> / b.<zone>) while the served CNAMEs stay
+      # pinned at the base zone and an operator-owned CNAME inside the base zone
+      # selects the live side. The served CNAME's immediate target is then the base
+      # name, not `<name>.…a/b.<zone>`, so the one-hop pre-check never matches and a
+      # side would block in `wait`. Set `DNS_SETUP_MODE=print` on those sides: it
+      # skips only this container's own pre-check (dnsguide.py returns immediately)
+      # and proceeds to issue the cert — Let's Encrypt and the dstack gateway both
+      # use normal resolution, which follows the full CNAME chain, so issuance and
+      # routing still work. Injected, so the measured text is identical either way;
+      # a side that sets it must also add DNS_SETUP_MODE to the app's allowed_envs.
+      - DNS_SETUP_MODE=${DNS_SETUP_MODE:-wait}
       # Least privilege: the container manages every record it needs INSIDE the
       # delegation zone (our token controls it), so the token needs NO access to
       # the served domain's own zone. The operator creates three static CNAMEs in
