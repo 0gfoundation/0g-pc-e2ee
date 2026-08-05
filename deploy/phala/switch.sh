@@ -78,6 +78,7 @@
 #   TTL              CNAME TTL in seconds           (default: 60)
 #   VERIFY_RETRIES   post-switch health attempts    (default: 20; window must outlast the route cache)
 #   VERIFY_INTERVAL  seconds between attempts       (default: 6)
+#   PROBE_RETRIES    pre-switch target probe tries  (default: 5, VERIFY_INTERVAL apart)
 #
 # This is a bash script (arrays, [[ ]], ${BASH_SOURCE}). If it was started with a
 # POSIX shell — `sh switch.sh` runs under dash on Debian/Ubuntu/WSL and chokes on
@@ -120,6 +121,7 @@ load_env_file() { # path
   [ -f "$f" ] || die "env file not found: $f"
   info "loading env from $f"
   while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"                             # tolerate CRLF (Windows/WSL) files
     line="${line#"${line%%[![:space:]]*}"}"          # strip leading whitespace
     case "$line" in ''|'#'*) continue ;; esac
     line="${line#export }"
@@ -391,7 +393,15 @@ cmd_switch() {
   [ -z "$probe" ] && probe="$(platform_probe_url "$target")"
   if [ -n "$probe" ]; then
     info "probing target side ${target} directly: $probe"
-    http_ok "$probe" || die "target-side probe failed ($probe) — refusing to switch"
+    local pi probe_ok=0
+    for ((pi=1; pi<=PROBE_RETRIES; pi++)); do
+      if http_ok "$probe"; then probe_ok=1; break; fi
+      if [ "$pi" -lt "$PROBE_RETRIES" ]; then
+        log "  probe attempt ${pi}/${PROBE_RETRIES} failed, retrying in ${VERIFY_INTERVAL}s"
+        sleep "$VERIFY_INTERVAL"
+      fi
+    done
+    [ "$probe_ok" = 1 ] || die "target-side probe failed after ${PROBE_RETRIES} attempts ($probe) — refusing to switch"
     info "target-side probe OK"
   else
     warn "no --probe-url and no PLATFORM_BASE: cannot health-check side ${target} before cutover (see blue-green.md)"
@@ -559,6 +569,7 @@ HEALTH_PATH="${HEALTH_PATH:-/healthz}"
 TTL="${TTL:-60}"
 VERIFY_RETRIES="${VERIFY_RETRIES:-20}"   # ~2x TTL by default, to outlast the gateway route cache
 VERIFY_INTERVAL="${VERIFY_INTERVAL:-6}"
+PROBE_RETRIES="${PROBE_RETRIES:-5}"      # pre-switch target probe attempts before refusing to switch
 
 # Switch-layer record names (in the delegation zone) that this script owns.
 SERVING_ALIAS="${DOMAIN}.${DELEGATION_ZONE}"           # static -> GATEWAY_DOMAIN (set by `setup`)
