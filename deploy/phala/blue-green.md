@@ -26,6 +26,19 @@ So "blue" and "green" are two CVMs with two `app_id`s, both serving `<DOMAIN>`,
 and releasing = repointing `_dstack-app-address.<DOMAIN>` from one to the other.
 [`switch.sh`](./switch.sh) does that flip safely.
 
+> **What actually sets `app_id` — the sides must be different builds.** dstack
+> measures the compose *text*, and the only literal, side-distinguishing field in
+> it is the **gateway image digest**. `DOMAIN`, `DELEGATION_ZONE`,
+> `GATEWAY_DOMAIN`, `ZG_GATEWAY_ROUTER_URL` and friends are `${...}` placeholders
+> injected from the CVM's encrypted env at boot, so **changing them does not
+> change `app_id`** (the compose comments call this out for the router URL). The
+> consequence that matters here: run the **same image** on both sides and they
+> share one `app_id` — dstack sees one app with two replicas, both per-side
+> records carry the same value, and the traffic switch **cannot select between
+> them**. Blue/green only isolates the two sides when they are genuinely
+> different gateway builds (the normal release case). To rehearse the flow before
+> a real release, use two different builds, not the same image twice.
+
 > **No percentage canary.** If you need gradual rollout, it has to be a *replica*
 > story (same `app_id`, more instances) or a second layer you build yourself.
 > The mechanism here gives fast atomic cutover + fast rollback, not 5%/50%/100%.
@@ -97,15 +110,16 @@ real environment overrides `switch.env`, and `--env-file PATH` points elsewhere.
    and both sides route through the same cluster, so one static value serves
    both. `switch.sh` does not manage this record.
 
-2. **Deploy side a and side b.** Two CVMs from [`docker-compose.yml`](./docker-compose.yml),
-   identical **except** `DELEGATION_ZONE`, each pinned to the gateway image you
-   want on that side:
+2. **Deploy side a and side b.** Two CVMs from [`docker-compose.yml`](./docker-compose.yml).
+   The **image digest** is what gives each side its own `app_id` (above), so the
+   two sides must be pinned to **different** gateway builds; `DELEGATION_ZONE`
+   differs too, but only to keep their DNS records apart:
 
    | | side a (blue) | side b (green) |
    |---|---|---|
-   | `DOMAIN` | `router-api-tee.0g.ai` | `router-api-tee.0g.ai` |
+   | gateway image digest | current build | **new build** (this is what makes it a distinct `app_id`) |
    | `DELEGATION_ZONE` | `a.integratenetwork.work` | `b.integratenetwork.work` |
-   | gateway image | current digest | new digest |
+   | `DOMAIN` | `router-api-tee.0g.ai` | `router-api-tee.0g.ai` |
 
    Everything else (the `GATEWAY_DOMAIN`, `CLOUDFLARE_API_TOKEN`, gateway env)
    stays as in the shared compose. Each side, on boot, publishes its own
@@ -209,12 +223,17 @@ completely dead standby can never silently take traffic.
 The instance running today uses `DELEGATION_ZONE=integratenetwork.work`, so it
 writes the **switch-layer names themselves** (the base-zone
 `_dstack-app-address.router-api-tee.0g.ai.integratenetwork.work` etc.) and
-**keeps reasserting** the routing one. You cannot relabel it in place — changing
-`DELEGATION_ZONE` changes the compose, hence the `app_id`, hence it is a new CVM
-anyway. So migrate by standing the first managed side up beside it:
+**keeps reasserting** the routing one. Migrate by standing a managed side up
+beside it under a per-side sub-zone, then retiring the legacy CVM. (You can't
+move the legacy instance into a sub-zone "in place": `DELEGATION_ZONE` is an
+encrypted-env value, so changing it is a mutation of the one live CVM and leaves
+you no second side to cut over to safely.)
 
-1. **Deploy side a** with `DELEGATION_ZONE=a.integratenetwork.work` (same image
-   the live instance runs, to start). It publishes `…a…` records the live
+1. **Deploy side a** with `DELEGATION_ZONE=a.integratenetwork.work`. Make this
+   your **next real gateway build** — a different image digest than the legacy
+   instance, so side a has a distinct `app_id` and the cutover is a clean pointer
+   flip (a same-image side would share the legacy `app_id`, i.e. be treated as a
+   replica of it; see the note at the top). It publishes `…a…` records the legacy
    instance never touches.
 2. **Issue side a's cert:** `./switch.sh acme a`. The base-zone `_acme-challenge`
    name is only written transiently during the live instance's own renewals, so
@@ -230,8 +249,9 @@ anyway. So migrate by standing the first managed side up beside it:
    The legacy instance reasserts the base-zone routing record on its reconcile
    loop, so until it is gone routing can briefly flap between it and side a.
    **This is not an outage:** both serve `router-api-tee.0g.ai` with valid certs,
-   so every request succeeds either way. Once the legacy CVM is destroyed, the
-   CNAME → side a is stable.
+   so every request succeeds either way — though because side a is a new build, a
+   few requests may hit the old build until the legacy CVM is gone. Once it is
+   destroyed, the CNAME → side a is stable.
 5. You now have side a as the sole managed side. The next release brings up
    **side b** under `b.integratenetwork.work` and uses `switch.sh` normally.
 

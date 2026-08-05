@@ -252,6 +252,7 @@ http_ok() { # url -> 0 if HTTP 2xx
 public_health_ok() { http_ok "https://${DOMAIN}${HEALTH_PATH}"; }
 
 confirm() {
+  [ "$DRY_RUN" = 1 ] && return 0        # dry-run changes nothing; never prompt
   [ "$ASSUME_YES" = 1 ] && return 0
   [ -t 0 ] || die "refusing to proceed non-interactively without --yes"
   local reply
@@ -278,11 +279,17 @@ cmd_status() {
   printf 'issuance switch : _acme-challenge.%s\n' "$DOMAIN"
   printf '   -> %s  [%s]\n\n' "${acme_now:-<unset>}" "${acme_side:-none}"
 
-  local s
+  local s app_a app_b
+  app_a="$(side_app_addr a || true)"
+  app_b="$(side_app_addr b || true)"
   for s in a b; do
     printf 'side %s : app-address %-24s app_id=%s\n' \
       "$s" "$(addr_target "$s")" "$(side_app_addr "$s" || true)"
   done
+  if [ -n "$app_a" ] && [ "$app_a" = "$app_b" ]; then
+    warn "both sides publish the same app_id — same build, so the switch cannot"
+    warn "select between them (dstack treats them as replicas). Use two images."
+  fi
   printf '\n'
 
   if public_health_ok; then
@@ -329,6 +336,17 @@ cmd_switch() {
     die "side ${target} publishes no app-address TXT at $(addr_target "$target") — is that CVM up and did its ingress publish?"
   fi
   info "side ${target} publishes app_id: ${tgt_addr}"
+
+  # A side's identity is its app_id, which comes from the gateway image digest.
+  # If both sides publish the SAME app_id they are the same build — dstack treats
+  # them as replicas of one app and routes to either, so the switch cannot
+  # isolate the target. That defeats the purpose; make it loud.
+  local other_addr; other_addr="$(side_app_addr "$(other_side "$target")")"
+  if [ -n "$other_addr" ] && [ "$other_addr" = "$tgt_addr" ]; then
+    warn "both sides publish the same app_id (${tgt_addr}) — they are the same"
+    warn "build, so dstack treats them as replicas and this switch cannot select"
+    warn "between them. Blue/green needs two DIFFERENT gateway images."
+  fi
 
   # Gate 2: optional direct probe of the target side before we send it traffic.
   if [ -n "$PROBE_URL" ]; then
