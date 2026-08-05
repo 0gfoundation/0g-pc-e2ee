@@ -399,6 +399,18 @@ the pointer; scaling keeps `app_id` and adds instances. They compose cleanly —
 ## Limitations & things to confirm in your environment
 
 - **No weighted/percentage canary** — atomic flip only (see the top section).
+- **Both sides must be in the same dstack cluster.** The serving alias is one
+  static value pointing at one cluster's gateway, and a gateway only routes to
+  `app_id`s in its **own** cluster — so flipping `_dstack-app-address` to a side in
+  another cluster would point the serving gateway at an `app_id` it cannot reach.
+  This scheme flips `_dstack-app-address` (+ `_acme-challenge`) only and treats the
+  serving alias as fixed. **Migrating to a new cluster** (or running the sides
+  across clusters) is not supported as-is; it additionally needs the serving alias
+  to become a *switched* record (→ the target side's `GATEWAY_DOMAIN`), a per-side
+  `GATEWAY_DOMAIN`/`PLATFORM_BASE`, and Phala's SNI allowlist on both clusters.
+  Because the client's gateway and the app-address then live in two records with
+  independent DNS caches, that cutover has a brief inconsistency window (shrink it
+  by lowering the TTLs first). Defer until a cluster move is actually needed.
 - **Standby probe needs `PLATFORM_BASE`** (the dstack platform base domain, e.g.
   `in1.phala.network`) — see [Health-checking the standby](#health-checking-the-standby-side).
 - **Cutover latency** is the switch-layer `TTL` (default 60 s) plus the dstack
