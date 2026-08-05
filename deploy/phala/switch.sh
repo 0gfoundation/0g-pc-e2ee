@@ -443,9 +443,10 @@ cmd_switch() {
   # The window must exceed the gateway's routing-cache TTL or a slow cache flush
   # reads as a failure — see VERIFY_RETRIES/VERIFY_INTERVAL.
   info "waiting for the public endpoint to serve from ${target} (record TTL ${TTL}s)..."
-  local i cert_now
+  local i cert_now healthz_seen=0
   for ((i=1; i<=VERIFY_RETRIES; i++)); do
     if public_health_ok; then
+      healthz_seen=1
       # `|| true`: never let a transient openssl/TLS hiccup abort mid-verify-loop —
       # traffic is already switched, so aborting here would skip the auto-rollback.
       # An empty cert_now just means "not confirmed yet", handled by the else below.
@@ -465,16 +466,25 @@ cmd_switch() {
     else
       log "  attempt ${i}/${VERIFY_RETRIES}: not healthy yet, sleeping ${VERIFY_INTERVAL}s"
     fi
-    sleep "$VERIFY_INTERVAL"
+    # Don't sleep after the final attempt — go straight to the failure path.
+    if [ "$i" -lt "$VERIFY_RETRIES" ]; then sleep "$VERIFY_INTERVAL"; fi
   done
 
-  warn "public endpoint did not become healthy after switching to ${target}"
+  # Two distinct failure modes, handled differently:
+  if [ "$healthz_seen" = 1 ]; then
+    warn "after ${VERIFY_RETRIES} attempts ${DOMAIN} /healthz is OK but still serving ${cur_side}'s cert"
+    warn "— the gateway route cache has not flushed to ${target} within the verify window."
+    warn "This usually means the window is shorter than the cache, not that ${target} is broken;"
+    warn "raise VERIFY_RETRIES (or lower TTL) and re-run before concluding the switch failed."
+  else
+    warn "after ${VERIFY_RETRIES} attempts ${DOMAIN} /healthz never became healthy on ${target}"
+  fi
   if [ -n "$cur_side" ]; then
     warn "AUTO-ROLLBACK: restoring traffic to ${cur_side}"
     move_switches "$cur_side"
-    die "rolled back to ${cur_side}. Investigate side ${target} before retrying."
+    die "rolled back to ${cur_side}. Investigate side ${target} (or the cache window) before retrying."
   fi
-  die "no previous side to roll back to; the switch now points at ${target} but /healthz is failing"
+  die "no previous side to roll back to; the switch points at ${target} but was not confirmed"
 }
 
 cmd_rollback() {
@@ -490,6 +500,10 @@ cmd_rollback() {
   fi
   local target; target="$(other_side "$cur_side")"
   info "rolling back: ${cur_side} -> ${target} (live side read from DNS)"
+  # A --probe-url passed to `rollback` would be for the wrong side (it names some
+  # specific endpoint, not ${target}); drop it so gate 2 uses ${target}'s own
+  # app-id probe instead of validating the rollback against an unrelated URL.
+  PROBE_URL=""
   cmd_switch "$target"
 }
 
@@ -525,9 +539,10 @@ cmd_setup() {
 }
 
 usage() {
-  # Print the header comment block (everything up to `set -euo pipefail`),
-  # stripping the leading "# ".
-  awk 'NR==1{next} /^set -euo pipefail/{exit} {sub(/^# ?/,""); print}' "$0"
+  # Print the header comment block: skip the shebang, then print comment lines and
+  # stop at the first NON-comment line (the bash re-exec guard, then `set -euo
+  # pipefail`) — so no code leaks into --help.
+  awk 'NR==1{next} /^[^#]/{exit} {sub(/^# ?/,""); print}' "$0"
   exit "${1:-0}"
 }
 
