@@ -55,10 +55,15 @@ func reportGateway(ctx context.Context, out io.Writer, ec evidenceChecker, domai
 		return fail(out)
 	}
 	filesOK := true
-	// Widest evidence filename in practice is cert-<domain>.pem; pad to keep the
-	// digest column aligned for the names that fit and merely push it right for the
-	// ones that do not.
-	const nameCol = 30
+	// Size the name column to the longest name actually present: cert-<domain>.pem
+	// grows with the domain, and a fixed width misaligns the digest column the moment
+	// a real hostname is longer than the guess.
+	nameCol := 20
+	for _, f := range rep.Files {
+		if n := len(f.Name); n > nameCol {
+			nameCol = n
+		}
+	}
 	for _, f := range rep.Files {
 		switch {
 		case f.Err != nil:
@@ -133,13 +138,18 @@ func reportGateway(ctx context.Context, out io.Writer, ec evidenceChecker, domai
 	// Waiving chain trust drops the link between this connection and the name that
 	// was asked for, so say what the pass no longer covers. Without this an operator
 	// reads a bare PASS as the full claim.
+	// The domain goes on its own line rather than mid-sentence: interpolating a
+	// hostname of unknown length into a hand-wrapped paragraph leaves it ragged.
 	if trustWaived {
-		fmt.Fprintf(out, "\nwarning: chain trust was waived, so this run does NOT establish that the connection\n"+
-			"  reached %s. An interceptor running its own attested CVM would satisfy every\n"+
-			"  other check above, serving its own quote, bundle and certificate. The claim is\n"+
-			"  \"a genuine TEE minted the certificate served on this connection\" — fine for\n"+
-			"  smoke-testing your own staging deployment, not for auditing an endpoint you do\n"+
-			"  not control.\n", rep.Domain)
+		fmt.Fprintf(out, "\nwarning: chain trust was waived, so this run does NOT establish that the\n"+
+			"  connection reached the domain asked for:\n"+
+			"    %s\n"+
+			"  An interceptor running its own attested CVM would satisfy every other check\n"+
+			"  above, serving its own quote, bundle and certificate — which match each other\n"+
+			"  because it controls both. The claim is only \"a genuine TEE minted the\n"+
+			"  certificate served on this connection\". Fine for smoke-testing a deployment\n"+
+			"  you operate; not for auditing an endpoint you do not control, and not on a\n"+
+			"  production hostname, where this check should pass without the flag.\n", rep.Domain)
 	}
 
 	if rep.Pass() && (trustOK || allowUntrustedCert) {
