@@ -115,6 +115,22 @@ TLS on the router path.
 See [`docs/design/router-e2e.md`](../docs/design/router-e2e.md) for the full trust
 model, the control-plane / data-plane split, and the encryption-key lifecycle.
 
+## Checking the trust chain yourself
+
+`cmd/pcverify` is a read-only diagnostic with one mode per attested party:
+
+```sh
+pcverify -provider 0x…            # a provider: DCAP quote + on-chain signer (trust-chain hops 2–5)
+pcverify -gateway <domain>        # the cloud-TEE gateway: its /evidences bundle + served certificate
+```
+
+The gateway mode matters for the third form above, which adds one attested trust
+party: it verifies the dstack-ingress cert-binding quote and confirms the
+certificate the domain **actually serves** is the one that quote committed to
+(`evidence/`). It does not yet establish which image the CVM runs — see
+[`docs/design/cloud-gateway.md`](../docs/design/cloud-gateway.md) §10. Both modes
+exit non-zero on a failed check, so either works as a deploy gate.
+
 ## Related repositories & products
 
 This repo (**`0g-pc-e2ee`**) holds two Go modules:

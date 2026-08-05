@@ -1,15 +1,15 @@
-// Command pcverify is a read-only diagnostic that checks a provider against the
-// 0G trust chain (docs/design/trust-chain.md) in one shot: it DCAP-verifies the
-// provider's TDX quote (hops 2–4 — genuine TDX, measurement, report_data) and
-// grounds the quote-bound signer in the on-chain InferenceServing registry
-// (hop 5 — SPEC §4.4 step 3). It is the pre-enable gate for the sidecar/gateway
-// -onchain / -attest modes: run it against the chain and provider you will point
-// them at to confirm the whole chain lines up before flipping on enforcement.
+// Command pcverify is a read-only diagnostic for the two halves of the 0G Private
+// Computer trust story. It has two modes, exactly one of which must be selected.
 //
-// It makes NO changes and sends NOTHING beyond a read of the chain RPC and a GET
-// of the provider's public /quote (plus the DCAP collateral fetch the verifier
-// does). Exit code is non-zero on any failed check, so it drops into CI or a
-// deploy gate.
+// # -provider: the provider trust chain
+//
+// Checks a provider against docs/design/trust-chain.md in one shot: it
+// DCAP-verifies the provider's TDX quote (hops 2–4 — genuine TDX, measurement,
+// report_data) and grounds the quote-bound signer in the on-chain
+// InferenceServing registry (hop 5 — SPEC §4.4 step 3). It is the pre-enable gate
+// for the sidecar/gateway -onchain / -attest modes: run it against the chain and
+// provider you will point them at to confirm the whole chain lines up before
+// flipping on enforcement.
 //
 //	pcverify -provider 0x... [-chain-rpc-url ...] [-serving-contract 0x...]
 //	         [-endpoint https://...] [-expect-signer 0x...] [-no-quote]
@@ -17,6 +17,33 @@
 // The provider's serving endpoint is read from the chain (Service.url), so
 // -endpoint is only needed to override it. -no-quote restricts the run to the
 // on-chain hop (no provider contact), matching the earlier on-chain-only tool.
+//
+// # -gateway: the cloud-TEE gateway's own attestation
+//
+// Checks the gateway endpoint itself — a hop the provider chain does not cover.
+// The gateway emits no quote of its own; its identity rests on the dstack-ingress
+// cert-binding quote published at https://<domain>/evidences/
+// (docs/design/cloud-gateway.md §6.1). This mode automates what
+// deploy/phala/README.md "Verify" describes by hand: verify the bundle against its
+// own sha256sum.txt, DCAP-verify quote.json, confirm its report_data binds that
+// manifest, and — the load-bearing step — confirm the certificate the domain
+// actually serves is the one the quote committed to.
+//
+//	pcverify -gateway pc-gateway.example.com [-pccs-url https://...]
+//	         [-allow-untrusted-cert]
+//
+// -allow-untrusted-cert accepts a certificate that does not chain to a public
+// root, for ACME-staging deployments; it relaxes no attestation check.
+//
+// A pass does NOT establish code identity: proving which image the CVM runs still
+// needs the event-log replay for app_id plus the app-compose.json comparison
+// against the deployed docker-compose.release.yml. The report says so, and prints
+// the measurement registers for that manual step.
+//
+// Both modes make NO changes and send NOTHING beyond reads: the chain RPC and the
+// provider's public /quote, or the public evidence files and one TLS handshake,
+// plus whatever DCAP collateral the verifier fetches. Exit code is non-zero on any
+// failed check, so either drops into CI or a deploy gate.
 package main
 
 import (
@@ -56,20 +83,44 @@ type quoteChecker interface {
 func run(ctx context.Context, out io.Writer, args []string) int {
 	fs := flag.NewFlagSet("pcverify", flag.ContinueOnError)
 	fs.SetOutput(out)
-	provider := fs.String("provider", "", "provider on-chain account address (0x + 40 hex, required)")
+	provider := fs.String("provider", "", "provider on-chain account address (0x + 40 hex); selects provider mode")
 	chainRPCURL := fs.String("chain-rpc-url", chain.DefaultChainRPCURL, "0G chain JSON-RPC endpoint; a source trusted independently of the router (defaults to 0G mainnet)")
 	servingContract := fs.String("serving-contract", chain.DefaultInferenceServingAddress, "InferenceServing contract address")
 	endpoint := fs.String("endpoint", "", "provider serving endpoint for the quote fetch (default: read from chain, Service.url)")
 	expectSigner := fs.String("expect-signer", "", "if set, require the on-chain teeSignerAddress to equal this")
 	noQuote := fs.Bool("no-quote", false, "skip the TDX quote hops; check only the on-chain signer (no provider contact)")
+	gateway := fs.String("gateway", "", "cloud-TEE gateway domain (e.g. pc-gateway.example.com); selects gateway mode — verify its /evidences bundle and compare the served certificate")
+	pccsURL := fs.String("pccs-url", "", "gateway mode: fetch DCAP collateral from this PCCS mirror instead of Intel PCS (e.g. https://pccs.phala.network)")
+	allowUntrustedCert := fs.Bool("allow-untrusted-cert", false, "gateway mode: accept a served certificate that does not chain to a public root (ACME staging); relaxes no attestation check")
 	timeout := fs.Duration("timeout", 30*time.Second, "overall timeout")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if strings.TrimSpace(*provider) == "" {
-		fmt.Fprintln(out, "pcverify: -provider is required")
+
+	// Exactly one mode. They verify unrelated things (a provider's trust chain vs
+	// the gateway endpoint's own attestation) and share no flags, so combining them
+	// would only hide which one the exit code refers to.
+	wantProvider := strings.TrimSpace(*provider) != ""
+	wantGateway := strings.TrimSpace(*gateway) != ""
+	switch {
+	case wantProvider && wantGateway:
+		fmt.Fprintln(out, "pcverify: -provider and -gateway are separate modes; pass exactly one")
+		return 2
+	case !wantProvider && !wantGateway:
+		fmt.Fprintln(out, "pcverify: one of -provider (provider trust chain) or -gateway (gateway attestation) is required")
 		fs.Usage()
 		return 2
+	}
+
+	if wantGateway {
+		ec, err := newEvidenceChecker(*pccsURL, *timeout)
+		if err != nil {
+			fmt.Fprintf(out, "pcverify: %v\n", err)
+			return 2
+		}
+		ctx, cancel := context.WithTimeout(ctx, *timeout)
+		defer cancel()
+		return reportGateway(ctx, out, ec, *gateway, *allowUntrustedCert)
 	}
 
 	reg, err := chain.NewOnChainRegistry(chain.Config{RPCURL: *chainRPCURL, ContractAddress: *servingContract})

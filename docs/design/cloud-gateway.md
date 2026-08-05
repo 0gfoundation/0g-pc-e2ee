@@ -164,8 +164,10 @@ controlled only by that enclave?"**
 > 1 rather than deleting it: the artifact exists, but it is **not** consumable by
 > §4's `protocol/attest` path as written. That parser expects
 > `enc_pub‖signer_addr‖version` in `report_data` and fails closed on anything
-> else, so verifying `/evidences` needs a second verifier, which is still to be
-> written.
+> else, so verifying `/evidences` needs a second verifier. That verifier now
+> exists: `attest.EvidenceReportData` / `VerifyEvidenceReportData` for the
+> cert-binding layout, and `client/evidence` for the bundle, the handshake and the
+> certificate comparison — driven by `pcverify -gateway` (§10 step 2).
 >
 > The gateway therefore needs no quote of its own and exposes **no `/quote`
 > route**. The only thing that could have required a distinct gateway quote — a
@@ -280,8 +282,9 @@ does not.
   response.
 - Depends on **`protocol/attest`** (issue #7) for quote verification on the
   gateway→provider hop. The gateway's *own* cert-binding quote comes from
-  dstack-ingress's `/evidences` (§6.1), whose `report_data` layout `attest` does
-  not currently parse; that verifier is still to be written.
+  dstack-ingress's `/evidences` (§6.1); its `report_data` layout is a second,
+  separate entry point in `attest` (`VerifyEvidenceReportData`) precisely because
+  the §4.2 parser must keep failing closed on it.
 - The **router** must accept the sealed request (0g-router#618) regardless of
   which client form produced it; the gateway is just another such client.
 
@@ -290,14 +293,29 @@ does not.
 1. **Gateway = the shared sidecar handler (`openaiproxy`) in a dstack CVM**, TLS
    terminated in that CVM by dstack-ingress on our own domain (§7,
    `deploy/phala/`). 0-code inference works, and the cert-binding quote is already
-   published at `/evidences/` — but nothing consumes it yet, so validation is
-   still manual. (Tier "2, un-auditable" until step 2 — internal / testing only.)
+   published at `/evidences/`. (Tier "2, un-auditable" until step 2 — internal /
+   testing only.)
 2. **A verifier for that cert-binding quote.** The cert binding itself is done
-   (§6.1); what is missing is code that checks it — DCAP-verify
-   `/evidences/quote.json`, recompute `report_data`, and compare the served cert
-   against the bundle. An operator/CLI can then validate out of band. Inference
-   authenticity is the provider's SPEC §8 signature, verified independently on the
-   gateway→provider hop; the gateway issues no signature of its own. (Tier 2.5.)
+   (§6.1); what was missing is code that checks it. **Endpoint identity is now
+   done** — `pcverify -gateway <domain>` (`client/evidence`, `client/cmd/pcverify`)
+   verifies the bundle against its own `sha256sum.txt`, DCAP-verifies
+   `/evidences/quote.json`, recomputes the `report_data` binding
+   (`attest.VerifyEvidenceReportData`), and compares the **served** certificate
+   against the bundle's, so an operator or auditor validates out of band with one
+   command that exits non-zero on failure. Inference authenticity is the provider's
+   SPEC §8 signature, verified independently on the gateway→provider hop; the
+   gateway issues no signature of its own.
+
+   **Code identity is still open**, so this is not yet the full tier 2.5: the tool
+   proves a genuine TEE minted the certificate the endpoint serves, not *which
+   image* that TEE runs. Closing it needs (a) event-log replay against the verified
+   RTMRs to recover `app_id` — unimplemented, and it needs a captured quote +
+   event-log fixture to be validated against, the same gap
+   `client/dcap/testdata/README.md` describes for hermetic DCAP tests — and (b)
+   comparing the CVM's `app-compose.json` with the digest-pinned
+   `docker-compose.release.yml` from the deployed Release, which needs the Phala
+   Cloud API. Until both land, `pcverify -gateway` prints the measurement registers
+   and says on every run that code identity is unchecked.
 3. **Publish `measurement ↔ cert` (transparency log / on-chain) + monitoring**,
    so cheating is publicly detectable without per-user effort.
 4. **Optional tier-3 path**: a WASM verify+seal SDK for clients that want
@@ -307,7 +325,9 @@ does not.
 ## 11. Limitations & caveats
 
 - **Tier 2.5, not tier 3**: detection, not prevention; relies on someone running
-  validation; default-trust for users who skip it. State this in product copy.
+  validation (`pcverify -gateway`); default-trust for users who skip it. State this
+  in product copy — including that the endpoint binding is checkable today while
+  code identity still needs the manual `app-compose.json` step (§10 step 2).
 - **Two enclaves see plaintext** (gateway + provider), vs one for direct-seal.
 - **Metadata** (model, sizes, timing) is visible as in the router path.
 - Cloud/runtime specifics marked **[verify]** must be confirmed against current

@@ -135,7 +135,24 @@ curl https://<DOMAIN>/healthz
 
 Attestation — this is the part that actually proves something. Fetching the
 bundle is not enough; the load-bearing step is comparing the **served**
-certificate with the one the quote commits to:
+certificate with the one the quote commits to.
+
+`pcverify -gateway` does all of that in one command — bundle integrity, DCAP
+verification of `quote.json`, the `report_data` binding, and the served-certificate
+comparison — and exits non-zero on any failed check, so it drops into a deploy gate:
+
+```sh
+go run ./client/cmd/pcverify -gateway <DOMAIN> -pccs-url https://pccs.phala.network
+```
+
+Add `-allow-untrusted-cert` when checking a hostname brought up against the ACME
+staging CA (`ACME_STAGING=true`): its certificate is correctly bound by the quote
+but deliberately signed by an untrusted CA. The flag relaxes no attestation check.
+
+It does **not** check code identity — see the `app-compose.json` step below, which
+is still manual. The command prints the quote's measurement registers for it.
+
+The equivalent by hand, for reference or when the tool is unavailable:
 
 ```bash
 # 1. the cert the endpoint actually serves
@@ -156,7 +173,9 @@ diff <(openssl x509 -in served.pem -noout -pubkey) \
 ```
 
 Then DCAP-verify `quote.json` and check its `report_data` — the first 32 bytes are
-`SHA-256(sha256sum.txt)`, right-padded to 64. Finally confirm the code: replay the
+`SHA-256(sha256sum.txt)`, right-padded to 64.
+
+Finally confirm the code — **this part `pcverify -gateway` does not do**: replay the
 event log against the verified quote to recover `app_id`, fetch the CVM's
 `app-compose.json` (Phala Cloud dashboard / API), check its `docker_compose_file`
 is byte-identical to the **`docker-compose.release.yml` from the GitHub Release

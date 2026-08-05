@@ -152,7 +152,9 @@ Honest gaps — half the value of this diagram is marking them (see
   chain.
 - **Cloud-gateway mode adds one attested trust party**: plaintext lands in 0G's
   TEE rather than the user's machine, so the gateway itself must be attested —
-  otherwise it degrades to today's plaintext L7 router.
+  otherwise it degrades to today's plaintext L7 router. That attestation is a
+  separate artifact from this chain and is checked separately
+  (`pcverify -gateway`, below); its code-identity half is still manual.
 - **Replay**: defeated client-side by a per-request nonce; a server-side
   freshness field in the signed proof is still TODO.
 
@@ -178,10 +180,21 @@ which is empty today — until it is filled, hop 3 runs in warn mode (or enforce
 rejects all). Hop 5 turns "an attested enclave" into "the **expected** attested
 enclave."
 
-**Checking a provider (`client/cmd/pcverify`).** A read-only diagnostic walks
-hops 2–5 for one provider in a single command — DCAP-verify its quote (genuine
-TDX + measurement + report_data) and cross-check the quote-bound signer against
-its acknowledged on-chain `teeSignerAddress`. Use it as the pre-enable gate
+**Checking a provider (`client/cmd/pcverify -provider`).** A read-only diagnostic
+walks hops 2–5 for one provider in a single command — DCAP-verify its quote
+(genuine TDX + measurement + report_data) and cross-check the quote-bound signer
+against its acknowledged on-chain `teeSignerAddress`. Use it as the pre-enable gate
 before flipping the sidecar/gateway into `-attest` / `-onchain`. The provider's
 endpoint is read from the chain (`Service.url`), so only `-provider` is required.
 `-no-quote` restricts the run to the on-chain hop.
+
+**Checking the gateway itself (`pcverify -gateway <domain>`).** The chain above
+covers the *provider* hop; in cloud-gateway mode there is one more attested party
+in front of it, and it is not on this chain — the gateway emits no quote and signs
+no responses. Its identity rests on the dstack-ingress cert-binding quote at
+`/evidences/` ([`cloud-gateway.md` §6.1](./cloud-gateway.md#61-mechanism)), which
+the gateway mode verifies: bundle integrity against its own `sha256sum.txt`, DCAP
+verification of `quote.json`, the `report_data` → manifest binding, and — the step
+that actually ties the quote to the endpoint you are talking to — the **served**
+certificate compared against the bundle's. What it does *not* establish is code
+identity (`app_id`); see `cloud-gateway.md` §10 step 2 for what that still needs.
