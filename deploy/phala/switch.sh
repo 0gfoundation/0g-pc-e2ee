@@ -141,12 +141,18 @@ side_label() { # a|b|blue|green -> configured label
     *) die "unknown side '$1' (want: a|b, or blue|green)" ;;
   esac
 }
-side_name() { case "$1" in a|A|blue) echo "a";; b|B|green) echo "b";; *) echo "$1";; esac; }
+# Normalize a side to a|b. Die (don't echo it back) on anything else, so a typo
+# like `switch c` fails at the argument instead of flowing into a record name.
+side_name() { case "$1" in a|A|blue) echo "a";; b|B|green) echo "b";; *) die "unknown side '$1' (want: a|b, or blue|green)";; esac; }
 other_side() { case "$(side_name "$1")" in a) echo b;; b) echo a;; esac; }
 
-# per-side target names for a side label
-addr_target() { echo "${TXT_PREFIX}.${DOMAIN}.$(side_label "$1").${DELEGATION_ZONE}"; }
-acme_target() { echo "_acme-challenge.${DOMAIN}.$(side_label "$1").${DELEGATION_ZONE}"; }
+# per-side target names for a side label. side_label's die runs in the `$(...)`
+# subshell, so it can't abort us directly; check its status with `|| return 1`
+# and return non-zero (emitting nothing) rather than echo a malformed name with an
+# empty label. Callers assign this via `$(...)` from a directly-called function
+# (e.g. move_switches), where that non-zero status does trip set -e.
+addr_target() { local l; l="$(side_label "$1")" || return 1; echo "${TXT_PREFIX}.${DOMAIN}.${l}.${DELEGATION_ZONE}"; }
+acme_target() { local l; l="$(side_label "$1")" || return 1; echo "_acme-challenge.${DOMAIN}.${l}.${DELEGATION_ZONE}"; }
 
 # ---------------------------------------------------------------------------
 # Cloudflare API
@@ -360,6 +366,12 @@ cmd_switch() {
   local cur_target cur_side
   cur_target="$(current_cname "$ADDR_SWITCH")"
   cur_side="$(which_side "$cur_target")"
+
+  # "?" = the traffic switch points at something that is neither side's record.
+  # Refuse rather than proceed: auto-rollback would have no valid side to restore.
+  if [ "$cur_side" = "?" ]; then
+    die "traffic switch points at an unrecognized target (${cur_target}); resolve it manually (./switch.sh status) before switching"
+  fi
 
   info "current live side: ${cur_side:-<none>}  ->  target: ${target}"
   if [ "$cur_side" = "$target" ]; then
