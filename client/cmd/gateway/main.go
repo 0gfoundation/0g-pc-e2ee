@@ -23,28 +23,59 @@
 // TEE/dstack deployment, where the compose file's `environment:` block is
 // measured into the CVM attestation (see deploy/phala/docker-compose.yml).
 //
-// Attestation (the /quote body and per-response signature; issue #19, on
-// protocol/attest / issue #7) and multi-tenant concerns (auth, billing, rate
-// limiting; issue #20) are later steps; /quote is a stub until then. Trusting
-// the router's returned endpoint (vs resolving it on chain) is tracked in
-// issue #18.
+// The gateway emits no attestation quote and signs no responses of its own.
+// Endpoint/code identity comes from the in-CVM cert-binding attestation that
+// dstack-ingress publishes at /evidences — its quote commits to app_id, which
+// covers this gateway image too (see deploy/phala/ and
+// docs/design/cloud-gateway.md §6). Inference authenticity rides the provider's
+// own SPEC §8 response signature, which the gateway verifies
+// (ZG_GATEWAY_VERIFY_RESPONSES). So the gateway exposes no /quote route. Multi-
+// tenant concerns (auth, billing, rate limiting; issue #20) are a later step.
+// Trusting the router's returned endpoint (vs resolving it on chain) is tracked
+// in issue #18.
 package main
 
 import (
+	"context"
 	"flag"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/cmd/internal/proxycli"
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 )
 
 func main() {
 	f := proxycli.RegisterFlags(flag.CommandLine, "ZG_GATEWAY", ":8443")
+	// Prometheus /metrics is a gateway-only concern (the sidecar shares the
+	// instrumentation but never exposes it), so its listen address is registered
+	// here rather than in the shared proxycli flags. Empty (the default) disables
+	// the endpoint entirely; the TEE deployment sets it to an internal address
+	// (e.g. 0.0.0.0:9464) that the compose neither publishes to the host nor fronts
+	// with dstack-ingress, so /metrics is reachable only over the CVM-internal
+	// compose network (the co-located Prometheus-agent scraper), never publicly.
+	metricsListen := flag.String("metrics-listen", os.Getenv("ZG_GATEWAY_METRICS_LISTEN"),
+		"address to serve Prometheus /metrics on; empty disables it. Bind an INTERNAL "+
+			"address never published through the public ingress (env ZG_GATEWAY_METRICS_LISTEN)")
+	// -health turns the binary into its OWN container health probe: it makes one
+	// GET /healthz to the -listen port, prints the result, and exits 0 (healthy)
+	// or 1 — it starts no server. The image is distroless (no shell, no curl,
+	// see cmd/gateway/Dockerfile), so the compose healthcheck runs THIS instead
+	// of a shell one-liner (deploy/phala/docker-compose.yml). Reusing -listen /
+	// $ZG_GATEWAY_LISTEN keeps the probe and the server on the same port.
+	health := flag.Bool("health", false, "probe GET /healthz on the -listen port and exit 0 (healthy) or 1; starts no server, for container healthchecks")
 	flag.Parse()
+
+	if *health {
+		os.Exit(runHealthCheck(*f.Listen))
+	}
 
 	// Build validates the flags and wires the route-and-seal client core (shared
 	// with the sidecar). "gateway" only labels the attestation log line. The debug
@@ -59,14 +90,31 @@ func main() {
 	logger := proxycli.NewLogger()
 	built := f.Build("gateway", logger)
 
+	// Parse the router base URL once, up front, so a malformed -router-url fails
+	// loud at startup (like Build's other validation) instead of surfacing as a
+	// broken catch-all on the first non-chat request. The catch-all reverse-proxies
+	// every otherwise-unmatched path to this router (see newRouterProxy).
+	routerTarget, err := url.Parse(*f.RouterURL)
+	if err != nil || routerTarget.Scheme == "" || routerTarget.Host == "" {
+		logger.Error("invalid -router-url", "url", *f.RouterURL, "err", err)
+		os.Exit(1)
+	}
+
 	// Start the background quote-cache warmer (a no-op unless -warm is set) so
 	// requests hit a warm cache instead of paying the DCAP verify inline; stop it
 	// on shutdown before the process exits.
 	stopWarmer := built.StartWarmer(logger)
 
+	// Serve Prometheus /metrics on its own internal listener (a no-op unless
+	// -metrics-listen is set). It is deliberately a separate server from the public
+	// one: the metrics address is bound to a port the compose does not publish, so
+	// it never rides the same ingress as the OpenAI API surface. stopMetrics shuts
+	// it down alongside the main server on a signal.
+	stopMetrics := startMetrics(*metricsListen, logger)
+
 	srv := &http.Server{
 		Addr:              *f.Listen,
-		Handler:           newHandler(built.Client, logger),
+		Handler:           newHandler(built.Client, routerTarget, logger),
 		ReadHeaderTimeout: 10 * time.Second, // mitigate slow-header (Slowloris) clients
 	}
 	// TLS is terminated ahead of this listener, inside the same enclave
@@ -78,31 +126,122 @@ func main() {
 	// dstack/Phala deployment sends it on every redeploy). ListenAndServe's clean
 	// shutdown is folded into a nil return; only a real listen failure is an error.
 	logger.Info("gateway listening", "listen", *f.Listen, "router_url", *f.RouterURL)
-	err := proxycli.Serve(srv, logger)
+	err = proxycli.Serve(srv, logger)
 	stopWarmer()
+	stopMetrics()
 	if err != nil {
 		logger.Error("gateway server exited", "err", err)
 		os.Exit(1)
 	}
 }
 
-// newHandler mounts the shared OpenAI proxy plus the gateway-only operational
-// routes (health, attestation quote), wrapped in the access-log middleware so
+// startMetrics serves the Prometheus /metrics endpoint on its own internal
+// listener and returns a stop function the caller runs at shutdown. When listen
+// is empty the endpoint is disabled and stop is a no-op, so main can wire it
+// unconditionally. A listen failure is logged but never fatal: metrics are
+// operational telemetry, so the gateway keeps serving requests even if its
+// metrics port cannot bind, rather than the observability path taking down the
+// data path.
+func startMetrics(listen string, logger *slog.Logger) (stop func()) {
+	if listen == "" {
+		return func() {}
+	}
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", metrics.Handler())
+	srv := &http.Server{
+		Addr:              listen,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second, // mitigate slow-header (Slowloris) clients
+	}
+	go func() {
+		logger.Info("metrics listening", "listen", listen)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Error("metrics server exited", "err", err)
+		}
+	}()
+	return func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	}
+}
+
+// healthURLFromListen turns a -listen value (":8443", "0.0.0.0:8443", …) into the
+// loopback /healthz URL the -health probe hits. The server may bind all
+// interfaces, but the probe runs INSIDE the same container, so it always dials
+// 127.0.0.1 on the listen port: that keeps probe and server on one port via
+// $ZG_GATEWAY_LISTEN, whatever interface the server bound.
+func healthURLFromListen(listen string) (string, error) {
+	_, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return "", fmt.Errorf("cannot derive port from listen %q: %w", listen, err)
+	}
+	if port == "" {
+		return "", fmt.Errorf("no port in listen %q", listen)
+	}
+	return "http://127.0.0.1:" + port + "/healthz", nil
+}
+
+// probeHealth makes one GET to url and returns nil only on a 200 — the body of
+// the -health container probe (see runHealthCheck). Split out so a test can drive
+// it against an httptest server without spawning a process.
+func probeHealth(url string, timeout time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("GET %s -> %s", url, resp.Status)
+	}
+	return nil
+}
+
+// runHealthCheck is the -health path: resolve the loopback /healthz URL from
+// -listen, probe it, and return a process exit code (0 healthy, 1 not). Because
+// the image is distroless, this IS the compose healthcheck (deploy/phala/).
+func runHealthCheck(listen string) int {
+	url, err := healthURLFromListen(listen)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "health: %v\n", err)
+		return 1
+	}
+	if err := probeHealth(url, 3*time.Second); err != nil {
+		fmt.Fprintf(os.Stderr, "health: %v\n", err)
+		return 1
+	}
+	return 0
+}
+
+// newHandler mounts the shared OpenAI proxy, the gateway-only operational route
+// (health), and a catch-all that reverse-proxies every other path to the router
+// (routerTarget), all wrapped in the access-log middleware so
 // every request emits one redaction-safe structured line. It is split out from
 // main so tests can drive it with httptest.
-func newHandler(c *core.Client, logger *slog.Logger) http.Handler {
+func newHandler(c *core.Client, routerTarget *url.URL, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	openaiproxy.Register(mux, c)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte("ok\n"))
 	})
-	// /quote will expose the enclave's attestation quote (with the TLS cert key
-	// bound into report_data) once the gateway attestation work lands (issue #19,
-	// on protocol/attest / issue #7); until then it advertises the endpoint but is
-	// Not Implemented, so a validator gets a clear signal rather than a 404.
-	mux.HandleFunc("GET /quote", func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "attestation quote not yet implemented", http.StatusNotImplemented)
-	})
+	// The gateway exposes no /quote route: it emits no attestation quote of its
+	// own. Endpoint/code identity comes from dstack-ingress's in-CVM cert-binding
+	// attestation (/evidences, which commits to app_id and so covers this image);
+	// see docs/design/cloud-gateway.md §6.
+	//
+	// Everything else — the router's non-sealed OpenAI surface (model catalog,
+	// discovery) a thin client needs — is reverse-proxied to the router as-is. The
+	// sealed chat route and /healthz are more specific patterns, so Go's
+	// ServeMux keeps serving them; only unmatched paths fall through here. This is a
+	// cleartext passthrough — safe for metadata, never for sealed content (see
+	// newRouterProxy).
+	mux.Handle("/", newRouterProxy(routerTarget, logger))
 	return openaiproxy.LogRequests(logger, mux)
 }

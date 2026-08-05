@@ -26,6 +26,13 @@ client ──TLS──> platform host front end ──> dstack gateway ──pas
   TCP through, so **plaintext never exists outside our own enclave**.
 - The gateway therefore serves **plaintext HTTP** on `:8443` and does no TLS. It
   is not published to the host — only dstack-ingress is reachable from outside.
+- The gateway has a Docker **healthcheck** (`gateway -health`, which probes its
+  own `/healthz` — the image is distroless, so the binary is its own probe), and
+  dstack-ingress `depends_on` it with `condition: service_healthy`. So ingress
+  only comes up once the gateway is actually serving, closing the first-boot race
+  where HAProxy resolves the `gateway` backend before it exists. (A *later*
+  recreation of the gateway with a new address still needs an ingress restart —
+  `depends_on` covers startup only.)
 - dstack-ingress serves `/evidences/` (`quote.json`, `cert-<DOMAIN>.pem`,
   `acme-account.json`, `sha256sum.txt`). The quote's `report_data` holds
   `SHA-256(sha256sum.txt)`, and `sha256sum.txt` covers the served certificate;
@@ -185,11 +192,18 @@ attestation above applies. Development only.
 
 ## Pin the image digest
 
+> **Development phase:** the checked-in compose currently references the gateway
+> as `ghcr.io/0gfoundation/0g-pc-e2ee-gateway:latest` so a fresh build is picked
+> up on redeploy without editing the file. This intentionally **breaks the
+> attestation guarantee below** and must be reverted to a digest pin before any
+> attested / production deploy. dstack-ingress stays digest-pinned throughout.
+
 `app_id` hashes the app-compose manifest, which embeds this compose file
 verbatim — so a floating `:latest` tag keeps the attestation identical while the
 code underneath changes, and anyone who can push to the registry could swap the
 gateway binary inside an "attested" CVM undetectably. Both images are therefore
-pinned by digest, and both have to be re-pinned deliberately on upgrade:
+pinned by digest for production, and both have to be re-pinned deliberately on
+upgrade:
 
 ```sh
 # what :latest points at RIGHT NOW — compare it with the digest in the compose
@@ -201,18 +215,115 @@ docker buildx imagetools inspect ghcr.io/0gfoundation/0g-pc-e2ee-gateway:latest
 Changing either digest changes `app_id`, which is the point: it is a new
 deployment, and verifiers have to re-audit it.
 
+## Metrics (Prometheus)
+
+The gateway exports Prometheus metrics, but **not on the public endpoint**. It
+serves `/metrics` on a separate internal listener (`ZG_GATEWAY_METRICS_LISTEN`,
+set to `0.0.0.0:9464` in the compose). That port is never published to the host
+and dstack-ingress does not front it, so — like the gateway's `:8443` — it is
+reachable only over the compose network. This keeps operational telemetry off the
+same edge as the OpenAI API and avoids adding a side channel to the confidential
+enclave.
+
+Shipping the samples out follows the same shape other 0G services use — a
+co-located Prometheus that scrapes locally and `remote_write`s to a central
+store — but in **agent mode**:
+
+- A `prometheus-agent` container (`prom/prometheus --enable-feature=agent`)
+  scrapes `gateway:9464` over the compose network and `remote_write`s to your
+  central Prometheus (or any `remote_write`-compatible store). Agent mode keeps
+  no local TSDB and no query API — this CVM is ephemeral; the durable copy lives
+  in the remote store. A self-hosted Prometheus receiving `remote_write` must run
+  with `--web.enable-remote-write-receiver`.
+- The agent also **self-scrapes**, so `remote_write` health (queue length, send
+  failures) is visible even though the CVM has no local query API — important
+  because an outbound break inside the enclave is otherwise hard to see.
+
+### Configuring remote_write
+
+You pass three values, not a hand-built config:
+
+| Variable | Secret? | Example |
+|---|---|---|
+| `ZG_PROM_REMOTE_WRITE_URL` | no | `https://prometheus.example.com/api/v1/write` |
+| `ZG_PROM_REMOTE_WRITE_USERNAME` | no | `0g-pc-gateway` |
+| `ZG_PROM_REMOTE_WRITE_PASSWORD` | **yes** | — |
+| `ZG_PROM_ENV` | no | `staging` / `mainnet` |
+
+Set all four in the CVM's **encrypted environment** — the Phala env file, the
+same channel as `CLOUDFLARE_API_TOKEN` — and list them in the app's
+`allowed_envs`, or dstack drops them.
+
+`ZG_PROM_ENV` becomes an `env` label stamped on every series (alongside a fixed
+`service=0g-pc-gateway`), so when staging and mainnet remote_write into the **same
+store** their metrics stay distinguishable — the dashboard filters on it. Set it
+per environment (`staging` in the staging env file, `mainnet` in the other); a
+missing value fails the deploy loudly (`:?`), but note it is not validated against
+the two names, so a typo yields a wrong-but-accepted label. Only `${VAR}` *references* live in the
+measured compose text, never the values, so nothing sensitive enters the
+attestation.
+
+Prometheus does not expand env vars in its own config, so `agent.yml` is a
+compose **`config`** whose `remote_write` url/username/password are `${VAR}` —
+interpolated by **compose** from the env file when it renders, then mounted
+read-only (0444, so the agent's `nobody` user can read it). No init container and
+no docker `secret`: Phala's env injection is already encrypted to the enclave,
+and the rendered password only ever lives inside this single-tenant CVM's own
+config — adequate for a write-only metrics credential. (A docker `secret` would
+only narrow in-CVM exposure — keep the value out of the container env and out of
+the config file — which is not worth an extra compose dependency here.)
+
+Scrape targets use docker **service names** on the compose network: `gateway:9464`
+for the app and `localhost:9090` for the agent's own metrics.
+
+> This uses top-level `configs:`, standard in Docker Compose / recent dstack. If
+> your runtime rejects it, render `agent.yml` with a small init container instead
+> (write it from the same env vars to a shared volume before the agent starts).
+> A password containing YAML-special characters (`"` or `\`) also wants the
+> init-container form (or a `password_file`) rather than the inline value.
+
+### Metric hygiene
+
+Labels are deliberately low-cardinality and content-free (route templates, HTTP
+methods, status codes, fixed outcome enums) — the same redaction discipline the
+access log keeps, so metrics never leak the plaintext the E2EE seal protects. See
+[`client/metrics`](../../client/metrics) for the full metric set (HTTP RED,
+completion outcome by source/stage, E2EE open failures, §8 response-signature
+verification failures, quote verify latency, quote/collateral cache hit ratios,
+and warmer liveness).
+
 ## Notes
 
-- **Secrets.** The Cloudflare token is the only secret to supply, but the
-  `cert-data` volume holds material just as sensitive — the TLS private key and
-  the ACME account key. It never leaves the CVM; do not snapshot or export it.
-  The `evidences` volume is public by design.
-- **Attestation** comes from dstack-ingress's `/evidences/`. The gateway's own
-  `/quote` route is a 501 stub pending issue #19; it is not part of this
-  deployment's trust story and is not needed for the certificate binding.
+- **Secrets.** The Cloudflare token and the `remote_write` password (see Metrics)
+  are the secrets to supply, but the `cert-data` volume holds material just as
+  sensitive — the TLS private key and the ACME account key. It never leaves the
+  CVM; do not snapshot or export it. The `evidences` volume is public by design.
+- **Attestation** comes entirely from dstack-ingress's `/evidences/`. The gateway
+  exposes no attestation endpoint of its own and signs no responses of its own:
+  its `app_id`-covered image is already attested by the ingress cert-binding
+  quote, and inference authenticity rides each provider's own SPEC §8 signature
+  (verified via `ZG_GATEWAY_VERIFY_RESPONSES`). See
+  [`cloud-gateway.md`](../../docs/design/cloud-gateway.md) §6.
 - The gateway holds no pinned provider key: it routes per request and derives
-  each provider's enc key + signer from the broker. It defaults to the 0G router;
-  override with `ZG_GATEWAY_ROUTER_URL`.
+  each provider's enc key + signer from the broker. The router base URL is
+  `${ZG_GATEWAY_ROUTER_URL:-https://router-api.0g.ai}` — unset it (production) to
+  use the 0G production router, or inject `ZG_GATEWAY_ROUTER_URL` via the CVM's
+  **encrypted environment** (staging) to point at a different router. The
+  variable must be listed in the app's `allowed_envs` for the override to reach
+  the container. Since the *measured* text is the `${…}` form, staging and
+  production share `app_id`; that is safe only because the router is untrusted by
+  construction (see the provider-verification note below).
+- **Provider verification** is on in verify-and-warn mode. Each provider's TDX
+  quote is DCAP-verified (`ZG_GATEWAY_ATTEST`), its quote-bound signer is
+  cross-checked against the on-chain `teeSignerAddress`
+  (`ZG_GATEWAY_ONCHAIN`), and each response's §8 TEE signature is verified
+  fail-closed against that signer (`ZG_GATEWAY_VERIFY_RESPONSES`). A background
+  warmer (`ZG_GATEWAY_WARM`) pre-verifies quotes so requests hit a warm cache.
+  The measurement and on-chain-signer checks only *warn* on a mismatch rather
+  than reject, because their enforce switches (`ZG_GATEWAY_ATTEST_ENFORCE`,
+  `ZG_GATEWAY_ONCHAIN_ENFORCE`) are off — the audited-image allowlist is not
+  wired yet, so enforcing measurements would reject every provider. Response
+  signatures are always fail-closed.
 - If the gateway container is recreated with a new address, restart
   dstack-ingress too — HAProxy resolves the backend name once, at startup.
 - **Zero-downtime upgrades.** A new gateway image is a new `app_id` (above), i.e.

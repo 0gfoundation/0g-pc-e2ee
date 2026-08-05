@@ -53,7 +53,7 @@ sdk/
 > (`cmd/sidecar`, `cmd/gateway`) share one more layer: `openaiproxy/`, the
 > OpenAI-compatible HTTP handler over `core` (seal request → open response,
 > buffered and streaming). The sidecar serves it as-is; the gateway serves it
-> plus its own operational routes (`/healthz`, `/quote`). `cmd/sidecar`,
+> plus its own operational route (`/healthz`). `cmd/sidecar`,
 > `cmd/gateway` and `sdk/go` are Go and share `core/`; `cmd/gateway` is the one
 > form that is **server-run and 0G-operated** (attested), not user-side, despite
 > living here — it runs client-core logic on behalf of browser/thin clients.

@@ -8,8 +8,10 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/route"
@@ -29,8 +31,20 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewJSONHandler(io.Discard, nil))
 }
 
+// mustURL parses a router base URL for newHandler's catch-all, failing the test
+// on a malformed one. The operational-route tests point it at an unused host;
+// only the tests that exercise the catch-all point it at a live router.
+func mustURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatalf("parse router url %q: %v", raw, err)
+	}
+	return u
+}
+
 func TestGatewayHealthz(t *testing.T) {
-	gw := httptest.NewServer(newHandler(routeClient(), discardLogger()))
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), discardLogger()))
 	defer gw.Close()
 
 	resp, err := http.Get(gw.URL + "/healthz")
@@ -43,19 +57,40 @@ func TestGatewayHealthz(t *testing.T) {
 	}
 }
 
-// /quote is still a stub: it must answer 501 (Not Implemented), not 404, so a
-// validator can tell the endpoint exists but attestation is not wired yet.
-func TestGatewayQuoteStub(t *testing.T) {
-	gw := httptest.NewServer(newHandler(routeClient(), discardLogger()))
+// The -health probe (used as the container healthcheck, since the distroless
+// image has no shell or curl) must return nil against a live /healthz and an
+// error against an unreachable one, and it must derive the port from the same
+// -listen value the server binds.
+func TestGatewayHealthProbe(t *testing.T) {
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), discardLogger()))
 	defer gw.Close()
 
-	resp, err := http.Get(gw.URL + "/quote")
-	if err != nil {
-		t.Fatalf("get /quote: %v", err)
+	// Healthy: probe the live server's /healthz directly.
+	if err := probeHealth(gw.URL+"/healthz", 3*time.Second); err != nil {
+		t.Fatalf("probeHealth against a live gateway: %v", err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNotImplemented {
-		t.Fatalf("/quote: got %d, want 501", resp.StatusCode)
+
+	// Unreachable: a server we immediately close refuses the connection, so the
+	// probe must fail (this is what a down gateway looks like to the healthcheck).
+	dead := httptest.NewServer(http.NotFoundHandler())
+	deadURL := dead.URL
+	dead.Close()
+	if err := probeHealth(deadURL+"/healthz", 3*time.Second); err == nil {
+		t.Fatal("probeHealth against a closed gateway: got nil, want an error")
+	}
+
+	// Port derivation: the probe URL must target loopback on the -listen port,
+	// whatever interface the server binds.
+	url, err := healthURLFromListen("0.0.0.0:8443")
+	if err != nil {
+		t.Fatalf("healthURLFromListen: %v", err)
+	}
+	if url != "http://127.0.0.1:8443/healthz" {
+		t.Fatalf("healthURLFromListen: got %q, want loopback on port 8443", url)
+	}
+	// A -listen with no port is a configuration error, not a silent no-probe.
+	if _, err := healthURLFromListen("8443"); err == nil {
+		t.Fatal("healthURLFromListen(\"8443\"): got nil, want an error")
 	}
 }
 
@@ -126,7 +161,7 @@ func TestGatewayRouteMode(t *testing.T) {
 	defer router.Close()
 
 	client := core.NewWithResolver(route.New(router.URL))
-	gw := httptest.NewServer(newHandler(client, discardLogger()))
+	gw := httptest.NewServer(newHandler(client, mustURL(t, router.URL), discardLogger()))
 	defer gw.Close()
 
 	userReq := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`
@@ -144,6 +179,116 @@ func TestGatewayRouteMode(t *testing.T) {
 	}
 }
 
+// TestGatewayRoutesOtherRequestsToRouter covers the catch-all: a path the mux
+// has no specific route for — the router's non-sealed OpenAI surface, e.g.
+// GET /v1/models — is reverse-proxied to the router as-is (path, query, and a
+// Host header rewritten to the router), and its response comes straight back.
+// This is the cleartext passthrough; it must never carry a prompt (see
+// newRouterProxy), which the sealed chat route — exercised by
+// TestGatewayRouteMode — continues to own.
+func TestGatewayRoutesOtherRequestsToRouter(t *testing.T) {
+	var gotPath, gotQuery, gotHost, gotAuth string
+	routerMux := http.NewServeMux()
+	routerMux.HandleFunc("GET /v1/models", func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotQuery, gotHost, gotAuth = r.URL.Path, r.URL.RawQuery, r.Host, r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"gpt-4o"}]}`))
+	})
+	router := httptest.NewServer(routerMux)
+	defer router.Close()
+
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, router.URL), discardLogger()))
+	defer gw.Close()
+
+	req, _ := http.NewRequest(http.MethodGet, gw.URL+"/v1/models?limit=1", nil)
+	req.Header.Set("Authorization", "Bearer user-key")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get /v1/models: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("got %d: %s", resp.StatusCode, body)
+	}
+	if !bytes.Contains(body, []byte(`"gpt-4o"`)) {
+		t.Fatalf("router response not passed through: %s", body)
+	}
+	if gotPath != "/v1/models" {
+		t.Errorf("router saw path %q, want /v1/models", gotPath)
+	}
+	if gotQuery != "limit=1" {
+		t.Errorf("router saw query %q, want limit=1", gotQuery)
+	}
+	// The Host header must be the router's, not the gateway's listen host, so the
+	// router's TLS/vhost routing resolves correctly.
+	if want := mustURL(t, router.URL).Host; gotHost != want {
+		t.Errorf("router saw Host %q, want %q", gotHost, want)
+	}
+	// The passthrough forwards the request verbatim, so the caller's credential
+	// reaches the router (which is the auth/billing point) unchanged.
+	if gotAuth != "Bearer user-key" {
+		t.Errorf("router saw Authorization %q, want the forwarded credential", gotAuth)
+	}
+}
+
+// TestGatewayRouterPassthroughUnreachable covers the catch-all's ErrorHandler:
+// when the router is unreachable, the passthrough must fail closed with a 502
+// carrying the SAME JSON error envelope the sealed path uses (so a thin client
+// parses errors identically on both paths), and must NOT leak the transport-level
+// error detail (router host/port) into the client-facing body.
+func TestGatewayRouterPassthroughUnreachable(t *testing.T) {
+	// Point the catch-all at a server we immediately close, so a connection to it
+	// is refused — a deterministic transport failure without depending on a
+	// hard-coded unused port.
+	dead := httptest.NewServer(http.NotFoundHandler())
+	deadURL := dead.URL
+	dead.Close()
+
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, deadURL), discardLogger()))
+	defer gw.Close()
+
+	resp, err := http.Get(gw.URL + "/v1/models")
+	if err != nil {
+		t.Fatalf("get /v1/models: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("unreachable router: got %d, want 502", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type: got %q, want application/json", ct)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	// The envelope's canonical shape: a client-facing error object plus the _0g
+	// attribution, source "upstream" (a failure reaching the router), never the
+	// raw transport error.
+	var env struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+		ZG struct {
+			Source string `json:"source"`
+		} `json:"_0g"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("502 body is not JSON: %v\n%s", err, body)
+	}
+	if env.ZG.Source != "upstream" {
+		t.Errorf("_0g.source: got %q, want upstream", env.ZG.Source)
+	}
+	if env.Error.Type != "upstream_error" {
+		t.Errorf("error.type: got %q, want upstream_error", env.Error.Type)
+	}
+	if env.Error.Message == "" {
+		t.Error("error.message is empty")
+	}
+	if bytes.Contains(body, []byte(mustURL(t, deadURL).Host)) {
+		t.Errorf("502 body leaked the router host: %s", body)
+	}
+}
+
 // TestGatewayAccessLog covers the middleware's contract: health probes are not
 // logged (they would drown real traffic), every other request emits one
 // structured line with the expected metadata fields, a caller-supplied request
@@ -152,7 +297,17 @@ func TestGatewayRouteMode(t *testing.T) {
 func TestGatewayAccessLog(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewJSONHandler(&buf, nil))
-	gw := httptest.NewServer(newHandler(routeClient(), logger))
+
+	// A stand-in router that answers a non-health path with a 5xx, so the log line
+	// exercises the error-severity mapping. A router 5xx is a successful proxy
+	// round trip, passed through verbatim as one logged request; the catch-all's
+	// ErrorHandler (which would add a second line) fires only on a transport
+	// failure — see newRouterProxy.
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "nope", http.StatusNotImplemented)
+	}))
+	defer upstream.Close()
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, upstream.URL), logger))
 	defer gw.Close()
 
 	// A health probe must not produce a log line.
@@ -163,15 +318,16 @@ func TestGatewayAccessLog(t *testing.T) {
 	}
 
 	// A real request carrying a secret Authorization header and a forwarded
-	// request id. /quote is a convenient non-health route (it answers 501).
+	// request id, reverse-proxied to the router as a non-sealed metadata path.
 	const secret = "Bearer super-secret-token"
 	const callerID = "caller-req-123"
-	req, _ := http.NewRequest(http.MethodGet, gw.URL+"/quote", nil)
+	const reqPath = "/v1/models"
+	req, _ := http.NewRequest(http.MethodGet, gw.URL+reqPath, nil)
 	req.Header.Set("Authorization", secret)
 	req.Header.Set("X-Request-Id", callerID)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		t.Fatalf("get /quote: %v", err)
+		t.Fatalf("get %s: %v", reqPath, err)
 	}
 	resp.Body.Close()
 
@@ -198,8 +354,8 @@ func TestGatewayAccessLog(t *testing.T) {
 	if rec["msg"] != "request" {
 		t.Errorf("msg: got %v, want %q", rec["msg"], "request")
 	}
-	if rec["path"] != "/quote" {
-		t.Errorf("path: got %v, want %q", rec["path"], "/quote")
+	if rec["path"] != reqPath {
+		t.Errorf("path: got %v, want %q", rec["path"], reqPath)
 	}
 	if rec["method"] != http.MethodGet {
 		t.Errorf("method: got %v, want %q", rec["method"], http.MethodGet)
@@ -219,6 +375,43 @@ func TestGatewayAccessLog(t *testing.T) {
 		if _, ok := rec[field]; !ok {
 			t.Errorf("log line missing field %q: %s", field, lines[0])
 		}
+	}
+}
+
+// An empty metrics address disables the endpoint; the returned stop must still
+// be a safe no-op the caller can defer unconditionally.
+func TestStartMetricsDisabled(t *testing.T) {
+	stop := startMetrics("", discardLogger())
+	stop()
+}
+
+// TestMetricsEndpointServes binds the metrics server to a concrete loopback port
+// and confirms /metrics answers 200 with the exposition format.
+func TestMetricsEndpointServes(t *testing.T) {
+	const addr = "127.0.0.1:19464"
+	stop := startMetrics(addr, discardLogger())
+	defer stop()
+
+	// The listener starts in a goroutine; retry briefly until it is accepting.
+	var resp *http.Response
+	var err error
+	for i := 0; i < 50; i++ {
+		resp, err = http.Get("http://" + addr + "/metrics")
+		if err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil {
+		t.Fatalf("get /metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("/metrics: got %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !bytes.Contains(body, []byte("go_goroutines")) {
+		t.Fatalf("/metrics did not serve the exposition format:\n%s", body)
 	}
 }
 

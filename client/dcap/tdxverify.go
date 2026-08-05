@@ -80,7 +80,17 @@ func NewQuoteParser(cfg Config) func([]byte) (attest.Measurement, [64]byte, erro
 			opts.Getter = getter
 		}
 		if !cfg.Now.IsZero() {
-			opts.Now = cfg.Now
+			// go-tdx-guest split the single verification "now" into a per-collateral
+			// TimeSet; our Config.Now is one frozen instant for every validity check
+			// (hermetic tests pin it against a captured snapshot), so apply it to all
+			// five fields.
+			opts.Now = &verify.TimeSet{
+				PckCertChain: cfg.Now,
+				TcbInfo:      cfg.Now,
+				QeIdentity:   cfg.Now,
+				PckCrl:       cfg.Now,
+				RootCaCrl:    cfg.Now,
+			}
 		}
 
 		if err := verify.RawTdxQuote(raw, opts); err != nil {
