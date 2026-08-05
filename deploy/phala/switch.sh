@@ -416,7 +416,11 @@ cmd_switch() {
   # openssl is present.
   local cert_before=""
   if [ -n "$cur_side" ]; then
-    cert_before="$(served_cert_fp)"
+    # `|| true`: a plain `var=$(cmd)` under `set -e` aborts if cmd exits non-zero
+    # (unlike `local var=$(cmd)`, where local's own status masks it). served_cert_fp
+    # returns non-zero on a transient TLS read failure (pipefail), which must fall
+    # through to the degradation below, not kill the script.
+    cert_before="$(served_cert_fp || true)"
     if [ -z "$cert_before" ]; then
       if command -v openssl >/dev/null 2>&1; then
         warn "could not read the current served cert; will verify /healthz only"
@@ -442,7 +446,10 @@ cmd_switch() {
   local i cert_now
   for ((i=1; i<=VERIFY_RETRIES; i++)); do
     if public_health_ok; then
-      cert_now="$(served_cert_fp)"
+      # `|| true`: never let a transient openssl/TLS hiccup abort mid-verify-loop —
+      # traffic is already switched, so aborting here would skip the auto-rollback.
+      # An empty cert_now just means "not confirmed yet", handled by the else below.
+      cert_now="$(served_cert_fp || true)"
       if [ -z "$cert_before" ]; then
         # No baseline to compare (no prior side, or no openssl): /healthz is all we have.
         info "public health OK after switch to ${target} (attempt ${i})"
