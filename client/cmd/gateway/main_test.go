@@ -57,6 +57,53 @@ func TestGatewayHealthz(t *testing.T) {
 	}
 }
 
+// TestGatewayAuthGateWiring confirms the front-door credential gate
+// (openaiproxy.RequireInferenceCredential) is mounted on the sealed inference route and
+// only there: a credential-less or mgmt-key request to /v1/chat/completions is
+// rejected at the gate (before any seal/route work — the router URL here is
+// unreachable, so reaching the core would surface as a 502, not the 401/403 the
+// gate returns), while /healthz stays open for the container probe.
+func TestGatewayAuthGateWiring(t *testing.T) {
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), discardLogger()))
+	defer gw.Close()
+
+	post := func(t *testing.T, auth string) int {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, gw.URL+"/v1/chat/completions",
+			strings.NewReader(`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`))
+		if err != nil {
+			t.Fatalf("build request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if got := post(t, ""); got != http.StatusUnauthorized {
+		t.Errorf("no credential: got %d, want 401", got)
+	}
+	if got := post(t, "Bearer mk-abc"); got != http.StatusForbidden {
+		t.Errorf("mgmt key: got %d, want 403", got)
+	}
+
+	// The gate must not touch the health route.
+	resp, err := http.Get(gw.URL + "/healthz")
+	if err != nil {
+		t.Fatalf("get /healthz: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("/healthz behind gate: got %d, want 200", resp.StatusCode)
+	}
+}
+
 // The -health probe (used as the container healthcheck, since the distroless
 // image has no shell or curl) must return nil against a live /healthz and an
 // error against an unreachable one, and it must derive the port from the same
@@ -165,7 +212,16 @@ func TestGatewayRouteMode(t *testing.T) {
 	defer gw.Close()
 
 	userReq := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`
-	resp, err := http.Post(gw.URL+"/v1/chat/completions", "application/json", strings.NewReader(userReq))
+	// Carry an inference key: the sealed path is now behind the front-door
+	// credential gate (openaiproxy.RequireInferenceCredential), which rejects a
+	// credential-less request before it ever reaches the seal/route path.
+	req, err := http.NewRequest(http.MethodPost, gw.URL+"/v1/chat/completions", strings.NewReader(userReq))
+	if err != nil {
+		t.Fatalf("build gateway request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer sk-test")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("post to gateway: %v", err)
 	}
