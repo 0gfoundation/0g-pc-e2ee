@@ -52,11 +52,15 @@ below.
 ```sh
 ./switch.sh acme b           # 1. aim the issuance switch at side b FIRST
 phala cvm create ...         # 2. deploy side b — new image digest (=> new app_id),
-                             #    DELEGATION_ZONE=b.integratenetwork.work
-./switch.sh switch b         # 3. verify + flip traffic; auto-rolls-back if the
-                             #    public /healthz fails after the cut
+                             #    DELEGATION_ZONE=b.integratenetwork.work, DNS_SETUP_MODE=print
+./switch.sh switch b         # 3. probe b directly, flip traffic, confirm b is really
+                             #    serving (cert changed) + /healthz; auto-rollback otherwise
 phala cvm delete <side a>    # 4. once b is confirmed live, retire a to free resources
 ```
+
+With `PLATFORM_BASE` set in `switch.env`, step 3 health-checks side b **before**
+the flip, so a broken b is rejected rather than briefly taking traffic — see
+[Health-checking the standby](#health-checking-the-standby-side).
 
 > **About the certificate (step 1).** Side b serves the same `router-api-tee.0g.ai`
 > and needs its own cert for it. **Side b's own dstack-ingress issues that cert on
@@ -119,6 +123,19 @@ Cloudflare zones. One token scoped to `integratenetwork.work` covers both sides
 The **issuance switch** moves only when a side needs to obtain/renew its cert;
 the **serving alias** (② line 1) is set once to `GATEWAY_DOMAIN` and never moves.
 
+**Each side must run `DNS_SETUP_MODE=print`.** dstack-ingress boots with a strict
+pre-check (default `DNS_SETUP_MODE=wait`): it blocks until the served
+`<name>.<DOMAIN>` CNAME resolves *directly* to `<name>.<DOMAIN>.<DELEGATION_ZONE>`
+— one hop, exact match. Here the served CNAMEs stay pinned at the base zone (①)
+while a side runs under `DELEGATION_ZONE=a/b.…`, so that check never matches and
+the side would block in `wait` until `DNS_SETUP_TIMEOUT` and then exit without a
+cert. `DNS_SETUP_MODE=print` (see [`docker-compose.yml`](./docker-compose.yml))
+skips **only** the container's own pre-check and proceeds to issue. Let's Encrypt
+and the dstack gateway do ordinary resolution, which follows the full chain
+① → ② → ③, so issuance and routing still work — **validated**: a side boots under
+its sub-zone, issues its cert, and serves. It is injected (`${DNS_SETUP_MODE:-wait}`),
+so a side that sets it must also list `DNS_SETUP_MODE` in the app's `allowed_envs`.
+
 ## One-time setup
 
 You need a Cloudflare API token that can **edit DNS in `integratenetwork.work`**
@@ -134,6 +151,8 @@ cp deploy/phala/switch.env.example deploy/phala/switch.env
 
 Or supply it via the environment instead (`CF_API_TOKEN=... ./switch.sh …`); the
 real environment overrides `switch.env`, and `--env-file PATH` points elsewhere.
+Also set `PLATFORM_BASE` (e.g. `in1.phala.network`) in `switch.env` to enable the
+per-side pre-switch probe ([Health-checking the standby](#health-checking-the-standby-side)).
 
 1. **Serving alias (once).** The one record you create by hand in the delegation
    zone: `router-api-tee.0g.ai.integratenetwork.work` CNAME → your `GATEWAY_DOMAIN`
@@ -161,12 +180,15 @@ real environment overrides `switch.env`, and `--env-file PATH` points elsewhere.
    |---|---|---|
    | gateway image digest | current build | **new build** (this is what makes it a distinct `app_id`) |
    | `DELEGATION_ZONE` | `a.integratenetwork.work` | `b.integratenetwork.work` |
+   | `DNS_SETUP_MODE` | `print` | `print` |
    | `DOMAIN` | `router-api-tee.0g.ai` | `router-api-tee.0g.ai` |
 
-   Everything else (the `GATEWAY_DOMAIN`, `CLOUDFLARE_API_TOKEN`, gateway env)
-   stays as in the shared compose. Each side, on boot, publishes its own
-   `_dstack-app-address.…a/b…` and tries to issue a cert for `router-api-tee.0g.ai`
-   — for which it needs the issuance switch (next section).
+   `DNS_SETUP_MODE` and (if used) `ACME_STAGING` must also be in the app's
+   `allowed_envs`, or dstack drops them and the side falls back to `wait` and
+   blocks (see the note above). Everything else (`GATEWAY_DOMAIN`,
+   `CLOUDFLARE_API_TOKEN`, gateway env) stays as in the shared compose. Each side,
+   on boot, publishes its own `_dstack-app-address.…a/b…` and tries to issue a cert
+   for `router-api-tee.0g.ai` — for which it needs the issuance switch (next section).
 
 3. **Confirm the switch layer.** `./switch.sh status` prints where the traffic
    and issuance switches point and each side's published `app_id`.
@@ -224,53 +246,71 @@ switch to the production compose only once it works.
 1. refuses if b is already live;
 2. **gate 1** — reads side b's published `app_id` from the delegation zone;
    aborts if b has not published one (its CVM is not up);
-3. **gate 2** — if `--probe-url` is given, health-checks side b **directly**
-   before sending it traffic (see [Health-checking the standby](#health-checking-the-standby-side));
-4. records the outgoing side for `rollback`, then repoints the traffic + issuance
-   switches at b;
-5. polls `https://router-api-tee.0g.ai/healthz` until it succeeds; **if it never
-   recovers, it auto-rolls-back** to the previous side and exits non-zero.
+3. **gate 2** — health-checks side b **directly** before sending it any traffic
+   (via `PLATFORM_BASE`, or an explicit `--probe-url`), retrying up to
+   `PROBE_RETRIES` times; refuses to switch if b stays unhealthy. See
+   [Health-checking the standby](#health-checking-the-standby-side);
+4. repoints the traffic + issuance switches at b;
+5. **confirms the cutover actually took effect, cache-proof.** It polls
+   `https://router-api-tee.0g.ai/healthz` **and** the served TLS cert fingerprint:
+   success needs `/healthz` OK **and** the cert to have changed to b's. Because the
+   dstack gateway caches the `_dstack-app-address` lookup (observed ~30 s), a bare
+   `/healthz` can return 200 from the *old* side for a while after the flip — the
+   fingerprint check refuses to be fooled by that, waiting until traffic genuinely
+   lands on b. If it never does within the window (`VERIFY_RETRIES` × `VERIFY_INTERVAL`,
+   ~2× `TTL` by default), it **auto-rolls-back** to a and exits non-zero.
 
 Useful flags: `--dry-run` (print the Cloudflare changes, apply nothing),
-`--yes` (no prompt, for automation), `--probe-url URL`, `--no-verify` (skip the
-post-switch check + auto-rollback).
+`--yes` (no prompt, for automation), `--probe-url URL` (override the per-side
+probe), `--no-verify` (skip the post-switch check + auto-rollback).
 
 ## Rollback
 
 ```sh
-./switch.sh rollback        # back to the side you switched away from
+./switch.sh rollback        # flip to the other side
 # or explicitly:
 ./switch.sh switch a
 ```
 
-Rollback is the same pointer flip in reverse. Because the old side is still
-running and still holds a valid cert, it is effectively instant (bounded by the
-`TTL`, default 60 s, plus any gateway-side resolver cache). **Keep the old side
-running until you are confident in the new one** — a destroyed side is no longer
-a rollback target.
+Rollback is the same pointer flip in reverse, and it goes through the full
+`switch` path (including the pre-switch probe of the side it returns to and the
+cache-proof post-switch check). It is **stateless**: with two sides "roll back"
+is just "switch to the other one", and which side is live is read from the shared
+switch record in DNS — there is no local state file, so every operator on any
+machine computes the same target. Because the old side is still running with a
+valid cert, rollback is effectively instant (bounded by `TTL` + the gateway route
+cache). **Keep the old side running until you are confident in the new one** — a
+destroyed side is no longer a rollback target.
 
 ## Health-checking the standby side
 
-The one genuinely environment-specific piece. `https://<DOMAIN>/healthz` always
-hits the **live** side, so to verify the *standby* before cutover you need a way
-to reach it directly. Options, roughly in order of preference:
+`https://<DOMAIN>/healthz` always hits the **live** side, so verifying the
+*standby* before cutover needs a way to reach it directly. The dstack platform
+gives you one, and it works alongside the custom domain:
 
-- **A direct probe URL** you pass as `--probe-url`. If your dstack cluster
-  exposes per-app hostnames (e.g. an `<app_id>-<port>` form that routes to a
-  specific app), point `--probe-url` at the standby's health path there. This is
-  the clean path when available; confirm the exact form with your cluster.
-- **A temporary probe hostname** for the standby (e.g. add a second name to that
-  side via the ingress `DOMAINS`/`ROUTING_MAP` support). Costs an extra cert and
-  DNS you control; only worth it if you cut over often.
-- **Cut over during a low-traffic window and rely on the post-switch check.**
-  `switch.sh` verifies `/healthz` after the flip and auto-rolls-back on failure.
-  Since both sides serve the same domain with valid certs, a failed green that
-  gets rolled back is a brief blip, not a broken TLS state. Acceptable for
-  infrequent releases; not a substitute for a real pre-flip probe.
+> **`https://<app_id>-443s.<PLATFORM_BASE>/healthz`** reaches a specific side
+> directly. The `-443s` form is TLS **passthrough** to that CVM's ingress on 443,
+> and the gateway routes it by the **app_id in the hostname** — independent of the
+> custom domain's `_dstack-app-address` — so it hits the standby even though no
+> traffic points at it yet. (Validated on `in1.phala.network`.)
 
-Whichever you use, `switch.sh` always does **gate 1** (the standby must be
-publishing an `app_id`) and the **post-switch `/healthz` + auto-rollback**, so a
-completely dead standby can never silently take traffic.
+Set `PLATFORM_BASE` (e.g. `in1.phala.network`) in `switch.env` and `switch.sh`
+builds this URL from the target side's published `app_id` and probes it
+automatically before every switch, refusing to cut over unless the standby is
+healthy (retrying `PROBE_RETRIES` times). `./switch.sh status` prints each side's
+probe URL. An explicit `--probe-url` overrides it.
+
+Notes on why other forms don't work here: `<app_id>-8443…` fails because the
+gateway port (8443) is deliberately **not** published (a published 8443 would
+serve plaintext outside the enclave); `<app_id>-443` **without** the `s` fails
+because the gateway would terminate TLS and hand plaintext to the ingress, which
+expects TLS. The `s` (passthrough) is the working form.
+
+Even without `PLATFORM_BASE`, `switch.sh` always does **gate 1** (the standby
+must be publishing an `app_id`) and the **cache-proof post-switch check +
+auto-rollback**, so a dead or broken standby is caught and reverted — just after
+a brief blip rather than before. Set `PLATFORM_BASE` to turn that into
+verify-before-cut.
 
 ## Migrating the current single instance into this scheme
 
@@ -283,12 +323,12 @@ move the legacy instance into a sub-zone "in place": `DELEGATION_ZONE` is an
 encrypted-env value, so changing it is a mutation of the one live CVM and leaves
 you no second side to cut over to safely.)
 
-1. **Deploy side a** with `DELEGATION_ZONE=a.integratenetwork.work`. Make this
-   your **next real gateway build** — a different image digest than the legacy
-   instance, so side a has a distinct `app_id` and the cutover is a clean pointer
-   flip (a same-image side would share the legacy `app_id`, i.e. be treated as a
-   replica of it; see the note at the top). It publishes `…a…` records the legacy
-   instance never touches.
+1. **Deploy side a** with `DELEGATION_ZONE=a.integratenetwork.work` and
+   `DNS_SETUP_MODE=print` (in `allowed_envs`). Make this your **next real gateway
+   build** — a different image digest than the legacy instance, so side a has a
+   distinct `app_id` and the cutover is a clean pointer flip (a same-image side
+   would share the legacy `app_id`, i.e. be treated as a replica of it; see the
+   note at the top). It publishes `…a…` records the legacy instance never touches.
 2. **Issue side a's cert:** `./switch.sh acme a`. The base-zone `_acme-challenge`
    name is only written transiently during the live instance's own renewals, so
    converting it to a CNAME → side a is safe between renewals; side a completes
@@ -328,12 +368,19 @@ the pointer; scaling keeps `app_id` and adds instances. They compose cleanly —
 ## Limitations & things to confirm in your environment
 
 - **No weighted/percentage canary** — atomic flip only (see the top section).
-- **Standby probe is cluster-specific** — see [Health-checking the standby](#health-checking-the-standby-side).
-- **Cutover latency** is the switch-layer `TTL` (default 60 s) plus whatever the
-  dstack gateway caches for `_dstack-app-address`. The flip is not sub-second;
-  size the `TTL` and expectations accordingly.
-- **Two CNAME hops** (① → ② → ③ for a TXT lookup) — standard and resolver-safe,
-  but if you debug resolution by hand, follow the full chain.
+- **Standby probe needs `PLATFORM_BASE`** (the dstack platform base domain, e.g.
+  `in1.phala.network`) — see [Health-checking the standby](#health-checking-the-standby-side).
+- **Cutover latency** is the switch-layer `TTL` (default 60 s) plus the dstack
+  gateway's cache of `_dstack-app-address` (**observed ~30 s** on `in1.phala.network`).
+  The flip is not sub-second; the post-switch verify window
+  (`VERIFY_RETRIES` × `VERIFY_INTERVAL`) must exceed this cache or a slow flush
+  reads as a failed switch and triggers an unnecessary rollback.
+- **Post-switch verification needs `openssl`** for the cache-proof cert-fingerprint
+  check; without it, `switch.sh` falls back to `/healthz`-only, which a cached
+  route to the old side can satisfy (it warns when it does).
+- **Two CNAME hops** (① → ② → ③ for a TXT lookup) and each side runs
+  `DNS_SETUP_MODE=print` — standard and resolver-safe, but if you debug resolution
+  by hand, follow the full chain.
 - **`app_id` LB across replicas on the custom-domain path is [verify]** — see
   [Scaling one side](#scaling-one-side-replicas).
 - **Every managed side is a separate attestation.** A verifier must re-audit each
