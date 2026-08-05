@@ -49,6 +49,7 @@
 #
 # Usage:
 #   ./switch.sh status                               # (reads switch.env if present)
+#   GATEWAY_DOMAIN=_.<cluster>.phala.network ./switch.sh setup   # one-time: static serving alias
 #   ./switch.sh switch b                             # flip traffic (+ acme) to side b
 #   ./switch.sh rollback                             # flip back to the previous side
 #   ./switch.sh acme b                               # point ONLY the issuance switch at b
@@ -67,6 +68,7 @@
 #   CF_ZONE          delegation zone name           (default: integratenetwork.work)
 #   DOMAIN           served hostname                (default: router-api-tee.0g.ai)
 #   DELEGATION_ZONE  base delegation zone           (default: same as CF_ZONE)
+#   GATEWAY_DOMAIN   cluster dstack gateway         (no default; required only by `setup`)
 #   SIDE_A_LABEL     sub-zone label for side a      (default: a)
 #   SIDE_B_LABEL     sub-zone label for side b      (default: b)
 #   TXT_PREFIX       app-address record prefix      (default: _dstack-app-address)
@@ -274,6 +276,8 @@ cmd_status() {
   printf 'delegation zone : %s (zone id %s)\n' "$CF_ZONE" "$ZONE_ID"
   printf 'served domain   : %s\n\n' "$DOMAIN"
 
+  printf 'serving alias   : %s\n' "$SERVING_ALIAS"
+  printf '   -> %s\n' "$(current_cname "$SERVING_ALIAS" || true)"
   printf 'traffic switch  : %s\n' "${TXT_PREFIX}.${DOMAIN}"
   printf '   -> %s  [%s]\n' "${addr_now:-<unset>}" "${addr_side:-none}"
   printf 'issuance switch : _acme-challenge.%s\n' "$DOMAIN"
@@ -422,6 +426,26 @@ cmd_acme() {
   info "so the live side can keep renewing:  $0 acme <live-side>"
 }
 
+cmd_setup() {
+  resolve_zone_id
+  local cur; cur="$(current_cname "$SERVING_ALIAS")"
+  if [ -z "$GATEWAY_DOMAIN" ]; then
+    # Help the operator "freeze" whatever the single-instance container wrote.
+    if [ -n "$cur" ]; then
+      info "serving alias ${SERVING_ALIAS} currently -> ${cur}"
+      die "set GATEWAY_DOMAIN to pin it (e.g. GATEWAY_DOMAIN=${cur} $0 setup)"
+    fi
+    die "set GATEWAY_DOMAIN (the cluster's dstack gateway, e.g. _.<cluster>.phala.network)"
+  fi
+  info "one-time setup: the static serving alias in the delegation zone"
+  info "  ${SERVING_ALIAS}  CNAME ->  ${GATEWAY_DOMAIN}"
+  info "the two switch records are created by 'acme'/'switch'; the per-side"
+  info "records are written by each CVM's dstack-ingress — none are set here."
+  confirm "Create/point ${SERVING_ALIAS} at ${GATEWAY_DOMAIN}?" || { warn "aborted"; exit 1; }
+  put_cname "$SERVING_ALIAS" "$GATEWAY_DOMAIN"
+  info "done. Next: point issuance at a side and deploy it (see blue-green.md fast path)."
+}
+
 usage() {
   # Print the header comment block (everything up to `set -euo pipefail`),
   # stripping the leading "# ".
@@ -465,6 +489,7 @@ fi
 CF_ZONE="${CF_ZONE:-integratenetwork.work}"
 DOMAIN="${DOMAIN:-router-api-tee.0g.ai}"
 DELEGATION_ZONE="${DELEGATION_ZONE:-$CF_ZONE}"
+GATEWAY_DOMAIN="${GATEWAY_DOMAIN:-}"   # dstack gateway of the cluster; needed only by `setup`
 SIDE_A_LABEL="${SIDE_A_LABEL:-a}"
 SIDE_B_LABEL="${SIDE_B_LABEL:-b}"
 TXT_PREFIX="${TXT_PREFIX:-_dstack-app-address}"
@@ -474,6 +499,7 @@ VERIFY_RETRIES="${VERIFY_RETRIES:-10}"
 VERIFY_INTERVAL="${VERIFY_INTERVAL:-6}"
 
 # Switch-layer record names (in the delegation zone) that this script owns.
+SERVING_ALIAS="${DOMAIN}.${DELEGATION_ZONE}"           # static -> GATEWAY_DOMAIN (set by `setup`)
 ADDR_SWITCH="${TXT_PREFIX}.${DOMAIN}.${DELEGATION_ZONE}"
 ACME_SWITCH="_acme-challenge.${DOMAIN}.${DELEGATION_ZONE}"
 
@@ -483,9 +509,10 @@ need curl; need jq
 cmd="${1:-status}"
 case "$cmd" in
   status)   cmd_status ;;
+  setup)    cmd_setup ;;
   switch)   cmd_switch "${2:-}" ;;
   rollback) cmd_rollback ;;
   acme)     cmd_acme "${2:-}" ;;
   ""|-h|--help|help) usage 0 ;;
-  *) die "unknown command '$cmd' (want: status | switch <a|b> | rollback | acme <a|b>)" ;;
+  *) die "unknown command '$cmd' (want: setup | status | switch <a|b> | rollback | acme <a|b>)" ;;
 esac

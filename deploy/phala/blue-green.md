@@ -135,11 +135,22 @@ cp deploy/phala/switch.env.example deploy/phala/switch.env
 Or supply it via the environment instead (`CF_API_TOKEN=... ./switch.sh …`); the
 real environment overrides `switch.env`, and `--env-file PATH` points elsewhere.
 
-1. **Serving alias (once).** Create
-   `router-api-tee.0g.ai.integratenetwork.work` CNAME → your `GATEWAY_DOMAIN`
-   (the `_.<cluster>.phala.network` value from the compose). It never changes,
-   and both sides route through the same cluster, so one static value serves
-   both. `switch.sh` does not manage this record.
+1. **Serving alias (once).** The one record you create by hand in the delegation
+   zone: `router-api-tee.0g.ai.integratenetwork.work` CNAME → your `GATEWAY_DOMAIN`
+   (the `_.<cluster>.phala.network` value from the compose). It never changes, and
+   both sides route through the same cluster, so one static value serves both.
+   `switch.sh setup` does it for you:
+
+   ```sh
+   GATEWAY_DOMAIN=_.<cluster>.phala.network ./switch.sh setup
+   # already running a single instance? run `./switch.sh setup` with GATEWAY_DOMAIN
+   # unset and it prints the value the container currently publishes, to pin as-is.
+   ```
+
+   Everything else in `integratenetwork.work` is automatic: the two switch records
+   (`_dstack-app-address.…` and `_acme-challenge.…`) are created and flipped by
+   `switch`/`acme`, and each side's `…a/b…` records are written by that CVM's own
+   dstack-ingress. You never hand-edit those.
 
 2. **Deploy side a and side b.** Two CVMs from [`docker-compose.yml`](./docker-compose.yml).
    The **image digest** is what gives each side its own `app_id` (above), so the
