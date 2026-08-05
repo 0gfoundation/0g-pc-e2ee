@@ -51,7 +51,7 @@
 #   ./switch.sh status                               # (reads switch.env if present)
 #   GATEWAY_DOMAIN=_.<cluster>.phala.network ./switch.sh setup   # one-time: static serving alias
 #   ./switch.sh switch b                             # flip traffic (+ acme) to side b
-#   ./switch.sh rollback                             # flip back to the previous side
+#   ./switch.sh rollback                             # flip to the other side (live side read from DNS; stateless)
 #   ./switch.sh acme b                               # point ONLY the issuance switch at b
 #   CF_API_TOKEN=... ./switch.sh status              # or supply config via the environment
 #
@@ -416,10 +416,6 @@ cmd_switch() {
     fi
   fi
 
-  # Record the side we are leaving, so `rollback` knows where to go.
-  local statedir="${TMPDIR:-/tmp}"
-  [ "$DRY_RUN" = 1 ] || printf '%s\n' "${cur_side:-}" > "${statedir}/.gw-switch-prev-${DOMAIN}" 2>/dev/null || true
-
   move_switches "$target"
 
   if [ "$DRY_RUN" = 1 ]; then info "dry-run complete; no changes applied"; exit 0; fi
@@ -466,20 +462,18 @@ cmd_switch() {
 
 cmd_rollback() {
   resolve_zone_id
-  local cur_side prev
+  # Stateless by design: with two sides, "roll back" is just "switch to the other
+  # one", and which side is live is read from the shared switch record — not a
+  # local file. So every operator, on any machine, computes the same target and
+  # there is no stale per-machine state to get it wrong.
+  local cur_side
   cur_side="$(which_side "$(current_cname "$ADDR_SWITCH")")"
-  local statedir="${TMPDIR:-/tmp}"
-  prev="$(cat "${statedir}/.gw-switch-prev-${DOMAIN}" 2>/dev/null || true)"
-  if [ -z "$prev" ] || [ "$prev" = "?" ]; then
-    # No recorded previous side: fall back to "the other side".
-    if [ -z "$cur_side" ] || [ "$cur_side" = "?" ]; then
-      die "cannot determine a side to roll back to; use: $0 switch <a|b>"
-    fi
-    prev="$(other_side "$cur_side")"
-    warn "no recorded previous side; rolling back to the other side: ${prev}"
+  if [ -z "$cur_side" ] || [ "$cur_side" = "?" ]; then
+    die "traffic switch points at neither side; nothing to roll back — use: $0 switch <a|b>"
   fi
-  info "rolling back: ${cur_side:-<none>} -> ${prev}"
-  cmd_switch "$prev"
+  local target; target="$(other_side "$cur_side")"
+  info "rolling back: ${cur_side} -> ${target} (live side read from DNS)"
+  cmd_switch "$target"
 }
 
 cmd_acme() {
