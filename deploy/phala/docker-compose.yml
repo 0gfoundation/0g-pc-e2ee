@@ -251,9 +251,12 @@ services:
   # (the Phala env file). The measured compose text keeps only the ${VAR}
   # references, never the values, so nothing sensitive enters the attestation.
   prometheus-agent:
-    # Prefer an immutable digest here too so the measured compose does not drift
-    # (see the gateway image note above).
-    image: prom/prometheus:v2.55.1
+    # Pinned by digest (the multi-arch index digest for v2.55.1) so app_id commits
+    # to this exact image — like dstack-ingress above, and unlike the gateway's dev
+    # :latest. A version tag alone is mutable; the digest is what makes the measured
+    # compose reproducible. Re-pin deliberately on any upgrade
+    # (`docker buildx imagetools inspect prom/prometheus:<tag>`).
+    image: prom/prometheus:v2.55.1@sha256:2659f4c2ebb718e7695cb9b25ffa7d6be64db013daba13e05c875451cf51b0d3
     restart: unless-stopped
     command:
       - "--config.file=/etc/prometheus/agent.yml"
