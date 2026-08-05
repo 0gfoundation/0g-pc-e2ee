@@ -248,10 +248,18 @@ You pass three values, not a hand-built config:
 | `ZG_PROM_REMOTE_WRITE_URL` | no | `https://prometheus.example.com/api/v1/write` |
 | `ZG_PROM_REMOTE_WRITE_USERNAME` | no | `0g-pc-gateway` |
 | `ZG_PROM_REMOTE_WRITE_PASSWORD` | **yes** | — |
+| `ZG_PROM_ENV` | no | `staging` / `mainnet` |
 
-Set all three in the CVM's **encrypted environment** — the Phala env file, the
+Set all four in the CVM's **encrypted environment** — the Phala env file, the
 same channel as `CLOUDFLARE_API_TOKEN` — and list them in the app's
-`allowed_envs`, or dstack drops them. Only `${VAR}` *references* live in the
+`allowed_envs`, or dstack drops them.
+
+`ZG_PROM_ENV` becomes an `env` label stamped on every series (alongside a fixed
+`service=0g-pc-gateway`), so when staging and mainnet remote_write into the **same
+store** their metrics stay distinguishable — the dashboard filters on it. Set it
+per environment (`staging` in the staging env file, `mainnet` in the other); a
+missing value fails the deploy loudly (`:?`), but note it is not validated against
+the two names, so a typo yields a wrong-but-accepted label. Only `${VAR}` *references* live in the
 measured compose text, never the values, so nothing sensitive enters the
 attestation.
 

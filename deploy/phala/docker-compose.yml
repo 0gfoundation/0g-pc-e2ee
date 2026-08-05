@@ -286,7 +286,15 @@ configs:
       global:
         scrape_interval: 15s
         external_labels:
+          # Stamped on every series the agent pushes, so a shared remote-write
+          # store can tell this gateway's metrics apart from other services
+          # (service) and this deployment's environment apart from the other
+          # (env). env is ${VAR}-interpolated by compose from the env file, so one
+          # compose serves both staging and mainnet; :? fails the deploy loudly if
+          # it is unset (it checks non-empty only, not that the value is one of the
+          # two — a typo still yields a wrong label).
           service: 0g-pc-gateway
+          env: "${ZG_PROM_ENV:?set staging or mainnet}"
       scrape_configs:
         - job_name: gateway
           static_configs:
