@@ -1,0 +1,201 @@
+name: Release
+
+# Manual release of the Phala gateway deployment. Resolves a commit to its
+# immutable gateway image digest, generates a digest-pinned
+# docker-compose.release.yml, and publishes it as a GitHub Release asset.
+#
+# The checked-in deploy/phala/docker-compose.yml is left untouched (it stays on
+# the floating `:latest` gateway tag for development). The digest-pinned manifest
+# — the artifact Phala actually attests via app_id — lives only on the Release.
+#
+# See deploy/phala/README.md "Release (automated)".
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag, or commit SHA to release (default: main). Accepts revision exprs like main~1 if reachable from the dispatched ref."
+        type: string
+        required: false
+        default: main
+
+# Serialize so two concurrent runs cannot compute the same release-YYYY.MM.DD.N.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  GATEWAY_IMAGE: ghcr.io/${{ github.repository }}-gateway
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the tag + GitHub Release
+      packages: write # build-if-missing push of the gateway image
+    steps:
+      - name: Checkout (full history + all branches)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve ref to a commit and check it out
+        id: ref
+        env:
+          # Bind through env (not inline ${{ }}) so a crafted ref can't break
+          # out of the shell — expanded env values are not re-scanned for command
+          # substitution.
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          # Populate remote-tracking refs for all branches + tags so branch
+          # names, SHAs, and revision expressions all resolve.
+          git fetch --no-tags --prune --force origin '+refs/heads/*:refs/remotes/origin/*'
+          git fetch --tags --force origin
+
+          IN="$INPUT_REF"
+          if SHA=$(git rev-parse --verify --quiet "${IN}^{commit}"); then
+            :
+          elif SHA=$(git rev-parse --verify --quiet "origin/${IN}^{commit}"); then
+            :
+          else
+            echo "::error::Could not resolve ref '${IN}' to a commit"
+            exit 1
+          fi
+          git checkout --detach "$SHA"
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "Releasing ref '${IN}' -> ${SHA}"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve gateway image digest (build-if-missing)
+        id: img
+        run: |
+          set -euo pipefail
+          SHA='${{ steps.ref.outputs.sha }}'
+          TAG="${GATEWAY_IMAGE}:sha-${SHA}"
+
+          if docker buildx imagetools inspect "$TAG" >/dev/null 2>&1; then
+            echo "Image exists, reusing: $TAG"
+            echo "built=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "No image for this commit; building from source at ${SHA}"
+            docker buildx build \
+              --file client/cmd/gateway/Dockerfile \
+              --tag "$TAG" \
+              --label "org.opencontainers.image.revision=${SHA}" \
+              --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+              --cache-from type=gha,scope=gateway \
+              --push \
+              .
+            echo "built=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          DIGEST=$(docker buildx imagetools inspect "$TAG" --format '{{.Manifest.Digest}}')
+          case "$DIGEST" in
+            sha256:*) ;;
+            *) echo "::error::Unexpected digest format: '$DIGEST'"; exit 1 ;;
+          esac
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Gateway digest: ${DIGEST}"
+
+      - name: Generate digest-pinned release compose
+        id: compose
+        run: |
+          set -euo pipefail
+          DIGEST='${{ steps.img.outputs.digest }}'
+          SRC=deploy/phala/docker-compose.yml
+          OUT=docker-compose.release.yml
+
+          # Replace ONLY the gateway service's `image:` mapping line, whatever it
+          # currently is (:latest, :tag, or @sha256). The `^\s*image:` anchor
+          # skips the comment that also mentions the image name. Every other byte
+          # is preserved, so the release manifest cannot drift from the compose
+          # at this commit.
+          sed -E "s#(^[[:space:]]*image:[[:space:]]*)ghcr\.io/0gfoundation/0g-pc-e2ee-gateway([:@][^[:space:]]*)?#\1ghcr.io/0gfoundation/0g-pc-e2ee-gateway@${DIGEST}#" \
+            "$SRC" > "$OUT"
+
+          # Guard: the gateway must no longer be on a floating tag, and the exact
+          # digest pin must be present. Catches a silently non-matching sed.
+          if grep -qE "^[[:space:]]*image:[[:space:]]*ghcr\.io/0gfoundation/0g-pc-e2ee-gateway:" "$OUT"; then
+            echo "::error::gateway still on a floating tag in $OUT"; exit 1
+          fi
+          if ! grep -qF "0g-pc-e2ee-gateway@${DIGEST}" "$OUT"; then
+            echo "::error::expected digest pin missing in $OUT"; exit 1
+          fi
+
+          COMPOSE_SHA=$(sha256sum "$OUT" | awk '{print $1}')
+          echo "compose_sha256=${COMPOSE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Release compose sha256: ${COMPOSE_SHA}"
+
+      - name: Compute version (release-YYYY.MM.DD.N, UTC)
+        id: ver
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          DATE=$(date -u +%Y.%m.%d)
+
+          # Union of existing releases and tags with today's prefix, so N never
+          # collides regardless of which created the earlier entry.
+          RELS=$(gh release list --limit 500 --json tagName -q '.[].tagName' 2>/dev/null || true)
+          TAGS=$(git tag -l "release-${DATE}.*" || true)
+          MAX=0
+          while IFS= read -r t; do
+            case "$t" in
+              release-${DATE}.*)
+                n=${t##*.}
+                if [[ "$n" =~ ^[0-9]+$ ]] && (( n > MAX )); then MAX=$n; fi
+                ;;
+            esac
+          done < <(printf '%s\n%s\n' "$RELS" "$TAGS")
+
+          VERSION="release-${DATE}.$((MAX + 1))"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Version: ${VERSION}"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          SHA='${{ steps.ref.outputs.sha }}'
+          DIGEST='${{ steps.img.outputs.digest }}'
+          VERSION='${{ steps.ver.outputs.version }}'
+          BUILT='${{ steps.img.outputs.built }}'
+          COMPOSE_SHA='${{ steps.compose.outputs.compose_sha256 }}'
+
+          if [[ "$BUILT" == "true" ]]; then IMG_NOTE="built from source (no prior image for this commit)"; else IMG_NOTE="reused existing published image"; fi
+
+          cat > release-notes.md <<EOF
+          Phala gateway deployment manifest, digest-pinned.
+
+          | | |
+          |---|---|
+          | Source ref (input) | \`${INPUT_REF}\` |
+          | Commit | \`${SHA}\` |
+          | Gateway image | \`${GATEWAY_IMAGE}@${DIGEST}\` |
+          | Image origin | ${IMG_NOTE} |
+          | Release compose sha256 | \`${COMPOSE_SHA}\` |
+
+          **Deploy:** upload the attached \`docker-compose.release.yml\` to Phala Cloud. Its exact bytes are what \`app_id\` attests. Verify per \`deploy/phala/README.md\` — the CVM's \`app-compose.json\` \`docker_compose_file\` must be byte-identical to this asset.
+
+          The tag is intentionally not \`v*\`, so it does not retrigger the image build workflow.
+          EOF
+
+          gh release create "$VERSION" \
+            --target "$SHA" \
+            --title "$VERSION" \
+            --notes-file release-notes.md \
+            docker-compose.release.yml
+          echo "Created release $VERSION at $SHA"

@@ -159,8 +159,11 @@ Then DCAP-verify `quote.json` and check its `report_data` — the first 32 bytes
 `SHA-256(sha256sum.txt)`, right-padded to 64. Finally confirm the code: replay the
 event log against the verified quote to recover `app_id`, fetch the CVM's
 `app-compose.json` (Phala Cloud dashboard / API), check its `docker_compose_file`
-is byte-identical to [`docker-compose.yml`](./docker-compose.yml) here, and that
-hashing the manifest reproduces that `app_id`.
+is byte-identical to the **`docker-compose.release.yml` from the GitHub Release
+you deployed** (the digest-pinned manifest), and that hashing the manifest
+reproduces that `app_id`. The [`docker-compose.yml`](./docker-compose.yml) checked
+in here carries the floating `:latest` gateway tag for development and will **not**
+match a production `app_id` — the Release asset is the attested artifact.
 
 Skip step 3 and the quote only proves *some* CVM obtained *some* certificate — it
 says nothing about the endpoint you are talking to. Skip the `app-compose.json`
@@ -220,6 +223,45 @@ docker buildx imagetools inspect ghcr.io/0gfoundation/0g-pc-e2ee-gateway:latest
 
 Changing either digest changes `app_id`, which is the point: it is a new
 deployment, and verifiers have to re-audit it.
+
+## Release (automated)
+
+[`.github/workflows/release.yml`](../../.github/workflows/release.yml) (manual
+`workflow_dispatch`) automates the pin step above and publishes the attested
+artifact as a GitHub Release. It does **not** edit the checked-in compose: `main`
+stays on `:latest` for development, and the digest-pinned manifest lives only on
+the Release. That artifact — not any git tree — is the audit reference; the
+authoritative record of what a CVM runs is still Phala's `app-compose.json` + the
+quote (see "Verify"), and the Release is the convenience copy you compare against.
+
+**Input** — `ref`: branch, tag, or commit SHA to release (default `main`).
+Because every push to `main` publishes a per-commit `sha-<full-sha>` gateway
+image, you can release **any** past main commit (e.g. `main~1` or an explicit
+SHA), not just the tip. For a ref with no published image yet — a feature branch,
+or a garbage-collected build — the workflow builds and pushes it first
+(build-if-missing); an image that still exists is reused, never rebuilt (a rebuild
+is not guaranteed bit-identical, so reuse preserves the original digest).
+
+**What it does:**
+
+1. Resolves `ref` to a full commit SHA and **checks the tree out at that commit**,
+   so the pinned image and the compose come from the same commit (an old image
+   paired with today's compose could carry mismatched env vars).
+2. Resolves that commit's gateway image digest (`sha-<full-sha>` tag →
+   `@sha256:…`).
+3. Generates `docker-compose.release.yml` by replacing **only** the gateway
+   `image:` line with the `@sha256:` pin — every other byte (env, ingress,
+   prometheus) is identical to the compose at that commit, so the two cannot
+   drift. A guard fails the run if the gateway is still on a floating tag.
+4. Computes a version `release-YYYY.MM.DD.N` (UTC date; `N` auto-incremented from
+   that day's existing releases/tags) and creates a GitHub Release at that commit
+   with `docker-compose.release.yml` attached.
+
+Deploy the attached asset to Phala; its bytes are what `app_id` attests. The tag
+is intentionally **not** `v*`, so it does not retrigger `docker.yml`'s build
+(which would produce a divergent digest). The per-commit `sha-` tag uses the full
+40-char SHA (`type=sha,format=long` in `docker.yml`) so any input commit maps to
+its image tag deterministically.
 
 ## Metrics (Prometheus)
 
