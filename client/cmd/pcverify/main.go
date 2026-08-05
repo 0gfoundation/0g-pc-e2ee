@@ -13,6 +13,7 @@
 //
 //	pcverify -provider 0x... [-chain-rpc-url ...] [-serving-contract 0x...]
 //	         [-endpoint https://...] [-expect-signer 0x...] [-no-quote]
+//	         [-pccs-url https://...]
 //
 // The provider's serving endpoint is read from the chain (Service.url), so
 // -endpoint is only needed to override it. -no-quote restricts the run to the
@@ -39,6 +40,16 @@
 // needs the event-log replay for app_id plus the app-compose.json comparison
 // against the deployed docker-compose.release.yml. The report says so, and prints
 // the measurement registers for that manual step.
+//
+// # Shared
+//
+// -pccs-url applies to whichever mode verifies a quote: it points DCAP collateral
+// fetches at a PCCS mirror instead of Intel PCS. It defaults to empty (Intel PCS,
+// the authority) rather than to a mirror, because a mirror can serve
+// older-but-still-valid CRL / TCB Info — a bounded freshness delegation this tool
+// should not take on by default. Pass it when Intel PCS rate-limits a repeated or
+// CI run, or to check against the collateral source a deployment actually uses
+// (ZG_GATEWAY_PCCS_URL).
 //
 // Both modes make NO changes and send NOTHING beyond reads: the chain RPC and the
 // provider's public /quote, or the public evidence files and one TLS handshake,
@@ -90,7 +101,7 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 	expectSigner := fs.String("expect-signer", "", "if set, require the on-chain teeSignerAddress to equal this")
 	noQuote := fs.Bool("no-quote", false, "skip the TDX quote hops; check only the on-chain signer (no provider contact)")
 	gateway := fs.String("gateway", "", "cloud-TEE gateway domain (e.g. pc-gateway.example.com); selects gateway mode — verify its /evidences bundle and compare the served certificate")
-	pccsURL := fs.String("pccs-url", "", "gateway mode: fetch DCAP collateral from this PCCS mirror instead of Intel PCS (e.g. https://pccs.phala.network)")
+	pccsURL := fs.String("pccs-url", "", "fetch DCAP collateral (TCB Info, QE Identity, PCK CRL) from this PCCS mirror instead of api.trustedservices.intel.com (e.g. https://pccs.phala.network); the root-CA CRL still comes from Intel. Applies to whichever mode verifies a quote")
 	allowUntrustedCert := fs.Bool("allow-untrusted-cert", false, "gateway mode: accept a served certificate that does not chain to a public root (ACME staging); relaxes no attestation check")
 	timeout := fs.Duration("timeout", 30*time.Second, "overall timeout")
 	if err := fs.Parse(args); err != nil {
@@ -131,7 +142,7 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 
 	var qc quoteChecker
 	if !*noQuote {
-		qc = newDCAPChecker()
+		qc = newDCAPChecker(*pccsURL)
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, *timeout)
@@ -219,12 +230,16 @@ type dcapChecker struct {
 	verifier *attest.Verifier
 }
 
-func newDCAPChecker() *dcapChecker {
+// newDCAPChecker builds the provider-mode verifier. pccsURL (when non-empty)
+// points collateral fetches at a PCCS mirror instead of Intel PCS — the same knob
+// the gateway mode and the sidecar/gateway binaries take, so a run of either mode
+// can be aimed at the collateral source the deployment actually uses.
+func newDCAPChecker(pccsURL string) *dcapChecker {
 	return &dcapChecker{
 		http: &http.Client{Timeout: 20 * time.Second},
 		verifier: attest.New(
 			attest.Policy{},
-			attest.WithQuoteParser(dcap.NewQuoteParser(dcap.Config{})),
+			attest.WithQuoteParser(dcap.NewQuoteParser(dcap.Config{PCCSBaseURL: pccsURL})),
 			attest.WithMeasurementMode(attest.ModeWarn),
 		),
 	}

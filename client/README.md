@@ -131,6 +131,12 @@ certificate the domain **actually serves** is the one that quote committed to
 [`docs/design/cloud-gateway.md`](../docs/design/cloud-gateway.md) §10. Both modes
 exit non-zero on a failed check, so either works as a deploy gate.
 
+`-pccs-url` applies to whichever mode verifies a quote, pointing DCAP collateral
+fetches at a PCCS mirror (e.g. `https://pccs.phala.network`) instead of Intel PCS.
+It defaults to Intel PCS — the authority — rather than to a mirror, since a mirror
+can serve older-but-still-valid CRL / TCB Info. Pass it when Intel PCS rate-limits
+a repeated or CI run, or to match the deployment's own collateral source.
+
 ## Related repositories & products
 
 This repo (**`0g-pc-e2ee`**) holds two Go modules:

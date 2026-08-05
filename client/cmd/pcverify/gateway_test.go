@@ -140,6 +140,31 @@ func TestRun_ModeSelection(t *testing.T) {
 	}
 }
 
+// -pccs-url is shared, not gateway-only: both modes verify a quote, so both must
+// accept being pointed at a PCCS mirror. A flag-parse rejection would surface as
+// exit 2; neither case here may produce that.
+func TestRun_PCCSURLAppliesToBothModes(t *testing.T) {
+	const mirror = "https://pccs.phala.network"
+	cases := []struct {
+		name string
+		args []string
+	}{
+		// -no-quote keeps this off the network: the flag still has to parse, and the
+		// chain lookup against a dead RPC is what decides the exit code.
+		{"provider mode", []string{"-provider", prov, "-no-quote", "-pccs-url", mirror,
+			"-chain-rpc-url", "http://127.0.0.1:0", "-timeout", "2s"}},
+		{"gateway mode", []string{"-gateway", "gateway.invalid", "-pccs-url", mirror, "-timeout", "2s"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			if code := run(context.Background(), &out, tc.args); code == 2 {
+				t.Errorf("-pccs-url was rejected in %s:\n%s", tc.name, out.String())
+			}
+		})
+	}
+}
+
 // The gateway mode must not touch the chain: it takes no chain flags and a
 // nonsense RPC URL is irrelevant to it. Pointed at a domain that does not
 // resolve, it must still fail as a *check* (exit 1), not as a setup error.
