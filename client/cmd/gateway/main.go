@@ -29,10 +29,14 @@
 // covers this gateway image too (see deploy/phala/ and
 // docs/design/cloud-gateway.md §6). Inference authenticity rides the provider's
 // own SPEC §8 response signature, which the gateway verifies
-// (ZG_GATEWAY_VERIFY_RESPONSES). So the gateway exposes no /quote route. Multi-
-// tenant concerns (auth, billing, rate limiting; issue #20) are a later step.
-// Trusting the router's returned endpoint (vs resolving it on chain) is tracked
-// in issue #18.
+// (ZG_GATEWAY_VERIFY_RESPONSES). So the gateway exposes no /quote route. The
+// sealed inference path carries a front-door credential gate
+// (openaiproxy.RequireCredential in newHandler): a cheap presence/shape check
+// that sheds missing-credential and mgmt-key traffic before the seal/route work,
+// while the router stays the authoritative auth/billing point and re-validates
+// every forwarded credential. The remaining multi-tenant concerns (per-user
+// billing attribution, rate limiting; issue #20) are a later step. Trusting the
+// router's returned endpoint (vs resolving it on chain) is tracked in issue #18.
 package main
 
 import (
@@ -226,7 +230,15 @@ func runHealthCheck(listen string) int {
 // main so tests can drive it with httptest.
 func newHandler(c *core.Client, routerTarget *url.URL, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
-	openaiproxy.Register(mux, c)
+	// Mount the sealed inference path behind the gateway's front-door credential
+	// gate. The gate is a cheap presence/shape check (reject missing credentials
+	// and mgmt keys), NOT authentication — the router stays the authoritative
+	// auth/billing point and re-validates every forwarded credential. It wraps
+	// only this route: /healthz must stay unauthenticated for the container probe,
+	// and the catch-all metadata passthrough below is discovery the router already
+	// governs. The sidecar shares openaiproxy but is single-user, so it never
+	// mounts this gate.
+	mux.Handle("POST /v1/chat/completions", openaiproxy.RequireCredential(openaiproxy.Handler(c)))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte("ok\n"))
