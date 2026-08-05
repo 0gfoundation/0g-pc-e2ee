@@ -78,14 +78,18 @@ the **serving alias** (② line 1) is set once to `GATEWAY_DOMAIN` and never mov
 ## One-time setup
 
 You need a Cloudflare API token that can **edit DNS in `integratenetwork.work`**
-(the same one the CVMs use for delegation is fine). Export it for the script:
+(the same one the CVMs use for delegation is fine). Put it — and any config
+overrides — in `switch.env` next to the script; it is loaded automatically and
+git-ignored (it holds the token):
 
 ```sh
-export CF_API_TOKEN=...          # Cloudflare token for integratenetwork.work
-# defaults already match production; override if your names differ:
-# export DOMAIN=router-api-tee.0g.ai
-# export CF_ZONE=integratenetwork.work
+cp deploy/phala/switch.env.example deploy/phala/switch.env
+# edit switch.env: set CF_API_TOKEN=... (defaults already match production)
+./switch.sh status
 ```
+
+Or supply it via the environment instead (`CF_API_TOKEN=... ./switch.sh …`); the
+real environment overrides `switch.env`, and `--env-file PATH` points elsewhere.
 
 1. **Serving alias (once).** Create
    `router-api-tee.0g.ai.integratenetwork.work` CNAME → your `GATEWAY_DOMAIN`

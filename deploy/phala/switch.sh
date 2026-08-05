@@ -41,11 +41,18 @@
 # from a single instance, certificate issuance, and the standby-probe options).
 #
 # ---------------------------------------------------------------------------
+# Config comes from the environment or an env file. Put your token + any
+# overrides in `switch.env` next to this script (see switch.env.example) and it
+# is loaded automatically; the real environment still wins over the file, so
+# `CF_API_TOKEN=… ./switch.sh …` overrides it for a one-off. `switch.env` is
+# git-ignored (it holds the Cloudflare token). Point elsewhere with --env-file.
+#
 # Usage:
-#   CF_API_TOKEN=... ./switch.sh status
-#   CF_API_TOKEN=... ./switch.sh switch b            # flip traffic (+ acme) to side b
-#   CF_API_TOKEN=... ./switch.sh rollback            # flip back to the previous side
-#   CF_API_TOKEN=... ./switch.sh acme b              # point ONLY the issuance switch at b
+#   ./switch.sh status                               # (reads switch.env if present)
+#   ./switch.sh switch b                             # flip traffic (+ acme) to side b
+#   ./switch.sh rollback                             # flip back to the previous side
+#   ./switch.sh acme b                               # point ONLY the issuance switch at b
+#   CF_API_TOKEN=... ./switch.sh status              # or supply config via the environment
 #
 # Common flags:
 #   --dry-run        show the Cloudflare changes without applying them
@@ -53,8 +60,9 @@
 #   --probe-url URL  health-check the *target* side directly before switching
 #                    (must return HTTP 200; see blue-green.md for how to obtain one)
 #   --no-verify      skip the post-switch public /healthz check + auto-rollback
+#   --env-file PATH  load config from PATH instead of ./switch.env
 #
-# Config (env, with defaults for the current production deployment):
+# Config (env or env file, with defaults for the current production deployment):
 #   CF_API_TOKEN     (required) Cloudflare token that can edit the delegation zone
 #   CF_ZONE          delegation zone name           (default: integratenetwork.work)
 #   DOMAIN           served hostname                (default: router-api-tee.0g.ai)
@@ -70,29 +78,18 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# Config
+# State set during arg parsing / config resolution (see the bottom of the file).
+# Config values (CF_ZONE, DOMAIN, …) are resolved AFTER the env file is loaded,
+# so a `switch.env` next to this script can supply them.
 # ---------------------------------------------------------------------------
-CF_ZONE="${CF_ZONE:-integratenetwork.work}"
-DOMAIN="${DOMAIN:-router-api-tee.0g.ai}"
-DELEGATION_ZONE="${DELEGATION_ZONE:-$CF_ZONE}"
-SIDE_A_LABEL="${SIDE_A_LABEL:-a}"
-SIDE_B_LABEL="${SIDE_B_LABEL:-b}"
-TXT_PREFIX="${TXT_PREFIX:-_dstack-app-address}"
-HEALTH_PATH="${HEALTH_PATH:-/healthz}"
-TTL="${TTL:-60}"
-VERIFY_RETRIES="${VERIFY_RETRIES:-10}"
-VERIFY_INTERVAL="${VERIFY_INTERVAL:-6}"
-
 DRY_RUN=0
 ASSUME_YES=0
 PROBE_URL=""
 NO_VERIFY=0
+ENV_FILE=""
 
 CF_API="https://api.cloudflare.com/client/v4"
-
-# Switch-layer record names (in the delegation zone) that this script owns.
-ADDR_SWITCH="${TXT_PREFIX}.${DOMAIN}.${DELEGATION_ZONE}"
-ACME_SWITCH="_acme-challenge.${DOMAIN}.${DELEGATION_ZONE}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -104,6 +101,26 @@ warn() { printf '%swarn:%s %s\n' "$c_yel" "$c_rst" "$*" >&2; }
 die()  { printf '%serror:%s %s\n' "$c_red" "$c_rst" "$*" >&2; exit 1; }
 
 need() { command -v "$1" >/dev/null 2>&1 || die "missing required command: $1"; }
+
+# Load KEY=VALUE lines from an env file (like a .env). The real environment wins,
+# so `CF_API_TOKEN=… ./switch.sh` still overrides a value in the file. Lines may
+# be blank, `# comments`, or `export KEY=VALUE`; values may be quoted. This runs
+# the file's assignments via the shell, so only point it at a file you trust.
+load_env_file() { # path
+  local f="$1" line key
+  [ -f "$f" ] || die "env file not found: $f"
+  info "loading env from $f"
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#"${line%%[![:space:]]*}"}"          # strip leading whitespace
+    case "$line" in ''|'#'*) continue ;; esac
+    line="${line#export }"
+    key="${line%%=*}"
+    [ "$key" = "$line" ] && continue                 # no '=' on the line
+    case "$key" in ''|*[!A-Za-z0-9_]*) continue ;; esac
+    printenv "$key" >/dev/null 2>&1 && continue       # already in the environment
+    eval "export $line"
+  done < "$f"
+}
 
 # side label helpers ---------------------------------------------------------
 side_label() { # a|b|blue|green -> configured label
@@ -388,7 +405,9 @@ cmd_acme() {
 }
 
 usage() {
-  sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'
+  # Print the header comment block (everything up to `set -euo pipefail`),
+  # stripping the leading "# ".
+  awk 'NR==1{next} /^set -euo pipefail/{exit} {sub(/^# ?/,""); print}' "$0"
   exit "${1:-0}"
 }
 
@@ -403,6 +422,8 @@ while [ $# -gt 0 ]; do
     --no-verify) NO_VERIFY=1 ;;
     --probe-url) PROBE_URL="${2:?--probe-url needs a URL}"; shift ;;
     --probe-url=*) PROBE_URL="${1#*=}" ;;
+    --env-file)  ENV_FILE="${2:?--env-file needs a path}"; shift ;;
+    --env-file=*) ENV_FILE="${1#*=}" ;;
     -h|--help)   usage 0 ;;
     -*)          die "unknown flag: $1 (try --help)" ;;
     *)           POSITIONAL+=("$1") ;;
@@ -411,8 +432,35 @@ while [ $# -gt 0 ]; do
 done
 set -- "${POSITIONAL[@]:-}"
 
+# Load config from an env file before resolving defaults. Precedence:
+#   real environment  >  --env-file / $ENV_FILE  >  ./switch.env next to script
+# The real environment always wins (load_env_file skips keys already set).
+if [ -n "$ENV_FILE" ]; then
+  load_env_file "$ENV_FILE"
+elif [ -f "${SCRIPT_DIR}/switch.env" ]; then
+  load_env_file "${SCRIPT_DIR}/switch.env"
+fi
+
+# ---------------------------------------------------------------------------
+# Config (env / env-file, with defaults for the current production deployment)
+# ---------------------------------------------------------------------------
+CF_ZONE="${CF_ZONE:-integratenetwork.work}"
+DOMAIN="${DOMAIN:-router-api-tee.0g.ai}"
+DELEGATION_ZONE="${DELEGATION_ZONE:-$CF_ZONE}"
+SIDE_A_LABEL="${SIDE_A_LABEL:-a}"
+SIDE_B_LABEL="${SIDE_B_LABEL:-b}"
+TXT_PREFIX="${TXT_PREFIX:-_dstack-app-address}"
+HEALTH_PATH="${HEALTH_PATH:-/healthz}"
+TTL="${TTL:-60}"
+VERIFY_RETRIES="${VERIFY_RETRIES:-10}"
+VERIFY_INTERVAL="${VERIFY_INTERVAL:-6}"
+
+# Switch-layer record names (in the delegation zone) that this script owns.
+ADDR_SWITCH="${TXT_PREFIX}.${DOMAIN}.${DELEGATION_ZONE}"
+ACME_SWITCH="_acme-challenge.${DOMAIN}.${DELEGATION_ZONE}"
+
 need curl; need jq
-: "${CF_API_TOKEN:?set CF_API_TOKEN (Cloudflare token for ${CF_ZONE})}"
+: "${CF_API_TOKEN:?set CF_API_TOKEN (Cloudflare token for ${CF_ZONE}); put it in ${SCRIPT_DIR}/switch.env or export it}"
 
 cmd="${1:-status}"
 case "$cmd" in
