@@ -42,6 +42,11 @@ jobs:
 
       - name: Resolve ref to a commit and check it out
         id: ref
+        env:
+          # Bind through env (not inline ${{ }}) so a crafted ref can't break
+          # out of the shell — expanded env values are not re-scanned for command
+          # substitution.
+          INPUT_REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
           # Populate remote-tracking refs for all branches + tags so branch
@@ -49,7 +54,7 @@ jobs:
           git fetch --no-tags --prune --force origin '+refs/heads/*:refs/remotes/origin/*'
           git fetch --tags --force origin
 
-          IN='${{ inputs.ref }}'
+          IN="$INPUT_REF"
           if SHA=$(git rev-parse --verify --quiet "${IN}^{commit}"); then
             :
           elif SHA=$(git rev-parse --verify --quiet "origin/${IN}^{commit}"); then
@@ -161,6 +166,7 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
           SHA='${{ steps.ref.outputs.sha }}'
@@ -176,7 +182,7 @@ jobs:
 
           | | |
           |---|---|
-          | Source ref (input) | \`${{ inputs.ref }}\` |
+          | Source ref (input) | \`${INPUT_REF}\` |
           | Commit | \`${SHA}\` |
           | Gateway image | \`${GATEWAY_IMAGE}@${DIGEST}\` |
           | Image origin | ${IMG_NOTE} |
