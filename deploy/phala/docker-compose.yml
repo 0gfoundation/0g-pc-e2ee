@@ -96,21 +96,25 @@ services:
       #   pc-gateway.example.com                     CNAME  pc-gateway.example.com.<DELEGATION_ZONE>
       #   _dstack-app-address.pc-gateway.example.com CNAME  _dstack-app-address.pc-gateway.example.com.<DELEGATION_ZONE>
       #   _acme-challenge.pc-gateway.example.com     CNAME  _acme-challenge.pc-gateway.example.com.<DELEGATION_ZONE>
-      # Two variables are deliberately NOT declared here, because a var absent
-      # from this block is NOT passed to the container — setting it in the CVM's
-      # environment would silently do nothing. Uncommenting either edits this
-      # file, which changes app_id: a different, separately auditable deployment.
-      #
-      # ACME_EMAIL is optional and PUBLISHED — the ACME account document is part
-      # of the evidence bundle, so any address here is world-readable at
-      # https://<DOMAIN>/evidences/acme-account.json. Leave it out unless a
-      # contact on the ACME account is actually wanted.
+      # ACME_EMAIL is deliberately NOT declared here — a var absent from this block
+      # is never passed to the container, and this one is optional and PUBLISHED:
+      # the ACME account document is part of the evidence bundle, so any address
+      # here is world-readable at https://<DOMAIN>/evidences/acme-account.json.
+      # Declaring it also changes app_id. Leave it out unless a contact on the ACME
+      # account is actually wanted.
       # - ACME_EMAIL=${ACME_EMAIL:-}
       #
-      # ACME_STAGING is off, so this deployment issues real, publicly trusted
-      # certs. Add the line below (not an env var) to bring up a NEW hostname
-      # against the staging CA first — see README "Deploy".
-      # - ACME_STAGING=true
+      # ACME_STAGING picks Let's Encrypt's staging CA. Injected, defaulting to
+      # false = real, publicly-trusted certs — byte-for-byte the behaviour of
+      # leaving it unset, which entrypoint.sh already defaults to "false". Set
+      # ACME_STAGING=true in the CVM's encrypted env (and add it to allowed_envs) to
+      # bring up a NEW hostname against the staging CA first: staging's rate limits
+      # are far higher, so iterate there instead of burning the
+      # 5-duplicate-certs-per-week budget on the real hostname. Staging certs are
+      # untrusted (smoke tests only). Because it is injected the measured text is
+      # identical, so a staging run and a production run share app_id; the served
+      # cert's issuer (LE staging vs real) is what distinguishes them, out of band.
+      - ACME_STAGING=${ACME_STAGING:-false}
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock # in-enclave attestation + cert binding
       - cert-data:/etc/letsencrypt
