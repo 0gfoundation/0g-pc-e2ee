@@ -112,6 +112,37 @@ gateway reads whichever `app_id` the **traffic switch** (②) currently points a
 and routes L4 to that CVM, where its dstack-ingress terminates TLS with its own
 Let's Encrypt cert for `router-api-tee.0g.ai`.
 
+The whole cutover is that **one CNAME** in ② — `switch.sh switch a|b` repoints it
+at the chosen side's per-side record; everything else is fixed. Solid = the live
+path, dashed = the alternate the flip selects:
+
+```mermaid
+flowchart TD
+    C(["client<br/>https://router-api-tee.0g.ai"]) --> GW
+    GW{{"dstack gateway (L4 passthrough)<br/>routes by app_id read from _dstack-app-address"}}
+
+    subgraph Z0 ["0g.ai served zone (set once, never touched)"]
+        R0["_dstack-app-address.router-api-tee.0g.ai<br/>CNAME to base (fixed)"]
+    end
+
+    subgraph ZD ["integratenetwork.work delegation zone (your token, switch.sh)"]
+        SW["★ TRAFFIC SWITCH<br/>_dstack-app-address (base)<br/>CNAME to .a or .b, switch.sh flips this"]
+        TA["side a record<br/>...a.integratenetwork.work<br/>TXT = app_id_a:443"]
+        TB["side b record<br/>...b.integratenetwork.work<br/>TXT = app_id_b:443"]
+    end
+
+    GW --> R0 --> SW
+    SW ==>|"now: points at .a (live)"| TA
+    SW -.->|"switch b: repoint to .b"| TB
+    TA ==> CA[["CVM A (blue)<br/>ingress + gateway, own cert"]]
+    TB -.-> CB[["CVM B (green)<br/>ingress + gateway, own cert"]]
+
+    classDef sw fill:#fde68a,stroke:#b45309,color:#000,stroke-width:2px
+    classDef live stroke:#15803d,stroke-width:2px
+    class SW sw
+    class CA,TA live
+```
+
 **Why sub-zones need no extra token.** dstack-ingress's Cloudflare provider
 resolves the **longest parent zone** the token can see, so
 `DELEGATION_ZONE=a.integratenetwork.work` is written into the real
