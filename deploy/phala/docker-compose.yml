@@ -70,6 +70,25 @@ services:
       - DELEGATION_ZONE=${DELEGATION_ZONE:?set DELEGATION_ZONE, the zone this container may write}
       - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:?set CLOUDFLARE_API_TOKEN, scoped to DELEGATION_ZONE only}
       - TARGET_ENDPOINT=gateway:8443 # forward decrypted traffic to the gateway
+      # DNS setup pre-check mode. Default `wait`: block on boot until the served
+      # CNAMEs resolve to `<name>.<DOMAIN>.<DELEGATION_ZONE>` (a strict, one-hop
+      # match), then proceed. That is correct for a single instance whose served
+      # CNAMEs point straight at its own delegation zone.
+      #
+      # Blue/green (deploy/phala/blue-green.md) runs each side under its OWN
+      # sub-zone (DELEGATION_ZONE=a.<zone> / b.<zone>) while the served CNAMEs stay
+      # pinned at the base zone and an operator-owned CNAME inside the base zone
+      # selects the live side. The served CNAME's immediate target is then the base
+      # name, not `<name>.…a/b.<zone>`, so the one-hop pre-check never matches and a
+      # side would block in `wait`. Set `DNS_SETUP_MODE=print` on those sides: it
+      # skips only this container's own pre-check (dnsguide.py returns immediately)
+      # and proceeds to issue the cert — Let's Encrypt and the dstack gateway both
+      # use normal resolution, which follows the full CNAME chain, so issuance and
+      # routing still work. Injected, so the measured text is identical either way,
+      # but DNS_SETUP_MODE must be listed in allowed_envs — keep it listed
+      # permanently and toggle by value, since allowed_envs is itself part of the
+      # measured app-compose (editing the list changes app_id).
+      - DNS_SETUP_MODE=${DNS_SETUP_MODE:-wait}
       # Least privilege: the container manages every record it needs INSIDE the
       # delegation zone (our token controls it), so the token needs NO access to
       # the served domain's own zone. The operator creates three static CNAMEs in
@@ -79,21 +98,26 @@ services:
       #   pc-gateway.example.com                     CNAME  pc-gateway.example.com.<DELEGATION_ZONE>
       #   _dstack-app-address.pc-gateway.example.com CNAME  _dstack-app-address.pc-gateway.example.com.<DELEGATION_ZONE>
       #   _acme-challenge.pc-gateway.example.com     CNAME  _acme-challenge.pc-gateway.example.com.<DELEGATION_ZONE>
-      # Two variables are deliberately NOT declared here, because a var absent
-      # from this block is NOT passed to the container — setting it in the CVM's
-      # environment would silently do nothing. Uncommenting either edits this
-      # file, which changes app_id: a different, separately auditable deployment.
-      #
-      # ACME_EMAIL is optional and PUBLISHED — the ACME account document is part
-      # of the evidence bundle, so any address here is world-readable at
-      # https://<DOMAIN>/evidences/acme-account.json. Leave it out unless a
-      # contact on the ACME account is actually wanted.
+      # ACME_EMAIL is deliberately NOT declared here — a var absent from this block
+      # is never passed to the container, and this one is optional and PUBLISHED:
+      # the ACME account document is part of the evidence bundle, so any address
+      # here is world-readable at https://<DOMAIN>/evidences/acme-account.json.
+      # Declaring it also changes app_id. Leave it out unless a contact on the ACME
+      # account is actually wanted.
       # - ACME_EMAIL=${ACME_EMAIL:-}
       #
-      # ACME_STAGING is off, so this deployment issues real, publicly trusted
-      # certs. Add the line below (not an env var) to bring up a NEW hostname
-      # against the staging CA first — see README "Deploy".
-      # - ACME_STAGING=true
+      # ACME_STAGING picks Let's Encrypt's staging CA. Injected, defaulting to
+      # false = real, publicly-trusted certs — byte-for-byte the behaviour of
+      # leaving it unset, which entrypoint.sh already defaults to "false". Keep
+      # ACME_STAGING listed in allowed_envs permanently and set ACME_STAGING=true in
+      # the CVM's encrypted env to bring up a NEW hostname against the staging CA
+      # first: staging's rate limits are far higher, so iterate there instead of
+      # burning the 5-duplicate-certs-per-week budget on the real hostname. Staging
+      # certs are untrusted (smoke tests only). Toggle by VALUE, not by editing
+      # allowed_envs — the list is part of the measured app-compose. Because only
+      # the injected value changes, a staging run and a production run share app_id;
+      # the served cert's issuer (LE staging vs real) is what distinguishes them.
+      - ACME_STAGING=${ACME_STAGING:-false}
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock # in-enclave attestation + cert binding
       - cert-data:/etc/letsencrypt

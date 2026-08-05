@@ -1,0 +1,11 @@
+# Shell scripts must stay LF-only. A CR in the shebang or in `set -o pipefail`
+# breaks the script under bash, and a CR in a sourced value breaks that value
+# (see deploy/phala/switch.sh loading switch.env). Pinning eol=lf here overrides
+# a contributor's core.autocrlf=true (common on Windows/WSL), so checkouts are
+# always LF regardless of local git config.
+*.sh          text eol=lf
+*.bash        text eol=lf
+
+# Env templates get copied to a live env file and read line-by-line — keep LF so
+# the copy doesn't start out with CRLF.
+*.env.example text eol=lf
