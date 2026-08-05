@@ -31,8 +31,14 @@ and releasing = repointing `_dstack-app-address.<DOMAIN>` from one to the other.
 > it is the **gateway image digest**. `DOMAIN`, `DELEGATION_ZONE`,
 > `GATEWAY_DOMAIN`, `ZG_GATEWAY_ROUTER_URL` and friends are `${...}` placeholders
 > injected from the CVM's encrypted env at boot, so **changing them does not
-> change `app_id`** (the compose comments call this out for the router URL). The
-> consequence that matters here: run the **same image** on both sides and they
+> change `app_id`** (the compose comments call this out for the router URL). Their
+> *values* are invisible to `app_id`, but the **`allowed_envs` list is part of the
+> measured app-compose** — so it must be **identical on both sides**, and the two
+> sides then differ by exactly the image digest. Keep `DNS_SETUP_MODE` and
+> `ACME_STAGING` **permanently listed** in `allowed_envs` (a fixed superset) and
+> toggle behaviour by the injected *value*, never by adding/removing the key —
+> otherwise `allowed_envs` differs and the sides diverge by more than the image.
+> The consequence that matters here: run the **same image** on both sides and they
 > share one `app_id` — dstack sees one app with two replicas, both per-side
 > records carry the same value, and the traffic switch **cannot select between
 > them**. Blue/green only isolates the two sides when they are genuinely
@@ -165,7 +171,8 @@ skips **only** the container's own pre-check and proceeds to issue. Let's Encryp
 and the dstack gateway do ordinary resolution, which follows the full chain
 ① → ② → ③, so issuance and routing still work — **validated**: a side boots under
 its sub-zone, issues its cert, and serves. It is injected (`${DNS_SETUP_MODE:-wait}`),
-so a side that sets it must also list `DNS_SETUP_MODE` in the app's `allowed_envs`.
+so `DNS_SETUP_MODE` must be in the app's `allowed_envs` — kept there **permanently
+and identically on both sides** (see the `app_id` note above), toggled by value.
 
 ## One-time setup
 
@@ -214,9 +221,12 @@ per-side pre-switch probe ([Health-checking the standby](#health-checking-the-st
    | `DNS_SETUP_MODE` | `print` | `print` |
    | `DOMAIN` | `router-api-tee.0g.ai` | `router-api-tee.0g.ai` |
 
-   `DNS_SETUP_MODE` and (if used) `ACME_STAGING` must also be in the app's
-   `allowed_envs`, or dstack drops them and the side falls back to `wait` and
-   blocks (see the note above). Everything else (`GATEWAY_DOMAIN`,
+   `allowed_envs` **must be identical on both sides** and list `DNS_SETUP_MODE`
+   and `ACME_STAGING` **permanently** — dstack drops any encrypted var not listed
+   (a side would fall back to `wait` and block), and because `allowed_envs` is part
+   of `app_id`, a list that differs between sides (or that you edit to toggle
+   staging) makes the sides diverge by more than the image. Toggle those two by
+   **value**, never by adding/removing the key. Everything else (`GATEWAY_DOMAIN`,
    `CLOUDFLARE_API_TOKEN`, gateway env) stays as in the shared compose. Each side,
    on boot, publishes its own `_dstack-app-address.…a/b…` and tries to issue a cert
    for `router-api-tee.0g.ai` — for which it needs the issuance switch (next section).

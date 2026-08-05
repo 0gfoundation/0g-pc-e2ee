@@ -111,16 +111,19 @@ phala cvm create --compose deploy/phala/docker-compose.yml
 
 When bringing up a **new** hostname, do the first round trips against Let's
 Encrypt's staging CA by setting `ACME_STAGING=true` in the CVM's encrypted
-environment (and adding `ACME_STAGING` to the app's `allowed_envs`). Every
-*successful* issuance for the same hostname counts against the
-5-duplicate-certificates-per-week limit, and each fresh CVM issues again from an
-empty `cert-data` volume, so iterating on production directly can leave the
-hostname uncertifiable for days. Staging's limits are far higher; its certs are
-untrusted, so use them for smoke tests only, then drop the variable (default
-`false`) for the real certificate. `ACME_STAGING` is injected, so the measured
-compose is identical either way — a staging run and the production run share
-`app_id`, and the served cert's issuer (LE staging vs real) is what tells them
-apart.
+environment. Keep `ACME_STAGING` **permanently listed in `allowed_envs`** (its
+default is `false`) and switch between staging and real by the **value**, not by
+adding/removing the key: `allowed_envs` is part of the measured app-compose, so
+editing the list changes `app_id`. Every *successful* issuance for the same
+hostname counts against the 5-duplicate-certificates-per-week limit, and each
+fresh CVM issues again from an empty `cert-data` volume, so iterating on
+production directly can leave the hostname uncertifiable for days. Staging's
+limits are far higher; its certs are untrusted, so use them for smoke tests only,
+then set `ACME_STAGING=false` (or drop the value) for the real certificate.
+Because only the injected *value* changes and `allowed_envs` stays constant, the
+measured compose is identical either way — a staging run and the production run
+share `app_id`, and the served cert's issuer (LE staging vs real) is what tells
+them apart.
 
 ## Verify
 
