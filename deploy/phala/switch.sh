@@ -77,6 +77,11 @@
 #   VERIFY_RETRIES   post-switch health attempts    (default: 10)
 #   VERIFY_INTERVAL  seconds between attempts       (default: 6)
 #
+# This is a bash script (arrays, [[ ]], ${BASH_SOURCE}). If it was started with a
+# POSIX shell — `sh switch.sh` runs under dash on Debian/Ubuntu/WSL and chokes on
+# `set -o pipefail` — re-exec under bash so it works either way.
+if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
+
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
