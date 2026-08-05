@@ -74,7 +74,7 @@
 #   TXT_PREFIX       app-address record prefix      (default: _dstack-app-address)
 #   HEALTH_PATH      public health path             (default: /healthz)
 #   TTL              CNAME TTL in seconds           (default: 60)
-#   VERIFY_RETRIES   post-switch health attempts    (default: 10)
+#   VERIFY_RETRIES   post-switch health attempts    (default: 20; window must outlast the route cache)
 #   VERIFY_INTERVAL  seconds between attempts       (default: 6)
 #
 # This is a bash script (arrays, [[ ]], ${BASH_SOURCE}). If it was started with a
@@ -258,6 +258,16 @@ http_ok() { # url -> 0 if HTTP 2xx
 
 public_health_ok() { http_ok "https://${DOMAIN}${HEALTH_PATH}"; }
 
+# SHA-256 fingerprint of the TLS cert currently served at $DOMAIN:443, or empty.
+# Each side runs its OWN dstack-ingress and issues its OWN cert, so the served
+# fingerprint identifies WHICH side answered — used to confirm a switch actually
+# took effect rather than being fooled by a cached routing lookup on the gateway.
+served_cert_fp() {
+  command -v openssl >/dev/null 2>&1 || return 0
+  echo | openssl s_client -servername "$DOMAIN" -connect "${DOMAIN}:443" 2>/dev/null \
+    | openssl x509 -noout -fingerprint -sha256 2>/dev/null | sed 's/.*=//'
+}
+
 confirm() {
   [ "$DRY_RUN" = 1 ] && return 0        # dry-run changes nothing; never prompt
   [ "$ASSUME_YES" = 1 ] && return 0
@@ -368,6 +378,23 @@ cmd_switch() {
 
   confirm "Switch traffic ${cur_side:-<none>} -> ${target} for ${DOMAIN}?" || { warn "aborted"; exit 1; }
 
+  # Fingerprint the cert the live side is serving BEFORE we flip. After the flip
+  # we wait for the served fingerprint to CHANGE — proof the gateway is now
+  # routing to ${target} and not answering our health check from a cached route
+  # to the old side. Only meaningful when switching between two live sides and
+  # openssl is present.
+  local cert_before=""
+  if [ -n "$cur_side" ]; then
+    cert_before="$(served_cert_fp)"
+    if [ -z "$cert_before" ]; then
+      if command -v openssl >/dev/null 2>&1; then
+        warn "could not read the current served cert; will verify /healthz only"
+      else
+        warn "openssl not found: verifying /healthz only — a cached gateway route to ${cur_side} could satisfy it (install openssl for cache-proof verification)"
+      fi
+    fi
+  fi
+
   # Record the side we are leaving, so `rollback` knows where to go.
   local statedir="${TMPDIR:-/tmp}"
   [ "$DRY_RUN" = 1 ] || printf '%s\n' "${cur_side:-}" > "${statedir}/.gw-switch-prev-${DOMAIN}" 2>/dev/null || true
@@ -380,16 +407,30 @@ cmd_switch() {
     info "switched to ${target} (post-switch verification skipped)"; exit 0
   fi
 
-  # Verify the public endpoint recovers; auto-rollback if it does not.
-  info "waiting for public endpoint to serve from ${target} (TTL ${TTL}s)..."
-  local i
+  # Verify the public endpoint recovers AND is actually being served by ${target}
+  # (cert fingerprint changed); auto-rollback if it does not within the window.
+  # The window must exceed the gateway's routing-cache TTL or a slow cache flush
+  # reads as a failure — see VERIFY_RETRIES/VERIFY_INTERVAL.
+  info "waiting for the public endpoint to serve from ${target} (record TTL ${TTL}s)..."
+  local i cert_now
   for ((i=1; i<=VERIFY_RETRIES; i++)); do
     if public_health_ok; then
-      info "public health OK after switch to ${target} (attempt ${i})"
-      info "done. rollback with:  $0 switch ${cur_side:-<other>}"
-      exit 0
+      cert_now="$(served_cert_fp)"
+      if [ -z "$cert_before" ]; then
+        # No baseline to compare (no prior side, or no openssl): /healthz is all we have.
+        info "public health OK after switch to ${target} (attempt ${i})"
+        info "done. rollback with:  $0 switch ${cur_side:-<other>}"
+        exit 0
+      elif [ -n "$cert_now" ] && [ "$cert_now" != "$cert_before" ]; then
+        info "verified: ${DOMAIN} now served by ${target} (cert changed) and /healthz OK"
+        info "done. rollback with:  $0 switch ${cur_side:-<other>}"
+        exit 0
+      else
+        log "  attempt ${i}/${VERIFY_RETRIES}: /healthz OK but still the old cert — gateway route cache not flushed yet, waiting ${VERIFY_INTERVAL}s"
+      fi
+    else
+      log "  attempt ${i}/${VERIFY_RETRIES}: not healthy yet, sleeping ${VERIFY_INTERVAL}s"
     fi
-    log "  attempt ${i}/${VERIFY_RETRIES}: not healthy yet, sleeping ${VERIFY_INTERVAL}s"
     sleep "$VERIFY_INTERVAL"
   done
 
@@ -500,7 +541,7 @@ SIDE_B_LABEL="${SIDE_B_LABEL:-b}"
 TXT_PREFIX="${TXT_PREFIX:-_dstack-app-address}"
 HEALTH_PATH="${HEALTH_PATH:-/healthz}"
 TTL="${TTL:-60}"
-VERIFY_RETRIES="${VERIFY_RETRIES:-10}"
+VERIFY_RETRIES="${VERIFY_RETRIES:-20}"   # ~2x TTL by default, to outlast the gateway route cache
 VERIFY_INTERVAL="${VERIFY_INTERVAL:-6}"
 
 # Switch-layer record names (in the delegation zone) that this script owns.
