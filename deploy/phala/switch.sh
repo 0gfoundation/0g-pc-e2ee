@@ -69,6 +69,8 @@
 #   DOMAIN           served hostname                (default: router-api-tee.0g.ai)
 #   DELEGATION_ZONE  base delegation zone           (default: same as CF_ZONE)
 #   GATEWAY_DOMAIN   cluster dstack gateway         (no default; required only by `setup`)
+#   PLATFORM_BASE    dstack platform base domain    (e.g. in1.phala.network; enables the
+#                    per-side app-id probe before a switch — <app_id>-443s.<PLATFORM_BASE>)
 #   SIDE_A_LABEL     sub-zone label for side a      (default: a)
 #   SIDE_B_LABEL     sub-zone label for side b      (default: b)
 #   TXT_PREFIX       app-address record prefix      (default: _dstack-app-address)
@@ -250,10 +252,24 @@ side_app_addr() { # a|b
     | awk -F'\t' '$2=="TXT"{print $3; exit}' | sed 's/^"//; s/"$//'
 }
 
-http_ok() { # url -> 0 if HTTP 2xx
+http_ok() { # url -> 0 if HTTP 2xx. -k: we check reachability/health, not cert
+  # validity (that is covered by the evidence bundle and the fingerprint check),
+  # and staging/per-side endpoints legitimately serve a cert for another name.
   local code
-  code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "$1" 2>/dev/null || echo 000)"
+  code="$(curl -sSk -o /dev/null -w '%{http_code}' --max-time 10 "$1" 2>/dev/null || echo 000)"
   [[ "$code" =~ ^2[0-9][0-9]$ ]]
+}
+
+# A per-side health URL that reaches THAT side directly, by app-id, via the dstack
+# gateway's platform hostname (<app_id>-443s.<PLATFORM_BASE>). The `s` = TLS
+# passthrough to the side's own ingress; routing is by the app-id in the hostname,
+# independent of the custom domain's _dstack-app-address, so it hits the target
+# side even before any traffic points at it. Empty if PLATFORM_BASE is unset.
+platform_probe_url() { # a|b
+  [ -n "$PLATFORM_BASE" ] || return 0
+  local addr; addr="$(side_app_addr "$1")"   # "<app_id>:443"
+  [ -n "$addr" ] || return 0
+  echo "https://${addr%%:*}-443s.${PLATFORM_BASE}${HEALTH_PATH}"
 }
 
 public_health_ok() { http_ok "https://${DOMAIN}${HEALTH_PATH}"; }
@@ -302,8 +318,8 @@ cmd_status() {
   app_a="$(side_app_addr a || true)"
   app_b="$(side_app_addr b || true)"
   for s in a b; do
-    printf 'side %s : app-address %-24s app_id=%s\n' \
-      "$s" "$(addr_target "$s")" "$(side_app_addr "$s" || true)"
+    printf 'side %s : app_id=%-45s probe=%s\n' \
+      "$s" "$(side_app_addr "$s" || true)" "$(platform_probe_url "$s" || true)"
   done
   if [ -n "$app_a" ] && [ "$app_a" = "$app_b" ]; then
     warn "both sides publish the same app_id — same build, so the switch cannot"
@@ -367,13 +383,18 @@ cmd_switch() {
     warn "between them. Blue/green needs two DIFFERENT gateway images."
   fi
 
-  # Gate 2: optional direct probe of the target side before we send it traffic.
-  if [ -n "$PROBE_URL" ]; then
-    info "probing target side directly: $PROBE_URL"
-    http_ok "$PROBE_URL" || die "target-side probe failed ($PROBE_URL) — refusing to switch"
+  # Gate 2: verify the TARGET side is healthy BEFORE we send it any traffic.
+  # Prefer an explicit --probe-url; otherwise, if PLATFORM_BASE is set, probe the
+  # target's own app-id endpoint, which reaches it directly regardless of where
+  # traffic currently points.
+  local probe="$PROBE_URL"
+  [ -z "$probe" ] && probe="$(platform_probe_url "$target")"
+  if [ -n "$probe" ]; then
+    info "probing target side ${target} directly: $probe"
+    http_ok "$probe" || die "target-side probe failed ($probe) — refusing to switch"
     info "target-side probe OK"
   else
-    warn "no --probe-url given: cannot health-check side ${target} before cutover (see blue-green.md)"
+    warn "no --probe-url and no PLATFORM_BASE: cannot health-check side ${target} before cutover (see blue-green.md)"
   fi
 
   confirm "Switch traffic ${cur_side:-<none>} -> ${target} for ${DOMAIN}?" || { warn "aborted"; exit 1; }
@@ -536,6 +557,7 @@ CF_ZONE="${CF_ZONE:-integratenetwork.work}"
 DOMAIN="${DOMAIN:-router-api-tee.0g.ai}"
 DELEGATION_ZONE="${DELEGATION_ZONE:-$CF_ZONE}"
 GATEWAY_DOMAIN="${GATEWAY_DOMAIN:-}"   # dstack gateway of the cluster; needed only by `setup`
+PLATFORM_BASE="${PLATFORM_BASE:-}"     # dstack platform base domain (e.g. in1.phala.network) for per-side app-id probes
 SIDE_A_LABEL="${SIDE_A_LABEL:-a}"
 SIDE_B_LABEL="${SIDE_B_LABEL:-b}"
 TXT_PREFIX="${TXT_PREFIX:-_dstack-app-address}"
