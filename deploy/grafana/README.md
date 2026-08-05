@@ -16,6 +16,9 @@ import you pick two variables:
 - **Service** — filters by the `service` label. The `prometheus-agent` sets
   `external_labels: { service: 0g-pc-gateway }`, so pick that; the default (`All`)
   matches everything, including data that carries no `service` label.
+- **Environment** — filters by the `env` label (`staging` / `mainnet`), which the
+  agent stamps from `ZG_PROM_ENV`. When both environments remote_write into the
+  same store this is how you scope the board to one; `All` shows both.
 
 It can also be provisioned as a file-based dashboard (drop it in a folder your
 Grafana `dashboards` provider watches). The `uid` is `0g-pc-gateway`.
