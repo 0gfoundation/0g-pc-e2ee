@@ -352,10 +352,16 @@ move_switches() { # target-side  [--acme-only]
   tgt_addr="$(addr_target "$target")"
   tgt_acme="$(acme_target "$target")"
 
+  # Order matters: the traffic switch is written LAST. A cf failure aborts the
+  # whole script (cf -> die), so if that happened between two writes with traffic
+  # first, traffic would be left pointing at the unverified target with neither
+  # the verify loop nor the auto-rollback reached. Writing issuance first means
+  # any failure before the final, single-PUT traffic flip leaves traffic on the
+  # current side.
+  put_cname "$ACME_SWITCH" "$tgt_acme"
   if [ "$acme_only" != "--acme-only" ]; then
     put_cname "$ADDR_SWITCH" "$tgt_addr"
   fi
-  put_cname "$ACME_SWITCH" "$tgt_acme"
 }
 
 cmd_switch() {
