@@ -275,6 +275,11 @@ func TestValidateOrigins(t *testing.T) {
 	if err := ValidateOrigins([]string{"*"}); err != nil {
 		t.Errorf(`"*" must validate: %v`, err)
 	}
+	// A single-label parent is legitimate (dev hostnames), so the wildcard check must
+	// not tighten into "the parent needs a dot".
+	if err := ValidateOrigins([]string{"https://*.localhost"}); err != nil {
+		t.Errorf("a single-label wildcard parent must validate: %v", err)
+	}
 
 	bad := map[string]string{
 		"https://app.example.com/":     "trailing slash — a browser Origin never has one, so it would match nothing",
@@ -284,6 +289,8 @@ func TestValidateOrigins(t *testing.T) {
 		"https://":                     "no host",
 		"https://*app.example.com":     "wildcard not on a label boundary",
 		"https://a.*.example.com":      "wildcard in the middle",
+		"https://*.":                   `"*." with no parent domain — compiles to the suffix "." and matches nothing`,
+		"https://*.*.example.com":      "two wildcards",
 		"https://a b.example.com":      "whitespace inside the host",
 	}
 	for pattern, why := range bad {
@@ -304,12 +311,33 @@ func TestStripCORSHeaders(t *testing.T) {
 	StripCORSHeaders(h)
 
 	for name := range h {
-		if strings.HasPrefix(name, "Access-Control-") {
+		if strings.HasPrefix(http.CanonicalHeaderKey(name), "Access-Control-") {
 			t.Errorf("%s survived; the upstream's CORS headers must not reach the browser alongside ours", name)
 		}
 	}
 	if h.Get("Content-Type") != "application/json" || h.Get("X-Request-ID") != "abc" {
 		t.Error("non-CORS headers must be left alone")
+	}
+}
+
+// A NON-CANONICAL map key must be stripped too. This has to be built by assigning
+// into the map directly: Header.Set canonicalizes, so it cannot produce the case —
+// and neither can Header.Del remove it, since Del canonicalizes its argument and
+// would delete a different entry, leaving the upstream Allow-Origin on the
+// response. Go's transport canonicalizes what it parses off the wire, so this
+// guards the hand-built / custom-RoundTripper path the classify-then-delete logic
+// already assumes is possible.
+func TestStripCORSHeadersNonCanonicalKey(t *testing.T) {
+	h := http.Header{}
+	h["access-control-allow-origin"] = []string{"https://router.example"}
+	h["ACCESS-CONTROL-ALLOW-CREDENTIALS"] = []string{"true"}
+	h["content-type"] = []string{"application/json"}
+
+	StripCORSHeaders(h)
+
+	if len(h) != 1 || h["content-type"][0] != "application/json" {
+		t.Errorf("got %v, want only the non-CORS header left (a surviving Access-Control-* "+
+			"would reach the browser next to the gateway's own → \"contains multiple values\")", h)
 	}
 }
 

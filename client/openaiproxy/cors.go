@@ -119,8 +119,17 @@ func validateOrigin(o string) error {
 	if strings.ContainsAny(host, "/?#") {
 		return errors.New("must have no path, query, or trailing slash — a browser's Origin header never carries one, so such a pattern can never match")
 	}
-	if strings.Contains(host, "*") && (!strings.HasPrefix(host, "*.") || strings.Contains(host[2:], "*")) {
-		return errors.New(`the only supported wildcard is a leading "*." label (e.g. https://*.0g.ai)`)
+	if strings.Contains(host, "*") {
+		// The parent domain after "*." must be non-empty: "https://*." would compile to
+		// the suffix "." and match no real origin, which is the same never-matches class
+		// as a trailing slash above. Note this deliberately still accepts a
+		// single-label parent ("https://*.localhost" is a legitimate dev pattern);
+		// rejecting a public-suffix parent like "https://*.com" would need the public
+		// suffix list, so that stays an operator judgment rather than a shape check.
+		rest, ok := strings.CutPrefix(host, "*.")
+		if !ok || rest == "" || strings.Contains(rest, "*") {
+			return errors.New(`the only supported wildcard is a leading "*." label followed by a domain (e.g. https://*.0g.ai)`)
+		}
 	}
 	return nil
 }
@@ -231,8 +240,15 @@ func CORS(origins []string, h http.Handler) http.Handler {
 // necessarily this gateway's. Called from the proxy's ModifyResponse.
 func StripCORSHeaders(h http.Header) {
 	for name := range h {
+		// Canonicalize only to CLASSIFY the key, then delete the literal map entry:
+		// http.Header.Del canonicalizes its argument, so on a non-canonical key it
+		// would delete a different (likely absent) entry and leave this one in place —
+		// exactly the upstream Allow-Origin this function exists to remove. Go's
+		// transport canonicalizes response headers, so that only bites a hand-built
+		// http.Header or a custom RoundTripper, but the check above already assumes
+		// non-canonical keys are possible, so the delete must handle them too.
 		if strings.HasPrefix(http.CanonicalHeaderKey(name), "Access-Control-") {
-			h.Del(name)
+			delete(h, name)
 		}
 	}
 }

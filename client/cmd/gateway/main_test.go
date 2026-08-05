@@ -230,6 +230,12 @@ func TestGatewayRouteMode(t *testing.T) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer sk-test")
+	// Carry a browser Origin (matched here through the "*." wildcard) so this also
+	// covers CORS on the SEALED path's real response — the one path where the
+	// handler writes its own headers (setResKey / setPassthrough) around the
+	// middleware's, and where losing them would leave a browser able to preflight
+	// successfully and then unable to read the answer.
+	req.Header.Set("Origin", "https://chat.0g.ai")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("post to gateway: %v", err)
@@ -241,6 +247,14 @@ func TestGatewayRouteMode(t *testing.T) {
 	}
 	if !bytes.Contains(body, []byte("routed answer")) {
 		t.Fatalf("user did not get routed plaintext back: %s", body)
+	}
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "https://chat.0g.ai" {
+		t.Errorf("sealed response Allow-Origin: got %q, want the origin echoed", got)
+	}
+	// Without Expose-Headers the browser cannot read ZG-Res-Key, so the user could
+	// not fetch the §8 signature to audit the very response it just received.
+	if got := resp.Header.Get("Access-Control-Expose-Headers"); !strings.Contains(got, "ZG-Res-Key") {
+		t.Errorf("sealed response Expose-Headers: got %q, want it to carry ZG-Res-Key", got)
 	}
 }
 
