@@ -147,7 +147,17 @@ go run ./client/cmd/pcverify -gateway <DOMAIN> -pccs-url https://pccs.phala.netw
 
 Add `-allow-untrusted-cert` when checking a hostname brought up against the ACME
 staging CA (`ACME_STAGING=true`): its certificate is correctly bound by the quote
-but deliberately signed by an untrusted CA. The flag relaxes no attestation check.
+but deliberately signed by an untrusted CA, and without the flag even the evidence
+fetch fails on ordinary PKI verification.
+
+It relaxes no attestation check, but it is **not** free: chain trust is what ties
+the connection to the domain you named, so waiving it lets an interceptor running
+its *own* attested CVM satisfy every other check — its own quote, its own
+consistent bundle, its own certificate, which then matches that bundle because it
+controls both. The claim narrows to "a genuine TEE minted the certificate served on
+this connection". Fine for smoke-testing a deployment you operate; never for
+auditing an endpoint you do not control, and never on the production hostname. The
+tool prints this caveat on any run that uses the flag.
 
 It does **not** check code identity — see the `app-compose.json` step below, which
 is still manual. The command prints the quote's measurement registers for it.

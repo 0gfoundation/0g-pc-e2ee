@@ -97,6 +97,35 @@ func TestReportGateway(t *testing.T) {
 	}
 }
 
+// Waiving chain trust must not print a bare PASS: it narrows the claim (an
+// interceptor with its own attested CVM would satisfy everything else), so the
+// caveat has to be on screen.
+func TestReportGateway_WaivedTrustWarns(t *testing.T) {
+	rep := passing()
+	rep.ChainTrustErr = errors.New("x509: certificate signed by unknown authority")
+
+	var out bytes.Buffer
+	if code := reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", true); code != 0 {
+		t.Fatalf("code = %d, want 0\n%s", code, out.String())
+	}
+	for _, want := range []string{"warning", "waived", "does NOT establish"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("output missing %q:\n%s", want, out.String())
+		}
+	}
+}
+
+// …and a run whose trust actually validates must NOT print that warning.
+func TestReportGateway_TrustedRunHasNoWarning(t *testing.T) {
+	var out bytes.Buffer
+	if code := reportGateway(context.Background(), &out, stubEvidence{rep: passing()}, "pc-gateway.test", true); code != 0 {
+		t.Fatalf("code = %d, want 0\n%s", code, out.String())
+	}
+	if strings.Contains(out.String(), "warning") {
+		t.Errorf("-allow-untrusted-cert must not warn when trust validated anyway:\n%s", out.String())
+	}
+}
+
 // A pass must never read as full attestation: the code-identity gap has to be on
 // screen.
 func TestReportGateway_PassStatesTheCodeIdentityGap(t *testing.T) {

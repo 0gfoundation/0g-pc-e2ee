@@ -33,8 +33,14 @@
 //	pcverify -gateway pc-gateway.example.com [-pccs-url https://...]
 //	         [-allow-untrusted-cert]
 //
-// -allow-untrusted-cert accepts a certificate that does not chain to a public
-// root, for ACME-staging deployments; it relaxes no attestation check.
+// -allow-untrusted-cert proceeds when the served certificate does not chain to a
+// public root, for ACME-staging deployments. It relaxes no attestation check — and
+// it is needed on the evidence FETCH too, not just the comparison, since that fetch
+// is itself an HTTPS GET. But chain trust is what ties the connection to the domain
+// asked for, so waiving it lets an interceptor running its OWN attested CVM satisfy
+// every other check with its own quote, bundle and certificate. A run that uses the
+// flag prints that caveat. Use it to smoke-test a deployment you operate, never to
+// audit an endpoint you do not control.
 //
 // A pass does NOT establish code identity: proving which image the CVM runs still
 // needs the event-log replay for app_id plus the app-compose.json comparison
@@ -102,7 +108,7 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 	noQuote := fs.Bool("no-quote", false, "skip the TDX quote hops; check only the on-chain signer (no provider contact)")
 	gateway := fs.String("gateway", "", "cloud-TEE gateway domain (e.g. pc-gateway.example.com); selects gateway mode — verify its /evidences bundle and compare the served certificate")
 	pccsURL := fs.String("pccs-url", "", "fetch DCAP collateral (TCB Info, QE Identity, PCK CRL) from this PCCS mirror instead of api.trustedservices.intel.com (e.g. https://pccs.phala.network); the root-CA CRL still comes from Intel. Applies to whichever mode verifies a quote")
-	allowUntrustedCert := fs.Bool("allow-untrusted-cert", false, "gateway mode: accept a served certificate that does not chain to a public root (ACME staging); relaxes no attestation check")
+	allowUntrustedCert := fs.Bool("allow-untrusted-cert", false, "gateway mode: proceed when the served certificate does not chain to a public root (ACME staging). Relaxes no attestation check, but drops the link between the connection and the domain asked for, so an interceptor running its own attested CVM would still pass — smoke-test your own deployment only")
 	timeout := fs.Duration("timeout", 30*time.Second, "overall timeout")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -124,7 +130,7 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 	}
 
 	if wantGateway {
-		ec, err := newEvidenceChecker(*pccsURL, *timeout)
+		ec, err := newEvidenceChecker(*pccsURL, *timeout, *allowUntrustedCert)
 		if err != nil {
 			fmt.Fprintf(out, "pcverify: %v\n", err)
 			return 2

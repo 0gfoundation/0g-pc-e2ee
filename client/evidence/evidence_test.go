@@ -195,15 +195,34 @@ func (f *fixture) parser() QuoteParser {
 	}
 }
 
+// dialPlain returns a DialContext that ignores the requested address and connects
+// to the fixture, so a client can keep its own TLS configuration while reaching a
+// server that testDomain does not actually resolve to.
+func (f *fixture) dialPlain() func(context.Context, string, string) (net.Conn, error) {
+	addr := f.server.Listener.Addr().String()
+	return func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	}
+}
+
+// dialTLS is the Config.DialTLS equivalent: the caller's tls.Config, the fixture's
+// address.
+func (f *fixture) dialTLS() func(context.Context, string, *tls.Config) (*tls.Conn, error) {
+	addr := f.server.Listener.Addr().String()
+	return func(ctx context.Context, _ string, tc *tls.Config) (*tls.Conn, error) {
+		conn, err := (&tls.Dialer{Config: tc}).DialContext(ctx, "tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+		return conn.(*tls.Conn), nil
+	}
+}
+
 // checker wires a Checker at the fixture: HTTP and TLS both dial the test server
 // while keeping testDomain as the name, so URLs, SNI and the certificate's DNS
 // name all line up without touching the resolver.
 func (f *fixture) checker(t *testing.T, cfg Config) *Checker {
 	t.Helper()
-	addr := f.server.Listener.Addr().String()
-	dialToFixture := func(ctx context.Context, _, _ string) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
-	}
 	pool := x509.NewCertPool()
 	pool.AddCert(f.ca.cert)
 
@@ -212,18 +231,12 @@ func (f *fixture) checker(t *testing.T, cfg Config) *Checker {
 	}
 	if cfg.HTTPClient == nil {
 		cfg.HTTPClient = &http.Client{Transport: &http.Transport{
-			DialContext:     dialToFixture,
+			DialContext:     f.dialPlain(),
 			TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
 		}}
 	}
 	if cfg.DialTLS == nil {
-		cfg.DialTLS = func(ctx context.Context, _ string, tc *tls.Config) (*tls.Conn, error) {
-			conn, err := (&tls.Dialer{Config: tc}).DialContext(ctx, "tcp", addr)
-			if err != nil {
-				return nil, err
-			}
-			return conn.(*tls.Conn), nil
-		}
+		cfg.DialTLS = f.dialTLS()
 	}
 	if cfg.Roots == nil {
 		cfg.Roots = pool
@@ -537,6 +550,72 @@ func TestCheck_HandshakeFailure(t *testing.T) {
 	}
 	if rep.Pass() {
 		t.Error("Pass = true without a served certificate to compare")
+	}
+}
+
+// The evidence fetch is itself an HTTPS GET, so a deployment on an ACME-staging
+// certificate is unverifiable unless AllowUntrustedCert reaches the fetch too. This
+// is the regression that made the flag useless where it was needed: the fetch died
+// on PKI verification before any check ran.
+//
+// Both cases go through New's own client (only its dialing is redirected at the
+// fixture) so the TLS decision under test is the one New makes.
+func TestCheck_AllowUntrustedCertAppliesToTheFetch(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		allow      bool
+		wantFetch  bool // did the bundle fetch get through?
+		wantErrHas string
+	}{
+		{name: "untrusted cert blocks the fetch by default", allow: false, wantFetch: false, wantErrHas: "x509"},
+		{name: "allowed: every check runs", allow: true, wantFetch: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			// No CA pool anywhere: the fixture's cert chains to nothing this client
+			// trusts, exactly like an ACME-staging deployment.
+			c, err := New(Config{
+				QuoteParser:        f.parser(),
+				AllowUntrustedCert: tc.allow,
+				Roots:              x509.NewCertPool(),
+				DialTLS:            f.dialTLS(),
+			})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			// Keep New's TLSClientConfig — the thing under test — and only redirect
+			// where the connection goes, since testDomain does not resolve.
+			c.http.Transport.(*http.Transport).DialContext = f.dialPlain()
+
+			rep, err := c.Check(context.Background(), testDomain)
+			if err != nil {
+				t.Fatalf("Check: %v", err)
+			}
+			gotFetch := rep.ManifestErr == nil
+			if gotFetch != tc.wantFetch {
+				t.Fatalf("bundle fetched = %v, want %v (ManifestErr = %v)", gotFetch, tc.wantFetch, rep.ManifestErr)
+			}
+			if tc.wantErrHas != "" && !strings.Contains(fmt.Sprint(rep.ManifestErr), tc.wantErrHas) {
+				t.Errorf("ManifestErr = %v, want it to mention %q", rep.ManifestErr, tc.wantErrHas)
+			}
+			if !tc.wantFetch {
+				return
+			}
+			// With the fetch through, the attestation checks must all have run and
+			// passed — the flag relaxes none of them.
+			if rep.QuoteErr != nil || rep.BindingErr != nil || rep.CertErr != nil {
+				t.Errorf("attestation checks did not run cleanly: quote=%v binding=%v cert=%v",
+					rep.QuoteErr, rep.BindingErr, rep.CertErr)
+			}
+			if rep.CertMatch != CertExact {
+				t.Errorf("CertMatch = %v, want CertExact", rep.CertMatch)
+			}
+			// …and chain trust must still be REPORTED as failing, since that is what
+			// the caller weighs against its own risk.
+			if rep.ChainTrustErr == nil {
+				t.Error("ChainTrustErr = nil; waiving trust must not hide that it failed")
+			}
+		})
 	}
 }
 

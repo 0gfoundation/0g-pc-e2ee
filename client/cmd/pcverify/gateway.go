@@ -19,10 +19,15 @@ type evidenceChecker interface {
 // newEvidenceChecker builds the real checker: a DCAP verifier over the ingress
 // quote, with collateral from pccsURL when set (Intel PCS otherwise — the same
 // choice the gateway itself makes, see ZG_GATEWAY_PCCS_URL).
-func newEvidenceChecker(pccsURL string, timeout time.Duration) (*evidence.Checker, error) {
+//
+// allowUntrustedCert must reach the checker, not just the reporting below: the
+// evidence FETCH is an HTTPS GET, so with an ACME-staging certificate it fails on
+// PKI verification before any check runs. See evidence.Config.AllowUntrustedCert.
+func newEvidenceChecker(pccsURL string, timeout time.Duration, allowUntrustedCert bool) (*evidence.Checker, error) {
 	return evidence.New(evidence.Config{
-		QuoteParser: dcap.NewQuoteParser(dcap.Config{PCCSBaseURL: pccsURL}),
-		Timeout:     timeout,
+		QuoteParser:        dcap.NewQuoteParser(dcap.Config{PCCSBaseURL: pccsURL}),
+		Timeout:            timeout,
+		AllowUntrustedCert: allowUntrustedCert,
 	})
 }
 
@@ -32,7 +37,9 @@ func newEvidenceChecker(pccsURL string, timeout time.Duration) (*evidence.Checke
 // allowUntrustedCert downgrades the chain-trust step (step 5) from a failure to a
 // note. It exists for ACME-staging deployments, whose certificates are correctly
 // bound by the quote but signed by an untrusted CA on purpose
-// (deploy/phala/README.md); it does NOT relax any attestation check.
+// (deploy/phala/README.md). It relaxes no attestation check, but it does narrow the
+// claim — an interceptor running its own attested CVM would satisfy everything
+// else — so a run that uses it prints that caveat rather than a bare PASS.
 func reportGateway(ctx context.Context, out io.Writer, ec evidenceChecker, domain string, allowUntrustedCert bool) int {
 	rep, err := ec.Check(ctx, domain)
 	if err != nil {
@@ -112,16 +119,28 @@ func reportGateway(ctx context.Context, out io.Writer, ec evidenceChecker, domai
 	// Step 5 — ordinary PKI trust, reported on its own so a staging certificate is
 	// distinguishable from a real trust failure.
 	trustOK := rep.ChainTrustErr == nil
+	trustWaived := !trustOK && allowUntrustedCert
 	switch {
 	case trustOK:
 		fmt.Fprintf(out, "%s chain trust        validates for %s\n", mark(true), rep.Domain)
-	case allowUntrustedCert:
-		fmt.Fprintf(out, "%s chain trust        %v (ignored: -allow-untrusted-cert)\n", mark(true), rep.ChainTrustErr)
+	case trustWaived:
+		fmt.Fprintf(out, "%s chain trust        %v (waived: -allow-untrusted-cert)\n", mark(true), rep.ChainTrustErr)
 	default:
 		fmt.Fprintf(out, "%s chain trust        %v\n", mark(false), rep.ChainTrustErr)
 	}
 
 	fmt.Fprintf(out, "\nnote: %s\n", rep.Note)
+	// Waiving chain trust drops the link between this connection and the name that
+	// was asked for, so say what the pass no longer covers. Without this an operator
+	// reads a bare PASS as the full claim.
+	if trustWaived {
+		fmt.Fprintf(out, "\nwarning: chain trust was waived, so this run does NOT establish that the connection\n"+
+			"  reached %s. An interceptor running its own attested CVM would satisfy every\n"+
+			"  other check above, serving its own quote, bundle and certificate. The claim is\n"+
+			"  \"a genuine TEE minted the certificate served on this connection\" — fine for\n"+
+			"  smoke-testing your own staging deployment, not for auditing an endpoint you do\n"+
+			"  not control.\n", rep.Domain)
+	}
 
 	if rep.Pass() && (trustOK || allowUntrustedCert) {
 		fmt.Fprintln(out, "\nPASS")

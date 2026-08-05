@@ -23,9 +23,11 @@
 //     load-bearing step: without it the quote proves only that *some* CVM
 //     obtained *some* certificate, saying nothing about the endpoint in front of
 //     you (deploy/phala/README.md "Verify").
-//  5. **Chain trust** — whether that certificate also validates against the
-//     system roots, reported separately so an ACME-staging smoke test can be
-//     told apart from a real trust failure.
+//  5. **Chain trust** — whether that certificate also validates for the domain
+//     against the system roots, reported separately so an ACME-staging smoke test
+//     can be told apart from a real trust failure. Separate does not mean optional:
+//     it is what rules out an interceptor presenting its own attested CVM (see
+//     Report.ChainTrustErr).
 //
 // # What this does NOT establish
 //
@@ -98,6 +100,21 @@ type Config struct {
 	// certificate comparison is an identity check against the quote, not a PKI
 	// decision, so the handshake deliberately does not depend on this.
 	Roots *x509.CertPool
+	// AllowUntrustedCert lets the evidence FETCH proceed over a TLS connection whose
+	// certificate does not chain to a trusted root, for a deployment brought up
+	// against the ACME staging CA (deploy/phala/README.md). Without it the fetch
+	// fails on ordinary PKI verification and no check runs at all, which makes a
+	// staging endpoint unverifiable.
+	//
+	// It does not weaken steps 1–3: the bundle is untrusted input either way, and
+	// its authenticity comes from the report_data binding to a DCAP-verified quote,
+	// never from TLS. What it DOES give up is the guarantee that the connection
+	// reaches the name that was asked for — see Report.ChainTrustErr for the
+	// consequence, which is why chain trust is still evaluated and reported.
+	//
+	// It applies only to the client this package builds; a caller supplying
+	// HTTPClient controls its own TLS configuration.
+	AllowUntrustedCert bool
 }
 
 const defaultTimeout = 30 * time.Second
@@ -123,7 +140,15 @@ func New(cfg Config) (*Checker, error) {
 	}
 	c := &Checker{cfg: cfg, http: cfg.HTTPClient, dial: cfg.DialTLS, limit: timeout}
 	if c.http == nil {
-		c.http = &http.Client{Timeout: timeout}
+		c.http = &http.Client{Timeout: timeout, Transport: &http.Transport{
+			// Verification is on by default and only AllowUntrustedCert turns it off;
+			// see that field for why doing so does not weaken the bundle checks, and
+			// what it does cost.
+			TLSClientConfig: &tls.Config{
+				MinVersion:         tls.VersionTLS12,
+				InsecureSkipVerify: cfg.AllowUntrustedCert, //nolint:gosec // opt-in, see Config.AllowUntrustedCert
+			},
+		}}
 	}
 	if c.dial == nil {
 		c.dial = dialTLS
@@ -221,10 +246,20 @@ type Report struct {
 	CertIssuer   string
 	CertNotAfter time.Time
 
-	// ChainTrustErr is set when the served certificate does not validate for
-	// Domain against the trust store (step 5). It is reported separately from
-	// CertMatch because an untrusted-but-correctly-bound certificate is an
-	// ACME-staging deployment, not an attestation failure.
+	// ChainTrustErr is set when the served certificate does not validate for Domain
+	// against the trust store (step 5). It is reported separately from CertMatch
+	// because an untrusted-but-correctly-bound certificate is an ACME-staging
+	// deployment rather than an attestation failure — but it is NOT cosmetic.
+	//
+	// Chain trust is what ties "the certificate on this connection" to "the DNS name
+	// I asked for". Without it, an attacker who can intercept the connection and
+	// runs its OWN dstack CVM can satisfy every other check: it serves its own
+	// genuine quote, its own consistent bundle, and its own certificate — which then
+	// matches the bundle, because it controls both. So treating a chain-trust failure
+	// as acceptable narrows the claim to "some genuine TEE minted the certificate
+	// being served on this connection", dropping "and this connection reaches the
+	// host I named". Acceptable for an operator smoke-testing their own staging
+	// deployment; not acceptable when auditing an endpoint you do not control.
 	ChainTrustErr error
 
 	// Note records what a pass does NOT cover, so a caller cannot present this as

@@ -131,6 +131,12 @@ certificate the domain **actually serves** is the one that quote committed to
 [`docs/design/cloud-gateway.md`](../docs/design/cloud-gateway.md) §10. Both modes
 exit non-zero on a failed check, so either works as a deploy gate.
 
+`-allow-untrusted-cert` (gateway mode) is for a hostname on the ACME staging CA,
+where even the evidence fetch would otherwise fail PKI verification. It relaxes no
+attestation check, but chain trust is what ties the connection to the domain you
+named — waive it and an interceptor running its own attested CVM passes everything
+else. Smoke-test your own deployment with it; never audit someone else's.
+
 `-pccs-url` applies to whichever mode verifies a quote, pointing DCAP collateral
 fetches at a PCCS mirror (e.g. `https://pccs.phala.network`) instead of Intel PCS.
 It defaults to Intel PCS — the authority — rather than to a mirror, since a mirror
