@@ -40,6 +40,17 @@ func newRouterProxy(target *url.URL, logger *slog.Logger) http.Handler {
 			// advertise client IPs or its internal hostname to the untrusted router.
 			pr.SetURL(target)
 		},
+		ModifyResponse: func(resp *http.Response) error {
+			// The router runs its own CORS middleware off its own allowlist, and this
+			// proxy copies upstream headers verbatim — so without this the browser would
+			// see two Access-Control-Allow-Origin values (a hard failure: "contains
+			// multiple values") whenever both the router and the gateway allowed the
+			// origin, and the router's verdict whenever they disagreed. Strip them and
+			// let the gateway's own middleware (openaiproxy.CORS, which wraps this
+			// handler) be the single authority for what a browser may reach here.
+			openaiproxy.StripCORSHeaders(resp.Header)
+			return nil
+		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			// A transport-level failure reaching the router — this fires only when the
 			// round trip never produced a response (connection refused, TLS, timeout); a

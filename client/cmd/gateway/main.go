@@ -17,11 +17,13 @@
 //
 // Startup wiring (flags, env-var defaults, route/seal plumbing) is shared with
 // the sidecar via client/cmd/internal/proxycli; the gateway keeps only its own
-// listen default (:8443), the ZG_GATEWAY_* env prefix, and the operational
-// routes below. Every parameter can be set via flag or a ZG_GATEWAY_* env var
-// (flag > env > built-in default); env config is the primary path for the
-// TEE/dstack deployment, where the compose file's `environment:` block is
-// measured into the CVM attestation (see deploy/phala/docker-compose.yml).
+// listen default (:8443), the ZG_GATEWAY_* env prefix, the browser-facing
+// concerns (the CORS origin allowlist — see -allowed-origins / newHandler), and
+// the operational routes below. Every parameter can be set via flag or a
+// ZG_GATEWAY_* env var (flag > env > built-in default); env config is the
+// primary path for the TEE/dstack deployment, where the compose file's
+// `environment:` block is measured into the CVM attestation (see
+// deploy/phala/docker-compose.yml).
 //
 // The gateway emits no attestation quote and signs no responses of its own.
 // Endpoint/code identity comes from the in-CVM cert-binding attestation that
@@ -68,6 +70,19 @@ func main() {
 	metricsListen := flag.String("metrics-listen", os.Getenv("ZG_GATEWAY_METRICS_LISTEN"),
 		"address to serve Prometheus /metrics on; empty disables it. Bind an INTERNAL "+
 			"address never published through the public ingress (env ZG_GATEWAY_METRICS_LISTEN)")
+	// The browser origin allowlist for CORS — a gateway-only concern, like
+	// -metrics-listen above: the gateway is the form that serves browsers
+	// (no-install / thin clients), while the sidecar is a single-user localhost
+	// process, so the shared proxycli flags stay unchanged. The default is the 0G
+	// first-party app origins (openaiproxy.DefaultAllowedOriginsCSV — a deliberate
+	// subset of what the router accepts), because a page allowed to call the router
+	// directly is exactly the page expected to swap its base URL to this gateway; an
+	// empty value allows no origin (browser access off) and is honored as set, not
+	// treated as unset.
+	allowedOrigins := flag.String("allowed-origins", proxycli.EnvOr("ZG_GATEWAY_ALLOWED_ORIGINS", openaiproxy.DefaultAllowedOriginsCSV),
+		"comma-separated browser origin allowlist for CORS: exact origins (https://app.example.com), "+
+			"\"*.\" wildcards (https://*.0g.ai — subdomains only, not the apex), or \"*\" for any; "+
+			"empty allows no origin, disabling browser access (env ZG_GATEWAY_ALLOWED_ORIGINS)")
 	// -health turns the binary into its OWN container health probe: it makes one
 	// GET /healthz to the -listen port, prints the result, and exits 0 (healthy)
 	// or 1 — it starts no server. The image is distroless (no shell, no curl,
@@ -104,6 +119,25 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Validate the origin allowlist at startup, same fail-loud stance: a pattern a
+	// browser Origin can never match (a trailing slash, a missing scheme) would
+	// otherwise show up only as the app it was meant to allow being blocked, with
+	// nothing in the log to explain it.
+	origins := openaiproxy.ParseOrigins(*allowedOrigins)
+	if err := openaiproxy.ValidateOrigins(origins); err != nil {
+		logger.Error("invalid -allowed-origins", "err", err)
+		os.Exit(1)
+	}
+	for _, o := range origins {
+		if o == "*" {
+			// Not fatal — an operator may genuinely want an open API — but it means any
+			// web page can drive this gateway with a key its own visitor holds, so it
+			// should never be the accidental result of a misrendered env var.
+			logger.Warn("CORS allowlist contains \"*\": every browser origin is allowed", "allowed_origins", origins)
+			break
+		}
+	}
+
 	// Start the background quote-cache warmer (a no-op unless -warm is set) so
 	// requests hit a warm cache instead of paying the DCAP verify inline; stop it
 	// on shutdown before the process exits.
@@ -118,7 +152,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              *f.Listen,
-		Handler:           newHandler(built.Client, routerTarget, logger),
+		Handler:           newHandler(built.Client, routerTarget, origins, logger),
 		ReadHeaderTimeout: 10 * time.Second, // mitigate slow-header (Slowloris) clients
 	}
 	// TLS is terminated ahead of this listener, inside the same enclave
@@ -129,7 +163,7 @@ func main() {
 	// (shared with the sidecar so both forms handle SIGTERM identically — the
 	// dstack/Phala deployment sends it on every redeploy). ListenAndServe's clean
 	// shutdown is folded into a nil return; only a real listen failure is an error.
-	logger.Info("gateway listening", "listen", *f.Listen, "router_url", *f.RouterURL)
+	logger.Info("gateway listening", "listen", *f.Listen, "router_url", *f.RouterURL, "cors_allowed_origins", origins)
 	err = proxycli.Serve(srv, logger)
 	stopWarmer()
 	stopMetrics()
@@ -225,10 +259,11 @@ func runHealthCheck(listen string) int {
 
 // newHandler mounts the shared OpenAI proxy, the gateway-only operational route
 // (health), and a catch-all that reverse-proxies every other path to the router
-// (routerTarget), all wrapped in the access-log middleware so
-// every request emits one redaction-safe structured line. It is split out from
-// main so tests can drive it with httptest.
-func newHandler(c *core.Client, routerTarget *url.URL, logger *slog.Logger) http.Handler {
+// (routerTarget), all wrapped in the CORS and access-log middleware so browser
+// callers on an allowed origin can reach it and every request emits one
+// redaction-safe structured line. It is split out from main so tests can drive it
+// with httptest.
+func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	// Mount the sealed inference path behind the gateway's front-door credential
 	// gate. The gate is a cheap presence/shape check (reject missing credentials
@@ -255,5 +290,10 @@ func newHandler(c *core.Client, routerTarget *url.URL, logger *slog.Logger) http
 	// cleartext passthrough — safe for metadata, never for sealed content (see
 	// newRouterProxy).
 	mux.Handle("/", newRouterProxy(routerTarget, logger))
-	return openaiproxy.LogRequests(logger, mux)
+	// CORS wraps the whole mux, INSIDE the access log: a preflight must be answered
+	// here — before the mux would hand it to the credential gate (which 401s a
+	// preflight, since a browser sends no credentials on one) or to the catch-all
+	// (which would let the ROUTER's allowlist decide what may reach this gateway) —
+	// while still emitting the one structured line per request, preflights included.
+	return openaiproxy.LogRequests(logger, openaiproxy.CORS(allowedOrigins, mux))
 }

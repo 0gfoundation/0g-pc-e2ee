@@ -310,6 +310,13 @@ does not.
   validation; default-trust for users who skip it. State this in product copy.
 - **Two enclaves see plaintext** (gateway + provider), vs one for direct-seal.
 - **Metadata** (model, sizes, timing) is visible as in the router path.
+- **The browser origin allowlist is not authentication.** Serving no-install
+  browser clients requires CORS, so the gateway ships an allowlist (default: the 0G
+  first-party app origins — a subset of what the router accepts — overridable per
+  deployment via `ZG_GATEWAY_ALLOWED_ORIGINS`). It constrains which *web pages* a browser will let
+  talk to the gateway; it constrains nothing else, because only browsers enforce it
+  — any non-browser caller simply omits or forges `Origin`. Authorization remains
+  the front-door credential gate plus the router's authoritative validation.
 - Cloud/runtime specifics marked **[verify]** must be confirmed against current
   GCP / dstack documentation before implementation.
 
