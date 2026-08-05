@@ -43,6 +43,37 @@ and releasing = repointing `_dstack-app-address.<DOMAIN>` from one to the other.
 > story (same `app_id`, more instances) or a second layer you build yourself.
 > The mechanism here gives fast atomic cutover + fast rollback, not 5%/50%/100%.
 
+## Releasing a new build (fast path)
+
+The common case, with side a live and releasing a new build as side b. `switch.env`
+holds the token ([One-time setup](#one-time-setup)); details are in the sections
+below.
+
+```sh
+./switch.sh acme b           # 1. aim the issuance switch at side b FIRST
+phala cvm create ...         # 2. deploy side b — new image digest (=> new app_id),
+                             #    DELEGATION_ZONE=b.integratenetwork.work
+./switch.sh switch b         # 3. verify + flip traffic; auto-rolls-back if the
+                             #    public /healthz fails after the cut
+phala cvm delete <side a>    # 4. once b is confirmed live, retire a to free resources
+```
+
+> **About the certificate (step 1).** Side b serves the same `router-api-tee.0g.ai`
+> and needs its own cert for it. **Side b's own dstack-ingress issues that cert on
+> first boot** (the key is generated in-enclave); `acme b` does not issue anything
+> — it just points `_acme-challenge.router-api-tee.0g.ai` at b's sub-zone so b's
+> ACME dns-01 challenge can validate. Aim it there **before** deploying b, so b
+> issues cleanly on first boot instead of failing in a retry loop against a
+> challenge record still pointed at a (which burns the 5-failed-validations-per-hour
+> budget — shared per hostname, so it can block a too — or trips
+> `DNS_SETUP_TIMEOUT` and restarts b without a cert). `switch b` moves issuance to
+> b as well, so the live side always ends up owning renewal. See
+> [Certificates](#certificates-the-issuance-switch-and-rate-limits) for the rare
+> case where you stage b for days before cutting over.
+>
+> Don't run step 4 until you've confirmed b — while a is alive, `./switch.sh
+> rollback` is an instant undo.
+
 ## The record architecture
 
 The served zone (`0g.ai`) is operator-delegated and we hold no token for it, so
@@ -136,18 +167,30 @@ For an **instant** flip, both sides must already hold a valid cert for
 single record `_acme-challenge.router-api-tee.0g.ai`, which can only resolve to
 one side at a time — that is the **issuance switch**.
 
-To let side b obtain its first cert (blue keeps serving throughout):
+To let side b obtain its first cert (side a keeps serving throughout):
 
 ```sh
 ./switch.sh acme b        # point _acme-challenge at side b; wait for it to issue
 # …watch side b's logs / status until it has a cert…
-./switch.sh acme a        # point it back at the live side so the live side can renew
+# then cut over (switch b) — see the fast path above
 ```
 
-The issuance switch is only borrowed for the minutes it takes to issue; the live
-side's cert has weeks of validity left, so it is unaffected. `switch.sh switch`
-also moves the issuance switch to the new side, so after a cutover the new live
-side renews itself automatically.
+`switch b` moves the issuance switch to the new live side, so it renews itself
+automatically after the cutover; you do **not** need to point `_acme-challenge`
+back at a by hand in the fast path.
+
+**The one exception — staging b for a long time before cutting over.** While
+`_acme-challenge` points at b, the still-live side a cannot renew. Its cert has
+weeks of validity, so a minutes-to-hours window is harmless — but if you leave b
+staged for **days** and a's cert enters its ~30-day renewal window meanwhile, a
+would fail to renew. In that case point it back until you cut over:
+
+```sh
+./switch.sh acme a        # only if b will sit staged for a long time
+```
+
+Rule of thumb: **the issuance switch should rest on whichever side is live**,
+borrowed only for the minutes it takes the standby to issue.
 
 **Let's Encrypt limits (README repeats these).** The binding limit is **5
 duplicate certificates per exact hostname per rolling week**. Each fresh CVM
