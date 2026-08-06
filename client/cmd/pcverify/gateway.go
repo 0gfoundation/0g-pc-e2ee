@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/dcap"
@@ -16,19 +18,51 @@ type evidenceChecker interface {
 	Check(ctx context.Context, domain string) (evidence.Report, error)
 }
 
+// gatewayConfig is the gateway mode's flag values, gathered so newEvidenceChecker
+// takes one argument instead of six positional ones.
+type gatewayConfig struct {
+	pccsURL            string
+	timeout            time.Duration
+	allowUntrustedCert bool
+	appComposePath     string
+	baseDomain         string
+	expectComposePath  string
+}
+
 // newEvidenceChecker builds the real checker: a DCAP verifier over the ingress
 // quote, with collateral from pccsURL when set (Intel PCS otherwise — the same
-// choice the gateway itself makes, see ZG_GATEWAY_PCCS_URL).
+// choice the gateway itself makes, see ZG_GATEWAY_PCCS_URL), plus whatever
+// code-identity material the operator supplied.
 //
 // allowUntrustedCert must reach the checker, not just the reporting below: the
 // evidence FETCH is an HTTPS GET, so with an ACME-staging certificate it fails on
 // PKI verification before any check runs. See evidence.Config.AllowUntrustedCert.
-func newEvidenceChecker(pccsURL string, timeout time.Duration, allowUntrustedCert bool) (*evidence.Checker, error) {
-	return evidence.New(evidence.Config{
-		QuoteParser:        dcap.NewQuoteParser(dcap.Config{PCCSBaseURL: pccsURL}),
-		Timeout:            timeout,
-		AllowUntrustedCert: allowUntrustedCert,
-	})
+//
+// Unreadable -app-compose / -expect-compose-file paths are errors here rather than
+// silently-skipped checks: an operator who passed the flag asked for the check, and
+// quietly reporting a pass without it is the worst possible outcome.
+func newEvidenceChecker(g gatewayConfig) (*evidence.Checker, error) {
+	cfg := evidence.Config{
+		QuoteParser:        dcap.NewQuoteParser(dcap.Config{PCCSBaseURL: g.pccsURL}),
+		Timeout:            g.timeout,
+		AllowUntrustedCert: g.allowUntrustedCert,
+		BaseDomain:         g.baseDomain,
+	}
+	if p := strings.TrimSpace(g.appComposePath); p != "" {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return nil, fmt.Errorf("-app-compose: %w", err)
+		}
+		cfg.AppCompose = b
+	}
+	if p := strings.TrimSpace(g.expectComposePath); p != "" {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return nil, fmt.Errorf("-expect-compose-file: %w", err)
+		}
+		cfg.ExpectComposeFile = b
+	}
+	return evidence.New(cfg)
 }
 
 // reportGateway prints the per-step result of verifying a gateway's evidence
@@ -134,6 +168,9 @@ func reportGateway(ctx context.Context, out io.Writer, ec evidenceChecker, domai
 		fmt.Fprintf(out, "%s chain trust        %v\n", mark(false), rep.ChainTrustErr)
 	}
 
+	// Step 6 — code identity.
+	reportCodeIdentity(out, rep.Code)
+
 	fmt.Fprintf(out, "\nnote: %s\n", rep.Note)
 	// Waiving chain trust drops the link between this connection and the name that
 	// was asked for, so say what the pass no longer covers. Without this an operator
@@ -157,4 +194,56 @@ func reportGateway(ctx context.Context, out io.Writer, ec evidenceChecker, domai
 		return 0
 	}
 	return fail(out)
+}
+
+// reportCodeIdentity prints the mr_config_id → compose_hash → app-compose →
+// docker_compose_file chain. compose_hash and app_id are printed whenever they are
+// available even if nothing else was requested: they are reproducible values an
+// operator can record and compare across deploys, unlike the raw measurement
+// registers.
+func reportCodeIdentity(out io.Writer, code evidence.CodeIdentity) {
+	if code.HashErr != nil {
+		fmt.Fprintf(out, "%s code identity      %v\n", mark(!code.Requested), code.HashErr)
+		return
+	}
+	fmt.Fprintf(out, "%s compose_hash       %x\n", mark(true), code.ComposeHash)
+	fmt.Fprintf(out, "  app_id           %s\n", code.AppID)
+
+	if !code.Requested {
+		// Not a failure — just say what would close the gap, next to the value it
+		// would resolve.
+		fmt.Fprintf(out, "- app-compose        not checked (pass -app-compose or -base-domain)\n")
+		return
+	}
+	switch {
+	case code.FetchErr != nil:
+		fmt.Fprintf(out, "%s app-compose        %v\n", mark(false), code.FetchErr)
+		return
+	case code.BoundErr != nil:
+		fmt.Fprintf(out, "%s app-compose        %v\n", mark(false), code.BoundErr)
+		if code.Source != "" {
+			fmt.Fprintf(out, "  source           %s\n", code.Source)
+		}
+		return
+	}
+	fmt.Fprintf(out, "%s app-compose        sha256 == compose_hash (authenticated)\n", mark(true))
+	fmt.Fprintf(out, "  source           %s\n", code.Source)
+	if code.Name != "" {
+		fmt.Fprintf(out, "  app name         %s\n", code.Name)
+	}
+	if len(code.AllowedEnvs) > 0 {
+		// Names only — the measured manifest never carries values. Worth showing:
+		// widening this set changes what the deployment can be handed at boot.
+		fmt.Fprintf(out, "  allowed_envs     %s\n", strings.Join(code.AllowedEnvs, " "))
+	}
+
+	if !code.ExpectRequested {
+		fmt.Fprintf(out, "- compose file       not compared (pass -expect-compose-file)\n")
+		return
+	}
+	if code.ExpectErr != nil {
+		fmt.Fprintf(out, "%s compose file       %v\n", mark(false), code.ExpectErr)
+		return
+	}
+	fmt.Fprintf(out, "%s compose file       matches the expected manifest byte-for-byte\n", mark(true))
 }

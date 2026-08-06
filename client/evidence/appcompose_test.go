@@ -1,0 +1,286 @@
+package evidence
+
+import (
+	"context"
+	"crypto/sha256"
+	"crypto/tls"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
+)
+
+// A small but structurally faithful app-compose: the docker-compose text is a
+// string FIELD, which is what makes the compose hash cover it.
+const testAppCompose = `{"manifest_version":2,"name":"0g-pc-gateway-staging-a","runner":"docker-compose",` +
+	`"docker_compose_file":"services:\n  gateway:\n    image: ghcr.io/x/gateway@sha256:abc\n",` +
+	`"allowed_envs":["ZG_GATEWAY_ROUTER_URL","ACME_STAGING"]}`
+
+func composeHashOf(s string) [attest.ComposeHashLen]byte { return sha256.Sum256([]byte(s)) }
+
+func TestVerifyAppCompose_Accepts(t *testing.T) {
+	ac, err := VerifyAppCompose([]byte(testAppCompose), composeHashOf(testAppCompose))
+	if err != nil {
+		t.Fatalf("VerifyAppCompose: %v", err)
+	}
+	if ac.Name != "0g-pc-gateway-staging-a" {
+		t.Errorf("Name = %q", ac.Name)
+	}
+	if !strings.Contains(ac.DockerComposeFile, "image: ghcr.io/x/gateway@sha256:abc") {
+		t.Errorf("docker_compose_file did not round-trip:\n%s", ac.DockerComposeFile)
+	}
+	if len(ac.AllowedEnvs) != 2 {
+		t.Errorf("AllowedEnvs = %v, want 2 entries", ac.AllowedEnvs)
+	}
+}
+
+func TestVerifyAppCompose_Rejects(t *testing.T) {
+	right := composeHashOf(testAppCompose)
+
+	// The bytes are semantically identical JSON but reformatted, so the digest moves.
+	// This is the mistake most likely to be made by hand, so it must be caught.
+	var reformatted map[string]any
+	if err := json.Unmarshal([]byte(testAppCompose), &reformatted); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	pretty, err := json.MarshalIndent(reformatted, "", "  ")
+	if err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+
+	cases := map[string]struct {
+		raw  []byte
+		hash [attest.ComposeHashLen]byte
+	}{
+		"different app-compose": {[]byte(`{"name":"other","docker_compose_file":"services: {}"}`), right},
+		"reformatted bytes":     {pretty, right},
+		"one byte changed":      {[]byte(testAppCompose + " "), right},
+		"zero hash":             {[]byte(testAppCompose), [attest.ComposeHashLen]byte{}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := VerifyAppCompose(tc.raw, tc.hash); err == nil {
+				t.Error("expected an error, got nil")
+			}
+		})
+	}
+}
+
+// Authenticated but with no compose text: must not report an empty match.
+func TestVerifyAppCompose_NoDockerComposeFile(t *testing.T) {
+	raw := `{"manifest_version":2,"name":"x","docker_compose_file":""}`
+	if _, err := VerifyAppCompose([]byte(raw), composeHashOf(raw)); err == nil {
+		t.Error("expected an error for an app-compose with no docker_compose_file")
+	}
+}
+
+// A guest-agent Info fixture with the real double-nesting: tcb_info is a JSON
+// string, and app_compose inside it is another JSON string.
+func infoBody(t *testing.T, appCompose string, publicTCBInfo bool) []byte {
+	t.Helper()
+	tcb := map[string]string{
+		"compose_hash": fmt.Sprintf("%x", composeHashOf(appCompose)),
+		"app_compose":  appCompose,
+	}
+	tcbJSON, err := json.Marshal(tcb)
+	if err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	info := map[string]string{"app_id": "deadbeef"}
+	if publicTCBInfo {
+		info["tcb_info"] = string(tcbJSON)
+	} else {
+		info["tcb_info"] = "" // what the guest agent returns when public_tcbinfo is off
+	}
+	b, err := json.Marshal(info)
+	if err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+	return b
+}
+
+// guestAgent serves /prpc/Info over TLS (FetchAppCompose builds an https URL) and
+// records the host+path it was asked for, so a test can assert the URL is derived
+// from the app_id.
+func guestAgent(t *testing.T, body []byte, status int) (*httptest.Server, *string) {
+	t.Helper()
+	var gotHost string
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHost = r.Host + r.URL.Path
+		w.WriteHeader(status)
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &gotHost
+}
+
+// httpTo returns a client whose requests all land on srv whatever host they name,
+// so the URL under test can be the real platform hostname (which does not resolve).
+//
+// It skips certificate verification because these tests exercise the fetch and the
+// double JSON unwrap, not TLS: httptest's certificate is issued for example.com,
+// never for the platform hostname the URL under test uses. That is sound here for
+// the same reason the endpoint's own TLS is not load-bearing in production — the
+// bytes are authenticated afterwards by VerifyAppCompose against the quote.
+func httpTo(srv *httptest.Server) *http.Client {
+	return &http.Client{Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp", srv.Listener.Addr().String())
+		},
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // see comment
+	}}
+}
+
+func TestFetchAppCompose(t *testing.T) {
+	srv, gotHost := guestAgent(t, infoBody(t, testAppCompose, true), http.StatusOK)
+
+	raw, err := FetchAppCompose(context.Background(), httpTo(srv), "f45d6de2b96e7f4a1b5dc093e9d5bc4db8ba5f66", "in1.phala.network")
+	if err != nil {
+		t.Fatalf("FetchAppCompose: %v", err)
+	}
+	if string(raw) != testAppCompose {
+		t.Errorf("app-compose bytes did not survive the double unwrap:\n got %q\nwant %q", raw, testAppCompose)
+	}
+	// The digest of what we fetched must be usable directly — i.e. no reformatting
+	// happened anywhere in the path.
+	if _, err := VerifyAppCompose(raw, composeHashOf(testAppCompose)); err != nil {
+		t.Errorf("fetched bytes do not hash to the expected compose_hash: %v", err)
+	}
+	// The URL must be built from the app_id and the guest-agent port.
+	if want := "f45d6de2b96e7f4a1b5dc093e9d5bc4db8ba5f66-8090.in1.phala.network/prpc/Info"; *gotHost != want {
+		t.Errorf("requested %q, want %q", *gotHost, want)
+	}
+}
+
+func TestFetchAppCompose_Errors(t *testing.T) {
+	t.Run("public_tcbinfo off", func(t *testing.T) {
+		srv, _ := guestAgent(t, infoBody(t, testAppCompose, false), http.StatusOK)
+		_, err := FetchAppCompose(context.Background(), httpTo(srv), "abc", "in1.phala.network")
+		if err == nil || !strings.Contains(err.Error(), "public_tcbinfo") {
+			t.Errorf("err = %v, want it to name public_tcbinfo", err)
+		}
+	})
+	t.Run("non-200", func(t *testing.T) {
+		srv, _ := guestAgent(t, []byte("nope"), http.StatusNotFound)
+		if _, err := FetchAppCompose(context.Background(), httpTo(srv), "abc", "in1.phala.network"); err == nil {
+			t.Error("expected an error on 404")
+		}
+	})
+	t.Run("no app_id", func(t *testing.T) {
+		srv, _ := guestAgent(t, infoBody(t, testAppCompose, true), http.StatusOK)
+		if _, err := FetchAppCompose(context.Background(), httpTo(srv), "", "in1.phala.network"); err == nil {
+			t.Error("expected an error with no app_id")
+		}
+	})
+	t.Run("no base domain", func(t *testing.T) {
+		srv, _ := guestAgent(t, infoBody(t, testAppCompose, true), http.StatusOK)
+		if _, err := FetchAppCompose(context.Background(), httpTo(srv), "abc", ""); err == nil {
+			t.Error("expected an error with no base domain")
+		}
+	})
+}
+
+func TestAppIDHost(t *testing.T) {
+	const app = "f45d6de2b96e7f4a1b5dc093e9d5bc4db8ba5f66"
+	want := app + "-8090.in1.phala.network"
+	for _, base := range []string{
+		"in1.phala.network",
+		"IN1.Phala.Network",
+		"https://in1.phala.network",
+		"in1.phala.network/",
+		// The form an operator is most likely to copy out of a dstack GATEWAY_DOMAIN.
+		"_.in1.phala.network",
+	} {
+		if got := appIDHost(app, base); got != want {
+			t.Errorf("appIDHost(_, %q) = %q, want %q", base, got, want)
+		}
+	}
+	if got := appIDHost(app, ""); got != "" {
+		t.Errorf("appIDHost with no base domain = %q, want empty", got)
+	}
+}
+
+func TestDiffComposeFile(t *testing.T) {
+	base := "services:\n  gateway:\n    image: x@sha256:aaa\n"
+
+	if err := diffComposeFile([]byte(base), []byte(base)); err != nil {
+		t.Errorf("identical: %v", err)
+	}
+	// Transport artifacts, not changes to what runs.
+	if err := diffComposeFile([]byte(strings.ReplaceAll(base, "\n", "\r\n")), []byte(base)); err != nil {
+		t.Errorf("CRLF should not differ: %v", err)
+	}
+	if err := diffComposeFile([]byte(strings.TrimSuffix(base, "\n")), []byte(base)); err != nil {
+		t.Errorf("missing final newline should not differ: %v", err)
+	}
+
+	// A changed image digest is the whole point: it must be reported, with the line.
+	changed := strings.Replace(base, "aaa", "bbb", 1)
+	err := diffComposeFile([]byte(changed), []byte(base))
+	if err == nil {
+		t.Fatal("a changed image digest was not reported")
+	}
+	if !strings.Contains(err.Error(), "line 3") || !strings.Contains(err.Error(), "bbb") {
+		t.Errorf("diff should name the line and show it, got: %v", err)
+	}
+
+	// Whitespace inside a line IS a difference — it changes the measured text.
+	if err := diffComposeFile([]byte("services:\n  gateway:\n     image: x@sha256:aaa\n"), []byte(base)); err == nil {
+		t.Error("indentation change was not reported")
+	}
+
+	// Extra / missing trailing lines.
+	if err := diffComposeFile([]byte(base+"  extra: true\n"), []byte(base)); err == nil ||
+		!strings.Contains(err.Error(), "extra line") {
+		t.Errorf("extra line: err = %v", err)
+	}
+	if err := diffComposeFile([]byte("services:\n"), []byte(base)); err == nil ||
+		!strings.Contains(err.Error(), "missing") {
+		t.Errorf("missing lines: err = %v", err)
+	}
+}
+
+func TestCodeIdentity_OK(t *testing.T) {
+	sentinel := errors.New("x")
+	cases := map[string]struct {
+		c    CodeIdentity
+		want bool
+	}{
+		// Nothing asked for: an unrequested check is not a failure.
+		"not requested":              {CodeIdentity{}, true},
+		"not requested, hash failed": {CodeIdentity{HashErr: sentinel}, true},
+		"requested, hash failed":     {CodeIdentity{Requested: true, HashErr: sentinel}, false},
+		"requested, fetch failed":    {CodeIdentity{Requested: true, FetchErr: sentinel}, false},
+		"requested, not bound":       {CodeIdentity{Requested: true, BoundErr: sentinel}, false},
+		"requested, bound":           {CodeIdentity{Requested: true}, true},
+		"compose file mismatch": {CodeIdentity{
+			Requested: true, ExpectRequested: true, ExpectErr: sentinel}, false},
+		"compose file match": {CodeIdentity{Requested: true, ExpectRequested: true}, true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			if got := tc.c.OK(); got != tc.want {
+				t.Errorf("OK() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestConfigNote(t *testing.T) {
+	if n := (Config{}).note(); !strings.Contains(n, "NOT checked") {
+		t.Errorf("no code identity requested: note = %q", n)
+	}
+	if n := (Config{AppCompose: []byte("{}")}).note(); !strings.Contains(n, "NOT compared") {
+		t.Errorf("app-compose only: note = %q", n)
+	}
+	n := (Config{AppCompose: []byte("{}"), ExpectComposeFile: []byte("x")}).note()
+	if !strings.Contains(n, "floating tag") {
+		t.Errorf("complete: note should still name the pinning caveat, got %q", n)
+	}
+}

@@ -196,5 +196,15 @@ no responses. Its identity rests on the dstack-ingress cert-binding quote at
 the gateway mode verifies: bundle integrity against its own `sha256sum.txt`, DCAP
 verification of `quote.json`, the `report_data` → manifest binding, and — the step
 that actually ties the quote to the endpoint you are talking to — the **served**
-certificate compared against the bundle's. What it does *not* establish is code
-identity (`app_id`); see `cloud-gateway.md` §10 step 2 for what that still needs.
+certificate compared against the bundle's.
+
+It also covers **code identity**, which the provider chain's hop 3 does for the
+broker but which the gateway needs separately: the verified quote's `mr_config_id`
+carries `compose_hash = SHA-256(app-compose.json)` in the clear, so given those
+app-compose bytes (`-base-domain` to fetch them, or `-app-compose`) the tool
+authenticates them and compares the `docker_compose_file` they embed against the
+manifest that was published (`-expect-compose-file`). Two limits are worth stating:
+the compose hash is only as strong as the image pinning inside the compose text — a
+floating tag keeps it stable while the code changes — and waiving chain trust
+(`-allow-untrusted-cert`) drops the link between the connection and the domain, so
+an interceptor with its own attested CVM would satisfy everything else.

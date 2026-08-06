@@ -150,3 +150,72 @@ func TestProviderReportData_RejectedAsEvidenceBinding(t *testing.T) {
 		t.Error("a §4.2 report_data passed as a cert binding")
 	}
 }
+
+// mrConfigV1 builds a well-formed V1 register for composeHash.
+func mrConfigV1(composeHash [ComposeHashLen]byte) [mrConfigIDLen]byte {
+	var r [mrConfigIDLen]byte
+	r[0] = byte(MRConfigV1)
+	copy(r[1:], composeHash[:])
+	return r
+}
+
+func TestComposeHashFromMRConfigID_V1(t *testing.T) {
+	var want [ComposeHashLen]byte
+	for i := range want {
+		want[i] = byte(i + 1)
+	}
+	got, err := ComposeHashFromMRConfigID(mrConfigV1(want))
+	if err != nil {
+		t.Fatalf("ComposeHashFromMRConfigID: %v", err)
+	}
+	if got != want {
+		t.Errorf("compose_hash = %x, want %x", got, want)
+	}
+}
+
+// V2/V3 commit to the compose hash inside a digest. Returning bytes 1..33 would
+// be a fabricated commitment, so they must fail closed instead.
+func TestComposeHashFromMRConfigID_Rejects(t *testing.T) {
+	var nonzeroTail [mrConfigIDLen]byte
+	nonzeroTail[0] = byte(MRConfigV1)
+	nonzeroTail[1] = 0xaa
+	nonzeroTail[mrConfigIDLen-1] = 0x01 // padding must be zero
+
+	v2 := [mrConfigIDLen]byte{0: byte(MRConfigV2), 1: 0xaa}
+	v3 := [mrConfigIDLen]byte{0: byte(MRConfigV3), 1: 0xaa}
+	unknown := [mrConfigIDLen]byte{0: 0x7f, 1: 0xaa}
+
+	cases := map[string][mrConfigIDLen]byte{
+		"v2 digest":          v2,
+		"v3 document hash":   v3,
+		"unknown version":    unknown,
+		"nonzero v1 padding": nonzeroTail,
+		"absent (all zero)":  {},
+		"v1 with zero hash":  mrConfigV1([ComposeHashLen]byte{}),
+	}
+	for name, r := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ComposeHashFromMRConfigID(r); !errors.Is(err, ErrUnsupportedMRConfig) {
+				t.Errorf("err = %v, want ErrUnsupportedMRConfig", err)
+			}
+		})
+	}
+}
+
+func TestAppIDFromComposeHash(t *testing.T) {
+	var ch [ComposeHashLen]byte
+	copy(ch[:], mustHex(t, "55d872aaa9c0b148228ebcf89302a52e7cd3d2529055a892a11715e863086f6a"))
+	// dstack's own short(&hash, 40): the first 20 bytes as 40 hex chars.
+	if got, want := AppIDFromComposeHash(ch), "55d872aaa9c0b148228ebcf89302a52e7cd3d252"; got != want {
+		t.Errorf("app_id = %q, want %q", got, want)
+	}
+}
+
+func mustHex(t *testing.T, s string) []byte {
+	t.Helper()
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		t.Fatalf("bad hex fixture: %v", err)
+	}
+	return b
+}

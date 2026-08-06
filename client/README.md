@@ -125,11 +125,21 @@ pcverify -gateway <domain>        # the cloud-TEE gateway: its /evidences bundle
 ```
 
 The gateway mode matters for the third form above, which adds one attested trust
-party: it verifies the dstack-ingress cert-binding quote and confirms the
-certificate the domain **actually serves** is the one that quote committed to
-(`evidence/`). It does not yet establish which image the CVM runs — see
-[`docs/design/cloud-gateway.md`](../docs/design/cloud-gateway.md) §10. Both modes
-exit non-zero on a failed check, so either works as a deploy gate.
+party: it verifies the dstack-ingress cert-binding quote, confirms the certificate
+the domain **actually serves** is the one that quote committed to, and — given the
+CVM's `app-compose.json` — establishes which configuration booted and whether its
+compose text is the manifest you published (`evidence/`):
+
+```sh
+pcverify -gateway <domain> -base-domain <cluster>.phala.network \
+         -expect-compose-file docker-compose.release.yml
+```
+
+`compose_hash` comes from the verified quote's `mr_config_id`, so the app-compose
+bytes can come from anywhere — the hash anchors them. Both modes exit non-zero on a
+failed check, so either works as a deploy gate. See
+[`docs/design/cloud-gateway.md`](../docs/design/cloud-gateway.md) §10 for what the
+result does and does not cover.
 
 `-allow-untrusted-cert` (gateway mode) is for a hostname on the ACME staging CA,
 where even the evidence fetch would otherwise fail PKI verification. It relaxes no

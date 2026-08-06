@@ -14,10 +14,11 @@
 # sha256sum.txt and quote.json — where
 #   report_data holds SHA-256(sha256sum.txt) (right-padded to 64 bytes), and
 #     sha256sum.txt covers the served certificate
-#   the quote's RTMR chain commits to app_id, the hash of the app-compose
-#     manifest — which embeds THIS file verbatim — recovered by replaying the
-#     event log against the verified quote, and therefore covering BOTH
-#     containers below
+#   the quote's mr_config_id commits to compose_hash — SHA-256 of the app-compose
+#     manifest, which embeds THIS file verbatim, and therefore covers BOTH
+#     containers below. app_id is its leading 20 bytes. mr_config_id is part of
+#     the signed TD report, so reading it needs no event-log replay; see
+#     attest.ComposeHashFromMRConfigID and `pcverify -gateway`
 # So the quote proves "a CVM running exactly this app-compose obtained this
 # certificate inside the TEE". Concluding that the endpoint you are *talking to*
 # is that CVM needs one more step the quote cannot do for you: handshake with

@@ -138,12 +138,28 @@ bundle is not enough; the load-bearing step is comparing the **served**
 certificate with the one the quote commits to.
 
 `pcverify -gateway` does all of that in one command — bundle integrity, DCAP
-verification of `quote.json`, the `report_data` binding, and the served-certificate
-comparison — and exits non-zero on any failed check, so it drops into a deploy gate:
+verification of `quote.json`, the `report_data` binding, the served-certificate
+comparison, and code identity — and exits non-zero on any failed check, so it drops
+into a deploy gate:
 
 ```sh
+# endpoint identity only: is a genuine TEE serving the certificate its quote binds
 go run ./client/cmd/pcverify -gateway <DOMAIN> -pccs-url https://pccs.phala.network
+
+# …plus code identity: which app-compose booted, and does its compose text match
+# the manifest from the Release that was deployed
+go run ./client/cmd/pcverify -gateway <DOMAIN> -pccs-url https://pccs.phala.network \
+  -base-domain <cluster>.phala.network \
+  -expect-compose-file docker-compose.release.yml
 ```
+
+`-base-domain` lets the tool fetch `app-compose.json` from the platform's guest
+agent, for the `app_id` **the quote itself names** — not one you type. That matters
+under blue/green, where both sides are live under different `app_id`s and picking one
+by hand is how you end up verifying the standby. Use `-app-compose <file>` instead
+when the guest agent is unreachable or the app's `public_tcbinfo` is off; the bytes
+are anchored by the quote's `compose_hash`, so their source does not have to be
+trusted.
 
 Add `-allow-untrusted-cert` when checking a hostname brought up against the ACME
 staging CA (`ACME_STAGING=true`): its certificate is correctly bound by the quote
@@ -158,9 +174,6 @@ controls both. The claim narrows to "a genuine TEE minted the certificate served
 this connection". Fine for smoke-testing a deployment you operate; never for
 auditing an endpoint you do not control, and never on the production hostname. The
 tool prints this caveat on any run that uses the flag.
-
-It does **not** check code identity — see the `app-compose.json` step below, which
-is still manual. The command prints the quote's measurement registers for it.
 
 The equivalent by hand, for reference or when the tool is unavailable:
 
@@ -185,14 +198,34 @@ diff <(openssl x509 -in served.pem -noout -pubkey) \
 Then DCAP-verify `quote.json` and check its `report_data` — the first 32 bytes are
 `SHA-256(sha256sum.txt)`, right-padded to 64.
 
-Finally confirm the code — **this part `pcverify -gateway` does not do**: replay the
-event log against the verified quote to recover `app_id`, fetch the CVM's
-`app-compose.json` (Phala Cloud dashboard / API), check its `docker_compose_file`
-is byte-identical to the **`docker-compose.release.yml` from the GitHub Release
-you deployed** (the digest-pinned manifest), and that hashing the manifest
-reproduces that `app_id`. The [`docker-compose.yml`](./docker-compose.yml) checked
-in here carries the floating `:latest` gateway tag for development and will **not**
-match a production `app_id` — the Release asset is the attested artifact.
+Then code identity. `compose_hash` is in the verified quote's **`mr_config_id`** —
+`0x01 ‖ SHA-256(app-compose.json) ‖ zero padding` — so it is read straight out of
+the signed TD report, with no event-log replay (the `compose-hash` runtime event in
+RTMR3 carries the same value if you want a cross-check). `app_id` is its leading 20
+bytes:
+
+```bash
+# app-compose.json, from the platform guest agent (public_tcbinfo defaults on).
+# APP is the app_id from the quote's mr_config_id — not one you pick.
+APP=<app_id>
+curl -s "https://$APP-8090.<cluster>.phala.network/prpc/Info" > info.json
+jq -r '.tcb_info' info.json > tcb.json
+jq -j '.app_compose' tcb.json > app-compose.json   # -j: no trailing newline
+
+# it must hash to the quote's compose_hash — this is what makes the bytes trustworthy
+shasum -a 256 app-compose.json
+
+# then its embedded compose text must be the manifest you deployed
+jq -j '.docker_compose_file' app-compose.json > deployed-compose.yml
+diff deployed-compose.yml docker-compose.release.yml
+```
+
+The [`docker-compose.yml`](./docker-compose.yml) checked in here carries the floating
+`:latest` gateway tag for development and will **not** match a production deployment
+— the Release asset is the attested artifact. And note what a floating tag costs even
+when every check above passes: `compose_hash` stays identical while the image behind
+the tag changes, so code identity is only ever as strong as the pinning in the compose
+text it authenticates.
 
 Skip step 3 and the quote only proves *some* CVM obtained *some* certificate — it
 says nothing about the endpoint you are talking to. Skip the `app-compose.json`

@@ -32,6 +32,18 @@
 //
 //	pcverify -gateway pc-gateway.example.com [-pccs-url https://...]
 //	         [-allow-untrusted-cert]
+//	         [-base-domain <cluster>.phala.network | -app-compose app-compose.json]
+//	         [-expect-compose-file docker-compose.release.yml]
+//
+// Code identity — which configuration, and so which images, the CVM booted — comes
+// from the same verified quote: its mr_config_id carries
+// compose_hash = SHA-256(app-compose.json), so no event-log replay is involved.
+// Supply the app-compose bytes (-base-domain fetches them from the platform guest
+// agent for the app_id the QUOTE names; -app-compose reads a local copy) and the
+// tool checks sha256 == compose_hash before believing anything in them. Add
+// -expect-compose-file to compare the authenticated docker_compose_file against the
+// manifest you published. Without those flags the compose hash and app_id are still
+// printed, but only as values to compare by eye.
 //
 // -allow-untrusted-cert proceeds when the served certificate does not chain to a
 // public root, for ACME-staging deployments. It relaxes no attestation check — and
@@ -42,10 +54,10 @@
 // flag prints that caveat. Use it to smoke-test a deployment you operate, never to
 // audit an endpoint you do not control.
 //
-// A pass does NOT establish code identity: proving which image the CVM runs still
-// needs the event-log replay for app_id plus the app-compose.json comparison
-// against the deployed docker-compose.release.yml. The report says so, and prints
-// the measurement registers for that manual step.
+// A pass is only ever as strong as the image pinning inside the compose text it
+// authenticates: a floating tag keeps compose_hash identical while the code behind
+// the tag changes. The report states which checks were skipped on every run, so a
+// partial result cannot be read as a full one.
 //
 // # Shared
 //
@@ -109,6 +121,9 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 	gateway := fs.String("gateway", "", "cloud-TEE gateway domain (e.g. pc-gateway.example.com); selects gateway mode — verify its /evidences bundle and compare the served certificate")
 	pccsURL := fs.String("pccs-url", "", "fetch DCAP collateral (TCB Info, QE Identity, PCK CRL) from this PCCS mirror instead of api.trustedservices.intel.com (e.g. https://pccs.phala.network); the root-CA CRL still comes from Intel. Applies to whichever mode verifies a quote")
 	allowUntrustedCert := fs.Bool("allow-untrusted-cert", false, "gateway mode: proceed when the served certificate does not chain to a public root (ACME staging). Relaxes no attestation check, but drops the link between the connection and the domain asked for, so an interceptor running its own attested CVM would still pass — smoke-test your own deployment only")
+	appCompose := fs.String("app-compose", "", "gateway mode: path to the CVM's app-compose.json, checked against the compose_hash the quote binds. Its source need not be trusted — the hash anchors it. Takes precedence over -base-domain")
+	baseDomain := fs.String("base-domain", "", "gateway mode: platform base domain (e.g. in1.phala.network) to fetch app-compose.json from the guest agent of the app_id the QUOTE names, when -app-compose is not given")
+	expectComposeFile := fs.String("expect-compose-file", "", "gateway mode: path to the docker-compose manifest the deployment should be running (the digest-pinned docker-compose.release.yml). Compared against the authenticated app-compose's docker_compose_file")
 	timeout := fs.Duration("timeout", 30*time.Second, "overall timeout")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -130,7 +145,15 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 	}
 
 	if wantGateway {
-		ec, err := newEvidenceChecker(*pccsURL, *timeout, *allowUntrustedCert)
+		gcfg := gatewayConfig{
+			pccsURL:            *pccsURL,
+			timeout:            *timeout,
+			allowUntrustedCert: *allowUntrustedCert,
+			appComposePath:     *appCompose,
+			baseDomain:         *baseDomain,
+			expectComposePath:  *expectComposeFile,
+		}
+		ec, err := newEvidenceChecker(gcfg)
 		if err != nil {
 			fmt.Fprintf(out, "pcverify: %v\n", err)
 			return 2

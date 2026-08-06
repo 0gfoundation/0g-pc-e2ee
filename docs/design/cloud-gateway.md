@@ -148,12 +148,12 @@ controlled only by that enclave?"**
 > **supplied by dstack-ingress's `/evidences`, not by a self-issued gateway
 > quote.** The gateway runs in one dstack app (one CVM) behind dstack-ingress
 > (see `deploy/phala/docker-compose.yml`), whose `/evidences` quote has
-> `report_data = SHA-256(sha256sum.txt)` covering the served certificate, and an
-> RTMR chain committing to `app_id = SHA-256(the whole app-compose)` — recovered
-> by replaying the event log against the verified quote, per §4's note in
-> `protocol/attest/dstack.go`, *not* read out of a measurement register. Because
-> `app_id` covers the whole compose, it attests **both** containers (ingress +
-> gateway) at once.
+> `report_data = SHA-256(sha256sum.txt)` covering the served certificate, and a
+> `mr_config_id` committing to `compose_hash = SHA-256(the whole app-compose)`
+> (`app_id` is its leading 20 bytes). That register is part of the signed TD
+> report, so it needs no event-log replay — see
+> `attest.ComposeHashFromMRConfigID`. Because the compose hash covers the whole
+> app-compose, it attests **both** containers (ingress + gateway) at once.
 >
 > What that quote proves is "a CVM running exactly this app-compose obtained this
 > certificate inside the TEE". Getting from there to "the endpoint I am talking to
@@ -306,16 +306,24 @@ does not.
    SPEC §8 signature, verified independently on the gateway→provider hop; the
    gateway issues no signature of its own.
 
-   **Code identity is still open**, so this is not yet the full tier 2.5: the tool
-   proves a genuine TEE minted the certificate the endpoint serves, not *which
-   image* that TEE runs. Closing it needs (a) event-log replay against the verified
-   RTMRs to recover `app_id` — unimplemented, and it needs a captured quote +
-   event-log fixture to be validated against, the same gap
-   `client/dcap/testdata/README.md` describes for hermetic DCAP tests — and (b)
-   comparing the CVM's `app-compose.json` with the digest-pinned
-   `docker-compose.release.yml` from the deployed Release, which needs the Phala
-   Cloud API. Until both land, `pcverify -gateway` prints the measurement registers
-   and says on every run that code identity is unchecked.
+   **Code identity is also done**, via a shorter route than this doc first
+   assumed. The verified quote's **`mr_config_id`** carries the dstack
+   `compose_hash` directly — `0x01 ‖ SHA-256(app-compose.json) ‖ padding`
+   (`dstack-types/src/mr_config.rs`, `MrConfig::V1`) — and that register is inside
+   the signed TD report, so **no event-log replay is needed**: whatever verified
+   the quote already authenticated it. `attest.ComposeHashFromMRConfigID` reads it
+   (failing closed on the V2/V3 layouts, which commit to the hash inside a digest
+   rather than carrying it), and `attest.AppIDFromComposeHash` derives the `app_id`
+   the platform labels by. The `compose-hash` runtime event in RTMR3 carries the
+   same value and is kept only as a cross-check in the KAT.
+   
+   From there `pcverify -gateway` closes the chain: given the app-compose bytes it
+   checks `sha256 == compose_hash` (`evidence.VerifyAppCompose`) and compares the
+   authenticated `docker_compose_file` against the manifest that was published
+   (`-expect-compose-file`). The app-compose bytes can come from anywhere — the
+   platform guest agent (`-base-domain`, fetched for the `app_id` **the quote
+   itself names**), a deploy record, or an operator's copy-paste — because the
+   compose hash anchors them; no Phala Cloud API access is required.
 3. **Publish `measurement ↔ cert` (transparency log / on-chain) + monitoring**,
    so cheating is publicly detectable without per-user effort.
 4. **Optional tier-3 path**: a WASM verify+seal SDK for clients that want

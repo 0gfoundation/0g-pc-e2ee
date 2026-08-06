@@ -26,12 +26,34 @@ import (
 
 const testDomain = "pc-gateway.test"
 
-// rawQuote is the placeholder quote body the fixture publishes. Its bytes are
-// meaningless: the DCAP verification is the injected QuoteParser's job, exactly as
-// in production where client/dcap fills that seam. What the tests exercise is
-// everything around it — bundle integrity, the report_data binding, and the
-// certificate comparison.
-var rawQuote = []byte{0xde, 0xad, 0xbe, 0xef}
+// TDX v4 quote geometry, mirrored here so the fixture can synthesize a
+// structurally valid quote prefix. The DCAP *verification* is the injected
+// QuoteParser's job (as in production, where client/dcap fills that seam), but the
+// Checker re-reads mr_config_id structurally from the verified bytes, so those
+// bytes have to be the right shape and carry the right fields.
+const (
+	fxQuoteLen      = 632 // 48-byte header + 584-byte TD report body
+	fxMRConfigOff   = 232
+	fxReportDataOff = 568
+)
+
+// mkMRConfigID builds a dstack mr_config_id: a version byte, then the compose hash,
+// then zero padding.
+func mkMRConfigID(version byte, composeHash [attest.ComposeHashLen]byte) [48]byte {
+	var r [48]byte
+	r[0] = version
+	copy(r[1:], composeHash[:])
+	return r
+}
+
+// mkRawQuote synthesizes the quote prefix the fixture publishes: the right length,
+// with mr_config_id and report_data at their real offsets.
+func mkRawQuote(mrConfigID [48]byte, reportData [64]byte) []byte {
+	raw := make([]byte, fxQuoteLen)
+	copy(raw[fxMRConfigOff:], mrConfigID[:])
+	copy(raw[fxReportDataOff:], reportData[:])
+	return raw
+}
 
 // certPair is a certificate plus the key that signs for it.
 type certPair struct {
@@ -114,6 +136,10 @@ type fixture struct {
 	// reportData is what the fixture's quote parser returns, set by bindQuote so a
 	// test can bind the quote to something other than the served manifest.
 	reportData [64]byte
+	// mrConfigID is what the published quote carries at the mr_config_id offset.
+	// Defaults to a valid dstack V1 register; a test overrides it (before Check) to
+	// exercise the unsupported-layout paths.
+	mrConfigID [48]byte
 }
 
 // newFixture builds the happy path: the bundle names the same certificate the
@@ -127,6 +153,9 @@ func newFixture(t *testing.T, opts ...func(*fixture)) *fixture {
 	leaf := newLeaf(t, ca, 100, nil)
 
 	f := &fixture{domain: testDomain, ca: ca, served: leaf, files: map[string][]byte{}}
+	// A valid dstack V1 register by default, committing to the test app-compose, so
+	// the code-identity hop works without every test setting it up.
+	f.mrConfigID = mkMRConfigID(1, composeHashOf(testAppCompose))
 	// lego publishes the fullchain, leaf first (dstack-ingress evidence_collect_cert).
 	f.files[accountName] = []byte(`{"status":"valid","uri":"https://acme.test/acct/1"}`)
 	f.files[certName(testDomain)] = append(leaf.pemBytes(), ca.pemBytes()...)
@@ -181,14 +210,24 @@ func (f *fixture) finalize(t *testing.T, bindTo []byte) {
 
 func (f *fixture) bindQuote(manifest []byte) {
 	f.reportData = attest.EvidenceReportData(manifest)
-	f.files[quoteName] = []byte(`{"quote":"` + hex.EncodeToString(rawQuote) + `"}`)
+	f.publishQuote()
 }
 
-// parser is the injected DCAP seam: it accepts only the fixture's quote bytes and
-// returns the report_data bindQuote last committed to.
+// publishQuote (re)writes quote.json from the fixture's current report_data and
+// mr_config_id. Called by bindQuote, and again by checker() so a test that
+// overrode mrConfigID after construction is reflected in the published bytes.
+func (f *fixture) publishQuote() {
+	raw := mkRawQuote(f.mrConfigID, f.reportData)
+	f.files[quoteName] = []byte(`{"quote":"` + hex.EncodeToString(raw) + `"}`)
+}
+
+// parser is the injected DCAP seam. It stands in for the real verifier: it checks
+// the bytes are the ones the fixture published and returns the measurement and
+// report_data, exactly as client/dcap does after a successful DCAP verify.
 func (f *fixture) parser() QuoteParser {
 	return func(raw []byte) (attest.Measurement, [64]byte, error) {
-		if string(raw) != string(rawQuote) {
+		want := mkRawQuote(f.mrConfigID, f.reportData)
+		if string(raw) != string(want) {
 			return attest.Measurement{}, [64]byte{}, fmt.Errorf("unexpected quote bytes %x", raw)
 		}
 		return attest.Measurement{MRTD: [48]byte{0x11}}, f.reportData, nil
@@ -223,6 +262,9 @@ func (f *fixture) dialTLS() func(context.Context, string, *tls.Config) (*tls.Con
 // name all line up without touching the resolver.
 func (f *fixture) checker(t *testing.T, cfg Config) *Checker {
 	t.Helper()
+	// Reflect any post-construction mrConfigID override in the published bytes, so
+	// the parser and the Checker's structural re-read see the same quote.
+	f.publishQuote()
 	pool := x509.NewCertPool()
 	pool.AddCert(f.ca.cert)
 
@@ -616,6 +658,148 @@ func TestCheck_AllowUntrustedCertAppliesToTheFetch(t *testing.T) {
 				t.Error("ChainTrustErr = nil; waiving trust must not hide that it failed")
 			}
 		})
+	}
+}
+
+// Code identity end to end: the fixture's quote parser reports an mr_config_id
+// committing to a compose hash, the app-compose is supplied, and its
+// docker_compose_file is compared against the expected manifest.
+func TestCheck_CodeIdentity(t *testing.T) {
+	composeHash := composeHashOf(testAppCompose)
+	expected := []byte("services:\n  gateway:\n    image: ghcr.io/x/gateway@sha256:abc\n")
+
+	cases := []struct {
+		name            string
+		appCompose      []byte
+		expectCompose   []byte
+		mrConfigVersion byte
+		wantPass        bool
+		check           func(*testing.T, CodeIdentity)
+	}{
+		{
+			name: "hash only, nothing requested", mrConfigVersion: 1, wantPass: true,
+			check: func(t *testing.T, c CodeIdentity) {
+				if c.Requested {
+					t.Error("Requested = true with no material supplied")
+				}
+				if c.ComposeHash != composeHash {
+					t.Errorf("compose_hash = %x, want %x", c.ComposeHash, composeHash)
+				}
+				// app_id must be the leading bytes of the hash, hex.
+				if want := attest.AppIDFromComposeHash(composeHash); c.AppID != want {
+					t.Errorf("app_id = %q, want %q", c.AppID, want)
+				}
+			},
+		},
+		{
+			name: "app-compose bound", mrConfigVersion: 1, appCompose: []byte(testAppCompose), wantPass: true,
+			check: func(t *testing.T, c CodeIdentity) {
+				if c.BoundErr != nil {
+					t.Fatalf("BoundErr = %v", c.BoundErr)
+				}
+				if c.Source != "supplied" {
+					t.Errorf("Source = %q", c.Source)
+				}
+				if c.Name != "0g-pc-gateway-staging-a" {
+					t.Errorf("Name = %q", c.Name)
+				}
+				if !strings.Contains(string(c.ComposeFile), "gateway@sha256:abc") {
+					t.Errorf("ComposeFile did not carry the image line:\n%s", c.ComposeFile)
+				}
+			},
+		},
+		{
+			// The wrong app's compose — exactly what happens when an operator picks an
+			// app_id by hand while blue/green sides run side by side.
+			name: "app-compose for another app", mrConfigVersion: 1,
+			appCompose: []byte(`{"name":"other","docker_compose_file":"services: {}"}`), wantPass: false,
+			check: func(t *testing.T, c CodeIdentity) {
+				if c.BoundErr == nil {
+					t.Error("BoundErr = nil for an app-compose the quote does not commit to")
+				}
+				if len(c.ComposeFile) != 0 {
+					t.Error("an unbound app-compose must not yield a ComposeFile")
+				}
+			},
+		},
+		{
+			name: "compose file matches", mrConfigVersion: 1,
+			appCompose: []byte(testAppCompose), expectCompose: expected, wantPass: true,
+			check: func(t *testing.T, c CodeIdentity) {
+				if c.ExpectErr != nil {
+					t.Errorf("ExpectErr = %v", c.ExpectErr)
+				}
+			},
+		},
+		{
+			name: "compose file differs", mrConfigVersion: 1,
+			appCompose:    []byte(testAppCompose),
+			expectCompose: []byte("services:\n  gateway:\n    image: ghcr.io/x/gateway@sha256:DIFFERENT\n"),
+			wantPass:      false,
+			check: func(t *testing.T, c CodeIdentity) {
+				if c.ExpectErr == nil {
+					t.Error("ExpectErr = nil although the image digest differs")
+				}
+			},
+		},
+		{
+			// V2 commits to the compose hash inside a digest, so it cannot be read out.
+			// Requested checks must fail rather than proceed on a guess.
+			name: "unsupported mr_config_id", mrConfigVersion: 2,
+			appCompose: []byte(testAppCompose), wantPass: false,
+			check: func(t *testing.T, c CodeIdentity) {
+				if c.HashErr == nil {
+					t.Error("HashErr = nil for a V2 mr_config_id")
+				}
+			},
+		},
+		{
+			// …but with nothing requested, an unreadable mr_config_id is only reported.
+			name: "unsupported mr_config_id, nothing requested", mrConfigVersion: 2, wantPass: true,
+			check: func(t *testing.T, c CodeIdentity) {
+				if c.HashErr == nil {
+					t.Error("HashErr = nil for a V2 mr_config_id")
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			f.mrConfigID = mkMRConfigID(tc.mrConfigVersion, composeHash)
+			c := f.checker(t, Config{
+				AppCompose:        tc.appCompose,
+				ExpectComposeFile: tc.expectCompose,
+			})
+			rep, err := c.Check(context.Background(), testDomain)
+			if err != nil {
+				t.Fatalf("Check: %v", err)
+			}
+			if got := rep.Pass(); got != tc.wantPass {
+				t.Errorf("Pass = %v, want %v (code: %+v)", got, tc.wantPass, rep.Code)
+			}
+			if tc.check != nil {
+				tc.check(t, rep.Code)
+			}
+		})
+	}
+}
+
+// A requested fetch that cannot be made must fail the run, not be skipped.
+func TestCheck_CodeIdentity_FetchFailure(t *testing.T) {
+	f := newFixture(t)
+	f.mrConfigID = mkMRConfigID(1, composeHashOf(testAppCompose))
+	// A base domain that does not resolve: the fetch is attempted and fails.
+	rep, err := f.checker(t, Config{BaseDomain: "gateway.invalid"}).Check(context.Background(), testDomain)
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if rep.Code.FetchErr == nil {
+		t.Error("FetchErr = nil although the guest agent is unreachable")
+	}
+	if rep.Pass() {
+		t.Error("Pass = true although a requested code-identity check could not run")
 	}
 }
 

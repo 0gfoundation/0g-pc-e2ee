@@ -28,22 +28,36 @@
 //     can be told apart from a real trust failure. Separate does not mean optional:
 //     it is what rules out an interceptor presenting its own attested CVM (see
 //     Report.ChainTrustErr).
+//  6. **Code identity** — *which* configuration, and therefore which container
+//     images, the CVM booted. The verified quote's `mr_config_id` carries the
+//     dstack `compose_hash` (SHA-256 over the bytes of the CVM's
+//     `app-compose.json`), so this needs no event-log replay: the register is
+//     inside the signed TD report. Given the app-compose bytes,
+//     `sha256 == compose_hash` authenticates them, and the `docker_compose_file`
+//     they carry is then compared against the manifest that was published. See
+//     CodeIdentity.
 //
-// # What this does NOT establish
+// # What a pass means, and what step 6 needs from the caller
 //
-// **Code identity.** Proving *which code* the CVM runs means recovering `app_id`
-// by replaying the quote's event log against the verified RTMRs, then checking
-// the CVM's `app-compose.json` against the digest-pinned
-// `docker-compose.release.yml` from the Release that was deployed. Neither half
-// is done here: the replay is unimplemented, and the compose comparison needs the
-// Phala Cloud API. So a PASS means "a genuine TEE minted the certificate this
-// endpoint serves" — not "that TEE runs the audited gateway image". Report.Note
-// says so, and the measurement registers are printed for manual comparison.
-// Until that lands this is docs/design/cloud-gateway.md §10 phase 2 for the cert
-// binding only.
+// Steps 1–5 are self-contained: point Check at a domain and it answers "is a
+// genuine TEE serving the certificate its own quote committed to".
 //
-// Everything here is read-only: HTTP GETs of public evidence files, one TLS
-// handshake, plus whatever collateral the DCAP verifier fetches.
+// Step 6 needs material supplied, because a hash has no preimage of its own: the
+// app-compose bytes (Config.AppCompose, or Config.BaseDomain to fetch them), and
+// the compose text to compare against (Config.ExpectComposeFile). Their source
+// need not be trusted — the compose_hash from the quote anchors them — but without
+// them compose_hash and app_id are only opaque values to eyeball: enough to notice
+// that a deployment changed, not enough to say what it runs. Report.Note records
+// which checks were skipped so a partial result cannot be presented as a full one.
+//
+// One limit survives even a complete step 6: an image referenced by a floating tag
+// instead of a digest keeps `compose_hash` stable while the code behind the tag
+// changes. Code identity is only ever as strong as the pinning in the compose text
+// it authenticates.
+//
+// Everything here is read-only: HTTP GETs of the public evidence files and (for
+// step 6) the platform's guest-agent Info endpoint, one TLS handshake, plus
+// whatever collateral the DCAP verifier fetches.
 package evidence
 
 import (
@@ -115,6 +129,26 @@ type Config struct {
 	// It applies only to the client this package builds; a caller supplying
 	// HTTPClient controls its own TLS configuration.
 	AllowUntrustedCert bool
+
+	// AppCompose, when non-nil, is the app-compose.json bytes to check the quote's
+	// compose_hash against — an operator's deploy record, a release asset, or a copy
+	// pulled from the platform by hand. It takes precedence over BaseDomain.
+	//
+	// Its source does not need to be trusted (see VerifyAppCompose); what matters is
+	// that the bytes are verbatim, since the digest is over them.
+	AppCompose []byte
+	// BaseDomain, when set and AppCompose is nil, enables fetching app-compose from
+	// the platform's guest-agent hostname for the app_id the quote itself names
+	// (e.g. "in1.phala.network" — see FetchAppCompose). Deriving the app_id from the
+	// quote rather than taking it as input is deliberate: it removes the chance of
+	// verifying a *different* app's compose, which is easy to do by hand when
+	// blue/green deployments run side by side under different app_ids.
+	BaseDomain string
+	// ExpectComposeFile, when non-nil, is the docker-compose text that the
+	// authenticated app-compose's docker_compose_file must equal — normally the
+	// digest-pinned manifest from the release that was deployed. This is the step
+	// that turns "we know which config booted" into "it is the config we published".
+	ExpectComposeFile []byte
 }
 
 const defaultTimeout = 30 * time.Second
@@ -226,6 +260,11 @@ type Report struct {
 	Measurement attest.Measurement
 	// ReportData is the verified quote's raw report_data, surfaced for diagnosis.
 	ReportData [64]byte
+	// MRConfigID is the verified quote's mr_config_id, which carries the dstack
+	// compose_hash (step 6). MRConfigIDErr is set if it could not be re-read from
+	// the verified quote bytes.
+	MRConfigID    [48]byte
+	MRConfigIDErr error
 	// BindingErr is set when report_data does not bind this manifest (step 3).
 	BindingErr error
 
@@ -262,15 +301,100 @@ type Report struct {
 	// deployment; not acceptable when auditing an endpoint you do not control.
 	ChainTrustErr error
 
+	// Code is the code-identity result: which configuration — and therefore which
+	// container images — the CVM booted (step 6). Only the checks the caller asked
+	// for are performed; see CodeIdentity.
+	Code CodeIdentity
+
 	// Note records what a pass does NOT cover, so a caller cannot present this as
 	// full attestation. See the package doc.
 	Note string
 }
 
-// codeIdentityNote is Report.Note: the one gap a caller must not paper over.
-const codeIdentityNote = "code identity (app_id) is NOT checked here — replay the event log against " +
-	"the verified quote and compare the CVM's app-compose.json with the deployed " +
-	"docker-compose.release.yml (see deploy/phala/README.md \"Verify\")"
+// CodeIdentity is the chain from the verified quote to the container images:
+// mr_config_id → compose_hash → app-compose.json → docker_compose_file.
+//
+// The first hop always runs (it is a read of the already-verified quote). The rest
+// run only when the caller supplies the material for them, because a hash has no
+// preimage of its own: without an app-compose there is nothing to learn from
+// compose_hash but "it changed", and without an expected compose file there is
+// nothing to compare the authenticated one to.
+type CodeIdentity struct {
+	// ComposeHash is SHA-256 of the CVM's app-compose.json, read from the verified
+	// quote's mr_config_id. AppID is its first bytes, hex — the platform's label.
+	ComposeHash [attest.ComposeHashLen]byte
+	AppID       string
+	// HashErr is set when mr_config_id does not expose a compose hash (an
+	// unsupported dstack layout, or no quote to read it from). Everything below is
+	// then unavailable.
+	HashErr error
+
+	// Requested reports whether the caller asked for the app-compose checks at all.
+	// When false, the fields below are unset and none of this affects Report.Pass.
+	Requested bool
+	// Source names where the app-compose bytes came from, for the report.
+	Source string
+	// FetchErr is set when the app-compose could not be obtained.
+	FetchErr error
+	// BoundErr is set when the app-compose's digest is not the quote's compose_hash
+	// — i.e. it is not the manifest this CVM booted. Until it is nil, nothing the
+	// app-compose says may be believed.
+	BoundErr error
+
+	// Name and AllowedEnvs come from the authenticated app-compose (only meaningful
+	// once BoundErr is nil). AllowedEnvs is names only — the platform never puts
+	// values in the measured manifest.
+	Name        string
+	AllowedEnvs []string
+	// ComposeFile is the authenticated docker_compose_file: the text that actually
+	// booted, proven by the quote. Empty unless the binding succeeded.
+	ComposeFile []byte
+
+	// ExpectRequested reports whether a compose-file comparison was asked for, and
+	// ExpectErr the result — nil meaning the deployed text equals the expected one.
+	ExpectRequested bool
+	ExpectErr       error
+}
+
+// OK reports whether every code-identity check the caller requested succeeded.
+// With nothing requested it is true: an unasked-for check is not a failure.
+func (c CodeIdentity) OK() bool {
+	if !c.Requested {
+		return true
+	}
+	if c.HashErr != nil || c.FetchErr != nil || c.BoundErr != nil {
+		return false
+	}
+	return !c.ExpectRequested || c.ExpectErr == nil
+}
+
+// Report.Note strings: what a given run did NOT cover, so a caller cannot present
+// a partial result as a full one. Which one applies depends on how far the
+// code-identity checks were asked to go.
+const (
+	noteNoCodeIdentity = "code identity was NOT checked — supply the app-compose bytes " +
+		"(-app-compose, or -base-domain to fetch them) so compose_hash can be resolved to " +
+		"an actual configuration; without it the hash below is only a value to compare by eye"
+	noteNoComposeFileCheck = "the app-compose is authenticated, but its docker_compose_file was " +
+		"NOT compared against a published manifest — pass the deployed " +
+		"docker-compose.release.yml to close that step"
+	noteComplete = "code identity is checked to the compose text; it is only as strong as the " +
+		"image pinning inside it — a floating tag keeps compose_hash stable while the code changes"
+)
+
+// note is the Report.Note for how far this configuration asks code identity to
+// go. It depends on the config alone, not on the outcome, so every run — including
+// one that fails early — still states which checks were never in scope.
+func (cfg Config) note() string {
+	switch {
+	case cfg.AppCompose == nil && strings.TrimSpace(cfg.BaseDomain) == "":
+		return noteNoCodeIdentity
+	case cfg.ExpectComposeFile == nil:
+		return noteNoComposeFileCheck
+	default:
+		return noteComplete
+	}
+}
 
 // Pass reports whether every enforced check succeeded. Chain trust is deliberately
 // excluded — callers decide whether an untrusted chain is acceptable (it is, for an
@@ -279,7 +403,7 @@ func (r Report) Pass() bool {
 	if r.ManifestErr != nil || r.QuoteErr != nil || r.BindingErr != nil || r.CertErr != nil {
 		return false
 	}
-	if !r.CertMatch.OK() {
+	if !r.CertMatch.OK() || !r.Code.OK() {
 		return false
 	}
 	if len(r.Files) == 0 {
@@ -308,7 +432,7 @@ func (c *Checker) Check(ctx context.Context, domain string) (Report, error) {
 	if h, _, splitErr := net.SplitHostPort(host); splitErr == nil {
 		name = h
 	}
-	rep := Report{Domain: host, Note: codeIdentityNote}
+	rep := Report{Domain: host, Note: c.cfg.note()}
 
 	// Step 1 — the manifest, then every file it names. The manifest bytes are kept
 	// verbatim: the binding in step 3 is a hash over exactly these bytes.
@@ -352,6 +476,18 @@ func (c *Checker) Check(ctx context.Context, domain string) (Report, error) {
 			rep.QuoteErr = verr
 		} else {
 			rep.Measurement, rep.ReportData = m, rd
+			// mr_config_id (for step 6) is not on the QuoteParser seam, which carries only
+			// what SPEC §4.4 needs. Re-read it structurally from the same bytes — safe
+			// ONLY here, after the parser above has verified the signature, and over
+			// exactly the bytes it verified. A structural parse of unverified bytes would
+			// be attacker-chosen; a structural parse of verified bytes is a field read.
+			if body, perr := attest.ParseTDXQuoteBody(raw); perr == nil {
+				rep.MRConfigID = body.MRConfigID
+			} else {
+				// The parser accepted the quote but its layout will not re-read: report it
+				// against code identity rather than silently leaving mr_config_id zero.
+				rep.MRConfigIDErr = perr
+			}
 			// Step 3 — the verified quote must bind this exact manifest.
 			rep.BindingErr = attest.VerifyEvidenceReportData(rd, manifest)
 		}
@@ -365,7 +501,69 @@ func (c *Checker) Check(ctx context.Context, domain string) (Report, error) {
 	// says. Run even when the quote failed: knowing whether the served certificate
 	// matches is useful either way, and Pass already requires both.
 	c.checkServedCert(ctx, host, name, certPEM, &rep)
+
+	// Step 6 — code identity, from the same verified quote.
+	c.checkCodeIdentity(ctx, &rep)
 	return rep, nil
+}
+
+// checkCodeIdentity walks mr_config_id → compose_hash → app-compose →
+// docker_compose_file, filling rep.Code. The first hop always runs; the rest only
+// when the caller supplied the material (see CodeIdentity).
+func (c *Checker) checkCodeIdentity(ctx context.Context, rep *Report) {
+	code := &rep.Code
+	code.Requested = c.cfg.AppCompose != nil || strings.TrimSpace(c.cfg.BaseDomain) != ""
+	code.ExpectRequested = c.cfg.ExpectComposeFile != nil
+
+	if rep.QuoteErr != nil {
+		code.HashErr = errors.New("not checked: the quote did not verify")
+		return
+	}
+	if rep.MRConfigIDErr != nil {
+		code.HashErr = rep.MRConfigIDErr
+		return
+	}
+	composeHash, err := attest.ComposeHashFromMRConfigID(rep.MRConfigID)
+	if err != nil {
+		code.HashErr = err
+		return
+	}
+	code.ComposeHash = composeHash
+	code.AppID = attest.AppIDFromComposeHash(composeHash)
+
+	if !code.Requested {
+		return
+	}
+
+	// Obtain the app-compose. A caller-supplied copy wins over fetching: it is what
+	// an operator uses to assert "this is the release I deployed", and it works when
+	// the platform endpoint is unreachable or public_tcbinfo is off.
+	var raw []byte
+	switch {
+	case c.cfg.AppCompose != nil:
+		raw, code.Source = c.cfg.AppCompose, "supplied"
+	default:
+		// The app_id comes from the quote, never from the caller, so this cannot be
+		// pointed at a different app's compose.
+		code.Source = appIDHost(code.AppID, c.cfg.BaseDomain)
+		raw, err = FetchAppCompose(ctx, c.http, code.AppID, c.cfg.BaseDomain)
+		if err != nil {
+			code.FetchErr = err
+			return
+		}
+	}
+
+	ac, err := VerifyAppCompose(raw, composeHash)
+	if err != nil {
+		code.BoundErr = err
+		return
+	}
+	code.Name, code.AllowedEnvs = ac.Name, ac.AllowedEnvs
+	code.ComposeFile = []byte(ac.DockerComposeFile)
+
+	if code.ExpectRequested {
+		code.ExpectErr = diffComposeFile(code.ComposeFile, c.cfg.ExpectComposeFile)
+	}
 }
 
 // requireEntries confirms the manifest covers the files this check depends on. A
