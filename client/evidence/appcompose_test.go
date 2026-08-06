@@ -273,14 +273,145 @@ func TestCodeIdentity_OK(t *testing.T) {
 }
 
 func TestConfigNote(t *testing.T) {
-	if n := (Config{}).note(); !strings.Contains(n, "NOT checked") {
-		t.Errorf("no code identity requested: note = %q", n)
+	// Discovery off and nothing supplied: code identity is out of scope entirely.
+	if n := (Config{NoDNSDiscovery: true}).note(); !strings.Contains(n, "NOT checked") {
+		t.Errorf("no code identity possible: note = %q", n)
+	}
+	// Discovery on (the default) counts as asking for the app-compose hop.
+	if n := (Config{}).note(); !strings.Contains(n, "NOT compared") {
+		t.Errorf("discovery on, no compose comparison: note = %q", n)
 	}
 	if n := (Config{AppCompose: []byte("{}")}).note(); !strings.Contains(n, "NOT compared") {
 		t.Errorf("app-compose only: note = %q", n)
 	}
-	n := (Config{AppCompose: []byte("{}"), ExpectComposeFile: []byte("x")}).note()
+	n := (Config{
+		AppCompose:         []byte("{}"),
+		ExpectComposeFiles: []ExpectedCompose{{Label: "x", Content: []byte("x")}},
+	}).note()
 	if !strings.Contains(n, "floating tag") {
 		t.Errorf("complete: note should still name the pinning caveat, got %q", n)
 	}
+}
+
+func TestDeriveBaseDomain(t *testing.T) {
+	// The real chain from a dstack deployment: served name → delegation zone →
+	// GATEWAY_DOMAIN, which is `_.<base>`.
+	chain := map[string]string{
+		"router-api-tee-staging.0g.ai":                       "router-api-tee-staging.0g.ai.integratenetwork.work.",
+		"router-api-tee-staging.0g.ai.integratenetwork.work": "_.in1.phala.network.",
+		"_.in1.phala.network":                                "_.in1.phala.network.",
+	}
+	lookup := func(_ context.Context, name string) (string, error) {
+		if c, ok := chain[name]; ok {
+			return c, nil
+		}
+		return "", fmt.Errorf("no such host: %s", name)
+	}
+
+	got, err := deriveBaseDomain(context.Background(), "router-api-tee-staging.0g.ai", lookup)
+	if err != nil {
+		t.Fatalf("deriveBaseDomain: %v", err)
+	}
+	if got != "in1.phala.network" {
+		t.Errorf("base domain = %q, want in1.phala.network", got)
+	}
+	// A port and a trailing dot are both things an operator may paste.
+	for _, in := range []string{"router-api-tee-staging.0g.ai:443", "Router-API-TEE-Staging.0G.AI."} {
+		if got, err := deriveBaseDomain(context.Background(), in, lookup); err != nil || got != "in1.phala.network" {
+			t.Errorf("deriveBaseDomain(%q) = %q, %v", in, got, err)
+		}
+	}
+}
+
+func TestDeriveBaseDomain_Errors(t *testing.T) {
+	t.Run("chain does not end at a gateway domain", func(t *testing.T) {
+		// A name that is not fronted by a dstack gateway: the last hop has no `_.`
+		// prefix, so guessing a base domain from it would be fabrication.
+		lookup := func(_ context.Context, name string) (string, error) {
+			if name == "plain.example.com" {
+				return "plain.example.com.", nil
+			}
+			return "", fmt.Errorf("unexpected %s", name)
+		}
+		_, err := deriveBaseDomain(context.Background(), "plain.example.com", lookup)
+		if err == nil || !strings.Contains(err.Error(), "not a dstack gateway domain") {
+			t.Errorf("err = %v, want it to say the chain does not end at a gateway domain", err)
+		}
+	})
+	t.Run("resolution failure", func(t *testing.T) {
+		lookup := func(context.Context, string) (string, error) { return "", errors.New("no such host") }
+		if _, err := deriveBaseDomain(context.Background(), "x.example.com", lookup); err == nil {
+			t.Error("expected an error when resolution fails")
+		}
+	})
+	t.Run("empty domain", func(t *testing.T) {
+		lookup := func(context.Context, string) (string, error) { return "", nil }
+		if _, err := deriveBaseDomain(context.Background(), "   ", lookup); err == nil {
+			t.Error("expected an error for an empty domain")
+		}
+	})
+	t.Run("loop is bounded", func(t *testing.T) {
+		// A chain that never terminates must stop, not spin.
+		n := 0
+		lookup := func(_ context.Context, name string) (string, error) {
+			n++
+			return fmt.Sprintf("hop%d.example.com.", n), nil
+		}
+		if _, err := deriveBaseDomain(context.Background(), "start.example.com", lookup); err == nil {
+			t.Error("expected an error when the chain never reaches a gateway domain")
+		}
+		if n > maxCNAMEHops {
+			t.Errorf("walked %d hops, want at most %d", n, maxCNAMEHops)
+		}
+	})
+}
+
+func TestMatchExpected(t *testing.T) {
+	live := []byte("services:\n  gateway:\n    image: x@sha256:aaa\n")
+	other := []byte("services:\n  gateway:\n    image: x@sha256:bbb\n")
+	third := []byte("services:\n  gateway:\n    image: x@sha256:ccc\n")
+
+	t.Run("single candidate match", func(t *testing.T) {
+		label, err := matchExpected(live, []ExpectedCompose{{Label: "release-1", Content: live}})
+		if err != nil || label != "release-1" {
+			t.Errorf("label = %q, err = %v", label, err)
+		}
+	})
+	t.Run("matches a later candidate", func(t *testing.T) {
+		// Newest first; the deployment is running the older one. Reporting WHICH is the
+		// point — "it is release-2, not the newest" is actionable.
+		label, err := matchExpected(live, []ExpectedCompose{
+			{Label: "release-3", Content: third},
+			{Label: "release-2", Content: live},
+		})
+		if err != nil || label != "release-2" {
+			t.Errorf("label = %q, err = %v", label, err)
+		}
+	})
+	t.Run("single candidate mismatch names it", func(t *testing.T) {
+		_, err := matchExpected(live, []ExpectedCompose{{Label: "release-9", Content: other}})
+		if err == nil || !strings.Contains(err.Error(), "release-9") {
+			t.Errorf("err = %v, want it to name the candidate", err)
+		}
+	})
+	t.Run("no candidate matches", func(t *testing.T) {
+		_, err := matchExpected(live, []ExpectedCompose{
+			{Label: "release-3", Content: third},
+			{Label: "release-2", Content: other},
+		})
+		if err == nil {
+			t.Fatal("expected an error")
+		}
+		// It must say how many were tried, list them, and diff against the newest.
+		for _, want := range []string{"none of 2", "release-3", "release-2", "line 3"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("err missing %q: %v", want, err)
+			}
+		}
+	})
+	t.Run("no candidates supplied", func(t *testing.T) {
+		if _, err := matchExpected(live, nil); err == nil {
+			t.Error("expected an error with no candidates")
+		}
+	})
 }

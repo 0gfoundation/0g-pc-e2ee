@@ -26,7 +26,11 @@ type gatewayConfig struct {
 	allowUntrustedCert bool
 	appComposePath     string
 	baseDomain         string
+	noDNSDiscovery     bool
 	expectComposePath  string
+	releases           int
+	releaseRepo        string
+	releaseAsset       string
 }
 
 // newEvidenceChecker builds the real checker: a DCAP verifier over the ingress
@@ -41,12 +45,13 @@ type gatewayConfig struct {
 // Unreadable -app-compose / -expect-compose-file paths are errors here rather than
 // silently-skipped checks: an operator who passed the flag asked for the check, and
 // quietly reporting a pass without it is the worst possible outcome.
-func newEvidenceChecker(g gatewayConfig) (*evidence.Checker, error) {
+func newEvidenceChecker(ctx context.Context, out io.Writer, g gatewayConfig) (*evidence.Checker, error) {
 	cfg := evidence.Config{
 		QuoteParser:        dcap.NewQuoteParser(dcap.Config{PCCSBaseURL: g.pccsURL}),
 		Timeout:            g.timeout,
 		AllowUntrustedCert: g.allowUntrustedCert,
 		BaseDomain:         g.baseDomain,
+		NoDNSDiscovery:     g.noDNSDiscovery,
 	}
 	if p := strings.TrimSpace(g.appComposePath); p != "" {
 		b, err := os.ReadFile(p)
@@ -55,12 +60,28 @@ func newEvidenceChecker(g gatewayConfig) (*evidence.Checker, error) {
 		}
 		cfg.AppCompose = b
 	}
-	if p := strings.TrimSpace(g.expectComposePath); p != "" {
-		b, err := os.ReadFile(p)
+
+	// The two ways to say what the compose text should be are different questions —
+	// "exactly this one" versus "any published release" — so requiring exactly one
+	// keeps the exit code unambiguous.
+	pinned := strings.TrimSpace(g.expectComposePath) != ""
+	switch {
+	case pinned && g.releases > 0:
+		return nil, fmt.Errorf("-expect-compose-file pins one manifest and -releases matches a set; pass one")
+	case pinned:
+		b, err := os.ReadFile(g.expectComposePath)
 		if err != nil {
 			return nil, fmt.Errorf("-expect-compose-file: %w", err)
 		}
-		cfg.ExpectComposeFile = b
+		cfg.ExpectComposeFiles = []evidence.ExpectedCompose{{Label: g.expectComposePath, Content: b}}
+	case g.releases > 0:
+		repo, asset := g.releaseRepo, g.releaseAsset
+		fmt.Fprintf(out, "releases           newest %d of %s (%s)\n", g.releases, repo, asset)
+		files, err := fetchReleaseComposeFiles(ctx, newGitHubClient(g.timeout), repo, asset, g.releases, out)
+		if err != nil {
+			return nil, err
+		}
+		cfg.ExpectComposeFiles = files
 	}
 	return evidence.New(cfg)
 }
@@ -209,15 +230,17 @@ func reportCodeIdentity(out io.Writer, code evidence.CodeIdentity) {
 	fmt.Fprintf(out, "%s compose_hash       %x\n", mark(true), code.ComposeHash)
 	fmt.Fprintf(out, "  app_id           %s\n", code.AppID)
 
-	if !code.Requested {
-		// Not a failure — just say what would close the gap, next to the value it
-		// would resolve.
-		fmt.Fprintf(out, "- app-compose        not checked (pass -app-compose or -base-domain)\n")
+	if !code.Requested && !code.ExpectRequested && code.Source == "" && code.FetchErr == nil {
+		// Discovery was switched off. Not a failure — say what would close the gap,
+		// next to the value it would resolve.
+		fmt.Fprintf(out, "- app-compose        not checked (-no-dns-discovery; pass -app-compose or -base-domain)\n")
 		return
 	}
 	switch {
 	case code.FetchErr != nil:
-		fmt.Fprintf(out, "%s app-compose        %v\n", mark(false), code.FetchErr)
+		// A lookup nobody asked for is a "-", not a "✗": DNS or the platform endpoint
+		// being unavailable says nothing about the deployment.
+		fmt.Fprintf(out, "%s app-compose        %v\n", failMark(code, code.Discovered), code.FetchErr)
 		return
 	case code.BoundErr != nil:
 		fmt.Fprintf(out, "%s app-compose        %v\n", mark(false), code.BoundErr)
@@ -238,12 +261,22 @@ func reportCodeIdentity(out io.Writer, code evidence.CodeIdentity) {
 	}
 
 	if !code.ExpectRequested {
-		fmt.Fprintf(out, "- compose file       not compared (pass -expect-compose-file)\n")
+		fmt.Fprintf(out, "- compose file       not compared (pass -expect-compose-file or -releases N)\n")
 		return
 	}
 	if code.ExpectErr != nil {
 		fmt.Fprintf(out, "%s compose file       %v\n", mark(false), code.ExpectErr)
 		return
 	}
-	fmt.Fprintf(out, "%s compose file       matches the expected manifest byte-for-byte\n", mark(true))
+	fmt.Fprintf(out, "%s compose file       matches %s byte-for-byte\n", mark(true), code.MatchedExpect)
+}
+
+// failMark renders a failed check as an advisory "-" when it was only attempted as
+// discovery, so an unavailable optional lookup does not read like a verification
+// failure. The exit code follows CodeIdentity.OK, which applies the same rule.
+func failMark(code evidence.CodeIdentity, advisory bool) string {
+	if advisory && !code.ExpectRequested {
+		return "-"
+	}
+	return mark(false)
 }

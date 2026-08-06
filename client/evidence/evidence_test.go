@@ -136,6 +136,9 @@ type fixture struct {
 	// reportData is what the fixture's quote parser returns, set by bindQuote so a
 	// test can bind the quote to something other than the served manifest.
 	reportData [64]byte
+	// wantDNSDiscovery opts a test into the DNS-derived base-domain path; checker()
+	// otherwise disables it, since testDomain does not resolve.
+	wantDNSDiscovery bool
 	// mrConfigID is what the published quote carries at the mr_config_id offset.
 	// Defaults to a valid dstack V1 register; a test overrides it (before Check) to
 	// exercise the unsupported-layout paths.
@@ -282,6 +285,11 @@ func (f *fixture) checker(t *testing.T, cfg Config) *Checker {
 	}
 	if cfg.Roots == nil {
 		cfg.Roots = pool
+	}
+	// testDomain does not resolve, so leave DNS discovery off unless a test asks for
+	// it: otherwise every case would pay a failing lookup and depend on the resolver.
+	if cfg.AppCompose == nil && cfg.BaseDomain == "" && !f.wantDNSDiscovery {
+		cfg.NoDNSDiscovery = true
 	}
 	c, err := New(cfg)
 	if err != nil {
@@ -769,8 +777,8 @@ func TestCheck_CodeIdentity(t *testing.T) {
 			f := newFixture(t)
 			f.mrConfigID = mkMRConfigID(tc.mrConfigVersion, composeHash)
 			c := f.checker(t, Config{
-				AppCompose:        tc.appCompose,
-				ExpectComposeFile: tc.expectCompose,
+				AppCompose:         tc.appCompose,
+				ExpectComposeFiles: expectCandidates(tc.expectCompose),
 			})
 			rep, err := c.Check(context.Background(), testDomain)
 			if err != nil {
@@ -959,4 +967,13 @@ func TestCertMatch_Strings(t *testing.T) {
 			t.Errorf("%v must not pass", m)
 		}
 	}
+}
+
+// expectCandidates wraps a single expected compose text as the one-candidate set,
+// which is the pinned-manifest form. nil means "no comparison requested".
+func expectCandidates(b []byte) []ExpectedCompose {
+	if b == nil {
+		return nil
+	}
+	return []ExpectedCompose{{Label: "expected", Content: b}}
 }

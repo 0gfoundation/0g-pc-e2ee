@@ -143,23 +143,34 @@ comparison, and code identity — and exits non-zero on any failed check, so it 
 into a deploy gate:
 
 ```sh
-# endpoint identity only: is a genuine TEE serving the certificate its quote binds
+# Everything it can do unaided: it derives the platform base domain from the served
+# domain's CNAME chain and fetches app-compose.json for the app_id the quote names,
+# so compose_hash resolves to an actual configuration with no extra arguments.
 go run ./client/cmd/pcverify -gateway <DOMAIN> -pccs-url https://pccs.phala.network
 
-# …plus code identity: which app-compose booted, and does its compose text match
-# the manifest from the Release that was deployed
+# …and close the last step by naming what SHOULD be running. Either the exact
+# manifest you deployed (a gate):
 go run ./client/cmd/pcverify -gateway <DOMAIN> -pccs-url https://pccs.phala.network \
-  -base-domain <cluster>.phala.network \
   -expect-compose-file docker-compose.release.yml
+
+# …or "any of the newest N published releases", which also reports WHICH one is live
+# — and whose interesting answer is "none of them":
+go run ./client/cmd/pcverify -gateway <DOMAIN> -pccs-url https://pccs.phala.network \
+  -releases 5
 ```
 
-`-base-domain` lets the tool fetch `app-compose.json` from the platform's guest
-agent, for the `app_id` **the quote itself names** — not one you type. That matters
-under blue/green, where both sides are live under different `app_id`s and picking one
-by hand is how you end up verifying the standby. Use `-app-compose <file>` instead
-when the guest agent is unreachable or the app's `public_tcbinfo` is off; the bytes
-are anchored by the quote's `compose_hash`, so their source does not have to be
-trusted.
+`-releases` reads the `docker-compose.release.yml` asset from the newest N published
+releases of this repo (`-repo` / `-release-asset` to override; drafts and prereleases
+are skipped). The repo is public, so no credentials are needed — set `GITHUB_TOKEN`
+only for a private repo or to lift the unauthenticated rate limit.
+
+Nothing about the app-compose lookup has to be typed in: the base domain comes from
+DNS (`-base-domain` overrides it, `-no-dns-discovery` turns it off) and the `app_id`
+comes from **the quote**, never from you or from DNS. That last part matters under
+blue/green, where both sides are live under different `app_id`s and picking one by
+hand is how you end up verifying the standby. Use `-app-compose <file>` when the
+guest agent is unreachable or the app's `public_tcbinfo` is off; the bytes are
+anchored by the quote's `compose_hash`, so their source does not have to be trusted.
 
 Add `-allow-untrusted-cert` when checking a hostname brought up against the ACME
 staging CA (`ACME_STAGING=true`): its certificate is correctly bound by the quote

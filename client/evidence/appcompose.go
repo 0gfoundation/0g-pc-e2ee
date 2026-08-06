@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -159,6 +160,60 @@ func FetchAppCompose(ctx context.Context, hc *http.Client, appID, baseDomain str
 	return []byte(tcb.AppCompose), nil
 }
 
+// maxCNAMEHops bounds the DNS walk in DeriveBaseDomain. The real chain is two hops
+// (served name → delegation zone → gateway domain); the cap is only a loop guard.
+const maxCNAMEHops = 8
+
+// DeriveBaseDomain works out the platform base domain for a served gateway domain
+// by following its CNAME chain to the end.
+//
+// A dstack deployment points its served name, via its delegation zone, at the
+// cluster's GATEWAY_DOMAIN, which by convention is `_.<base_domain>` (see the
+// DELEGATION_ZONE / GATEWAY_DOMAIN contract in deploy/phala/). So the last hop of
+// the chain names the base domain, and an operator does not have to know — or
+// correctly retype — their cluster's topology to run a verification.
+//
+// **DNS is not authenticated, and this does not pretend otherwise.** The result is
+// used only to LOCATE the app-compose bytes; those bytes are then checked against
+// the compose_hash from the verified quote (VerifyAppCompose), so a hijacked or
+// merely wrong answer here can cause a failed lookup or a failed binding — never a
+// false pass. Nothing else in this package takes input from DNS.
+func DeriveBaseDomain(ctx context.Context, domain string) (string, error) {
+	return deriveBaseDomain(ctx, domain, net.DefaultResolver.LookupCNAME)
+}
+
+// deriveBaseDomain is DeriveBaseDomain over an injectable resolver, so the chain
+// walk and the gateway-domain shape check are testable without DNS.
+func deriveBaseDomain(ctx context.Context, domain string, lookupCNAME func(context.Context, string) (string, error)) (string, error) {
+	name := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
+	if h, _, err := net.SplitHostPort(name); err == nil {
+		name = h
+	}
+	if name == "" {
+		return "", errors.New("no domain to derive a base domain from")
+	}
+
+	last := name
+	for i := 0; i < maxCNAMEHops; i++ {
+		cname, err := lookupCNAME(ctx, last)
+		if err != nil {
+			return "", fmt.Errorf("resolve CNAME for %s: %w", last, err)
+		}
+		cname = strings.TrimSuffix(strings.ToLower(cname), ".")
+		if cname == "" || cname == last {
+			break // end of the chain
+		}
+		last = cname
+	}
+	// The gateway domain is the `_.<base>` form; anything else means this name is not
+	// fronted by a dstack gateway the way the deployment docs describe.
+	base, ok := strings.CutPrefix(last, "_.")
+	if !ok || base == "" {
+		return "", fmt.Errorf("CNAME chain for %s ends at %q, which is not a dstack gateway domain (_.<base>); pass the base domain explicitly", name, last)
+	}
+	return base, nil
+}
+
 // appIDHost builds the platform's per-app hostname for the guest agent. baseDomain
 // may be given bare ("in1.phala.network") or as a URL; a leading "_." — the form
 // that appears in a dstack GATEWAY_DOMAIN — is stripped, since operators tend to
@@ -179,6 +234,32 @@ func appIDHost(appID, baseDomain string) string {
 		return ""
 	}
 	return fmt.Sprintf("%s-%d.%s", strings.ToLower(strings.TrimSpace(appID)), guestAgentPort, strings.ToLower(d))
+}
+
+// matchExpected finds the candidate whose compose text equals got, returning its
+// label. When none matches it reports how many were tried plus the diff against the
+// FIRST candidate — callers pass them newest-first, and the newest release is the
+// one an operator most likely meant to be running.
+func matchExpected(got []byte, candidates []ExpectedCompose) (string, error) {
+	for _, c := range candidates {
+		if diffComposeFile(got, c.Content) == nil {
+			return c.Label, nil
+		}
+	}
+	switch len(candidates) {
+	case 0:
+		return "", errors.New("no candidate compose files supplied")
+	case 1:
+		return "", fmt.Errorf("does not match %s: %w", candidates[0].Label, diffComposeFile(got, candidates[0].Content))
+	default:
+		labels := make([]string, 0, len(candidates))
+		for _, c := range candidates {
+			labels = append(labels, c.Label)
+		}
+		return "", fmt.Errorf("matches none of %d candidates (%s); versus %s: %w",
+			len(candidates), strings.Join(labels, ", "), candidates[0].Label,
+			diffComposeFile(got, candidates[0].Content))
+	}
 }
 
 // diffComposeFile compares the authenticated docker-compose text against the one

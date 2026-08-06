@@ -137,18 +137,35 @@ type Config struct {
 	// Its source does not need to be trusted (see VerifyAppCompose); what matters is
 	// that the bytes are verbatim, since the digest is over them.
 	AppCompose []byte
-	// BaseDomain, when set and AppCompose is nil, enables fetching app-compose from
-	// the platform's guest-agent hostname for the app_id the quote itself names
-	// (e.g. "in1.phala.network" — see FetchAppCompose). Deriving the app_id from the
-	// quote rather than taking it as input is deliberate: it removes the chance of
-	// verifying a *different* app's compose, which is easy to do by hand when
-	// blue/green deployments run side by side under different app_ids.
+	// BaseDomain, when set and AppCompose is nil, is the platform base domain to
+	// fetch app-compose from — e.g. "in1.phala.network", giving
+	// `<app_id>-8090.in1.phala.network` (see FetchAppCompose). Leave it empty to let
+	// Check derive it from the served domain's DNS (see DeriveBaseDomain), which is
+	// what makes `Check(domain)` alone able to do code identity.
+	//
+	// The app_id in that hostname always comes from the quote, never from a caller.
+	// That is deliberate: picking one by hand is how an operator ends up verifying
+	// the standby side of a blue/green pair while the other one serves traffic.
 	BaseDomain string
-	// ExpectComposeFile, when non-nil, is the docker-compose text that the
-	// authenticated app-compose's docker_compose_file must equal — normally the
-	// digest-pinned manifest from the release that was deployed. This is the step
-	// that turns "we know which config booted" into "it is the config we published".
-	ExpectComposeFile []byte
+	// NoDNSDiscovery disables deriving BaseDomain from DNS. Set it to keep the run
+	// to the endpoint and the inputs given.
+	NoDNSDiscovery bool
+	// ExpectComposeFiles are candidate docker-compose texts, any one of which the
+	// authenticated docker_compose_file may equal — normally the digest-pinned
+	// manifest(s) from the release(s) that could be deployed. This is the step that
+	// turns "we know which configuration booted" into "it is one we published".
+	//
+	// With one candidate this is a gate: it must be exactly that. With several it is
+	// discovery — which published release is live — and the answer "none of them" is
+	// the finding that matters.
+	ExpectComposeFiles []ExpectedCompose
+}
+
+// ExpectedCompose is one candidate compose text and the name to report it by (a
+// release tag, a file path).
+type ExpectedCompose struct {
+	Label   string
+	Content []byte
 }
 
 const defaultTimeout = 30 * time.Second
@@ -351,19 +368,37 @@ type CodeIdentity struct {
 	ComposeFile []byte
 
 	// ExpectRequested reports whether a compose-file comparison was asked for, and
-	// ExpectErr the result — nil meaning the deployed text equals the expected one.
+	// ExpectErr the result — nil meaning the deployed text equals one of the
+	// candidates, whose label is then MatchedExpect.
 	ExpectRequested bool
 	ExpectErr       error
+	MatchedExpect   string
+
+	// Discovered reports that BaseDomain was derived from DNS rather than supplied.
+	// A failure of a discovered lookup is informational: the caller did not ask for
+	// it, so it does not fail the run (see OK).
+	Discovered bool
 }
 
 // OK reports whether every code-identity check the caller requested succeeded.
-// With nothing requested it is true: an unasked-for check is not a failure.
+//
+// Two things are deliberately not failures. Nothing requested at all: an
+// unasked-for check cannot fail. And a *discovered* app-compose lookup that did not
+// pan out — DNS or the platform endpoint being unavailable is not evidence against
+// the deployment, and the caller did not ask. Supplying -app-compose / -base-domain
+// (or asking for a compose comparison) is how you say "this must work".
 func (c CodeIdentity) OK() bool {
-	if !c.Requested {
+	if !c.Requested && !c.ExpectRequested {
 		return true
 	}
-	if c.HashErr != nil || c.FetchErr != nil || c.BoundErr != nil {
+	if c.HashErr != nil {
 		return false
+	}
+	if (c.FetchErr != nil || c.BoundErr != nil) && (!c.Discovered || c.ExpectRequested) {
+		return false
+	}
+	if c.FetchErr != nil || c.BoundErr != nil {
+		return true // discovered-only lookup that did not pan out
 	}
 	return !c.ExpectRequested || c.ExpectErr == nil
 }
@@ -372,12 +407,12 @@ func (c CodeIdentity) OK() bool {
 // a partial result as a full one. Which one applies depends on how far the
 // code-identity checks were asked to go.
 const (
-	noteNoCodeIdentity = "code identity was NOT checked — supply the app-compose bytes " +
-		"(-app-compose, or -base-domain to fetch them) so compose_hash can be resolved to " +
-		"an actual configuration; without it the hash below is only a value to compare by eye"
+	noteNoCodeIdentity = "code identity was NOT checked — app-compose discovery is off, so " +
+		"compose_hash could not be resolved to an actual configuration; it is only a value " +
+		"to compare by eye"
 	noteNoComposeFileCheck = "the app-compose is authenticated, but its docker_compose_file was " +
 		"NOT compared against a published manifest — pass the deployed " +
-		"docker-compose.release.yml to close that step"
+		"docker-compose.release.yml (or a set of releases) to close that step"
 	noteComplete = "code identity is checked to the compose text; it is only as strong as the " +
 		"image pinning inside it — a floating tag keeps compose_hash stable while the code changes"
 )
@@ -386,10 +421,11 @@ const (
 // go. It depends on the config alone, not on the outcome, so every run — including
 // one that fails early — still states which checks were never in scope.
 func (cfg Config) note() string {
+	noAppCompose := cfg.AppCompose == nil && strings.TrimSpace(cfg.BaseDomain) == "" && cfg.NoDNSDiscovery
 	switch {
-	case cfg.AppCompose == nil && strings.TrimSpace(cfg.BaseDomain) == "":
+	case noAppCompose:
 		return noteNoCodeIdentity
-	case cfg.ExpectComposeFile == nil:
+	case len(cfg.ExpectComposeFiles) == 0:
 		return noteNoComposeFileCheck
 	default:
 		return noteComplete
@@ -513,7 +549,7 @@ func (c *Checker) Check(ctx context.Context, domain string) (Report, error) {
 func (c *Checker) checkCodeIdentity(ctx context.Context, rep *Report) {
 	code := &rep.Code
 	code.Requested = c.cfg.AppCompose != nil || strings.TrimSpace(c.cfg.BaseDomain) != ""
-	code.ExpectRequested = c.cfg.ExpectComposeFile != nil
+	code.ExpectRequested = len(c.cfg.ExpectComposeFiles) > 0
 
 	if rep.QuoteErr != nil {
 		code.HashErr = errors.New("not checked: the quote did not verify")
@@ -531,10 +567,6 @@ func (c *Checker) checkCodeIdentity(ctx context.Context, rep *Report) {
 	code.ComposeHash = composeHash
 	code.AppID = attest.AppIDFromComposeHash(composeHash)
 
-	if !code.Requested {
-		return
-	}
-
 	// Obtain the app-compose. A caller-supplied copy wins over fetching: it is what
 	// an operator uses to assert "this is the release I deployed", and it works when
 	// the platform endpoint is unreachable or public_tcbinfo is off.
@@ -543,10 +575,25 @@ func (c *Checker) checkCodeIdentity(ctx context.Context, rep *Report) {
 	case c.cfg.AppCompose != nil:
 		raw, code.Source = c.cfg.AppCompose, "supplied"
 	default:
-		// The app_id comes from the quote, never from the caller, so this cannot be
-		// pointed at a different app's compose.
-		code.Source = appIDHost(code.AppID, c.cfg.BaseDomain)
-		raw, err = FetchAppCompose(ctx, c.http, code.AppID, c.cfg.BaseDomain)
+		baseDomain := strings.TrimSpace(c.cfg.BaseDomain)
+		if baseDomain == "" {
+			// Nothing supplied: derive the platform base domain from the served domain's
+			// DNS so `Check(domain)` alone can do code identity. Marked Discovered, so a
+			// lookup the caller never asked for cannot fail the run on its own.
+			if c.cfg.NoDNSDiscovery {
+				return
+			}
+			code.Discovered = true
+			baseDomain, err = DeriveBaseDomain(ctx, rep.Domain)
+			if err != nil {
+				code.FetchErr = err
+				return
+			}
+		}
+		// The app_id comes from the quote, never from the caller or from DNS, so this
+		// cannot be pointed at a different app's compose.
+		code.Source = appIDHost(code.AppID, baseDomain)
+		raw, err = FetchAppCompose(ctx, c.http, code.AppID, baseDomain)
 		if err != nil {
 			code.FetchErr = err
 			return
@@ -562,7 +609,7 @@ func (c *Checker) checkCodeIdentity(ctx context.Context, rep *Report) {
 	code.ComposeFile = []byte(ac.DockerComposeFile)
 
 	if code.ExpectRequested {
-		code.ExpectErr = diffComposeFile(code.ComposeFile, c.cfg.ExpectComposeFile)
+		code.MatchedExpect, code.ExpectErr = matchExpected(code.ComposeFile, c.cfg.ExpectComposeFiles)
 	}
 }
 

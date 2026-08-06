@@ -317,13 +317,20 @@ does not.
    the platform labels by. The `compose-hash` runtime event in RTMR3 carries the
    same value and is kept only as a cross-check in the KAT.
    
-   From there `pcverify -gateway` closes the chain: given the app-compose bytes it
-   checks `sha256 == compose_hash` (`evidence.VerifyAppCompose`) and compares the
-   authenticated `docker_compose_file` against the manifest that was published
-   (`-expect-compose-file`). The app-compose bytes can come from anywhere — the
-   platform guest agent (`-base-domain`, fetched for the `app_id` **the quote
-   itself names**), a deploy record, or an operator's copy-paste — because the
-   compose hash anchors them; no Phala Cloud API access is required.
+   From there `pcverify -gateway` closes the chain with no extra arguments: it
+   derives the platform base domain from the served domain's CNAME chain
+   (`evidence.DeriveBaseDomain` — dstack points a served name at `_.<base_domain>`),
+   fetches the app-compose from the guest agent of the `app_id` **the quote itself
+   names**, and checks `sha256 == compose_hash` (`evidence.VerifyAppCompose`) before
+   believing anything in it. `-app-compose` supplies those bytes from a file
+   instead — a deploy record, a release asset, a copy-paste — because the compose
+   hash anchors them; no Phala Cloud API access is required.
+
+   Naming what *should* be running is the one thing only the caller knows:
+   `-expect-compose-file` pins one manifest, `-releases N` accepts any of the newest
+   N published releases and reports which is live. DNS is used only to *locate* the
+   app-compose, never to decide anything — a wrong or hijacked answer yields a failed
+   lookup or a failed binding, never a false pass.
 3. **Publish `measurement ↔ cert` (transparency log / on-chain) + monitoring**,
    so cheating is publicly detectable without per-user effort.
 4. **Optional tier-3 path**: a WASM verify+seal SDK for clients that want
