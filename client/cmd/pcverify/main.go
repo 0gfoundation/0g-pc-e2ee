@@ -136,6 +136,7 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 	allowUntrustedCert := fs.Bool("allow-untrusted-cert", false, "gateway mode: proceed when the served certificate does not chain to a public root (ACME staging). Relaxes no attestation check, but drops the link between the connection and the domain asked for, so an interceptor running its own attested CVM would still pass — smoke-test your own deployment only")
 	appCompose := fs.String("app-compose", "", "gateway mode: path to the CVM's app-compose.json, checked against the compose_hash the quote binds. Its source need not be trusted — the hash anchors it. Takes precedence over the guest-agent fetch")
 	baseDomain := fs.String("base-domain", "", "gateway mode: platform base domain (e.g. in1.phala.network) to fetch app-compose.json from the guest agent of the app_id the QUOTE names. Default: derived from the served domain's CNAME chain")
+	osImages := fs.String("os-image-allowlist", "", "gateway mode: read the expected OS-image boot-chain measurements from this file instead of the ones built into the binary (see client/evidence/osimages.json). For testing and for pinning an image before it is committed")
 	noDNSDiscovery := fs.Bool("no-dns-discovery", false, "gateway mode: do not derive the platform base domain from DNS; check only what was passed in")
 	expectComposeFile := fs.String("expect-compose-file", "", "gateway mode: path to the docker-compose manifest this deployment should be running (a digest-pinned docker-compose.release.yml), compared against the authenticated app-compose's docker_compose_file. Overrides the default -releases lookup")
 	releases := fs.Int("releases", defaultReleases, "gateway mode: accept the deployment if its compose text matches any of the newest N published releases, and report which one. 0 disables the lookup")
@@ -169,6 +170,7 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 			appComposePath:     *appCompose,
 			baseDomain:         *baseDomain,
 			noDNSDiscovery:     *noDNSDiscovery,
+			osImagesPath:       *osImages,
 			expectComposePath:  *expectComposeFile,
 			releases:           *releases,
 			releaseRepo:        *releaseRepo,

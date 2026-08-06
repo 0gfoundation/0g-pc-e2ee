@@ -11,6 +11,7 @@ import (
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/dcap"
 	"github.com/0gfoundation/0g-pc-e2ee/client/evidence"
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
 )
 
 // evidenceChecker is the seam over client/evidence so reportGateway can be
@@ -28,6 +29,7 @@ type gatewayConfig struct {
 	appComposePath     string
 	baseDomain         string
 	noDNSDiscovery     bool
+	osImagesPath       string
 	expectComposePath  string
 	releases           int
 	releaseRepo        string
@@ -89,6 +91,22 @@ func newEvidenceChecker(ctx context.Context, out io.Writer, g gatewayConfig) (*e
 		AllowUntrustedCert: g.allowUntrustedCert,
 		BaseDomain:         g.baseDomain,
 		NoDNSDiscovery:     g.noDNSDiscovery,
+	}
+	if p := strings.TrimSpace(g.osImagesPath); p != "" {
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return nil, expect, fmt.Errorf("-os-image-allowlist: %w", err)
+		}
+		imgs, err := evidence.ParseOSImages(b)
+		if err != nil {
+			return nil, expect, fmt.Errorf("-os-image-allowlist: %w", err)
+		}
+		// A file that parses to nothing disables the check; say so rather than letting a
+		// caller think they pinned something.
+		if len(imgs) == 0 {
+			return nil, expect, fmt.Errorf("-os-image-allowlist %s contains no images", p)
+		}
+		cfg.OSImages = imgs
 	}
 	if p := strings.TrimSpace(g.appComposePath); p != "" {
 		b, err := os.ReadFile(p)
@@ -185,21 +203,12 @@ func reportGateway(ctx context.Context, out io.Writer, ec evidenceChecker, domai
 	if rep.QuoteErr != nil {
 		fmt.Fprintf(out, "%s quote              %v\n", mark(false), rep.QuoteErr)
 	} else {
+		// The measurement registers are deliberately NOT dumped here. MRTD/RTMR0-2 are
+		// reported by the os-image step below, which is the check that gives them meaning,
+		// and RTMR3 is superseded by compose_hash — a value that can actually be
+		// recomputed and compared. Printing 5×96 hex characters that nothing checks was
+		// noise dressed as rigour.
 		fmt.Fprintf(out, "%s quote              genuine TDX (DCAP verified)\n", mark(true))
-		// All five registers, because app identity lives in RTMR3 while MRTD is the
-		// VM image: the manual code-identity step needs to see both.
-		for _, r := range []struct {
-			name string
-			val  []byte
-		}{
-			{"MRTD", rep.Measurement.MRTD[:]},
-			{"RTMR0", rep.Measurement.RTMR0[:]},
-			{"RTMR1", rep.Measurement.RTMR1[:]},
-			{"RTMR2", rep.Measurement.RTMR2[:]},
-			{"RTMR3", rep.Measurement.RTMR3[:]},
-		} {
-			fmt.Fprintf(out, "  measurement %-5s %x\n", r.name, r.val)
-		}
 	}
 
 	// Step 3 — the quote binds this bundle.
@@ -239,6 +248,21 @@ func reportGateway(ctx context.Context, out io.Writer, ec evidenceChecker, domai
 
 	// Step 6 — code identity.
 	reportCodeIdentity(out, rep.Code, expect)
+
+	// Step 7 — the OS image that enforced step 6's binding. The boot-chain registers
+	// are printed only when they are the reader's next action: to record a value that
+	// is not pinned yet, or to diagnose one that did not match. A clean match needs
+	// only the name.
+	switch {
+	case !rep.OSImage.Configured:
+		fmt.Fprintf(out, "- os image           not pinned (allowlist is empty; see client/evidence/osimages.json)\n")
+		reportBootChain(out, rep.OSImage.Observed)
+	case rep.OSImage.Err != nil:
+		fmt.Fprintf(out, "%s os image           %v\n", mark(false), rep.OSImage.Err)
+		reportBootChain(out, rep.OSImage.Observed)
+	default:
+		fmt.Fprintf(out, "%s os image           %s\n", mark(true), rep.OSImage.Matched)
+	}
 
 	fmt.Fprintf(out, "\nnote: %s\n", rep.Note)
 	// Waiving chain trust drops the link between this connection and the name that
@@ -334,4 +358,20 @@ func failMark(code evidence.CodeIdentity, advisory bool) string {
 		return "-"
 	}
 	return mark(false)
+}
+
+// reportBootChain prints the observed MRTD/RTMR0-2 in the shape an osimages.json entry
+// wants, so recording a legitimate OS upgrade is a copy rather than a transcription.
+func reportBootChain(out io.Writer, bc attest.BootChain) {
+	for _, r := range []struct {
+		key string
+		val []byte
+	}{
+		{"mrtd", bc.MRTD[:]},
+		{"rtmr0", bc.RTMR0[:]},
+		{"rtmr1", bc.RTMR1[:]},
+		{"rtmr2", bc.RTMR2[:]},
+	} {
+		fmt.Fprintf(out, "  observed %-6s %x\n", r.key, r.val)
+	}
 }

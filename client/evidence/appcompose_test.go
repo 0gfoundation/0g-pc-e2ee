@@ -272,24 +272,55 @@ func TestCodeIdentity_OK(t *testing.T) {
 	}
 }
 
-func TestConfigNote(t *testing.T) {
+func TestCheckerNote(t *testing.T) {
+	// note() is built from the configuration, so a bare Checker is enough. A populated
+	// OS-image allowlist is supplied where the OS caveat is not the thing under test.
+	pinned := []OSImage{{Name: "img", BootChain: mkBootChain(0x11)}}
+	note := func(cfg Config) string {
+		cfg.QuoteParser = func([]byte) (attest.Measurement, [64]byte, error) {
+			return attest.Measurement{}, [64]byte{}, nil
+		}
+		if cfg.OSImages == nil {
+			cfg.OSImages = pinned
+		}
+		c, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		return c.note()
+	}
+
 	// Discovery off and nothing supplied: code identity is out of scope entirely.
-	if n := (Config{NoDNSDiscovery: true}).note(); !strings.Contains(n, "NOT checked") {
+	if n := note(Config{NoDNSDiscovery: true}); !strings.Contains(n, "NOT checked") {
 		t.Errorf("no code identity possible: note = %q", n)
 	}
 	// Discovery on (the default) counts as asking for the app-compose hop.
-	if n := (Config{}).note(); !strings.Contains(n, "NOT compared") {
+	if n := note(Config{}); !strings.Contains(n, "NOT compared") {
 		t.Errorf("discovery on, no compose comparison: note = %q", n)
 	}
-	if n := (Config{AppCompose: []byte("{}")}).note(); !strings.Contains(n, "NOT compared") {
+	if n := note(Config{AppCompose: []byte("{}")}); !strings.Contains(n, "NOT compared") {
 		t.Errorf("app-compose only: note = %q", n)
 	}
-	n := (Config{
+	n := note(Config{
 		AppCompose:         []byte("{}"),
 		ExpectComposeFiles: []ExpectedCompose{{Label: "x", Content: []byte("x")}},
-	}).note()
+	})
 	if !strings.Contains(n, "floating tag") {
 		t.Errorf("complete: note should still name the pinning caveat, got %q", n)
+	}
+	if strings.Contains(n, "OS image is NOT pinned") {
+		t.Errorf("OS image was pinned; note should not claim otherwise: %q", n)
+	}
+
+	// An empty allowlist must add the caveat that undercuts code identity, and must do
+	// so even on an otherwise-complete run.
+	n = note(Config{
+		OSImages:           []OSImage{},
+		AppCompose:         []byte("{}"),
+		ExpectComposeFiles: []ExpectedCompose{{Label: "x", Content: []byte("x")}},
+	})
+	if !strings.Contains(n, "OS image is NOT pinned") || !strings.Contains(n, "not proof") {
+		t.Errorf("unpinned OS image: note = %q", n)
 	}
 }
 

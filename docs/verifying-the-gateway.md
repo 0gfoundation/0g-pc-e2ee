@@ -40,6 +40,7 @@ gateway            pc-gateway.0g.ai
   app_id           55d872aaa9c0b148228ebcf89302a52e7cd3d252
 ✓ app-compose        sha256 == compose_hash (authenticated)
 ✓ compose file       matches release-2026.08.06.1 byte-for-byte
+✓ os image           dstack-nvidia-0.5.4.1 (1 vCPU / 2 GiB / 0 GPU)
 ```
 
 ---
@@ -64,7 +65,7 @@ against the manifests published in this repository's releases.
 flowchart TB
     subgraph ROOTS["What you actually trust"]
         INTEL["Intel<br/>TDX attestation root"]
-        OS["dstack OS image<br/>(measured, reproducible)"]
+        OS["dstack OS image<br/>(measured, reproducible,<br/>allowlisted in-binary)"]
         GH["GitHub<br/>publisher of record"]
         CA["Public CAs<br/>(same as any HTTPS site)"]
     end
@@ -109,6 +110,7 @@ flowchart LR
     CA["public CA roots"]
     AC["app-compose.json"]
     R["docker-compose.release.yml<br/>from a published release"]
+    OSA["allowlisted OS-image<br/>boot chains"]
 
     M -->|"1 covers"| C
     M -->|"1 covers"| A
@@ -117,6 +119,7 @@ flowchart LR
     CA -->|"5 must validate"| S
     Q -->|"6a mr_config_id<br/>= SHA-256 of"| AC
     AC -->|"6b its docker_compose_file<br/>must equal"| R
+    Q -->|"7 MRTD + RTMR0-2<br/>must be one of"| OSA
 ```
 
 **1. Bundle integrity.** Every file in the bundle matches the digest
@@ -160,6 +163,24 @@ this against the newest 5 by default and reports **which** release is live.
 > needs no replay of any log and no cooperation from anyone. `app_id`, the identifier
 > the hosting platform labels the deployment by, is simply its first 20 bytes.
 
+**7. OS image.** `mr_config_id` is supplied by the (untrusted) host when the enclave
+is built, so step 6 needs one more thing to stand up: the guest OS inside the enclave
+reads its own quote at boot, compares `mr_config_id` against the manifest it actually
+received, and **refuses to boot on a mismatch**. Trusting that means trusting the code
+doing it — which is what the quote's `MRTD` and `RTMR0`–`RTMR2` boot-chain
+measurements record. The tool compares them against an allowlist built into the
+binary, so nobody has to supply a value; see [current limits](#current-limits) for
+whether the deployment you are checking is covered yet.
+
+`RTMR3` is deliberately *not* pinned: it carries the per-application and
+per-instance runtime events, so it legitimately differs between two deployments of
+the same OS. The application is already pinned, more precisely, by step 6.
+
+> An allowlist entry is an **(image, VM shape)** pair, not an image. `MRTD` and
+> `RTMR0`–`RTMR2` are a function of the image *and* the VM it booted on — vCPU count,
+> RAM size, PCI topology, GPU count — which is why dstack publishes reproducible build
+> material rather than a table of measurements.
+
 ---
 
 ## Trust assumptions, stated plainly
@@ -168,14 +189,12 @@ this against the newest 5 by default and reports **which** release is live.
 TDX is broken, this collapses — as does every other confidential-computing claim.
 This is the irreducible assumption.
 
-**The dstack OS image.** `mr_config_id` is supplied by the (untrusted) host when the
-enclave is built, so on its own it proves nothing. What makes it truthful is that the
-guest OS inside the enclave reads its own quote at boot, compares `mr_config_id`
-against the manifest it actually received, and **refuses to boot on a mismatch**.
-Trusting that check means trusting that the code performing it is the audited dstack
-OS — which is exactly what the quote's `MRTD` and `RTMR0`–`RTMR2` boot-chain
-measurements record. Those measurements are reproducible from dstack's public build.
-See [current limits](#current-limits) for the status of this check.
+**The dstack OS image.** Step 7 above. What you are trusting is that the boot-chain
+measurements in the allowlist really are the audited dstack OS — and that is checkable
+rather than asserted: they are recomputed from dstack's reproducible build with
+`dstack-mr`, and [`client/evidence/osimages.json`](../client/evidence/osimages.json)
+records, for each entry, the image and VM shape it was derived for. Reviewing what this
+tool accepts is reviewing that file.
 
 **GitHub, as publisher of record.** Comparing against "the manifests we published"
 means someone must be the publisher. A tampered release asset causes a *mismatch*,
@@ -216,14 +235,16 @@ the quote.
 
 Read this section before relying on a `PASS`.
 
-**The OS-image measurement is not yet pinned.** The tool prints `MRTD` and
-`RTMR0`–`RTMR3` but does not yet compare them against known-good dstack values. Until
-it does, a host that booted a *modified* dstack OS — one that skipped the
-`mr_config_id` check described above — could commit to a published release's
+**The OS-image allowlist is not populated yet.** Step 7 is implemented and runs
+automatically, but
+[`client/evidence/osimages.json`](../client/evidence/osimages.json) currently ships
+empty, so on today's builds the step reports `- os image  not pinned` rather than
+checking anything. While that is the case, a host that booted a *modified* dstack OS —
+one with the `mr_config_id` check removed — could commit to a published release's
 `compose_hash` while running something else, and the run would still report `PASS`.
-Closing this needs a reviewed allowlist of dstack OS measurements committed to this
-repository, so that no user has to supply a value. **Treat code identity as
-"strong evidence, not proof" until then.** Endpoint identity (steps 1–5) is unaffected.
+**Treat code identity as "strong evidence, not proof" until the allowlist is
+populated.** Endpoint identity (steps 1–5) is unaffected either way, and the run says
+which case you are in — both on the `os image` line and in its closing note.
 
 **Code identity is only as strong as the pinning in the manifest.** An image
 referenced by a mutable tag rather than a digest keeps `compose_hash` identical while
@@ -320,6 +341,7 @@ Release manifests are the `docker-compose.release.yml` asset on
 | certificate does not validate | ordinary TLS failure, an interception, or a deliberately untrusted staging certificate |
 | `app-compose` digest does not match `compose_hash` | the manifest is for a different deployment or instance — under blue/green, most often the standby side rather than the live one |
 | compose text matches no published release | **the finding that matters.** The deployment is running something that was not published. Report it. |
+| `os image` matches no allowlisted image | either the deployment was upgraded to an OS this tool does not know yet, or it is not running the OS it should be. The observed registers are printed so the two can be told apart against the reproducible build. |
 
 Anything that is not a clean pass is worth reporting: open an issue at
 <https://github.com/0gfoundation/0g-pc-e2ee/issues>.

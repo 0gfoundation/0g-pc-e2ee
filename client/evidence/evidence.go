@@ -150,6 +150,14 @@ type Config struct {
 	// NoDNSDiscovery disables deriving BaseDomain from DNS. Set it to keep the run
 	// to the endpoint and the inputs given.
 	NoDNSDiscovery bool
+	// OSImages is the allowlist of acceptable OS-image boot chains (step 7). Nil loads
+	// the embedded builtin, which is what makes the check need no configuration; pass
+	// an explicitly empty slice to disable it, or your own entries to override.
+	//
+	// This is what grounds code identity: mr_config_id is host-chosen, and it is the
+	// guest OS that refuses to boot when it disagrees with the real app-compose, so the
+	// compose hash means what it says only if the OS is the audited one.
+	OSImages []OSImage
 	// ExpectComposeFiles are candidate docker-compose texts, any one of which the
 	// authenticated docker_compose_file may equal — normally the digest-pinned
 	// manifest(s) from the release(s) that could be deployed. This is the step that
@@ -173,10 +181,11 @@ const defaultTimeout = 30 * time.Second
 // Checker verifies evidence bundles. It is immutable after New and safe for
 // concurrent use.
 type Checker struct {
-	cfg   Config
-	http  *http.Client
-	dial  func(ctx context.Context, domain string, cfg *tls.Config) (*tls.Conn, error)
-	limit time.Duration
+	cfg      Config
+	http     *http.Client
+	dial     func(ctx context.Context, domain string, cfg *tls.Config) (*tls.Conn, error)
+	limit    time.Duration
+	osImages []OSImage
 }
 
 // New returns a Checker. It errors when QuoteParser is nil rather than defaulting
@@ -189,7 +198,17 @@ func New(cfg Config) (*Checker, error) {
 	if timeout <= 0 {
 		timeout = defaultTimeout
 	}
-	c := &Checker{cfg: cfg, http: cfg.HTTPClient, dial: cfg.DialTLS, limit: timeout}
+	// A malformed embedded allowlist is a mistake in this repository, not a fact about
+	// any deployment, so it fails construction rather than quietly leaving the OS-image
+	// check unconfigured — which would drop it without anyone noticing.
+	osImages := cfg.OSImages
+	if osImages == nil {
+		var err error
+		if osImages, err = BuiltinOSImages(); err != nil {
+			return nil, err
+		}
+	}
+	c := &Checker{cfg: cfg, http: cfg.HTTPClient, dial: cfg.DialTLS, limit: timeout, osImages: osImages}
 	if c.http == nil {
 		c.http = &http.Client{Timeout: timeout, Transport: &http.Transport{
 			// Verification is on by default and only AllowUntrustedCert turns it off;
@@ -323,6 +342,11 @@ type Report struct {
 	// for are performed; see CodeIdentity.
 	Code CodeIdentity
 
+	// OSImage is the OS-image boot-chain check (step 7): whether MRTD/RTMR0-2 are an
+	// OS image this verifier accepts. It is what makes Code meaningful rather than
+	// self-reported — see Config.OSImages.
+	OSImage OSImageCheck
+
 	// Note records what a pass does NOT cover, so a caller cannot present this as
 	// full attestation. See the package doc.
 	Note string
@@ -406,6 +430,8 @@ func (c CodeIdentity) OK() bool {
 // Report.Note strings: what a given run did NOT cover, so a caller cannot present
 // a partial result as a full one. Which one applies depends on how far the
 // code-identity checks were asked to go.
+// Report.Note caveats. Each names one thing a pass does NOT cover; note() composes
+// the ones that apply, so a partial result can never be read as a full one.
 const (
 	noteNoCodeIdentity = "code identity was NOT checked — app-compose discovery is off, so " +
 		"compose_hash could not be resolved to an actual configuration; it is only a value " +
@@ -413,23 +439,35 @@ const (
 	noteNoComposeFileCheck = "the app-compose is authenticated, but its docker_compose_file was " +
 		"NOT compared against a published manifest — pass the deployed " +
 		"docker-compose.release.yml (or a set of releases) to close that step"
-	noteComplete = "code identity is checked to the compose text; it is only as strong as the " +
-		"image pinning inside it — a floating tag keeps compose_hash stable while the code changes"
+	noteFloatingTag = "code identity is only as strong as the image pinning inside the compose " +
+		"text — a floating tag keeps compose_hash stable while the code changes"
+	// The one caveat that undercuts code identity rather than qualifying it: without a
+	// pinned OS image, nothing establishes that the guest enforced the compose binding
+	// at all, so the compose hash is evidence rather than proof.
+	noteNoOSImage = "the OS image is NOT pinned (the allowlist is empty), so nothing establishes " +
+		"that the guest enforced the compose-hash binding — treat code identity as strong " +
+		"evidence, not proof. Endpoint identity is unaffected"
 )
 
-// note is the Report.Note for how far this configuration asks code identity to
-// go. It depends on the config alone, not on the outcome, so every run — including
-// one that fails early — still states which checks were never in scope.
-func (cfg Config) note() string {
+// note is the Report.Note for this run: the caveats that apply, joined. It depends on
+// the configuration rather than the outcome, so a run that fails early still states
+// what was never in scope.
+func (c *Checker) note() string {
+	var notes []string
+	cfg := c.cfg
 	noAppCompose := cfg.AppCompose == nil && strings.TrimSpace(cfg.BaseDomain) == "" && cfg.NoDNSDiscovery
 	switch {
 	case noAppCompose:
-		return noteNoCodeIdentity
+		notes = append(notes, noteNoCodeIdentity)
 	case len(cfg.ExpectComposeFiles) == 0:
-		return noteNoComposeFileCheck
+		notes = append(notes, noteNoComposeFileCheck, noteFloatingTag)
 	default:
-		return noteComplete
+		notes = append(notes, noteFloatingTag)
 	}
+	if len(c.osImages) == 0 {
+		notes = append(notes, noteNoOSImage)
+	}
+	return strings.Join(notes, "; ")
 }
 
 // Pass reports whether every enforced check succeeded. Chain trust is deliberately
@@ -439,7 +477,7 @@ func (r Report) Pass() bool {
 	if r.ManifestErr != nil || r.QuoteErr != nil || r.BindingErr != nil || r.CertErr != nil {
 		return false
 	}
-	if !r.CertMatch.OK() || !r.Code.OK() {
+	if !r.CertMatch.OK() || !r.Code.OK() || !r.OSImage.OK() {
 		return false
 	}
 	if len(r.Files) == 0 {
@@ -468,7 +506,7 @@ func (c *Checker) Check(ctx context.Context, domain string) (Report, error) {
 	if h, _, splitErr := net.SplitHostPort(host); splitErr == nil {
 		name = h
 	}
-	rep := Report{Domain: host, Note: c.cfg.note()}
+	rep := Report{Domain: host, Note: c.note()}
 
 	// Step 1 — the manifest, then every file it names. The manifest bytes are kept
 	// verbatim: the binding in step 3 is a hash over exactly these bytes.
@@ -540,6 +578,15 @@ func (c *Checker) Check(ctx context.Context, domain string) (Report, error) {
 
 	// Step 6 — code identity, from the same verified quote.
 	c.checkCodeIdentity(ctx, &rep)
+
+	// Step 7 — is the OS that enforced step 6's binding one we accept? Only meaningful
+	// once the quote verified; before that there is no measurement to compare.
+	if rep.QuoteErr == nil {
+		rep.OSImage = checkOSImage(c.osImages, rep.Measurement)
+	} else {
+		rep.OSImage = OSImageCheck{Configured: len(c.osImages) > 0,
+			Err: errors.New("not checked: the quote did not verify")}
+	}
 	return rep, nil
 }
 
