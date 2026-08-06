@@ -1,0 +1,338 @@
+# Verifying the 0G Private Computer gateway
+
+You are about to send prompts to `https://<gateway-domain>`. This document is how
+you check, for yourself, that the thing answering is a genuine confidential-computing
+enclave running code you can read — instead of taking our word for it.
+
+Everything here is independently checkable. Nothing in it requires trusting 0G, and
+the one command below is a convenience, not the source of truth: the
+[manual procedure](#doing-it-by-hand) uses only `curl`, `openssl`, `jq` and
+`sha256sum`.
+
+> **Scope.** This document covers the **gateway** — the 0G-operated enclave that
+> takes your request and seals it to a provider. Verifying the *provider* that runs
+> the model is a separate chain, documented in
+> [`design/trust-chain.md`](./design/trust-chain.md); the gateway performs those
+> checks on your behalf per request.
+
+---
+
+## The one command
+
+```sh
+pcverify -gateway <gateway-domain>
+```
+
+Exit code 0 means every check below passed. Non-zero means one did not, and the
+output names which. There is nothing to configure: the tool discovers what it needs
+from the endpoint itself and from public sources.
+
+```
+gateway            pc-gateway.0g.ai
+✓   acme-account.json              0443a4bf…
+✓   cert-pc-gateway.0g.ai.pem      36024092…
+✓ evidence bundle    2 file(s) match sha256sum.txt
+✓ quote              genuine TDX (DCAP verified)
+✓ bundle binding     report_data == SHA-256(sha256sum.txt)
+✓ endpoint binding   served certificate is the one the quote binds
+✓ chain trust        validates for pc-gateway.0g.ai
+✓ compose_hash       55d872aa…
+  app_id           55d872aaa9c0b148228ebcf89302a52e7cd3d252
+✓ app-compose        sha256 == compose_hash (authenticated)
+✓ compose file       matches release-2026.08.06.1 byte-for-byte
+```
+
+---
+
+## What the checks establish
+
+Two separate questions, answered by two separate mechanisms.
+
+**Endpoint identity** — *is the thing I am talking to a genuine enclave?* The
+enclave generates its own TLS private key inside the CVM, obtains a certificate for
+the domain, and commits to that certificate inside a hardware-signed attestation
+quote. If the certificate your browser or SDK negotiated is the one the quote
+commits to, then your TLS session terminates **inside** that enclave. Nobody
+outside it — including 0G's own operators and the cloud host — holds the key.
+
+**Code identity** — *what is running in there?* The same quote commits to a hash of
+the CVM's deployment manifest, which embeds the container images by digest. Resolve
+that hash and you know exactly which build is serving you, and can compare it
+against the manifests published in this repository's releases.
+
+```mermaid
+flowchart TB
+    subgraph ROOTS["What you actually trust"]
+        INTEL["Intel<br/>TDX attestation root"]
+        OS["dstack OS image<br/>(measured, reproducible)"]
+        GH["GitHub<br/>publisher of record"]
+        CA["Public CAs<br/>(same as any HTTPS site)"]
+    end
+
+    INTEL -->|"signs"| Q["a genuine TDX quote"]
+    Q -->|"commits to the<br/>certificate served"| EP["endpoint identity:<br/>your TLS session ends inside the enclave"]
+    CA -->|"proves the certificate<br/>is for this domain"| EP
+    Q -->|"carries it in<br/>mr_config_id"| CH["compose_hash:<br/>which manifest booted"]
+    OS -->|"refuses to boot unless<br/>it matches the real manifest"| CH
+    CH -->|"resolved to the<br/>manifest it hashes"| CODE["code identity:<br/>which image digests are running"]
+    GH -->|"publishes the<br/>manifest to expect"| CODE
+
+    EP --> CLAIM["you are talking to a known enclave<br/>running a published build"]
+    CODE --> CLAIM
+```
+
+Note what is **not** in that box: not 0G, not the cloud provider hosting the
+enclave, not DNS, and not the API that hands out the manifest. The
+[trust assumptions](#trust-assumptions-stated-plainly) section explains why each of
+those is not load-bearing.
+
+---
+
+## The checks, one at a time
+
+The enclave publishes an *evidence bundle* at `https://<domain>/evidences/`:
+
+| File | What it is |
+|------|-----------|
+| `quote.json` | the hardware attestation quote |
+| `sha256sum.txt` | digests of every other file in the bundle |
+| `cert-<domain>.pem` | the certificate chain the enclave obtained |
+| `acme-account.json` | the ACME account the certificate was issued under |
+
+```mermaid
+flowchart LR
+    Q["quote.json<br/>step 2: DCAP-verified,<br/>so its fields are Intel-signed"]
+    M["sha256sum.txt"]
+    C["cert-domain.pem"]
+    A["acme-account.json"]
+    S["the certificate your<br/>TLS session negotiated"]
+    CA["public CA roots"]
+    AC["app-compose.json"]
+    R["docker-compose.release.yml<br/>from a published release"]
+
+    M -->|"1 covers"| C
+    M -->|"1 covers"| A
+    Q -->|"3 report_data<br/>= SHA-256 of"| M
+    C -->|"4 must equal"| S
+    CA -->|"5 must validate"| S
+    Q -->|"6a mr_config_id<br/>= SHA-256 of"| AC
+    AC -->|"6b its docker_compose_file<br/>must equal"| R
+```
+
+**1. Bundle integrity.** Every file in the bundle matches the digest
+`sha256sum.txt` records for it. This is `sha256sum -c`. On its own it proves
+nothing — the whole bundle could be fabricated — but it makes the next step cover
+all of it at once.
+
+**2. Quote authenticity.** `quote.json` is DCAP-verified: its signature chains up to
+Intel's attestation root, the quoting enclave's identity is checked, and the
+platform's TCB status must be current. This is what makes the quote's contents
+mean "a real Intel TDX enclave said this" rather than "a JSON file claims this".
+*Skip it and everything below is unfounded.*
+
+**3. Bundle binding.** The quote's `report_data` field must equal
+`SHA-256(sha256sum.txt)`. `report_data` is chosen by the enclave when it requests
+the quote, so this is the enclave saying, under Intel's signature: *these exact
+bundle files are mine.* Combined with step 1, the quote now covers the certificate.
+
+**4. Endpoint binding.** We open our own TLS connection to the domain and compare
+the certificate we are served against the one in the bundle. **This is the
+load-bearing step.** Skip it and the quote proves only that *some* enclave
+somewhere obtained *some* certificate — it says nothing about the endpoint in front
+of you, and anyone could republish a genuine bundle they downloaded from elsewhere.
+
+**5. Chain trust.** The served certificate must validate for the domain against the
+public CA roots, exactly as your browser would check it. This ties the connection to
+the *name* you asked for. Without it, someone who can intercept your traffic and
+runs their own enclave would satisfy every other check — their own quote, their own
+consistent bundle, their own certificate matching it, because they control both.
+
+**6. Code identity.** The quote's `mr_config_id` register carries
+`compose_hash` — the SHA-256 of the CVM's `app-compose.json`, the manifest that
+embeds the `docker-compose` text verbatim. So the quote commits to the deployment
+configuration, and therefore to the container image digests. Fetch that manifest
+from anywhere, confirm its digest is the one the quote names, and read the image
+digests out of it. Then compare the embedded compose text against the
+`docker-compose.release.yml` published in this repository's releases — the tool does
+this against the newest 5 by default and reports **which** release is live.
+
+> `mr_config_id` is part of the signed hardware report, so recovering `compose_hash`
+> needs no replay of any log and no cooperation from anyone. `app_id`, the identifier
+> the hosting platform labels the deployment by, is simply its first 20 bytes.
+
+---
+
+## Trust assumptions, stated plainly
+
+**Intel.** The attestation root. If Intel's signing infrastructure is compromised or
+TDX is broken, this collapses — as does every other confidential-computing claim.
+This is the irreducible assumption.
+
+**The dstack OS image.** `mr_config_id` is supplied by the (untrusted) host when the
+enclave is built, so on its own it proves nothing. What makes it truthful is that the
+guest OS inside the enclave reads its own quote at boot, compares `mr_config_id`
+against the manifest it actually received, and **refuses to boot on a mismatch**.
+Trusting that check means trusting that the code performing it is the audited dstack
+OS — which is exactly what the quote's `MRTD` and `RTMR0`–`RTMR2` boot-chain
+measurements record. Those measurements are reproducible from dstack's public build.
+See [current limits](#current-limits) for the status of this check.
+
+**GitHub, as publisher of record.** Comparing against "the manifests we published"
+means someone must be the publisher. A tampered release asset causes a *mismatch*,
+never a false pass, because it is only ever compared against text the quote already
+authenticated. You can substitute your own copy with `-expect-compose-file`.
+
+**Public CAs.** Step 5 is ordinary web PKI, the same assumption you make visiting any
+HTTPS site.
+
+### What you do *not* have to trust
+
+**0G.** Every check above is over artifacts you fetch yourself, verified against
+Intel's signature and public releases. We cannot make a failing deployment pass. The
+verification tool is in this repository and the [manual procedure](#doing-it-by-hand)
+avoids it entirely.
+
+**The cloud provider hosting the enclave.** It is the untrusted host in the TDX
+model. It cannot read enclave memory, cannot extract the TLS key, and cannot forge a
+quote. It *can* refuse to serve you — availability is not protected — and it decides
+which OS image boots, which is why the OS measurement matters.
+
+**The API that hands out `app-compose.json`.** This surprises people, so it is worth
+being precise: that fetch is a **hash preimage lookup**, not testimony. The quote
+already told you the digest. If the API returns the wrong bytes, the digest does not
+match and the check fails; if it returns the right bytes, you have learned the truth —
+not because the API was honest, but because SHA-256 is collision-resistant. This is
+why the manifest may come from anywhere: the platform, a mirror, an operator's
+records, or a hostile party.
+
+**DNS.** Used only to *locate* things: which platform host to ask for the manifest.
+A wrong or hijacked answer produces a failed lookup or a failed digest comparison,
+never a false pass. The deployment's identity is never taken from DNS — it comes from
+the quote.
+
+---
+
+## Current limits
+
+Read this section before relying on a `PASS`.
+
+**The OS-image measurement is not yet pinned.** The tool prints `MRTD` and
+`RTMR0`–`RTMR3` but does not yet compare them against known-good dstack values. Until
+it does, a host that booted a *modified* dstack OS — one that skipped the
+`mr_config_id` check described above — could commit to a published release's
+`compose_hash` while running something else, and the run would still report `PASS`.
+Closing this needs a reviewed allowlist of dstack OS measurements committed to this
+repository, so that no user has to supply a value. **Treat code identity as
+"strong evidence, not proof" until then.** Endpoint identity (steps 1–5) is unaffected.
+
+**Code identity is only as strong as the pinning in the manifest.** An image
+referenced by a mutable tag rather than a digest keeps `compose_hash` identical while
+the code behind the tag changes. Check that the compose text you read pins digests
+(`image: …@sha256:…`), not tags.
+
+**The gateway sees your prompt in plaintext.** That is what it is for: it seals your
+request to the provider enclave on your behalf. So the gateway is a second enclave
+that handles cleartext, versus one for a client that seals directly. If that is
+unacceptable for your use case, run the sidecar or the in-process SDK instead and seal
+on your own machine — see [`../client/README.md`](../client/README.md).
+
+**Metadata is visible to the router.** Model name, approximate token counts, timing
+and packet sizes are not hidden.
+
+**Detection, not prevention.** These checks tell you whether a deployment *is* what it
+claims. They do not stop a bad deployment from existing — they make it detectable by
+anyone who looks. If you never run them, you are trusting by default.
+
+**Availability is not attested.** Nothing here prevents the endpoint from being taken
+offline.
+
+---
+
+## Doing it by hand
+
+If you would rather not run our binary, the whole procedure is four tools. `DOMAIN`
+is the gateway; the checks are numbered as above.
+
+```bash
+DOMAIN=pc-gateway.0g.ai
+
+# --- 1. bundle integrity ---
+for f in quote.json sha256sum.txt acme-account.json "cert-$DOMAIN.pem"; do
+  curl -sO "https://$DOMAIN/evidences/$f"
+done
+sha256sum -c sha256sum.txt          # every listed file must be OK
+
+# --- 4. endpoint binding: the cert you are served vs the cert in the bundle ---
+openssl s_client -servername "$DOMAIN" -connect "$DOMAIN:443" </dev/null 2>/dev/null \
+  | openssl x509 -outform pem > served.pem
+diff <(openssl x509 -in served.pem -noout -pubkey) \
+     <(openssl x509 -in "cert-$DOMAIN.pem" -noout -pubkey) \
+  && echo "served certificate is the one in the bundle"
+
+# --- 5. chain trust ---
+openssl s_client -servername "$DOMAIN" -connect "$DOMAIN:443" -verify_return_error \
+  </dev/null >/dev/null && echo "certificate validates for $DOMAIN"
+
+# --- 3. bundle binding ---
+sha256sum sha256sum.txt             # must equal the first 32 bytes of report_data
+```
+
+Step **2** — DCAP-verifying `quote.json` — needs a quote verifier;
+[`dcap-qvl`](https://github.com/Phala-Network/dcap-qvl) or Intel's own QVL will do.
+Take `report_data` and `mr_config_id` **from the verified quote body**, not from the
+convenience fields alongside it in `quote.json`: those are unsigned copies, and using
+them would make the whole exercise circular. In the verified body, `report_data` is
+`SHA-256(sha256sum.txt)` followed by 32 zero bytes, and `mr_config_id` is `0x01`, the
+32-byte `compose_hash`, then zero padding.
+
+```bash
+# --- 6. code identity ---
+APP=<first 20 bytes of compose_hash, as hex>    # from the verified quote
+curl -s "https://$APP-8090.<platform-base-domain>/prpc/Info" > info.json
+jq -r '.tcb_info' info.json > tcb.json
+jq -j '.app_compose' tcb.json > app-compose.json    # -j: no trailing newline
+
+# the digest must be the compose_hash the quote committed to — THIS is the step
+# that makes the bytes above trustworthy, whatever their source
+sha256sum app-compose.json
+
+# then read out the deployment manifest and compare it with a published release
+jq -j '.docker_compose_file' app-compose.json > deployed-compose.yml
+diff deployed-compose.yml docker-compose.release.yml
+```
+
+The platform base domain is the end of the served domain's CNAME chain
+(`dig +short CNAME` repeatedly; it ends at `_.<base-domain>`).
+
+Release manifests are the `docker-compose.release.yml` asset on
+<https://github.com/0gfoundation/0g-pc-e2ee/releases>.
+
+---
+
+## If a check fails
+
+| Symptom | Most likely cause |
+|---|---|
+| `sha256sum -c` mismatch | the bundle was modified after it was hashed, or is being served by something other than the enclave |
+| quote fails DCAP verification | not a genuine TDX quote, or the platform's TCB is out of date |
+| `report_data` does not match the manifest digest | the quote belongs to a different bundle — often a stale quote republished beside regenerated evidence |
+| served certificate is not the one in the bundle | you are not talking to the enclave the bundle came from, **or** the certificate was renewed and the evidence was not regenerated (the tool distinguishes these: a renewal keeps the same public key) |
+| certificate does not validate | ordinary TLS failure, an interception, or a deliberately untrusted staging certificate |
+| `app-compose` digest does not match `compose_hash` | the manifest is for a different deployment or instance — under blue/green, most often the standby side rather than the live one |
+| compose text matches no published release | **the finding that matters.** The deployment is running something that was not published. Report it. |
+
+Anything that is not a clean pass is worth reporting: open an issue at
+<https://github.com/0gfoundation/0g-pc-e2ee/issues>.
+
+---
+
+## Further reading
+
+- [`design/cloud-gateway.md`](./design/cloud-gateway.md) — the gateway's design, its
+  trust model, and why it emits no attestation quote of its own
+- [`design/trust-chain.md`](./design/trust-chain.md) — the provider-side chain the
+  gateway verifies per request on your behalf
+- [`../protocol/SPEC.md`](../protocol/SPEC.md) — the normative wire format: how
+  requests are sealed and responses proven
+- [`../deploy/phala/README.md`](../deploy/phala/README.md) — how the gateway is
+  deployed, from the operator's side

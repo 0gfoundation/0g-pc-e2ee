@@ -117,6 +117,11 @@ model, the control-plane / data-plane split, and the encryption-key lifecycle.
 
 ## Checking the trust chain yourself
 
+**If you are a user of a 0G-hosted gateway and want to verify it, start here:**
+[**docs/verifying-the-gateway.md**](../docs/verifying-the-gateway.md) — what each check
+proves, what you have to trust and what you do not, and the by-hand procedure for
+auditors who would rather not run our binary.
+
 `cmd/pcverify` is a read-only diagnostic with one mode per attested party:
 
 ```sh

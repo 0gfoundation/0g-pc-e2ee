@@ -344,9 +344,20 @@ does not.
 ## 11. Limitations & caveats
 
 - **Tier 2.5, not tier 3**: detection, not prevention; relies on someone running
-  validation (`pcverify -gateway`); default-trust for users who skip it. State this
-  in product copy — including that the endpoint binding is checkable today while
-  code identity still needs the manual `app-compose.json` step (§10 step 2).
+  validation (`pcverify -gateway`); default-trust for users who skip it. The
+  user-facing statement of exactly this — what a pass proves, what remains trusted,
+  and the current limits — is [`../verifying-the-gateway.md`](../verifying-the-gateway.md);
+  keep product copy consistent with it rather than restating it.
+- **The gateway CVM's own OS measurement is not yet pinned.** `mr_config_id` is
+  host-supplied, and what makes it truthful is the guest refusing to boot when it
+  disagrees with the real `app-compose.json`
+  (dstack `config_id_verifier.rs`) — a check whose integrity rests on `MRTD` /
+  `RTMR0`–`RTMR2` being the audited dstack OS. `pcverify` prints those registers but
+  compares them against nothing, so a modified OS image that skipped the check would
+  still pass. Closing it needs a reviewed dstack OS measurement allowlist committed
+  here (so no user supplies a value) — the same shape as the broker measurement
+  allowlist in `trust-chain.md` hop 3. Until then code identity is strong evidence,
+  not proof.
 - **Two enclaves see plaintext** (gateway + provider), vs one for direct-seal.
 - **Metadata** (model, sizes, timing) is visible as in the router path.
 - Cloud/runtime specifics marked **[verify]** must be confirmed against current

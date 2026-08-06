@@ -137,6 +137,11 @@ Attestation — this is the part that actually proves something. Fetching the
 bundle is not enough; the load-bearing step is comparing the **served**
 certificate with the one the quote commits to.
 
+> This section is the operator's view. The **user-facing** version — what each check
+> proves, which trust assumptions remain, and the by-hand procedure — is
+> [`docs/verifying-the-gateway.md`](../../docs/verifying-the-gateway.md). Point beta
+> users at that, not at this file.
+
 `pcverify -gateway` does all of that in one command — bundle integrity, DCAP
 verification of `quote.json`, the `report_data` binding, the served-certificate
 comparison, and code identity — and exits non-zero on any failed check, so it drops
