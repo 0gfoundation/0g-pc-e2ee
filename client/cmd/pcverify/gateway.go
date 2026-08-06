@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -31,6 +32,41 @@ type gatewayConfig struct {
 	releases           int
 	releaseRepo        string
 	releaseAsset       string
+	// releasesSet / expectComposeSet record whether the flag was PASSED, as opposed
+	// to holding its default. -releases defaults to a nonzero count, so the two have
+	// to be distinguished: an explicit request must win over the default and must be
+	// fatal when it cannot be satisfied, while the default degrades to advisory.
+	releasesSet      bool
+	expectComposeSet bool
+}
+
+// expectSource records how the "what should be running" side was resolved, so the
+// report can say what happened when it could not be.
+type expectSource struct {
+	// Label describes where the candidates came from, for the report.
+	Label string
+	// Err is set when the candidates could not be obtained. Advisory says the lookup
+	// was only the default, so a failure is reported without failing the run — the
+	// same rule DNS discovery follows.
+	Err      error
+	Advisory bool
+}
+
+// defaultReleases is how many published releases the compose text is matched against
+// when the operator says nothing. Enough to cover a rollback or a lagging side of a
+// blue/green pair, few enough that "matches none of them" stays a strong signal.
+const defaultReleases = 5
+
+// flagSet reports whether name was passed on the command line, rather than holding
+// its default.
+func flagSet(fs *flag.FlagSet, name string) bool {
+	seen := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			seen = true
+		}
+	})
+	return seen
 }
 
 // newEvidenceChecker builds the real checker: a DCAP verifier over the ingress
@@ -45,7 +81,8 @@ type gatewayConfig struct {
 // Unreadable -app-compose / -expect-compose-file paths are errors here rather than
 // silently-skipped checks: an operator who passed the flag asked for the check, and
 // quietly reporting a pass without it is the worst possible outcome.
-func newEvidenceChecker(ctx context.Context, out io.Writer, g gatewayConfig) (*evidence.Checker, error) {
+func newEvidenceChecker(ctx context.Context, out io.Writer, g gatewayConfig) (*evidence.Checker, expectSource, error) {
+	var expect expectSource
 	cfg := evidence.Config{
 		QuoteParser:        dcap.NewQuoteParser(dcap.Config{PCCSBaseURL: g.pccsURL}),
 		Timeout:            g.timeout,
@@ -56,34 +93,45 @@ func newEvidenceChecker(ctx context.Context, out io.Writer, g gatewayConfig) (*e
 	if p := strings.TrimSpace(g.appComposePath); p != "" {
 		b, err := os.ReadFile(p)
 		if err != nil {
-			return nil, fmt.Errorf("-app-compose: %w", err)
+			return nil, expect, fmt.Errorf("-app-compose: %w", err)
 		}
 		cfg.AppCompose = b
 	}
 
 	// The two ways to say what the compose text should be are different questions —
-	// "exactly this one" versus "any published release" — so requiring exactly one
-	// keeps the exit code unambiguous.
+	// "exactly this one" versus "any published release". Passing BOTH explicitly is
+	// ambiguous and rejected; -expect-compose-file otherwise simply wins over the
+	// -releases default, since naming a file is the more specific instruction.
 	pinned := strings.TrimSpace(g.expectComposePath) != ""
 	switch {
-	case pinned && g.releases > 0:
-		return nil, fmt.Errorf("-expect-compose-file pins one manifest and -releases matches a set; pass one")
+	case g.expectComposeSet && g.releasesSet:
+		return nil, expect, fmt.Errorf("-expect-compose-file pins one manifest and -releases matches a set; pass one")
 	case pinned:
 		b, err := os.ReadFile(g.expectComposePath)
 		if err != nil {
-			return nil, fmt.Errorf("-expect-compose-file: %w", err)
+			return nil, expect, fmt.Errorf("-expect-compose-file: %w", err)
 		}
 		cfg.ExpectComposeFiles = []evidence.ExpectedCompose{{Label: g.expectComposePath, Content: b}}
+		expect.Label = g.expectComposePath
 	case g.releases > 0:
-		repo, asset := g.releaseRepo, g.releaseAsset
-		fmt.Fprintf(out, "releases           newest %d of %s (%s)\n", g.releases, repo, asset)
-		files, err := fetchReleaseComposeFiles(ctx, newGitHubClient(g.timeout), repo, asset, g.releases, out)
-		if err != nil {
-			return nil, err
+		expect.Label = fmt.Sprintf("newest %d release(s) of %s (%s)", g.releases, g.releaseRepo, g.releaseAsset)
+		fmt.Fprintf(out, "expected compose   %s\n", expect.Label)
+		// Not explicitly asked for: the lookup reaches GitHub, and an unreachable or
+		// rate-limited API says nothing about the deployment. Degrade to advisory rather
+		// than fail, exactly as a DNS-discovered app-compose lookup does.
+		expect.Advisory = !g.releasesSet
+		files, err := fetchReleaseComposeFiles(ctx, newGitHubClient(g.timeout), g.releaseRepo, g.releaseAsset, g.releases, out)
+		switch {
+		case err != nil && expect.Advisory:
+			expect.Err = err
+		case err != nil:
+			return nil, expect, err
+		default:
+			cfg.ExpectComposeFiles = files
 		}
-		cfg.ExpectComposeFiles = files
 	}
-	return evidence.New(cfg)
+	c, err := evidence.New(cfg)
+	return c, expect, err
 }
 
 // reportGateway prints the per-step result of verifying a gateway's evidence
@@ -95,7 +143,7 @@ func newEvidenceChecker(ctx context.Context, out io.Writer, g gatewayConfig) (*e
 // (deploy/phala/README.md). It relaxes no attestation check, but it does narrow the
 // claim — an interceptor running its own attested CVM would satisfy everything
 // else — so a run that uses it prints that caveat rather than a bare PASS.
-func reportGateway(ctx context.Context, out io.Writer, ec evidenceChecker, domain string, allowUntrustedCert bool) int {
+func reportGateway(ctx context.Context, out io.Writer, ec evidenceChecker, domain string, allowUntrustedCert bool, expect expectSource) int {
 	rep, err := ec.Check(ctx, domain)
 	if err != nil {
 		fmt.Fprintf(out, "pcverify: %v\n", err)
@@ -190,7 +238,7 @@ func reportGateway(ctx context.Context, out io.Writer, ec evidenceChecker, domai
 	}
 
 	// Step 6 — code identity.
-	reportCodeIdentity(out, rep.Code)
+	reportCodeIdentity(out, rep.Code, expect)
 
 	fmt.Fprintf(out, "\nnote: %s\n", rep.Note)
 	// Waiving chain trust drops the link between this connection and the name that
@@ -222,7 +270,7 @@ func reportGateway(ctx context.Context, out io.Writer, ec evidenceChecker, domai
 // available even if nothing else was requested: they are reproducible values an
 // operator can record and compare across deploys, unlike the raw measurement
 // registers.
-func reportCodeIdentity(out io.Writer, code evidence.CodeIdentity) {
+func reportCodeIdentity(out io.Writer, code evidence.CodeIdentity, expect expectSource) {
 	if code.HashErr != nil {
 		fmt.Fprintf(out, "%s code identity      %v\n", mark(!code.Requested), code.HashErr)
 		return
@@ -261,7 +309,14 @@ func reportCodeIdentity(out io.Writer, code evidence.CodeIdentity) {
 	}
 
 	if !code.ExpectRequested {
-		fmt.Fprintf(out, "- compose file       not compared (pass -expect-compose-file or -releases N)\n")
+		switch {
+		case expect.Err != nil:
+			// The default lookup ran and failed. Say so — "not compared" alone would read
+			// as a choice rather than an outcome.
+			fmt.Fprintf(out, "- compose file       not compared: %v\n", expect.Err)
+		default:
+			fmt.Fprintf(out, "- compose file       not compared (-releases 0; pass -expect-compose-file or -releases N)\n")
+		}
 		return
 	}
 	if code.ExpectErr != nil {

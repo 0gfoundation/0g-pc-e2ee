@@ -326,11 +326,15 @@ does not.
    instead — a deploy record, a release asset, a copy-paste — because the compose
    hash anchors them; no Phala Cloud API access is required.
 
-   Naming what *should* be running is the one thing only the caller knows:
-   `-expect-compose-file` pins one manifest, `-releases N` accepts any of the newest
-   N published releases and reports which is live. DNS is used only to *locate* the
-   app-compose, never to decide anything — a wrong or hijacked answer yields a failed
-   lookup or a failed binding, never a false pass.
+   Naming what *should* be running defaults to the newest 5 published releases
+   (`-releases`), so the report says which release is live and flags "none of them";
+   `-expect-compose-file` overrides that with a single pinned manifest. Neither DNS
+   nor GitHub is trusted to decide anything: DNS only *locates* the app-compose (a
+   wrong or hijacked answer yields a failed lookup or a failed binding, never a false
+   pass), and a release asset is only ever compared against text the quote already
+   authenticated. Both lookups are advisory when they happen by default and fatal when
+   explicitly requested, so a network problem is never reported as a verification
+   failure — nor silently as a pass.
 3. **Publish `measurement ↔ cert` (transparency log / on-chain) + monitoring**,
    so cheating is publicly detectable without per-user effort.
 4. **Optional tier-3 path**: a WASM verify+seal SDK for clients that want

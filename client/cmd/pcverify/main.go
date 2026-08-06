@@ -46,11 +46,17 @@
 // bytes from a file instead; -base-domain overrides the derived domain;
 // -no-dns-discovery keeps the run to the endpoint and the inputs given.
 //
-// The last step is naming what SHOULD be running, which only the caller knows:
-// -expect-compose-file pins one manifest (a gate), while -releases N accepts any of
-// the newest N published releases and reports which one is live (discovery, whose
-// interesting answer is "none of them"). Without either, the compose hash and app_id
-// are still printed, but nothing says whether the configuration is the intended one.
+// The last step — what SHOULD be running — defaults to -releases 5: the deployment
+// matches if its compose text equals any of the newest 5 published releases, and the
+// report names which one (its interesting answer is "none of them").
+// -expect-compose-file overrides that with a single pinned manifest, a stricter gate;
+// -releases 0 skips the comparison entirely. Passing -expect-compose-file and an
+// explicit -releases together is rejected — they answer different questions.
+//
+// Because -releases has a default, its failure mode depends on whether it was asked
+// for: a GitHub lookup that fails on a DEFAULT run is advisory and does not fail the
+// run (an unreachable or rate-limited API says nothing about the deployment), while an
+// explicit -releases N that cannot be satisfied is fatal. Same rule as DNS discovery.
 //
 // -allow-untrusted-cert proceeds when the served certificate does not chain to a
 // public root, for ACME-staging deployments. It relaxes no attestation check — and
@@ -131,8 +137,8 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 	appCompose := fs.String("app-compose", "", "gateway mode: path to the CVM's app-compose.json, checked against the compose_hash the quote binds. Its source need not be trusted — the hash anchors it. Takes precedence over the guest-agent fetch")
 	baseDomain := fs.String("base-domain", "", "gateway mode: platform base domain (e.g. in1.phala.network) to fetch app-compose.json from the guest agent of the app_id the QUOTE names. Default: derived from the served domain's CNAME chain")
 	noDNSDiscovery := fs.Bool("no-dns-discovery", false, "gateway mode: do not derive the platform base domain from DNS; check only what was passed in")
-	expectComposeFile := fs.String("expect-compose-file", "", "gateway mode: path to the docker-compose manifest this deployment should be running (a digest-pinned docker-compose.release.yml), compared against the authenticated app-compose's docker_compose_file. Mutually exclusive with -releases")
-	releases := fs.Int("releases", 0, "gateway mode: instead of -expect-compose-file, accept the deployment if its compose text matches any of the newest N published releases, and report which one")
+	expectComposeFile := fs.String("expect-compose-file", "", "gateway mode: path to the docker-compose manifest this deployment should be running (a digest-pinned docker-compose.release.yml), compared against the authenticated app-compose's docker_compose_file. Overrides the default -releases lookup")
+	releases := fs.Int("releases", defaultReleases, "gateway mode: accept the deployment if its compose text matches any of the newest N published releases, and report which one. 0 disables the lookup")
 	releaseRepo := fs.String("repo", defaultReleaseRepo, "gateway mode: owner/name to read releases from, with -releases")
 	releaseAsset := fs.String("release-asset", defaultReleaseAsset, "gateway mode: release asset holding the deployment manifest, with -releases")
 	timeout := fs.Duration("timeout", 30*time.Second, "overall timeout")
@@ -167,16 +173,22 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 			releases:           *releases,
 			releaseRepo:        *releaseRepo,
 			releaseAsset:       *releaseAsset,
+			// Whether a flag was PASSED, not just what it holds: -releases has a nonzero
+			// default, so "the operator asked for this" and "this is what the default does"
+			// have to be told apart — it decides both which expectation wins and whether a
+			// failed release lookup is fatal.
+			releasesSet:      flagSet(fs, "releases"),
+			expectComposeSet: flagSet(fs, "expect-compose-file"),
 		}
-		// The release lookup happens inside Build, so it shares the run's deadline.
+		// The release lookup happens during construction, so it shares the run's deadline.
 		ctx, cancel := context.WithTimeout(ctx, *timeout)
 		defer cancel()
-		ec, err := newEvidenceChecker(ctx, out, gcfg)
+		ec, expect, err := newEvidenceChecker(ctx, out, gcfg)
 		if err != nil {
 			fmt.Fprintf(out, "pcverify: %v\n", err)
 			return 2
 		}
-		return reportGateway(ctx, out, ec, *gateway, *allowUntrustedCert)
+		return reportGateway(ctx, out, ec, *gateway, *allowUntrustedCert, expect)
 	}
 
 	reg, err := chain.NewOnChainRegistry(chain.Config{RPCURL: *chainRPCURL, ContractAddress: *servingContract})

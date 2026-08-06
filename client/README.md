@@ -131,15 +131,15 @@ CVM's `app-compose.json` — establishes which configuration booted and whether 
 compose text is the manifest you published (`evidence/`):
 
 ```sh
-pcverify -gateway <domain>                    # incl. code identity, no extra args
-pcverify -gateway <domain> -releases 5        # …and which published release is live
+pcverify -gateway <domain>   # the whole chain, incl. which release is live
 ```
 
 `compose_hash` comes from the verified quote's `mr_config_id`; the platform base
 domain is derived from the served domain's CNAME chain and the `app_id` from the
 quote, so the app-compose is located without anything being typed in — and its bytes
-can come from anywhere (`-app-compose <file>`), because the hash anchors them.
-`-expect-compose-file` pins one manifest instead of a set.
+can come from anywhere (`-app-compose <file>`), because the hash anchors them. The
+compose text is then matched against the newest 5 published releases by default
+(`-releases N`, `0` to disable); `-expect-compose-file` pins one manifest instead.
 
 Both modes exit non-zero on a failed check, so either works as a deploy gate. See
 [`docs/design/cloud-gateway.md`](../docs/design/cloud-gateway.md) §10 for what the

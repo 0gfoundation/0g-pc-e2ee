@@ -202,10 +202,12 @@ func TestNewEvidenceChecker_RejectsBothExpectForms(t *testing.T) {
 	if err := os.WriteFile(path, []byte("services: {}\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err := newEvidenceChecker(context.Background(), &bytes.Buffer{}, gatewayConfig{
+	_, _, err := newEvidenceChecker(context.Background(), &bytes.Buffer{}, gatewayConfig{
 		timeout:           10 * time.Second,
 		expectComposePath: path,
+		expectComposeSet:  true,
 		releases:          3,
+		releasesSet:       true,
 	})
 	if err == nil || !strings.Contains(err.Error(), "pass one") {
 		t.Errorf("err = %v, want a complaint that both were given", err)
@@ -219,9 +221,99 @@ func TestNewEvidenceChecker_UnreadablePathsAreErrors(t *testing.T) {
 		"expect-compose-file": {timeout: time.Second, expectComposePath: missing},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if _, err := newEvidenceChecker(context.Background(), &bytes.Buffer{}, g); err == nil {
+			if _, _, err := newEvidenceChecker(context.Background(), &bytes.Buffer{}, g); err == nil {
 				t.Error("a flag that was passed but cannot be read must be an error, not a skipped check")
 			}
 		})
+	}
+}
+
+// -releases has a nonzero default, so its failure mode has to depend on whether the
+// operator actually asked. A default lookup that cannot reach GitHub says nothing
+// about the deployment and must not fail the run; an explicit one must.
+func TestNewEvidenceChecker_ReleaseLookupFailure(t *testing.T) {
+	// A server that 500s on the releases listing.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+	old := githubAPI
+	githubAPI = srv.URL
+	t.Cleanup(func() { githubAPI = old })
+
+	base := gatewayConfig{timeout: 10 * time.Second, releases: defaultReleases,
+		releaseRepo: defaultReleaseRepo, releaseAsset: defaultReleaseAsset}
+
+	t.Run("default is advisory", func(t *testing.T) {
+		g := base // releasesSet stays false
+		c, expect, err := newEvidenceChecker(context.Background(), &bytes.Buffer{}, g)
+		if err != nil {
+			t.Fatalf("a default lookup failure must not be fatal, got: %v", err)
+		}
+		if c == nil {
+			t.Fatal("no checker returned")
+		}
+		if expect.Err == nil {
+			t.Error("the failure must still be recorded so the report can state it")
+		}
+		if !expect.Advisory {
+			t.Error("Advisory = false for a lookup that was never requested")
+		}
+	})
+
+	t.Run("explicit is fatal", func(t *testing.T) {
+		g := base
+		g.releasesSet = true
+		if _, _, err := newEvidenceChecker(context.Background(), &bytes.Buffer{}, g); err == nil {
+			t.Error("an explicitly requested lookup that failed must be fatal")
+		}
+	})
+}
+
+// Naming a file is the more specific instruction, so it wins over the -releases
+// default without an error — only two EXPLICIT flags conflict.
+func TestNewEvidenceChecker_PinnedFileBeatsDefaultReleases(t *testing.T) {
+	path := t.TempDir() + "/compose.yml"
+	if err := os.WriteFile(path, []byte("services: {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// No GitHub server registered: if the release lookup ran, this would fail.
+	old := githubAPI
+	githubAPI = "http://127.0.0.1:0"
+	t.Cleanup(func() { githubAPI = old })
+
+	_, expect, err := newEvidenceChecker(context.Background(), &bytes.Buffer{}, gatewayConfig{
+		timeout:           10 * time.Second,
+		expectComposePath: path,
+		expectComposeSet:  true,
+		releases:          defaultReleases, // the default, not passed
+		releaseRepo:       defaultReleaseRepo,
+		releaseAsset:      defaultReleaseAsset,
+	})
+	if err != nil {
+		t.Fatalf("newEvidenceChecker: %v", err)
+	}
+	if expect.Label != path {
+		t.Errorf("Label = %q, want the pinned file %q", expect.Label, path)
+	}
+	if expect.Err != nil {
+		t.Errorf("the release lookup should not have run: %v", expect.Err)
+	}
+}
+
+// -releases 0 turns the lookup off entirely.
+func TestNewEvidenceChecker_ReleasesZeroDisables(t *testing.T) {
+	old := githubAPI
+	githubAPI = "http://127.0.0.1:0" // any lookup would fail
+	t.Cleanup(func() { githubAPI = old })
+
+	_, expect, err := newEvidenceChecker(context.Background(), &bytes.Buffer{}, gatewayConfig{
+		timeout: 10 * time.Second, releases: 0, releasesSet: true,
+	})
+	if err != nil {
+		t.Fatalf("newEvidenceChecker: %v", err)
+	}
+	if expect.Label != "" || expect.Err != nil {
+		t.Errorf("expected no expectation source, got %+v", expect)
 	}
 }

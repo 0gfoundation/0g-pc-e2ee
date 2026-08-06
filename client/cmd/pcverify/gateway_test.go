@@ -86,7 +86,7 @@ func TestReportGateway(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var out bytes.Buffer
-			code := reportGateway(context.Background(), &out, stubEvidence{rep: tc.rep}, "pc-gateway.test", tc.allowUntrusted)
+			code := reportGateway(context.Background(), &out, stubEvidence{rep: tc.rep}, "pc-gateway.test", tc.allowUntrusted, expectSource{})
 			if code != tc.wantCode {
 				t.Errorf("code = %d, want %d\n%s", code, tc.wantCode, out.String())
 			}
@@ -105,7 +105,7 @@ func TestReportGateway_WaivedTrustWarns(t *testing.T) {
 	rep.ChainTrustErr = errors.New("x509: certificate signed by unknown authority")
 
 	var out bytes.Buffer
-	if code := reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", true); code != 0 {
+	if code := reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", true, expectSource{}); code != 0 {
 		t.Fatalf("code = %d, want 0\n%s", code, out.String())
 	}
 	for _, want := range []string{"warning", "waived", "does NOT establish"} {
@@ -118,7 +118,7 @@ func TestReportGateway_WaivedTrustWarns(t *testing.T) {
 // …and a run whose trust actually validates must NOT print that warning.
 func TestReportGateway_TrustedRunHasNoWarning(t *testing.T) {
 	var out bytes.Buffer
-	if code := reportGateway(context.Background(), &out, stubEvidence{rep: passing()}, "pc-gateway.test", true); code != 0 {
+	if code := reportGateway(context.Background(), &out, stubEvidence{rep: passing()}, "pc-gateway.test", true, expectSource{}); code != 0 {
 		t.Fatalf("code = %d, want 0\n%s", code, out.String())
 	}
 	if strings.Contains(out.String(), "warning") {
@@ -133,7 +133,7 @@ func TestReportGateway_PassStatesTheCodeIdentityGap(t *testing.T) {
 	rep.Note = "code identity (app_id) is NOT checked here — replay the event log"
 
 	var out bytes.Buffer
-	if code := reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", false); code != 0 {
+	if code := reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", false, expectSource{}); code != 0 {
 		t.Fatalf("code = %d, want 0\n%s", code, out.String())
 	}
 	if !strings.Contains(out.String(), "app_id") {
@@ -144,7 +144,7 @@ func TestReportGateway_PassStatesTheCodeIdentityGap(t *testing.T) {
 // An unusable domain is a caller error (exit 2), not a failed check (exit 1).
 func TestReportGateway_CheckerError(t *testing.T) {
 	var out bytes.Buffer
-	code := reportGateway(context.Background(), &out, stubEvidence{err: errors.New("evidence: empty domain")}, "", false)
+	code := reportGateway(context.Background(), &out, stubEvidence{err: errors.New("evidence: empty domain")}, "", false, expectSource{})
 	if code != 2 {
 		t.Errorf("code = %d, want 2\n%s", code, out.String())
 	}
@@ -182,7 +182,8 @@ func TestRun_PCCSURLAppliesToBothModes(t *testing.T) {
 		// chain lookup against a dead RPC is what decides the exit code.
 		{"provider mode", []string{"-provider", prov, "-no-quote", "-pccs-url", mirror,
 			"-chain-rpc-url", "http://127.0.0.1:0", "-timeout", "2s"}},
-		{"gateway mode", []string{"-gateway", "gateway.invalid", "-pccs-url", mirror, "-timeout", "2s"}},
+		// -releases 0 keeps this off GitHub; the default lookup is covered separately.
+		{"gateway mode", []string{"-gateway", "gateway.invalid", "-pccs-url", mirror, "-timeout", "2s", "-releases", "0"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -203,6 +204,7 @@ func TestRun_GatewayModeNeedsNoChain(t *testing.T) {
 		"-gateway", "gateway.invalid",
 		"-chain-rpc-url", "http://127.0.0.1:0",
 		"-timeout", "2s",
+		"-releases", "0", // no GitHub lookup; this test is about the chain flags
 	})
 	if code != 1 {
 		t.Errorf("exit = %d, want 1 (a failed check)\n%s", code, out.String())

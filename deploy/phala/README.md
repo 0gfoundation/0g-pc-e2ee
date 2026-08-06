@@ -143,26 +143,35 @@ comparison, and code identity — and exits non-zero on any failed check, so it 
 into a deploy gate:
 
 ```sh
-# Everything it can do unaided: it derives the platform base domain from the served
-# domain's CNAME chain and fetches app-compose.json for the app_id the quote names,
-# so compose_hash resolves to an actual configuration with no extra arguments.
+# The whole chain, no extra arguments: it derives the platform base domain from the
+# served domain's CNAME chain, fetches app-compose.json for the app_id the quote
+# names, and matches the compose text against the newest 5 published releases.
 go run ./client/cmd/pcverify -gateway <DOMAIN> -pccs-url https://pccs.phala.network
-
-# …and close the last step by naming what SHOULD be running. Either the exact
-# manifest you deployed (a gate):
-go run ./client/cmd/pcverify -gateway <DOMAIN> -pccs-url https://pccs.phala.network \
-  -expect-compose-file docker-compose.release.yml
-
-# …or "any of the newest N published releases", which also reports WHICH one is live
-# — and whose interesting answer is "none of them":
-go run ./client/cmd/pcverify -gateway <DOMAIN> -pccs-url https://pccs.phala.network \
-  -releases 5
 ```
 
-`-releases` reads the `docker-compose.release.yml` asset from the newest N published
-releases of this repo (`-repo` / `-release-asset` to override; drafts and prereleases
-are skipped). The repo is public, so no credentials are needed — set `GITHUB_TOKEN`
-only for a private repo or to lift the unauthenticated rate limit.
+The last step defaults to `-releases 5`: the `docker-compose.release.yml` asset from
+the newest 5 published releases of this repo (`-repo` / `-release-asset` to override;
+drafts and prereleases are skipped). It reports **which** release is live, and its
+interesting answer is "none of them". The repo is public, so no credentials are
+needed — set `GITHUB_TOKEN` only for a private repo or to lift the unauthenticated
+rate limit.
+
+Two ways to change what the compose text is compared against:
+
+```sh
+# a gate: it must be exactly the manifest you deployed
+… -expect-compose-file docker-compose.release.yml
+
+# no comparison at all (offline, or GitHub deliberately out of the loop)
+… -releases 0
+```
+
+Because `-releases` has a default, its failure mode depends on whether you asked for
+it: an unreachable or rate-limited GitHub on a **default** run is reported as
+advisory (`-`) and does not fail, since it says nothing about the deployment, while an
+explicit `-releases N` that cannot be satisfied is fatal. Passing
+`-expect-compose-file` simply overrides the default; passing it *and* an explicit
+`-releases` is rejected, since they answer different questions.
 
 Nothing about the app-compose lookup has to be typed in: the base domain comes from
 DNS (`-base-domain` overrides it, `-no-dns-discovery` turns it off) and the `app_id`
