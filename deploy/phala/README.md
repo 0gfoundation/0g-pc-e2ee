@@ -361,6 +361,24 @@ and warmer liveness).
   the container. Since the *measured* text is the `${…}` form, staging and
   production share `app_id`; that is safe only because the router is untrusted by
   construction (see the provider-verification note below).
+- **Browser origins (CORS).** The gateway answers cross-origin browser calls only
+  from the origins in `ZG_GATEWAY_ALLOWED_ORIGINS`, whose compose default is the 0G
+  first-party app origins — a page allowed to call the router directly can point its
+  base URL at this gateway instead — and deliberately *not* every origin the router
+  accepts, since its list also carries third-party-hosted preview/deploy origins
+  that do not get to drive sealed inference through an enclave by default. The list is
+  spelled out in the measured compose text on purpose (which web origins may drive
+  sealed inference through the enclave is trust-relevant, so `app_id` should commit
+  to it), and the `${…}` form still lets an **encrypted-environment** override win
+  at boot, provided the variable is listed in `allowed_envs`. Patterns are exact
+  origins, a leading `*.` wildcard (`https://*.0g.ai` — subdomains only, never the
+  apex, which must be listed separately), or `*` for any; an empty value allows no
+  origin and turns browser access off, and a malformed pattern (a trailing slash, a
+  missing scheme) fails the boot rather than silently blocking the app it was meant
+  to allow. Non-browser callers (SDKs, server-side code, `curl`) send no `Origin`
+  header and are unaffected by any of this. The default carries two `localhost`
+  ports as development conveniences — drop them via the override on a deployment
+  that does not need dev hosts reaching this enclave.
 - **Provider verification** is on in verify-and-warn mode. Each provider's TDX
   quote is DCAP-verified (`ZG_GATEWAY_ATTEST`), its quote-bound signer is
   cross-checked against the on-chain `teeSignerAddress`

@@ -194,6 +194,25 @@ services:
       # on-chain signer (ATTEST/ONCHAIN below), so a swapped router cannot forge a
       # provider; the blast radius is routing/availability, not confidentiality.
       - "ZG_GATEWAY_ROUTER_URL=${ZG_GATEWAY_ROUTER_URL:-https://router-api.0g.ai}"
+      # Browser origin allowlist (CORS). Spelled out here rather than left to the
+      # binary's built-in default precisely BECAUSE this block is measured: which
+      # web origins may drive sealed inference through this enclave is a
+      # trust-relevant parameter, so app_id should commit to the list a reader can
+      # see, not to "whatever the image happens to default to". Keep it in sync with
+      # openaiproxy.DefaultAllowedOriginsCSV: the 0G first-party app origins, so a
+      # page allowed to call the router directly can swap its base URL to this
+      # gateway, and deliberately NOT every origin the router accepts (its list also
+      # carries third-party-hosted preview/deploy origins, which don't get to drive
+      # sealed inference through an enclave by default). The ${...} form lets an
+      # encrypted-env override win at boot without changing app_id — list
+      # ZG_GATEWAY_ALLOWED_ORIGINS in allowed_envs or dstack drops it. An empty value
+      # allows no origin, which turns browser access off entirely (SDK / server-side
+      # callers are unaffected: they send no Origin header).
+      #
+      # NOTE the localhost entries are development conveniences: they let a page
+      # served from a developer's machine seal through this enclave. Drop them via
+      # the override for any deployment that does not need that.
+      - "ZG_GATEWAY_ALLOWED_ORIGINS=${ZG_GATEWAY_ALLOWED_ORIGINS:-https://0g.ai,https://*.0g.ai,http://localhost:3000,http://localhost:5173}"
       # Request fields sealed end-to-end to the provider (must include
       # "messages"). Defaults to the binary's built-in set; uncomment to override.
       # - "ZG_GATEWAY_SEAL_FIELDS=messages"
