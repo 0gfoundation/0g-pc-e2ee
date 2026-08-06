@@ -39,21 +39,97 @@ const DefaultAllowedOriginsCSV = "https://0g.ai,https://*.0g.ai,http://localhost
 // so every other verb has to be named.
 const corsAllowMethods = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
 
-// corsAllowHeaders is the preflight's Access-Control-Allow-Headers: the router's
-// own list plus the two headers only the gateway sees.
+// corsAllowHeaders is the FIXED part of the preflight's Access-Control-Allow-Headers:
+// the router's own list, the two headers only the gateway sees, and every routing
+// directive the router consumes today.
 //
 //   - x-api-key — the Anthropic-convention credential this proxy accepts
 //     alongside Authorization (see credential()). The router does not list it;
 //     the gateway must, or an Anthropic-SDK-shaped browser call fails preflight.
 //   - X-Request-Id — honored inbound for cross-hop correlation (see accesslog.go).
+//   - The Max-Price-Usd caps are header-only on the router (no body equivalent), so
+//     omitting them here does not merely make a header awkward to send — it puts
+//     price ceilings entirely out of reach of a browser client.
 //
-// The X-0G-* routing directives are listed individually rather than by prefix
-// because Access-Control-Allow-Headers has no wildcard-per-prefix form; a new
-// forwarded directive (routingHeaders forwards the whole X-0G-* namespace) needs
-// its name added here before a browser can send it.
+// Access-Control-Allow-Headers has no wildcard-per-prefix form, so these are named
+// individually. That enumeration is a drift hazard on its own — routingHeaders
+// forwards the whole X-0G-* namespace by PREFIX, so any directive the router adds
+// later would be forwarded by the gateway yet rejected at the browser's preflight,
+// which surfaces as fetch() failing with no status on the wire. allowHeadersFor
+// closes that gap by also echoing requested names in the namespace; this list stays
+// so the supported directives are advertised even to a preflight that asks for none.
 const corsAllowHeaders = "Origin, Content-Type, Authorization, x-api-key, X-Request-Id, " +
 	"X-0G-Source-Id, HTTP-Referer, X-Title, " +
-	"X-0G-Provider-Address, X-0G-Provider-Sort, X-0G-Provider-Trust-Mode, X-0G-Provider-Allow-Fallbacks"
+	"X-0G-Provider-Address, X-0G-Provider-Sort, X-0G-Provider-Trust-Mode, X-0G-Provider-Allow-Fallbacks, " +
+	"X-0G-Provider-Require-Parameters, X-0G-Provider-Max-Price-Usd-Prompt, " +
+	"X-0G-Provider-Max-Price-Usd-Completion, X-0G-Provider-Max-Price-Usd-Image"
+
+// corsFixedAllowHeaderSet indexes corsAllowHeaders for case-insensitive lookup, so
+// allowHeadersFor does not repeat a name the fixed list already advertises.
+var corsFixedAllowHeaderSet = func() map[string]bool {
+	m := make(map[string]bool)
+	for _, name := range strings.Split(corsAllowHeaders, ", ") {
+		m[strings.ToLower(name)] = true
+	}
+	return m
+}()
+
+// allowHeadersFor builds the Access-Control-Allow-Headers answer for a preflight
+// whose Access-Control-Request-Headers was `requested`: the fixed list, plus any
+// requested name in the router-owned X-0G-* namespace that the list does not
+// already carry.
+//
+// This makes the preflight answer follow the SAME rule as the forwarding it
+// authorizes — routingHeaders forwards on the x-0g- prefix, so a browser may send
+// on that prefix — instead of a hand-maintained list that silently falls behind the
+// router. Echoing is safe here: the namespace is cleartext routing directives with
+// no authority a non-browser caller does not already have, the gateway forwards
+// nothing outside it, and the response already carries Vary:
+// Access-Control-Request-Headers so a cache cannot serve one request's answer to
+// another. Names are filtered to valid HTTP tokens before being reflected.
+func allowHeadersFor(requested string) string {
+	if requested == "" {
+		return corsAllowHeaders
+	}
+	var extra []string
+	seen := make(map[string]bool)
+	for _, name := range strings.Split(requested, ",") {
+		name = strings.TrimSpace(name)
+		lower := strings.ToLower(name)
+		if !strings.HasPrefix(lower, routingHeaderPrefix) || corsFixedAllowHeaderSet[lower] || seen[lower] {
+			continue
+		}
+		if !isHeaderToken(name) {
+			continue
+		}
+		seen[lower] = true
+		extra = append(extra, name)
+	}
+	if len(extra) == 0 {
+		return corsAllowHeaders
+	}
+	return corsAllowHeaders + ", " + strings.Join(extra, ", ")
+}
+
+// isHeaderToken reports whether s is a valid HTTP field name (RFC 9110 token). The
+// preflight reflects caller-controlled names, so anything outside the token set is
+// dropped rather than echoed — net/http would sanitize a stray CR/LF on write, but
+// the filter keeps junk out of the response in the first place.
+func isHeaderToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case strings.IndexByte("!#$%&'*+-.^_`|~", c) >= 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
 
 // corsMaxAge lets a browser cache one preflight for 12h (the router's value), so
 // a chatting page pays the extra round trip once rather than per request.
@@ -222,7 +298,7 @@ func CORS(origins []string, h http.Handler) http.Handler {
 			w.Header().Add("Vary", "Access-Control-Request-Method")
 			w.Header().Add("Vary", "Access-Control-Request-Headers")
 			w.Header().Set("Access-Control-Allow-Methods", corsAllowMethods)
-			w.Header().Set("Access-Control-Allow-Headers", corsAllowHeaders)
+			w.Header().Set("Access-Control-Allow-Headers", allowHeadersFor(r.Header.Get("Access-Control-Request-Headers")))
 			w.Header().Set("Access-Control-Max-Age", corsMaxAge)
 			w.WriteHeader(http.StatusNoContent)
 			return

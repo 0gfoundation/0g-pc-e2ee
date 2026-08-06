@@ -69,15 +69,81 @@ func TestCORSPreflightAllowed(t *testing.T) {
 	// Both credential spellings and the routing directives must be preflight-able,
 	// or the corresponding browser call never leaves the page.
 	headers := strings.ToLower(rec.Header().Get("Access-Control-Allow-Headers"))
-	for _, name := range []string{"authorization", "x-api-key", "content-type", "x-0g-provider-address", "http-referer"} {
+	for _, name := range []string{"authorization", "x-api-key", "content-type", "http-referer"} {
 		if !strings.Contains(headers, name) {
 			t.Errorf("Allow-Headers %q missing %s", headers, name)
+		}
+	}
+	// Every routing directive the router consumes must be preflight-able. The
+	// Max-Price-Usd caps are header-only upstream (no body equivalent), so leaving
+	// one out does not just make a header awkward to send — it puts price ceilings
+	// out of reach of browser clients entirely.
+	for _, name := range []string{
+		"x-0g-source-id",
+		"x-0g-provider-address",
+		"x-0g-provider-sort",
+		"x-0g-provider-trust-mode",
+		"x-0g-provider-allow-fallbacks",
+		"x-0g-provider-require-parameters",
+		"x-0g-provider-max-price-usd-prompt",
+		"x-0g-provider-max-price-usd-completion",
+		"x-0g-provider-max-price-usd-image",
+	} {
+		if !strings.Contains(headers, name) {
+			t.Errorf("Allow-Headers %q missing routing directive %s", headers, name)
 		}
 	}
 	vary := rec.Header().Values("Vary")
 	for _, want := range []string{"Origin", "Access-Control-Request-Method", "Access-Control-Request-Headers"} {
 		if !containsValue(vary, want) {
 			t.Errorf("Vary %v missing %s", vary, want)
+		}
+	}
+}
+
+// The preflight answer must follow the same rule as the forwarding it authorizes:
+// routingHeaders forwards on the x-0g- PREFIX, so a directive the router adds later
+// — one this test cannot know the name of — must be preflight-able without a code
+// change here, while a header outside the namespace stays unadvertised.
+func TestCORSPreflightEchoesRoutingNamespace(t *testing.T) {
+	h, _ := corsHandler(ParseOrigins(DefaultAllowedOriginsCSV))
+	r := preflight("https://chat.0g.ai")
+	r.Header.Set("Access-Control-Request-Headers",
+		"authorization, X-0G-Provider-Future-Directive, x-not-forwarded, X-0G-Provider-Address")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+
+	allow := rec.Header().Get("Access-Control-Allow-Headers")
+	if !strings.Contains(allow, "X-0G-Provider-Future-Directive") {
+		t.Errorf("Allow-Headers %q: an unknown X-0G-* directive must be echoed — the gateway "+
+			"forwards the whole namespace, so a browser must be allowed to send it", allow)
+	}
+	if strings.Contains(strings.ToLower(allow), "x-not-forwarded") {
+		t.Errorf("Allow-Headers %q: a header outside the X-0G-* namespace must not be echoed "+
+			"(the gateway would not forward it anyway)", allow)
+	}
+	// A name already in the fixed list must not be repeated.
+	if n := strings.Count(strings.ToLower(allow), "x-0g-provider-address"); n != 1 {
+		t.Errorf("Allow-Headers %q: x-0g-provider-address appears %d times, want 1", allow, n)
+	}
+}
+
+// Reflected names are caller-controlled, so anything that is not a valid HTTP token
+// is dropped rather than echoed into the response.
+func TestCORSPreflightRejectsNonTokenHeaderNames(t *testing.T) {
+	h, _ := corsHandler(ParseOrigins(DefaultAllowedOriginsCSV))
+	r := preflight("https://chat.0g.ai")
+	r.Header.Set("Access-Control-Request-Headers", "x-0g-bad\r\nInjected: yes, x-0g-also bad, x-0g-good")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+
+	allow := rec.Header().Get("Access-Control-Allow-Headers")
+	if !strings.Contains(allow, "x-0g-good") {
+		t.Errorf("Allow-Headers %q dropped the valid token", allow)
+	}
+	for _, bad := range []string{"Injected", "also bad"} {
+		if strings.Contains(allow, bad) {
+			t.Errorf("Allow-Headers %q echoed a non-token name (%q)", allow, bad)
 		}
 	}
 }
