@@ -101,30 +101,91 @@ func TestCORSPreflightAllowed(t *testing.T) {
 	}
 }
 
-// The preflight answer must follow the same rule as the forwarding it authorizes:
-// routingHeaders forwards on the x-0g- PREFIX, so a directive the router adds later
-// — one this test cannot know the name of — must be preflight-able without a code
-// change here, while a header outside the namespace stays unadvertised.
-func TestCORSPreflightEchoesRoutingNamespace(t *testing.T) {
+// The client this form exists for is an UNMODIFIED OpenAI / Anthropic SDK pointed
+// at the gateway's base URL (docs/design/cloud-gateway.md §1). Those SDKs attach
+// their own telemetry and protocol headers to every request, and a browser refuses
+// to send the real request unless the preflight response allows EVERY name it
+// listed — so anything short of granting them blocks the SDK outright rather than
+// merely dropping its telemetry.
+func TestCORSPreflightAllowsSDKHeaders(t *testing.T) {
+	// The headers openai-node and @anthropic-ai/sdk actually send from a browser.
+	sdkHeaders := []string{
+		"x-stainless-lang",
+		"x-stainless-package-version",
+		"x-stainless-os",
+		"x-stainless-arch",
+		"x-stainless-runtime",
+		"x-stainless-runtime-version",
+		"x-stainless-retry-count",
+		"x-stainless-timeout",
+		"anthropic-version",
+		"anthropic-dangerous-direct-browser-access",
+		"openai-organization",
+		"openai-project",
+		"openai-beta",
+	}
 	h, _ := corsHandler(ParseOrigins(DefaultAllowedOriginsCSV))
 	r := preflight("https://chat.0g.ai")
 	r.Header.Set("Access-Control-Request-Headers",
-		"authorization, X-0G-Provider-Future-Directive, x-not-forwarded, X-0G-Provider-Address")
+		"authorization, content-type, "+strings.Join(sdkHeaders, ", "))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, r)
+
+	allow := strings.ToLower(rec.Header().Get("Access-Control-Allow-Headers"))
+	for _, name := range sdkHeaders {
+		if !strings.Contains(allow, name) {
+			t.Errorf("Allow-Headers %q missing %s — the browser would refuse to send the real request", allow, name)
+		}
+	}
+}
+
+// A directive the router adds later — one this test cannot know the name of — must
+// be preflight-able without a code change here, and a name already in the fixed
+// list must not be repeated.
+func TestCORSPreflightEchoesUnknownHeaders(t *testing.T) {
+	h, _ := corsHandler(ParseOrigins(DefaultAllowedOriginsCSV))
+	r := preflight("https://chat.0g.ai")
+	r.Header.Set("Access-Control-Request-Headers",
+		"authorization, X-0G-Provider-Future-Directive, X-0G-Provider-Address")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, r)
 
 	allow := rec.Header().Get("Access-Control-Allow-Headers")
 	if !strings.Contains(allow, "X-0G-Provider-Future-Directive") {
-		t.Errorf("Allow-Headers %q: an unknown X-0G-* directive must be echoed — the gateway "+
+		t.Errorf("Allow-Headers %q: an unknown X-0G-* directive must be granted — the gateway "+
 			"forwards the whole namespace, so a browser must be allowed to send it", allow)
 	}
-	if strings.Contains(strings.ToLower(allow), "x-not-forwarded") {
-		t.Errorf("Allow-Headers %q: a header outside the X-0G-* namespace must not be echoed "+
-			"(the gateway would not forward it anyway)", allow)
-	}
-	// A name already in the fixed list must not be repeated.
 	if n := strings.Count(strings.ToLower(allow), "x-0g-provider-address"); n != 1 {
 		t.Errorf("Allow-Headers %q: x-0g-provider-address appears %d times, want 1", allow, n)
+	}
+}
+
+// Granting a header a browser may SEND is not the same as forwarding it: what
+// leaves the gateway for the untrusted router stays restricted to the X-0G-*
+// namespace and the attribution headers, enforced server-side by routingHeaders.
+// This pins that boundary, since the preflight no longer narrows it.
+func TestPreflightGrantDoesNotWidenForwarding(t *testing.T) {
+	h := http.Header{}
+	h.Set("Authorization", "Bearer sk-test")
+	h.Set("X-Stainless-Lang", "js")
+	h.Set("Anthropic-Version", "2023-06-01")
+	h.Set("Cookie", "session=abc")
+	h.Set("X-0G-Provider-Sort", "price")
+	h.Set("HTTP-Referer", "https://chat.0g.ai")
+
+	fwd := routingHeaders(h)
+
+	if got := fwd.Get("X-0G-Provider-Sort"); got != "price" {
+		t.Errorf("routing directive not forwarded: %q", got)
+	}
+	if got := fwd.Get("HTTP-Referer"); got != "https://chat.0g.ai" {
+		t.Errorf("attribution header not forwarded: %q", got)
+	}
+	for _, name := range []string{"Authorization", "X-Stainless-Lang", "Anthropic-Version", "Cookie"} {
+		if v := fwd.Get(name); v != "" {
+			t.Errorf("%s reached the router (%q); allowing a browser to send a header must not "+
+				"widen what the gateway forwards", name, v)
+		}
 	}
 }
 

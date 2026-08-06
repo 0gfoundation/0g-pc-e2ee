@@ -51,13 +51,11 @@ const corsAllowMethods = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
 //     omitting them here does not merely make a header awkward to send — it puts
 //     price ceilings entirely out of reach of a browser client.
 //
-// Access-Control-Allow-Headers has no wildcard-per-prefix form, so these are named
-// individually. That enumeration is a drift hazard on its own — routingHeaders
-// forwards the whole X-0G-* namespace by PREFIX, so any directive the router adds
-// later would be forwarded by the gateway yet rejected at the browser's preflight,
-// which surfaces as fetch() failing with no status on the wire. allowHeadersFor
-// closes that gap by also echoing requested names in the namespace; this list stays
-// so the supported directives are advertised even to a preflight that asks for none.
+// This list is the BASELINE advertisement, not the limit: allowHeadersFor also
+// grants whatever else a preflight asks for (see there for why that is safe, and
+// for the two conditions that would require narrowing it). Keeping the known names
+// here means a preflight that requests nothing still shows a client which routing
+// directives exist, and it documents them next to the code that forwards them.
 const corsAllowHeaders = "Origin, Content-Type, Authorization, x-api-key, X-Request-Id, " +
 	"X-0G-Source-Id, HTTP-Referer, X-Title, " +
 	"X-0G-Provider-Address, X-0G-Provider-Sort, X-0G-Provider-Trust-Mode, X-0G-Provider-Allow-Fallbacks, " +
@@ -75,18 +73,35 @@ var corsFixedAllowHeaderSet = func() map[string]bool {
 }()
 
 // allowHeadersFor builds the Access-Control-Allow-Headers answer for a preflight
-// whose Access-Control-Request-Headers was `requested`: the fixed list, plus any
-// requested name in the router-owned X-0G-* namespace that the list does not
-// already carry.
+// whose Access-Control-Request-Headers was `requested`: the fixed list above, plus
+// every OTHER requested name that is a valid HTTP token.
 //
-// This makes the preflight answer follow the SAME rule as the forwarding it
-// authorizes — routingHeaders forwards on the x-0g- prefix, so a browser may send
-// on that prefix — instead of a hand-maintained list that silently falls behind the
-// router. Echoing is safe here: the namespace is cleartext routing directives with
-// no authority a non-browser caller does not already have, the gateway forwards
-// nothing outside it, and the response already carries Vary:
-// Access-Control-Request-Headers so a cache cannot serve one request's answer to
-// another. Names are filtered to valid HTTP tokens before being reflected.
+// It grants what the caller asked for because an ALLOWLIST HERE PROTECTS NOTHING.
+// Access-Control-Allow-Headers constrains browsers only — any non-browser caller
+// sends whatever headers it likes — while the constraint that actually matters,
+// "what leaves this gateway for the untrusted router", is enforced server-side by
+// routingHeaders, which forwards only the X-0G-* namespace and the attribution
+// headers and drops everything else. A name allowed here that the gateway does not
+// forward is simply read and discarded.
+//
+// Withholding names, by contrast, breaks the client this whole form exists for.
+// The design goal (docs/design/cloud-gateway.md §1) is "an unmodified OpenAI SDK
+// pointed at a base_url": openai-node and @anthropic-ai/sdk attach x-stainless-*
+// telemetry to every request, and the Anthropic SDK adds anthropic-version and
+// anthropic-dangerous-direct-browser-access. A browser lists ALL of those in its
+// preflight and refuses to send the real request unless the response allows EVERY
+// one — so an enumerated list does not degrade an SDK's telemetry, it blocks the
+// SDK outright, and each new SDK header would break it again silently.
+//
+// This is safe only while both of the following hold. If either changes, this must
+// narrow to an explicit list:
+//   - No ambient credentials: Access-Control-Allow-Credentials stays unset and no
+//     cookie is read, so a page on an allowed origin still needs its own key.
+//   - No header is treated as proof of origin (the CSRF pattern where a server
+//     trusts that a custom header implies same-origin JS).
+//
+// Vary: Access-Control-Request-Headers is already set, so no cache serves one
+// request's answer to another. Reflected names are filtered to valid HTTP tokens.
 func allowHeadersFor(requested string) string {
 	if requested == "" {
 		return corsAllowHeaders
@@ -96,10 +111,7 @@ func allowHeadersFor(requested string) string {
 	for _, name := range strings.Split(requested, ",") {
 		name = strings.TrimSpace(name)
 		lower := strings.ToLower(name)
-		if !strings.HasPrefix(lower, routingHeaderPrefix) || corsFixedAllowHeaderSet[lower] || seen[lower] {
-			continue
-		}
-		if !isHeaderToken(name) {
+		if lower == "" || corsFixedAllowHeaderSet[lower] || seen[lower] || !isHeaderToken(name) {
 			continue
 		}
 		seen[lower] = true
