@@ -90,10 +90,11 @@ services:
       # preview hop and posts straight to the broker — a different path, useful
       # only for the verification measurement above.
       - "ZG_GATEWAY_PROVIDER_URL=${ZG_GATEWAY_PROVIDER_URL:-}"
-      # The knob this rig exists to A/B. 128 is the shipped default; set it to 2 to
-      # reproduce Go's stock http.DefaultTransport behaviour and see what an
-      # undersized idle-connection pool costs at concurrency.
-      - "ZG_GATEWAY_MAX_IDLE_CONNS_PER_HOST=${ZG_GATEWAY_MAX_IDLE_CONNS_PER_HOST:-128}"
+      # The idle-connection pool size is a constant in the binary
+      # (core.maxIdleConnsPerHost), not an env var — see README "The
+      # connection-pool A/B" for how to run that comparison, which is an edit and a
+      # rebuild rather than a restart.
+      #
       # No browser origin is involved in a load run, and an empty list is honored
       # as set (browser access off) rather than falling back to the default.
       - "ZG_GATEWAY_ALLOWED_ORIGINS="

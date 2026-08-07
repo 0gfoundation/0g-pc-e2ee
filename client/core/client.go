@@ -288,7 +288,7 @@ func NewWithResolver(r Resolver, opts ...Option) *Client {
 	// 2 per host throttles a proxy that sends every request to the same router),
 	// and bound the wait for response headers via ResponseHeaderTimeout. No blunt
 	// http.Client.Timeout: it would also cut a long stream (see providerTimeout).
-	tr := NewPooledTransport(DefaultMaxIdleConnsPerHost)
+	tr := NewPooledTransport()
 	tr.ResponseHeaderTimeout = providerTimeout
 	c := &Client{
 		resolver:      r,

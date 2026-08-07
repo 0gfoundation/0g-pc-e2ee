@@ -93,7 +93,6 @@ Useful knobs (all via env on `docker compose`):
 | Variable | Default | What it changes |
 |---|---|---|
 | `GATEWAY_CPUS` | `2` | Gateway CPU budget — the main capacity-per-core input |
-| `ZG_GATEWAY_MAX_IDLE_CONNS_PER_HOST` | `128` | Idle connection pool; see the A/B below |
 | `ZG_GATEWAY_VERIFY_RESPONSES` | `false` | §8 verification — see the section below; needs direct-broker mode here |
 | `MOCK_TTFT` / `MOCK_CHUNK_INTERVAL` / `MOCK_CHUNKS` | `200ms` / `40ms` / `64` | The simulated completion shape |
 | `STREAM` | `true` | Streaming vs buffered completions |
@@ -153,18 +152,26 @@ completion, and (with verification on) a §8 signature fetch per response — so
 pool of 2, every concurrent request past the second dials and TLS-handshakes a
 fresh connection and then throws it away, paying it again next time.
 
-The shipped default is now 128 (`core.DefaultMaxIdleConnsPerHost`), tunable via
-`-max-idle-conns-per-host` / `ZG_GATEWAY_MAX_IDLE_CONNS_PER_HOST`. The old
-behaviour is one env var away, which makes it a clean experiment — run the same
-steady load twice:
+The shipped size is 128, a constant in `client/core/transport.go`
+(`maxIdleConnsPerHost`) rather than a flag: the value that is right for a
+deployment cannot be judged without exactly this measurement, and a knob nobody
+can set correctly is a knob someone eventually sets to something slow.
+
+So the A/B is an edit and a rebuild, not a restart — the compose builds from
+source, so that is one `sed` apart:
 
 ```sh
-ZG_GATEWAY_MAX_IDLE_CONNS_PER_HOST=2   docker compose up -d gateway
-docker compose --profile load run --rm -e MODE=steady -e RATE=40 k6
+docker compose --profile load run --rm -e MODE=steady -e RATE=40 k6   # at 128
 
-ZG_GATEWAY_MAX_IDLE_CONNS_PER_HOST=128 docker compose up -d gateway
-docker compose --profile load run --rm -e MODE=steady -e RATE=40 k6
+sed -i 's/maxIdleConnsPerHost = 128/maxIdleConnsPerHost = 2/' ../client/core/transport.go
+docker compose up -d --build gateway
+docker compose --profile load run --rm -e MODE=steady -e RATE=40 k6   # at Go's stock 2
+git -C .. checkout client/core/transport.go
 ```
+
+Compare `http_req_waiting` p99 and the achieved rate. If a run like this ever
+shows 128 is the wrong number, change the constant — it is one value in one place
+and it reaches both proxy forms and all three transports at once.
 
 Note this rig speaks **plaintext HTTP** to the fixture, so it shows the dial and
 socket churn but not the TLS handshake cost that dominates the same effect against

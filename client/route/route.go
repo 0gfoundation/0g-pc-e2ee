@@ -90,9 +90,8 @@ const (
 	// rotation is re-checked promptly; the warmer refreshes ahead of it.
 	defaultQuoteTTL = 5 * time.Minute
 	// controlPlaneHeaderTimeout bounds the wait for response headers on a
-	// control-plane call (preview, pubkey, quote). Named because two places build
-	// this transport — New and WithMaxIdleConnsPerHost — and a drift between them
-	// would give a Router a different timeout depending on which options it got.
+	// control-plane call (preview, pubkey, quote) — short, unlike the data plane's,
+	// because none of these streams.
 	controlPlaneHeaderTimeout = 30 * time.Second
 	// quoteVerifyTimeout bounds a single (de-duplicated) quote verification, which
 	// runs under a context detached from any one caller (so no caller's
@@ -157,21 +156,6 @@ func WithHTTPClient(h *http.Client) Option {
 		if h != nil {
 			r.http = h
 		}
-	}
-}
-
-// WithMaxIdleConnsPerHost resizes the idle-connection pool of the Router's
-// control-plane transport (see core.NewPooledTransport). It rebuilds the
-// transport, so it overrides — and is overridden by — WithHTTPClient, whichever
-// is applied last. A non-positive n leaves the default in place.
-func WithMaxIdleConnsPerHost(n int) Option {
-	return func(r *Router) {
-		if n <= 0 {
-			return
-		}
-		tr := core.NewPooledTransport(n)
-		tr.ResponseHeaderTimeout = controlPlaneHeaderTimeout
-		r.http = &http.Client{Transport: tr}
 	}
 }
 
@@ -274,7 +258,7 @@ func New(routerURL string, opts ...Option) *Router {
 	// runs on EVERY request against the one router host, so an undersized pool
 	// (Go's default is 2) turns each concurrent request past the second into a
 	// fresh dial + TLS handshake (see core.NewPooledTransport).
-	tr := core.NewPooledTransport(core.DefaultMaxIdleConnsPerHost)
+	tr := core.NewPooledTransport()
 	tr.ResponseHeaderTimeout = controlPlaneHeaderTimeout
 	r := &Router{
 		previewURL:      base + previewPath,

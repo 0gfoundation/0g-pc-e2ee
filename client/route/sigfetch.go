@@ -54,20 +54,10 @@ func NewSignatureFetcher(hc *http.Client) *SignatureFetcher {
 	if hc == nil {
 		hc = &http.Client{
 			Timeout:   15 * time.Second,
-			Transport: core.NewPooledTransport(core.DefaultMaxIdleConnsPerHost),
+			Transport: core.NewPooledTransport(),
 		}
 	}
 	return &SignatureFetcher{http: hc}
-}
-
-// NewPooledSignatureFetcher builds a fetcher whose idle-connection pool is sized
-// to maxIdleConnsPerHost, for a caller that tunes the pool globally (the proxy
-// binaries' -max-idle-conns-per-host). A non-positive value yields the default.
-func NewPooledSignatureFetcher(maxIdleConnsPerHost int) *SignatureFetcher {
-	return NewSignatureFetcher(&http.Client{
-		Timeout:   15 * time.Second,
-		Transport: core.NewPooledTransport(maxIdleConnsPerHost),
-	})
 }
 
 var _ core.SignatureFetcher = (*SignatureFetcher)(nil)

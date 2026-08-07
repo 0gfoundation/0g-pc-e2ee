@@ -150,7 +150,6 @@ type Flags struct {
 	warmInterval     *time.Duration
 	pccsURL          *string
 	collateralTTL    *time.Duration
-	maxIdleConns     *int
 }
 
 // defaultWarmInterval is the refresh-ahead period the background quote-cache
@@ -175,7 +174,7 @@ const defaultCollateralTTL = time.Hour
 // default: <envPrefix>_LISTEN, _ROUTER_URL, _PROVIDER_URL, _SEAL_FIELDS,
 // _UNBOUND_FIELDS, _ATTEST, _ATTEST_ENFORCE, _ONCHAIN, _ONCHAIN_ENFORCE,
 // _CHAIN_RPC_URL, _SERVING_CONTRACT, _WARM, _WARM_INTERVAL, _PCCS_URL,
-// _COLLATERAL_TTL, _MAX_IDLE_CONNS_PER_HOST.
+// _COLLATERAL_TTL.
 // defaultListen is the built-in listen address used when neither the flag nor
 // <envPrefix>_LISTEN is set.
 func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen string) *Flags {
@@ -211,8 +210,6 @@ func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen string) *Flags {
 			fmt.Sprintf("with -attest, fetch Intel PCS collateral (TCB Info, QE Identity, PCK CRL) from this PCCS base (e.g. https://pccs.phala.network) instead of api.trustedservices.intel.com; the root-CA CRL still comes from Intel (env %s)", env("PCCS_URL"))),
 		collateralTTL: fs.Duration("collateral-ttl", envDuration(env("COLLATERAL_TTL"), defaultCollateralTTL),
 			fmt.Sprintf("with -attest, how long to memoize DCAP collateral by URL so it is not re-fetched per provider/sweep; bounds revocation lag, 0 disables (env %s)", env("COLLATERAL_TTL"))),
-		maxIdleConns: fs.Int("max-idle-conns-per-host", envInt(env("MAX_IDLE_CONNS_PER_HOST"), core.DefaultMaxIdleConnsPerHost),
-			fmt.Sprintf("idle HTTP connections kept per upstream host, across the route-preview, sealed-completion, pubkey/quote and signature paths. Every request fans out to the SAME router host, so a small pool (Go's own default is 2) caps throughput by forcing a fresh dial + TLS handshake per concurrent request; raise it for a high-concurrency deployment, or set it to 2 to reproduce that behaviour when measuring the effect (env %s)", env("MAX_IDLE_CONNS_PER_HOST"))),
 	}
 }
 
@@ -317,20 +314,13 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 		logger.Error("-warm requires a positive -warm-interval")
 		os.Exit(1)
 	}
-	if *f.maxIdleConns <= 0 {
-		logger.Error("-max-idle-conns-per-host must be positive", "value", *f.maxIdleConns)
-		os.Exit(1)
-	}
 
 	// Route per request: pick the provider via the router and derive its enc key +
 	// signer from the broker, so no provider key is pinned up front. The router is
 	// told to withhold exactly the sealed fields, so the prompt never reaches it in
 	// cleartext even on the control-plane preview call. The service type is fixed
 	// (route.New defaults to "chatbot"); it is not a startup choice.
-	routeOpts := []route.Option{
-		route.WithSensitiveFields(sealFields),
-		route.WithMaxIdleConnsPerHost(*f.maxIdleConns),
-	}
+	routeOpts := []route.Option{route.WithSensitiveFields(sealFields)}
 	if *f.attestOn {
 		routeOpts = append(routeOpts, route.WithQuoteVerification(
 			newVerifier(label, *f.attestEnforce, *f.pccsURL, *f.collateralTTL, logger), logger))
@@ -353,7 +343,6 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 	coreOpts := []core.Option{
 		core.WithSealFields(sealFields),
 		core.WithUnboundFields(unboundFields),
-		core.WithMaxIdleConnsPerHost(*f.maxIdleConns),
 		core.WithDebugLogger(logger),
 		// Meter response-open failures. The counter lives in client/metrics and is
 		// only exported by the gateway's /metrics listener; the sidecar increments it
@@ -368,7 +357,7 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 		// resolver-grounded signer via the shared proof contract. The same fetcher
 		// works in direct-broker mode — it already talks to Provider.Endpoint, which
 		// the direct resolver sets to the provider URL.
-		coreOpts = append(coreOpts, core.WithResponseVerification(route.NewPooledSignatureFetcher(*f.maxIdleConns), sig.Recover))
+		coreOpts = append(coreOpts, core.WithResponseVerification(route.NewSignatureFetcher(nil), sig.Recover))
 		logger.Info("response signature verification enabled", "label", label, "direct", directMode, "onchain_grounded", *f.onchainOn)
 	}
 
@@ -508,21 +497,6 @@ func envBool(key string, def bool) bool {
 		log.Fatalf("invalid %s=%q: must be a boolean (true/false)", key, v)
 	}
 	return b
-}
-
-// envInt parses an integer environment variable. An unset variable falls back
-// to def; a set-but-unparseable value is fatal rather than silently defaulting,
-// so a typo cannot quietly leave a tuning parameter at its default.
-func envInt(key string, def int) int {
-	v, ok := os.LookupEnv(key)
-	if !ok {
-		return def
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		log.Fatalf("invalid %s=%q: must be an integer", key, v)
-	}
-	return n
 }
 
 // envDuration parses a duration environment variable (Go duration syntax, e.g.
