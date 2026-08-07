@@ -27,7 +27,11 @@ Exit code 0 means every check below passed. Non-zero means one did not, and the
 output names which. There is nothing to configure: the tool discovers what it needs
 from the endpoint itself and from public sources.
 
+Digests below are abbreviated with `…` for readability; a real run prints them in
+full. This is what a pass looks like on today's builds:
+
 ```
+expected compose   newest 5 release(s) of 0gfoundation/0g-pc-e2ee (docker-compose.release.yml)
 gateway            pc-gateway.0g.ai
 ✓   acme-account.json              0443a4bf…
 ✓   cert-pc-gateway.0g.ai.pem      36024092…
@@ -35,13 +39,39 @@ gateway            pc-gateway.0g.ai
 ✓ quote              genuine TDX (DCAP verified)
 ✓ bundle binding     report_data == SHA-256(sha256sum.txt)
 ✓ endpoint binding   served certificate is the one the quote binds
+  served cert      46d34704…
+  subject          CN=pc-gateway.0g.ai
+  issuer           CN=E5,O=Let's Encrypt,C=US
+  not after        2026-11-05T14:35:22Z
 ✓ chain trust        validates for pc-gateway.0g.ai
 ✓ compose_hash       55d872aa…
   app_id           55d872aaa9c0b148228ebcf89302a52e7cd3d252
 ✓ app-compose        sha256 == compose_hash (authenticated)
-✓ compose file       matches release-2026.08.06.1 byte-for-byte
-✓ os image           dstack-nvidia-0.5.4.1 (1 vCPU / 2 GiB / 0 GPU)
+  source           55d872aaa9c0b148228ebcf89302a52e7cd3d252-8090.in1.phala.network
+  app name         0g-pc-gateway-a-1
+  allowed_envs     ZG_GATEWAY_ROUTER_URL DOMAIN GATEWAY_DOMAIN …
+✓ compose file       matches release-2026.08.07.1 byte-for-byte
+- os image           not pinned (allowlist is empty; see client/evidence/osimages.json)
+  observed mrtd   b24d3b24…
+  observed rtmr0  01361d27…
+  observed rtmr1  6e1afb74…
+  observed rtmr2  89e73ced…
+
+note: code identity is only as strong as the image pinning inside the compose text —
+a floating tag keeps compose_hash stable while the code changes; the OS image is NOT
+pinned (the allowlist is empty), so nothing establishes that the guest enforced the
+compose-hash binding — treat code identity as strong evidence, not proof. Endpoint
+identity is unaffected
+
+PASS
 ```
+
+The `-` on `os image` is the one step that does not check anything yet, and the
+closing `note` says so on every run — see [Current limits](#current-limits). Once the
+allowlist is populated that line becomes a name, e.g.
+`✓ os image  dstack-nvidia-0.5.4.1 (1 vCPU / 2 GiB / 0 GPU)`, and the note drops the
+OS-image caveat. The four `observed` registers are printed precisely because they are
+what an auditor records while the step is unpinned.
 
 ---
 
