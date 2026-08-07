@@ -54,6 +54,7 @@ import (
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/cmd/internal/proxycli"
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/client/dstack"
 	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 )
@@ -89,6 +90,21 @@ func main() {
 	// see cmd/gateway/Dockerfile), so the compose healthcheck runs THIS instead
 	// of a shell one-liner (deploy/phala/docker-compose.yml). Reusing -listen /
 	// $ZG_GATEWAY_LISTEN keeps the probe and the server on the same port.
+	// Where to reach the dstack guest agent, which is the only source of this CVM's
+	// own identity (client/dstack). A gateway app can be backed by several
+	// replicas sharing one app_id, so without it a merged log stream and a shared
+	// metrics store cannot tell them apart. Empty disables the lookup entirely —
+	// the right value for a local run, where there is no CVM to identify.
+	dstackSocket := flag.String("dstack-socket", proxycli.EnvOr("ZG_GATEWAY_DSTACK_SOCKET", dstack.DefaultSocket),
+		"path to the dstack guest-agent unix socket, read ONCE at startup for this CVM's instance_id/app_id "+
+			"(used as metric labels and log fields); empty disables the lookup (env ZG_GATEWAY_DSTACK_SOCKET)")
+	// Whether to tell each caller which replica served it. Off by default: the id
+	// is public, but a per-response header hands any client a free census of the
+	// fleet behind the domain (see openaiproxy.StampInstance).
+	instanceHeader := flag.Bool("instance-header", proxycli.EnvBool("ZG_GATEWAY_INSTANCE_HEADER", false),
+		fmt.Sprintf("return the serving CVM's instance id to callers in the %s response header; "+
+			"off by default (the metric labels and log fields carry it regardless, without exposing "+
+			"the fleet shape to clients) (env ZG_GATEWAY_INSTANCE_HEADER)", openaiproxy.HeaderGatewayInstance))
 	health := flag.Bool("health", false, "probe GET /healthz on the -listen port and exit 0 (healthy) or 1; starts no server, for container healthchecks")
 	flag.Parse()
 
@@ -107,6 +123,34 @@ func main() {
 	// forms don't drift (see proxycli.NewLogger). dstack/Phala captures stdout as
 	// line records; a later GCP move can swap the handler in one place.
 	logger := proxycli.NewLogger()
+
+	// Ask the runtime who this CVM is, before anything else logs. The identity is
+	// attached to the logger (so EVERY line this process emits — startup, access
+	// log, the core's open-failure diagnostics — carries it) and to the metric
+	// label set, which is what keeps two replicas of one app_id from writing
+	// colliding series into the shared remote-write store.
+	//
+	// Best-effort on purpose: outside a CVM there is no socket, and inside one a
+	// wedged agent must not keep the gateway from serving. Telemetry loses a
+	// dimension; the data path is unaffected. It is logged at Warn rather than
+	// Info so a deployment that MEANT to mount the socket (deploy/phala/) and
+	// didn't sees it.
+	instanceID := ""
+	if *dstackSocket != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), dstack.DefaultTimeout)
+		info, err := dstack.FetchInfo(ctx, *dstackSocket)
+		cancel()
+		if err != nil {
+			logger.Warn("dstack identity unavailable; metrics and logs carry no instance dimension",
+				"socket", *dstackSocket, "err", err)
+		} else {
+			instanceID = info.InstanceID
+			logger = logger.With("instance_id", info.InstanceID)
+			metrics.SetInstanceIdentity(info.InstanceID, info.AppID)
+			logger.Info("dstack identity", "app_id", info.AppID, "app_name", info.AppName, "compose_hash", info.ComposeHash)
+		}
+	}
+
 	built := f.Build("gateway", logger)
 
 	// Parse the router base URL once, up front, so a malformed -router-url fails
@@ -150,9 +194,15 @@ func main() {
 	// it down alongside the main server on a signal.
 	stopMetrics := startMetrics(*metricsListen, logger)
 
+	// The header is opt-in, so pass an empty id unless -instance-header is set;
+	// newHandler then wires no stamping middleware at all.
+	headerInstanceID := ""
+	if *instanceHeader {
+		headerInstanceID = instanceID
+	}
 	srv := &http.Server{
 		Addr:              *f.Listen,
-		Handler:           newHandler(built.Client, routerTarget, origins, logger),
+		Handler:           newHandler(built.Client, routerTarget, origins, headerInstanceID, logger),
 		ReadHeaderTimeout: 10 * time.Second, // mitigate slow-header (Slowloris) clients
 	}
 	// TLS is terminated ahead of this listener, inside the same enclave
@@ -163,7 +213,8 @@ func main() {
 	// (shared with the sidecar so both forms handle SIGTERM identically — the
 	// dstack/Phala deployment sends it on every redeploy). ListenAndServe's clean
 	// shutdown is folded into a nil return; only a real listen failure is an error.
-	logger.Info("gateway listening", "listen", *f.Listen, "router_url", *f.RouterURL, "cors_allowed_origins", origins)
+	logger.Info("gateway listening", "listen", *f.Listen, "router_url", *f.RouterURL,
+		"cors_allowed_origins", origins, "instance_header", *instanceHeader)
 	err = proxycli.Serve(srv, logger)
 	stopWarmer()
 	stopMetrics()
@@ -263,7 +314,11 @@ func runHealthCheck(listen string) int {
 // callers on an allowed origin can reach it and every request emits one
 // redaction-safe structured line. It is split out from main so tests can drive it
 // with httptest.
-func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, logger *slog.Logger) http.Handler {
+//
+// instanceID, when non-empty, is stamped on every response as the serving CVM's
+// id (openaiproxy.StampInstance). main passes it only when -instance-header is
+// set, so the default build of the handler behaves exactly as before.
+func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, instanceID string, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	// Mount the sealed inference path behind the gateway's front-door credential
 	// gate. The gate is a cheap presence/shape check (reject missing credentials
@@ -295,5 +350,8 @@ func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, 
 	// preflight, since a browser sends no credentials on one) or to the catch-all
 	// (which would let the ROUTER's allowlist decide what may reach this gateway) —
 	// while still emitting the one structured line per request, preflights included.
-	return openaiproxy.LogRequests(logger, openaiproxy.CORS(allowedOrigins, mux))
+	// StampInstance sits OUTSIDE CORS so a preflight — answered by CORS without
+	// ever reaching the mux — carries the header too, and inside the access log so
+	// the middleware order stays "log everything that happens below it".
+	return openaiproxy.LogRequests(logger, openaiproxy.StampInstance(instanceID, openaiproxy.CORS(allowedOrigins, mux)))
 }

@@ -40,6 +40,7 @@ signed — see the design doc).
 core/            # client core: quote + response-signature verification, seal, pin, fallback, key cache
 route/           # gateway route mode: pick the provider per request via the router's route-preview + broker pubkey APIs
 openaiproxy/     # shared OpenAI-compatible HTTP handler over core (used by both server forms)
+dstack/          # gateway-only: reads this CVM's instance_id/app_id from the dstack guest agent at startup
 cmd/
   sidecar/       # local sidecar binary (OpenAI-compatible proxy on localhost) — user-operated, no new trust party
   gateway/       # cloud-TEE gateway — SAME core, but SERVER-RUN + 0G-operated, runs in an attested CVM (adds one attested trust party)

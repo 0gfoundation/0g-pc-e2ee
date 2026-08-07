@@ -477,6 +477,12 @@ func envOr(key, def string) string {
 // instead of each main re-deciding what an empty env var means.
 func EnvOr(key, def string) string { return envOr(key, def) }
 
+// EnvBool is the boolean counterpart of EnvOr for a binary's own flag (the
+// gateway's -instance-header), so a one-off boolean inherits the same
+// fail-loud-on-typo behaviour as every shared boolean flag rather than silently
+// falling back to the default.
+func EnvBool(key string, def bool) bool { return envBool(key, def) }
+
 // envBool parses a boolean environment variable (accepting the same forms as
 // the -flag=bool syntax: 1/t/T/TRUE/true, 0/f/F/FALSE/false, etc.). An unset
 // variable falls back to def; a set-but-unparseable value is fatal rather than

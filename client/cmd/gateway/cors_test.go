@@ -29,7 +29,7 @@ func TestGatewayPreflightAnsweredLocally(t *testing.T) {
 	}))
 	defer router.Close()
 
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, router.URL), corsTestOrigins, discardLogger()))
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, router.URL), corsTestOrigins, "", discardLogger()))
 	defer gw.Close()
 
 	// One preflight per path class: the sealed route (behind the credential gate)
@@ -76,7 +76,7 @@ func TestGatewayCatchAllStripsUpstreamCORS(t *testing.T) {
 	}))
 	defer router.Close()
 
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, router.URL), corsTestOrigins, discardLogger()))
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, router.URL), corsTestOrigins, "", discardLogger()))
 	defer gw.Close()
 
 	req, err := http.NewRequest(http.MethodGet, gw.URL+"/v1/models", nil)

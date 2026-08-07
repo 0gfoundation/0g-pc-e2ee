@@ -287,6 +287,40 @@ store — but in **agent mode**:
   failures) is visible even though the CVM has no local query API — important
   because an outbound break inside the enclave is otherwise hard to see.
 
+### Telling replicas apart
+
+Every series the gateway exports carries `instance_id` and `app_id`, read once at
+boot from the dstack guest-agent socket the compose mounts into the gateway
+container (`ZG_GATEWAY_DSTACK_SOCKET`). The same `instance_id` is attached to
+every log line the process writes.
+
+This is a prerequisite for running more than one CVM per side, not a nicety.
+Replicas of one `app_id` are identical CVMs running identical Prometheus agents,
+so their external labels (`service`, `env`) and target labels (`gateway:9464`) are
+identical too — without a per-CVM label they write the **same series** to the
+shared store and the samples collide. `app_id` additionally separates a blue side
+from a green one, which `env` cannot.
+
+Two caveats:
+
+- **The `prometheus-agent` self-scrape still collides** across replicas. Compose
+  interpolation happens at deploy time and cannot see a value the runtime assigns
+  per CVM, so those ~30 agent-health series have no per-instance source. Gateway
+  telemetry — what alerting runs on — is unaffected.
+- **A missing mount degrades silently in the data path and loudly in the log.**
+  If the socket is absent or the agent does not answer, the gateway logs
+  `dstack identity unavailable` at WARN and serves normally, without the labels.
+  Grep for that line after a deploy if a replica's metrics go missing.
+
+To attribute a *specific request* to a replica (e.g. while measuring how the
+platform distributes connections), set `ZG_GATEWAY_INSTANCE_HEADER=true` and the
+gateway returns `X-0G-Gateway-Instance` on every response. It is **off by
+default**: the id is public, but a per-response header lets any caller enumerate
+the fleet behind the domain. Toggle it by value — keep the key permanently in
+`allowed_envs`, since editing that list changes `app_id`. Note that selection is
+per TCP connection, so a keep-alive client sees one replica no matter how many
+requests it sends; see `blue-green.md` "Scaling one side".
+
 ### Configuring remote_write
 
 You pass three values, not a hand-built config:

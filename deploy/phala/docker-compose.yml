@@ -276,6 +276,42 @@ services:
       # implicit at its 4m default, under the ~5m quote-cache TTL.
       - "ZG_GATEWAY_WARM=true"
       # - "ZG_GATEWAY_WARM_INTERVAL=4m" # optional; 4m is already the default
+      #
+      # Where to read THIS CVM's own identity (instance_id / app_id), from the
+      # guest-agent socket mounted below. Stated explicitly rather than left to the
+      # binary's identical default because this block is measured: which privileged
+      # runtime socket the gateway opens should be readable here, not implied. Read
+      # ONCE at startup; empty disables the lookup (the right value for a local run).
+      # Without it, two replicas of one app_id are indistinguishable — see the
+      # volume comment below.
+      - "ZG_GATEWAY_DSTACK_SOCKET=/var/run/dstack.sock"
+      # Whether to return the serving replica's instance id to CALLERS, in the
+      # X-0G-Gateway-Instance response header. Off, deliberately: the id itself is
+      # public (the platform routes to it by name at
+      # <instance_id>-443s.<base_domain>), but a per-response header lets any client
+      # enumerate how many replicas stand behind this domain and how traffic spreads
+      # over them — free reconnaissance. The metric labels and log fields carry the
+      # same value unconditionally and stay inside the enclave, which is where it
+      # belongs by default. Injected, so flip it by VALUE for a debugging window
+      # without changing app_id; list ZG_GATEWAY_INSTANCE_HEADER in allowed_envs
+      # permanently (dstack drops any var not listed) rather than editing the list,
+      # which is itself measured.
+      - "ZG_GATEWAY_INSTANCE_HEADER=${ZG_GATEWAY_INSTANCE_HEADER:-false}"
+    volumes:
+      # Read-only in intent, mounted read-write in fact: connect(2) on a unix socket
+      # needs write permission, so a `:ro` bind mount would make it unusable. This is
+      # the same socket dstack-ingress mounts above, and it is a PRIVILEGED surface —
+      # the guest agent behind it also derives keys and issues quotes. The gateway
+      # calls exactly one method on it, Info, once at startup (client/dstack), and
+      # exposes no attestation route of its own; the reason it needs even that much is
+      # that a replica cannot otherwise name itself. Several CVMs can share one app_id
+      # (deploy/phala/blue-green.md "Scaling one side"), the dstack gateway picks which
+      # one a connection reaches, and the L4 passthrough in front adds no headers — so
+      # without instance_id the two replicas' logs interleave unattributably AND their
+      # co-located Prometheus agents write byte-identical series into the shared
+      # remote-write store, where the samples collide. Part of the measured compose
+      # text (app_id), like every other line here.
+      - /var/run/dstack.sock:/var/run/dstack.sock
     # The gateway itself holds no secret: no pinned provider key, and no TLS
     # material — the cert and its key belong to dstack-ingress above, generated
     # in-enclave via ACME and kept in the cert-data volume.
@@ -339,6 +375,20 @@ configs:
           # compose serves both staging and mainnet; :? fails the deploy loudly if
           # it is unset (it checks non-empty only, not that the value is one of the
           # two — a typo still yields a wrong label).
+          #
+          # These labels CANNOT separate replicas: two CVMs of one app_id run this
+          # exact config, so every label here — and every target label below — is
+          # identical between them. Per-CVM separation comes from the gateway job's
+          # own exposition instead: the gateway reads its instance_id/app_id from
+          # the guest agent and stamps them on every series it exports
+          # (ZG_GATEWAY_DSTACK_SOCKET above, client/metrics.SetInstanceIdentity).
+          # KNOWN GAP: the `prometheus-agent` self-scrape below has no such source,
+          # so with multiple replicas those ~30 agent-health series still collide in
+          # the remote store. Compose interpolation happens at deploy time and cannot
+          # see a value the runtime assigns per CVM, so closing it needs Prometheus'
+          # expand-external-labels against a per-container env var — a churny,
+          # restart-scoped token, deliberately not taken here. Gateway telemetry —
+          # what alerting runs on — is unaffected.
           service: 0g-pc-gateway
           env: "${ZG_PROM_ENV:?set staging or mainnet}"
       scrape_configs:

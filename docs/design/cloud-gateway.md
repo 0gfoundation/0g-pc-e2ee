@@ -230,9 +230,17 @@ managed features:
   *our* enclave and the cert is bound to *our* `app_id` (§6.1). One platform-side
   prerequisite: the host front end forwards only SNI suffixes Phala has
   allowlisted. See `deploy/phala/README.md`.
-- **Fleet + LB**: dstack load-balances across replicas by app id, with TLS
-  passthrough available — so the "which instance holds the key" routing problem
-  is handled by the runtime rather than by us. **[verify]**
+- **Fleet + LB**: dstack selects among replicas by app id, with TLS passthrough
+  available — so the "which instance holds the key" routing problem is handled by
+  the runtime rather than by us. **Verified in the gateway source, with a caveat
+  that matters for capacity planning:** the custom-domain (passthrough) path uses
+  the *same* selection as the platform hostname, but that selection is neither
+  round-robin nor load-aware — it takes the few instances with the freshest
+  WireGuard handshake, caches that candidate set for ~30s, races a TCP connect
+  against them and keeps the first to answer, **per TCP connection** (so a
+  keep-alive client stays pinned to one replica). Treat replicas as HA and
+  headroom, not as an even split. See `deploy/phala/blue-green.md` "Scaling one
+  side".
 - **Runs on Phala Cloud, and on GCP / AWS**: dstack is one framework across
   clouds, so scaling on GCP does **not** require hand-building confidential TLS
   — run **dstack on GCP** to get GCP's scale *and* dstack's confidential
@@ -317,6 +325,18 @@ does not.
   talk to the gateway; it constrains nothing else, because only browsers enforce it
   — any non-browser caller simply omits or forges `Origin`. Authorization remains
   the front-door credential gate plus the router's authoritative validation.
+- **The gateway container opens the dstack guest-agent socket** (`/var/run/dstack.sock`,
+  mounted in `deploy/phala/docker-compose.yml`) to read its own `instance_id` /
+  `app_id` once at startup. That socket is a privileged surface — the same agent
+  derives keys and issues quotes — so this widens what a compromised gateway
+  container could reach, and it is part of the measured compose, so a verifier
+  sees it. It buys the one thing a replica cannot otherwise have: a name. Without
+  it, replicas of one `app_id` produce unattributable interleaved logs and
+  colliding Prometheus series (identical external and target labels), which makes
+  running more than one CVM per side impractical. It does **not** change §6: the
+  values are self-reported operational labels, the gateway still publishes no
+  quote of its own and still exposes no `/quote` route, and endpoint identity
+  still rests on dstack-ingress's cert-binding attestation.
 - Cloud/runtime specifics marked **[verify]** must be confirmed against current
   GCP / dstack documentation before implementation.
 
