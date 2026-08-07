@@ -23,12 +23,18 @@ services:
     build:
       context: ..
       dockerfile: client/cmd/mockupstream/Dockerfile
-    # Every knob is passed as a FLAG with ${MOCK_*} interpolation, not through an
-    # `environment:` block. The fixture accepts either (flag > env > default), but
-    # compose interpolates ${...} here from the host env at parse time, whereas a
-    # container inherits nothing from the host — so a MOCK_* var that is not listed
-    # below is silently ignored, not passed through. Adding a knob to the fixture
-    # means adding a line HERE too, or the documentation for it will be a lie.
+    environment:
+      # Same reasoning as the gateway's below: `cpus:` is a quota, not a CPU-set, so
+      # without this the Go runtime sizes itself to the host's core count and gets
+      # throttled against a 4-CPU quota. A throttled fixture is worse here than
+      # anywhere — it becomes the slow party, and the run then measures the fixture.
+      - "GOMAXPROCS=${MOCK_CPUS:-4}"
+    # Fixture CONFIG, on the other hand, is passed as FLAGS with ${MOCK_*}
+    # interpolation. The fixture accepts either (flag > env > default), but compose
+    # interpolates ${...} here from the host env at parse time, whereas a container
+    # inherits nothing from the host — so a MOCK_* var that is not listed below is
+    # silently ignored, not passed through. Adding a knob to the fixture means
+    # adding a line HERE too, or the documentation for it will be a lie.
     command:
       - "-listen=0.0.0.0:8080"
       # The simulated completion shape. Defaults model a chatty small model:
@@ -82,6 +88,18 @@ services:
       # the real deployment this port is never published.
       - "${GATEWAY_METRICS_PORT:-9464}:9464"
     environment:
+      # Pin the Go runtime to the SAME number of Ps as the CPU limit below.
+      #
+      # `cpus:` is a CFS bandwidth quota, not a CPU-set: the container still sees
+      # every host core, and the Go runtime this module builds with (1.24) sizes
+      # GOMAXPROCS from that count. On a big test host that means dozens of Ps
+      # competing for a 2-CPU quota — the runtime oversubscribes, gets throttled at
+      # the end of each period, and the extra scheduling and cache traffic show up
+      # as latency that has nothing to do with the gateway's own work. The knee
+      # then lands in the wrong place, which is worse than no measurement.
+      # (Go 1.25 derives this from the cgroup limit itself; until the module moves
+      # to it, this line is what makes GATEWAY_CPUS mean what it says.)
+      - "GOMAXPROCS=${GATEWAY_CPUS:-2}"
       - "ZG_GATEWAY_LISTEN=0.0.0.0:8443"
       - "ZG_GATEWAY_METRICS_LISTEN=0.0.0.0:9464"
       - "ZG_GATEWAY_ROUTER_URL=http://mockupstream:8080"
@@ -155,6 +173,10 @@ services:
       - "STEP_DURATION=${STEP_DURATION:-}"
       - "DURATION=${DURATION:-}"
       - "MAX_VUS=${MAX_VUS:-}"
+      # The completion length the driver sizes its VU pool from. Defaulted here from
+      # the fixture's own schedule, so changing the schedule on the command line
+      # keeps the pool honest without a second thing to remember.
+      - "EXPECTED_SECONDS=${EXPECTED_SECONDS:-}"
       - "PROMPT_BYTES=${PROMPT_BYTES:-}"
       - "API_KEY=${API_KEY:-sk-loadtest}"
     command: ["run", "/scripts/chat.js"]

@@ -65,12 +65,38 @@ const CLIMB_SECONDS = 15;
 const RATE = num(__ENV.RATE, 25);
 const DURATION = __ENV.DURATION || '5m';
 
-// preAllocatedVUs / maxVUs must comfortably exceed rate × request-duration, or k6
-// runs out of workers and reports a dropped_iterations count instead of load. A
-// streamed completion is held open for its whole token schedule, so this needs to
-// be generous — dropped_iterations in the summary means the DRIVER fell short, not
-// the gateway.
-const MAX_VUS = num(__ENV.MAX_VUS, 2000);
+// VU pool sizing. An arrival-rate executor needs roughly rate × request-seconds
+// VUs in flight, and a streamed completion is held open for its WHOLE token
+// schedule — so the pool has to be sized from the completion length, not guessed.
+// Under-allocate and k6 quietly stops offering the configured rate and reports
+// dropped_iterations instead: the gateway is then measured at a lower load than the
+// run claims, which moves the apparent knee. That failure is the driver's, not the
+// gateway's, and it is easy to miss in a summary — hence the threshold on
+// dropped_iterations below as well.
+//
+// EXPECTED_SECONDS is how long one completion takes; the default matches the
+// fixture's own default schedule (MOCK_TTFT 200ms + 63 × MOCK_CHUNK_INTERVAL 40ms
+// ≈ 2.7s). Change it alongside MOCK_CHUNKS / MOCK_CHUNK_INTERVAL.
+const EXPECTED_SECONDS = num(__ENV.EXPECTED_SECONDS, 3);
+// Headroom over the arithmetic minimum, because request duration INFLATES exactly
+// where this test is aimed: at the knee, completions take longer, so the VU demand
+// at a given arrival rate rises just when the pool would otherwise run dry.
+const VU_HEADROOM = 2;
+
+// vusFor is the pool size needed to sustain an arrival rate (Little's law, plus
+// headroom).
+function vusFor(rate) {
+  return Math.ceil(rate * EXPECTED_SECONDS * VU_HEADROOM);
+}
+
+// The ceiling k6 may grow the pool to. Derived so it cannot silently sit below what
+// the configured peak needs; an explicit MAX_VUS still wins.
+const MAX_VUS = num(__ENV.MAX_VUS, Math.max(2000, vusFor(MODE === 'steady' ? RATE : PEAK_RATE)));
+
+// Pre-allocate the whole expected pool up front rather than letting k6 grow it
+// mid-run: allocation is lazy, so a pool that has to grow during a step drops
+// iterations while it catches up — precisely during the step whose numbers matter.
+const PRE_ALLOCATED_VUS = Math.min(MAX_VUS, vusFor(MODE === 'steady' ? RATE : PEAK_RATE));
 
 const failed = new Rate('gateway_failed');
 
@@ -102,7 +128,7 @@ function rampScenario() {
       executor: 'ramping-arrival-rate',
       startRate: START_RATE,
       timeUnit: '1s',
-      preAllocatedVUs: Math.min(MAX_VUS, 200),
+      preAllocatedVUs: PRE_ALLOCATED_VUS,
       maxVUs: MAX_VUS,
       stages,
     },
@@ -126,7 +152,7 @@ function rampThresholds() {
   const holdSeconds = seconds(STEP_DURATION);
   const stepSeconds = CLIMB_SECONDS + holdSeconds;
   const settle = Math.min(30, holdSeconds);
-  const thresholds = {};
+  const thresholds = driverThresholds();
   rampRates().forEach((_rate, i) => {
     const delay = Math.round(i * stepSeconds + CLIMB_SECONDS + settle);
     thresholds[`gateway_failed{step:${i}}`] = [
@@ -136,6 +162,16 @@ function rampThresholds() {
   return thresholds;
 }
 
+// driverThresholds assert on the DRIVER, not the gateway: a dropped iteration means
+// k6 could not start a request the schedule called for, so the gateway was offered
+// less load than the run claims and every number in it describes a lighter test. It
+// is not an abort (the data collected so far is still worth having) but it does fail
+// the run, so it cannot pass unnoticed in a summary and get quoted as a capacity
+// figure. Seeing it means raising EXPECTED_SECONDS or MAX_VUS — see their comments.
+function driverThresholds() {
+  return { dropped_iterations: [{ threshold: 'count<1', abortOnFail: false }] };
+}
+
 function steadyScenario() {
   return {
     steady: {
@@ -143,7 +179,7 @@ function steadyScenario() {
       rate: RATE,
       timeUnit: '1s',
       duration: DURATION,
-      preAllocatedVUs: Math.min(MAX_VUS, 200),
+      preAllocatedVUs: PRE_ALLOCATED_VUS,
       maxVUs: MAX_VUS,
     },
   };
@@ -153,6 +189,7 @@ function steadyScenario() {
 // dilute a run-scoped rate — the plain threshold is correct here.
 function steadyThresholds() {
   return {
+    ...driverThresholds(),
     gateway_failed: [{ threshold: 'rate<0.01', abortOnFail: true, delayAbortEval: '30s' }],
   };
 }

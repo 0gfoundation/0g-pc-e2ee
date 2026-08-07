@@ -71,6 +71,14 @@ CVM size rather than onto the test host. The fixture gets `MOCK_CPUS` (default 4
 because it does real HPKE work on both halves of every request — **watch its CPU,
 and if it is pegged, the run measured the fixture and the numbers are void.**
 
+Both containers also get `GOMAXPROCS` pinned to their own limit, and that is what
+makes the limit mean anything: `cpus:` is a CFS bandwidth quota, not a CPU-set, so
+the container still sees every host core and the Go runtime (through 1.24) sizes
+itself to that count. Left alone, a 2-CPU gateway on a large host runs dozens of Ps
+against its quota, gets throttled at each period boundary, and reports latency that
+belongs to the scheduler rather than to the gateway — putting the knee somewhere it
+isn't. Go 1.25 reads the cgroup limit itself and makes this line redundant.
+
 Without Docker, the same rig is two processes and a local k6 — handy for a quick
 check that the path works before committing a host to a real run:
 
@@ -98,7 +106,8 @@ Useful knobs (all via env on `docker compose`):
 
 | Variable | Default | What it changes |
 |---|---|---|
-| `GATEWAY_CPUS` | `2` | Gateway CPU budget — the main capacity-per-core input |
+| `GATEWAY_CPUS` | `2` | Gateway CPU budget — the main capacity-per-core input; also sets its `GOMAXPROCS` |
+| `EXPECTED_SECONDS` | `3` | Assumed completion length, which sizes the k6 VU pool — keep it in step with the fixture's schedule |
 | `ZG_GATEWAY_VERIFY_RESPONSES` | `false` | §8 verification — see the section below; needs direct-broker mode here |
 | `MOCK_TTFT` / `MOCK_CHUNK_INTERVAL` / `MOCK_CHUNKS` | `200ms` / `40ms` / `64` | The simulated completion shape |
 | `STREAM` | `true` | Streaming vs buffered completions |
@@ -110,8 +119,20 @@ Useful knobs (all via env on `docker compose`):
 **Open-loop, always.** The k6 driver uses arrival-rate executors, never a fixed VU
 pool. A fixed-VU test throttles itself as the server slows, so the server never
 really overloads and the latency numbers understate the problem (coordinated
-omission). If the k6 summary reports `dropped_iterations`, the *driver* ran out of
-VUs — raise `MAX_VUS` and rerun; that is not a gateway result.
+omission).
+
+**`dropped_iterations` is a failed run, not a data point.** An arrival-rate
+executor needs about `rate × request-seconds` VUs in flight, and a streamed
+completion is held open for its whole token schedule — at the default peak that is
+200/s × ~2.8s ≈ 550 VUs. If the pool cannot supply them, k6 stops offering the
+configured rate and counts the shortfall as `dropped_iterations`: the gateway then
+saw *less* load than the run claims, so the knee lands too low and every number in
+that summary describes a lighter test. The script therefore sizes the pool from
+`PEAK_RATE × EXPECTED_SECONDS` with 2× headroom (1200 at the defaults) and carries
+a `dropped_iterations: count<1` threshold, so a shortfall fails the run instead of
+passing quietly. If you see it, raise `EXPECTED_SECONDS` — and set it whenever you
+change `MOCK_CHUNKS` / `MOCK_CHUNK_INTERVAL`, since it is the completion length the
+sizing is derived from.
 
 **The three numbers that matter:**
 
