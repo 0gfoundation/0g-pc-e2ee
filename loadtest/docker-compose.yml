@@ -97,6 +97,11 @@ services:
       # No browser origin is involved in a load run, and an empty list is honored
       # as set (browser access off) rather than falling back to the default.
       - "ZG_GATEWAY_ALLOWED_ORIGINS="
+      # There is no CVM here, so there is no dstack guest-agent socket and no
+      # identity to read. Empty disables the lookup outright, which keeps the boot
+      # log clean — left at its default the gateway would warn once per start about
+      # an absent socket, which in this rig is expected, not a misconfiguration.
+      - "ZG_GATEWAY_DSTACK_SOCKET="
       # Profiler on the metrics listener: `go tool pprof -http=:8000
       # http://localhost:9464/debug/pprof/profile?seconds=30` during a run is the
       # fastest way to see where the throughput went.

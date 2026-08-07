@@ -55,6 +55,7 @@ import (
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/cmd/internal/proxycli"
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/client/dstack"
 	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 )
@@ -84,6 +85,23 @@ func main() {
 		"comma-separated browser origin allowlist for CORS: exact origins (https://app.example.com), "+
 			"\"*.\" wildcards (https://*.0g.ai — subdomains only, not the apex), or \"*\" for any; "+
 			"empty allows no origin, disabling browser access (env ZG_GATEWAY_ALLOWED_ORIGINS)")
+	// Where this CVM's own identity comes from. A gateway app can be backed by
+	// several replicas sharing one app_id, so without it a merged log stream and a
+	// shared metrics store cannot tell them apart.
+	//
+	// Two sources, and the file is preferred BECAUSE it is the weaker privilege:
+	// cmd/cvmid opens the guest-agent socket once at boot and writes the file, so
+	// the deployed gateway — the long-lived container that sees user prompts — never
+	// touches a socket that also derives keys and issues quotes. The direct socket
+	// path stays for local runs and for anyone deploying without that init step.
+	identityFile := flag.String("identity-file", proxycli.EnvOr("ZG_GATEWAY_IDENTITY_FILE", ""),
+		"path to the identity JSON written by cmd/cvmid, read ONCE at startup for this CVM's "+
+			"instance_id/app_id (used as log fields and the X-0G-Gateway-Instance response header; "+
+			"metrics are labelled by the scraper, not here); takes precedence over -dstack-socket, "+
+			"which the deployed form leaves unset (env ZG_GATEWAY_IDENTITY_FILE)")
+	dstackSocket := flag.String("dstack-socket", proxycli.EnvOr("ZG_GATEWAY_DSTACK_SOCKET", dstack.DefaultSocket),
+		"path to the dstack guest-agent unix socket, read ONCE at startup for the same identity when "+
+			"-identity-file is unset; empty disables the lookup (env ZG_GATEWAY_DSTACK_SOCKET)")
 	// Mount the Go runtime profiler on the metrics listener. OFF by default and
 	// deliberately not a production knob: it is the fastest way to find where a
 	// load test's throughput is going (`go tool pprof
@@ -119,6 +137,34 @@ func main() {
 	// forms don't drift (see proxycli.NewLogger). dstack/Phala captures stdout as
 	// line records; a later GCP move can swap the handler in one place.
 	logger := proxycli.NewLogger()
+
+	// Learn who this CVM is, before anything else logs. It is attached to the logger
+	// (so EVERY line this process emits — startup, access log, the core's
+	// open-failure diagnostics — carries it) and returned to callers in the
+	// X-0G-Gateway-Instance header.
+	//
+	// Note it does NOT label this process's metrics. Which replica a series came
+	// from is a TARGET label, applied by the scraper from the same file_sd document
+	// cmd/cvmid writes — the only mechanism that also reaches up and the other
+	// per-scrape series, which Prometheus builds from target labels alone (see
+	// client/metrics).
+	//
+	// Best-effort on purpose: outside a CVM there is neither file nor socket, and
+	// inside one a missing init container or a wedged agent must not keep the
+	// gateway from serving. Telemetry loses a dimension; the data path is
+	// unaffected. It is logged at Warn rather than Info so a deployment that MEANT
+	// to wire this up (deploy/phala/) and didn't sees it.
+	instanceID := ""
+	if info, source, err := loadIdentity(*identityFile, *dstackSocket); err != nil {
+		logger.Warn("dstack identity unavailable; logs and responses carry no instance dimension",
+			"source", source, "err", err)
+	} else if source != "" {
+		instanceID = info.InstanceID
+		logger = logger.With("instance_id", info.InstanceID)
+		logger.Info("dstack identity", "source", source, "app_id", info.AppID,
+			"app_name", info.AppName, "compose_hash", info.ComposeHash)
+	}
+
 	built := f.Build("gateway", logger)
 
 	// Parse the router base URL once, up front, so a malformed -router-url fails
@@ -168,7 +214,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              *f.Listen,
-		Handler:           newHandler(built.Client, routerTarget, origins, logger),
+		Handler:           newHandler(built.Client, routerTarget, origins, instanceID, logger),
 		ReadHeaderTimeout: 10 * time.Second, // mitigate slow-header (Slowloris) clients
 	}
 	// TLS is terminated ahead of this listener, inside the same enclave
@@ -179,13 +225,37 @@ func main() {
 	// (shared with the sidecar so both forms handle SIGTERM identically — the
 	// dstack/Phala deployment sends it on every redeploy). ListenAndServe's clean
 	// shutdown is folded into a nil return; only a real listen failure is an error.
-	logger.Info("gateway listening", "listen", *f.Listen, "router_url", *f.RouterURL, "cors_allowed_origins", origins)
+	logger.Info("gateway listening", "listen", *f.Listen, "router_url", *f.RouterURL,
+		"cors_allowed_origins", origins)
 	err = proxycli.Serve(srv, logger)
 	stopWarmer()
 	stopMetrics()
 	if err != nil {
 		logger.Error("gateway server exited", "err", err)
 		os.Exit(1)
+	}
+}
+
+// loadIdentity resolves this CVM's identity from the first configured source: the
+// file cmd/cvmid wrote, else the guest-agent socket directly. It returns the
+// identity, the source it came from (for the log line), and any error.
+//
+// The file wins when both are set because it is the lower-privilege path — see
+// the -identity-file flag. With neither configured it returns an empty source and
+// no error: that is a deliberate local-run configuration, not a failure, so it
+// must not log a warning.
+func loadIdentity(identityFile, socket string) (dstack.Info, string, error) {
+	switch {
+	case identityFile != "":
+		info, err := dstack.ReadIdentityFile(identityFile)
+		return info, "file:" + identityFile, err
+	case socket != "":
+		ctx, cancel := context.WithTimeout(context.Background(), dstack.DefaultTimeout)
+		defer cancel()
+		info, err := dstack.FetchInfo(ctx, socket)
+		return info, "socket:" + socket, err
+	default:
+		return dstack.Info{}, "", nil
 	}
 }
 
@@ -296,7 +366,12 @@ func runHealthCheck(listen string) int {
 // callers on an allowed origin can reach it and every request emits one
 // redaction-safe structured line. It is split out from main so tests can drive it
 // with httptest.
-func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, logger *slog.Logger) http.Handler {
+//
+// instanceID, when non-empty, is stamped on every response as the serving CVM's
+// id (openaiproxy.StampInstance). It is empty only when the identity lookup found
+// nothing — a local run, or a deployment that wired neither source — in which case
+// no stamping middleware is wired at all.
+func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, instanceID string, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	// Mount the sealed inference path behind the gateway's front-door credential
 	// gate. The gate is a cheap presence/shape check (reject missing credentials
@@ -328,5 +403,8 @@ func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, 
 	// preflight, since a browser sends no credentials on one) or to the catch-all
 	// (which would let the ROUTER's allowlist decide what may reach this gateway) —
 	// while still emitting the one structured line per request, preflights included.
-	return openaiproxy.LogRequests(logger, openaiproxy.CORS(allowedOrigins, mux))
+	// StampInstance sits OUTSIDE CORS so a preflight — answered by CORS without
+	// ever reaching the mux — carries the header too, and inside the access log so
+	// the middleware order stays "log everything that happens below it".
+	return openaiproxy.LogRequests(logger, openaiproxy.StampInstance(instanceID, openaiproxy.CORS(allowedOrigins, mux)))
 }
