@@ -102,6 +102,28 @@ func TestWritePromSDPartialIdentity(t *testing.T) {
 	}
 }
 
+// The identity volume outlives a boot, so a file left by an earlier one must not
+// survive a boot that could not produce an identity — a dstack in-place upgrade
+// reuses the disk under a new app_id, and instance_id is derived from it, so the
+// stale file would name a replica that no longer exists.
+func TestStaleIdentityFileIsRemoved(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "identity.json")
+	if err := dstack.WriteIdentityFile(path, dstack.Info{InstanceID: "aa11", AppID: "bb22"}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	// The identity-unavailable branch of main: nothing to write, so clear it.
+	if err := clearIdentityFile(path); err != nil {
+		t.Fatalf("clearIdentityFile: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("stale identity file survived (stat err = %v)", err)
+	}
+	// Idempotent: a boot that never had an identity must not fail on the absence.
+	if err := clearIdentityFile(path); err != nil {
+		t.Errorf("clearIdentityFile on a missing file = %v, want nil", err)
+	}
+}
+
 // Rewriting must replace the document wholesale and leave no temp file behind:
 // Prometheus watches this path, and a stray .sd-* would be discovered as a second
 // (stale) source of the same target.

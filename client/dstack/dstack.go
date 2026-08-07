@@ -135,57 +135,63 @@ func FetchInfo(ctx context.Context, socket string) (Info, error) {
 	return info, nil
 }
 
-// identityFileMode is what the identity file is written with: readable by every
-// uid in the CVM, writable only by the (root) writer. The consumers run as
-// unprivileged users of their own images — the gateway as distroless `nonroot`,
-// the Prometheus agent as `nobody` — so anything narrower would be unreadable by
-// exactly the containers this file exists for.
-const identityFileMode = 0o644
+// publishedFileMode is what everything on the identity volume is written with:
+// readable by every uid in the CVM, writable only by the (root) writer. The
+// consumers run as unprivileged users of their own images — the gateway as
+// distroless `nonroot`, the Prometheus agent as `nobody` — so anything narrower
+// would be unreadable by exactly the containers these files exist for.
+const publishedFileMode = 0o644
 
-// identityDirMode is the mode for a directory the writer has to create. The file
+// publishedDirMode is the mode for a directory the writer has to create. The file
 // mode above is what actually governs access; this just has to be traversable.
-const identityDirMode = 0o755
+const publishedDirMode = 0o755
 
-// WriteIdentityFile writes info to path as JSON, creating the parent directory if
-// needed. It is how cmd/cvmid hands the identity to the other containers of the
-// CVM over a shared volume, so that only that one short-lived container needs the
-// guest-agent socket.
+// PublishFile writes body to path on the shared identity volume, creating the
+// parent directory if needed.
 //
-// The write is atomic (temp file + rename): a reader that starts while this runs
-// must see either the old file or the complete new one, never a half-written one
-// it would then treat as a corrupt identity.
-func WriteIdentityFile(path string, info Info) error {
+// Two properties both consumers depend on, which is why this is one helper rather
+// than an os.WriteFile at each call site:
+//
+//   - Atomic (temp file + rename). Readers start concurrently — the gateway reads
+//     its identity at boot, and Prometheus watches its file_sd path and reloads on
+//     every change — so a half-written file would be read as a corrupt one.
+//   - World-readable. os.CreateTemp leaves 0600 behind, and the writer is root
+//     while every reader is some other unprivileged user (see publishedFileMode).
+func PublishFile(path string, body []byte) error {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, identityDirMode); err != nil {
-		return fmt.Errorf("identity file %s: %w", path, err)
+	if err := os.MkdirAll(dir, publishedDirMode); err != nil {
+		return fmt.Errorf("publish %s: %w", path, err)
 	}
-	body, err := json.MarshalIndent(info, "", "  ")
+	tmp, err := os.CreateTemp(dir, ".publish-*")
 	if err != nil {
-		return fmt.Errorf("identity file %s: %w", path, err)
-	}
-	body = append(body, '\n')
-
-	tmp, err := os.CreateTemp(dir, ".identity-*")
-	if err != nil {
-		return fmt.Errorf("identity file %s: %w", path, err)
+		return fmt.Errorf("publish %s: %w", path, err)
 	}
 	defer os.Remove(tmp.Name()) // no-op once the rename below succeeds
 	if _, err := tmp.Write(body); err != nil {
 		tmp.Close()
-		return fmt.Errorf("identity file %s: %w", path, err)
+		return fmt.Errorf("publish %s: %w", path, err)
 	}
 	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("identity file %s: %w", path, err)
+		return fmt.Errorf("publish %s: %w", path, err)
 	}
-	// CreateTemp makes the file 0600; the consumers are other users (see
-	// identityFileMode), so widen it before it becomes visible under its real name.
-	if err := os.Chmod(tmp.Name(), identityFileMode); err != nil {
-		return fmt.Errorf("identity file %s: %w", path, err)
+	if err := os.Chmod(tmp.Name(), publishedFileMode); err != nil {
+		return fmt.Errorf("publish %s: %w", path, err)
 	}
 	if err := os.Rename(tmp.Name(), path); err != nil {
-		return fmt.Errorf("identity file %s: %w", path, err)
+		return fmt.Errorf("publish %s: %w", path, err)
 	}
 	return nil
+}
+
+// WriteIdentityFile writes info to path as JSON. It is how cmd/cvmid hands the
+// identity to the other containers of the CVM over a shared volume, so that only
+// that one short-lived container needs the guest-agent socket.
+func WriteIdentityFile(path string, info Info) error {
+	body, err := json.MarshalIndent(info, "", "  ")
+	if err != nil {
+		return fmt.Errorf("identity file %s: %w", path, err)
+	}
+	return PublishFile(path, append(body, '\n'))
 }
 
 // ReadIdentityFile loads an identity previously written by WriteIdentityFile.

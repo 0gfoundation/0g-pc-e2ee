@@ -148,8 +148,8 @@ func TestIdentityFileRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat: %v", err)
 	}
-	if perm := fi.Mode().Perm(); perm != identityFileMode {
-		t.Errorf("file mode = %o, want %o", perm, identityFileMode)
+	if perm := fi.Mode().Perm(); perm != publishedFileMode {
+		t.Errorf("file mode = %o, want %o", perm, publishedFileMode)
 	}
 	// The temp file must not survive under its own name; a stray .identity-* in the
 	// directory would be shipped in the volume forever.

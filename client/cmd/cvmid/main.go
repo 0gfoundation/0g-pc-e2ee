@@ -44,7 +44,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/dstack"
 )
@@ -86,8 +85,20 @@ func main() {
 	// ReadIdentityFile's validation at the far end, which is a worse signal than
 	// its absence. The reader (the gateway) treats both the same way — warn and
 	// serve without the dimension.
-	if *outIdentity != "" && info.InstanceID != "" {
-		if err := dstack.WriteIdentityFile(*outIdentity, info); err != nil {
+	//
+	// Removing a leftover matters as much as writing a new one. The volume outlives
+	// any single boot, so a file from an earlier one would otherwise be read as
+	// current. Within one CVM that is harmless (the id is stable), but a dstack
+	// in-place upgrade reuses the disk under a NEW app_id — and instance_id is
+	// derived from it — so the stale file would name a replica that no longer
+	// exists. Missing telemetry beats confidently wrong telemetry.
+	if *outIdentity != "" {
+		if info.InstanceID != "" {
+			if err := dstack.WriteIdentityFile(*outIdentity, info); err != nil {
+				fmt.Fprintf(os.Stderr, "cvmid: %v\n", err)
+				os.Exit(1)
+			}
+		} else if err := clearIdentityFile(*outIdentity); err != nil {
 			fmt.Fprintf(os.Stderr, "cvmid: %v\n", err)
 			os.Exit(1)
 		}
@@ -99,6 +110,17 @@ func main() {
 		}
 	}
 	fmt.Fprintf(os.Stdout, "cvmid: instance_id=%q app_id=%q\n", info.InstanceID, info.AppID)
+}
+
+// clearIdentityFile removes a leftover identity file, treating an already-absent
+// one as success. Failing to remove one IS an error worth exiting on: it means
+// the volume is not writable the way the compose says, the same condition the
+// write path exits for.
+func clearIdentityFile(path string) error {
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("removing stale identity file %s: %w", path, err)
+	}
+	return nil
 }
 
 // promSDEntry is one entry of a Prometheus file_sd document: the targets to
@@ -137,35 +159,8 @@ func writePromSD(path, target string, info dstack.Info) error {
 	if err != nil {
 		return fmt.Errorf("prometheus file_sd %s: %w", path, err)
 	}
-	return writeFile(path, append(body, '\n'))
-}
-
-// writeFile writes body to path atomically (temp file + rename) and
-// world-readable, matching how the identity file is written: Prometheus watches
-// the file_sd path and reloads on change, so a reader can arrive mid-write, and
-// it runs as a different user (nobody) than this container (root).
-func writeFile(path string, body []byte) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("%s: %w", path, err)
-	}
-	tmp, err := os.CreateTemp(dir, ".sd-*")
-	if err != nil {
-		return fmt.Errorf("%s: %w", path, err)
-	}
-	defer os.Remove(tmp.Name()) // no-op once the rename below succeeds
-	if _, err := tmp.Write(body); err != nil {
-		tmp.Close()
-		return fmt.Errorf("%s: %w", path, err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("%s: %w", path, err)
-	}
-	if err := os.Chmod(tmp.Name(), 0o644); err != nil {
-		return fmt.Errorf("%s: %w", path, err)
-	}
-	if err := os.Rename(tmp.Name(), path); err != nil {
-		return fmt.Errorf("%s: %w", path, err)
-	}
-	return nil
+	// Same publish path as the identity file: atomic and world-readable, both of
+	// which this file needs — Prometheus watches it and reloads on change, and it
+	// runs as nobody while this container runs as root.
+	return dstack.PublishFile(path, append(body, '\n'))
 }
