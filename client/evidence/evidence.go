@@ -1,13 +1,13 @@
 // Package evidence verifies the cloud-TEE gateway's own attestation: the
 // dstack-ingress evidence bundle published at `https://<domain>/evidences/`.
 //
-// It answers the one question the gateway's trust story rests on and that the
-// provider-side trust chain (docs/design/trust-chain.md) does not cover:
-// **is the endpoint I am talking to a genuine TEE, and is its TLS certificate
-// one that was minted inside that enclave?** The gateway emits no quote of its
-// own — its identity comes from the ingress's cert-binding quote, whose
-// `report_data` commits to the bundle manifest and whose RTMR chain commits to
-// `app_id` (docs/design/cloud-gateway.md §6.1).
+// It answers the two questions the gateway's trust story rests on and that the
+// provider-side trust chain (docs/design/trust-chain.md) does not cover: **is the
+// endpoint I am talking to a genuine TEE whose TLS certificate was minted inside
+// it, and which code is it running?** The gateway emits no quote of its own — both
+// answers come from the ingress's cert-binding quote, whose `report_data` commits to
+// the bundle manifest and whose `mr_config_id` commits to the deployment's compose
+// hash (docs/design/cloud-gateway.md §6.1).
 //
 // The checks, in the order Check runs them:
 //
@@ -36,24 +36,34 @@
 //     `sha256 == compose_hash` authenticates them, and the `docker_compose_file`
 //     they carry is then compared against the manifest that was published. See
 //     CodeIdentity.
+//  7. **OS image** — `mr_config_id` is chosen by the untrusted host, so step 6
+//     stands up only because the guest OS refuses to boot when that register
+//     disagrees with the app-compose actually delivered. Trusting that means
+//     trusting the OS doing it, so the quote's boot chain (MRTD + RTMR0-2) must be
+//     one this verifier accepts. See OSImageCheck and Config.OSImages.
 //
-// # What a pass means, and what step 6 needs from the caller
+// # What a pass means
 //
 // Steps 1–5 are self-contained: point Check at a domain and it answers "is a
 // genuine TEE serving the certificate its own quote committed to".
 //
-// Step 6 needs material supplied, because a hash has no preimage of its own: the
-// app-compose bytes (Config.AppCompose, or Config.BaseDomain to fetch them), and
-// the compose text to compare against (Config.ExpectComposeFile). Their source
-// need not be trusted — the compose_hash from the quote anchors them — but without
-// them compose_hash and app_id are only opaque values to eyeball: enough to notice
-// that a deployment changed, not enough to say what it runs. Report.Note records
-// which checks were skipped so a partial result cannot be presented as a full one.
+// Step 6 needs material, because a hash has no preimage of its own: the app-compose
+// bytes (Config.AppCompose, or fetched — Config.BaseDomain, or derived from DNS) and
+// the compose text to compare against (Config.ExpectComposeFiles). Their source need
+// not be trusted, since the compose_hash from the quote anchors them; but without
+// them compose_hash and app_id are only opaque values to eyeball — enough to notice
+// that a deployment changed, not enough to say what it runs.
 //
-// One limit survives even a complete step 6: an image referenced by a floating tag
-// instead of a digest keeps `compose_hash` stable while the code behind the tag
-// changes. Code identity is only ever as strong as the pinning in the compose text
-// it authenticates.
+// Step 7 needs an allowlist, which ships embedded (see Config.OSImages) so a caller
+// supplies nothing. While it is empty the step reports "not pinned" rather than
+// failing, and code identity is evidence rather than proof: nothing then establishes
+// that the guest enforced step 6's binding at all.
+//
+// Report.Note carries whichever of these caveats apply, so a partial result cannot be
+// presented as a full one. One survives even a complete run: an image referenced by a
+// floating tag instead of a digest keeps `compose_hash` stable while the code behind
+// the tag changes. Code identity is only ever as strong as the pinning in the compose
+// text it authenticates.
 //
 // Everything here is read-only: HTTP GETs of the public evidence files and (for
 // step 6) the platform's guest-agent Info endpoint, one TLS handshake, plus

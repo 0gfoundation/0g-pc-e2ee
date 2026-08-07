@@ -29,7 +29,8 @@ func passing() evidence.Report {
 			{Name: "cert-pc-gateway.test.pem"},
 		},
 		CertMatch: evidence.CertExact,
-		Note:      "code identity is not checked here",
+		// A representative note; the real strings live in client/evidence.
+		Note: "code identity is only as strong as the image pinning inside the compose text",
 	}
 }
 
@@ -126,18 +127,63 @@ func TestReportGateway_TrustedRunHasNoWarning(t *testing.T) {
 	}
 }
 
-// A pass must never read as full attestation: the code-identity gap has to be on
-// screen.
-func TestReportGateway_PassStatesTheCodeIdentityGap(t *testing.T) {
+// A pass must never read as full attestation: whatever the report's note says was out
+// of scope has to reach the screen.
+func TestReportGateway_PassStatesItsCaveats(t *testing.T) {
 	rep := passing()
-	rep.Note = "code identity (app_id) is NOT checked here — replay the event log"
+	rep.Note = "the OS image is NOT pinned, so nothing establishes that the guest enforced " +
+		"the compose-hash binding — treat code identity as strong evidence, not proof"
 
 	var out bytes.Buffer
 	if code := reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", false, expectSource{}); code != 0 {
 		t.Fatalf("code = %d, want 0\n%s", code, out.String())
 	}
-	if !strings.Contains(out.String(), "app_id") {
-		t.Errorf("a passing report must still surface the code-identity gap:\n%s", out.String())
+	if !strings.Contains(out.String(), "not proof") {
+		t.Errorf("a passing report must still surface its caveats:\n%s", out.String())
+	}
+}
+
+// An unpinned OS image is reported as advisory, and a mismatch as a failure — the exit
+// code follows OSImageCheck.OK, so the two must not look alike on screen either.
+func TestReportGateway_OSImage(t *testing.T) {
+	unpinned := passing()
+	unpinned.OSImage = evidence.OSImageCheck{Configured: false}
+
+	mismatch := passing()
+	mismatch.OSImage = evidence.OSImageCheck{Configured: true,
+		Err: errors.New("MRTD/RTMR0-2 match no allowlisted OS image (dstack-nvidia-0.5.4.1)")}
+
+	matched := passing()
+	matched.OSImage = evidence.OSImageCheck{Configured: true, Matched: "dstack-nvidia-0.5.4.1 (1 vCPU)"}
+
+	cases := []struct {
+		name     string
+		rep      evidence.Report
+		wantCode int
+		contains string
+	}{
+		{"not pinned is advisory", unpinned, 0, "not pinned"},
+		{"mismatch fails", mismatch, 1, "no allowlisted OS image"},
+		{"match names the image", matched, 0, "dstack-nvidia-0.5.4.1 (1 vCPU)"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			code := reportGateway(context.Background(), &out, stubEvidence{rep: tc.rep},
+				"pc-gateway.test", false, expectSource{})
+			if code != tc.wantCode {
+				t.Errorf("code = %d, want %d\n%s", code, tc.wantCode, out.String())
+			}
+			if !strings.Contains(out.String(), tc.contains) {
+				t.Errorf("output missing %q:\n%s", tc.contains, out.String())
+			}
+		})
+	}
+	// The observed registers appear where they are actionable, and not otherwise.
+	var out bytes.Buffer
+	reportGateway(context.Background(), &out, stubEvidence{rep: matched}, "pc-gateway.test", false, expectSource{})
+	if strings.Contains(out.String(), "observed mrtd") {
+		t.Errorf("a clean match should not dump registers:\n%s", out.String())
 	}
 }
 

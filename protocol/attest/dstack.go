@@ -15,10 +15,11 @@ import (
 // the quote is the sole artifact Intel signs. The real reply also carries
 // event_log, tcb_info, vm_config and app_compose, but NONE of those are signed
 // by Intel; they are convenience decodes a caller must not trust directly. A
-// verifier re-derives the measurement from the *verified* quote (and, for app
-// identity, replays the event log against it) instead of reading tcb_info. Those
-// fields are intentionally omitted from this struct so the trusted path cannot
-// accidentally depend on them.
+// verifier re-derives everything it needs from the *verified* quote instead of
+// reading tcb_info: the measurement registers and, for app identity, the compose
+// hash in mr_config_id (see ComposeHashFromMRConfigID — it is in the signed report,
+// so no event-log replay is involved). Those fields are intentionally omitted from
+// this struct so the trusted path cannot accidentally depend on them.
 type QuoteResponse struct {
 	Quote string `json:"quote"`
 }

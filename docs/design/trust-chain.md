@@ -154,7 +154,8 @@ Honest gaps — half the value of this diagram is marking them (see
   TEE rather than the user's machine, so the gateway itself must be attested —
   otherwise it degrades to today's plaintext L7 router. That attestation is a
   separate artifact from this chain and is checked separately
-  (`pcverify -gateway`, below); its code-identity half is still manual.
+  (`pcverify -gateway`, below), including code identity — though the OS-image
+  allowlist that grounds it ships empty, so that last link is not closed yet.
 - **Replay**: defeated client-side by a per-request nonce; a server-side
   freshness field in the signed proof is still TODO.
 
@@ -203,8 +204,21 @@ broker but which the gateway needs separately: the verified quote's `mr_config_i
 carries `compose_hash = SHA-256(app-compose.json)` in the clear, so given those
 app-compose bytes (`-base-domain` to fetch them, or `-app-compose`) the tool
 authenticates them and compares the `docker_compose_file` they embed against the
-manifest that was published (`-expect-compose-file`). Two limits are worth stating:
-the compose hash is only as strong as the image pinning inside the compose text — a
-floating tag keeps it stable while the code changes — and waiving chain trust
-(`-allow-untrusted-cert`) drops the link between the connection and the domain, so
-an interceptor with its own attested CVM would satisfy everything else.
+manifest that was published (`-expect-compose-file`, or by default the newest published
+releases).
+
+Underneath that sits the **gateway CVM's own OS image**, which plays the role hop 3
+plays for the broker. `mr_config_id` is written by the untrusted host; the compose hash
+is truthful only because the guest OS refuses to boot when that register disagrees with
+the app-compose actually delivered, so the OS doing that check is part of the chain. The
+tool compares the quote's boot chain — `MRTD` + `RTMR0`–`RTMR2`, with `RTMR3` excluded
+because the compose hash already pins the app more precisely — against an allowlist
+embedded in the binary (`client/evidence/osimages.json`). **That allowlist ships empty**,
+so today the step reports "not pinned" and code identity is evidence rather than proof;
+populating it is the same kind of task as filling hop 3's measurement allowlist.
+
+Two further limits are worth stating: the compose hash is only as strong as the image
+pinning inside the compose text — a floating tag keeps it stable while the code changes
+— and waiving chain trust (`-allow-untrusted-cert`) drops the link between the
+connection and the domain, so an interceptor with its own attested CVM would satisfy
+everything else.

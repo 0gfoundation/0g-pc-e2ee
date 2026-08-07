@@ -34,7 +34,7 @@
 //	         [-allow-untrusted-cert]
 //	         [-expect-compose-file docker-compose.release.yml | -releases N]
 //	         [-app-compose app-compose.json | -base-domain <cluster>.phala.network]
-//	         [-no-dns-discovery]
+//	         [-no-dns-discovery] [-os-image-allowlist osimages.json]
 //
 // Code identity — which configuration, and so which images, the CVM booted — comes
 // from the same verified quote: its mr_config_id carries
@@ -66,6 +66,15 @@
 // every other check with its own quote, bundle and certificate. A run that uses the
 // flag prints that caveat. Use it to smoke-test a deployment you operate, never to
 // audit an endpoint you do not control.
+//
+// Underneath all of that sits the OS image. mr_config_id is chosen by the untrusted
+// host, so the compose hash means what it says only because the guest OS refuses to
+// boot when that register disagrees with the app-compose actually delivered — which
+// makes the OS itself part of the chain. The quote's boot chain (MRTD + RTMR0-2) is
+// therefore compared against an allowlist embedded in the binary, so nothing has to be
+// supplied; -os-image-allowlist overrides it for testing or for pinning an image before
+// it is committed. While that allowlist is empty the step reports "not pinned" instead
+// of failing, and the run says code identity is evidence rather than proof.
 //
 // A pass is only ever as strong as the image pinning inside the compose text it
 // authenticates: a floating tag keeps compose_hash identical while the code behind

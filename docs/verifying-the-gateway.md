@@ -325,6 +325,22 @@ diff deployed-compose.yml docker-compose.release.yml
 The platform base domain is the end of the served domain's CNAME chain
 (`dig +short CNAME` repeatedly; it ends at `_.<base-domain>`).
 
+Step **7** — the OS image — is the one part that needs the image itself. Recompute the
+expected boot chain from dstack's reproducible build and compare it with the verified
+quote's registers:
+
+```bash
+cargo build --release -p dstack-mr-cli   # from github.com/Dstack-TEE/dstack
+dstack-mr diagnose --vm-config vm-config.json --image-dir <image> \
+  --actual-mrtd <hex> --actual-rtmr0 <hex> --actual-rtmr1 <hex> --actual-rtmr2 <hex>
+```
+
+`vm-config.json` is the `vm_config` the CVM reports. A mismatch is reported per RTMR0
+event, so it points at what diverged rather than just saying no. The values this tool
+accepts are in
+[`client/evidence/osimages.json`](../client/evidence/osimages.json) — reviewing that
+file is reviewing what it will call acceptable.
+
 Release manifests are the `docker-compose.release.yml` asset on
 <https://github.com/0gfoundation/0g-pc-e2ee/releases>.
 

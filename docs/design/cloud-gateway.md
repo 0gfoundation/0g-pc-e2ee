@@ -316,7 +316,7 @@ does not.
    rather than carrying it), and `attest.AppIDFromComposeHash` derives the `app_id`
    the platform labels by. The `compose-hash` runtime event in RTMR3 carries the
    same value and is kept only as a cross-check in the KAT.
-   
+
    From there `pcverify -gateway` closes the chain with no extra arguments: it
    derives the platform base domain from the served domain's CNAME chain
    (`evidence.DeriveBaseDomain` — dstack points a served name at `_.<base_domain>`),
@@ -335,6 +335,18 @@ does not.
    authenticated. Both lookups are advisory when they happen by default and fatal when
    explicitly requested, so a network problem is never reported as a verification
    failure — nor silently as a pass.
+
+   **One dependency of code identity is implemented but not yet populated.**
+   `mr_config_id` is host-chosen, so the compose hash is truthful only because the
+   guest OS refuses to boot when it disagrees with the app-compose delivered; the
+   verifier therefore also compares the quote's boot chain — `MRTD` + `RTMR0`–`RTMR2`,
+   via `attest.BootChainPolicy`, with `RTMR3` excluded since `compose_hash` pins the
+   app more precisely — against an allowlist embedded in the binary
+   (`client/evidence/osimages.json`). That allowlist ships **empty**, so the step
+   currently reports "not pinned" instead of checking, and every run says code identity
+   is evidence rather than proof. Populating it is the same task as filling hop 3's
+   broker measurement allowlist (`trust-chain.md`), and until then this step is not
+   fully closed.
 3. **Publish `measurement ↔ cert` (transparency log / on-chain) + monitoring**,
    so cheating is publicly detectable without per-user effort.
 4. **Optional tier-3 path**: a WASM verify+seal SDK for clients that want

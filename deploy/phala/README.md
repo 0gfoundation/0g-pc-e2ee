@@ -35,12 +35,12 @@ client ──TLS──> platform host front end ──> dstack gateway ──pas
   `depends_on` covers startup only.)
 - dstack-ingress serves `/evidences/` (`quote.json`, `cert-<DOMAIN>.pem`,
   `acme-account.json`, `sha256sum.txt`). The quote's `report_data` holds
-  `SHA-256(sha256sum.txt)`, and `sha256sum.txt` covers the served certificate;
-  its RTMR chain commits to this app's `app_id`, the hash of the app-compose
-  manifest that embeds this compose file verbatim. So one quote proves *"a CVM
-  running exactly this app-compose obtained this certificate inside the TEE"*,
-  covering both containers. See [Verify](#verify) for the step the quote cannot do
-  for you.
+  `SHA-256(sha256sum.txt)`, and `sha256sum.txt` covers the served certificate; its
+  `mr_config_id` commits to `compose_hash`, the SHA-256 of the app-compose manifest
+  that embeds this compose file verbatim (`app_id` is its leading 20 bytes). So one
+  quote proves *"a CVM running exactly this app-compose obtained this certificate
+  inside the TEE"*, covering both containers. See [Verify](#verify) for the steps the
+  quote cannot do for you.
 
 ## Serving domain
 
@@ -144,8 +144,8 @@ certificate with the one the quote commits to.
 
 `pcverify -gateway` does all of that in one command — bundle integrity, DCAP
 verification of `quote.json`, the `report_data` binding, the served-certificate
-comparison, and code identity — and exits non-zero on any failed check, so it drops
-into a deploy gate:
+comparison, code identity, and the OS image the compose binding rests on — and exits
+non-zero on any failed check, so it drops into a deploy gate:
 
 ```sh
 # The whole chain, no extra arguments: it derives the platform base domain from the
@@ -244,6 +244,27 @@ shasum -a 256 app-compose.json
 jq -j '.docker_compose_file' app-compose.json > deployed-compose.yml
 diff deployed-compose.yml docker-compose.release.yml
 ```
+
+Finally the OS image, which is what makes the step above mean anything: `mr_config_id`
+is written by the untrusted host, and the compose hash is truthful only because the
+guest OS refuses to boot when that register disagrees with the app-compose it actually
+received (dstack `config_id_verifier.rs`). So the OS doing that check is part of the
+chain, and the quote's `MRTD` + `RTMR0`–`RTMR2` are what identify it. Recompute the
+expected values from the image's reproducible build and compare:
+
+```bash
+cargo build --release -p dstack-mr-cli   # from github.com/Dstack-TEE/dstack
+dstack-mr diagnose --vm-config vm-config.json --image-dir <image> \
+  --actual-mrtd <hex> --actual-rtmr0 <hex> --actual-rtmr1 <hex> --actual-rtmr2 <hex>
+```
+
+`vm-config.json` is the `vm_config` the CVM reports — the values are a function of the
+image **and** the VM shape (vCPU, RAM, PCI, GPU), so an expectation that names only an
+image version is wrong. `RTMR3` is deliberately not pinned: it holds the per-app and
+per-instance events, which `compose_hash` already covers more precisely. Once a tuple
+is derived it belongs in
+[`client/evidence/osimages.json`](../../client/evidence/osimages.json), which
+`pcverify` embeds so no user ever supplies it.
 
 The [`docker-compose.yml`](./docker-compose.yml) checked in here carries the floating
 `:latest` gateway tag for development and will **not** match a production deployment
