@@ -122,6 +122,96 @@ func TestFetchInfoRejectsBadResponses(t *testing.T) {
 	}
 }
 
+func TestIdentityFileRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "identity.json")
+	want := Info{
+		InstanceID:  "aa11bb22cc33dd44ee55ff6600112233445566aa",
+		AppID:       "3327603e03f5bd1f830812ca4a789277fc31f577",
+		AppName:     "0g-pc-gateway",
+		ComposeHash: "beef00",
+	}
+	if err := WriteIdentityFile(path, want); err != nil {
+		t.Fatalf("WriteIdentityFile: %v", err)
+	}
+	got, err := ReadIdentityFile(path)
+	if err != nil {
+		t.Fatalf("ReadIdentityFile: %v", err)
+	}
+	if got != want {
+		t.Errorf("round trip = %+v, want %+v", got, want)
+	}
+	// The consumers run as other users (the gateway as distroless nonroot, the
+	// Prometheus agent as nobody) while the writer runs as root, so a 0600 file —
+	// which is what os.CreateTemp leaves behind — would be unreadable by exactly
+	// the containers this file exists for.
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := fi.Mode().Perm(); perm != identityFileMode {
+		t.Errorf("file mode = %o, want %o", perm, identityFileMode)
+	}
+	// The temp file must not survive under its own name; a stray .identity-* in the
+	// directory would be shipped in the volume forever.
+	entries, err := os.ReadDir(filepath.Dir(path))
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "identity.json" {
+		t.Errorf("directory holds %v, want only identity.json", entries)
+	}
+}
+
+// Overwriting must land the new content whole — the file is read by containers
+// starting concurrently.
+func TestWriteIdentityFileOverwrites(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "identity.json")
+	if err := WriteIdentityFile(path, Info{InstanceID: "aa11"}); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	if err := WriteIdentityFile(path, Info{InstanceID: "bb22", AppID: "cc33"}); err != nil {
+		t.Fatalf("second write: %v", err)
+	}
+	got, err := ReadIdentityFile(path)
+	if err != nil {
+		t.Fatalf("ReadIdentityFile: %v", err)
+	}
+	if got.InstanceID != "bb22" || got.AppID != "cc33" {
+		t.Errorf("after overwrite = %+v", got)
+	}
+}
+
+// ReadIdentityFile re-validates rather than trusting the file: its contents become
+// metric label values, so a stale volume or a hand-edited file must fail the same
+// way a bad RPC reply does.
+func TestReadIdentityFileRejectsBadContent(t *testing.T) {
+	dir := t.TempDir()
+	cases := map[string]string{
+		"malformed json":  `{"instance_id":`,
+		"no instance id":  `{"app_id":"aa11"}`,
+		"non-hex":         `{"instance_id":"../../etc/passwd"}`,
+		"empty object":    `{}`,
+		"overlong":        `{"instance_id":"` + strings.Repeat("a", maxIDLen+1) + `"}`,
+		"wrong json type": `["not","an","object"]`,
+	}
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(dir, "bad.json")
+			if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			if _, err := ReadIdentityFile(path); err == nil {
+				t.Fatal("ReadIdentityFile = nil error, want failure")
+			}
+		})
+	}
+	t.Run("missing file", func(t *testing.T) {
+		if _, err := ReadIdentityFile(filepath.Join(dir, "absent.json")); err == nil {
+			t.Fatal("ReadIdentityFile on a missing file = nil error, want failure")
+		}
+	})
+}
+
 // A usable instance_id with an unusable app_id still yields identity: the
 // instance label is what separates colliding replica series, so losing the app
 // label must not cost us both.

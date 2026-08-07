@@ -40,10 +40,11 @@ signed — see the design doc).
 core/            # client core: quote + response-signature verification, seal, pin, fallback, key cache
 route/           # gateway route mode: pick the provider per request via the router's route-preview + broker pubkey APIs
 openaiproxy/     # shared OpenAI-compatible HTTP handler over core (used by both server forms)
-dstack/          # gateway-only: reads this CVM's instance_id/app_id from the dstack guest agent at startup
+dstack/          # CVM identity: read instance_id/app_id from the dstack guest agent, and pass it between containers as a file
 cmd/
   sidecar/       # local sidecar binary (OpenAI-compatible proxy on localhost) — user-operated, no new trust party
   gateway/       # cloud-TEE gateway — SAME core, but SERVER-RUN + 0G-operated, runs in an attested CVM (adds one attested trust party)
+  cvmid/         # init container shipped in the gateway image: publishes the CVM's identity to its sibling containers, then exits
 sdk/
   go/            # in-process Go SDK (thin wrapper over core; shares the Go core)
   ts/            # (planned) TS / WASM build for the browser — aligns to protocol/SPEC.md, does NOT import the Go core

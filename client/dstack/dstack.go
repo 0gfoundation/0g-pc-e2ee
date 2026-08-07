@@ -1,4 +1,5 @@
-// Package dstack reads the CVM's own identity from the dstack guest agent.
+// Package dstack reads the CVM's own identity from the dstack guest agent, and
+// passes it between containers of one CVM as a small JSON file.
 //
 // A gateway replica has no way to name itself: it is one of N CVMs that share an
 // app_id (deploy/phala/blue-green.md "Scaling one side"), it sits behind an L4
@@ -11,14 +12,20 @@
 //
 // The socket is a privileged surface — the same endpoint also derives keys and
 // issues quotes — so this package deliberately implements ONLY Info: identity in,
-// nothing else. It is read at startup, once; nothing here runs on the request
-// path.
+// nothing else. In the deployed form even that much is kept away from the
+// long-lived containers: cmd/cvmid opens the socket once at boot, writes the
+// identity file, and exits, so the gateway reads a plain file and never touches
+// the agent (WriteIdentityFile / ReadIdentityFile). Nothing here runs on the
+// request path.
 //
-// Attestation-wise the values are self-reported, not proven: they come from the
-// runtime the container already trusts for everything else, and nothing here is
-// a substitute for the cert-binding quote dstack-ingress publishes
-// (docs/design/cloud-gateway.md §6). Treat them as operational labels, not as
-// evidence.
+// On what the values are worth: instance_id and app_id are not merely
+// self-reported. dstack-util derives instance_id at boot as
+// sha256(instance_id_seed ‖ app_id)[:20] and extends BOTH into RTMR3, so a
+// verifier replaying the event log against a quote can confirm them. This package
+// does no such verification — it takes the agent's word, which is appropriate for
+// the operational labels it feeds and is no substitute for the cert-binding quote
+// dstack-ingress publishes (docs/design/cloud-gateway.md §6). The attested path
+// exists if these ever need to be evidence rather than labels.
 package dstack
 
 import (
@@ -28,6 +35,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -60,8 +69,9 @@ type Info struct {
 	// value the dstack gateway routes by in the per-instance hostname form
 	// (<instance_id>-443s.<base_domain>), so it is already public.
 	InstanceID string `json:"instance_id"`
-	// AppID is SHA-256(app-compose) — the same value the cert-binding quote commits
-	// to, and the one that distinguishes a blue side from a green one.
+	// AppID is SHA-256(app-compose) TRUNCATED to 20 bytes (40 hex, which is why an
+	// app id is 40 characters and not 64) — the same value the cert-binding quote
+	// commits to, and the one that distinguishes a blue side from a green one.
 	AppID string `json:"app_id"`
 	// AppName and ComposeHash are logged at startup for operator orientation only;
 	// they are not exported as metric labels.
@@ -118,6 +128,84 @@ func FetchInfo(ctx context.Context, socket string) (Info, error) {
 	// it. A malformed id is dropped, not truncated — a truncated id is not an id.
 	if !validID(info.InstanceID) {
 		return Info{}, fmt.Errorf("dstack guest agent at %s: Info returned no usable instance_id", socket)
+	}
+	if !validID(info.AppID) {
+		info.AppID = ""
+	}
+	return info, nil
+}
+
+// identityFileMode is what the identity file is written with: readable by every
+// uid in the CVM, writable only by the (root) writer. The consumers run as
+// unprivileged users of their own images — the gateway as distroless `nonroot`,
+// the Prometheus agent as `nobody` — so anything narrower would be unreadable by
+// exactly the containers this file exists for.
+const identityFileMode = 0o644
+
+// identityDirMode is the mode for a directory the writer has to create. The file
+// mode above is what actually governs access; this just has to be traversable.
+const identityDirMode = 0o755
+
+// WriteIdentityFile writes info to path as JSON, creating the parent directory if
+// needed. It is how cmd/cvmid hands the identity to the other containers of the
+// CVM over a shared volume, so that only that one short-lived container needs the
+// guest-agent socket.
+//
+// The write is atomic (temp file + rename): a reader that starts while this runs
+// must see either the old file or the complete new one, never a half-written one
+// it would then treat as a corrupt identity.
+func WriteIdentityFile(path string, info Info) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, identityDirMode); err != nil {
+		return fmt.Errorf("identity file %s: %w", path, err)
+	}
+	body, err := json.MarshalIndent(info, "", "  ")
+	if err != nil {
+		return fmt.Errorf("identity file %s: %w", path, err)
+	}
+	body = append(body, '\n')
+
+	tmp, err := os.CreateTemp(dir, ".identity-*")
+	if err != nil {
+		return fmt.Errorf("identity file %s: %w", path, err)
+	}
+	defer os.Remove(tmp.Name()) // no-op once the rename below succeeds
+	if _, err := tmp.Write(body); err != nil {
+		tmp.Close()
+		return fmt.Errorf("identity file %s: %w", path, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("identity file %s: %w", path, err)
+	}
+	// CreateTemp makes the file 0600; the consumers are other users (see
+	// identityFileMode), so widen it before it becomes visible under its real name.
+	if err := os.Chmod(tmp.Name(), identityFileMode); err != nil {
+		return fmt.Errorf("identity file %s: %w", path, err)
+	}
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return fmt.Errorf("identity file %s: %w", path, err)
+	}
+	return nil
+}
+
+// ReadIdentityFile loads an identity previously written by WriteIdentityFile.
+//
+// It re-validates the identifiers rather than trusting the file. The file is
+// produced inside the CVM by a container the compose measures, so this is not a
+// trust boundary — but its contents become metric label values, and a bad path
+// (a stale volume, a hand-edited file, a future writer with a bug) should fail
+// the same way a bad RPC reply does instead of quietly widening the label set.
+func ReadIdentityFile(path string) (Info, error) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return Info{}, err
+	}
+	var info Info
+	if err := json.Unmarshal(body, &info); err != nil {
+		return Info{}, fmt.Errorf("identity file %s: %w", path, err)
+	}
+	if !validID(info.InstanceID) {
+		return Info{}, fmt.Errorf("identity file %s: no usable instance_id", path)
 	}
 	if !validID(info.AppID) {
 		info.AppID = ""

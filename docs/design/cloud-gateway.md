@@ -325,18 +325,25 @@ does not.
   talk to the gateway; it constrains nothing else, because only browsers enforce it
   — any non-browser caller simply omits or forges `Origin`. Authorization remains
   the front-door credential gate plus the router's authoritative validation.
-- **The gateway container opens the dstack guest-agent socket** (`/var/run/dstack.sock`,
-  mounted in `deploy/phala/docker-compose.yml`) to read its own `instance_id` /
-  `app_id` once at startup. That socket is a privileged surface — the same agent
-  derives keys and issues quotes — so this widens what a compromised gateway
-  container could reach, and it is part of the measured compose, so a verifier
-  sees it. It buys the one thing a replica cannot otherwise have: a name. Without
-  it, replicas of one `app_id` produce unattributable interleaved logs and
-  colliding Prometheus series (identical external and target labels), which makes
-  running more than one CVM per side impractical. It does **not** change §6: the
-  values are self-reported operational labels, the gateway still publishes no
-  quote of its own and still exposes no `/quote` route, and endpoint identity
-  still rests on dstack-ingress's cert-binding attestation.
+- **One container in the CVM opens the dstack guest-agent socket** — `cvm-identity`,
+  an init container that reads this CVM's `instance_id` / `app_id` once at boot,
+  writes them to a shared volume, and exits (`deploy/phala/docker-compose.yml`,
+  `client/cmd/cvmid`). That socket is a privileged surface: the same agent derives
+  keys and issues quotes. It is kept off the **gateway** — the long-lived container
+  that sees user prompts, which reads a plain JSON file instead — so a compromised
+  gateway reaches nothing it could not reach before. The mount is part of the
+  measured compose, so a verifier sees exactly which container holds it.
+  It buys the one thing a replica cannot otherwise have: a name. Without it,
+  replicas of one `app_id` produce unattributable interleaved logs and colliding
+  Prometheus series (identical external and target labels), which makes running
+  more than one CVM per side impractical.
+  It does **not** change §6: the gateway still publishes no quote of its own and
+  still exposes no `/quote` route, and endpoint identity still rests on
+  dstack-ingress's cert-binding attestation. Note the identifiers are **not merely
+  self-reported** — `dstack-util` extends both `app-id` and `instance-id` into
+  RTMR3 at boot, so a verifier replaying the event log against a quote can confirm
+  them. We do not verify them here (they feed operational labels, not decisions),
+  but the attested path exists should they ever need to be evidence.
 - Cloud/runtime specifics marked **[verify]** must be confirmed against current
   GCP / dstack documentation before implementation.
 

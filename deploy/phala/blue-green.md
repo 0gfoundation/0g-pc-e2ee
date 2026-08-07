@@ -7,8 +7,11 @@ Let's Encrypt notes.
 
 ## Why blue/green here is a DNS pointer flip, not a load-balancer weight
 
-The gateway's `app_id` is `SHA-256(app-compose)`, and the compose embeds the
-gateway image **by digest**. So a new gateway build is a **different `app_id`** —
+The gateway's `app_id` is `SHA-256(app-compose)` **truncated to 20 bytes** (which
+is why an app id is 40 hex characters, not 64 — `dstack-util` does
+`truncate(compose_hash, 20)`; recompute it that way or it will never match), and
+the compose embeds the gateway image **by digest**. So a new gateway build is a
+**different `app_id`** —
 a separate, separately-attested CVM (README "Pin the image digest"). That single
 fact shapes everything:
 
@@ -430,12 +433,12 @@ Two consequences for testing it:
   A load test that reuses connections will show 100% of traffic on a single CVM
   and prove nothing; disable keep-alive (`curl --no-keepalive`, or a fresh process
   per request) to observe the distribution.
-- **Attribute the traffic, don't infer it.** Each gateway stamps its `instance_id`
-  (and `app_id`) on its metrics and log lines, read at boot from the guest-agent
-  socket, and `ZG_GATEWAY_INSTANCE_HEADER=true` additionally returns it in the
-  `X-0G-Gateway-Instance` response header for the duration of an experiment
-  (deploy/phala/docker-compose.yml). That header is off by default because it
-  advertises the fleet shape to every caller.
+- **Attribute the traffic, don't infer it.** Each CVM publishes its own
+  `instance_id` / `app_id` at boot (the `cvm-identity` init container), and the
+  gateway stamps them on its metrics and log lines. For an experiment, set
+  `ZG_GATEWAY_INSTANCE_HEADER=true` and every response carries
+  `X-0G-Gateway-Instance` (deploy/phala/docker-compose.yml). That header is off by
+  default because it advertises the fleet shape to every caller.
 
 > The `connect_top_n` / `cache_top_n` defaults above are upstream's
 > (`gateway/gateway.toml` in Phala-Network/dstack); a cluster operator can set

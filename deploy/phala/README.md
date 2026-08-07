@@ -289,28 +289,55 @@ store — but in **agent mode**:
 
 ### Telling replicas apart
 
-Every series the gateway exports carries `instance_id` and `app_id`, read once at
-boot from the dstack guest-agent socket the compose mounts into the gateway
-container (`ZG_GATEWAY_DSTACK_SOCKET`). The same `instance_id` is attached to
-every log line the process writes.
+Running more than one CVM per side requires this; it is not a nicety. Replicas of
+one `app_id` are identical CVMs running identical Prometheus agents, so their
+external labels (`service`, `env`) and target labels (`gateway:9464`,
+`localhost:9090`) are identical too — without a per-CVM label they write the
+**same series** to the shared store and the samples collide. `app_id` additionally
+separates a blue side from a green one, which `env` cannot.
 
-This is a prerequisite for running more than one CVM per side, not a nicety.
-Replicas of one `app_id` are identical CVMs running identical Prometheus agents,
-so their external labels (`service`, `env`) and target labels (`gateway:9464`) are
-identical too — without a per-CVM label they write the **same series** to the
-shared store and the samples collide. `app_id` additionally separates a blue side
-from a green one, which `env` cannot.
+Nothing inside a CVM can work its identity out for itself: the answer lives behind
+the dstack guest-agent socket, and compose interpolation happens at deploy time,
+before the runtime has assigned one. So a small init container,
+**`cvm-identity`**, does it once at boot and exits:
 
-Two caveats:
+```
+cvm-identity ──/var/run/dstack.sock──▶ guest agent (Info)
+     │
+     ├─▶ /run/identity/identity.json    ──▶ gateway   (log fields + exported metric labels)
+     └─▶ /run/identity/prom-agent.json  ──▶ prom agent (file_sd target labels, self-scrape)
+```
 
-- **The `prometheus-agent` self-scrape still collides** across replicas. Compose
-  interpolation happens at deploy time and cannot see a value the runtime assigns
-  per CVM, so those ~30 agent-health series have no per-instance source. Gateway
-  telemetry — what alerting runs on — is unaffected.
-- **A missing mount degrades silently in the data path and loudly in the log.**
-  If the socket is absent or the agent does not answer, the gateway logs
-  `dstack identity unavailable` at WARN and serves normally, without the labels.
-  Grep for that line after a deploy if a replica's metrics go missing.
+Both consumers mount the `identity` volume **read-only**; only `cvm-identity`
+mounts the socket. That is deliberate: the guest agent also derives keys and
+issues quotes, so the container that holds user prompts for the life of the CVM
+should not be able to reach it. It runs from the **same image** as the gateway
+(different `entrypoint`), so the compose gains no second digest to pin.
+
+The two jobs are labelled by two different mechanisms, and **they must not be
+mixed**:
+
+| job | how it gets the labels |
+|---|---|
+| `gateway` | the gateway exports them itself, on every series (`static_configs` target) |
+| `prometheus-agent` | `file_sd_configs` reads `prom-agent.json`, which carries them as target labels |
+
+If the `gateway` job also got `file_sd` labels, the target label would win under
+the default `honor_labels: false` and the gateway's own would be renamed
+`exported_instance_id`. Prometheus watches the `file_sd` path and reloads on
+change, so no restart is involved either way.
+
+Failure behaviour:
+
+- **Guest agent unreachable** → `cvm-identity` exits **0** having written the
+  file_sd document with the target but no labels, and no identity file. The
+  gateway logs `dstack identity unavailable` at WARN and serves normally. A
+  telemetry dimension is lost; nothing else is. Grep for that line after a deploy
+  if a replica's metrics go missing.
+- **Volume not writable** → `cvm-identity` exits **non-zero**, and because both
+  consumers gate on `service_completed_successfully` the app does not come up.
+  That is intentional: it means the compose is wrong, and blue/green will simply
+  never cut traffic to a side that never became healthy.
 
 To attribute a *specific request* to a replica (e.g. while measuring how the
 platform distributes connections), set `ZG_GATEWAY_INSTANCE_HEADER=true` and the
