@@ -155,6 +155,21 @@ func WithHTTPClient(h *http.Client) Option {
 	}
 }
 
+// WithMaxIdleConnsPerHost resizes the idle-connection pool of the Router's
+// control-plane transport (see core.NewPooledTransport). It rebuilds the
+// transport, so it overrides — and is overridden by — WithHTTPClient, whichever
+// is applied last. A non-positive n leaves the default in place.
+func WithMaxIdleConnsPerHost(n int) Option {
+	return func(r *Router) {
+		if n <= 0 {
+			return
+		}
+		tr := core.NewPooledTransport(n)
+		tr.ResponseHeaderTimeout = 30 * time.Second
+		r.http = &http.Client{Transport: tr}
+	}
+}
+
 // WithSensitiveFields sets the request fields stripped before the preview call,
 // so they never reach the (untrusted) router in cleartext. Default is
 // wire.DefaultSealedFields; keep it in sync with the client's seal set so
@@ -248,9 +263,13 @@ func New(routerURL string, opts ...Option) *Router {
 		routerURL = DefaultRouterURL
 	}
 	base := strings.TrimRight(routerURL, "/")
-	// A dedicated transport with a bounded header wait, mirroring core.New; the
-	// control-plane calls are short, so no long-stream concern applies.
-	tr := http.DefaultTransport.(*http.Transport).Clone()
+	// A dedicated transport with a server-sized idle-connection pool and a bounded
+	// header wait, mirroring core.NewWithResolver; the control-plane calls are
+	// short, so no long-stream concern applies. The pool matters most here: preview
+	// runs on EVERY request against the one router host, so an undersized pool
+	// (Go's default is 2) turns each concurrent request past the second into a
+	// fresh dial + TLS handshake (see core.NewPooledTransport).
+	tr := core.NewPooledTransport(core.DefaultMaxIdleConnsPerHost)
 	tr.ResponseHeaderTimeout = 30 * time.Second
 	r := &Router{
 		previewURL:      base + previewPath,
