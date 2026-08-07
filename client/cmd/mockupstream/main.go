@@ -64,7 +64,7 @@ func main() {
 	flag.StringVar(&cfg.Model, "model", envOr("MOCK_MODEL", "mock-model"),
 		"canonical model id the preview advertises and the responses report (env MOCK_MODEL)")
 	flag.IntVar(&cfg.SignatureCache, "signature-cache", envInt("MOCK_SIGNATURE_CACHE", 1<<16),
-		"how many recent response signatures to retain for fetching; the oldest is evicted past this, so a sustained load cannot grow the fixture's memory without bound (env MOCK_SIGNATURE_CACHE)")
+		"how many recent response signatures to retain for fetching; the oldest is evicted past this, so a sustained load cannot grow the fixture's memory without bound. Keep it well ABOVE peak concurrency: a signature evicted before the gateway fetches it surfaces as a fail-closed verification error that looks like a gateway fault (env MOCK_SIGNATURE_CACHE)")
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))

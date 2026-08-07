@@ -195,6 +195,11 @@ sides stay consistent. Add `MOCK_SIGNATURE_DELAY` to model a slow broker: the fe
 is on the critical path, after the final frame, so it lands directly on
 end-to-end latency (not on TTFT).
 
+One invariant if you touch `MOCK_SIGNATURE_CACHE`: keep it well above peak
+concurrency. The fixture retains signatures in a fixed ring, and one evicted before
+the gateway fetches it surfaces as a fail-closed verification error that reads like
+a gateway fault. The 65536 default is far above anything a single gateway carries.
+
 ## Known gaps worth testing next
 
 - **No admission control.** The gateway has no concurrency limit or rate limit

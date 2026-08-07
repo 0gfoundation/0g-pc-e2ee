@@ -143,9 +143,13 @@ export default function () {
   failed.add(!ok);
 }
 
+// A healthy stream ends with `data: [DONE]` and carries no gateway error event.
+// The marker is `_0g`, not `error`: the gateway's error envelope always includes
+// that sibling attribution block (openaiproxy.errorEnvelope), and unlike "error"
+// it cannot collide with generated content that happens to contain the word.
 function isCompleteStream(res) {
   const body = res.body || '';
-  return body.includes('data: [DONE]') && !body.includes('"error"');
+  return body.includes('data: [DONE]') && !body.includes('"_0g"');
 }
 
 function isCompleteJSON(res) {

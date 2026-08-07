@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -124,6 +125,93 @@ func TestFixtureRoundTripsWithClientCore(t *testing.T) {
 			t.Errorf("content: got %q, want %q", got.String(), wantStream)
 		}
 	})
+}
+
+// A one-frame stream is the shortest legitimate load shape, and its single frame
+// is both the first and the last — so it must still be terminated (final +
+// finish_reason) rather than ending on a content-only frame. The core rejects a
+// stream that never delivers a final frame, so this failing looks like a
+// truncated-stream error, not a subtly odd payload.
+func TestSingleChunkStreamIsTerminated(t *testing.T) {
+	cfg := testConfig()
+	cfg.Chunks = 1
+	ts := newTestFixture(t, cfg)
+	c := newTestClient(ts)
+
+	frames := 0
+	var finish string
+	err := c.CompleteStream(context.Background(), chatRequest(true), func(f wire.Response) error {
+		frames++
+		var choices []struct {
+			FinishReason string `json:"finish_reason"`
+			Delta        struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"delta"`
+		}
+		if err := json.Unmarshal(f["choices"], &choices); err != nil {
+			return err
+		}
+		if len(choices) > 0 {
+			finish = choices[0].FinishReason
+			if choices[0].Delta.Role != "assistant" {
+				t.Errorf("delta.role: got %q, want assistant", choices[0].Delta.Role)
+			}
+			if choices[0].Delta.Content == "" {
+				t.Error("delta.content: empty, want the chunk content")
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("CompleteStream: %v", err)
+	}
+	if frames != 1 {
+		t.Errorf("frames: got %d, want 1", frames)
+	}
+	if finish != "stop" {
+		t.Errorf("finish_reason: got %q, want stop", finish)
+	}
+}
+
+// The fixture is only useful if it holds up under the concurrency it exists to
+// generate. This drives it from many goroutines at once so `go test -race`
+// actually covers the state shared across requests — the signature ring and the
+// precomputed frame fragments — which a sequential test cannot reach.
+func TestFixtureIsConcurrencySafe(t *testing.T) {
+	const workers = 24
+	cfg := testConfig()
+	// Above the worker count on purpose: the ring must outlive the window between a
+	// response being written and its signature being fetched (see sigStore). Sizing
+	// it below concurrency is the documented misconfiguration, not the thing under
+	// test here — eviction logic itself is covered by TestSigStoreEvictsOldest.
+	cfg.SignatureCache = 4 * workers
+	ts := newTestFixture(t, cfg)
+	c := newTestClient(ts)
+
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			// Half streaming, half buffered: the two paths seal, bind and sign
+			// differently, so both need to be in flight together.
+			if i%2 == 0 {
+				errs <- c.CompleteStream(context.Background(), chatRequest(true), func(wire.Response) error { return nil })
+				return
+			}
+			_, err := c.Complete(context.Background(), chatRequest(false))
+			errs <- err
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("concurrent completion: %v", err)
+		}
+	}
 }
 
 // With -sign=false the fixture serves no signature, so a gateway configured to

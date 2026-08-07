@@ -80,6 +80,7 @@ type server struct {
 	firstChoices  json.RawMessage
 	chunkChoices  json.RawMessage
 	finalChoices  json.RawMessage
+	soleChoices   json.RawMessage
 	fullChoices   json.RawMessage
 	usageRaw      json.RawMessage
 }
@@ -167,6 +168,15 @@ func newServer(cfg config) (*server, error) {
 	}
 	if err := marshalInto(&s.finalChoices, []any{map[string]any{
 		"index": 0, "delta": map[string]any{}, "finish_reason": "stop",
+	}}); err != nil {
+		return nil, err
+	}
+	// -chunks=1 is a legitimate load shape (the shortest possible stream), and its
+	// one frame is both the first and the last — so it needs the role AND the
+	// finish_reason. Without this it would carry neither a terminator nor a usage
+	// block, which a real provider's single-chunk stream does.
+	if err := marshalInto(&s.soleChoices, []any{map[string]any{
+		"index": 0, "delta": map[string]any{"role": "assistant", "content": content}, "finish_reason": "stop",
 	}}); err != nil {
 		return nil, err
 	}
@@ -414,12 +424,18 @@ func (s *server) serveStream(w http.ResponseWriter, r *http.Request, ephPub []by
 			"model":   s.modelRaw,
 			"choices": s.chunkChoices,
 		}
+		// `final` is checked before `i == 0` so a one-frame stream (-chunks=1, where
+		// the frame is both) gets terminated rather than silently ending on a
+		// content-only frame.
 		switch {
-		case i == 0:
-			frame["choices"] = s.firstChoices
+		case final && i == 0:
+			frame["choices"] = s.soleChoices
+			frame["usage"] = s.usageRaw
 		case final:
 			frame["choices"] = s.finalChoices
 			frame["usage"] = s.usageRaw
+		case i == 0:
+			frame["choices"] = s.firstChoices
 		}
 		sealed, err := sealer.SealFrame(frame, nil, final)
 		if err != nil {
@@ -492,8 +508,18 @@ func (s *server) sign(text string) proof.ChatSignature {
 }
 
 // sigStore retains the most recent signatures in a fixed-size ring, so a load run
-// of any length holds a bounded amount of memory: a signature is only ever fetched
-// moments after its response, so evicting the oldest is free in practice.
+// of any length holds a bounded amount of memory rather than accumulating one
+// entry per request forever.
+//
+// The size is an invariant, not just a memory budget: an entry must survive from
+// the moment the response is written to the moment the gateway fetches its
+// signature (which it does immediately after the final frame), so the ring must be
+// comfortably LARGER than the number of responses in that window — i.e. than peak
+// concurrency. Undersized, a signature is evicted by later requests before its own
+// fetch arrives, and the gateway reports a fail-closed verification error that
+// looks like a gateway fault and is really a fixture misconfiguration. The default
+// (65536) is far above what a single gateway carries; that is why it is large.
+// The failure is at least loud — a 404 the gateway surfaces, never a silent pass.
 type sigStore struct {
 	mu   sync.Mutex
 	m    map[string]proof.ChatSignature

@@ -89,6 +89,11 @@ const (
 	// (not permanent) so a TCB downgrade, collateral expiry, revocation, or enc-key
 	// rotation is re-checked promptly; the warmer refreshes ahead of it.
 	defaultQuoteTTL = 5 * time.Minute
+	// controlPlaneHeaderTimeout bounds the wait for response headers on a
+	// control-plane call (preview, pubkey, quote). Named because two places build
+	// this transport — New and WithMaxIdleConnsPerHost — and a drift between them
+	// would give a Router a different timeout depending on which options it got.
+	controlPlaneHeaderTimeout = 30 * time.Second
 	// quoteVerifyTimeout bounds a single (de-duplicated) quote verification, which
 	// runs under a context detached from any one caller (so no caller's
 	// cancellation kills the shared work); this caps a hung upstream instead.
@@ -165,7 +170,7 @@ func WithMaxIdleConnsPerHost(n int) Option {
 			return
 		}
 		tr := core.NewPooledTransport(n)
-		tr.ResponseHeaderTimeout = 30 * time.Second
+		tr.ResponseHeaderTimeout = controlPlaneHeaderTimeout
 		r.http = &http.Client{Transport: tr}
 	}
 }
@@ -270,7 +275,7 @@ func New(routerURL string, opts ...Option) *Router {
 	// (Go's default is 2) turns each concurrent request past the second into a
 	// fresh dial + TLS handshake (see core.NewPooledTransport).
 	tr := core.NewPooledTransport(core.DefaultMaxIdleConnsPerHost)
-	tr.ResponseHeaderTimeout = 30 * time.Second
+	tr.ResponseHeaderTimeout = controlPlaneHeaderTimeout
 	r := &Router{
 		previewURL:      base + previewPath,
 		completionsURL:  base + completionsPath,
