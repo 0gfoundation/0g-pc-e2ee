@@ -347,18 +347,15 @@ services:
       # and the binary's own default would reinstate the socket path as a fallback.
       - "ZG_GATEWAY_IDENTITY_FILE=/run/identity/identity.json"
       - "ZG_GATEWAY_DSTACK_SOCKET="
-      # Whether to return the serving replica's instance id to CALLERS, in the
-      # X-0G-Gateway-Instance response header. Off, deliberately: the id itself is
-      # public (the platform routes to it by name at
-      # <instance_id>-443s.<base_domain>), but a per-response header lets any client
-      # enumerate how many replicas stand behind this domain and how traffic spreads
-      # over them — free reconnaissance. The metric labels and log fields carry the
-      # same value unconditionally and stay inside the enclave, which is where it
-      # belongs by default. Injected, so flip it by VALUE for a debugging window
-      # without changing app_id; list ZG_GATEWAY_INSTANCE_HEADER in allowed_envs
-      # permanently (dstack drops any var not listed) rather than editing the list,
-      # which is itself measured.
-      - "ZG_GATEWAY_INSTANCE_HEADER=${ZG_GATEWAY_INSTANCE_HEADER:-false}"
+      # NOTE there is no switch here for the X-0G-Gateway-Instance response header:
+      # the gateway returns the serving replica's id to callers unconditionally,
+      # whenever it knows it (the same convention as a CDN's X-Served-By). It was
+      # briefly a toggle; that was dropped because the setting would have lived in
+      # the encrypted environment, so turning it on means restarting the deployment
+      # — which nobody does mid-incident, making it a knob that is off exactly when
+      # it is wanted. What it discloses is the fleet shape, and the id itself is
+      # already public (the platform routes to it by name at
+      # <instance_id>-443s.<base_domain>).
     volumes:
       # Identity in, read-only, as a plain JSON file — deliberately NOT the
       # guest-agent socket. That socket also derives keys and issues quotes, and

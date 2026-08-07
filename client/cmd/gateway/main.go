@@ -106,13 +106,6 @@ func main() {
 	dstackSocket := flag.String("dstack-socket", proxycli.EnvOr("ZG_GATEWAY_DSTACK_SOCKET", dstack.DefaultSocket),
 		"path to the dstack guest-agent unix socket, read ONCE at startup for the same identity when "+
 			"-identity-file is unset; empty disables the lookup (env ZG_GATEWAY_DSTACK_SOCKET)")
-	// Whether to tell each caller which replica served it. Off by default: the id
-	// is public, but a per-response header hands any client a free census of the
-	// fleet behind the domain (see openaiproxy.StampInstance).
-	instanceHeader := flag.Bool("instance-header", proxycli.EnvBool("ZG_GATEWAY_INSTANCE_HEADER", false),
-		fmt.Sprintf("return the serving CVM's instance id to callers in the %s response header; "+
-			"off by default (the metric labels and log fields carry it regardless, without exposing "+
-			"the fleet shape to clients) (env ZG_GATEWAY_INSTANCE_HEADER)", openaiproxy.HeaderGatewayInstance))
 	health := flag.Bool("health", false, "probe GET /healthz on the -listen port and exit 0 (healthy) or 1; starts no server, for container healthchecks")
 	flag.Parse()
 
@@ -198,15 +191,9 @@ func main() {
 	// it down alongside the main server on a signal.
 	stopMetrics := startMetrics(*metricsListen, logger)
 
-	// The header is opt-in, so pass an empty id unless -instance-header is set;
-	// newHandler then wires no stamping middleware at all.
-	headerInstanceID := ""
-	if *instanceHeader {
-		headerInstanceID = instanceID
-	}
 	srv := &http.Server{
 		Addr:              *f.Listen,
-		Handler:           newHandler(built.Client, routerTarget, origins, headerInstanceID, logger),
+		Handler:           newHandler(built.Client, routerTarget, origins, instanceID, logger),
 		ReadHeaderTimeout: 10 * time.Second, // mitigate slow-header (Slowloris) clients
 	}
 	// TLS is terminated ahead of this listener, inside the same enclave
@@ -218,7 +205,7 @@ func main() {
 	// dstack/Phala deployment sends it on every redeploy). ListenAndServe's clean
 	// shutdown is folded into a nil return; only a real listen failure is an error.
 	logger.Info("gateway listening", "listen", *f.Listen, "router_url", *f.RouterURL,
-		"cors_allowed_origins", origins, "instance_header", *instanceHeader)
+		"cors_allowed_origins", origins)
 	err = proxycli.Serve(srv, logger)
 	stopWarmer()
 	stopMetrics()
@@ -343,8 +330,9 @@ func runHealthCheck(listen string) int {
 // with httptest.
 //
 // instanceID, when non-empty, is stamped on every response as the serving CVM's
-// id (openaiproxy.StampInstance). main passes it only when -instance-header is
-// set, so the default build of the handler behaves exactly as before.
+// id (openaiproxy.StampInstance). It is empty only when the identity lookup found
+// nothing — a local run, or a deployment that wired neither source — in which case
+// no stamping middleware is wired at all.
 func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, instanceID string, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	// Mount the sealed inference path behind the gateway's front-door credential

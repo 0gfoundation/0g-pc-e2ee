@@ -435,10 +435,15 @@ Two consequences for testing it:
   per request) to observe the distribution.
 - **Attribute the traffic, don't infer it.** Each CVM publishes its own
   `instance_id` / `app_id` at boot (the `cvm-identity` init container), and the
-  gateway stamps them on its metrics and log lines. For an experiment, set
-  `ZG_GATEWAY_INSTANCE_HEADER=true` and every response carries
-  `X-0G-Gateway-Instance` (deploy/phala/docker-compose.yml). That header is off by
-  default because it advertises the fleet shape to every caller.
+  gateway stamps them on its metrics and log lines. So the distribution is a
+  metrics query, not an experiment you have to set up:
+
+  ```promql
+  sum by (instance_id) (rate(zg_gateway_http_requests_total[5m]))
+  ```
+
+  Per *request*, every response also carries `X-0G-Gateway-Instance` naming the
+  replica that served it — always on, nothing to enable.
 
 > The `connect_top_n` / `cache_top_n` defaults above are upstream's
 > (`gateway/gateway.toml` in Phala-Network/dstack); a cluster operator can set

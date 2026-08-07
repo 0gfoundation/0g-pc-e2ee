@@ -358,14 +358,27 @@ Failure behaviour:
   That is intentional: it means the compose is wrong, and blue/green will simply
   never cut traffic to a side that never became healthy.
 
-To attribute a *specific request* to a replica (e.g. while measuring how the
-platform distributes connections), set `ZG_GATEWAY_INSTANCE_HEADER=true` and the
-gateway returns `X-0G-Gateway-Instance` on every response. It is **off by
-default**: the id is public, but a per-response header lets any caller enumerate
-the fleet behind the domain. Toggle it by value — keep the key permanently in
-`allowed_envs`, since editing that list changes `app_id`. Note that selection is
-per TCP connection, so a keep-alive client sees one replica no matter how many
-requests it sends; see `blue-green.md` "Scaling one side".
+To attribute a *specific request* to a replica, read **`X-0G-Gateway-Instance`**
+off the response. The gateway sets it unconditionally whenever it knows its own
+id — the same convention as a CDN's `X-Served-By` — so it is there during an
+incident without anyone having to have turned it on first. There is no switch:
+the setting would have lived in the encrypted environment, so flipping it means
+restarting the deployment, and a knob that is off exactly when you want it is
+worse than a decision. What it discloses is the fleet shape; the id itself is
+already public, since the platform routes to it by name at
+`<instance_id>-443s.<PLATFORM_BASE>`.
+
+To measure how traffic *distributes* across replicas, don't use the header —
+query the metrics, which carry the same dimension and need no client-side
+plumbing:
+
+```promql
+sum by (instance_id) (rate(zg_gateway_http_requests_total[5m]))
+```
+
+Note that selection happens per TCP connection, so a keep-alive client sees one
+replica no matter how many requests it sends; see `blue-green.md`
+"Scaling one side".
 
 ### Configuring remote_write
 

@@ -9,10 +9,11 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 )
 
-// With an instance id wired in (-instance-header on, and the dstack lookup having
-// succeeded), every response carries it — including the ones that never reach the
-// sealed route, since those are exactly the responses an operator is trying to
-// attribute to a replica when one CVM misbehaves.
+// Once the gateway knows its identity, every response carries it — including the
+// ones that never reach the sealed route, since those are exactly the responses
+// someone is trying to attribute to a replica when one CVM misbehaves. There is
+// no toggle: a header that had to be switched on would be off during the incident
+// that wanted it.
 func TestInstanceHeaderStampedOnEveryResponse(t *testing.T) {
 	const id = "aa11bb22cc33dd44"
 	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), testOrigins(), id, discardLogger()))
@@ -65,9 +66,10 @@ func TestInstanceHeaderStampedOnEveryResponse(t *testing.T) {
 	})
 }
 
-// The default: no id (either -instance-header is off or the dstack lookup
-// failed), so nothing is stamped and the fleet shape stays unadvertised.
-func TestInstanceHeaderAbsentByDefault(t *testing.T) {
+// The one case that stamps nothing: the process never learned its own id (a local
+// run, or a deployment that wired neither identity source). It must serve
+// normally, without a header naming an empty replica.
+func TestInstanceHeaderAbsentWithoutIdentity(t *testing.T) {
 	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), testOrigins(), "", discardLogger()))
 	defer gw.Close()
 
