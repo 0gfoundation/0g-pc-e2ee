@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"net/url"
 	"strings"
 	"testing"
@@ -265,6 +266,32 @@ func TestGatewayRouteMode(t *testing.T) {
 // This is the cleartext passthrough; it must never carry a prompt (see
 // newRouterProxy), which the sealed chat route — exercised by
 // TestGatewayRouteMode — continues to own.
+// The catch-all sends every request it forwards to the one router host, so it
+// needs the shared server-sized connection pool like every other path to that
+// host. A nil Transport is the defect this guards: ReverseProxy silently falls
+// back to the process-global http.DefaultTransport and its 2 idle connections per
+// host, which no functional test would notice — it only shows up as a throughput
+// ceiling under concurrency the load rig does not even drive through this route.
+func TestRouterProxyUsesThePooledTransport(t *testing.T) {
+	proxy, ok := newRouterProxy(mustURL(t, "http://router.unused"), discardLogger()).(*httputil.ReverseProxy)
+	if !ok {
+		t.Fatal("newRouterProxy did not return a *httputil.ReverseProxy")
+	}
+	if proxy.Transport == nil {
+		t.Fatal("Transport: nil — the proxy would fall back to the process-global http.DefaultTransport")
+	}
+	tr, ok := proxy.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("Transport: got %T, want *http.Transport", proxy.Transport)
+	}
+	if want := core.NewPooledTransport().MaxIdleConnsPerHost; tr.MaxIdleConnsPerHost != want {
+		t.Errorf("MaxIdleConnsPerHost: got %d, want %d (core.NewPooledTransport's)", tr.MaxIdleConnsPerHost, want)
+	}
+	if tr == http.DefaultTransport {
+		t.Error("Transport is http.DefaultTransport itself: the pool would be shared process-wide")
+	}
+}
+
 func TestGatewayRoutesOtherRequestsToRouter(t *testing.T) {
 	var gotPath, gotQuery, gotHost, gotAuth string
 	routerMux := http.NewServeMux()

@@ -53,12 +53,18 @@ separately.
 cd loadtest
 docker compose up --build -d
 
-# Bracket the ceiling: a staircase of arrival rates that aborts past 1% errors.
+# Bracket the ceiling: a staircase of arrival rates, aborting on the first step
+# whose own error rate passes 1%.
 docker compose --profile load run --rm k6
 
-# Then pin a number at a rate just under the knee.
+# Then pin a number at a rate just under the knee. This is the quotable run.
 docker compose --profile load run --rm -e MODE=steady -e RATE=40 -e DURATION=5m k6
 ```
+
+The two runs are not interchangeable: the ramp **brackets**, the steady run
+**measures**. A ramp gives every step only its hold to produce a distribution, and
+its whole point is to walk into overload — so quote the steady run's percentiles,
+and use the ramp only to find out which rate to give it.
 
 The gateway is CPU-limited to `GATEWAY_CPUS` (default 2) so the result maps onto a
 CVM size rather than onto the test host. The fixture gets `MOCK_CPUS` (default 4)
@@ -119,8 +125,28 @@ VUs — raise `MAX_VUS` and rerun; that is not a gateway result.
   the fixture's token schedule, so it only becomes informative once the gateway
   itself is the slow part.
 
-The capacity figure is **the highest step whose p99 `http_req_waiting` has not yet
-turned up and whose error rate is still under 1%** — not the peak RPS reached.
+The capacity figure is **the highest arrival rate at which p99 `http_req_waiting`
+has not yet turned up and the error rate is still under 1%** — not the peak RPS the
+ramp reached.
+
+**Where the per-step numbers actually are.** In ramp mode every metric is tagged
+with its step index, and each step carries its own `gateway_failed` threshold — so
+the end-of-test summary prints a row per step (`gateway_failed{step:0}`, `{step:1}`,
+…) instead of one diluted run-wide rate, and the run aborts on the first step that
+breaks rather than only on one that collapses.
+
+Per-step **latency** is not in that summary: k6 only prints submetrics that have a
+threshold, and putting a threshold on latency would assert a bound this script has
+no basis to pick. So read per-step latency from a timeseries output —
+
+```sh
+docker compose --profile load run --rm k6 run --out json=/scripts/out.json /scripts/chat.js
+```
+
+— or from Prometheus remote write, and slice by the `step` tag. In practice the
+shorter path is: take the step where `gateway_failed{step:N}` first moves, then
+re-run that rate under `MODE=steady`, where the whole run is one rate and every
+percentile in the summary is directly about it.
 
 **Watch the gateway's own metrics next to the client's.** On `:9464`:
 

@@ -23,6 +23,12 @@ services:
     build:
       context: ..
       dockerfile: client/cmd/mockupstream/Dockerfile
+    # Every knob is passed as a FLAG with ${MOCK_*} interpolation, not through an
+    # `environment:` block. The fixture accepts either (flag > env > default), but
+    # compose interpolates ${...} here from the host env at parse time, whereas a
+    # container inherits nothing from the host — so a MOCK_* var that is not listed
+    # below is silently ignored, not passed through. Adding a knob to the fixture
+    # means adding a line HERE too, or the documentation for it will be a lie.
     command:
       - "-listen=0.0.0.0:8080"
       # The simulated completion shape. Defaults model a chatty small model:
@@ -34,7 +40,18 @@ services:
       - "-chunk-interval=${MOCK_CHUNK_INTERVAL:-40ms}"
       - "-chunks=${MOCK_CHUNKS:-64}"
       - "-chunk-bytes=${MOCK_CHUNK_BYTES:-16}"
+      - "-providers=${MOCK_PROVIDERS:-1}"
+      # Upstream latency the gateway pays per request (preview) and per response
+      # (the §8 signature fetch, when verification is on).
       - "-preview-delay=${MOCK_PREVIEW_DELAY:-0s}"
+      - "-signature-delay=${MOCK_SIGNATURE_DELAY:-0s}"
+      # Must stay well above peak concurrency — a signature evicted before the
+      # gateway fetches it reads like a gateway fault (see README).
+      - "-signature-cache=${MOCK_SIGNATURE_CACHE:-65536}"
+      # Interpolated into BOTH sides: the fixture advertises this model and the k6
+      # driver requests it (see the k6 service's MODEL below). Wiring only one side
+      # would leave the driver asking for a model the preview never offers.
+      - "-model=${MOCK_MODEL:-mock-model}"
       # Must match the gateway's ZG_GATEWAY_VERIFY_RESPONSES below: with verification
       # on the fixture has to sign (and the gateway pays a signature fetch per
       # response); with it off, signing is pure fixture overhead.
