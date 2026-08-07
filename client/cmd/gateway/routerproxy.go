@@ -6,6 +6,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 )
 
@@ -30,6 +31,15 @@ import (
 // never let it become the path for sealed content.
 func newRouterProxy(target *url.URL, logger *slog.Logger) http.Handler {
 	return &httputil.ReverseProxy{
+		// Every request this proxy makes goes to the one router host, so it needs the
+		// same server-sized idle-connection pool as the sealed path. Left nil,
+		// ReverseProxy falls through to the process-global http.DefaultTransport and
+		// its 2 idle connections per host — which would make this the one gateway path
+		// still throttled that way, and the one sharing a pool with whatever else
+		// happens to use the global default. It is not per-chat, but it IS per page
+		// load for the browser clients this catch-all exists to serve (the model
+		// catalog and discovery fan-out), so the concurrency is real.
+		Transport: core.NewPooledTransport(),
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			// Route the outbound to the router, preserving any base path on the
 			// configured URL (…/api + /v1/models → …/api/v1/models) and merging query
@@ -39,6 +49,17 @@ func newRouterProxy(target *url.URL, logger *slog.Logger) http.Handler {
 			// gateway runs inside the enclave behind dstack-ingress and must not
 			// advertise client IPs or its internal hostname to the untrusted router.
 			pr.SetURL(target)
+		},
+		ModifyResponse: func(resp *http.Response) error {
+			// The router runs its own CORS middleware off its own allowlist, and this
+			// proxy copies upstream headers verbatim — so without this the browser would
+			// see two Access-Control-Allow-Origin values (a hard failure: "contains
+			// multiple values") whenever both the router and the gateway allowed the
+			// origin, and the router's verdict whenever they disagreed. Strip them and
+			// let the gateway's own middleware (openaiproxy.CORS, which wraps this
+			// handler) be the single authority for what a browser may reach here.
+			openaiproxy.StripCORSHeaders(resp.Header)
+			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			// A transport-level failure reaching the router — this fires only when the

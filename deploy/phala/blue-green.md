@@ -7,16 +7,20 @@ Let's Encrypt notes.
 
 ## Why blue/green here is a DNS pointer flip, not a load-balancer weight
 
-The gateway's `app_id` is `SHA-256(app-compose)`, and the compose embeds the
-gateway image **by digest**. So a new gateway build is a **different `app_id`** —
+The gateway's `app_id` is `SHA-256(app-compose)` **truncated to 20 bytes** (which
+is why an app id is 40 hex characters, not 64 — `dstack-util` does
+`truncate(compose_hash, 20)`; recompute it that way or it will never match), and
+the compose embeds the gateway image **by digest**. So a new gateway build is a
+**different `app_id`** —
 a separate, separately-attested CVM (README "Pin the image digest"). That single
 fact shapes everything:
 
-- **dstack only load-balances *within one `app_id`*.** Deploy N CVMs from the
-  *same* compose and dstack's gateway spreads traffic across them automatically
-  ("when using the app ID, the load balancer selects one of the available
-  instances"). That is horizontal scaling / HA, and it is **orthogonal** to
-  releases — see [Scaling one side](#scaling-one-side-replicas).
+- **dstack only spreads traffic *within one `app_id`*.** Deploy N CVMs from the
+  *same* compose and dstack's gateway picks among them per connection ("when
+  using the app ID, the load balancer selects one of the available instances" —
+  though the selection is a connect race, not round-robin; see
+  [Scaling one side](#scaling-one-side-replicas)). That is horizontal scaling /
+  HA, and it is **orthogonal** to releases.
 - **Two different images are two unrelated apps.** dstack will not blend traffic
   across them, so a release cannot be a weighted canary at this layer. It is an
   **all-or-nothing flip** of one record: `_dstack-app-address.<DOMAIN>`, the TXT
@@ -393,18 +397,59 @@ you no second side to cut over to safely.)
 ## Scaling one side (replicas)
 
 Independent of releases: to scale or add HA **within** a side, deploy more CVMs
-from that side's *exact* compose (same `app_id`). dstack load-balances across
+from that side's *exact* compose (same `app_id`). dstack spreads traffic across
 them by `app_id`, and each publishes the same `_dstack-app-address` value, so no
 switch-layer change is needed. Releases (this document) change `app_id` and flip
 the pointer; scaling keeps `app_id` and adds instances. They compose cleanly —
 `switch.sh` neither knows nor cares how many CVMs back the side it points at.
 
-> **[verify] on the custom-domain path.** dstack's app-id load balancing is
-> documented for the platform-hostname path. Our deployment adds dstack-ingress
-> + L4 passthrough on our own domain; the routing key is still the `app_id` in
-> `_dstack-app-address`, so replicas *should* balance the same way, but confirm
-> empirically (bring up two same-compose CVMs, watch both receive traffic)
-> before relying on it for HA.
+**The custom-domain path uses the same selection code as the platform hostname.**
+An SNI the gateway holds no cert for and a `…-443s` platform hostname both land in
+`tls_passthough::proxy_to_app`, which calls `select_top_n_hosts(app_id)` — so
+replicas behind our own domain are selected exactly as they are behind
+`<app_id>-443s.<base_domain>`. What that function does is worth knowing before
+you plan capacity, because **it is not round-robin and it does not balance by
+load**:
+
+1. an id that names an *instance* short-circuits to that CVM (this is what makes
+   the standby probe above work);
+2. an `app_id` is expanded to its instances, sorted by **WireGuard handshake
+   recency**, truncated to `connect_top_n` (upstream default **3**) and **cached
+   for `cache_top_n` (default 30s)**;
+3. the proxy then races a TCP connect against all of those at once and keeps
+   **whichever answers first**, dropping the rest.
+
+`connections` counters exist on each instance but take no part in the decision.
+Practically that means the closest/fastest replica wins most connections rather
+than traffic splitting evenly — this is HA and headroom, **not** an even spread —
+and `connect_top_n = 0` is the only setting that degrades to a per-connection
+random pick among healthy instances (also the fallback when handshake data is
+unavailable).
+
+Two consequences for testing it:
+
+- **Selection is per TCP connection, not per request.** Any keep-alive client —
+  a browser, an OpenAI SDK — pins every request on one connection to one replica.
+  A load test that reuses connections will show 100% of traffic on a single CVM
+  and prove nothing; disable keep-alive (`curl --no-keepalive`, or a fresh process
+  per request) to observe the distribution.
+- **Attribute the traffic, don't infer it.** Each CVM publishes its own
+  `instance_id` / `app_id` at boot (the `cvm-identity` init container); the
+  Prometheus agent applies them as target labels on every scrape, and the gateway
+  puts `instance_id` on every log line. So the distribution is a metrics query,
+  not an experiment you have to set up:
+
+  ```promql
+  sum by (instance_id) (rate(zg_gateway_http_requests_total[5m]))
+  ```
+
+  Per *request*, every response also carries `X-0G-Gateway-Instance` naming the
+  replica that served it — always on, nothing to enable.
+
+> The `connect_top_n` / `cache_top_n` defaults above are upstream's
+> (`gateway/gateway.toml` in Phala-Network/dstack); a cluster operator can set
+> them differently, and that config is not visible from outside. Confirm the
+> behaviour you actually get on your cluster before relying on it for HA.
 
 ## Limitations & things to confirm in your environment
 
@@ -434,8 +479,9 @@ the pointer; scaling keeps `app_id` and adds instances. They compose cleanly —
 - **Two CNAME hops** (① → ② → ③ for a TXT lookup) and each side runs
   `DNS_SETUP_MODE=print` — standard and resolver-safe, but if you debug resolution
   by hand, follow the full chain.
-- **`app_id` LB across replicas on the custom-domain path is [verify]** — see
-  [Scaling one side](#scaling-one-side-replicas).
+- **Replica selection is a connect race, not round-robin, and it is per TCP
+  connection** — see [Scaling one side](#scaling-one-side-replicas) before sizing
+  a fleet or measuring its distribution.
 - **Every managed side is a separate attestation.** A verifier must re-audit each
   side's `app_id` against [`docker-compose.yml`](./docker-compose.yml) per
   README "Verify"; blue and green are audited independently.

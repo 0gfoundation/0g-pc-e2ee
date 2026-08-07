@@ -17,11 +17,13 @@
 //
 // Startup wiring (flags, env-var defaults, route/seal plumbing) is shared with
 // the sidecar via client/cmd/internal/proxycli; the gateway keeps only its own
-// listen default (:8443), the ZG_GATEWAY_* env prefix, and the operational
-// routes below. Every parameter can be set via flag or a ZG_GATEWAY_* env var
-// (flag > env > built-in default); env config is the primary path for the
-// TEE/dstack deployment, where the compose file's `environment:` block is
-// measured into the CVM attestation (see deploy/phala/docker-compose.yml).
+// listen default (:8443), the ZG_GATEWAY_* env prefix, the browser-facing
+// concerns (the CORS origin allowlist — see -allowed-origins / newHandler), and
+// the operational routes below. Every parameter can be set via flag or a
+// ZG_GATEWAY_* env var (flag > env > built-in default); env config is the
+// primary path for the TEE/dstack deployment, where the compose file's
+// `environment:` block is measured into the CVM attestation (see
+// deploy/phala/docker-compose.yml).
 //
 // The gateway emits no attestation quote and signs no responses of its own.
 // Endpoint/code identity comes from the in-CVM cert-binding attestation that
@@ -46,12 +48,14 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"net/url"
 	"os"
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/cmd/internal/proxycli"
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/client/dstack"
 	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 )
@@ -68,6 +72,47 @@ func main() {
 	metricsListen := flag.String("metrics-listen", os.Getenv("ZG_GATEWAY_METRICS_LISTEN"),
 		"address to serve Prometheus /metrics on; empty disables it. Bind an INTERNAL "+
 			"address never published through the public ingress (env ZG_GATEWAY_METRICS_LISTEN)")
+	// The browser origin allowlist for CORS — a gateway-only concern, like
+	// -metrics-listen above: the gateway is the form that serves browsers
+	// (no-install / thin clients), while the sidecar is a single-user localhost
+	// process, so the shared proxycli flags stay unchanged. The default is the 0G
+	// first-party app origins (openaiproxy.DefaultAllowedOriginsCSV — a deliberate
+	// subset of what the router accepts), because a page allowed to call the router
+	// directly is exactly the page expected to swap its base URL to this gateway; an
+	// empty value allows no origin (browser access off) and is honored as set, not
+	// treated as unset.
+	allowedOrigins := flag.String("allowed-origins", proxycli.EnvOr("ZG_GATEWAY_ALLOWED_ORIGINS", openaiproxy.DefaultAllowedOriginsCSV),
+		"comma-separated browser origin allowlist for CORS: exact origins (https://app.example.com), "+
+			"\"*.\" wildcards (https://*.0g.ai — subdomains only, not the apex), or \"*\" for any; "+
+			"empty allows no origin, disabling browser access (env ZG_GATEWAY_ALLOWED_ORIGINS)")
+	// Where this CVM's own identity comes from. A gateway app can be backed by
+	// several replicas sharing one app_id, so without it a merged log stream and a
+	// shared metrics store cannot tell them apart.
+	//
+	// Two sources, and the file is preferred BECAUSE it is the weaker privilege:
+	// cmd/cvmid opens the guest-agent socket once at boot and writes the file, so
+	// the deployed gateway — the long-lived container that sees user prompts — never
+	// touches a socket that also derives keys and issues quotes. The direct socket
+	// path stays for local runs and for anyone deploying without that init step.
+	identityFile := flag.String("identity-file", proxycli.EnvOr("ZG_GATEWAY_IDENTITY_FILE", ""),
+		"path to the identity JSON written by cmd/cvmid, read ONCE at startup for this CVM's "+
+			"instance_id/app_id (used as log fields and the X-0G-Gateway-Instance response header; "+
+			"metrics are labelled by the scraper, not here); takes precedence over -dstack-socket, "+
+			"which the deployed form leaves unset (env ZG_GATEWAY_IDENTITY_FILE)")
+	dstackSocket := flag.String("dstack-socket", proxycli.EnvOr("ZG_GATEWAY_DSTACK_SOCKET", dstack.DefaultSocket),
+		"path to the dstack guest-agent unix socket, read ONCE at startup for the same identity when "+
+			"-identity-file is unset; empty disables the lookup (env ZG_GATEWAY_DSTACK_SOCKET)")
+	// Mount the Go runtime profiler on the metrics listener. OFF by default and
+	// deliberately not a production knob: it is the fastest way to find where a
+	// load test's throughput is going (`go tool pprof
+	// http://<metrics-listen>/debug/pprof/profile?seconds=30`), and it rides the
+	// internal metrics port precisely because that port is never published through
+	// the ingress. Enabling it in an attested deployment would also change the
+	// measured compose text (app_id), so keep it to load-test CVMs.
+	pprofOn := flag.Bool("pprof", proxycli.EnvBool("ZG_GATEWAY_PPROF", false),
+		"serve the Go runtime profiler at /debug/pprof/ on the -metrics-listen address (requires -metrics-listen). "+
+			"For load testing and diagnosis only — it exposes process internals, so never enable it on a listener "+
+			"reachable from outside the CVM (env ZG_GATEWAY_PPROF)")
 	// -health turns the binary into its OWN container health probe: it makes one
 	// GET /healthz to the -listen port, prints the result, and exits 0 (healthy)
 	// or 1 — it starts no server. The image is distroless (no shell, no curl,
@@ -92,6 +137,34 @@ func main() {
 	// forms don't drift (see proxycli.NewLogger). dstack/Phala captures stdout as
 	// line records; a later GCP move can swap the handler in one place.
 	logger := proxycli.NewLogger()
+
+	// Learn who this CVM is, before anything else logs. It is attached to the logger
+	// (so EVERY line this process emits — startup, access log, the core's
+	// open-failure diagnostics — carries it) and returned to callers in the
+	// X-0G-Gateway-Instance header.
+	//
+	// Note it does NOT label this process's metrics. Which replica a series came
+	// from is a TARGET label, applied by the scraper from the same file_sd document
+	// cmd/cvmid writes — the only mechanism that also reaches up and the other
+	// per-scrape series, which Prometheus builds from target labels alone (see
+	// client/metrics).
+	//
+	// Best-effort on purpose: outside a CVM there is neither file nor socket, and
+	// inside one a missing init container or a wedged agent must not keep the
+	// gateway from serving. Telemetry loses a dimension; the data path is
+	// unaffected. It is logged at Warn rather than Info so a deployment that MEANT
+	// to wire this up (deploy/phala/) and didn't sees it.
+	instanceID := ""
+	if info, source, err := loadIdentity(*identityFile, *dstackSocket); err != nil {
+		logger.Warn("dstack identity unavailable; logs and responses carry no instance dimension",
+			"source", source, "err", err)
+	} else if source != "" {
+		instanceID = info.InstanceID
+		logger = logger.With("instance_id", info.InstanceID)
+		logger.Info("dstack identity", "source", source, "app_id", info.AppID,
+			"app_name", info.AppName, "compose_hash", info.ComposeHash)
+	}
+
 	built := f.Build("gateway", logger)
 
 	// Parse the router base URL once, up front, so a malformed -router-url fails
@@ -104,6 +177,25 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Validate the origin allowlist at startup, same fail-loud stance: a pattern a
+	// browser Origin can never match (a trailing slash, a missing scheme) would
+	// otherwise show up only as the app it was meant to allow being blocked, with
+	// nothing in the log to explain it.
+	origins := openaiproxy.ParseOrigins(*allowedOrigins)
+	if err := openaiproxy.ValidateOrigins(origins); err != nil {
+		logger.Error("invalid -allowed-origins", "err", err)
+		os.Exit(1)
+	}
+	for _, o := range origins {
+		if o == "*" {
+			// Not fatal — an operator may genuinely want an open API — but it means any
+			// web page can drive this gateway with a key its own visitor holds, so it
+			// should never be the accidental result of a misrendered env var.
+			logger.Warn("CORS allowlist contains \"*\": every browser origin is allowed", "allowed_origins", origins)
+			break
+		}
+	}
+
 	// Start the background quote-cache warmer (a no-op unless -warm is set) so
 	// requests hit a warm cache instead of paying the DCAP verify inline; stop it
 	// on shutdown before the process exits.
@@ -114,11 +206,15 @@ func main() {
 	// one: the metrics address is bound to a port the compose does not publish, so
 	// it never rides the same ingress as the OpenAI API surface. stopMetrics shuts
 	// it down alongside the main server on a signal.
-	stopMetrics := startMetrics(*metricsListen, logger)
+	if *pprofOn && *metricsListen == "" {
+		logger.Error("-pprof requires -metrics-listen (the profiler is served on that internal listener)")
+		os.Exit(1)
+	}
+	stopMetrics := startMetrics(*metricsListen, *pprofOn, logger)
 
 	srv := &http.Server{
 		Addr:              *f.Listen,
-		Handler:           newHandler(built.Client, routerTarget, logger),
+		Handler:           newHandler(built.Client, routerTarget, origins, instanceID, logger),
 		ReadHeaderTimeout: 10 * time.Second, // mitigate slow-header (Slowloris) clients
 	}
 	// TLS is terminated ahead of this listener, inside the same enclave
@@ -129,13 +225,37 @@ func main() {
 	// (shared with the sidecar so both forms handle SIGTERM identically — the
 	// dstack/Phala deployment sends it on every redeploy). ListenAndServe's clean
 	// shutdown is folded into a nil return; only a real listen failure is an error.
-	logger.Info("gateway listening", "listen", *f.Listen, "router_url", *f.RouterURL)
+	logger.Info("gateway listening", "listen", *f.Listen, "router_url", *f.RouterURL,
+		"cors_allowed_origins", origins)
 	err = proxycli.Serve(srv, logger)
 	stopWarmer()
 	stopMetrics()
 	if err != nil {
 		logger.Error("gateway server exited", "err", err)
 		os.Exit(1)
+	}
+}
+
+// loadIdentity resolves this CVM's identity from the first configured source: the
+// file cmd/cvmid wrote, else the guest-agent socket directly. It returns the
+// identity, the source it came from (for the log line), and any error.
+//
+// The file wins when both are set because it is the lower-privilege path — see
+// the -identity-file flag. With neither configured it returns an empty source and
+// no error: that is a deliberate local-run configuration, not a failure, so it
+// must not log a warning.
+func loadIdentity(identityFile, socket string) (dstack.Info, string, error) {
+	switch {
+	case identityFile != "":
+		info, err := dstack.ReadIdentityFile(identityFile)
+		return info, "file:" + identityFile, err
+	case socket != "":
+		ctx, cancel := context.WithTimeout(context.Background(), dstack.DefaultTimeout)
+		defer cancel()
+		info, err := dstack.FetchInfo(ctx, socket)
+		return info, "socket:" + socket, err
+	default:
+		return dstack.Info{}, "", nil
 	}
 }
 
@@ -146,12 +266,29 @@ func main() {
 // operational telemetry, so the gateway keeps serving requests even if its
 // metrics port cannot bind, rather than the observability path taking down the
 // data path.
-func startMetrics(listen string, logger *slog.Logger) (stop func()) {
+//
+// withPprof additionally mounts the Go runtime profiler on the same listener
+// (see the -pprof flag). It shares this listener rather than getting one of its
+// own because the property that makes it safe — never published through the
+// ingress, reachable only on the CVM-internal network — is a property of THIS
+// listener; a second one would have to re-establish it.
+func startMetrics(listen string, withPprof bool, logger *slog.Logger) (stop func()) {
 	if listen == "" {
 		return func() {}
 	}
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", metrics.Handler())
+	if withPprof {
+		// Registered explicitly rather than by relying on net/http/pprof's init()
+		// (which only populates http.DefaultServeMux — a mux this binary never
+		// serves), so what the profiler exposes is visible here at the call site.
+		mux.HandleFunc("GET /debug/pprof/", pprof.Index)
+		mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
+		logger.Warn("pprof profiler enabled on the metrics listener", "listen", listen, "path", "/debug/pprof/")
+	}
 	srv := &http.Server{
 		Addr:              listen,
 		Handler:           mux,
@@ -225,10 +362,16 @@ func runHealthCheck(listen string) int {
 
 // newHandler mounts the shared OpenAI proxy, the gateway-only operational route
 // (health), and a catch-all that reverse-proxies every other path to the router
-// (routerTarget), all wrapped in the access-log middleware so
-// every request emits one redaction-safe structured line. It is split out from
-// main so tests can drive it with httptest.
-func newHandler(c *core.Client, routerTarget *url.URL, logger *slog.Logger) http.Handler {
+// (routerTarget), all wrapped in the CORS and access-log middleware so browser
+// callers on an allowed origin can reach it and every request emits one
+// redaction-safe structured line. It is split out from main so tests can drive it
+// with httptest.
+//
+// instanceID, when non-empty, is stamped on every response as the serving CVM's
+// id (openaiproxy.StampInstance). It is empty only when the identity lookup found
+// nothing — a local run, or a deployment that wired neither source — in which case
+// no stamping middleware is wired at all.
+func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, instanceID string, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	// Mount the sealed inference path behind the gateway's front-door credential
 	// gate. The gate is a cheap presence/shape check (reject missing credentials
@@ -255,5 +398,13 @@ func newHandler(c *core.Client, routerTarget *url.URL, logger *slog.Logger) http
 	// cleartext passthrough — safe for metadata, never for sealed content (see
 	// newRouterProxy).
 	mux.Handle("/", newRouterProxy(routerTarget, logger))
-	return openaiproxy.LogRequests(logger, mux)
+	// CORS wraps the whole mux, INSIDE the access log: a preflight must be answered
+	// here — before the mux would hand it to the credential gate (which 401s a
+	// preflight, since a browser sends no credentials on one) or to the catch-all
+	// (which would let the ROUTER's allowlist decide what may reach this gateway) —
+	// while still emitting the one structured line per request, preflights included.
+	// StampInstance sits OUTSIDE CORS so a preflight — answered by CORS without
+	// ever reaching the mux — carries the header too, and inside the access log so
+	// the middleware order stays "log everything that happens below it".
+	return openaiproxy.LogRequests(logger, openaiproxy.StampInstance(instanceID, openaiproxy.CORS(allowedOrigins, mux)))
 }

@@ -6,8 +6,12 @@
 #
 # dstack-ingress terminates TLS *inside this CVM* (the key is generated in the
 # enclave and never leaves it) and forwards plaintext to the gateway over the
-# compose network, so the gateway itself must NOT do TLS. Both containers
-# therefore have to live in this one compose / one CVM.
+# compose network, so the gateway itself must NOT do TLS. Those two therefore have
+# to live in this one compose / one CVM. Two more containers ride along:
+# `cvm-identity`, a one-shot init container that tells the others which replica
+# they are, and `prometheus-agent`, which ships telemetry out. Everything below is
+# measured into app_id — including the images, the volumes, and the depends_on
+# edges — so a verifier sees the whole set.
 #
 # What the attestation actually gives you (cloud-gateway.md §6.1):
 # dstack-ingress serves /evidences/ — acme-account.json, cert-<DOMAIN>.pem,
@@ -36,6 +40,58 @@
 # Phala CLI, with the environment and DNS records in README "Serving domain".
 
 services:
+  # cvm-identity publishes THIS CVM's identity (instance_id / app_id) to the other
+  # containers, then exits. It is an init container, not a service.
+  #
+  # It exists because several CVMs can back one app_id (deploy/phala/blue-green.md
+  # "Scaling one side") and the platform picks which one a connection reaches — so
+  # every container here is byte-identical to its counterpart in the sibling
+  # replica and cannot say which one it is. The gateway needs that for its log
+  # fields and metric labels; the Prometheus agent below needs it or its
+  # self-scrape series collide with the sibling's in the shared remote-write store.
+  # Neither can work it out alone: the answer lives behind the guest-agent socket,
+  # and compose interpolation (deploy time) cannot see a value the runtime assigns
+  # per CVM.
+  #
+  # Concentrating the lookup here is also what lets the GATEWAY drop that socket.
+  # The guest agent is a privileged surface — it derives keys and issues quotes —
+  # and this container touches it for one call, then exits, whereas the gateway
+  # runs for the life of the CVM handling user prompts.
+  cvm-identity:
+    # The SAME image as the gateway, which already contains this binary: a second
+    # image would be a second digest to pin and a second supply-chain item for a
+    # verifier to audit, for ~100 lines of code. Keep this pin identical to the
+    # gateway's below — they are one artifact.
+    image: ghcr.io/0gfoundation/0g-pc-e2ee-gateway:latest
+    # `entrypoint:`, not `command:`: the image's ENTRYPOINT is the gateway and it
+    # declares no CMD, so a `command:` would be appended to it instead of replacing
+    # it. Root, because the shared volume below is created root-owned by docker and
+    # the image's default user is `nonroot`.
+    entrypoint: ["/usr/local/bin/cvmid"]
+    user: "0:0"
+    command:
+      - "-out-identity"
+      - "/run/identity/identity.json"
+      # One file_sd document per scrape job — they must not share one, or each job
+      # would discover the other's target. These carry the identity as TARGET
+      # labels, which is the only mechanism that also reaches `up` and the other
+      # per-scrape series: Prometheus builds those from target labels alone, never
+      # from the exposition, so nothing the exporter itself stamps can label them.
+      # `up` per replica is the signal most worth alerting on, which is why BOTH
+      # jobs go through here rather than the gateway labelling its own metrics.
+      - "-prom-sd"
+      - "/run/identity/sd/gateway.json=gateway:9464"
+      - "-prom-sd"
+      - "/run/identity/sd/prom-agent.json=localhost:9090"
+    # Runs once. `unless-stopped` would restart it forever after each clean exit.
+    restart: "no"
+    volumes:
+      # dstack-ingress mounts this socket too, and always has (cert binding, below).
+      # What is new here is only that this container holds it BRIEFLY — it makes one
+      # call and exits — so the set of LONG-LIVED holders is unchanged by adding it.
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - identity:/run/identity
+
   dstack-ingress:
     # Official upstream image, v2.3 — the first release with the DNS-01
     # DELEGATION_ZONE feature (Dstack-TEE/dstack-examples #104/#108). Public on
@@ -137,6 +193,16 @@ services:
     # deliberately on every upgrade; see README "Pin the image digest".
     image: ghcr.io/0gfoundation/0g-pc-e2ee-gateway:latest
     restart: unless-stopped
+    # Wait for the identity file to exist, so the gateway's very first log line
+    # already carries instance_id — it reads the file ONCE at startup, so a race
+    # here would cost the dimension for the whole life of the process, not just for
+    # a moment. cvm-identity exits 0 even when the guest agent does not answer
+    # (writing no identity file), precisely so a telemetry problem cannot hold the
+    # gateway down; it exits non-zero only if the volume is not writable, which is a
+    # broken deploy. depends_on is part of the measured compose (app_id).
+    depends_on:
+      cvm-identity:
+        condition: service_completed_successfully
     # Deliberately NOT published to the host: a published 8443 would also be
     # served at `<app-id>-8443.<base_domain>`, where the dstack gateway (not this
     # CVM) terminates TLS — the same requests, but outside our own enclave and
@@ -195,6 +261,25 @@ services:
       # on-chain signer (ATTEST/ONCHAIN below), so a swapped router cannot forge a
       # provider; the blast radius is routing/availability, not confidentiality.
       - "ZG_GATEWAY_ROUTER_URL=${ZG_GATEWAY_ROUTER_URL:-https://router-api.0g.ai}"
+      # Browser origin allowlist (CORS). Spelled out here rather than left to the
+      # binary's built-in default precisely BECAUSE this block is measured: which
+      # web origins may drive sealed inference through this enclave is a
+      # trust-relevant parameter, so app_id should commit to the list a reader can
+      # see, not to "whatever the image happens to default to". Keep it in sync with
+      # openaiproxy.DefaultAllowedOriginsCSV: the 0G first-party app origins, so a
+      # page allowed to call the router directly can swap its base URL to this
+      # gateway, and deliberately NOT every origin the router accepts (its list also
+      # carries third-party-hosted preview/deploy origins, which don't get to drive
+      # sealed inference through an enclave by default). The ${...} form lets an
+      # encrypted-env override win at boot without changing app_id — list
+      # ZG_GATEWAY_ALLOWED_ORIGINS in allowed_envs or dstack drops it. An empty value
+      # allows no origin, which turns browser access off entirely (SDK / server-side
+      # callers are unaffected: they send no Origin header).
+      #
+      # NOTE the localhost entries are development conveniences: they let a page
+      # served from a developer's machine seal through this enclave. Drop them via
+      # the override for any deployment that does not need that.
+      - "ZG_GATEWAY_ALLOWED_ORIGINS=${ZG_GATEWAY_ALLOWED_ORIGINS:-https://0g.ai,https://*.0g.ai,http://localhost:3000,http://localhost:5173}"
       # Request fields sealed end-to-end to the provider (must include
       # "messages"). Defaults to the binary's built-in set; uncomment to override.
       # - "ZG_GATEWAY_SEAL_FIELDS=messages"
@@ -258,6 +343,33 @@ services:
       # implicit at its 4m default, under the ~5m quote-cache TTL.
       - "ZG_GATEWAY_WARM=true"
       # - "ZG_GATEWAY_WARM_INTERVAL=4m" # optional; 4m is already the default
+      #
+      # Where to read THIS CVM's own identity (instance_id / app_id): the file the
+      # cvm-identity init container wrote, NOT the guest-agent socket. Both env vars
+      # are spelled out because this block is measured — a reader should be able to
+      # see, without consulting the binary's defaults, that the long-lived container
+      # handling user prompts opens no privileged runtime socket. The empty
+      # ZG_GATEWAY_DSTACK_SOCKET is the load-bearing half of that statement: unset it
+      # and the binary's own default would reinstate the socket path as a fallback.
+      - "ZG_GATEWAY_IDENTITY_FILE=/run/identity/identity.json"
+      - "ZG_GATEWAY_DSTACK_SOCKET="
+      # NOTE there is no switch here for the X-0G-Gateway-Instance response header:
+      # the gateway returns the serving replica's id to callers unconditionally,
+      # whenever it knows it (the same convention as a CDN's X-Served-By). It was
+      # briefly a toggle; that was dropped because the setting would have lived in
+      # the encrypted environment, so turning it on means restarting the deployment
+      # — which nobody does mid-incident, making it a knob that is off exactly when
+      # it is wanted. What it discloses is the fleet shape, and the id itself is
+      # already public (the platform routes to it by name at
+      # <instance_id>-443s.<base_domain>).
+    volumes:
+      # Identity in, read-only, as a plain JSON file — deliberately NOT the
+      # guest-agent socket. That socket also derives keys and issues quotes, and
+      # THIS container is the one that handles user prompts for the life of the
+      # CVM, so it gets the derived file instead. (dstack-ingress does mount the
+      # socket, for cert binding; the point is not that nothing holds it, but that
+      # the prompt-handling container does not.)
+      - identity:/run/identity:ro
     # The gateway itself holds no secret: no pinned provider key, and no TLS
     # material — the cert and its key belong to dstack-ingress above, generated
     # in-enclave via ACME and kept in the cert-data volume.
@@ -290,10 +402,24 @@ services:
       # Compose mounts this 0444, so the agent (uid 65534/nobody) can read it.
       - source: prom_agent_config
         target: /etc/prometheus/agent.yml
+    # The file_sd documents cvm-identity wrote, carrying this CVM's identity as the
+    # target labels for both scrape jobs. Read-only: nothing here writes them.
+    volumes:
+      - identity:/run/identity:ro
+    # Now load-bearing, not just tidy: BOTH jobs discover their targets from those
+    # documents, so until they exist this agent scrapes nothing at all. cvm-identity
+    # always writes them (unlabelled if the guest agent did not answer) and exits
+    # non-zero only if it cannot, which fails the deploy rather than starting a
+    # blind agent. Prometheus would also pick up a late file on its own — it watches
+    # these paths — but gating removes the gap entirely.
+    depends_on:
+      cvm-identity:
+        condition: service_completed_successfully
 
 volumes:
   cert-data: # SECRET: holds the TLS private key and the ACME account key
   evidences: # public evidence bundle served at /evidences/
+  identity: # this CVM's instance_id/app_id, written once by cvm-identity, read-only everywhere else
 
 configs:
   # agent.yml, rendered by COMPOSE (not Prometheus): the ${...} refs below are
@@ -321,15 +447,38 @@ configs:
           # compose serves both staging and mainnet; :? fails the deploy loudly if
           # it is unset (it checks non-empty only, not that the value is one of the
           # two — a typo still yields a wrong label).
+          #
+          # These labels CANNOT separate replicas: two CVMs of one app_id run this
+          # exact config, so every label here is identical between them. Per-CVM
+          # separation comes from the per-job file_sd target labels below.
           service: 0g-pc-gateway
           env: "${ZG_PROM_ENV:?set staging or mainnet}"
       scrape_configs:
+        # BOTH jobs get their per-replica identity as TARGET labels, from the file_sd
+        # documents cvm-identity wrote. Nothing is labelled exporter-side.
+        #
+        # That is not a style choice. Prometheus synthesises `up`,
+        # scrape_duration_seconds, scrape_samples_scraped,
+        # scrape_samples_post_metric_relabeling and scrape_series_added from TARGET
+        # labels alone — they never pass through the scraped process — so a label the
+        # exporter stamps on its own series cannot reach them. `up` is the extreme
+        # case: it exists precisely when the exposition could NOT be read. Leaving
+        # either job on static_configs would leave all five byte-identical between
+        # two replicas of one app_id, landing the collision on the signal you would
+        # most want to alert on per replica.
+        #
+        # file_sd is also what makes this an init container rather than an ordering
+        # problem: Prometheus watches these paths and reloads on change, with no
+        # restart and no env-var plumbing (a container's environment cannot be
+        # written from outside once it exists).
         - job_name: gateway
-          static_configs:
-            - targets: ["gateway:9464"]
+          file_sd_configs:
+            - files: ["/run/identity/sd/gateway.json"]
+        # The agent's own series — remote_write queue depth, send failures: the
+        # signal that tells you a replica has gone deaf.
         - job_name: prometheus-agent
-          static_configs:
-            - targets: ["localhost:9090"]
+          file_sd_configs:
+            - files: ["/run/identity/sd/prom-agent.json"]
       remote_write:
         - url: "${ZG_PROM_REMOTE_WRITE_URL:?set the remote_write endpoint, e.g. https://prometheus.example.com/api/v1/write}"
           basic_auth:

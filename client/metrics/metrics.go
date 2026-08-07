@@ -15,6 +15,18 @@
 // low-cardinality and content-free: route templates, HTTP methods, status codes,
 // and fixed outcome enums. A provider address, endpoint URL, request id, model
 // name, or any other caller-supplied value must NEVER become a label value.
+//
+// Which CVM produced a series is deliberately NOT decided here. It is a TARGET
+// label, applied by the scraper from the file_sd document cmd/cvmid writes (see
+// deploy/phala/docker-compose.yml). Stamping it exporter-side instead — via
+// WrapRegistererWith, which this package briefly did — cannot work: Prometheus
+// synthesises up, scrape_duration_seconds and the other per-scrape series from
+// target labels alone, so they would never carry it. `up` is the extreme case;
+// it exists precisely when the exposition could NOT be read, so no label this
+// process produces can ever reach it — and `up` per replica is the signal most
+// worth alerting on. client_golang says the same thing about its own API:
+// WrapRegistererWith "should not be used to add fixed labels to all metrics
+// exposed".
 package metrics
 
 import (

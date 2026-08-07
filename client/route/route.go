@@ -89,6 +89,10 @@ const (
 	// (not permanent) so a TCB downgrade, collateral expiry, revocation, or enc-key
 	// rotation is re-checked promptly; the warmer refreshes ahead of it.
 	defaultQuoteTTL = 5 * time.Minute
+	// controlPlaneHeaderTimeout bounds the wait for response headers on a
+	// control-plane call (preview, pubkey, quote) — short, unlike the data plane's,
+	// because none of these streams.
+	controlPlaneHeaderTimeout = 30 * time.Second
 	// quoteVerifyTimeout bounds a single (de-duplicated) quote verification, which
 	// runs under a context detached from any one caller (so no caller's
 	// cancellation kills the shared work); this caps a hung upstream instead.
@@ -248,10 +252,14 @@ func New(routerURL string, opts ...Option) *Router {
 		routerURL = DefaultRouterURL
 	}
 	base := strings.TrimRight(routerURL, "/")
-	// A dedicated transport with a bounded header wait, mirroring core.New; the
-	// control-plane calls are short, so no long-stream concern applies.
-	tr := http.DefaultTransport.(*http.Transport).Clone()
-	tr.ResponseHeaderTimeout = 30 * time.Second
+	// A dedicated transport with a server-sized idle-connection pool and a bounded
+	// header wait, mirroring core.NewWithResolver; the control-plane calls are
+	// short, so no long-stream concern applies. The pool matters most here: preview
+	// runs on EVERY request against the one router host, so an undersized pool
+	// (Go's default is 2) turns each concurrent request past the second into a
+	// fresh dial + TLS handshake (see core.NewPooledTransport).
+	tr := core.NewPooledTransport()
+	tr.ResponseHeaderTimeout = controlPlaneHeaderTimeout
 	r := &Router{
 		previewURL:      base + previewPath,
 		completionsURL:  base + completionsPath,

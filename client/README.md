@@ -41,9 +41,12 @@ core/            # client core: quote + response-signature verification, seal, p
 route/           # gateway route mode: pick the provider per request via the router's route-preview + broker pubkey APIs
 evidence/        # verify a deployed gateway's OWN attestation: /evidences bundle, served cert, code identity, OS image
 openaiproxy/     # shared OpenAI-compatible HTTP handler over core (used by both server forms)
+dstack/          # CVM identity: read instance_id/app_id from the dstack guest agent, and pass it between containers as a file
 cmd/
   sidecar/       # local sidecar binary (OpenAI-compatible proxy on localhost) — user-operated, no new trust party
   gateway/       # cloud-TEE gateway — SAME core, but SERVER-RUN + 0G-operated, runs in an attested CVM (adds one attested trust party)
+  cvmid/         # init container shipped in the gateway image: publishes the CVM's identity to its sibling containers, then exits
+  mockupstream/  # load-test FIXTURE (never deployed): a protocol-exact stand-in for the router, broker and provider enclave — see ../loadtest/
 sdk/
   go/            # in-process Go SDK (thin wrapper over core; shares the Go core)
   ts/            # (planned) TS / WASM build for the browser — aligns to protocol/SPEC.md, does NOT import the Go core
@@ -98,7 +101,8 @@ identify the caller. Send no key and the request goes upstream unauthenticated.
 Any request header in the **`X-0G-*`** namespace is forwarded verbatim to the
 provider — the router's cleartext routing directives (`X-0G-Provider-Address`
 to pin a provider, `-Sort`, `-Trust-Mode`, `-Allow-Fallbacks`,
-`-Require-Parameters`). No other header is forwarded: arbitrary client headers
+`-Require-Parameters`, and the `-Max-Price-Usd-{Prompt,Completion,Image}` caps,
+which the router accepts as headers only). No other header is forwarded: arbitrary client headers
 (cookies, app-internal metadata) must not leak to the router, which terminates
 TLS on the router path.
 

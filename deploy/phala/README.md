@@ -318,19 +318,31 @@ attestation above applies. Development only.
 `app_id` hashes the app-compose manifest, which embeds this compose file
 verbatim — so a floating `:latest` tag keeps the attestation identical while the
 code underneath changes, and anyone who can push to the registry could swap the
-gateway binary inside an "attested" CVM undetectably. Both images are therefore
-pinned by digest for production, and both have to be re-pinned deliberately on
-upgrade:
+binary inside an "attested" CVM undetectably. Every image is therefore pinned by
+digest for production, and each has to be re-pinned deliberately on upgrade.
+
+> **The gateway image appears on TWO service lines** — `gateway` and
+> `cvm-identity`, which runs the `cvmid` binary out of the same artifact. Pinning
+> by hand means editing **both**, to the **same** digest. Pinning only the gateway
+> leaves `cvm-identity` floating on `:latest`, which is the exact hole this section
+> exists to close — and in the container that runs as root with the guest-agent
+> socket mounted. [Release (automated)](#release-automated) does both for you and
+> refuses to publish a manifest with any gateway line still on a tag; prefer it to
+> hand-editing.
 
 ```sh
 # what :latest points at RIGHT NOW — compare it with the digest in the compose
 # file to see whether the pin is still the current build (a difference is
 # expected and fine; it just means the pin is older than the tag)
 docker buildx imagetools inspect ghcr.io/0gfoundation/0g-pc-e2ee-gateway:latest
+
+# after hand-editing: both gateway-image lines must carry the same digest and
+# none may be on a tag
+grep -nE '^\s*image:\s*ghcr\.io/0gfoundation/0g-pc-e2ee-gateway' deploy/phala/docker-compose.yml
 ```
 
-Changing either digest changes `app_id`, which is the point: it is a new
-deployment, and verifiers have to re-audit it.
+Changing any digest changes `app_id`, which is the point: it is a new deployment,
+and verifiers have to re-audit it.
 
 ## Release (automated)
 
@@ -394,6 +406,94 @@ store — but in **agent mode**:
 - The agent also **self-scrapes**, so `remote_write` health (queue length, send
   failures) is visible even though the CVM has no local query API — important
   because an outbound break inside the enclave is otherwise hard to see.
+
+### Telling replicas apart
+
+Running more than one CVM per side requires this; it is not a nicety. Replicas of
+one `app_id` are identical CVMs running identical Prometheus agents, so their
+external labels (`service`, `env`) and target labels (`gateway:9464`,
+`localhost:9090`) are identical too — without a per-CVM label they write the
+**same series** to the shared store and the samples collide. `app_id` additionally
+separates a blue side from a green one, which `env` cannot.
+
+Nothing inside a CVM can work its identity out for itself: the answer lives behind
+the dstack guest-agent socket, and compose interpolation happens at deploy time,
+before the runtime has assigned one. So a small init container,
+**`cvm-identity`**, does it once at boot and exits:
+
+```
+cvm-identity ──/var/run/dstack.sock──▶ guest agent (Info)
+     │
+     ├─▶ /run/identity/identity.json          ──▶ gateway    (log fields + X-0G-Gateway-Instance)
+     ├─▶ /run/identity/sd/gateway.json        ─┐
+     └─▶ /run/identity/sd/prom-agent.json     ─┴▶ prom agent (file_sd target labels, one per job)
+```
+
+Both consumers mount the `identity` volume **read-only** and reach the guest agent
+not at all. That is deliberate: the agent also derives keys and issues quotes, so
+the container that holds user prompts for the life of the CVM should not be able
+to reach it. `cvm-identity` runs from the **same image** as the gateway (different
+`entrypoint`), so the compose gains no second digest to pin.
+
+To be precise about what that does and does not buy: **`dstack-ingress` also mounts
+this socket, and always has** — it needs it for the cert binding that the whole
+attestation story rests on ([Verify](#verify)). So the socket is not exclusive to
+`cvm-identity`, and this scheme does not make it so. What it does is keep the
+socket off the **gateway**, and add no new long-lived holder: `cvm-identity` makes
+one call and exits.
+
+**Both** jobs get the labels the same way — as **target labels**, from their own
+`file_sd` document. Nothing is labelled exporter-side, and each job needs its own
+file (two jobs pointing at one document would each discover the other's target).
+
+That uniformity is required, not tidiness. Prometheus synthesises `up`,
+`scrape_duration_seconds`, `scrape_samples_scraped`,
+`scrape_samples_post_metric_relabeling` and `scrape_series_added` from **target
+labels alone** — they never pass through the scraped process — so a label an
+exporter stamps on its own series cannot reach them. `up` is the extreme case: it
+exists precisely when the exposition could *not* be read. Leaving a job on
+`static_configs` would therefore leave all five byte-identical between two
+replicas, putting the collision on the signal you would most want to alert on per
+replica. (`client_golang` says the same thing about its own API: `WrapRegistererWith`
+"should not be used to add fixed labels to all metrics exposed".)
+
+Prometheus watches the `file_sd` paths and reloads on change, so no restart is
+involved — that is what lets a container that has already exited supply them.
+
+Failure behaviour:
+
+- **Guest agent unreachable** → `cvm-identity` exits **0** having written both
+  file_sd documents with their targets but no labels, and no identity file. Both
+  jobs are still scraped, just unattributed; the gateway logs
+  `dstack identity unavailable` at WARN, serves normally, and sends no
+  `X-0G-Gateway-Instance`. A telemetry dimension is lost; nothing else is. Grep
+  for that line after a deploy if a replica's metrics turn up unlabelled.
+- **Volume not writable** → `cvm-identity` exits **non-zero**, and because both
+  consumers gate on `service_completed_successfully` the app does not come up.
+  That is intentional: it means the compose is wrong, and blue/green will simply
+  never cut traffic to a side that never became healthy.
+
+To attribute a *specific request* to a replica, read **`X-0G-Gateway-Instance`**
+off the response. The gateway sets it unconditionally whenever it knows its own
+id — the same convention as a CDN's `X-Served-By` — so it is there during an
+incident without anyone having to have turned it on first. There is no switch:
+the setting would have lived in the encrypted environment, so flipping it means
+restarting the deployment, and a knob that is off exactly when you want it is
+worse than a decision. What it discloses is the fleet shape; the id itself is
+already public, since the platform routes to it by name at
+`<instance_id>-443s.<PLATFORM_BASE>`.
+
+To measure how traffic *distributes* across replicas, don't use the header —
+query the metrics, which carry the same dimension and need no client-side
+plumbing:
+
+```promql
+sum by (instance_id) (rate(zg_gateway_http_requests_total[5m]))
+```
+
+Note that selection happens per TCP connection, so a keep-alive client sees one
+replica no matter how many requests it sends; see `blue-green.md`
+"Scaling one side".
 
 ### Configuring remote_write
 
@@ -469,6 +569,24 @@ and warmer liveness).
   the container. Since the *measured* text is the `${…}` form, staging and
   production share `app_id`; that is safe only because the router is untrusted by
   construction (see the provider-verification note below).
+- **Browser origins (CORS).** The gateway answers cross-origin browser calls only
+  from the origins in `ZG_GATEWAY_ALLOWED_ORIGINS`, whose compose default is the 0G
+  first-party app origins — a page allowed to call the router directly can point its
+  base URL at this gateway instead — and deliberately *not* every origin the router
+  accepts, since its list also carries third-party-hosted preview/deploy origins
+  that do not get to drive sealed inference through an enclave by default. The list is
+  spelled out in the measured compose text on purpose (which web origins may drive
+  sealed inference through the enclave is trust-relevant, so `app_id` should commit
+  to it), and the `${…}` form still lets an **encrypted-environment** override win
+  at boot, provided the variable is listed in `allowed_envs`. Patterns are exact
+  origins, a leading `*.` wildcard (`https://*.0g.ai` — subdomains only, never the
+  apex, which must be listed separately), or `*` for any; an empty value allows no
+  origin and turns browser access off, and a malformed pattern (a trailing slash, a
+  missing scheme) fails the boot rather than silently blocking the app it was meant
+  to allow. Non-browser callers (SDKs, server-side code, `curl`) send no `Origin`
+  header and are unaffected by any of this. The default carries two `localhost`
+  ports as development conveniences — drop them via the override on a deployment
+  that does not need dev hosts reaching this enclave.
 - **Provider verification** is on in verify-and-warn mode. Each provider's TDX
   quote is DCAP-verified (`ZG_GATEWAY_ATTEST`), its quote-bound signer is
   cross-checked against the on-chain `teeSignerAddress`

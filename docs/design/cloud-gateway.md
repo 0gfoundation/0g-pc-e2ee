@@ -232,9 +232,17 @@ managed features:
   *our* enclave and the cert is bound to *our* `app_id` (§6.1). One platform-side
   prerequisite: the host front end forwards only SNI suffixes Phala has
   allowlisted. See `deploy/phala/README.md`.
-- **Fleet + LB**: dstack load-balances across replicas by app id, with TLS
-  passthrough available — so the "which instance holds the key" routing problem
-  is handled by the runtime rather than by us. **[verify]**
+- **Fleet + LB**: dstack selects among replicas by app id, with TLS passthrough
+  available — so the "which instance holds the key" routing problem is handled by
+  the runtime rather than by us. **Verified in the gateway source, with a caveat
+  that matters for capacity planning:** the custom-domain (passthrough) path uses
+  the *same* selection as the platform hostname, but that selection is neither
+  round-robin nor load-aware — it takes the few instances with the freshest
+  WireGuard handshake, caches that candidate set for ~30s, races a TCP connect
+  against them and keeps the first to answer, **per TCP connection** (so a
+  keep-alive client stays pinned to one replica). Treat replicas as HA and
+  headroom, not as an even split. See `deploy/phala/blue-green.md` "Scaling one
+  side".
 - **Runs on Phala Cloud, and on GCP / AWS**: dstack is one framework across
   clouds, so scaling on GCP does **not** require hand-building confidential TLS
   — run **dstack on GCP** to get GCP's scale *and* dstack's confidential
@@ -372,6 +380,36 @@ does not.
   not proof.
 - **Two enclaves see plaintext** (gateway + provider), vs one for direct-seal.
 - **Metadata** (model, sizes, timing) is visible as in the router path.
+- **The browser origin allowlist is not authentication.** Serving no-install
+  browser clients requires CORS, so the gateway ships an allowlist (default: the 0G
+  first-party app origins — a subset of what the router accepts — overridable per
+  deployment via `ZG_GATEWAY_ALLOWED_ORIGINS`). It constrains which *web pages* a browser will let
+  talk to the gateway; it constrains nothing else, because only browsers enforce it
+  — any non-browser caller simply omits or forges `Origin`. Authorization remains
+  the front-door credential gate plus the router's authoritative validation.
+- **A second container in the CVM opens the dstack guest-agent socket** —
+  `cvm-identity`, an init container that reads this CVM's `instance_id` / `app_id`
+  once at boot, writes them to a shared volume, and exits
+  (`deploy/phala/docker-compose.yml`, `client/cmd/cvmid`). That socket is a
+  privileged surface: the same agent derives keys and issues quotes. **dstack-ingress
+  already mounts it** — it must, for the cert binding §6.1 rests on — and it is
+  long-lived, so the socket is not and never was exclusive to one container. The
+  narrower claim this design does support: the socket is kept off the **gateway**,
+  the long-lived container that sees user prompts (it reads a plain JSON file
+  instead), and adding `cvm-identity` introduces no new long-lived holder. Every
+  mount is part of the measured compose, so a verifier sees exactly which
+  containers hold it and for how long.
+  It buys the one thing a replica cannot otherwise have: a name. Without it,
+  replicas of one `app_id` produce unattributable interleaved logs and colliding
+  Prometheus series (identical external and target labels), which makes running
+  more than one CVM per side impractical.
+  It does **not** change §6: the gateway still publishes no quote of its own and
+  still exposes no `/quote` route, and endpoint identity still rests on
+  dstack-ingress's cert-binding attestation. Note the identifiers are **not merely
+  self-reported** — `dstack-util` extends both `app-id` and `instance-id` into
+  RTMR3 at boot, so a verifier replaying the event log against a quote can confirm
+  them. We do not verify them here (they feed operational labels, not decisions),
+  but the attested path exists should they ever need to be evidence.
 - Cloud/runtime specifics marked **[verify]** must be confirmed against current
   GCP / dstack documentation before implementation.
 

@@ -471,6 +471,17 @@ func envOr(key, def string) string {
 	return def
 }
 
+// EnvOr exposes envOr to a binary registering its OWN (non-shared) flag — the
+// gateway's -metrics-listen / -allowed-origins — so a one-off flag keeps the same
+// precedence and the same set-but-empty semantics as every shared flag here,
+// instead of each main re-deciding what an empty env var means.
+func EnvOr(key, def string) string { return envOr(key, def) }
+
+// EnvBool is EnvOr's boolean counterpart, for a binary registering its OWN
+// boolean flag (the gateway's -pprof): same precedence, and the same fail-loud
+// treatment of an unparseable value as every shared flag here.
+func EnvBool(key string, def bool) bool { return envBool(key, def) }
+
 // envBool parses a boolean environment variable (accepting the same forms as
 // the -flag=bool syntax: 1/t/T/TRUE/true, 0/f/F/FALSE/false, etc.). An unset
 // variable falls back to def; a set-but-unparseable value is fatal rather than

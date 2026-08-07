@@ -8,12 +8,14 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 	"github.com/0gfoundation/0g-pc-e2ee/client/route"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
@@ -31,6 +33,14 @@ func discardLogger() *slog.Logger {
 	return slog.New(slog.NewJSONHandler(io.Discard, nil))
 }
 
+// testOrigins is the browser allowlist newHandler gets in tests that don't
+// exercise CORS: the binary's own built-in default, so the middleware runs in the
+// configuration production runs in rather than an empty one. The CORS tests
+// (cors_test.go) pass their own list.
+func testOrigins() []string {
+	return openaiproxy.ParseOrigins(openaiproxy.DefaultAllowedOriginsCSV)
+}
+
 // mustURL parses a router base URL for newHandler's catch-all, failing the test
 // on a malformed one. The operational-route tests point it at an unused host;
 // only the tests that exercise the catch-all point it at a live router.
@@ -44,7 +54,7 @@ func mustURL(t *testing.T, raw string) *url.URL {
 }
 
 func TestGatewayHealthz(t *testing.T) {
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), discardLogger()))
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), testOrigins(), "", discardLogger()))
 	defer gw.Close()
 
 	resp, err := http.Get(gw.URL + "/healthz")
@@ -64,7 +74,7 @@ func TestGatewayHealthz(t *testing.T) {
 // unreachable, so reaching the core would surface as a 502, not the 401/403 the
 // gate returns), while /healthz stays open for the container probe.
 func TestGatewayAuthGateWiring(t *testing.T) {
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), discardLogger()))
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), testOrigins(), "", discardLogger()))
 	defer gw.Close()
 
 	post := func(t *testing.T, auth string) int {
@@ -109,7 +119,7 @@ func TestGatewayAuthGateWiring(t *testing.T) {
 // error against an unreachable one, and it must derive the port from the same
 // -listen value the server binds.
 func TestGatewayHealthProbe(t *testing.T) {
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), discardLogger()))
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), testOrigins(), "", discardLogger()))
 	defer gw.Close()
 
 	// Healthy: probe the live server's /healthz directly.
@@ -208,7 +218,7 @@ func TestGatewayRouteMode(t *testing.T) {
 	defer router.Close()
 
 	client := core.NewWithResolver(route.New(router.URL))
-	gw := httptest.NewServer(newHandler(client, mustURL(t, router.URL), discardLogger()))
+	gw := httptest.NewServer(newHandler(client, mustURL(t, router.URL), testOrigins(), "", discardLogger()))
 	defer gw.Close()
 
 	userReq := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`
@@ -221,6 +231,12 @@ func TestGatewayRouteMode(t *testing.T) {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer sk-test")
+	// Carry a browser Origin (matched here through the "*." wildcard) so this also
+	// covers CORS on the SEALED path's real response — the one path where the
+	// handler writes its own headers (setResKey / setPassthrough) around the
+	// middleware's, and where losing them would leave a browser able to preflight
+	// successfully and then unable to read the answer.
+	req.Header.Set("Origin", "https://chat.0g.ai")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("post to gateway: %v", err)
@@ -233,6 +249,14 @@ func TestGatewayRouteMode(t *testing.T) {
 	if !bytes.Contains(body, []byte("routed answer")) {
 		t.Fatalf("user did not get routed plaintext back: %s", body)
 	}
+	if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "https://chat.0g.ai" {
+		t.Errorf("sealed response Allow-Origin: got %q, want the origin echoed", got)
+	}
+	// Without Expose-Headers the browser cannot read ZG-Res-Key, so the user could
+	// not fetch the §8 signature to audit the very response it just received.
+	if got := resp.Header.Get("Access-Control-Expose-Headers"); !strings.Contains(got, "ZG-Res-Key") {
+		t.Errorf("sealed response Expose-Headers: got %q, want it to carry ZG-Res-Key", got)
+	}
 }
 
 // TestGatewayRoutesOtherRequestsToRouter covers the catch-all: a path the mux
@@ -242,6 +266,32 @@ func TestGatewayRouteMode(t *testing.T) {
 // This is the cleartext passthrough; it must never carry a prompt (see
 // newRouterProxy), which the sealed chat route — exercised by
 // TestGatewayRouteMode — continues to own.
+// The catch-all sends every request it forwards to the one router host, so it
+// needs the shared server-sized connection pool like every other path to that
+// host. A nil Transport is the defect this guards: ReverseProxy silently falls
+// back to the process-global http.DefaultTransport and its 2 idle connections per
+// host, which no functional test would notice — it only shows up as a throughput
+// ceiling under concurrency the load rig does not even drive through this route.
+func TestRouterProxyUsesThePooledTransport(t *testing.T) {
+	proxy, ok := newRouterProxy(mustURL(t, "http://router.unused"), discardLogger()).(*httputil.ReverseProxy)
+	if !ok {
+		t.Fatal("newRouterProxy did not return a *httputil.ReverseProxy")
+	}
+	if proxy.Transport == nil {
+		t.Fatal("Transport: nil — the proxy would fall back to the process-global http.DefaultTransport")
+	}
+	tr, ok := proxy.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("Transport: got %T, want *http.Transport", proxy.Transport)
+	}
+	if want := core.NewPooledTransport().MaxIdleConnsPerHost; tr.MaxIdleConnsPerHost != want {
+		t.Errorf("MaxIdleConnsPerHost: got %d, want %d (core.NewPooledTransport's)", tr.MaxIdleConnsPerHost, want)
+	}
+	if tr == http.DefaultTransport {
+		t.Error("Transport is http.DefaultTransport itself: the pool would be shared process-wide")
+	}
+}
+
 func TestGatewayRoutesOtherRequestsToRouter(t *testing.T) {
 	var gotPath, gotQuery, gotHost, gotAuth string
 	routerMux := http.NewServeMux()
@@ -253,7 +303,7 @@ func TestGatewayRoutesOtherRequestsToRouter(t *testing.T) {
 	router := httptest.NewServer(routerMux)
 	defer router.Close()
 
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, router.URL), discardLogger()))
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, router.URL), testOrigins(), "", discardLogger()))
 	defer gw.Close()
 
 	req, _ := http.NewRequest(http.MethodGet, gw.URL+"/v1/models?limit=1", nil)
@@ -301,7 +351,7 @@ func TestGatewayRouterPassthroughUnreachable(t *testing.T) {
 	deadURL := dead.URL
 	dead.Close()
 
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, deadURL), discardLogger()))
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, deadURL), testOrigins(), "", discardLogger()))
 	defer gw.Close()
 
 	resp, err := http.Get(gw.URL + "/v1/models")
@@ -363,7 +413,7 @@ func TestGatewayAccessLog(t *testing.T) {
 		http.Error(w, "nope", http.StatusNotImplemented)
 	}))
 	defer upstream.Close()
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, upstream.URL), logger))
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, upstream.URL), testOrigins(), "", logger))
 	defer gw.Close()
 
 	// A health probe must not produce a log line.
@@ -437,7 +487,7 @@ func TestGatewayAccessLog(t *testing.T) {
 // An empty metrics address disables the endpoint; the returned stop must still
 // be a safe no-op the caller can defer unconditionally.
 func TestStartMetricsDisabled(t *testing.T) {
-	stop := startMetrics("", discardLogger())
+	stop := startMetrics("", false, discardLogger())
 	stop()
 }
 
@@ -445,7 +495,7 @@ func TestStartMetricsDisabled(t *testing.T) {
 // and confirms /metrics answers 200 with the exposition format.
 func TestMetricsEndpointServes(t *testing.T) {
 	const addr = "127.0.0.1:19464"
-	stop := startMetrics(addr, discardLogger())
+	stop := startMetrics(addr, false, discardLogger())
 	defer stop()
 
 	// The listener starts in a goroutine; retry briefly until it is accepting.
@@ -468,6 +518,45 @@ func TestMetricsEndpointServes(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if !bytes.Contains(body, []byte("go_goroutines")) {
 		t.Fatalf("/metrics did not serve the exposition format:\n%s", body)
+	}
+}
+
+// The profiler is opt-in: it must not appear on the metrics listener unless
+// -pprof asked for it, and it must appear when it did. It rides that listener
+// because that port is never published through the ingress, so a regression that
+// mounted it unconditionally would put process internals on an operator's port
+// without anyone choosing it.
+func TestPprofOptIn(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		addr     string
+		pprofOn  bool
+		wantCode int
+	}{
+		{"off by default", "127.0.0.1:19465", false, http.StatusNotFound},
+		{"on when enabled", "127.0.0.1:19466", true, http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stop := startMetrics(tc.addr, tc.pprofOn, discardLogger())
+			defer stop()
+
+			var resp *http.Response
+			var err error
+			for i := 0; i < 50; i++ {
+				resp, err = http.Get("http://" + tc.addr + "/debug/pprof/")
+				if err == nil {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if err != nil {
+				t.Fatalf("get /debug/pprof/: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.wantCode {
+				t.Errorf("/debug/pprof/: got %d, want %d", resp.StatusCode, tc.wantCode)
+			}
+		})
 	}
 }
 

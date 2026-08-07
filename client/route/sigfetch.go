@@ -45,10 +45,17 @@ type SignatureFetcher struct {
 	http *http.Client
 }
 
-// NewSignatureFetcher builds a fetcher. A nil client gets a bounded-timeout default.
+// NewSignatureFetcher builds a fetcher. A nil client gets a bounded-timeout
+// default over a server-sized connection pool: with verification on, this fetch
+// runs once per RESPONSE against the provider's endpoint, so it is on the hot
+// path and must not fall back to http.DefaultTransport's 2-idle-conns-per-host
+// (see core.NewPooledTransport).
 func NewSignatureFetcher(hc *http.Client) *SignatureFetcher {
 	if hc == nil {
-		hc = &http.Client{Timeout: 15 * time.Second}
+		hc = &http.Client{
+			Timeout:   15 * time.Second,
+			Transport: core.NewPooledTransport(),
+		}
 	}
 	return &SignatureFetcher{http: hc}
 }

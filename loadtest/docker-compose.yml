@@ -1,0 +1,182 @@
+# Layer-2 load-test rig: the real gateway against a controllable fake upstream.
+#
+# What this measures: the gateway's own concurrency ceiling — sealing, the
+# per-request control-plane round trips, connection pooling, HTTP handling and
+# CPU — with inference capacity taken out of the picture. What it does NOT
+# measure: TLS termination in the enclave (dstack-ingress) or real provider
+# behaviour. See README.md for the layers above and below this one.
+#
+#   docker compose up --build -d
+#   docker compose --profile load run --rm k6            # ramp to find the knee
+#   docker compose --profile load run --rm -e MODE=steady -e RATE=40 k6
+#
+# The gateway is deliberately CPU-limited (GATEWAY_CPUS, default 2) so a result
+# maps onto a CVM size instead of onto whatever the test host happens to have.
+# The fixture gets more, because it does real HPKE work on both halves of every
+# request and must not be the thing that saturates first — watch its CPU, and if
+# it is pegged, the run is measuring the fixture and the numbers are void.
+
+name: 0g-pc-gateway-loadtest
+
+services:
+  mockupstream:
+    build:
+      context: ..
+      dockerfile: client/cmd/mockupstream/Dockerfile
+    environment:
+      # Same reasoning as the gateway's below: `cpus:` is a quota, not a CPU-set, so
+      # without this the Go runtime sizes itself to the host's core count and gets
+      # throttled against a 4-CPU quota. A throttled fixture is worse here than
+      # anywhere — it becomes the slow party, and the run then measures the fixture.
+      - "GOMAXPROCS=${MOCK_CPUS:-4}"
+    # Fixture CONFIG, on the other hand, is passed as FLAGS with ${MOCK_*}
+    # interpolation. The fixture accepts either (flag > env > default), but compose
+    # interpolates ${...} here from the host env at parse time, whereas a container
+    # inherits nothing from the host — so a MOCK_* var that is not listed below is
+    # silently ignored, not passed through. Adding a knob to the fixture means
+    # adding a line HERE too, or the documentation for it will be a lie.
+    command:
+      - "-listen=0.0.0.0:8080"
+      # The simulated completion shape. Defaults model a chatty small model:
+      # 200ms to first token, then a token every 40ms for 64 tokens (~2.7s total).
+      # Raise MOCK_CHUNKS / lower MOCK_CHUNK_INTERVAL to hold more concurrent
+      # streams open per unit of arrival rate — that, not the request rate, is
+      # what a streaming gateway actually carries.
+      - "-ttft=${MOCK_TTFT:-200ms}"
+      - "-chunk-interval=${MOCK_CHUNK_INTERVAL:-40ms}"
+      - "-chunks=${MOCK_CHUNKS:-64}"
+      - "-chunk-bytes=${MOCK_CHUNK_BYTES:-16}"
+      - "-providers=${MOCK_PROVIDERS:-1}"
+      # Upstream latency the gateway pays per request (preview) and per response
+      # (the §8 signature fetch, when verification is on).
+      - "-preview-delay=${MOCK_PREVIEW_DELAY:-0s}"
+      - "-signature-delay=${MOCK_SIGNATURE_DELAY:-0s}"
+      # Must stay well above peak concurrency — a signature evicted before the
+      # gateway fetches it reads like a gateway fault (see README).
+      - "-signature-cache=${MOCK_SIGNATURE_CACHE:-65536}"
+      # Interpolated into BOTH sides: the fixture advertises this model and the k6
+      # driver requests it (see the k6 service's MODEL below). Wiring only one side
+      # would leave the driver asking for a model the preview never offers.
+      - "-model=${MOCK_MODEL:-mock-model}"
+      # Must match the gateway's ZG_GATEWAY_VERIFY_RESPONSES below: with verification
+      # on the fixture has to sign (and the gateway pays a signature fetch per
+      # response); with it off, signing is pure fixture overhead.
+      - "-sign=${ZG_GATEWAY_VERIFY_RESPONSES:-false}"
+      # The gateway reaches the fixture by service name, and the fixture advertises
+      # itself as the provider endpoint from the Host header — so this is only
+      # needed if you put something in between.
+      - "-advertise=${MOCK_ADVERTISE:-}"
+    expose:
+      - "8080"
+    deploy:
+      resources:
+        limits:
+          cpus: "${MOCK_CPUS:-4}"
+
+  gateway:
+    build:
+      context: ..
+      dockerfile: client/cmd/gateway/Dockerfile
+    depends_on:
+      - mockupstream
+    ports:
+      # Plaintext HTTP: in the real deployment dstack-ingress terminates TLS in
+      # front of this port. That hop is NOT in this rig, so these numbers are the
+      # gateway's alone — measuring the TLS cost is layer 3 (README).
+      - "${GATEWAY_PORT:-8443}:8443"
+      # Metrics + pprof, published here only because this is a local test rig. In
+      # the real deployment this port is never published.
+      - "${GATEWAY_METRICS_PORT:-9464}:9464"
+    environment:
+      # Pin the Go runtime to the SAME number of Ps as the CPU limit below.
+      #
+      # `cpus:` is a CFS bandwidth quota, not a CPU-set: the container still sees
+      # every host core, and the Go runtime this module builds with (1.24) sizes
+      # GOMAXPROCS from that count. On a big test host that means dozens of Ps
+      # competing for a 2-CPU quota — the runtime oversubscribes, gets throttled at
+      # the end of each period, and the extra scheduling and cache traffic show up
+      # as latency that has nothing to do with the gateway's own work. The knee
+      # then lands in the wrong place, which is worse than no measurement.
+      # (Go 1.25 derives this from the cgroup limit itself; until the module moves
+      # to it, this line is what makes GATEWAY_CPUS mean what it says.)
+      - "GOMAXPROCS=${GATEWAY_CPUS:-2}"
+      - "ZG_GATEWAY_LISTEN=0.0.0.0:8443"
+      - "ZG_GATEWAY_METRICS_LISTEN=0.0.0.0:9464"
+      - "ZG_GATEWAY_ROUTER_URL=http://mockupstream:8080"
+      # The fixture serves no TDX quote, so attestation must be off — and -onchain
+      # and -warm require it, so they are off too. That is this layer's main blind
+      # spot: a real deployment additionally pays a DCAP verify on a cold quote
+      # cache (the warmer exists to keep it off the request path). Everything else
+      # on the request path is exercised for real.
+      - "ZG_GATEWAY_ATTEST=false"
+      - "ZG_GATEWAY_ONCHAIN=false"
+      - "ZG_GATEWAY_WARM=false"
+      # §8 response verification adds one upstream fetch per response. It is OFF
+      # here, and cannot simply be turned on: in router mode the gateway requires
+      # -attest for it (the signer has to come from a verified quote), and the
+      # fixture has no quote. To price it, switch to direct-broker mode — set
+      # ZG_GATEWAY_PROVIDER_URL below and flip this to true, which the gateway does
+      # allow without attestation because there is no untrusted router in the path.
+      # See README "Pricing §8 response verification".
+      - "ZG_GATEWAY_VERIFY_RESPONSES=${ZG_GATEWAY_VERIFY_RESPONSES:-false}"
+      # Empty (the default) keeps ROUTER mode: every request pays the route-preview
+      # call, which is the shape production runs. Setting it to
+      # http://mockupstream:8080 switches to direct-broker mode, which DROPS the
+      # preview hop and posts straight to the broker — a different path, useful
+      # only for the verification measurement above.
+      - "ZG_GATEWAY_PROVIDER_URL=${ZG_GATEWAY_PROVIDER_URL:-}"
+      # The idle-connection pool size is a constant in the binary
+      # (core.maxIdleConnsPerHost), not an env var — see README "The
+      # connection-pool A/B" for how to run that comparison, which is an edit and a
+      # rebuild rather than a restart.
+      #
+      # No browser origin is involved in a load run, and an empty list is honored
+      # as set (browser access off) rather than falling back to the default.
+      - "ZG_GATEWAY_ALLOWED_ORIGINS="
+      # There is no CVM here, so there is no dstack guest-agent socket and no
+      # identity to read. Empty disables the lookup outright, which keeps the boot
+      # log clean — left at its default the gateway would warn once per start about
+      # an absent socket, which in this rig is expected, not a misconfiguration.
+      - "ZG_GATEWAY_DSTACK_SOCKET="
+      # Profiler on the metrics listener: `go tool pprof -http=:8000
+      # http://localhost:9464/debug/pprof/profile?seconds=30` during a run is the
+      # fastest way to see where the throughput went.
+      - "ZG_GATEWAY_PPROF=true"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/gateway", "-health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "${GATEWAY_CPUS:-2}"
+
+  # Run on demand, not with `up`: `docker compose --profile load run --rm k6`.
+  k6:
+    image: grafana/k6:0.54.0
+    profiles: ["load"]
+    depends_on:
+      - gateway
+    volumes:
+      - ./k6:/scripts:ro
+    environment:
+      - "GATEWAY_URL=http://gateway:8443"
+      - "MODEL=${MOCK_MODEL:-mock-model}"
+      - "MODE=${MODE:-ramp}"
+      - "STREAM=${STREAM:-true}"
+      - "RATE=${RATE:-}"
+      - "START_RATE=${START_RATE:-}"
+      - "PEAK_RATE=${PEAK_RATE:-}"
+      - "STEPS=${STEPS:-}"
+      - "STEP_DURATION=${STEP_DURATION:-}"
+      - "DURATION=${DURATION:-}"
+      - "MAX_VUS=${MAX_VUS:-}"
+      # The completion length the driver sizes its VU pool from. Defaulted here from
+      # the fixture's own schedule, so changing the schedule on the command line
+      # keeps the pool honest without a second thing to remember.
+      - "EXPECTED_SECONDS=${EXPECTED_SECONDS:-}"
+      - "PROMPT_BYTES=${PROMPT_BYTES:-}"
+      - "API_KEY=${API_KEY:-sk-loadtest}"
+    command: ["run", "/scripts/chat.js"]
