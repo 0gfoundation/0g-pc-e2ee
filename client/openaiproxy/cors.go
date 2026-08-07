@@ -148,14 +148,21 @@ func isHeaderToken(s string) bool {
 const corsMaxAge = "43200"
 
 // corsExposeHeaders is derived from the SAME list the proxy actually re-emits
-// (passthroughResponseHeaders) plus ZG-Res-Key, which setResKey surfaces
-// separately. Deriving it instead of restating it is what keeps the two from
-// drifting: a header added to the passthrough set becomes readable by browser JS
+// (passthroughResponseHeaders) plus the two headers the proxy originates itself —
+// ZG-Res-Key, which setResKey surfaces separately, and HeaderGatewayInstance,
+// which StampInstance sets when the gateway is configured to identify its replica.
+// Deriving it instead of restating it is what keeps the two from drifting: a
+// header added to the passthrough set becomes readable by browser JS
 // automatically, and one removed stops being advertised. Without this, fetch()
 // sees only the CORS-safelisted response headers — Retry-After, the rate-limit
 // counters, ZG-Failure-Source and X-Request-ID would all read as absent from a
 // browser even though they are on the wire.
-var corsExposeHeaders = strings.Join(append([]string{headerResKey}, passthroughResponseHeaders...), ", ")
+//
+// Advertising HeaderGatewayInstance unconditionally is safe even though the
+// gateway usually does not send it: Access-Control-Expose-Headers naming a header
+// the response does not carry is a no-op, and making the advertisement depend on
+// the toggle would put a deployment flag into the CORS answer for no gain.
+var corsExposeHeaders = strings.Join(append([]string{headerResKey, HeaderGatewayInstance}, passthroughResponseHeaders...), ", ")
 
 // ParseOrigins splits a comma-separated origin allowlist into trimmed, non-empty
 // patterns. An empty (or all-blank) value yields nil — no origin matches, i.e.
