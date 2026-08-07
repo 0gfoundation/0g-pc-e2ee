@@ -210,19 +210,31 @@ attestation above applies. Development only.
 `app_id` hashes the app-compose manifest, which embeds this compose file
 verbatim — so a floating `:latest` tag keeps the attestation identical while the
 code underneath changes, and anyone who can push to the registry could swap the
-gateway binary inside an "attested" CVM undetectably. Both images are therefore
-pinned by digest for production, and both have to be re-pinned deliberately on
-upgrade:
+binary inside an "attested" CVM undetectably. Every image is therefore pinned by
+digest for production, and each has to be re-pinned deliberately on upgrade.
+
+> **The gateway image appears on TWO service lines** — `gateway` and
+> `cvm-identity`, which runs the `cvmid` binary out of the same artifact. Pinning
+> by hand means editing **both**, to the **same** digest. Pinning only the gateway
+> leaves `cvm-identity` floating on `:latest`, which is the exact hole this section
+> exists to close — and in the container that runs as root with the guest-agent
+> socket mounted. [Release (automated)](#release-automated) does both for you and
+> refuses to publish a manifest with any gateway line still on a tag; prefer it to
+> hand-editing.
 
 ```sh
 # what :latest points at RIGHT NOW — compare it with the digest in the compose
 # file to see whether the pin is still the current build (a difference is
 # expected and fine; it just means the pin is older than the tag)
 docker buildx imagetools inspect ghcr.io/0gfoundation/0g-pc-e2ee-gateway:latest
+
+# after hand-editing: both gateway-image lines must carry the same digest and
+# none may be on a tag
+grep -nE '^\s*image:\s*ghcr\.io/0gfoundation/0g-pc-e2ee-gateway' deploy/phala/docker-compose.yml
 ```
 
-Changing either digest changes `app_id`, which is the point: it is a new
-deployment, and verifiers have to re-audit it.
+Changing any digest changes `app_id`, which is the point: it is a new deployment,
+and verifiers have to re-audit it.
 
 ## Release (automated)
 

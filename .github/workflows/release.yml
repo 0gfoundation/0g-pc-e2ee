@@ -116,22 +116,36 @@ jobs:
           SRC=deploy/phala/docker-compose.yml
           OUT=docker-compose.release.yml
 
-          # Replace ONLY the gateway service's `image:` mapping line, whatever it
-          # currently is (:latest, :tag, or @sha256). The `^\s*image:` anchor
-          # skips the comment that also mentions the image name. Every other byte
-          # is preserved, so the release manifest cannot drift from the compose
-          # at this commit.
+          # Replace EVERY `image:` mapping line referencing the gateway image,
+          # whatever it currently is (:latest, :tag, or @sha256). There is more than
+          # one: the `gateway` service and the `cvm-identity` init container, which
+          # runs the cvmid binary out of the same artifact and must therefore carry
+          # the SAME digest — one substitution with one ${DIGEST} guarantees that.
+          # The `^\s*image:` anchor skips the comments that also mention the image
+          # name. Every other byte is preserved, so the release manifest cannot
+          # drift from the compose at this commit.
           sed -E "s#(^[[:space:]]*image:[[:space:]]*)ghcr\.io/0gfoundation/0g-pc-e2ee-gateway([:@][^[:space:]]*)?#\1ghcr.io/0gfoundation/0g-pc-e2ee-gateway@${DIGEST}#" \
             "$SRC" > "$OUT"
 
-          # Guard: the gateway must no longer be on a floating tag, and the exact
-          # digest pin must be present. Catches a silently non-matching sed.
+          # Guards against a silently non-matching sed. The first two also cover a
+          # PARTIAL match: if a new service referencing the gateway image were added
+          # and the substitution missed it, that line would still read `...-gateway:`
+          # and trip guard 1.
           if grep -qE "^[[:space:]]*image:[[:space:]]*ghcr\.io/0gfoundation/0g-pc-e2ee-gateway:" "$OUT"; then
-            echo "::error::gateway still on a floating tag in $OUT"; exit 1
+            echo "::error::gateway image still on a floating tag in $OUT"; exit 1
           fi
           if ! grep -qF "0g-pc-e2ee-gateway@${DIGEST}" "$OUT"; then
             echo "::error::expected digest pin missing in $OUT"; exit 1
           fi
+          # Every gateway-image line survived the substitution and carries THIS
+          # digest — so the gateway and cvm-identity cannot end up on different
+          # builds of an artifact they are required to share.
+          SRC_N=$(grep -cE "^[[:space:]]*image:[[:space:]]*ghcr\.io/0gfoundation/0g-pc-e2ee-gateway[:@]" "$SRC")
+          OUT_N=$(grep -cF "image: ghcr.io/0gfoundation/0g-pc-e2ee-gateway@${DIGEST}" "$OUT")
+          if [[ "$SRC_N" -eq 0 || "$SRC_N" -ne "$OUT_N" ]]; then
+            echo "::error::expected ${SRC_N} gateway-image line(s) pinned to ${DIGEST}, found ${OUT_N}"; exit 1
+          fi
+          echo "Pinned ${OUT_N} gateway-image line(s) to ${DIGEST}"
 
           COMPOSE_SHA=$(sha256sum "$OUT" | awk '{print $1}')
           echo "compose_sha256=${COMPOSE_SHA}" >> "$GITHUB_OUTPUT"
