@@ -15,14 +15,23 @@
 // low-cardinality and content-free: route templates, HTTP methods, status codes,
 // and fixed outcome enums. A provider address, endpoint URL, request id, model
 // name, or any other caller-supplied value must NEVER become a label value.
-// SetInstanceIdentity adds two more (instance_id, app_id) that meet the same bar:
-// one fixed value per process, self-describing, already public.
+//
+// Which CVM produced a series is deliberately NOT decided here. It is a TARGET
+// label, applied by the scraper from the file_sd document cmd/cvmid writes (see
+// deploy/phala/docker-compose.yml). Stamping it exporter-side instead — via
+// WrapRegistererWith, which this package briefly did — cannot work: Prometheus
+// synthesises up, scrape_duration_seconds and the other per-scrape series from
+// target labels alone, so they would never carry it. `up` is the extreme case;
+// it exists precisely when the exposition could NOT be read, so no label this
+// process produces can ever reach it — and `up` per replica is the signal most
+// worth alerting on. client_golang says the same thing about its own API:
+// WrapRegistererWith "should not be used to add fixed labels to all metrics
+// exposed".
 package metrics
 
 import (
 	"net/http"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -130,31 +139,8 @@ var (
 	})
 )
 
-// registerOnce guards the one-shot registration below. Registration is deferred
-// (rather than done in an init function) purely so SetInstanceIdentity can attach
-// constant labels to every collector: the Prometheus client applies those at
-// registration time, and the identity is not known until the process has asked
-// the dstack guest agent who it is. Nothing else about the collectors is lazy —
-// they are package values, so a counter incremented before registration keeps its
-// value and is exported as soon as the registry is built.
-var registerOnce sync.Once
-
-// registerDefault wires the package registry exactly once, whichever of
-// SetInstanceIdentity / Handler gets there first.
-func registerDefault(labels prometheus.Labels) {
-	registerOnce.Do(func() { register(registry, labels) })
-}
-
-// register wires every collector into reg, wrapping the registerer so labels (if
-// any) are stamped on each exported series. It takes the registry as a parameter
-// so a test can exercise the labelling against a throwaway one — the collectors
-// themselves are shared values and may belong to more than one registry.
-func register(reg *prometheus.Registry, labels prometheus.Labels) {
-	var r prometheus.Registerer = reg
-	if len(labels) > 0 {
-		r = prometheus.WrapRegistererWith(labels, reg)
-	}
-	r.MustRegister(
+func init() {
+	registry.MustRegister(
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		httpRequests, httpDuration, httpInFlight,
@@ -165,51 +151,12 @@ func register(reg *prometheus.Registry, labels prometheus.Labels) {
 	)
 }
 
-// identityLabels turns a CVM identity into the constant label set, dropping
-// whichever parts the guest agent could not supply.
-func identityLabels(instanceID, appID string) prometheus.Labels {
-	labels := prometheus.Labels{}
-	if instanceID != "" {
-		labels["instance_id"] = instanceID
-	}
-	if appID != "" {
-		labels["app_id"] = appID
-	}
-	return labels
-}
-
-// SetInstanceIdentity stamps this CVM's identity onto every exported series, as
-// the constant labels instance_id and app_id. Empty values are omitted, so a
-// process that could not reach the dstack guest agent simply exports what it
-// always did.
-//
-// This is not decoration: it is what makes running more than one replica of a
-// gateway app possible at all. Replicas of one app_id are byte-identical CVMs
-// scraped by byte-identical co-located Prometheus agents, whose external labels
-// (service, env) and target labels (gateway:9464) are therefore also identical —
-// so without a per-CVM label every replica writes the SAME series to the shared
-// remote-write store and the samples collide. instance_id separates them;
-// app_id additionally separates a blue side from a green one, which the existing
-// env label cannot.
-//
-// It must be called BEFORE Handler (main does both at startup, in that order):
-// registration happens once, and whichever call comes first decides the label
-// set. Calling it afterwards is a no-op rather than an error — losing a label is
-// not worth failing a process over.
-func SetInstanceIdentity(instanceID, appID string) {
-	registerDefault(identityLabels(instanceID, appID))
-}
-
 // Handler returns the HTTP handler that serves the Prometheus exposition format.
 // The gateway mounts it on a separate internal listener that is NOT published
 // through the dstack tproxy ingress, so the metrics stay reachable only from the
 // CVM-internal docker network (the co-located Prometheus-agent scraper), never
 // the public endpoint.
 func Handler() http.Handler {
-	// Ensure the collectors are registered even when SetInstanceIdentity was never
-	// called (the sidecar, tests, any run outside a CVM) — then the exposition is
-	// exactly what it was before instance labels existed.
-	registerDefault(nil)
 	return promhttp.HandlerFor(registry, promhttp.HandlerOpts{})
 }
 

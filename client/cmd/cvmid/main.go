@@ -31,10 +31,23 @@
 //
 //   - -out-identity: {"instance_id","app_id","app_name","compose_hash"}, read by
 //     the gateway (client/dstack.ReadIdentityFile).
-//   - -out-prom-sd: a Prometheus file_sd document pinning -prom-target with the
-//     identity as target labels. Prometheus watches the file and picks it up
-//     without a restart, which is what makes this an init container instead of an
-//     ordering problem.
+//   - -prom-sd PATH=TARGET, repeatable: a Prometheus file_sd document pinning
+//     TARGET with the identity as TARGET LABELS. Prometheus watches the file and
+//     picks it up without a restart, which is what makes this an init container
+//     instead of an ordering problem.
+//
+// One document per scrape job, not one shared file: a file_sd document belongs to
+// the job that references it, so pointing two jobs at one file would make each
+// discover the other's target.
+//
+// Target labels are the ONLY mechanism that works here, which is why this exists
+// rather than the exporter stamping its own identity. Prometheus synthesises up,
+// scrape_duration_seconds, scrape_samples_scraped,
+// scrape_samples_post_metric_relabeling and scrape_series_added from target
+// labels alone — never from the exposition — so an exporter-side label cannot
+// reach them. `up` makes it obvious: it exists precisely when the exposition
+// could NOT be read. Per-replica `up` is the signal most worth alerting on, so
+// the label has to come from the scraper's side of the boundary.
 //
 // Exit codes are load-bearing, because the compose gates other services on this
 // one completing: a failed IDENTITY LOOKUP exits 0 (the files are still written,
@@ -49,6 +62,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/dstack"
 )
@@ -58,19 +72,16 @@ func main() {
 		"path to the dstack guest-agent unix socket to read this CVM's identity from")
 	outIdentity := flag.String("out-identity", "",
 		"write the identity as JSON to this path (read by the gateway); empty skips it")
-	outPromSD := flag.String("out-prom-sd", "",
-		"write a Prometheus file_sd document to this path, pinning -prom-target with the identity as "+
-			"target labels; empty skips it")
-	promTarget := flag.String("prom-target", "",
-		"the scrape target to name in the -out-prom-sd document (e.g. localhost:9090)")
+	var promSD promSDFlag
+	flag.Var(&promSD, "prom-sd",
+		"PATH=TARGET: write a Prometheus file_sd document to PATH pinning TARGET (e.g. "+
+			"/run/identity/sd/gateway.json=gateway:9464) with the identity as target labels. "+
+			"Repeat once per scrape job — two jobs must not share one document, or each would "+
+			"discover the other's target")
 	flag.Parse()
 
-	if *outIdentity == "" && *outPromSD == "" {
-		fmt.Fprintln(os.Stderr, "cvmid: nothing to do: set -out-identity and/or -out-prom-sd")
-		os.Exit(2)
-	}
-	if *outPromSD != "" && *promTarget == "" {
-		fmt.Fprintln(os.Stderr, "cvmid: -out-prom-sd requires -prom-target")
+	if *outIdentity == "" && len(promSD) == 0 {
+		fmt.Fprintln(os.Stderr, "cvmid: nothing to do: set -out-identity and/or -prom-sd")
 		os.Exit(2)
 	}
 
@@ -108,13 +119,43 @@ func main() {
 			os.Exit(1)
 		}
 	}
-	if *outPromSD != "" {
-		if err := writePromSD(*outPromSD, *promTarget, info); err != nil {
+	for _, sd := range promSD {
+		if err := writePromSD(sd.path, sd.target, info); err != nil {
 			fmt.Fprintf(os.Stderr, "cvmid: %v\n", err)
 			os.Exit(1)
 		}
 	}
 	fmt.Fprintf(os.Stdout, "cvmid: instance_id=%q app_id=%q\n", info.InstanceID, info.AppID)
+}
+
+// promSDOutput is one -prom-sd PATH=TARGET pair: the document to write and the
+// scrape target it pins.
+type promSDOutput struct{ path, target string }
+
+// promSDFlag collects repeated -prom-sd pairs. One per scrape job.
+type promSDFlag []promSDOutput
+
+func (f *promSDFlag) String() string {
+	parts := make([]string, 0, len(*f))
+	for _, o := range *f {
+		parts = append(parts, o.path+"="+o.target)
+	}
+	return strings.Join(parts, ",")
+}
+
+// Set parses one PATH=TARGET pair. It splits on the FIRST "=" — a scrape target
+// is host:port and never contains one, so any "=" belongs to the path, which in
+// practice has none either.
+func (f *promSDFlag) Set(v string) error {
+	path, target, ok := strings.Cut(v, "=")
+	if !ok {
+		return fmt.Errorf("expected PATH=TARGET, got %q", v)
+	}
+	if path == "" || target == "" {
+		return fmt.Errorf("both PATH and TARGET must be non-empty, got %q", v)
+	}
+	*f = append(*f, promSDOutput{path: path, target: target})
+	return nil
 }
 
 // clearIdentityFile removes a leftover identity file, treating an already-absent
@@ -143,11 +184,9 @@ type promSDEntry struct {
 // (recoverable, and honest about what we know) and "the agent has no self-scrape
 // target at all" (the health signal disappears entirely).
 //
-// It labels ONLY this document's target. The gateway's job deliberately stays on
-// static_configs and carries the same identity as EXPORTED labels instead — if
-// both mechanisms applied to one job, the target label would win under the
-// default honor_labels: false and the gateway's own would be renamed
-// exported_instance_id.
+// Every scrape job gets its identity this way — nothing is labelled exporter-side
+// — so there is no honor_labels conflict to reason about and the per-scrape series
+// (up and friends) are labelled too.
 func writePromSD(path, target string, info dstack.Info) error {
 	entry := promSDEntry{Targets: []string{target}}
 	labels := map[string]string{}

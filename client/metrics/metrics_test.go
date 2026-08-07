@@ -8,8 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
@@ -142,61 +140,6 @@ func TestHandlerServesExposition(t *testing.T) {
 	for _, want := range []string{"zg_gateway_quote_measurement_untrusted_total", "go_goroutines"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("exposition missing %q", want)
-		}
-	}
-}
-
-// identityLabels drops what the guest agent could not supply, so a partial
-// identity still yields the part that matters (instance_id separates colliding
-// replica series; app_id only adds the blue/green dimension).
-func TestIdentityLabels(t *testing.T) {
-	cases := []struct {
-		instanceID, appID string
-		want              prometheus.Labels
-	}{
-		{"aa11", "bb22", prometheus.Labels{"instance_id": "aa11", "app_id": "bb22"}},
-		{"aa11", "", prometheus.Labels{"instance_id": "aa11"}},
-		{"", "", prometheus.Labels{}},
-	}
-	for _, c := range cases {
-		got := identityLabels(c.instanceID, c.appID)
-		if len(got) != len(c.want) {
-			t.Fatalf("identityLabels(%q,%q) = %v, want %v", c.instanceID, c.appID, got, c.want)
-		}
-		for k, v := range c.want {
-			if got[k] != v {
-				t.Errorf("identityLabels(%q,%q)[%s] = %q, want %q", c.instanceID, c.appID, k, got[k], v)
-			}
-		}
-	}
-}
-
-// The whole point of the identity labels: two replicas of one app_id are scraped
-// through identical target and external labels, so unless the exporter stamps a
-// per-CVM label their series collide in the shared remote-write store. Register
-// into a throwaway registry (the package one is a once-only, process-wide value)
-// and check the labels actually reach the exposition — on a domain metric AND on
-// the runtime collectors, which collide just as badly.
-func TestInstanceLabelsStampExposition(t *testing.T) {
-	reg := prometheus.NewRegistry()
-	register(reg, identityLabels("aa11bb22", "cc33dd44"))
-
-	MeasurementUntrusted()
-	srv := httptest.NewServer(promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
-	defer srv.Close()
-	resp, err := http.Get(srv.URL)
-	if err != nil {
-		t.Fatalf("scrape: %v", err)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	text := string(body)
-	for _, want := range []string{
-		`zg_gateway_quote_measurement_untrusted_total{app_id="cc33dd44",instance_id="aa11bb22"}`,
-		`go_goroutines{app_id="cc33dd44",instance_id="aa11bb22"}`,
-	} {
-		if !strings.Contains(text, want) {
-			t.Errorf("exposition missing %q\ngot:\n%s", want, text)
 		}
 	}
 }

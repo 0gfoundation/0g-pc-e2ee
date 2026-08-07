@@ -101,8 +101,9 @@ func main() {
 	// path stays for local runs and for anyone deploying without that init step.
 	identityFile := flag.String("identity-file", proxycli.EnvOr("ZG_GATEWAY_IDENTITY_FILE", ""),
 		"path to the identity JSON written by cmd/cvmid, read ONCE at startup for this CVM's "+
-			"instance_id/app_id (used as metric labels and log fields); takes precedence over "+
-			"-dstack-socket, which the deployed form leaves unset (env ZG_GATEWAY_IDENTITY_FILE)")
+			"instance_id/app_id (used as log fields and the X-0G-Gateway-Instance response header; "+
+			"metrics are labelled by the scraper, not here); takes precedence over -dstack-socket, "+
+			"which the deployed form leaves unset (env ZG_GATEWAY_IDENTITY_FILE)")
 	dstackSocket := flag.String("dstack-socket", proxycli.EnvOr("ZG_GATEWAY_DSTACK_SOCKET", dstack.DefaultSocket),
 		"path to the dstack guest-agent unix socket, read ONCE at startup for the same identity when "+
 			"-identity-file is unset; empty disables the lookup (env ZG_GATEWAY_DSTACK_SOCKET)")
@@ -125,11 +126,16 @@ func main() {
 	// line records; a later GCP move can swap the handler in one place.
 	logger := proxycli.NewLogger()
 
-	// Learn who this CVM is, before anything else logs. The identity is attached to
-	// the logger (so EVERY line this process emits — startup, access log, the
-	// core's open-failure diagnostics — carries it) and to the metric label set,
-	// which is what keeps two replicas of one app_id from writing colliding series
-	// into the shared remote-write store.
+	// Learn who this CVM is, before anything else logs. It is attached to the logger
+	// (so EVERY line this process emits — startup, access log, the core's
+	// open-failure diagnostics — carries it) and returned to callers in the
+	// X-0G-Gateway-Instance header.
+	//
+	// Note it does NOT label this process's metrics. Which replica a series came
+	// from is a TARGET label, applied by the scraper from the same file_sd document
+	// cmd/cvmid writes — the only mechanism that also reaches up and the other
+	// per-scrape series, which Prometheus builds from target labels alone (see
+	// client/metrics).
 	//
 	// Best-effort on purpose: outside a CVM there is neither file nor socket, and
 	// inside one a missing init container or a wedged agent must not keep the
@@ -138,12 +144,11 @@ func main() {
 	// to wire this up (deploy/phala/) and didn't sees it.
 	instanceID := ""
 	if info, source, err := loadIdentity(*identityFile, *dstackSocket); err != nil {
-		logger.Warn("dstack identity unavailable; metrics and logs carry no instance dimension",
+		logger.Warn("dstack identity unavailable; logs and responses carry no instance dimension",
 			"source", source, "err", err)
 	} else if source != "" {
 		instanceID = info.InstanceID
 		logger = logger.With("instance_id", info.InstanceID)
-		metrics.SetInstanceIdentity(info.InstanceID, info.AppID)
 		logger.Info("dstack identity", "source", source, "app_id", info.AppID,
 			"app_name", info.AppName, "compose_hash", info.ComposeHash)
 	}

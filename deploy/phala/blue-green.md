@@ -434,9 +434,10 @@ Two consequences for testing it:
   and prove nothing; disable keep-alive (`curl --no-keepalive`, or a fresh process
   per request) to observe the distribution.
 - **Attribute the traffic, don't infer it.** Each CVM publishes its own
-  `instance_id` / `app_id` at boot (the `cvm-identity` init container), and the
-  gateway stamps them on its metrics and log lines. So the distribution is a
-  metrics query, not an experiment you have to set up:
+  `instance_id` / `app_id` at boot (the `cvm-identity` init container); the
+  Prometheus agent applies them as target labels on every scrape, and the gateway
+  puts `instance_id` on every log line. So the distribution is a metrics query,
+  not an experiment you have to set up:
 
   ```promql
   sum by (instance_id) (rate(zg_gateway_http_requests_total[5m]))

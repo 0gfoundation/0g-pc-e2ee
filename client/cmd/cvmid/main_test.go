@@ -102,6 +102,37 @@ func TestWritePromSDPartialIdentity(t *testing.T) {
 	}
 }
 
+// -prom-sd is repeated once per scrape job (two jobs must not share a document),
+// so the pair parsing is what stands between a typo and an agent that discovers
+// nothing.
+func TestPromSDFlagParsing(t *testing.T) {
+	var f promSDFlag
+	for _, v := range []string{
+		"/run/identity/sd/gateway.json=gateway:9464",
+		"/run/identity/sd/prom-agent.json=localhost:9090",
+	} {
+		if err := f.Set(v); err != nil {
+			t.Fatalf("Set(%q): %v", v, err)
+		}
+	}
+	if len(f) != 2 {
+		t.Fatalf("collected %d pairs, want 2", len(f))
+	}
+	if f[0].path != "/run/identity/sd/gateway.json" || f[0].target != "gateway:9464" {
+		t.Errorf("pair 0 = %+v", f[0])
+	}
+	if f[1].path != "/run/identity/sd/prom-agent.json" || f[1].target != "localhost:9090" {
+		t.Errorf("pair 1 = %+v", f[1])
+	}
+
+	for _, bad := range []string{"", "no-equals-sign", "=gateway:9464", "/path="} {
+		var g promSDFlag
+		if err := g.Set(bad); err == nil {
+			t.Errorf("Set(%q) = nil error, want failure", bad)
+		}
+	}
+}
+
 // The identity volume outlives a boot, so a file left by an earlier one must not
 // survive a boot that could not produce an identity — a dstack in-place upgrade
 // reuses the disk under a new app_id, and instance_id is derived from it, so the

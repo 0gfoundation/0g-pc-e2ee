@@ -71,12 +71,17 @@ services:
     command:
       - "-out-identity"
       - "/run/identity/identity.json"
-      - "-out-prom-sd"
-      - "/run/identity/prom-agent.json"
-      # The Prometheus agent scrapes ITSELF at this address; the file_sd document
-      # written here is what attaches the identity to those series.
-      - "-prom-target"
-      - "localhost:9090"
+      # One file_sd document per scrape job — they must not share one, or each job
+      # would discover the other's target. These carry the identity as TARGET
+      # labels, which is the only mechanism that also reaches `up` and the other
+      # per-scrape series: Prometheus builds those from target labels alone, never
+      # from the exposition, so nothing the exporter itself stamps can label them.
+      # `up` per replica is the signal most worth alerting on, which is why BOTH
+      # jobs go through here rather than the gateway labelling its own metrics.
+      - "-prom-sd"
+      - "/run/identity/sd/gateway.json=gateway:9464"
+      - "-prom-sd"
+      - "/run/identity/sd/prom-agent.json=localhost:9090"
     # Runs once. `unless-stopped` would restart it forever after each clean exit.
     restart: "no"
     volumes:
@@ -396,14 +401,16 @@ services:
       # Compose mounts this 0444, so the agent (uid 65534/nobody) can read it.
       - source: prom_agent_config
         target: /etc/prometheus/agent.yml
-    # The file_sd document cvm-identity wrote, carrying this CVM's identity as the
-    # target labels for the self-scrape job below. Read-only: nothing here writes it.
+    # The file_sd documents cvm-identity wrote, carrying this CVM's identity as the
+    # target labels for both scrape jobs. Read-only: nothing here writes them.
     volumes:
       - identity:/run/identity:ro
-    # Same reason as the gateway's: have the document in place before the first
-    # scrape. Missing it would be recoverable — Prometheus watches file_sd paths and
-    # reloads on change, so a late file just means a gap rather than a permanent
-    # loss — but there is no reason to accept the gap.
+    # Now load-bearing, not just tidy: BOTH jobs discover their targets from those
+    # documents, so until they exist this agent scrapes nothing at all. cvm-identity
+    # always writes them (unlabelled if the guest agent did not answer) and exits
+    # non-zero only if it cannot, which fails the deploy rather than starting a
+    # blind agent. Prometheus would also pick up a late file on its own — it watches
+    # these paths — but gating removes the gap entirely.
     depends_on:
       cvm-identity:
         condition: service_completed_successfully
@@ -442,29 +449,35 @@ configs:
           #
           # These labels CANNOT separate replicas: two CVMs of one app_id run this
           # exact config, so every label here is identical between them. Per-CVM
-          # separation is done per job instead, by two DIFFERENT mechanisms — see the
-          # scrape_configs below for why they must not be mixed.
+          # separation comes from the per-job file_sd target labels below.
           service: 0g-pc-gateway
           env: "${ZG_PROM_ENV:?set staging or mainnet}"
       scrape_configs:
-        # The gateway carries instance_id/app_id as EXPORTED labels: it reads the
-        # identity file itself and stamps every series it exposes
-        # (client/metrics.SetInstanceIdentity). So this job stays on a plain static
-        # target and must NOT also get file_sd labels — with the default
-        # honor_labels: false a target label of the same name wins and the gateway's
-        # own would be renamed exported_instance_id. One mechanism per job.
+        # BOTH jobs get their per-replica identity as TARGET labels, from the file_sd
+        # documents cvm-identity wrote. Nothing is labelled exporter-side.
+        #
+        # That is not a style choice. Prometheus synthesises `up`,
+        # scrape_duration_seconds, scrape_samples_scraped,
+        # scrape_samples_post_metric_relabeling and scrape_series_added from TARGET
+        # labels alone — they never pass through the scraped process — so a label the
+        # exporter stamps on its own series cannot reach them. `up` is the extreme
+        # case: it exists precisely when the exposition could NOT be read. Leaving
+        # either job on static_configs would leave all five byte-identical between
+        # two replicas of one app_id, landing the collision on the signal you would
+        # most want to alert on per replica.
+        #
+        # file_sd is also what makes this an init container rather than an ordering
+        # problem: Prometheus watches these paths and reloads on change, with no
+        # restart and no env-var plumbing (a container's environment cannot be
+        # written from outside once it exists).
         - job_name: gateway
-          static_configs:
-            - targets: ["gateway:9464"]
-        # The agent's own series (remote_write queue depth, send failures — the
-        # signal that tells you a replica has gone deaf) have no such source: this
-        # container exports metrics about itself and knows nothing about the CVM.
-        # file_sd is the seam — cvm-identity writes the document, Prometheus watches
-        # the path and applies the labels, no restart and no env-var plumbing (a
-        # container's environment cannot be written from outside once it exists).
+          file_sd_configs:
+            - files: ["/run/identity/sd/gateway.json"]
+        # The agent's own series — remote_write queue depth, send failures: the
+        # signal that tells you a replica has gone deaf.
         - job_name: prometheus-agent
           file_sd_configs:
-            - files: ["/run/identity/prom-agent.json"]
+            - files: ["/run/identity/sd/prom-agent.json"]
       remote_write:
         - url: "${ZG_PROM_REMOTE_WRITE_URL:?set the remote_write endpoint, e.g. https://prometheus.example.com/api/v1/write}"
           basic_auth:

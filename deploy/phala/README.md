@@ -316,8 +316,9 @@ before the runtime has assigned one. So a small init container,
 ```
 cvm-identity ──/var/run/dstack.sock──▶ guest agent (Info)
      │
-     ├─▶ /run/identity/identity.json    ──▶ gateway   (log fields + exported metric labels)
-     └─▶ /run/identity/prom-agent.json  ──▶ prom agent (file_sd target labels, self-scrape)
+     ├─▶ /run/identity/identity.json          ──▶ gateway    (log fields + X-0G-Gateway-Instance)
+     ├─▶ /run/identity/sd/gateway.json        ─┐
+     └─▶ /run/identity/sd/prom-agent.json     ─┴▶ prom agent (file_sd target labels, one per job)
 ```
 
 Both consumers mount the `identity` volume **read-only** and reach the guest agent
@@ -333,26 +334,32 @@ attestation story rests on ([Verify](#verify)). So the socket is not exclusive t
 socket off the **gateway**, and add no new long-lived holder: `cvm-identity` makes
 one call and exits.
 
-The two jobs are labelled by two different mechanisms, and **they must not be
-mixed**:
+**Both** jobs get the labels the same way — as **target labels**, from their own
+`file_sd` document. Nothing is labelled exporter-side, and each job needs its own
+file (two jobs pointing at one document would each discover the other's target).
 
-| job | how it gets the labels |
-|---|---|
-| `gateway` | the gateway exports them itself, on every series (`static_configs` target) |
-| `prometheus-agent` | `file_sd_configs` reads `prom-agent.json`, which carries them as target labels |
+That uniformity is required, not tidiness. Prometheus synthesises `up`,
+`scrape_duration_seconds`, `scrape_samples_scraped`,
+`scrape_samples_post_metric_relabeling` and `scrape_series_added` from **target
+labels alone** — they never pass through the scraped process — so a label an
+exporter stamps on its own series cannot reach them. `up` is the extreme case: it
+exists precisely when the exposition could *not* be read. Leaving a job on
+`static_configs` would therefore leave all five byte-identical between two
+replicas, putting the collision on the signal you would most want to alert on per
+replica. (`client_golang` says the same thing about its own API: `WrapRegistererWith`
+"should not be used to add fixed labels to all metrics exposed".)
 
-If the `gateway` job also got `file_sd` labels, the target label would win under
-the default `honor_labels: false` and the gateway's own would be renamed
-`exported_instance_id`. Prometheus watches the `file_sd` path and reloads on
-change, so no restart is involved either way.
+Prometheus watches the `file_sd` paths and reloads on change, so no restart is
+involved — that is what lets a container that has already exited supply them.
 
 Failure behaviour:
 
-- **Guest agent unreachable** → `cvm-identity` exits **0** having written the
-  file_sd document with the target but no labels, and no identity file. The
-  gateway logs `dstack identity unavailable` at WARN and serves normally. A
-  telemetry dimension is lost; nothing else is. Grep for that line after a deploy
-  if a replica's metrics go missing.
+- **Guest agent unreachable** → `cvm-identity` exits **0** having written both
+  file_sd documents with their targets but no labels, and no identity file. Both
+  jobs are still scraped, just unattributed; the gateway logs
+  `dstack identity unavailable` at WARN, serves normally, and sends no
+  `X-0G-Gateway-Instance`. A telemetry dimension is lost; nothing else is. Grep
+  for that line after a deploy if a replica's metrics turn up unlabelled.
 - **Volume not writable** → `cvm-identity` exits **non-zero**, and because both
   consumers gate on `service_completed_successfully` the app does not come up.
   That is intentional: it means the compose is wrong, and blue/green will simply
