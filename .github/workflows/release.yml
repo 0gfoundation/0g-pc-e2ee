@@ -127,11 +127,24 @@ jobs:
           sed -E "s#(^[[:space:]]*image:[[:space:]]*)ghcr\.io/0gfoundation/0g-pc-e2ee-gateway([:@][^[:space:]]*)?#\1ghcr.io/0gfoundation/0g-pc-e2ee-gateway@${DIGEST}#" \
             "$SRC" > "$OUT"
 
-          # Guards against a silently non-matching sed. The first two also cover a
-          # PARTIAL match: if a new service referencing the gateway image were added
-          # and the substitution missed it, that line would still read `...-gateway:`
-          # and trip guard 1.
-          if grep -qE "^[[:space:]]*image:[[:space:]]*ghcr\.io/0gfoundation/0g-pc-e2ee-gateway:" "$OUT"; then
+          # Guards against a silently non-matching sed. ONE anchor for all of them,
+          # so they cannot disagree about what a gateway-image line looks like — an
+          # asymmetric pair (say an -E pattern counting the source and a fixed-string
+          # pattern counting the output) fails a correctly-pinned release the moment
+          # the compose uses two spaces after `image:`. The trailing boundary stops
+          # this matching a longer image name that merely starts the same way.
+          GW='^[[:space:]]*image:[[:space:]]*ghcr\.io/0gfoundation/0g-pc-e2ee-gateway'
+
+          # `grep -c` exits 1 when it counts zero, and under `set -e` a bare
+          # assignment from a command substitution adopts that status and kills the
+          # step — which would make the "found 0" diagnostic below unreachable and
+          # turn a real problem into a bare non-zero exit with no annotation.
+          SRC_N=$(grep -cE "${GW}(:|@|[[:space:]]|\$)" "$SRC" || true)
+          OUT_N=$(grep -cE "${GW}@${DIGEST}([[:space:]]|\$)" "$OUT" || true)
+
+          # No gateway line left on a floating reference. A BARE `image: …-gateway`
+          # counts: docker reads it as :latest, so it is floating too.
+          if grep -qE "${GW}(:|[[:space:]]|\$)" "$OUT"; then
             echo "::error::gateway image still on a floating tag in $OUT"; exit 1
           fi
           if ! grep -qF "0g-pc-e2ee-gateway@${DIGEST}" "$OUT"; then
@@ -140,10 +153,8 @@ jobs:
           # Every gateway-image line survived the substitution and carries THIS
           # digest — so the gateway and cvm-identity cannot end up on different
           # builds of an artifact they are required to share.
-          SRC_N=$(grep -cE "^[[:space:]]*image:[[:space:]]*ghcr\.io/0gfoundation/0g-pc-e2ee-gateway[:@]" "$SRC")
-          OUT_N=$(grep -cF "image: ghcr.io/0gfoundation/0g-pc-e2ee-gateway@${DIGEST}" "$OUT")
-          if [[ "$SRC_N" -eq 0 || "$SRC_N" -ne "$OUT_N" ]]; then
-            echo "::error::expected ${SRC_N} gateway-image line(s) pinned to ${DIGEST}, found ${OUT_N}"; exit 1
+          if [[ "${SRC_N:-0}" -eq 0 || "${SRC_N:-0}" -ne "${OUT_N:-0}" ]]; then
+            echo "::error::expected ${SRC_N:-0} gateway-image line(s) pinned to ${DIGEST}, found ${OUT_N:-0}"; exit 1
           fi
           echo "Pinned ${OUT_N} gateway-image line(s) to ${DIGEST}"
 

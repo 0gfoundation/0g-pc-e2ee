@@ -84,12 +84,6 @@ func main() {
 		"comma-separated browser origin allowlist for CORS: exact origins (https://app.example.com), "+
 			"\"*.\" wildcards (https://*.0g.ai — subdomains only, not the apex), or \"*\" for any; "+
 			"empty allows no origin, disabling browser access (env ZG_GATEWAY_ALLOWED_ORIGINS)")
-	// -health turns the binary into its OWN container health probe: it makes one
-	// GET /healthz to the -listen port, prints the result, and exits 0 (healthy)
-	// or 1 — it starts no server. The image is distroless (no shell, no curl,
-	// see cmd/gateway/Dockerfile), so the compose healthcheck runs THIS instead
-	// of a shell one-liner (deploy/phala/docker-compose.yml). Reusing -listen /
-	// $ZG_GATEWAY_LISTEN keeps the probe and the server on the same port.
 	// Where this CVM's own identity comes from. A gateway app can be backed by
 	// several replicas sharing one app_id, so without it a merged log stream and a
 	// shared metrics store cannot tell them apart.
@@ -107,6 +101,12 @@ func main() {
 	dstackSocket := flag.String("dstack-socket", proxycli.EnvOr("ZG_GATEWAY_DSTACK_SOCKET", dstack.DefaultSocket),
 		"path to the dstack guest-agent unix socket, read ONCE at startup for the same identity when "+
 			"-identity-file is unset; empty disables the lookup (env ZG_GATEWAY_DSTACK_SOCKET)")
+	// -health turns the binary into its OWN container health probe: it makes one
+	// GET /healthz to the -listen port, prints the result, and exits 0 (healthy)
+	// or 1 — it starts no server. The image is distroless (no shell, no curl,
+	// see cmd/gateway/Dockerfile), so the compose healthcheck runs THIS instead
+	// of a shell one-liner (deploy/phala/docker-compose.yml). Reusing -listen /
+	// $ZG_GATEWAY_LISTEN keeps the probe and the server on the same port.
 	health := flag.Bool("health", false, "probe GET /healthz on the -listen port and exit 0 (healthy) or 1; starts no server, for container healthchecks")
 	flag.Parse()
 
