@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"net/url"
 	"strings"
 	"testing"
@@ -265,6 +266,32 @@ func TestGatewayRouteMode(t *testing.T) {
 // This is the cleartext passthrough; it must never carry a prompt (see
 // newRouterProxy), which the sealed chat route — exercised by
 // TestGatewayRouteMode — continues to own.
+// The catch-all sends every request it forwards to the one router host, so it
+// needs the shared server-sized connection pool like every other path to that
+// host. A nil Transport is the defect this guards: ReverseProxy silently falls
+// back to the process-global http.DefaultTransport and its 2 idle connections per
+// host, which no functional test would notice — it only shows up as a throughput
+// ceiling under concurrency the load rig does not even drive through this route.
+func TestRouterProxyUsesThePooledTransport(t *testing.T) {
+	proxy, ok := newRouterProxy(mustURL(t, "http://router.unused"), discardLogger()).(*httputil.ReverseProxy)
+	if !ok {
+		t.Fatal("newRouterProxy did not return a *httputil.ReverseProxy")
+	}
+	if proxy.Transport == nil {
+		t.Fatal("Transport: nil — the proxy would fall back to the process-global http.DefaultTransport")
+	}
+	tr, ok := proxy.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("Transport: got %T, want *http.Transport", proxy.Transport)
+	}
+	if want := core.NewPooledTransport().MaxIdleConnsPerHost; tr.MaxIdleConnsPerHost != want {
+		t.Errorf("MaxIdleConnsPerHost: got %d, want %d (core.NewPooledTransport's)", tr.MaxIdleConnsPerHost, want)
+	}
+	if tr == http.DefaultTransport {
+		t.Error("Transport is http.DefaultTransport itself: the pool would be shared process-wide")
+	}
+}
+
 func TestGatewayRoutesOtherRequestsToRouter(t *testing.T) {
 	var gotPath, gotQuery, gotHost, gotAuth string
 	routerMux := http.NewServeMux()
@@ -460,7 +487,7 @@ func TestGatewayAccessLog(t *testing.T) {
 // An empty metrics address disables the endpoint; the returned stop must still
 // be a safe no-op the caller can defer unconditionally.
 func TestStartMetricsDisabled(t *testing.T) {
-	stop := startMetrics("", discardLogger())
+	stop := startMetrics("", false, discardLogger())
 	stop()
 }
 
@@ -468,7 +495,7 @@ func TestStartMetricsDisabled(t *testing.T) {
 // and confirms /metrics answers 200 with the exposition format.
 func TestMetricsEndpointServes(t *testing.T) {
 	const addr = "127.0.0.1:19464"
-	stop := startMetrics(addr, discardLogger())
+	stop := startMetrics(addr, false, discardLogger())
 	defer stop()
 
 	// The listener starts in a goroutine; retry briefly until it is accepting.
@@ -491,6 +518,45 @@ func TestMetricsEndpointServes(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	if !bytes.Contains(body, []byte("go_goroutines")) {
 		t.Fatalf("/metrics did not serve the exposition format:\n%s", body)
+	}
+}
+
+// The profiler is opt-in: it must not appear on the metrics listener unless
+// -pprof asked for it, and it must appear when it did. It rides that listener
+// because that port is never published through the ingress, so a regression that
+// mounted it unconditionally would put process internals on an operator's port
+// without anyone choosing it.
+func TestPprofOptIn(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		addr     string
+		pprofOn  bool
+		wantCode int
+	}{
+		{"off by default", "127.0.0.1:19465", false, http.StatusNotFound},
+		{"on when enabled", "127.0.0.1:19466", true, http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stop := startMetrics(tc.addr, tc.pprofOn, discardLogger())
+			defer stop()
+
+			var resp *http.Response
+			var err error
+			for i := 0; i < 50; i++ {
+				resp, err = http.Get("http://" + tc.addr + "/debug/pprof/")
+				if err == nil {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if err != nil {
+				t.Fatalf("get /debug/pprof/: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.wantCode {
+				t.Errorf("/debug/pprof/: got %d, want %d", resp.StatusCode, tc.wantCode)
+			}
+		})
 	}
 }
 

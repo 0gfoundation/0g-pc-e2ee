@@ -45,6 +45,7 @@ cmd/
   sidecar/       # local sidecar binary (OpenAI-compatible proxy on localhost) — user-operated, no new trust party
   gateway/       # cloud-TEE gateway — SAME core, but SERVER-RUN + 0G-operated, runs in an attested CVM (adds one attested trust party)
   cvmid/         # init container shipped in the gateway image: publishes the CVM's identity to its sibling containers, then exits
+  mockupstream/  # load-test FIXTURE (never deployed): a protocol-exact stand-in for the router, broker and provider enclave — see ../loadtest/
 sdk/
   go/            # in-process Go SDK (thin wrapper over core; shares the Go core)
   ts/            # (planned) TS / WASM build for the browser — aligns to protocol/SPEC.md, does NOT import the Go core

@@ -283,10 +283,12 @@ func New(p Provider, opts ...Option) *Client {
 // enc key). The sealed-field set defaults to wire.DefaultSealedFields and the
 // unbound-field set to wire.DefaultUnboundFields.
 func NewWithResolver(r Resolver, opts ...Option) *Client {
-	// Clone the default transport (keeps env proxy, dial timeout, keepalives) and
-	// bound the wait for response headers via ResponseHeaderTimeout. No blunt
+	// Clone the default transport (keeps env proxy, dial timeout, keepalives) with
+	// a server-sized idle-connection pool (see NewPooledTransport — Go's default of
+	// 2 per host throttles a proxy that sends every request to the same router),
+	// and bound the wait for response headers via ResponseHeaderTimeout. No blunt
 	// http.Client.Timeout: it would also cut a long stream (see providerTimeout).
-	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr := NewPooledTransport()
 	tr.ResponseHeaderTimeout = providerTimeout
 	c := &Client{
 		resolver:      r,

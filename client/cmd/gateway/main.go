@@ -48,6 +48,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"net/url"
 	"os"
 	"time"
@@ -101,6 +102,17 @@ func main() {
 	dstackSocket := flag.String("dstack-socket", proxycli.EnvOr("ZG_GATEWAY_DSTACK_SOCKET", dstack.DefaultSocket),
 		"path to the dstack guest-agent unix socket, read ONCE at startup for the same identity when "+
 			"-identity-file is unset; empty disables the lookup (env ZG_GATEWAY_DSTACK_SOCKET)")
+	// Mount the Go runtime profiler on the metrics listener. OFF by default and
+	// deliberately not a production knob: it is the fastest way to find where a
+	// load test's throughput is going (`go tool pprof
+	// http://<metrics-listen>/debug/pprof/profile?seconds=30`), and it rides the
+	// internal metrics port precisely because that port is never published through
+	// the ingress. Enabling it in an attested deployment would also change the
+	// measured compose text (app_id), so keep it to load-test CVMs.
+	pprofOn := flag.Bool("pprof", proxycli.EnvBool("ZG_GATEWAY_PPROF", false),
+		"serve the Go runtime profiler at /debug/pprof/ on the -metrics-listen address (requires -metrics-listen). "+
+			"For load testing and diagnosis only — it exposes process internals, so never enable it on a listener "+
+			"reachable from outside the CVM (env ZG_GATEWAY_PPROF)")
 	// -health turns the binary into its OWN container health probe: it makes one
 	// GET /healthz to the -listen port, prints the result, and exits 0 (healthy)
 	// or 1 — it starts no server. The image is distroless (no shell, no curl,
@@ -194,7 +206,11 @@ func main() {
 	// one: the metrics address is bound to a port the compose does not publish, so
 	// it never rides the same ingress as the OpenAI API surface. stopMetrics shuts
 	// it down alongside the main server on a signal.
-	stopMetrics := startMetrics(*metricsListen, logger)
+	if *pprofOn && *metricsListen == "" {
+		logger.Error("-pprof requires -metrics-listen (the profiler is served on that internal listener)")
+		os.Exit(1)
+	}
+	stopMetrics := startMetrics(*metricsListen, *pprofOn, logger)
 
 	srv := &http.Server{
 		Addr:              *f.Listen,
@@ -250,12 +266,29 @@ func loadIdentity(identityFile, socket string) (dstack.Info, string, error) {
 // operational telemetry, so the gateway keeps serving requests even if its
 // metrics port cannot bind, rather than the observability path taking down the
 // data path.
-func startMetrics(listen string, logger *slog.Logger) (stop func()) {
+//
+// withPprof additionally mounts the Go runtime profiler on the same listener
+// (see the -pprof flag). It shares this listener rather than getting one of its
+// own because the property that makes it safe — never published through the
+// ingress, reachable only on the CVM-internal network — is a property of THIS
+// listener; a second one would have to re-establish it.
+func startMetrics(listen string, withPprof bool, logger *slog.Logger) (stop func()) {
 	if listen == "" {
 		return func() {}
 	}
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", metrics.Handler())
+	if withPprof {
+		// Registered explicitly rather than by relying on net/http/pprof's init()
+		// (which only populates http.DefaultServeMux — a mux this binary never
+		// serves), so what the profiler exposes is visible here at the call site.
+		mux.HandleFunc("GET /debug/pprof/", pprof.Index)
+		mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
+		logger.Warn("pprof profiler enabled on the metrics listener", "listen", listen, "path", "/debug/pprof/")
+	}
 	srv := &http.Server{
 		Addr:              listen,
 		Handler:           mux,
