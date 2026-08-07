@@ -153,7 +153,9 @@ controlled only by that enclave?"**
 > (`app_id` is its leading 20 bytes). That register is part of the signed TD
 > report, so it needs no event-log replay — see
 > `attest.ComposeHashFromMRConfigID`. Because the compose hash covers the whole
-> app-compose, it attests **both** containers (ingress + gateway) at once.
+> app-compose, it attests **every** container in the CVM at once — ingress and
+> gateway on the request path, plus the `cvm-identity` init container and the
+> `prometheus-agent` sidecar.
 >
 > What that quote proves is "a CVM running exactly this app-compose obtained this
 > certificate inside the TEE". Getting from there to "the endpoint I am talking to
@@ -372,12 +374,14 @@ does not.
   host-supplied, and what makes it truthful is the guest refusing to boot when it
   disagrees with the real `app-compose.json`
   (dstack `config_id_verifier.rs`) — a check whose integrity rests on `MRTD` /
-  `RTMR0`–`RTMR2` being the audited dstack OS. `pcverify` prints those registers but
-  compares them against nothing, so a modified OS image that skipped the check would
-  still pass. Closing it needs a reviewed dstack OS measurement allowlist committed
-  here (so no user supplies a value) — the same shape as the broker measurement
-  allowlist in `trust-chain.md` hop 3. Until then code identity is strong evidence,
-  not proof.
+  `RTMR0`–`RTMR2` being the audited dstack OS. The allowlist that would pin them is
+  plumbed through (`attest.BootChainPolicy`, `client/evidence/osimages.json`) but
+  ships **empty**, so `pcverify` prints the observed registers and compares them
+  against nothing — a modified OS image that skipped the boot check would still pass.
+  Closing it needs a reviewed dstack OS measurement recomputed with `dstack-mr` for
+  the deployed image *and* VM shape, committed here so no user supplies a value — the
+  same shape as the broker measurement allowlist in `trust-chain.md` hop 3. Until
+  then code identity is strong evidence, not proof.
 - **Two enclaves see plaintext** (gateway + provider), vs one for direct-seal.
 - **Metadata** (model, sizes, timing) is visible as in the router path.
 - **The browser origin allowlist is not authentication.** Serving no-install

@@ -8,7 +8,8 @@ model (tier 2.5: confidential by default, cheating publicly detectable).
 
 ## How it works
 
-Two containers, one CVM, one measured compose file:
+One CVM, one measured compose file, four containers — the two on the request path
+plus two that only support them:
 
 ```
 client ──TLS──> platform host front end ──> dstack gateway ──passthrough──┐
@@ -16,8 +17,15 @@ client ──TLS──> platform host front end ──> dstack gateway ──pas
                                                                           v
                                        ┌──────────────── this CVM ────────────────┐
                                        │ dstack-ingress ──plaintext──> gateway    │
+                                       │                                          │
+                                       │ cvm-identity (init, exits)               │
+                                       │ prometheus-agent ──metrics out──▶        │
                                        └──────────────────────────────────────────┘
 ```
+
+The two support containers are covered below: [`cvm-identity`](#telling-replicas-apart)
+writes this replica's `instance_id`/`app_id` once at boot and exits, and
+[`prometheus-agent`](#metrics-prometheus) ships telemetry out.
 
 - [dstack-ingress](https://github.com/Dstack-TEE/dstack-examples/tree/main/custom-domain)
   terminates TLS **inside this CVM**: it generates the key in the enclave, gets a
@@ -39,8 +47,8 @@ client ──TLS──> platform host front end ──> dstack gateway ──pas
   `mr_config_id` commits to `compose_hash`, the SHA-256 of the app-compose manifest
   that embeds this compose file verbatim (`app_id` is its leading 20 bytes). So one
   quote proves *"a CVM running exactly this app-compose obtained this certificate
-  inside the TEE"*, covering both containers. See [Verify](#verify) for the steps the
-  quote cannot do for you.
+  inside the TEE"*, covering all four containers. See [Verify](#verify) for the steps
+  the quote cannot do for you.
 
 ## Serving domain
 
@@ -370,7 +378,8 @@ is not guaranteed bit-identical, so reuse preserves the original digest).
 2. Resolves that commit's gateway image digest (`sha-<full-sha>` tag →
    `@sha256:…`).
 3. Generates `docker-compose.release.yml` by replacing **only** the gateway
-   `image:` line with the `@sha256:` pin — every other byte (env, ingress,
+   `image:` lines — both of them, `gateway` and `cvm-identity`, in one substitution
+   so they cannot disagree — with the `@sha256:` pin; every other byte (env, ingress,
    prometheus) is identical to the compose at that commit, so the two cannot
    drift. A guard fails the run if the gateway is still on a floating tag.
 4. Computes a version `release-YYYY.MM.DD.N` (UTC date; `N` auto-incremented from
