@@ -12,11 +12,12 @@
 //
 // The socket is a privileged surface — the same endpoint also derives keys and
 // issues quotes — so this package deliberately implements ONLY Info: identity in,
-// nothing else. In the deployed form even that much is kept away from the
-// long-lived containers: cmd/cvmid opens the socket once at boot, writes the
-// identity file, and exits, so the gateway reads a plain file and never touches
-// the agent (WriteIdentityFile / ReadIdentityFile). Nothing here runs on the
-// request path.
+// nothing else. In the deployed form it is kept off the GATEWAY specifically:
+// cmd/cvmid opens the socket once at boot, writes the identity file, and exits, so
+// the container that handles user prompts reads a plain file and never touches the
+// agent (WriteIdentityFile / ReadIdentityFile). Other containers of the same CVM do
+// hold the socket — dstack-ingress needs it for cert binding — so this is a
+// narrowing, not an exclusion. Nothing here runs on the request path.
 //
 // On what the values are worth: instance_id and app_id are not merely
 // self-reported. dstack-util derives instance_id at boot as
@@ -184,8 +185,8 @@ func PublishFile(path string, body []byte) error {
 }
 
 // WriteIdentityFile writes info to path as JSON. It is how cmd/cvmid hands the
-// identity to the other containers of the CVM over a shared volume, so that only
-// that one short-lived container needs the guest-agent socket.
+// identity to the other containers of the CVM over a shared volume, so that the
+// gateway does not need the guest-agent socket to learn who it is.
 func WriteIdentityFile(path string, info Info) error {
 	body, err := json.MarshalIndent(info, "", "  ")
 	if err != nil {

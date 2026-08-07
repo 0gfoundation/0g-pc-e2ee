@@ -80,7 +80,10 @@ services:
     # Runs once. `unless-stopped` would restart it forever after each clean exit.
     restart: "no"
     volumes:
-      - /var/run/dstack.sock:/var/run/dstack.sock # the ONLY container that mounts it
+      # dstack-ingress mounts this socket too, and always has (cert binding, below).
+      # What is new here is only that this container holds it BRIEFLY — it makes one
+      # call and exits — so the set of LONG-LIVED holders is unchanged by adding it.
+      - /var/run/dstack.sock:/var/run/dstack.sock
       - identity:/run/identity
 
   dstack-ingress:
@@ -358,10 +361,11 @@ services:
       - "ZG_GATEWAY_INSTANCE_HEADER=${ZG_GATEWAY_INSTANCE_HEADER:-false}"
     volumes:
       # Identity in, read-only, as a plain JSON file — deliberately NOT the
-      # guest-agent socket, which only cvm-identity mounts (see there). This
-      # container handles user prompts for the life of the CVM; the socket behind
-      # that identity also derives keys and issues quotes, so it stays with the
-      # container that makes one call and exits.
+      # guest-agent socket. That socket also derives keys and issues quotes, and
+      # THIS container is the one that handles user prompts for the life of the
+      # CVM, so it gets the derived file instead. (dstack-ingress does mount the
+      # socket, for cert binding; the point is not that nothing holds it, but that
+      # the prompt-handling container does not.)
       - identity:/run/identity:ro
     # The gateway itself holds no secret: no pinned provider key, and no TLS
     # material — the cert and its key belong to dstack-ingress above, generated

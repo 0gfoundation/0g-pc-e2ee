@@ -15,12 +15,17 @@
 //  2. Only the dstack guest agent knows the answer, and it is reached over a
 //     PRIVILEGED unix socket: the same endpoint derives keys and issues quotes.
 //
-// Doing the lookup here rather than in each consumer means exactly one
-// short-lived container mounts that socket, and the long-running gateway — the
-// container that handles user prompts — does not. The Prometheus agent could not
-// do it for itself in any case: compose interpolation happens at deploy time and
-// cannot see a value the runtime assigns per CVM, and a container's environment
-// cannot be written from outside once it exists. A file can.
+// Doing the lookup here rather than in each consumer keeps that socket off the
+// long-running gateway — the container that handles user prompts — which reads a
+// derived file instead. It does NOT make the socket exclusive: dstack-ingress
+// mounts it too, and always has, for the cert binding the attestation story rests
+// on. The honest framing is that this adds a holder that exits, not a holder that
+// runs for the life of the CVM.
+//
+// The Prometheus agent could not do the lookup for itself in any case: compose
+// interpolation happens at deploy time and cannot see a value the runtime assigns
+// per CVM, and a container's environment cannot be written from outside once it
+// exists. A file can.
 //
 // Outputs (either may be omitted):
 //

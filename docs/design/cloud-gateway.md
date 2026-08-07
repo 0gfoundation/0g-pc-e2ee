@@ -325,14 +325,18 @@ does not.
   talk to the gateway; it constrains nothing else, because only browsers enforce it
   — any non-browser caller simply omits or forges `Origin`. Authorization remains
   the front-door credential gate plus the router's authoritative validation.
-- **One container in the CVM opens the dstack guest-agent socket** — `cvm-identity`,
-  an init container that reads this CVM's `instance_id` / `app_id` once at boot,
-  writes them to a shared volume, and exits (`deploy/phala/docker-compose.yml`,
-  `client/cmd/cvmid`). That socket is a privileged surface: the same agent derives
-  keys and issues quotes. It is kept off the **gateway** — the long-lived container
-  that sees user prompts, which reads a plain JSON file instead — so a compromised
-  gateway reaches nothing it could not reach before. The mount is part of the
-  measured compose, so a verifier sees exactly which container holds it.
+- **A second container in the CVM opens the dstack guest-agent socket** —
+  `cvm-identity`, an init container that reads this CVM's `instance_id` / `app_id`
+  once at boot, writes them to a shared volume, and exits
+  (`deploy/phala/docker-compose.yml`, `client/cmd/cvmid`). That socket is a
+  privileged surface: the same agent derives keys and issues quotes. **dstack-ingress
+  already mounts it** — it must, for the cert binding §6.1 rests on — and it is
+  long-lived, so the socket is not and never was exclusive to one container. The
+  narrower claim this design does support: the socket is kept off the **gateway**,
+  the long-lived container that sees user prompts (it reads a plain JSON file
+  instead), and adding `cvm-identity` introduces no new long-lived holder. Every
+  mount is part of the measured compose, so a verifier sees exactly which
+  containers hold it and for how long.
   It buys the one thing a replica cannot otherwise have: a name. Without it,
   replicas of one `app_id` produce unattributable interleaved logs and colliding
   Prometheus series (identical external and target labels), which makes running

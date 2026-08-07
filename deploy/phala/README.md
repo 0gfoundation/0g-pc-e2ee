@@ -308,11 +308,18 @@ cvm-identity ──/var/run/dstack.sock──▶ guest agent (Info)
      └─▶ /run/identity/prom-agent.json  ──▶ prom agent (file_sd target labels, self-scrape)
 ```
 
-Both consumers mount the `identity` volume **read-only**; only `cvm-identity`
-mounts the socket. That is deliberate: the guest agent also derives keys and
-issues quotes, so the container that holds user prompts for the life of the CVM
-should not be able to reach it. It runs from the **same image** as the gateway
-(different `entrypoint`), so the compose gains no second digest to pin.
+Both consumers mount the `identity` volume **read-only** and reach the guest agent
+not at all. That is deliberate: the agent also derives keys and issues quotes, so
+the container that holds user prompts for the life of the CVM should not be able
+to reach it. `cvm-identity` runs from the **same image** as the gateway (different
+`entrypoint`), so the compose gains no second digest to pin.
+
+To be precise about what that does and does not buy: **`dstack-ingress` also mounts
+this socket, and always has** — it needs it for the cert binding that the whole
+attestation story rests on ([Verify](#verify)). So the socket is not exclusive to
+`cvm-identity`, and this scheme does not make it so. What it does is keep the
+socket off the **gateway**, and add no new long-lived holder: `cvm-identity` makes
+one call and exits.
 
 The two jobs are labelled by two different mechanisms, and **they must not be
 mixed**:
