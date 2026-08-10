@@ -317,3 +317,69 @@ func TestReportGateway_DiscoveredLookupFailureIsAdvisory(t *testing.T) {
 		})
 	}
 }
+
+// The CLI half of the same bug: -no-dns-discovery must never print a ✓ for an
+// app-compose that was never fetched or a compose file that was never compared. The
+// old early-return condition included !ExpectRequested, so a DEFAULT -releases lookup
+// having found candidates made it fall through to the success branch.
+//
+// Also covers the mark/exit-code contradiction on the HashErr line: with the default
+// -releases, ExpectRequested is set, so mark(!Requested) printed ✓ next to a run that
+// then exited 1.
+func TestReportCodeIdentity_NeverMarksWorkThatDidNotHappen(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		code     evidence.CodeIdentity
+		wantCode int
+		absent   []string
+		present  []string
+	}{
+		{
+			name: "no source, default comparison had candidates",
+			code: evidence.CodeIdentity{NoSource: true, ExpectRequested: true},
+			// Opting out is not a failure, but nothing may be claimed.
+			wantCode: 0,
+			absent:   []string{"✓ app-compose", "✓ compose file", "byte-for-byte"},
+			present:  []string{"- app-compose", "not checked"},
+		},
+		{
+			name: "no source, comparison explicitly asked for",
+			code: evidence.CodeIdentity{NoSource: true, ExpectRequested: true, ExpectExplicit: true},
+			// A comparison was demanded and cannot be performed.
+			wantCode: 1,
+			absent:   []string{"✓ app-compose", "byte-for-byte"},
+			present:  []string{"✗ app-compose"},
+		},
+		{
+			name: "hash unavailable while the default comparison ran",
+			code: evidence.CodeIdentity{
+				ExpectRequested: true,
+				HashErr:         errors.New("mr_config_id layout does not expose compose_hash"),
+			},
+			wantCode: 1,
+			absent:   []string{"✓ code identity"},
+			present:  []string{"✗ code identity"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rep := passing()
+			rep.Code = tc.code
+			var out bytes.Buffer
+			got := reportGateway(context.Background(), &out, stubEvidence{rep: rep},
+				"pc-gateway.test", false, expectSource{Label: "newest 5 release(s)"})
+			if got != tc.wantCode {
+				t.Errorf("exit = %d, want %d\n%s", got, tc.wantCode, out.String())
+			}
+			for _, s := range tc.absent {
+				if strings.Contains(out.String(), s) {
+					t.Errorf("output must not contain %q:\n%s", s, out.String())
+				}
+			}
+			for _, s := range tc.present {
+				if !strings.Contains(out.String(), s) {
+					t.Errorf("output must contain %q:\n%s", s, out.String())
+				}
+			}
+		})
+	}
+}

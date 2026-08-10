@@ -491,35 +491,52 @@ type CodeIdentity struct {
 	// A failure of a discovered lookup is informational: the caller did not ask for
 	// it, so it does not fail the run (see OK).
 	Discovered bool
+	// NoSource reports that the app-compose stage never ran because there was nothing
+	// to run it with: DNS discovery is off and neither AppCompose nor BaseDomain was
+	// given. Deliberately distinct from FetchErr — nothing was attempted, so nothing
+	// failed — and it exists so that no later step can read the resulting zero
+	// ComposeFile / nil ExpectErr as a success.
+	NoSource bool
 }
 
 // OK reports whether every code-identity check the caller requested succeeded.
 //
-// Two things are deliberately not failures. Nothing requested at all: an
-// unasked-for check cannot fail. And a *discovered* app-compose lookup that did not
-// pan out — DNS or the platform endpoint being unavailable is not evidence against
-// the deployment, and the caller did not ask. Supplying -app-compose / -base-domain
-// (or explicitly asking for a compose comparison) is how you say "this must work".
+// The line it draws: an **availability** failure is advisory, a **fact about the
+// deployment** is fatal. DNS or the platform endpoint being unreachable says nothing
+// about what is running, and the caller did not ask for that lookup. A compose_hash
+// the register does not expose, bytes that do not hash to it, or a compose text
+// matching no published release are all statements about the deployment itself.
 //
-// The hardening test is ExpectExplicit, never ExpectRequested. A comparison that ran
-// only because it is the default must not turn a discovered lookup into a failure —
-// and inferring it from "candidates were obtained" would make the verdict depend on
-// whether an unrelated network call succeeded: the same DNS failure would be fatal
-// when GitHub was reachable and advisory when it was not.
+// Requested and ExpectExplicit are the only two ways a caller says "this must work".
+// ExpectRequested is NOT one of them: it can be true purely because -releases has a
+// nonzero default, and treating it as a demand made the verdict depend on whether an
+// unrelated network call happened to succeed.
 func (c CodeIdentity) OK() bool {
-	if !c.Requested && !c.ExpectRequested {
-		return true
+	// Nothing to run the stage with. That is a configuration the caller chose, so it is
+	// not a failure — unless they also explicitly asked for a comparison, which cannot
+	// be performed without an app-compose to compare.
+	if c.NoSource {
+		return !c.ExpectExplicit
 	}
 	if c.HashErr != nil {
+		return !c.Requested && !c.ExpectRequested
+	}
+	// Bytes that claim to be this CVM's manifest and do not hash to the quote's
+	// compose_hash are a finding however they were obtained, so this never degrades to
+	// advisory the way an unreachable endpoint does.
+	if c.BoundErr != nil {
 		return false
 	}
-	if (c.FetchErr != nil || c.BoundErr != nil) && (!c.Discovered || c.ExpectExplicit) {
-		return false
+	if c.FetchErr != nil {
+		return c.Discovered && !c.ExpectExplicit
 	}
-	if c.FetchErr != nil || c.BoundErr != nil {
-		return true // discovered-only lookup that did not pan out
+	if !c.ExpectRequested {
+		return true
 	}
-	return !c.ExpectRequested || c.ExpectErr == nil
+	// A comparison counts as passed only if it names what it matched. Without this,
+	// any path that returns early with ExpectErr still nil — having compared nothing —
+	// reads as a match.
+	return c.ExpectErr == nil && c.MatchedExpect != ""
 }
 
 // Report.Note strings: what a given run did NOT cover, so a caller cannot present
@@ -725,6 +742,10 @@ func (c *Checker) checkCodeIdentity(ctx context.Context, rep *Report) {
 			// DNS so `Check(domain)` alone can do code identity. Marked Discovered, so a
 			// lookup the caller never asked for cannot fail the run on its own.
 			if c.cfg.NoDNSDiscovery {
+				// Say so explicitly. Returning with every field at its zero value left
+				// ComposeFile empty and ExpectErr nil, which downstream read as "compared,
+				// matched" — two ✓ for work that never happened.
+				code.NoSource = true
 				return
 			}
 			code.Discovered = true

@@ -261,15 +261,26 @@ func TestCodeIdentity_OK(t *testing.T) {
 		"requested, bound":           {CodeIdentity{Requested: true}, true},
 		"compose file mismatch": {CodeIdentity{
 			Requested: true, ExpectRequested: true, ExpectErr: sentinel}, false},
-		"compose file match": {CodeIdentity{Requested: true, ExpectRequested: true}, true},
+		// A real match always names what it matched; OK() now requires that, so this
+		// case has to carry a label. Without one the state is indistinguishable from an
+		// early return that compared nothing.
+		"compose file match": {CodeIdentity{
+			Requested: true, ExpectRequested: true, MatchedExpect: "release-1"}, true},
+		"compose file 'match' with no label is not a match": {CodeIdentity{
+			Requested: true, ExpectRequested: true}, false},
 
 		// A DISCOVERED lookup (DNS-derived base domain) that did not pan out is
 		// advisory: nobody asked for it, and DNS or the platform endpoint being
 		// unavailable is not evidence about the deployment.
 		"discovered, fetch failed": {CodeIdentity{
 			Requested: true, Discovered: true, FetchErr: sentinel}, true},
+		// Not bound is a FINDING, not an availability problem: bytes that claim to be
+		// this CVM's manifest and do not hash to the quote's compose_hash say something
+		// about the deployment however they were reached. So unlike FetchErr it stays
+		// fatal even when the lookup was only discovery — which also removes a
+		// contradiction, since the report always printed ✗ for it.
 		"discovered, not bound": {CodeIdentity{
-			Requested: true, Discovered: true, BoundErr: sentinel}, true},
+			Requested: true, Discovered: true, BoundErr: sentinel}, false},
 		// The regression this guards: -releases defaults to 5, so a DEFAULT comparison
 		// normally has candidates and ExpectRequested is true. That must NOT harden the
 		// discovered lookup — otherwise whether a DNS failure fails the whole run would
@@ -285,6 +296,18 @@ func TestCodeIdentity_OK(t *testing.T) {
 		// discovered, so a failure is fatal with no comparison involved at all.
 		"supplied base domain, fetch failed": {CodeIdentity{
 			Requested: true, Discovered: false, FetchErr: sentinel}, false},
+
+		// -no-dns-discovery with no bytes supplied: the stage never ran. The caller
+		// opted out, so it is not a failure — but it must never read as a pass either,
+		// which is what the zero ExpectErr used to do once the DEFAULT -releases lookup
+		// had populated candidates.
+		"no source": {CodeIdentity{NoSource: true}, true},
+		"no source, default comparison had candidates": {CodeIdentity{
+			NoSource: true, ExpectRequested: true}, true},
+		// Asking explicitly for a comparison there is nothing to compare is a
+		// contradiction, and fatal.
+		"no source, comparison explicitly asked for": {CodeIdentity{
+			NoSource: true, ExpectRequested: true, ExpectExplicit: true}, false},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

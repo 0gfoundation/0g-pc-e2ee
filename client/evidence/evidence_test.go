@@ -1042,3 +1042,61 @@ func TestSession_ServedChainDetectsAReplicaChange(t *testing.T) {
 		t.Errorf("no connection recorded: changed = %v, chain = %v; want false, nil", changed, chain)
 	}
 }
+
+// An invariant, asserted independently of the state table above because it is the
+// shape a whole CLASS of bug takes: any early return in checkCodeIdentity leaves
+// ExpectErr nil and MatchedExpect empty, and the old OK() read exactly that as
+// "compared, matched". Nothing may ever count a comparison as passed without naming
+// what it matched.
+func TestCodeIdentity_ComparisonNeedsALabelToPass(t *testing.T) {
+	for _, c := range []CodeIdentity{
+		{Requested: true, ExpectRequested: true},
+		{Requested: true, ExpectRequested: true, ExpectExplicit: true},
+		{ExpectRequested: true},
+		{Discovered: true, ExpectRequested: true},
+		{NoSource: true, ExpectRequested: true, ExpectExplicit: true},
+	} {
+		if c.ExpectErr != nil || c.MatchedExpect != "" {
+			t.Fatalf("test bug: case is not the no-result shape: %+v", c)
+		}
+		if c.OK() {
+			t.Errorf("OK() = true for %+v — a comparison with neither a result nor an error "+
+				"must never pass", c)
+		}
+	}
+}
+
+// -no-dns-discovery with no -app-compose / -base-domain, which deploy/phala/README.md
+// documents for a DNS-less environment. The app-compose stage cannot run. Before the
+// fix this returned with every field zero while ExpectRequested was already true from
+// the default -releases lookup, so the run reported an authenticated app-compose and a
+// byte-for-byte compose match — two ✓ and exit 0 — having fetched nothing.
+func TestCheck_NoDNSDiscoveryCannotFabricateACodeIdentityPass(t *testing.T) {
+	f := newFixture(t)
+	c := f.checker(t, Config{
+		NoDNSDiscovery: true,
+		// What the default -releases 5 produces: candidates exist, but nothing asked for them.
+		ExpectComposeFiles: []ExpectedCompose{{Label: "release-1", Content: []byte("services: {}\n")}},
+	})
+
+	rep, err := c.Check(context.Background(), testDomain)
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	code := rep.Code
+	if !code.NoSource {
+		t.Error("NoSource = false; the stage did not run and must say so")
+	}
+	if code.ComposeFile != nil || code.MatchedExpect != "" || code.Source != "" {
+		t.Errorf("state claims work that never happened: ComposeFile=%q MatchedExpect=%q Source=%q",
+			code.ComposeFile, code.MatchedExpect, code.Source)
+	}
+	// Endpoint identity is untouched by any of this, and opting out of a check is not a
+	// failure — so the run still passes. What must NOT happen is claiming code identity.
+	if !rep.Pass() {
+		t.Error("Pass = false: declining code identity is not a verification failure")
+	}
+	if rep.Note == "" {
+		t.Error("Note is empty; a partial result must carry its caveat")
+	}
+}

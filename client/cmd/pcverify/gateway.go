@@ -303,16 +303,25 @@ func reportGateway(ctx context.Context, out io.Writer, ec evidenceChecker, domai
 // registers.
 func reportCodeIdentity(out io.Writer, code evidence.CodeIdentity, expect expectSource) {
 	if code.HashErr != nil {
-		fmt.Fprintf(out, "%s code identity      %v\n", mark(!code.Requested), code.HashErr)
+		// Both halves of OK's short-circuit, or the mark contradicts the exit code: with
+		// -releases at its default ExpectRequested is set, so mark(!Requested) alone
+		// printed a ✓ next to a run that then failed.
+		fmt.Fprintf(out, "%s code identity      %v\n", mark(!code.Requested && !code.ExpectRequested), code.HashErr)
 		return
 	}
 	fmt.Fprintf(out, "%s compose_hash       %x\n", mark(true), code.ComposeHash)
 	fmt.Fprintf(out, "  app_id           %s\n", code.AppID)
 
-	if !code.Requested && !code.ExpectRequested && code.Source == "" && code.FetchErr == nil {
-		// Discovery was switched off. Not a failure — say what would close the gap,
-		// next to the value it would resolve.
-		fmt.Fprintf(out, "- app-compose        not checked (-no-dns-discovery; pass -app-compose or -base-domain)\n")
+	if code.NoSource {
+		// Discovery was switched off and no bytes were supplied, so the app-compose stage
+		// never ran. This must be keyed on NoSource, not on ExpectRequested being false:
+		// -releases defaults to 5, so candidates normally exist and the old condition fell
+		// through to the success branch — printing ✓ for an app-compose never fetched and a
+		// comparison never made. Say what would close the gap, next to the value it would
+		// resolve; a ✗ when the caller explicitly asked for a comparison, since they
+		// demanded one that cannot be performed without a source.
+		fmt.Fprintf(out, "%s app-compose        not checked (-no-dns-discovery; pass -app-compose or -base-domain)\n",
+			failMark(code, !code.ExpectExplicit))
 		return
 	}
 	switch {
@@ -352,6 +361,12 @@ func reportCodeIdentity(out io.Writer, code evidence.CodeIdentity, expect expect
 	}
 	if code.ExpectErr != nil {
 		fmt.Fprintf(out, "%s compose file       %v\n", mark(false), code.ExpectErr)
+		return
+	}
+	// No error AND no label means nothing was actually compared — the shape any future
+	// early return would produce. Never print it as a match; OK() rejects it too.
+	if code.MatchedExpect == "" {
+		fmt.Fprintf(out, "%s compose file       not compared (no result recorded)\n", mark(false))
 		return
 	}
 	fmt.Fprintf(out, "%s compose file       matches %s byte-for-byte\n", mark(true), code.MatchedExpect)

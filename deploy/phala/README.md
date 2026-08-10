@@ -194,6 +194,13 @@ hand is how you end up verifying the standby. Use `-app-compose <file>` when the
 guest agent is unreachable or the app's `public_tcbinfo` is off; the bytes are
 anchored by the quote's `compose_hash`, so their source does not have to be trusted.
 
+`-no-dns-discovery` with no `-app-compose` / `-base-domain` leaves the app-compose
+stage with nothing to run on, so code identity is reported as **not checked** — the
+run can still pass on endpoint identity (declining a check is not a failure), and the
+closing note says which case it is in. Combining it with an explicit
+`-expect-compose-file` / `-releases N` is a contradiction and fails: a comparison was
+demanded that cannot be performed.
+
 Add `-allow-untrusted-cert` when checking a hostname brought up against the ACME
 staging CA (`ACME_STAGING=true`): its certificate is correctly bound by the quote but
 deliberately signed by an untrusted CA, so the chain-trust step fails on purpose. Every
