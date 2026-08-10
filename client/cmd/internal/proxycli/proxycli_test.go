@@ -1,6 +1,8 @@
 package proxycli
 
 import (
+	"bufio"
+	"errors"
 	"flag"
 	"io"
 	"log/slog"
@@ -193,4 +195,72 @@ func TestBuildDirectMode(t *testing.T) {
 	}
 	// No warmer in direct mode: StartWarmer must be a no-op that returns cleanly.
 	built.StartWarmer(testLogger())()
+}
+
+// IdleTimeout's whole justification is a net/http behaviour that is easy to
+// misread: ReadHeaderTimeout does NOT bound a connection sitting idle between
+// requests, only IdleTimeout does. Both halves are asserted here, so if a future
+// Go release changes either one the constant's doc comment stops being true and
+// this test says so — rather than the comment quietly becoming folklore.
+func TestIdleKeepAliveIsBoundedOnlyByIdleTimeout(t *testing.T) {
+	// Short enough to keep the test fast, long enough that a loaded machine does
+	// not close the connection for unrelated reasons.
+	const short = 150 * time.Millisecond
+
+	for _, tc := range []struct {
+		name        string
+		idleTimeout time.Duration
+		wantClosed  bool
+	}{
+		{"IdleTimeout set closes the idle connection", short, true},
+		{"ReadHeaderTimeout alone leaves it open", 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatalf("listen: %v", err)
+			}
+			srv := &http.Server{
+				Handler:           http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("ok")) }),
+				ReadHeaderTimeout: short,
+				IdleTimeout:       tc.idleTimeout,
+			}
+			go func() { _ = srv.Serve(ln) }()
+			defer func() { _ = srv.Close() }()
+
+			conn, err := net.Dial("tcp", ln.Addr().String())
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer func() { _ = conn.Close() }()
+
+			// One complete request/response first: the state under test is IDLE
+			// (between requests), which a never-used connection is not in.
+			if _, err := io.WriteString(conn, "GET / HTTP/1.1\r\nHost: test\r\n\r\n"); err != nil {
+				t.Fatalf("write request: %v", err)
+			}
+			br := bufio.NewReader(conn)
+			resp, err := http.ReadResponse(br, nil)
+			if err != nil {
+				t.Fatalf("read response: %v", err)
+			}
+			if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+				t.Fatalf("drain body: %v", err)
+			}
+			_ = resp.Body.Close()
+
+			// Now send nothing and see whether the server hangs up. A server-side
+			// close surfaces as EOF (or a reset); a connection still held open
+			// surfaces as our own read deadline. Waiting several multiples of
+			// `short` keeps a slow machine from flipping the verdict.
+			if err := conn.SetReadDeadline(time.Now().Add(6 * short)); err != nil {
+				t.Fatalf("set deadline: %v", err)
+			}
+			_, err = br.Peek(1)
+			closed := err != nil && !errors.Is(err, os.ErrDeadlineExceeded)
+			if closed != tc.wantClosed {
+				t.Errorf("idle connection closed = %v (err %v), want closed = %v", closed, err, tc.wantClosed)
+			}
+		})
+	}
 }
