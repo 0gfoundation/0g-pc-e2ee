@@ -278,6 +278,18 @@ test "$(sha256sum sha256sum.txt | awk '{print $1}')" = "$(cat digest.txt)"
 cargo run --bin dstack-mr measure -c 1 -m 2G dstack-<version>/metadata.json
 ```
 
+> **The image you pick at deploy time decides whether this is possible at all.** The
+> derivation above needs the guest-OS artifact from a source independent of the host,
+> which in practice means a published `meta-dstack` release (`< 0.6.0`) or a dstack
+> `guest-os-*` release. Not every dashboard option has one: the `dstack-nvidia` flavour
+> is published from **v0.5.5 onward**, so `dstack-nvidia-0.5.4.1` — offered by the Phala
+> dashboard, and what staging first ran — has **no downloadable artifact**, and its
+> measurements therefore cannot be derived independently at all. Obtaining the image
+> from the platform instead would be circular: the party being verified would be
+> supplying the reference. Pick a version whose flavour is published (0.5.11 is the
+> newest in the 0.5 line) — and note that a GPU-less deployment does not need the
+> nvidia flavour in the first place.
+
 Two registers are deliberately excluded. `RTMR3` holds the per-app and per-instance
 events, which `compose_hash` already covers more precisely. `RTMR0` records the **VM
 shape** (vCPU, RAM, ACPI/device layout), which this check does not need to establish —
