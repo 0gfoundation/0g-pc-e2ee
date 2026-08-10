@@ -40,7 +40,9 @@ flowchart LR
     APP -->|"TLS"| ING
     GW -->|"request sealed to the provider (HPKE)"| R
     R -->|"forwards the sealed body opaquely"| P
-    P -.->|"signed response"| GW
+    P -.->|"sealed response, relayed back"| R
+    R -.->|"still sealed to the gateway"| GW
+    P ---->|"response signature, fetched DIRECT<br/>(the router does not proxy it)"| GW
 ```
 
 The gateway runs the **same client core** a caller would otherwise run locally —

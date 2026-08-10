@@ -80,9 +80,11 @@ sequenceDiagram
     Note over C,E: Data plane — response
     E->>E: fresh HPKE-seal choices to client_eph_pub, usage etc into AAD and covered by signature
     E->>E: ECDSA-secp256k1 sign = SHA256(req aad,ct) + SHA256(resp aad,ct)
-    E->>R: sealed response (+ signature)
+    E->>R: sealed response (+ chatKey header naming the cached signature)
     R->>R: read usage for billing (cannot alter, covered by signature)
     R->>C: forward
+    C->>E: GET /v1/proxy/signature/{chatKey} — DIRECT, the router does not proxy this route
+    E-->>C: ChatSignature
     C->>C: open frames (in order, final required) then verify signature: ecrecover accepts on-chain addr only
     C->>App: cleartext response
 ```
