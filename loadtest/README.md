@@ -66,6 +66,32 @@ The two runs are not interchangeable: the ramp **brackets**, the steady run
 its whole point is to walk into overload — so quote the steady run's percentiles,
 and use the ramp only to find out which rate to give it.
 
+### Sweeping vCPU against rate
+
+The compose above measures **one** gateway size per run, and finds its ceiling by
+walking into overload — which needs a host with enough spare cores that the
+fixture and the driver are demonstrably not what saturated. To get the *shape* of
+the relationship (capacity per vCPU, and the memory that comes with it) there is
+[`sweep.sh`](./sweep.sh), which runs the same gateway and fixture as plain
+processes under `taskset` and walks a matrix of vCPU budget × arrival rate:
+
+```sh
+K6_BIN=/path/to/k6 loadtest/sweep.sh          # default matrix -> ./sweep-out/sweep.csv
+```
+
+It needs no docker and no root, and it differs from the compose rig in two ways
+that matter. It pins each process to its own **cpuset**, so the three cannot steal
+from each other and every row states what the fixture and driver were using — a
+row where either was near its own ceiling is marked void rather than quoted. And
+its headline figure is the gateway's **CPU-seconds per request**, taken from its
+own `process_cpu_seconds_total`, which is a property of the code and the hardware
+rather than of how busy the host was: capacity per core follows by division, so it
+is measurable at a comfortable rate instead of at the edge of collapse.
+
+[**RESULTS.md**](./RESULTS.md) is what a run of it produced — per-vCPU capacity,
+the memory-per-stream figure, and why an RPS number quoted without a completion
+length does not mean much for this service.
+
 The gateway is CPU-limited to `GATEWAY_CPUS` (default 2) so the result maps onto a
 CVM size rather than onto the test host. The fixture gets `MOCK_CPUS` (default 4)
 because it does real HPKE work on both halves of every request — **watch its CPU,
@@ -260,11 +286,15 @@ a gateway fault. The 65536 default is far above anything a single gateway carrie
   (issue #20), so past saturation it does not shed load — everything slows together
   until requests time out. The ramp will show this as a latency cliff rather than a
   rising 503 rate. Whether to add a max-in-flight limit that returns 503 is a
-  decision this measurement should inform.
+  decision this measurement should inform — and RESULTS.md now measures the cliff:
+  one step past the knee, p99 TTFT went from 406 ms to 7.7 s with **zero** errors
+  returned, so status codes alone report that state as healthy.
 - **Long-lived streams.** `core.providerTimeout` is 10m30s, and each in-flight
   stream holds a goroutine, a connection to the router, and buffers. Memory, not
   CPU, may be the real ceiling for high-`MOCK_CHUNKS` shapes — watch the heap
-  profile and `go_goroutines`.
+  profile and `go_goroutines`. RESULTS.md prices a held stream at ~266 KiB, which
+  makes the steady state cheap and the stalled-provider case (streams accruing for
+  the whole 10m30s while CPU sits idle) the one that actually sizes RAM.
 - **Cold quote cache** (L3) — the one significant path this layer cannot cover.
 - **The ingress hop** (L3) — TLS terminates inside the CVM, and handshakes are
   CPU-expensive on the same vCPU budget the gateway is using.
