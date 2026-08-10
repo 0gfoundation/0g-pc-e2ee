@@ -40,15 +40,15 @@ func TestBuiltinOSImages_Parses(t *testing.T) {
 }
 
 func TestParseOSImages(t *testing.T) {
-	good := `{"images":[{"name":"dstack-nvidia-0.5.4.1","vm_shape":"1 vCPU / 2 GiB / 0 GPU",` +
-		`"os_image_hash":"86b18137","mrtd":"` + reg(0xaa) + `","rtmr0":"` + reg(0xbb) + `",` +
+	good := `{"images":[{"name":"dstack-0.5.3",` +
+		`"os_image_hash":"86b18137","mrtd":"` + reg(0xaa) + `",` +
 		`"rtmr1":"` + reg(0xcc) + `","rtmr2":"` + reg(0xdd) + `"}]}`
 
 	imgs, err := ParseOSImages([]byte(good))
 	if err != nil {
 		t.Fatalf("ParseOSImages: %v", err)
 	}
-	if len(imgs) != 1 || imgs[0].Name != "dstack-nvidia-0.5.4.1" {
+	if len(imgs) != 1 || imgs[0].Name != "dstack-0.5.3" {
 		t.Fatalf("parsed = %+v", imgs)
 	}
 	if imgs[0].BootChain.MRTD[0] != 0xaa || imgs[0].BootChain.RTMR2[0] != 0xdd {
@@ -57,18 +57,21 @@ func TestParseOSImages(t *testing.T) {
 }
 
 func TestParseOSImages_Rejects(t *testing.T) {
-	full := func(name, mrtd, rtmr0, rtmr1, rtmr2 string) string {
-		return `{"images":[{"name":"` + name + `","mrtd":"` + mrtd + `","rtmr0":"` + rtmr0 +
+	full := func(name, mrtd, rtmr1, rtmr2 string) string {
+		return `{"images":[{"name":"` + name + `","mrtd":"` + mrtd +
 			`","rtmr1":"` + rtmr1 + `","rtmr2":"` + rtmr2 + `"}]}`
 	}
 	cases := map[string]string{
 		"not json":       `{`,
-		"missing name":   full("", reg(0xaa), reg(0xbb), reg(0xcc), reg(0xdd)),
-		"short register": full("x", "aabb", reg(0xbb), reg(0xcc), reg(0xdd)),
-		"non-hex":        full("x", strings.Repeat("zz", 48), reg(0xbb), reg(0xcc), reg(0xdd)),
+		"missing name":   full("", reg(0xaa), reg(0xcc), reg(0xdd)),
+		"short register": full("x", "aabb", reg(0xcc), reg(0xdd)),
+		"non-hex":        full("x", strings.Repeat("zz", 48), reg(0xcc), reg(0xdd)),
 		// The dangerous one: a placeholder of all zeros would match a quote whose
 		// registers failed to parse.
-		"all zero": full("x", reg(0x00), reg(0x00), reg(0x00), reg(0x00)),
+		"all zero": full("x", reg(0x00), reg(0x00), reg(0x00)),
+		// An rtmr0 field is no longer part of the schema; supplying one must not smuggle
+		// a value into the compared set, and the entry is judged on the three that are.
+		"rtmr0 is ignored, not compared": `{"images":[{"name":"x","rtmr0":"` + reg(0xbb) + `"}]}`,
 	}
 	for name, in := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -83,17 +86,27 @@ func TestCheckOSImage(t *testing.T) {
 	m := mkMeasurement(0x11)
 	allowed := []OSImage{
 		{Name: "other", BootChain: mkBootChain(0x99)},
-		{Name: "dstack-nvidia-0.5.4.1", VMShape: "1 vCPU / 2 GiB", BootChain: attest.BootChainOf(m)},
+		{Name: "dstack-0.5.3", BootChain: attest.BootChainOf(m)},
 	}
 
-	t.Run("match names the entry and its shape", func(t *testing.T) {
+	t.Run("match names the entry", func(t *testing.T) {
 		got := checkOSImage(allowed, m)
 		if !got.OK() || got.Err != nil {
 			t.Fatalf("err = %v", got.Err)
 		}
-		if !strings.Contains(got.Matched, "dstack-nvidia-0.5.4.1") ||
-			!strings.Contains(got.Matched, "1 vCPU") {
-			t.Errorf("Matched = %q, want the image and the VM shape", got.Matched)
+		if !strings.Contains(got.Matched, "dstack-0.5.3") {
+			t.Errorf("Matched = %q, want the image name", got.Matched)
+		}
+	})
+
+	// The whole point of dropping RTMR0: one entry covers the image whatever VM shape
+	// it was booted on. If this ever fails, the allowlist is back to needing an entry
+	// per (image, shape) pair.
+	t.Run("RTMR0 must not affect the result", func(t *testing.T) {
+		reshaped := m
+		reshaped.RTMR0 = mkMeasurement(0x55).RTMR0
+		if got := checkOSImage(allowed, reshaped); !got.OK() {
+			t.Errorf("a differing RTMR0 (a different VM shape) broke the match: %v", got.Err)
 		}
 	})
 
@@ -111,7 +124,7 @@ func TestCheckOSImage(t *testing.T) {
 		if got.OK() {
 			t.Fatal("OK() = true for an unlisted OS image")
 		}
-		if !strings.Contains(got.Err.Error(), "dstack-nvidia-0.5.4.1") {
+		if !strings.Contains(got.Err.Error(), "dstack-0.5.3") {
 			t.Errorf("the error should name the allowlisted images: %v", got.Err)
 		}
 		// The observed value must be reported so an operator can add a legitimate upgrade.

@@ -39,8 +39,9 @@
 //  7. **OS image** — `mr_config_id` is chosen by the untrusted host, so step 6
 //     stands up only because the guest OS refuses to boot when that register
 //     disagrees with the app-compose actually delivered. Trusting that means
-//     trusting the OS doing it, so the quote's boot chain (MRTD + RTMR0-2) must be
-//     one this verifier accepts. See OSImageCheck and Config.OSImages.
+//     trusting the OS doing it, so the quote's image registers (MRTD, RTMR1, RTMR2)
+//     must be ones this verifier accepts. RTMR0 is excluded: it records the VM shape,
+//     which this check does not depend on. See OSImageCheck and Config.OSImages.
 //
 // # What a pass means
 //
@@ -427,7 +428,7 @@ type Report struct {
 	// for are performed; see CodeIdentity.
 	Code CodeIdentity
 
-	// OSImage is the OS-image boot-chain check (step 7): whether MRTD/RTMR0-2 are an
+	// OSImage is the OS-image check (step 7): whether MRTD/RTMR1/RTMR2 are an
 	// OS image this verifier accepts. It is what makes Code meaningful rather than
 	// self-reported — see Config.OSImages.
 	OSImage OSImageCheck

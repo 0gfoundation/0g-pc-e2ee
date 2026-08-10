@@ -19,22 +19,23 @@ import (
 //go:embed osimages.json
 var osImagesFS embed.FS
 
-// OSImage is one allowlisted (image, VM shape) pair. The identity that matters is
-// BootChain; everything else is provenance, carried so a report can name what matched
-// and so a reader can tell whether an entry applies to their deployment at all.
+// OSImage is one allowlisted OS image. **One entry per image, not per (image, VM
+// shape)** — attest.BootChain excludes the shape-dependent register, so the same entry
+// holds however many vCPUs or GPUs the CVM was given. The identity that matters is
+// BootChain; the rest is provenance, carried so a report can name what matched.
 type OSImage struct {
-	// Name is the image as the platform labels it, e.g. "dstack-nvidia-0.5.4.1".
+	// Name is the image as the platform labels it, e.g. "dstack-0.5.3" — dstack's
+	// vm_config.image. A label for humans; matching never uses it.
 	Name string
-	// VMShape summarizes the VM configuration the measurements were computed for.
-	// Two entries may share a Name and differ only here — that is not a duplicate,
-	// because the measurements genuinely differ.
-	VMShape string
-	// OSImageHash is sha256(sha256sum.txt) for the image: stable per image and
-	// independent of VM shape, so it is the human-legible way to say which image an
-	// entry is about. It is NOT used for matching — it reaches a verifier only through
-	// an unsigned runtime event, whereas the boot chain is in the signed report.
+	// OSImageHash is the image's digest.txt, i.e. sha256(sha256sum.txt) over the
+	// published release — dstack's vm_config.os_image_hash. This is the value that
+	// identifies WHICH release an entry was computed from, and the one to check a
+	// downloaded release against before running dstack-mr on it. It is NOT used for
+	// matching: it reaches a verifier only through unsigned runtime data, whereas the
+	// boot chain is in the signed report.
 	OSImageHash string
-	// BootChain is MRTD + RTMR0-2, the value actually compared.
+	// BootChain is MRTD + RTMR1 + RTMR2 — the image-identifying registers, and the
+	// value actually compared.
 	BootChain attest.BootChain
 }
 
@@ -42,10 +43,8 @@ type OSImage struct {
 type osImagesFile struct {
 	Images []struct {
 		Name        string `json:"name"`
-		VMShape     string `json:"vm_shape"`
 		OSImageHash string `json:"os_image_hash"`
 		MRTD        string `json:"mrtd"`
-		RTMR0       string `json:"rtmr0"`
 		RTMR1       string `json:"rtmr1"`
 		RTMR2       string `json:"rtmr2"`
 	} `json:"images"`
@@ -87,7 +86,6 @@ func ParseOSImages(raw []byte) ([]OSImage, error) {
 			dst  []byte
 		}{
 			{"mrtd", e.MRTD, bc.MRTD[:]},
-			{"rtmr0", e.RTMR0, bc.RTMR0[:]},
 			{"rtmr1", e.RTMR1, bc.RTMR1[:]},
 			{"rtmr2", e.RTMR2, bc.RTMR2[:]},
 		} {
@@ -105,7 +103,7 @@ func ParseOSImages(raw []byte) ([]OSImage, error) {
 			return nil, fmt.Errorf("OS-image allowlist %s: all registers are zero; a placeholder entry would match an unparsed quote", label)
 		}
 		out = append(out, OSImage{
-			Name: e.Name, VMShape: e.VMShape, OSImageHash: e.OSImageHash, BootChain: bc,
+			Name: e.Name, OSImageHash: e.OSImageHash, BootChain: bc,
 		})
 	}
 	return out, nil
@@ -147,15 +145,12 @@ func checkOSImage(allowed []OSImage, m attest.Measurement) OSImageCheck {
 		for _, img := range allowed {
 			names = append(names, img.Name)
 		}
-		out.Err = fmt.Errorf("MRTD/RTMR0-2 match no allowlisted OS image (%s)", strings.Join(names, ", "))
+		out.Err = fmt.Errorf("MRTD/RTMR1/RTMR2 match no allowlisted OS image (%s)", strings.Join(names, ", "))
 		return out
 	}
 	for _, img := range allowed {
 		if img.BootChain == out.Observed {
 			out.Matched = img.Name
-			if img.VMShape != "" {
-				out.Matched += " (" + img.VMShape + ")"
-			}
 			break
 		}
 	}

@@ -349,9 +349,10 @@ does not.
    **One dependency of code identity is implemented but not yet populated.**
    `mr_config_id` is host-chosen, so the compose hash is truthful only because the
    guest OS refuses to boot when it disagrees with the app-compose delivered; the
-   verifier therefore also compares the quote's boot chain — `MRTD` + `RTMR0`–`RTMR2`,
-   via `attest.BootChainPolicy`, with `RTMR3` excluded since `compose_hash` pins the
-   app more precisely — against an allowlist embedded in the binary
+   verifier therefore also compares the quote's image registers — `MRTD` + `RTMR1` +
+   `RTMR2`, via `attest.BootChainPolicy`, excluding `RTMR3` (`compose_hash` pins the app
+   more precisely) and `RTMR0` (the VM shape, which this check does not need to
+   establish) — against an allowlist embedded in the binary
    (`client/evidence/osimages.json`). That allowlist ships **empty**, so the step
    currently reports "not pinned" instead of checking, and every run says code identity
    is evidence rather than proof. Populating it is the same task as filling hop 3's
@@ -373,15 +374,19 @@ does not.
 - **The gateway CVM's own OS measurement is not yet pinned.** `mr_config_id` is
   host-supplied, and what makes it truthful is the guest refusing to boot when it
   disagrees with the real `app-compose.json`
-  (dstack `config_id_verifier.rs`) — a check whose integrity rests on `MRTD` /
-  `RTMR0`–`RTMR2` being the audited dstack OS. The allowlist that would pin them is
-  plumbed through (`attest.BootChainPolicy`, `client/evidence/osimages.json`) but
-  ships **empty**, so `pcverify` prints the observed registers and compares them
-  against nothing — a modified OS image that skipped the boot check would still pass.
-  Closing it needs a reviewed dstack OS measurement recomputed with `dstack-mr` for
-  the deployed image *and* VM shape, committed here so no user supplies a value — the
-  same shape as the broker measurement allowlist in `trust-chain.md` hop 3. Until
-  then code identity is strong evidence, not proof.
+  (dstack `config_id_verifier.rs`) — a check whose integrity rests on `MRTD` / `RTMR1` /
+  `RTMR2` being the audited dstack OS. Those three measure the firmware, kernel and
+  rootfs, i.e. every piece of code performing that check; `RTMR0` is excluded because it
+  records the VM shape, which the check does not depend on, and pinning it would have
+  cost an entry per (image, shape) pair rather than per image. The allowlist is plumbed
+  through (`attest.BootChainPolicy`, `client/evidence/osimages.json`) but ships
+  **empty**, so `pcverify` prints the observed registers and compares them against
+  nothing — a modified OS image that skipped the boot check would still pass. Closing it
+  needs the three values computed with `dstack-mr` from the published guest-OS release
+  (matched to the CVM's `os_image_hash`) and confirmed against a live quote, committed
+  here so no user supplies a value — the same *kind* of task as the broker measurement
+  allowlist in `trust-chain.md` hop 3. Until then code identity is strong evidence, not
+  proof.
 - **Two enclaves see plaintext** (gateway + provider), vs one for direct-seal.
 - **Metadata** (model, sizes, timing) is visible as in the router path.
 - **The browser origin allowlist is not authentication.** Serving no-install

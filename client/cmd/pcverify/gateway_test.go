@@ -151,7 +151,7 @@ func TestReportGateway_OSImage(t *testing.T) {
 
 	mismatch := passing()
 	mismatch.OSImage = evidence.OSImageCheck{Configured: true,
-		Err: errors.New("MRTD/RTMR0-2 match no allowlisted OS image (dstack-nvidia-0.5.4.1)")}
+		Err: errors.New("MRTD/RTMR1/RTMR2 match no allowlisted OS image (dstack-0.5.3)")}
 
 	matched := passing()
 	matched.OSImage = evidence.OSImageCheck{Configured: true, Matched: "dstack-nvidia-0.5.4.1 (1 vCPU)"}

@@ -265,20 +265,25 @@ Finally the OS image, which is what makes the step above mean anything: `mr_conf
 is written by the untrusted host, and the compose hash is truthful only because the
 guest OS refuses to boot when that register disagrees with the app-compose it actually
 received (dstack `config_id_verifier.rs`). So the OS doing that check is part of the
-chain, and the quote's `MRTD` + `RTMR0`–`RTMR2` are what identify it. Recompute the
-expected values from the image's reproducible build and compare:
+chain, and the quote's `MRTD` + `RTMR1` + `RTMR2` are what identify it — the virtual
+firmware, the kernel, and the cmdline (carrying the rootfs verity hash) plus initrd,
+i.e. every piece of code that performs that boot-time check. Compute them from the
+published guest-OS release and compare:
 
 ```bash
-cargo build --release -p dstack-mr-cli   # from github.com/Dstack-TEE/dstack
-dstack-mr diagnose --vm-config vm-config.json --image-dir <image> \
-  --actual-mrtd <hex> --actual-rtmr0 <hex> --actual-rtmr1 <hex> --actual-rtmr2 <hex>
+# the release must be the one this CVM runs: vm_config.os_image_hash IS digest.txt
+test "$(sha256sum sha256sum.txt | awk '{print $1}')" = "$(cat digest.txt)"
+
+# from github.com/Dstack-TEE/dstack. -c/-m are required but affect only RTMR0
+cargo run --bin dstack-mr measure -c 1 -m 2G dstack-<version>/metadata.json
 ```
 
-`vm-config.json` is the `vm_config` the CVM reports — the values are a function of the
-image **and** the VM shape (vCPU, RAM, PCI, GPU), so an expectation that names only an
-image version is wrong. `RTMR3` is deliberately not pinned: it holds the per-app and
-per-instance events, which `compose_hash` already covers more precisely. Once a tuple
-is derived it belongs in
+Two registers are deliberately excluded. `RTMR3` holds the per-app and per-instance
+events, which `compose_hash` already covers more precisely. `RTMR0` records the **VM
+shape** (vCPU, RAM, ACPI/device layout), which this check does not need to establish —
+so an entry is **one per image**, not one per (image, shape) pair, and the `-c`/`-m`
+values above do not affect the result. Once the three values are derived and confirmed
+against a live quote they belong in
 [`client/evidence/osimages.json`](../../client/evidence/osimages.json), which
 `pcverify` embeds so no user ever supplies it.
 

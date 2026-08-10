@@ -210,7 +210,7 @@ func reportGateway(ctx context.Context, out io.Writer, ec evidenceChecker, domai
 	if rep.QuoteErr != nil {
 		fmt.Fprintf(out, "%s quote              %v\n", mark(false), rep.QuoteErr)
 	} else {
-		// The measurement registers are deliberately NOT dumped here. MRTD/RTMR0-2 are
+		// The measurement registers are deliberately NOT dumped here. MRTD/RTMR1/RTMR2 are
 		// reported by the os-image step below, which is the check that gives them meaning,
 		// and RTMR3 is superseded by compose_hash — a value that can actually be
 		// recomputed and compared. Printing 5×96 hex characters that nothing checks was
@@ -264,9 +264,11 @@ func reportGateway(ctx context.Context, out io.Writer, ec evidenceChecker, domai
 	case !rep.OSImage.Configured:
 		fmt.Fprintf(out, "- os image           not pinned (allowlist is empty; see client/evidence/osimages.json)\n")
 		reportBootChain(out, rep.OSImage.Observed)
+		reportShapeRegister(out, rep.Measurement)
 	case rep.OSImage.Err != nil:
 		fmt.Fprintf(out, "%s os image           %v\n", mark(false), rep.OSImage.Err)
 		reportBootChain(out, rep.OSImage.Observed)
+		reportShapeRegister(out, rep.Measurement)
 	default:
 		fmt.Fprintf(out, "%s os image           %s\n", mark(true), rep.OSImage.Matched)
 	}
@@ -382,18 +384,30 @@ func failMark(code evidence.CodeIdentity, advisory bool) string {
 	return mark(false)
 }
 
-// reportBootChain prints the observed MRTD/RTMR0-2 in the shape an osimages.json entry
-// wants, so recording a legitimate OS upgrade is a copy rather than a transcription.
+// reportBootChain prints the observed image registers in the shape an osimages.json
+// entry wants, so recording a legitimate OS upgrade is a copy rather than a
+// transcription.
+//
+// These are the three the allowlist compares. RTMR0 is deliberately absent: it records
+// the VM shape, which is not what this check is about (see attest.BootChain), and
+// printing it here would invite someone to paste it into an entry field that no longer
+// exists. reportShapeRegister covers it separately, as information.
 func reportBootChain(out io.Writer, bc attest.BootChain) {
 	for _, r := range []struct {
 		key string
 		val []byte
 	}{
 		{"mrtd", bc.MRTD[:]},
-		{"rtmr0", bc.RTMR0[:]},
 		{"rtmr1", bc.RTMR1[:]},
 		{"rtmr2", bc.RTMR2[:]},
 	} {
 		fmt.Fprintf(out, "  observed %-6s %x\n", r.key, r.val)
 	}
+}
+
+// reportShapeRegister prints RTMR0, which nothing compares. It is worth showing
+// because it changes when the VM shape changes — a signal an operator may want even
+// though it is not part of the OS-image identity the allowlist pins.
+func reportShapeRegister(out io.Writer, m attest.Measurement) {
+	fmt.Fprintf(out, "  rtmr0 (vm shape, not pinned) %x\n", m.RTMR0[:])
 }

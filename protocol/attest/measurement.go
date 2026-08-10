@@ -24,35 +24,45 @@ type Measurement struct {
 	RTMR3 [measurementRegLen]byte
 }
 
-// BootChain is the part of a Measurement that identifies the guest OS image and
-// how it booted, with the application deliberately excluded: MRTD (the initial VM
-// image) plus RTMR0–RTMR2 (firmware, boot loader, kernel/initrd).
+// BootChain identifies the guest OS **image**: MRTD (the virtual firmware), RTMR1
+// (the kernel) and RTMR2 (the kernel cmdline — which carries the rootfs dm-verity
+// hash — plus the initrd). Two of the five registers are deliberately excluded, for
+// different reasons.
 //
-// RTMR3 is left out because it is where the *application* is recorded — dstack
-// extends it with per-app and per-instance runtime events (app-id, compose-hash,
-// instance-id). Pinning it would mean a new expected value on every deployment and
-// every instance, and it would be redundant: the application is already pinned, more
-// precisely, by the compose hash in mr_config_id.
+// **RTMR3 is the application.** dstack extends it with per-app and per-instance
+// runtime events (app-id, compose-hash, instance-id), so it differs between two
+// replicas of one deployment. Pinning it would mean an expected value per CVM, and it
+// would be redundant: the application is already pinned, more precisely, by the
+// compose hash in mr_config_id.
+//
+// **RTMR0 is the virtual hardware, and it is not load-bearing here.** It records the
+// VM shape — vCPU count, memory size, ACPI/device layout (dstack's own diagnose
+// output annotates every RTMR0 event with the shape parameter it varies with). The
+// claim this type exists to support is that the guest OS enforced the mr_config_id ↔
+// app-compose binding, and every piece of code performing that enforcement is
+// measured by the three registers above. Changing the vCPU count does not change that
+// code. Including RTMR0 would have bought nothing and cost an expected value per
+// (image, VM shape) pair rather than per image — which is why it is out.
+//
+// The security-relevant shape parameters are covered anyway: disabling root verity
+// changes the cmdline and so RTMR2; device DMA into private memory is blocked by the
+// TDX module rather than by the ACPI layout. A verifier that wants the shape pinned
+// too should treat that as an additional, separate check — RTMR0 remains available on
+// Measurement, and pcverify reports it.
 //
 // So BootChain answers "is this the OS image I audited?" while the compose hash
 // answers "is this the app I published?" — two questions with two different lifetimes,
 // which is why they get two mechanisms.
-//
-// **A BootChain is not a property of an OS image alone.** MRTD and RTMR0–RTMR2 are a
-// function of the image *and* the VM shape it was booted with — vCPU count, RAM size,
-// PCI topology, GPU count. An expected value is therefore only meaningful for a stated
-// (image, VM configuration) pair, and dstack's own `dstack-mr` tool takes both as
-// input. An allowlist entry that names only an image version is a bug.
 type BootChain struct {
 	MRTD  [measurementRegLen]byte
-	RTMR0 [measurementRegLen]byte
 	RTMR1 [measurementRegLen]byte
 	RTMR2 [measurementRegLen]byte
 }
 
-// BootChainOf projects a full Measurement onto its boot chain, dropping RTMR3.
+// BootChainOf projects a full Measurement onto the image-identifying registers,
+// dropping RTMR0 (VM shape) and RTMR3 (the application). See BootChain.
 func BootChainOf(m Measurement) BootChain {
-	return BootChain{MRTD: m.MRTD, RTMR0: m.RTMR0, RTMR1: m.RTMR1, RTMR2: m.RTMR2}
+	return BootChain{MRTD: m.MRTD, RTMR1: m.RTMR1, RTMR2: m.RTMR2}
 }
 
 // IsZero reports whether the boot chain is entirely zero, which is what an absent or
@@ -63,8 +73,8 @@ func (b BootChain) IsZero() bool { return b == BootChain{} }
 
 // BootChainPolicy is the allowlist of OS-image boot chains a verifier accepts. Like
 // Policy it must come from a source trusted independently of the thing being verified
-// — for a dstack image, values recomputed from its reproducible build (`dstack-mr`)
-// for the VM shape actually deployed.
+// — for a dstack image, values recomputed from its reproducible build (`dstack-mr`),
+// which is one entry per image because the shape-dependent register is excluded.
 //
 // An empty allowlist means "not configured". Unlike Policy, which fails closed on an
 // empty set, that decision is left to the caller here: this check grounds a claim

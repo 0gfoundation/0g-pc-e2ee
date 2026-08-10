@@ -72,10 +72,10 @@
 // Underneath all of that sits the OS image. mr_config_id is chosen by the untrusted
 // host, so the compose hash means what it says only because the guest OS refuses to
 // boot when that register disagrees with the app-compose actually delivered — which
-// makes the OS itself part of the chain. The quote's boot chain (MRTD + RTMR0-2) is
-// therefore compared against an allowlist embedded in the binary, so nothing has to be
-// supplied; -os-image-allowlist overrides it for testing or for pinning an image before
-// it is committed. While that allowlist is empty the step reports "not pinned" instead
+// makes the OS itself part of the chain. The quote's image registers (MRTD, RTMR1,
+// RTMR2) are therefore compared against an allowlist embedded in the binary, so
+// nothing has to be supplied; -os-image-allowlist overrides it for testing or for
+// pinning an image before it is committed. While that allowlist is empty the step reports "not pinned" instead
 // of failing, and the run says code identity is evidence rather than proof.
 //
 // A pass is only ever as strong as the image pinning inside the compose text it

@@ -192,12 +192,17 @@ turns "an attested enclave" into "the **expected** attested enclave."
 > upgrade, and could never be published ahead of a deployment.
 >
 > The workable form is the split this branch already makes for the gateway
-> (`attest.BootChain` + `BootChainPolicy`): pin **MRTD + RTMR0–RTMR2** for the OS
+> (`attest.BootChain` + `BootChainPolicy`): pin **MRTD + RTMR1 + RTMR2** for the OS
 > image, and pin the application separately and more precisely by its compose hash.
-> Two questions with two lifetimes, so two mechanisms. Note that a boot-chain value
-> is a function of the image *and* the VM shape (vCPU, RAM, PCI, GPU count) — see
-> `attest.BootChain`'s doc — so entries must be recomputed with `dstack-mr` for the
-> shape actually deployed, never copied off a running machine.
+> Two questions with two lifetimes, so two mechanisms.
+>
+> Note which registers those are. **RTMR0 is excluded as well**, because it records the
+> VM shape (vCPU count, memory, ACPI/device layout) and the shape is not something this
+> check needs to establish: the code that performs the boot-time binding check lives in
+> the firmware, kernel and rootfs, which the three registers above measure. Including it
+> would have cost an entry per (image, VM shape) pair for no gain. So the allowlist is
+> **one entry per image**, computed with `dstack-mr` from the published release and then
+> confirmed against a live quote — never copied off a running machine.
 >
 > Where the expected values are *published* is still open: on-chain alongside the
 > provider registry, or as release assets of the broker repo (which `pcverify`
@@ -236,9 +241,10 @@ Underneath that sits the **gateway CVM's own OS image**, which plays the role ho
 plays for the broker. `mr_config_id` is written by the untrusted host; the compose hash
 is truthful only because the guest OS refuses to boot when that register disagrees with
 the app-compose actually delivered, so the OS doing that check is part of the chain. The
-tool compares the quote's boot chain — `MRTD` + `RTMR0`–`RTMR2`, with `RTMR3` excluded
-because the compose hash already pins the app more precisely — against an allowlist
-embedded in the binary (`client/evidence/osimages.json`). **That allowlist ships empty**,
+tool compares the quote's image registers — `MRTD` + `RTMR1` + `RTMR2`, excluding
+`RTMR3` (the compose hash already pins the app, more precisely) and `RTMR0` (the VM
+shape, which this check does not need) — against an allowlist embedded in the binary
+(`client/evidence/osimages.json`). **That allowlist ships empty**,
 so today the step reports "not pinned" and code identity is evidence rather than proof;
 populating it is the same kind of task as filling hop 3's measurement allowlist.
 

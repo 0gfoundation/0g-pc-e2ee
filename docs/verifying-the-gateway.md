@@ -53,9 +53,9 @@ gateway            pc-gateway.0g.ai
 ✓ compose file       matches release-2026.08.07.1 byte-for-byte
 - os image           not pinned (allowlist is empty; see client/evidence/osimages.json)
   observed mrtd   b24d3b24…
-  observed rtmr0  01361d27…
   observed rtmr1  6e1afb74…
   observed rtmr2  89e73ced…
+  rtmr0 (vm shape, not pinned) 01361d27…
 
 note: code identity is only as strong as the image pinning inside the compose text —
 a floating tag keeps compose_hash stable while the code changes; the OS image is NOT
@@ -69,9 +69,10 @@ PASS
 The `-` on `os image` is the one step that does not check anything yet, and the
 closing `note` says so on every run — see [Current limits](#current-limits). Once the
 allowlist is populated that line becomes a name, e.g.
-`✓ os image  dstack-nvidia-0.5.4.1 (1 vCPU / 2 GiB / 0 GPU)`, and the note drops the
-OS-image caveat. The four `observed` registers are printed precisely because they are
-what an auditor records while the step is unpinned.
+`✓ os image  dstack-0.5.3`, and the note drops the OS-image caveat. The three
+`observed` registers are printed precisely because they are what an auditor records
+while the step is unpinned — `rtmr0` is shown separately because nothing compares it
+(see step 7).
 
 ---
 
@@ -140,7 +141,7 @@ flowchart LR
     CA["public CA roots"]
     AC["app-compose.json"]
     R["docker-compose.release.yml<br/>from a published release"]
-    OSA["allowlisted OS-image<br/>boot chains"]
+    OSA["allowlisted OS-image<br/>measurements"]
 
     M -->|"1 covers"| C
     M -->|"1 covers"| A
@@ -149,7 +150,7 @@ flowchart LR
     CA -->|"5 must validate"| S
     Q -->|"6a mr_config_id<br/>= SHA-256 of"| AC
     AC -->|"6b its docker_compose_file<br/>must equal"| R
-    Q -->|"7 MRTD + RTMR0-2<br/>must be one of"| OSA
+    Q -->|"7 MRTD + RTMR1 + RTMR2<br/>must be one of"| OSA
 ```
 
 **1. Bundle integrity.** Every file in the bundle matches the digest
@@ -197,19 +198,23 @@ this against the newest 5 by default and reports **which** release is live.
 is built, so step 6 needs one more thing to stand up: the guest OS inside the enclave
 reads its own quote at boot, compares `mr_config_id` against the manifest it actually
 received, and **refuses to boot on a mismatch**. Trusting that means trusting the code
-doing it — which is what the quote's `MRTD` and `RTMR0`–`RTMR2` boot-chain
-measurements record. The tool compares them against an allowlist built into the
-binary, so nobody has to supply a value; see [current limits](#current-limits) for
-whether the deployment you are checking is covered yet.
+doing it — which is what the quote's `MRTD`, `RTMR1` and `RTMR2` measurements record:
+the virtual firmware, the kernel, and the kernel cmdline (carrying the rootfs
+dm-verity hash) plus the initrd. Between them they cover every piece of code that
+performs the boot-time check. The tool compares them against an allowlist built into
+the binary, so nobody has to supply a value; see
+[current limits](#current-limits) for whether the deployment you are checking is
+covered yet.
 
-`RTMR3` is deliberately *not* pinned: it carries the per-application and
-per-instance runtime events, so it legitimately differs between two deployments of
-the same OS. The application is already pinned, more precisely, by step 6.
-
-> An allowlist entry is an **(image, VM shape)** pair, not an image. `MRTD` and
-> `RTMR0`–`RTMR2` are a function of the image *and* the VM it booted on — vCPU count,
-> RAM size, PCI topology, GPU count — which is why dstack publishes reproducible build
-> material rather than a table of measurements.
+Two of the five registers are deliberately *not* pinned, for different reasons.
+**`RTMR3`** carries the per-application and per-instance runtime events, so it
+legitimately differs between two replicas of one deployment — and the application is
+already pinned, more precisely, by step 6. **`RTMR0`** records the *VM shape*: vCPU
+count, memory size, device and ACPI layout. That is not something this step needs to
+establish — changing the vCPU count does not change the code that enforces the
+binding — and pinning it would have meant one expected value per (image, VM shape)
+pair instead of per image. It is printed, so a shape change is still visible; it just
+is not compared.
 
 ---
 
@@ -219,12 +224,14 @@ the same OS. The application is already pinned, more precisely, by step 6.
 TDX is broken, this collapses — as does every other confidential-computing claim.
 This is the irreducible assumption.
 
-**The dstack OS image.** Step 7 above. What you are trusting is that the boot-chain
-measurements in the allowlist really are the audited dstack OS — and that is checkable
-rather than asserted: they are recomputed from dstack's reproducible build with
-`dstack-mr`, and [`client/evidence/osimages.json`](../client/evidence/osimages.json)
-records, for each entry, the image and VM shape it was derived for. Reviewing what this
-tool accepts is reviewing that file.
+**The dstack OS image.** Step 7 above. What you are trusting is that the measurements
+in the allowlist really are the audited dstack OS — and that is checkable rather than
+asserted: they are computed from dstack's published guest-OS release with `dstack-mr`
+(and can be re-derived from a source rebuild), and
+[`client/evidence/osimages.json`](../client/evidence/osimages.json) records, for each
+entry, the release it came from — including that release's `digest.txt`, so you can
+fetch the same artifact and recompute. Reviewing what this tool accepts is reviewing
+that file.
 
 **GitHub, as publisher of record.** Comparing against "the manifests we published"
 means someone must be the publisher. A tampered release asset causes a *mismatch*,
@@ -380,19 +387,24 @@ diff deployed-compose.yml docker-compose.release.yml
 The platform base domain is the end of the served domain's CNAME chain
 (`dig +short CNAME` repeatedly; it ends at `_.<base-domain>`).
 
-Step **7** — the OS image — is the one part that needs the image itself. Recompute the
-expected boot chain from dstack's reproducible build and compare it with the verified
-quote's registers:
+Step **7** — the OS image — is the one part that needs the image itself. Fetch the
+guest-OS release the CVM reports (`vm_config.os_image_hash` is its `digest.txt`, i.e.
+`sha256(sha256sum.txt)`, which is how you know you have the same artifact), then
+compute the three registers and compare:
 
 ```bash
-cargo build --release -p dstack-mr-cli   # from github.com/Dstack-TEE/dstack
-dstack-mr diagnose --vm-config vm-config.json --image-dir <image> \
-  --actual-mrtd <hex> --actual-rtmr0 <hex> --actual-rtmr1 <hex> --actual-rtmr2 <hex>
+# 1. the release is the one the CVM is running
+test "$(sha256sum sha256sum.txt | awk '{print $1}')" = "$(cat digest.txt)"
+
+# 2. compute. -c/-m are required but affect only RTMR0, which is not compared
+cargo run --bin dstack-mr measure -c 1 -m 2G dstack-<version>/metadata.json
 ```
 
-`vm-config.json` is the `vm_config` the CVM reports. A mismatch is reported per RTMR0
-event, so it points at what diverged rather than just saying no. The values this tool
-accepts are in
+Compare `MRTD`, `RTMR1` and `RTMR2` with what `pcverify` printed. To locate a
+divergence, `dstack-mr diagnose --vm-config vm-config.json --image-dir <image>
+--actual-mrtd <hex> --actual-rtmr1 <hex> --actual-rtmr2 <hex>` reports per event
+rather than just saying no; `vm-config.json` is the `vm_config` the CVM reports. The
+values this tool accepts are in
 [`client/evidence/osimages.json`](../client/evidence/osimages.json) — reviewing that
 file is reviewing what it will call acceptable.
 
