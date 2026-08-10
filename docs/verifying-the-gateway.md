@@ -289,6 +289,12 @@ certificate, so:
   `app_id`. Code identity therefore generalizes across replicas; endpoint identity
   does not — it is established for the connection that was checked.
 
+Within a single run this cannot bite: the bundle and the certificate are fetched over
+**one** connection, so they always describe the same replica. (If that connection is
+recycled mid-run onto a different one, the tool says
+`the connection to … changed mid-run` and asks you to re-run, rather than reporting a
+mismatch it cannot interpret.)
+
 If you want coverage of more than one replica, run the check again (a fresh
 connection may land elsewhere); every response also carries `X-0G-Gateway-Instance`
 naming the replica that served it.

@@ -76,9 +76,12 @@ func flagSet(fs *flag.FlagSet, name string) bool {
 // choice the gateway itself makes, see ZG_GATEWAY_PCCS_URL), plus whatever
 // code-identity material the operator supplied.
 //
-// allowUntrustedCert must reach the checker, not just the reporting below: the
-// evidence FETCH is an HTTPS GET, so with an ACME-staging certificate it fails on
-// PKI verification before any check runs. See evidence.Config.AllowUntrustedCert.
+// allowUntrustedCert is deliberately NOT passed to the checker: the evidence fetch
+// never verifies PKI (it rides the same unverified-but-recorded connection the
+// certificate comparison examines — see evidence's session type), so nothing needs
+// relaxing for a staging deployment to be checkable. The flag is purely a reporting
+// decision, applied in reportGateway: whether a failed chain-trust step blocks the
+// verdict.
 //
 // Unreadable -app-compose / -expect-compose-file paths are errors here rather than
 // silently-skipped checks: an operator who passed the flag asked for the check, and
@@ -86,11 +89,10 @@ func flagSet(fs *flag.FlagSet, name string) bool {
 func newEvidenceChecker(ctx context.Context, out io.Writer, g gatewayConfig) (*evidence.Checker, expectSource, error) {
 	var expect expectSource
 	cfg := evidence.Config{
-		QuoteParser:        dcap.NewQuoteParser(dcap.Config{PCCSBaseURL: g.pccsURL}),
-		Timeout:            g.timeout,
-		AllowUntrustedCert: g.allowUntrustedCert,
-		BaseDomain:         g.baseDomain,
-		NoDNSDiscovery:     g.noDNSDiscovery,
+		QuoteParser:    dcap.NewQuoteParser(dcap.Config{PCCSBaseURL: g.pccsURL}),
+		Timeout:        g.timeout,
+		BaseDomain:     g.baseDomain,
+		NoDNSDiscovery: g.noDNSDiscovery,
 	}
 	if p := strings.TrimSpace(g.osImagesPath); p != "" {
 		b, err := os.ReadFile(p)
@@ -130,6 +132,7 @@ func newEvidenceChecker(ctx context.Context, out io.Writer, g gatewayConfig) (*e
 			return nil, expect, fmt.Errorf("-expect-compose-file: %w", err)
 		}
 		cfg.ExpectComposeFiles = []evidence.ExpectedCompose{{Label: g.expectComposePath, Content: b}}
+		cfg.ExpectComposeExplicit = true
 		expect.Label = g.expectComposePath
 	case g.releases > 0:
 		expect.Label = fmt.Sprintf("newest %d release(s) of %s (%s)", g.releases, g.releaseRepo, g.releaseAsset)
@@ -138,6 +141,10 @@ func newEvidenceChecker(ctx context.Context, out io.Writer, g gatewayConfig) (*e
 		// rate-limited API says nothing about the deployment. Degrade to advisory rather
 		// than fail, exactly as a DNS-discovered app-compose lookup does.
 		expect.Advisory = !g.releasesSet
+		// Explicit iff the operator typed -releases. Passing the default through as
+		// "explicit" would let a successful GitHub lookup harden the unrelated
+		// DNS-discovered app-compose lookup — see evidence.CodeIdentity.OK.
+		cfg.ExpectComposeExplicit = g.releasesSet
 		files, err := fetchReleaseComposeFiles(ctx, newGitHubClient(g.timeout), g.releaseRepo, g.releaseAsset, g.releases, out)
 		switch {
 		case err != nil && expect.Advisory:
@@ -354,7 +361,7 @@ func reportCodeIdentity(out io.Writer, code evidence.CodeIdentity, expect expect
 // discovery, so an unavailable optional lookup does not read like a verification
 // failure. The exit code follows CodeIdentity.OK, which applies the same rule.
 func failMark(code evidence.CodeIdentity, advisory bool) string {
-	if advisory && !code.ExpectRequested {
+	if advisory && !code.ExpectExplicit {
 		return "-"
 	}
 	return mark(false)

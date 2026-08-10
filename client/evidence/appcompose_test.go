@@ -262,6 +262,29 @@ func TestCodeIdentity_OK(t *testing.T) {
 		"compose file mismatch": {CodeIdentity{
 			Requested: true, ExpectRequested: true, ExpectErr: sentinel}, false},
 		"compose file match": {CodeIdentity{Requested: true, ExpectRequested: true}, true},
+
+		// A DISCOVERED lookup (DNS-derived base domain) that did not pan out is
+		// advisory: nobody asked for it, and DNS or the platform endpoint being
+		// unavailable is not evidence about the deployment.
+		"discovered, fetch failed": {CodeIdentity{
+			Requested: true, Discovered: true, FetchErr: sentinel}, true},
+		"discovered, not bound": {CodeIdentity{
+			Requested: true, Discovered: true, BoundErr: sentinel}, true},
+		// The regression this guards: -releases defaults to 5, so a DEFAULT comparison
+		// normally has candidates and ExpectRequested is true. That must NOT harden the
+		// discovered lookup — otherwise whether a DNS failure fails the whole run would
+		// depend on whether GitHub happened to be reachable that minute.
+		"discovered fetch failed, default comparison ran": {CodeIdentity{
+			Requested: true, Discovered: true, FetchErr: sentinel, ExpectRequested: true}, true},
+		// Explicitly asking (-expect-compose-file, or -releases typed out) is how the
+		// caller says "this must work", and then it is fatal.
+		"discovered fetch failed, comparison explicitly asked for": {CodeIdentity{
+			Requested: true, Discovered: true, FetchErr: sentinel,
+			ExpectRequested: true, ExpectExplicit: true}, false},
+		// Supplying -base-domain / -app-compose is the other way to say it: not
+		// discovered, so a failure is fatal with no comparison involved at all.
+		"supplied base domain, fetch failed": {CodeIdentity{
+			Requested: true, Discovered: false, FetchErr: sentinel}, false},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

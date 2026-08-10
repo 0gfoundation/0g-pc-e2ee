@@ -195,9 +195,10 @@ guest agent is unreachable or the app's `public_tcbinfo` is off; the bytes are
 anchored by the quote's `compose_hash`, so their source does not have to be trusted.
 
 Add `-allow-untrusted-cert` when checking a hostname brought up against the ACME
-staging CA (`ACME_STAGING=true`): its certificate is correctly bound by the quote
-but deliberately signed by an untrusted CA, and without the flag even the evidence
-fetch fails on ordinary PKI verification.
+staging CA (`ACME_STAGING=true`): its certificate is correctly bound by the quote but
+deliberately signed by an untrusted CA, so the chain-trust step fails on purpose. Every
+other check runs without the flag; what it decides is whether that one failure blocks
+the verdict.
 
 It relaxes no attestation check, but it is **not** free: chain trust is what ties
 the connection to the domain you named, so waiving it lets an interceptor running

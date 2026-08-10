@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -125,6 +126,9 @@ func newLeaf(t *testing.T, ca certPair, serial int64, key *ecdsa.PrivateKey) cer
 	return certPair{cert: cert, der: der, key: key}
 }
 
+// rotateCert is a newFixture option: see fixture.rotateCert.
+func rotateCert(f *fixture) { f.rotateCert = true }
+
 // fixture is a running stand-in for a dstack-ingress CVM: an HTTPS endpoint
 // serving an evidence bundle under /evidences/ and presenting a certificate.
 type fixture struct {
@@ -136,6 +140,14 @@ type fixture struct {
 	// reportData is what the fixture's quote parser returns, set by bindQuote so a
 	// test can bind the quote to something other than the served manifest.
 	reportData [64]byte
+	// rotateCert makes the server present a DIFFERENT certificate on every handshake
+	// after the first — what a domain backed by several CVMs looks like, since dstack
+	// picks a replica per TCP connection and each generates its own key inside itself.
+	// handshakes counts them, guarded because the TLS callback may run off the test
+	// goroutine.
+	rotateCert  bool
+	handshakeMu sync.Mutex
+	handshakes  int
 	// wantDNSDiscovery opts a test into the DNS-derived base-domain path; checker()
 	// otherwise disables it, since testDomain does not resolve.
 	wantDNSDiscovery bool
@@ -177,11 +189,26 @@ func newFixture(t *testing.T, opts ...func(*fixture)) *fixture {
 		}
 		_, _ = w.Write(body)
 	})
-	srv := httptest.NewUnstartedServer(mux)
-	srv.TLS = &tls.Config{Certificates: []tls.Certificate{{
+	primary := &tls.Certificate{
 		Certificate: [][]byte{f.served.der, ca.der},
 		PrivateKey:  f.served.key,
-	}}}
+	}
+	srv := httptest.NewUnstartedServer(mux)
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{*primary}}
+	if f.rotateCert {
+		// A second replica's certificate, minted up front so the callback needs no *testing.T.
+		alt := newLeaf(t, ca, 101, nil)
+		altPair := &tls.Certificate{Certificate: [][]byte{alt.der, ca.der}, PrivateKey: alt.key}
+		srv.TLS = &tls.Config{GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+			f.handshakeMu.Lock()
+			defer f.handshakeMu.Unlock()
+			f.handshakes++
+			if f.handshakes == 1 {
+				return primary, nil
+			}
+			return altPair, nil
+		}}
+	}
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
 	f.server = srv
@@ -274,12 +301,10 @@ func (f *fixture) checker(t *testing.T, cfg Config) *Checker {
 	if cfg.QuoteParser == nil {
 		cfg.QuoteParser = f.parser()
 	}
-	if cfg.HTTPClient == nil {
-		cfg.HTTPClient = &http.Client{Transport: &http.Transport{
-			DialContext:     f.dialPlain(),
-			TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
-		}}
-	}
+	// Deliberately no HTTPClient: leaving it nil is what makes Check build its own
+	// pinned session, so the tests exercise the production transport — one connection
+	// for the whole run, which is the property step 4 depends on. Only DialTLS is
+	// redirected, since testDomain does not resolve.
 	if cfg.DialTLS == nil {
 		cfg.DialTLS = f.dialTLS()
 	}
@@ -579,8 +604,10 @@ func TestCheck_UnparseableCertInBundle(t *testing.T) {
 	}
 }
 
-// The endpoint does not complete a handshake: the bundle may verify, but nothing
-// ties it to an endpoint, so the run must fail.
+// The endpoint does not complete a handshake, so there is no run: the bundle and the
+// certificate come over the SAME connection now, and without it neither exists. The
+// error must name the dial rather than surfacing as some downstream mismatch, and the
+// run must not pass.
 func TestCheck_HandshakeFailure(t *testing.T) {
 	f := newFixture(t)
 	sentinel := errors.New("connection reset by peer")
@@ -592,80 +619,54 @@ func TestCheck_HandshakeFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Check: %v", err)
 	}
-	if !errors.Is(rep.CertErr, sentinel) {
-		t.Errorf("CertErr = %v, want it to wrap %v", rep.CertErr, sentinel)
-	}
-	if rep.BindingErr != nil {
-		t.Errorf("BindingErr = %v; the bundle checks are independent of the handshake", rep.BindingErr)
+	if !errors.Is(rep.ManifestErr, sentinel) {
+		t.Errorf("ManifestErr = %v, want it to wrap %v", rep.ManifestErr, sentinel)
 	}
 	if rep.Pass() {
-		t.Error("Pass = true without a served certificate to compare")
+		t.Error("Pass = true with no connection to the endpoint at all")
 	}
 }
 
-// The evidence fetch is itself an HTTPS GET, so a deployment on an ACME-staging
-// certificate is unverifiable unless AllowUntrustedCert reaches the fetch too. This
-// is the regression that made the flag useless where it was needed: the fetch died
-// on PKI verification before any check ran.
+// A deployment on an ACME-staging certificate must be fully checkable with no flag
+// and no trust store: the fetch rides the same unverified connection whose
+// certificate step 4 compares, so PKI never gates the evidence. Chain trust is still
+// evaluated and REPORTED — that is the caller's decision to weigh, not this
+// package's.
 //
-// Both cases go through New's own client (only its dialing is redirected at the
-// fixture) so the TLS decision under test is the one New makes.
-func TestCheck_AllowUntrustedCertAppliesToTheFetch(t *testing.T) {
-	for _, tc := range []struct {
-		name       string
-		allow      bool
-		wantFetch  bool // did the bundle fetch get through?
-		wantErrHas string
-	}{
-		{name: "untrusted cert blocks the fetch by default", allow: false, wantFetch: false, wantErrHas: "x509"},
-		{name: "allowed: every check runs", allow: true, wantFetch: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newFixture(t)
-			// No CA pool anywhere: the fixture's cert chains to nothing this client
-			// trusts, exactly like an ACME-staging deployment.
-			c, err := New(Config{
-				QuoteParser:        f.parser(),
-				AllowUntrustedCert: tc.allow,
-				Roots:              x509.NewCertPool(),
-				DialTLS:            f.dialTLS(),
-			})
-			if err != nil {
-				t.Fatalf("New: %v", err)
-			}
-			// Keep New's TLSClientConfig — the thing under test — and only redirect
-			// where the connection goes, since testDomain does not resolve.
-			c.http.Transport.(*http.Transport).DialContext = f.dialPlain()
+// This replaces an earlier contract in which the fetch verified PKI and a flag had to
+// relax it. That shape put the same decision in two places and made a staging
+// endpoint unverifiable until the flag reached both.
+func TestCheck_UntrustedCertIsCheckableAndReported(t *testing.T) {
+	f := newFixture(t)
+	// No CA pool anywhere: the fixture's certificate chains to nothing trusted,
+	// exactly like an ACME-staging deployment.
+	c, err := New(Config{
+		QuoteParser:    f.parser(),
+		Roots:          x509.NewCertPool(),
+		DialTLS:        f.dialTLS(),
+		NoDNSDiscovery: true,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	f.publishQuote()
 
-			rep, err := c.Check(context.Background(), testDomain)
-			if err != nil {
-				t.Fatalf("Check: %v", err)
-			}
-			gotFetch := rep.ManifestErr == nil
-			if gotFetch != tc.wantFetch {
-				t.Fatalf("bundle fetched = %v, want %v (ManifestErr = %v)", gotFetch, tc.wantFetch, rep.ManifestErr)
-			}
-			if tc.wantErrHas != "" && !strings.Contains(fmt.Sprint(rep.ManifestErr), tc.wantErrHas) {
-				t.Errorf("ManifestErr = %v, want it to mention %q", rep.ManifestErr, tc.wantErrHas)
-			}
-			if !tc.wantFetch {
-				return
-			}
-			// With the fetch through, the attestation checks must all have run and
-			// passed — the flag relaxes none of them.
-			if rep.QuoteErr != nil || rep.BindingErr != nil || rep.CertErr != nil {
-				t.Errorf("attestation checks did not run cleanly: quote=%v binding=%v cert=%v",
-					rep.QuoteErr, rep.BindingErr, rep.CertErr)
-			}
-			if rep.CertMatch != CertExact {
-				t.Errorf("CertMatch = %v, want CertExact", rep.CertMatch)
-			}
-			// …and chain trust must still be REPORTED as failing, since that is what
-			// the caller weighs against its own risk.
-			if rep.ChainTrustErr == nil {
-				t.Error("ChainTrustErr = nil; waiving trust must not hide that it failed")
-			}
-		})
+	rep, err := c.Check(context.Background(), testDomain)
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if rep.ManifestErr != nil {
+		t.Fatalf("ManifestErr = %v; an untrusted certificate must not block the fetch", rep.ManifestErr)
+	}
+	if rep.QuoteErr != nil || rep.BindingErr != nil || rep.CertErr != nil {
+		t.Errorf("attestation checks did not run cleanly: quote=%v binding=%v cert=%v",
+			rep.QuoteErr, rep.BindingErr, rep.CertErr)
+	}
+	if rep.CertMatch != CertExact {
+		t.Errorf("CertMatch = %v, want CertExact", rep.CertMatch)
+	}
+	if rep.ChainTrustErr == nil {
+		t.Error("ChainTrustErr = nil; an untrusted chain must still be reported as untrusted")
 	}
 }
 
@@ -976,4 +977,68 @@ func expectCandidates(b []byte) []ExpectedCompose {
 		return nil
 	}
 	return []ExpectedCompose{{Label: "expected", Content: b}}
+}
+
+// The bundle and the served certificate must come over ONE connection.
+//
+// dstack picks a CVM per TCP connection and each CVM generates its own TLS key inside
+// itself, so a second connection can legitimately land on a replica presenting a
+// different certificate. While the fetch and the comparison used separate
+// connections, an N-replica deployment reported "served certificate is not in the
+// bundle" — a healthy deployment described in the shape of an attack — roughly
+// (N-1)/N of the time.
+//
+// The fixture models exactly that: one address that hands out a different certificate
+// to every handshake after the first. Only a run that stays on connection 1 can match
+// the bundle, so this fails for ANY second connection, wherever it is opened from.
+func TestCheck_RunUsesOneConnection(t *testing.T) {
+	f := newFixture(t, rotateCert)
+	c := f.checker(t, Config{})
+
+	rep, err := c.Check(context.Background(), testDomain)
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	f.handshakeMu.Lock()
+	handshakes := f.handshakes
+	f.handshakeMu.Unlock()
+	if handshakes != 1 {
+		t.Errorf("handshakes = %d, want 1: the bundle and the certificate must come "+
+			"from the same connection, or replicas get compared against each other", handshakes)
+	}
+	if rep.CertErr != nil {
+		t.Fatalf("CertErr = %v", rep.CertErr)
+	}
+	if rep.CertMatch != CertExact {
+		t.Errorf("CertMatch = %v, want CertExact", rep.CertMatch)
+	}
+	if !rep.Pass() {
+		t.Error("Pass = false on a healthy multi-replica deployment")
+	}
+}
+
+// If the run does end up spanning connections with different certificates — a
+// connection recycled mid-run onto another replica — the report must say THAT, not
+// hand back a mismatch verdict. Both leaves may be legitimate, so there is no
+// comparison to make, and "not in the bundle" would send the reader hunting an attack.
+func TestSession_ServedChainDetectsAReplicaChange(t *testing.T) {
+	a := newFixture(t)
+	b := newFixture(t)
+
+	same := &session{chains: [][]*x509.Certificate{{a.served.cert}, {a.served.cert}}}
+	if chain, changed := same.servedChain(); changed || len(chain) == 0 {
+		t.Errorf("two connections to the same replica: changed = %v, chain len = %d; want false, >0",
+			changed, len(chain))
+	}
+
+	differing := &session{chains: [][]*x509.Certificate{{a.served.cert}, {b.served.cert}}}
+	if chain, changed := differing.servedChain(); !changed || chain != nil {
+		t.Errorf("two connections to different replicas: changed = %v, chain = %v; want true, nil",
+			changed, chain)
+	}
+
+	empty := &session{}
+	if chain, changed := empty.servedChain(); changed || chain != nil {
+		t.Errorf("no connection recorded: changed = %v, chain = %v; want false, nil", changed, chain)
+	}
 }

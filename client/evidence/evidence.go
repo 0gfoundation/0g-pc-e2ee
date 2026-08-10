@@ -83,6 +83,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
@@ -110,7 +111,11 @@ type QuoteParser func(raw []byte) (attest.Measurement, [64]byte, error)
 type Config struct {
 	// QuoteParser DCAP-verifies quote.json. Required.
 	QuoteParser QuoteParser
-	// HTTPClient fetches the evidence files. Nil uses a client with Timeout.
+	// HTTPClient overrides BOTH HTTP paths: the evidence-bundle fetch and the
+	// app-compose lookup. Nil is the normal case and the one production uses — the
+	// bundle then rides a per-run pinned connection (see the session type) whose
+	// certificate is what step 4 compares, which a caller-supplied client cannot
+	// provide. Set it only when the transport itself is what you are controlling.
 	HTTPClient *http.Client
 	// DialTLS opens the TLS connection whose served certificate is compared
 	// against the bundle. Nil dials <domain>:443. Injected by tests; also the seam
@@ -124,22 +129,6 @@ type Config struct {
 	// certificate comparison is an identity check against the quote, not a PKI
 	// decision, so the handshake deliberately does not depend on this.
 	Roots *x509.CertPool
-	// AllowUntrustedCert lets the evidence FETCH proceed over a TLS connection whose
-	// certificate does not chain to a trusted root, for a deployment brought up
-	// against the ACME staging CA (deploy/phala/README.md). Without it the fetch
-	// fails on ordinary PKI verification and no check runs at all, which makes a
-	// staging endpoint unverifiable.
-	//
-	// It does not weaken steps 1–3: the bundle is untrusted input either way, and
-	// its authenticity comes from the report_data binding to a DCAP-verified quote,
-	// never from TLS. What it DOES give up is the guarantee that the connection
-	// reaches the name that was asked for — see Report.ChainTrustErr for the
-	// consequence, which is why chain trust is still evaluated and reported.
-	//
-	// It applies only to the client this package builds; a caller supplying
-	// HTTPClient controls its own TLS configuration.
-	AllowUntrustedCert bool
-
 	// AppCompose, when non-nil, is the app-compose.json bytes to check the quote's
 	// compose_hash against — an operator's deploy record, a release asset, or a copy
 	// pulled from the platform by hand. It takes precedence over BaseDomain.
@@ -177,6 +166,12 @@ type Config struct {
 	// discovery — which published release is live — and the answer "none of them" is
 	// the finding that matters.
 	ExpectComposeFiles []ExpectedCompose
+	// ExpectComposeExplicit says the caller ASKED for the compose comparison, as
+	// opposed to it happening by default. It must not be inferred from
+	// ExpectComposeFiles being non-empty: a default lookup that happens to succeed
+	// would then harden an unrelated discovered lookup (see CodeIdentity.OK), making
+	// the verdict depend on whether an unrelated network call worked.
+	ExpectComposeExplicit bool
 }
 
 // ExpectedCompose is one candidate compose text and the name to report it by (a
@@ -220,20 +215,100 @@ func New(cfg Config) (*Checker, error) {
 	}
 	c := &Checker{cfg: cfg, http: cfg.HTTPClient, dial: cfg.DialTLS, limit: timeout, osImages: osImages}
 	if c.http == nil {
+		// Used for the app-compose lookup only (a DIFFERENT host from the endpoint, so
+		// it shares nothing with the pinned bundle connection). Ordinary PKI
+		// verification: it is the platform's own public hostname, and the bytes it
+		// returns are authenticated against the quote's compose_hash regardless, so a
+		// TLS failure here is an advisory dead end rather than something to work around.
 		c.http = &http.Client{Timeout: timeout, Transport: &http.Transport{
-			// Verification is on by default and only AllowUntrustedCert turns it off;
-			// see that field for why doing so does not weaken the bundle checks, and
-			// what it does cost.
-			TLSClientConfig: &tls.Config{
-				MinVersion:         tls.VersionTLS12,
-				InsecureSkipVerify: cfg.AllowUntrustedCert, //nolint:gosec // opt-in, see Config.AllowUntrustedCert
-			},
+			TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12},
 		}}
 	}
 	if c.dial == nil {
 		c.dial = dialTLS
 	}
 	return c, nil
+}
+
+// session is one Check's transport. Everything a single run fetches goes over ONE
+// TLS connection, and that connection's certificate chain is what step 4 compares
+// against the bundle.
+//
+// That has to be the same connection, not merely the same host. dstack selects a
+// CVM **per TCP connection** (a connect race over the instances of one app_id — see
+// deploy/phala/blue-green.md), and every CVM generates its own TLS key inside itself.
+// So a deployment with N replicas would, on separate connections, hand the fetch one
+// replica's bundle and the handshake another replica's certificate: a healthy
+// deployment reported as "served certificate is not in the bundle", which is the
+// shape of an attack. Pinning removes that whole class of false negative.
+//
+// The handshake does not verify PKI. It cannot: an ACME-staging deployment's
+// certificate is correctly quote-bound and deliberately untrusted, and refusing to
+// connect would make the tool useless exactly where it is needed. Nothing is lost —
+// the bundle is untrusted input either way (its authenticity comes from the
+// report_data binding to a DCAP-verified quote, never from TLS), and chain trust is
+// verified explicitly afterwards against Config.Roots and reported as its own
+// property for the caller's verdict to require.
+type session struct {
+	client *http.Client
+	mu     sync.Mutex
+	// chains is one entry per connection this session dialed. More than one means
+	// the run may have spanned replicas; see servedChain.
+	chains [][]*x509.Certificate
+}
+
+// newSession builds the pinned transport for one run. name is the SNI to present,
+// which is the hostname without any port.
+func (c *Checker) newSession(name string) *session {
+	s := &session{}
+	if c.cfg.HTTPClient != nil {
+		// A caller supplying its own client owns its transport, so nothing can be
+		// pinned or recorded; checkServedCert falls back to its own handshake.
+		s.client = c.cfg.HTTPClient
+		return s
+	}
+	s.client = &http.Client{Timeout: c.limit, Transport: &http.Transport{
+		// MaxConnsPerHost pins the run to one connection so the recorded chain is the
+		// one the evidence came over. DisableKeepAlives must stay false or every
+		// request would dial afresh, which is the behaviour being fixed.
+		MaxConnsPerHost: 1,
+		DialTLSContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+			conn, err := c.dial(ctx, addr, &tls.Config{
+				ServerName:         name,
+				InsecureSkipVerify: true, //nolint:gosec // identity check; chain trust verified separately, see session
+				MinVersion:         tls.VersionTLS12,
+			})
+			if err != nil {
+				return nil, err
+			}
+			s.mu.Lock()
+			s.chains = append(s.chains, conn.ConnectionState().PeerCertificates)
+			s.mu.Unlock()
+			return conn, nil
+		},
+	}}
+	return s
+}
+
+// servedChain returns the certificate chain the run's connection presented.
+//
+// It reports changed=true when the session dialed more than once and the leaves
+// disagree — a replica change mid-run. The caller must then say so rather than
+// compare, because either leaf may be legitimate and a mismatch verdict would name
+// the wrong problem.
+func (s *session) servedChain() (chain []*x509.Certificate, changed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.chains) == 0 {
+		return nil, false
+	}
+	first := s.chains[0]
+	for _, other := range s.chains[1:] {
+		if len(other) == 0 || len(first) == 0 || !other[0].Equal(first[0]) {
+			return nil, true
+		}
+	}
+	return first, false
 }
 
 // FileCheck is one manifest entry and how the fetched file compared to it.
@@ -401,12 +476,16 @@ type CodeIdentity struct {
 	// booted, proven by the quote. Empty unless the binding succeeded.
 	ComposeFile []byte
 
-	// ExpectRequested reports whether a compose-file comparison was asked for, and
+	// ExpectRequested reports whether a compose-file comparison happened at all, and
 	// ExpectErr the result — nil meaning the deployed text equals one of the
 	// candidates, whose label is then MatchedExpect.
 	ExpectRequested bool
 	ExpectErr       error
 	MatchedExpect   string
+	// ExpectExplicit reports that the comparison was ASKED for rather than run by
+	// default (Config.ExpectComposeExplicit). Only this may harden an otherwise
+	// advisory lookup — see OK.
+	ExpectExplicit bool
 
 	// Discovered reports that BaseDomain was derived from DNS rather than supplied.
 	// A failure of a discovered lookup is informational: the caller did not ask for
@@ -420,7 +499,13 @@ type CodeIdentity struct {
 // unasked-for check cannot fail. And a *discovered* app-compose lookup that did not
 // pan out — DNS or the platform endpoint being unavailable is not evidence against
 // the deployment, and the caller did not ask. Supplying -app-compose / -base-domain
-// (or asking for a compose comparison) is how you say "this must work".
+// (or explicitly asking for a compose comparison) is how you say "this must work".
+//
+// The hardening test is ExpectExplicit, never ExpectRequested. A comparison that ran
+// only because it is the default must not turn a discovered lookup into a failure —
+// and inferring it from "candidates were obtained" would make the verdict depend on
+// whether an unrelated network call succeeded: the same DNS failure would be fatal
+// when GitHub was reachable and advisory when it was not.
 func (c CodeIdentity) OK() bool {
 	if !c.Requested && !c.ExpectRequested {
 		return true
@@ -428,7 +513,7 @@ func (c CodeIdentity) OK() bool {
 	if c.HashErr != nil {
 		return false
 	}
-	if (c.FetchErr != nil || c.BoundErr != nil) && (!c.Discovered || c.ExpectRequested) {
+	if (c.FetchErr != nil || c.BoundErr != nil) && (!c.Discovered || c.ExpectExplicit) {
 		return false
 	}
 	if c.FetchErr != nil || c.BoundErr != nil {
@@ -517,10 +602,11 @@ func (c *Checker) Check(ctx context.Context, domain string) (Report, error) {
 		name = h
 	}
 	rep := Report{Domain: host, Note: c.note()}
+	sess := c.newSession(name)
 
 	// Step 1 — the manifest, then every file it names. The manifest bytes are kept
 	// verbatim: the binding in step 3 is a hash over exactly these bytes.
-	manifest, err := c.fetch(ctx, host, manifestName)
+	manifest, err := c.fetch(ctx, sess, host, manifestName)
 	if err != nil {
 		rep.ManifestErr = err
 		return rep, nil
@@ -536,7 +622,7 @@ func (c *Checker) Check(ctx context.Context, domain string) (Report, error) {
 	}
 	var certPEM []byte
 	for _, e := range entries {
-		body, ferr := c.fetch(ctx, host, e.Name)
+		body, ferr := c.fetch(ctx, sess, host, e.Name)
 		fc := FileCheck{Name: e.Name, Want: e.Digest, Err: ferr}
 		if ferr == nil {
 			fc.Got = sha256.Sum256(body)
@@ -549,7 +635,7 @@ func (c *Checker) Check(ctx context.Context, domain string) (Report, error) {
 
 	// Step 2 — the quote. Fetched separately: it is generated from the manifest's
 	// digest, so it is not (and cannot be) a manifest entry.
-	quoteBody, err := c.fetch(ctx, host, quoteName)
+	quoteBody, err := c.fetch(ctx, sess, host, quoteName)
 	if err != nil {
 		rep.QuoteErr = err
 	} else {
@@ -584,7 +670,7 @@ func (c *Checker) Check(ctx context.Context, domain string) (Report, error) {
 	// Steps 4 and 5 — what the endpoint actually serves, versus what the bundle
 	// says. Run even when the quote failed: knowing whether the served certificate
 	// matches is useful either way, and Pass already requires both.
-	c.checkServedCert(ctx, host, name, certPEM, &rep)
+	c.checkServedCert(ctx, sess, host, name, certPEM, &rep)
 
 	// Step 6 — code identity, from the same verified quote.
 	c.checkCodeIdentity(ctx, &rep)
@@ -607,6 +693,7 @@ func (c *Checker) checkCodeIdentity(ctx context.Context, rep *Report) {
 	code := &rep.Code
 	code.Requested = c.cfg.AppCompose != nil || strings.TrimSpace(c.cfg.BaseDomain) != ""
 	code.ExpectRequested = len(c.cfg.ExpectComposeFiles) > 0
+	code.ExpectExplicit = c.cfg.ExpectComposeExplicit
 
 	if rep.QuoteErr != nil {
 		code.HashErr = errors.New("not checked: the quote did not verify")
@@ -696,7 +783,7 @@ func requireEntries(entries []ManifestEntry, name string) error {
 // checkServedCert performs the TLS handshake, compares the served leaf against
 // the bundle's certificate, and records chain trust. It fills rep in place and
 // never returns an error: every outcome is a reported field.
-func (c *Checker) checkServedCert(ctx context.Context, host, name string, certPEM []byte, rep *Report) {
+func (c *Checker) checkServedCert(ctx context.Context, sess *session, host, name string, certPEM []byte, rep *Report) {
 	if certPEM == nil {
 		// requireEntries guarantees the manifest names it, so getting here means the
 		// fetch failed — already recorded as that entry's FileCheck.Err.
@@ -709,25 +796,35 @@ func (c *Checker) checkServedCert(ctx context.Context, host, name string, certPE
 		return
 	}
 
-	handshakeCtx, cancel := context.WithTimeout(ctx, c.limit)
-	defer cancel()
-	// InsecureSkipVerify on purpose: this handshake exists to OBTAIN the served
-	// certificate so it can be compared against the quote-bound one, which is an
-	// identity check that does not depend on PKI. Verifying here instead would make
-	// the tool useless exactly when it is most needed — an ACME-staging deployment,
-	// or a misissued-but-trusted certificate. Chain trust is checked explicitly
-	// below and reported as its own property.
-	conn, err := c.dial(handshakeCtx, host, &tls.Config{
-		ServerName:         name,
-		InsecureSkipVerify: true, //nolint:gosec // see comment: identity check, trust verified separately below
-		MinVersion:         tls.VersionTLS12,
-	})
-	if err != nil {
-		rep.CertErr = fmt.Errorf("TLS handshake with %s: %w", host, err)
+	// The chain the run's own connection presented — the one the bundle above came
+	// over, which is what makes this a comparison of one replica against itself
+	// rather than of two replicas against each other (see session).
+	served, changed := sess.servedChain()
+	switch {
+	case changed:
+		// Two connections, two different leaves. Both may be legitimate replicas, so
+		// there is no comparison to report: say what happened and let the caller re-run.
+		rep.CertErr = fmt.Errorf("the connection to %s changed mid-run and the two certificates differ "+
+			"(a deployment can be several CVMs, each with its own key); re-run to check one of them", host)
 		return
+	case served == nil:
+		// No connection was recorded: either the caller supplied its own HTTP client
+		// (nothing to record) or every fetch failed before a handshake completed. Fall
+		// back to a handshake of our own so the report can still name the certificate.
+		handshakeCtx, cancel := context.WithTimeout(ctx, c.limit)
+		defer cancel()
+		conn, derr := c.dial(handshakeCtx, host, &tls.Config{
+			ServerName:         name,
+			InsecureSkipVerify: true, //nolint:gosec // identity check; chain trust verified separately, see session
+			MinVersion:         tls.VersionTLS12,
+		})
+		if derr != nil {
+			rep.CertErr = fmt.Errorf("TLS handshake with %s: %w", host, derr)
+			return
+		}
+		defer conn.Close()
+		served = conn.ConnectionState().PeerCertificates
 	}
-	defer conn.Close()
-	served := conn.ConnectionState().PeerCertificates
 	if len(served) == 0 {
 		rep.CertErr = fmt.Errorf("%s presented no certificate", host)
 		return
@@ -816,13 +913,13 @@ func parseCertChain(pemBytes []byte) ([]*x509.Certificate, error) {
 // fetch GETs one evidence file and returns its bytes. The read is bounded and a
 // non-200 is an error: a bundle served as an HTML error page must not be hashed
 // and reported as a digest mismatch.
-func (c *Checker) fetch(ctx context.Context, host, name string) ([]byte, error) {
+func (c *Checker) fetch(ctx context.Context, sess *session, host, name string) ([]byte, error) {
 	u := "https://" + host + "/evidences/" + url.PathEscape(name)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
 	}
-	resp, err := c.http.Do(req)
+	resp, err := sess.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("fetch %s: %w", name, err)
 	}

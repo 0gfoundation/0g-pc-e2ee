@@ -259,3 +259,61 @@ func TestRun_GatewayModeNeedsNoChain(t *testing.T) {
 		t.Errorf("expected a FAIL report:\n%s", out.String())
 	}
 }
+
+// A failed app-compose lookup is a "-" and exit 0 when it was only discovery, and a
+// "✗" with exit 1 when the caller asked for it. The distinction must key off
+// ExpectExplicit, not ExpectRequested: -releases defaults to a nonzero count, so a
+// DEFAULT comparison normally has candidates, and keying off "candidates exist" made a
+// DNS failure fatal or advisory depending on whether GitHub happened to be reachable.
+func TestReportGateway_DiscoveredLookupFailureIsAdvisory(t *testing.T) {
+	lookupFailed := errors.New("no CNAME chain to a dstack base domain")
+
+	base := func() evidence.Report {
+		rep := passing()
+		rep.Code.Requested = true
+		rep.Code.Discovered = true
+		rep.Code.FetchErr = lookupFailed
+		return rep
+	}
+
+	for _, tc := range []struct {
+		name     string
+		mutate   func(*evidence.Report)
+		wantCode int
+		wantMark string
+	}{
+		{
+			name:     "discovery only",
+			mutate:   func(*evidence.Report) {},
+			wantCode: 0, wantMark: "- app-compose",
+		},
+		{
+			// The bug: a default -releases lookup succeeded, so ExpectRequested is true.
+			name:     "default compose comparison also ran",
+			mutate:   func(r *evidence.Report) { r.Code.ExpectRequested = true },
+			wantCode: 0, wantMark: "- app-compose",
+		},
+		{
+			name: "comparison explicitly requested",
+			mutate: func(r *evidence.Report) {
+				r.Code.ExpectRequested = true
+				r.Code.ExpectExplicit = true
+			},
+			wantCode: 1, wantMark: "✗ app-compose",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rep := base()
+			tc.mutate(&rep)
+			var out bytes.Buffer
+			got := reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", false,
+				expectSource{Label: "newest 5 release(s)"})
+			if got != tc.wantCode {
+				t.Errorf("exit = %d, want %d\n%s", got, tc.wantCode, out.String())
+			}
+			if !strings.Contains(out.String(), tc.wantMark) {
+				t.Errorf("output does not contain %q:\n%s", tc.wantMark, out.String())
+			}
+		})
+	}
+}

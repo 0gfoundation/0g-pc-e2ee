@@ -161,11 +161,13 @@ Both modes exit non-zero on a failed check, so either works as a deploy gate. Se
 [`docs/design/cloud-gateway.md`](../docs/design/cloud-gateway.md) §10 for what the
 result does and does not cover.
 
-`-allow-untrusted-cert` (gateway mode) is for a hostname on the ACME staging CA,
-where even the evidence fetch would otherwise fail PKI verification. It relaxes no
-attestation check, but chain trust is what ties the connection to the domain you
-named — waive it and an interceptor running its own attested CVM passes everything
-else. Smoke-test your own deployment with it; never audit someone else's.
+`-allow-untrusted-cert` (gateway mode) is for a hostname on the ACME staging CA. Every
+check runs either way — the evidence fetch does not verify PKI, since it rides the same
+connection whose certificate is being compared — so what the flag decides is whether the
+reported chain-trust failure blocks the verdict. It relaxes no attestation check, but
+chain trust is what ties the connection to the domain you named: waive it and an
+interceptor running its own attested CVM passes everything else. Smoke-test your own
+deployment with it; never audit someone else's.
 
 `-pccs-url` applies to whichever mode verifies a quote, pointing DCAP collateral
 fetches at a PCCS mirror (e.g. `https://pccs.phala.network`) instead of Intel PCS.

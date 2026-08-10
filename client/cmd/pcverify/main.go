@@ -58,14 +58,16 @@
 // run (an unreachable or rate-limited API says nothing about the deployment), while an
 // explicit -releases N that cannot be satisfied is fatal. Same rule as DNS discovery.
 //
-// -allow-untrusted-cert proceeds when the served certificate does not chain to a
-// public root, for ACME-staging deployments. It relaxes no attestation check — and
-// it is needed on the evidence FETCH too, not just the comparison, since that fetch
-// is itself an HTTPS GET. But chain trust is what ties the connection to the domain
-// asked for, so waiving it lets an interceptor running its OWN attested CVM satisfy
-// every other check with its own quote, bundle and certificate. A run that uses the
-// flag prints that caveat. Use it to smoke-test a deployment you operate, never to
-// audit an endpoint you do not control.
+// -allow-untrusted-cert accepts a served certificate that does not chain to a public
+// root, for ACME-staging deployments. It is purely a verdict decision: the evidence
+// fetch never verifies PKI in the first place (it rides the same connection whose
+// certificate is being compared), so every check still runs without the flag — what
+// the flag changes is whether the reported chain-trust failure blocks the result. It
+// relaxes no attestation check, but chain trust is what ties the connection to the
+// domain asked for, so waiving it lets an interceptor running its OWN attested CVM
+// satisfy every other check with its own quote, bundle and certificate. A run that
+// uses the flag prints that caveat. Use it to smoke-test a deployment you operate,
+// never to audit an endpoint you do not control.
 //
 // Underneath all of that sits the OS image. mr_config_id is chosen by the untrusted
 // host, so the compose hash means what it says only because the guest OS refuses to
