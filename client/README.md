@@ -21,6 +21,12 @@ shapes:
 | **In-process SDK** | The core imported as a library | You want it inside your app, no extra process |
 | **Cloud-TEE gateway** | The same core run as an attested server | Browser / thin / no-install clients (introduces one attested trust party) |
 
+> **Which of the three is offered today:** the **gateway** — it is what 0G deploys
+> and what [`docs/verifying-the-gateway.md`](../docs/verifying-the-gateway.md)
+> teaches users to verify. The sidecar and the in-process SDK are built and tested
+> here, but are not currently offered as supported entry points; the table above
+> describes the architecture, not a menu.
+
 Sealing (end-to-end confidentiality) is **required on the router path** (an L7
 reseller router terminates TLS there by design) and **optional on the direct
 path** (direct TLS terminates inside the provider CVM, and every response is

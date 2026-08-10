@@ -276,6 +276,23 @@ one with the `mr_config_id` check removed — could commit to a published releas
 populated.** Endpoint identity (steps 1–5) is unaffected either way, and the run says
 which case you are in — both on the `os image` line and in its closing note.
 
+**A run covers the connection it made, and a domain may be served by several
+enclaves.** One `app_id` can be backed by more than one CVM for capacity and
+failover, and the platform picks one **per TCP connection** (a connect race, not
+round-robin — see [`../deploy/phala/blue-green.md`](../deploy/phala/blue-green.md#scaling-one-side-replicas)).
+Each of those CVMs generates its **own** TLS key inside itself and gets its **own**
+certificate, so:
+
+- the `served cert` digest can legitimately differ between two runs, and between a
+  run and what your browser shows — that is a different replica, not a failure;
+- `compose_hash` / `app_id` must **not** differ, because replicas are grouped *by*
+  `app_id`. Code identity therefore generalizes across replicas; endpoint identity
+  does not — it is established for the connection that was checked.
+
+If you want coverage of more than one replica, run the check again (a fresh
+connection may land elsewhere); every response also carries `X-0G-Gateway-Instance`
+naming the replica that served it.
+
 **Code identity is only as strong as the pinning in the manifest.** An image
 referenced by a mutable tag rather than a digest keeps `compose_hash` identical while
 the code behind the tag changes. Check that the compose text you read pins digests
@@ -283,9 +300,11 @@ the code behind the tag changes. Check that the compose text you read pins diges
 
 **The gateway sees your prompt in plaintext.** That is what it is for: it seals your
 request to the provider enclave on your behalf. So the gateway is a second enclave
-that handles cleartext, versus one for a client that seals directly. If that is
-unacceptable for your use case, run the sidecar or the in-process SDK instead and seal
-on your own machine — see [`../client/README.md`](../client/README.md).
+that handles cleartext, versus one for a client that seals directly. Sealing on your
+own machine is what the sidecar and in-process SDK forms exist for
+([`../client/README.md`](../client/README.md)), but neither is currently offered as a
+supported entry point — so if a second cleartext enclave is unacceptable for your use
+case, the hosted gateway is not the right form for you today.
 
 **Metadata is visible to the router.** Model name, approximate token counts, timing
 and packet sizes are not hidden.
