@@ -119,8 +119,10 @@ TLS on the router path.
 
 ## What it verifies
 
-- **Attestation** — the provider quote is genuine TEE hardware running the
-  expected measurement (anchored on-chain / against a published baseline).
+- **Attestation** — the provider quote is genuine TEE hardware (DCAP-verified;
+  enforced). Whether the measurement is an *audited* one is checked against
+  `attest.Policy`, but that allowlist is empty today, so the deployed gateway runs that
+  part in warn mode — see [`trust-chain.md`](../docs/design/trust-chain.md) hop 3.
 - **Response authenticity** — each response is signed by the TEE key and the
   signer matches the on-chain `teeSignerAddress`.
 - **Routing / confidentiality** — on the router path, the sensitive request

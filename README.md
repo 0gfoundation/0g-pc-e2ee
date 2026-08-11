@@ -13,10 +13,10 @@ enclave: **confidentiality** (the prompt and tool definitions are sealed) *and*
 confidentiality alone.
 
 > **Why this repository is public.** So that the claims above can be *checked*.
-> The security of the product rests on outsiders being able to read the
-> verification code, the wire spec, and the exact manifest that runs in
-> production — so all three are here. That, rather than community development, is
-> what the openness is for.
+> The security of the product rests on outsiders being able to read the verification
+> code and the wire spec — both here — and the exact manifest that runs in production,
+> which is published as a Release asset (git holds its `:latest` development form). That,
+> rather than community development, is what the openness is for.
 
 ## The shape of it
 
@@ -61,7 +61,7 @@ enough evidence to be checked rather than believed.
 | You are | Go to |
 |---|---|
 | **using a 0G-hosted gateway** and want to know whether to trust it | [`docs/verifying-the-gateway.md`](docs/verifying-the-gateway.md) — one command, what a `PASS` does and does not prove, and the same procedure by hand with `curl` / `openssl` / `jq` |
-| **auditing the design** | [`docs/design/trust-chain.md`](docs/design/trust-chain.md) — every hop and where its trust bottoms out → [`protocol/SPEC.md`](protocol/SPEC.md) — the normative wire format → [`deploy/phala/docker-compose.yml`](deploy/phala/docker-compose.yml) — the manifest that is literally hashed into the attestation |
+| **auditing the design** | [`docs/design/trust-chain.md`](docs/design/trust-chain.md) — every hop and where its trust bottoms out → [`protocol/SPEC.md`](protocol/SPEC.md) — the normative wire format → the **`docker-compose.release.yml` attached to a [Release](https://github.com/0gfoundation/0g-pc-e2ee/releases)**, which is the manifest actually hashed into the attestation. The [`deploy/phala/docker-compose.yml`](deploy/phala/docker-compose.yml) in git is the same file with the gateway image left on `:latest` for development — readable, but it will not match a deployment |
 
 Those are the two audiences this repository is written for. The rest of it —
 the gateway implementation, the deployment runbook, the load-test rig — is 0G's
@@ -81,7 +81,7 @@ And three directories that are not modules:
 | | |
 |---|---|
 | [`docs/`](docs/) | [`verifying-the-gateway.md`](docs/verifying-the-gateway.md) for users; [`design/`](docs/design/) for the trust model, the router path, and the request envelope |
-| [`deploy/`](deploy/) | [`phala/`](deploy/phala/) is the CVM deployment — its `docker-compose.yml` is the measured manifest, so it doubles as evidence; [`grafana/`](deploy/grafana/) is the operational dashboard |
+| [`deploy/`](deploy/) | [`phala/`](deploy/phala/) is the CVM deployment. Its `docker-compose.yml` is the *source* of the measured manifest, but carries `:latest` for development — the digest-pinned `docker-compose.release.yml` on a Release is what a deployment actually runs and what the attestation covers; [`grafana/`](deploy/grafana/) is the operational dashboard |
 | [`loadtest/`](loadtest/) | capacity measurement for the gateway. Internal |
 
 ## Status

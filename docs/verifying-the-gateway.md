@@ -364,16 +364,31 @@ mismatch is stable, a replica split is not — or take both from one connection,
 `s_client` can do by carrying the request itself:
 
 ```sh
-# ONE connection: the served chain (-showcerts) and a bundle file in the same output.
-# -ign_eof is load-bearing — without it s_client closes at stdin EOF and you get the
-# certificate but no HTTP response.
-printf 'GET /evidences/sha256sum.txt HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' "$DOMAIN" |
-  openssl s_client -servername "$DOMAIN" -connect "$DOMAIN:443" -showcerts -ign_eof 2>/dev/null
+# ONE connection carrying both halves of step 4: the chain this connection served
+# (-showcerts) and, in the response body, that same replica's bundle certificate.
+# Ask for cert-$DOMAIN.pem, not sha256sum.txt — step 4 compares certificates, and the
+# manifest only holds a digest of the PEM *file*, which is not the DER fingerprint used
+# below. -ign_eof is load-bearing: without it s_client closes at stdin EOF and you get
+# the certificate but no HTTP response.
+printf 'GET /evidences/cert-%s.pem HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' \
+  "$DOMAIN" "$DOMAIN" |
+  openssl s_client -servername "$DOMAIN" -connect "$DOMAIN:443" -showcerts -ign_eof \
+  2>/dev/null > one.txt
+
+# first PEM block overall = the leaf that connection served
+leaf() { awk '/BEGIN CERTIFICATE/{n++} n==1{print} /END CERTIFICATE/{if(n==1) exit}' "$1"; }
+leaf one.txt > served-1conn.pem
+# first PEM block after the HTTP headers = that replica's bundle leaf
+sed -n '/^HTTP\/1/,$p' one.txt | sed '1,/^\r$/d' > body.pem
+leaf body.pem > bundle-1conn.pem
+
+diff <(openssl x509 -in served-1conn.pem -noout -fingerprint -sha256) \
+     <(openssl x509 -in bundle-1conn.pem -noout -fingerprint -sha256) \
+  && echo "step 4 on one connection: same replica, same certificate"
 ```
 
-The first `BEGIN CERTIFICATE` block is the leaf that connection served; the body after
-the HTTP headers is that same replica's `sha256sum.txt`. Compare them and you have
-step 4 with no replica ambiguity at all.
+Because both sides came out of the same TCP connection, a replica split cannot produce
+either a false match or a false mismatch here.
 
 If you want coverage of more than one replica, run the check again (a fresh
 connection may land elsewhere); every response also carries `X-0G-Gateway-Instance`
@@ -481,6 +496,10 @@ compute the three registers and compare:
 
 ```bash
 # 1. the release is the one the CVM is running
+# NOTE: run this INSIDE the unpacked image directory. That release also contains a
+# sha256sum.txt, and step 1 downloaded the evidence bundle's file of the same name into
+# the working directory — comparing that one against digest.txt fails every time.
+cd dstack-<version>/
 test "$(sha256sum sha256sum.txt | awk '{print $1}')" = "$(cat digest.txt)"
 
 # 2. compute MRTD/RTMR1/RTMR2 — dstack-mr's

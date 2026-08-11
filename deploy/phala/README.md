@@ -72,11 +72,12 @@ only symptom is an interpolation error at boot.
 Only variables the compose file actually references reach the container. Setting
 anything else in the CVM environment does nothing; changing what the compose
 references means editing the file, which changes `app_id`. Two optional
-dstack-ingress variables are therefore commented out in the compose rather than
-listed above — `ACME_EMAIL` (optional, and published in the evidence bundle, so
-the address would be world-readable at
-`https://<DOMAIN>/evidences/acme-account.json`) and `ACME_STAGING` (see
-[Deploy](#deploy)).
+dstack-ingress variables are therefore handled differently from the four above.
+`ACME_EMAIL` is **commented out** in the compose — it is optional, and it is published in
+the evidence bundle, so any address there would be world-readable at
+`https://<DOMAIN>/evidences/acme-account.json`. `ACME_STAGING` **is** referenced
+(`${ACME_STAGING:-false}`), precisely so it can be switched by value without editing the
+measured text — see [Deploy](#deploy).
 
 Whoever runs the served zone's DNS creates three CNAMEs **once, before the first
 boot**. They all point into the delegation zone, so they never change again — not
@@ -280,7 +281,10 @@ i.e. every piece of code that performs that boot-time check. Compute them from t
 published guest-OS release and compare:
 
 ```bash
-# the release must be the one this CVM runs: vm_config.os_image_hash IS digest.txt
+# the release must be the one this CVM runs: vm_config.os_image_hash IS digest.txt.
+# Run this INSIDE the unpacked image directory — the evidence bundle has a sha256sum.txt
+# too, and comparing that one against the image's digest.txt fails every time.
+cd dstack-<version>/
 test "$(sha256sum sha256sum.txt | awk '{print $1}')" = "$(cat digest.txt)"
 
 # from github.com/Dstack-TEE/dstack: tdx::tdx_measurements_for_image_dir_without_rtmr0,
