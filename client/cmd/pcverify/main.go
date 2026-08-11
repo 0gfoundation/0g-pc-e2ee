@@ -75,8 +75,9 @@
 // makes the OS itself part of the chain. The quote's image registers (MRTD, RTMR1,
 // RTMR2) are therefore compared against an allowlist embedded in the binary, so
 // nothing has to be supplied; -os-image-allowlist overrides it for testing or for
-// pinning an image before it is committed. While that allowlist is empty the step reports "not pinned" instead
-// of failing, and the run says code identity is evidence rather than proof.
+// pinning an image before it is committed. An image that is not listed FAILS the run.
+// (An allowlist with no entries at all would instead report "not pinned" and pass, but
+// the embedded one has entries and -os-image-allowlist rejects an empty file.)
 //
 // A pass is only ever as strong as the image pinning inside the compose text it
 // authenticates: a floating tag keeps compose_hash identical while the code behind

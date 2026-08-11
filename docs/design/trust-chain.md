@@ -156,9 +156,9 @@ Honest gaps — half the value of this diagram is marking them (see
   TEE rather than the user's machine, so the gateway itself must be attested —
   otherwise it degrades to today's plaintext L7 router. That attestation is a
   separate artifact from this chain and is checked separately
-  (`pcverify -gateway`, below), including code identity — though the OS-image
-  allowlist that grounds it is populated for the deployed image, so that link is closed
-  for the images listed — an unlisted one fails rather than being skipped.
+  (`pcverify -gateway`, below), including code identity: the OS-image allowlist that
+  grounds it is populated for the deployed image, so that link is closed for the images
+  listed, and an unlisted one fails rather than being skipped.
 - **Replay**: defeated client-side by a per-request nonce; a server-side
   freshness field in the signed proof is still TODO.
 

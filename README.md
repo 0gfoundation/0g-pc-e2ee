@@ -45,6 +45,10 @@ flowchart LR
     P ---->|"response signature, fetched DIRECT<br/>(the router does not proxy it)"| GW
 ```
 
+Two containers are omitted for clarity: `cvm-identity`, an init container that names
+this replica and exits, and `prometheus-agent`. All four are inside the measured
+manifest — see [`deploy/phala/README.md`](deploy/phala/README.md).
+
 The gateway runs the **same client core** a caller would otherwise run locally —
 verify the provider's attestation quote, seal the request to it, verify the
 signature on the way back — just hosted, so browsers and thin clients get it with
@@ -101,9 +105,11 @@ user-facing document states it:
   how the entries were derived.
 - The **provider** hop — the one the gateway walks on your behalf — is wired end to
   end: DCAP quote verification, the `report_data` binding, and a cross-check of the
-  quote-bound signer against the provider's on-chain `teeSignerAddress`. It carries
-  its measurement allowlist is still empty, so that link runs in warn mode — and,
-  unlike the gateway's, it needs a shape change before it can be filled at all.
+  quote-bound signer against the provider's on-chain `teeSignerAddress`. Both of those
+  run in **verify-and-warn** mode in the deployed gateway, for different reasons: the
+  measurement allowlist (hop 3) is empty and — unlike the gateway's — needs a shape
+  change before it can be filled at all, while the on-chain check (hop 5) is wired but
+  its enforce switch is deliberately still off.
   [`trust-chain.md`](docs/design/trust-chain.md) marks the status of every link.
 
 ## The other end

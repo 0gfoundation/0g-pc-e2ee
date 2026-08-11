@@ -13,7 +13,9 @@ the one command below is a convenience, not the source of truth: the
 > takes your request and seals it to a provider. Verifying the *provider* that runs
 > the model is a separate chain, documented in
 > [`design/trust-chain.md`](./design/trust-chain.md); the gateway performs those
-> checks on your behalf per request.
+> checks on your behalf per request — today in **verify-and-warn** mode, because the
+> provider-side measurement allowlist is not populated yet, so a failing provider check
+> is logged rather than refused.
 
 ---
 
@@ -22,6 +24,19 @@ the one command below is a convenience, not the source of truth: the
 ```sh
 pcverify -gateway <gateway-domain>
 ```
+
+**Getting `pcverify`.** There is no published binary, and for a verification tool that
+is arguably the right default — build it from the source you are about to rely on:
+
+```sh
+git clone https://github.com/0gfoundation/0g-pc-e2ee
+cd 0g-pc-e2ee/client
+go build -o pcverify ./cmd/pcverify     # or: go run ./cmd/pcverify -gateway <domain>
+```
+
+(`go install …/cmd/pcverify@latest` does **not** work: `client/go.mod` carries a
+`replace` for the in-repo `protocol` module, which `go install` refuses. Clone and
+build.)
 
 Exit code 0 means every check below passed. Non-zero means one did not, and the
 output names which. There is nothing to configure: the tool discovers what it needs
@@ -59,20 +74,24 @@ a floating tag keeps compose_hash stable while the code changes
 PASS
 ```
 
-A matched `os image` prints only the name. When the image is **not** in the allowlist —
-or the allowlist is empty — the run prints the registers instead, because those are
-what you compare or record:
+A matched `os image` prints only the name. An image **not** in the allowlist is a
+**failure**, not a soft note — the run prints the registers so you can see what it
+saw, and exits non-zero:
 
 ```
-- os image           not pinned (allowlist is empty; see client/evidence/osimages.json)
+✗ os image           MRTD/RTMR1/RTMR2 match no allowlisted OS image (dstack-nvidia-0.5.4.1)
   observed mrtd   b24d3b24…
   observed rtmr1  6e1afb74…
   observed rtmr2  89e73ced…
   rtmr0 (vm shape, not pinned) 01361d27…
 ```
 
-`rtmr0` is listed apart because nothing compares it (see step 7), and the closing
-`note` gains a sentence saying code identity is then evidence rather than proof.
+`rtmr0` is listed apart because nothing compares it (see step 7).
+
+There is a third state — `- os image  not pinned`, which passes — but only when the
+allowlist is *empty*. A released binary's is not, and `-os-image-allowlist` rejects a
+file with no entries, so you should not see it unless you are building with the
+embedded list emptied.
 
 ---
 
@@ -122,12 +141,16 @@ those is not load-bearing.
 
 ## The checks, one at a time
 
-The enclave publishes an *evidence bundle* at `https://<domain>/evidences/`:
+The enclave publishes an *evidence bundle* at `https://<domain>/evidences/`. The
+component producing it is **dstack-ingress**, which runs inside the same CVM and is the
+thing that terminates your TLS; the gateway process that answers your API calls issues
+no quote of its own, because one quote over the whole CVM already covers it. That is why
+"the quote" below is always the ingress's cert-binding quote.
 
 | File | What it is |
 |------|-----------|
 | `quote.json` | the hardware attestation quote |
-| `sha256sum.txt` | digests of every other file in the bundle |
+| `sha256sum.txt` | digests of the certificate and the ACME account. **Not** `quote.json`: the quote is generated *from* this file's digest, so it cannot contain its own hash |
 | `cert-<domain>.pem` | the certificate chain the enclave obtained |
 | `acme-account.json` | the ACME account the certificate was issued under |
 
@@ -354,9 +377,17 @@ sha256sum -c sha256sum.txt          # every listed file must be OK
 # --- 4. endpoint binding: the cert you are served vs the cert in the bundle ---
 openssl s_client -servername "$DOMAIN" -connect "$DOMAIN:443" </dev/null 2>/dev/null \
   | openssl x509 -outform pem > served.pem
+# the WHOLE certificate, not just its key: a renewal keeps the key and changes the
+# bytes, and that is a stale bundle, not a match (see the failure table below)
+diff <(openssl x509 -in served.pem -noout -fingerprint -sha256) \
+     <(openssl x509 -in "cert-$DOMAIN.pem" -noout -fingerprint -sha256) \
+  && echo "served certificate is the one in the bundle"
+
+# only if that differs: same key means a renewal the evidence has not caught up with,
+# a different key means you are not talking to the enclave the bundle came from
 diff <(openssl x509 -in served.pem -noout -pubkey) \
      <(openssl x509 -in "cert-$DOMAIN.pem" -noout -pubkey) \
-  && echo "served certificate is the one in the bundle"
+  && echo "same public key: renewed certificate, stale evidence"
 
 # --- 5. chain trust ---
 openssl s_client -servername "$DOMAIN" -connect "$DOMAIN:443" -verify_return_error \
@@ -402,9 +433,18 @@ compute the three registers and compare:
 # 1. the release is the one the CVM is running
 test "$(sha256sum sha256sum.txt | awk '{print $1}')" = "$(cat digest.txt)"
 
-# 2. compute. -c/-m are required but affect only RTMR0, which is not compared
-cargo run --bin dstack-mr measure -c 1 -m 2G dstack-<version>/metadata.json
+# 2. compute MRTD/RTMR1/RTMR2 — dstack-mr's
+#    tdx::tdx_measurements_for_image_dir_without_rtmr0(image_dir, vm_config).
+#    The `measure` SUBCOMMAND also computes RTMR0 and therefore needs QEMU via
+#    dstack-acpi-tables, which you do not want for this.
 ```
+
+Two traps worth knowing before you compare. `MRTD` depends on the host's page-add mode
+(`vm_config.qemu_single_pass_add_pages`) — the deployment is **two-pass**, and computing
+single-pass gives a different, equally valid-looking MRTD. And the Go `dstack-mr`
+(`github.com/kvinwang/dstack-mr`) models no page-add mode at all, so it returns the
+single-pass value. `-c`/`-m` affect only RTMR0, which is not compared.
+[`osimages.json`](../client/evidence/osimages.json) records the mode each entry used.
 
 Compare `MRTD`, `RTMR1` and `RTMR2` with what `pcverify` printed. To locate a
 divergence, `dstack-mr diagnose --vm-config vm-config.json --image-dir <image>
@@ -440,7 +480,8 @@ Anything that is not a clean pass is worth reporting: open an issue at
 ## Further reading
 
 - [`design/cloud-gateway.md`](./design/cloud-gateway.md) — the gateway's design, its
-  trust model, and why it emits no attestation quote of its own
+  trust model, and why the quote comes from dstack-ingress rather than from the gateway
+  process itself
 - [`design/trust-chain.md`](./design/trust-chain.md) — the provider-side chain the
   gateway verifies per request on your behalf
 - [`../protocol/SPEC.md`](../protocol/SPEC.md) — the normative wire format: how

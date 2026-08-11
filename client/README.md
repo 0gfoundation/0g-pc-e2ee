@@ -6,8 +6,9 @@ to an attested provider enclave: **authenticity** — verify that a response rea
 came from an attested TEE provider — and **confidentiality** — on the router path,
 keep your prompt unreadable to everything between you and the provider enclave.
 
-> Status: early / design-stage. The design lives in [`docs/design`](../docs/design)
-> (see `router-e2e.md`). Interfaces will change.
+> Status: **beta** — the gateway form is deployed; interfaces will change. The design
+> lives in [`docs/design`](../docs/design): `cloud-gateway.md` (the deployed form),
+> `trust-chain.md`, `router-e2e.md`, `request-envelope-and-integrity.md`.
 
 ## One core, three forms
 
@@ -62,16 +63,20 @@ sdk/
 > shells over it and must not reimplement seal/verify. The two server forms
 > (`cmd/sidecar`, `cmd/gateway`) share one more layer: `openaiproxy/`, the
 > OpenAI-compatible HTTP handler over `core` (seal request → open response,
-> buffered and streaming). The sidecar serves it as-is; the gateway serves it
-> plus its own operational route (`/healthz`). `cmd/sidecar`,
+> buffered and streaming). The sidecar serves it as-is; the gateway adds `GET /healthz`,
+> a catch-all `/` that proxies to the router for non-inference routes, and — on a
+> separate internal listener the compose never publishes — `GET /metrics` plus an
+> optional pprof (see `-metrics-listen` / `-pprof`). `cmd/sidecar`,
 > `cmd/gateway` and `sdk/go` are Go and share `core/`; `cmd/gateway` is the one
 > form that is **server-run and 0G-operated** (attested), not user-side, despite
 > living here — it runs client-core logic on behalf of browser/thin clients.
 > `sdk/ts` is a separate language stack that cannot share the Go core and stays
 > byte-for-byte aligned only through the frozen wire spec (`protocol/SPEC.md`).
 
-Design docs live at the repo root under
-[`docs/design`](../docs/design) (currently `router-e2e.md`).
+Design docs live at the repo root under [`docs/design`](../docs/design):
+`cloud-gateway.md`, `trust-chain.md`, `router-e2e.md` and
+`request-envelope-and-integrity.md`. The user-facing verification guide is
+[`docs/verifying-the-gateway.md`](../docs/verifying-the-gateway.md).
 
 Depends on **`github.com/0gfoundation/0g-pc-e2ee/protocol`** — the shared wire
 format and verification/sealing crypto used by the broker, the router, and this

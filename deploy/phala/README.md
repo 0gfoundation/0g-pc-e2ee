@@ -232,8 +232,10 @@ sha256sum -c sha256sum.txt
 
 # 3. the served cert must be the one in the bundle. Compare public keys: the
 #    bundle carries the full chain, `s_client` gives the leaf.
-diff <(openssl x509 -in served.pem -noout -pubkey) \
-     <(openssl x509 -in cert-<DOMAIN>.pem -noout -pubkey) && echo "cert matches evidence"
+# compare the WHOLE certificate; a renewal keeps the key and changes the bytes, which
+# is a stale bundle rather than a match
+diff <(openssl x509 -in served.pem -noout -fingerprint -sha256) \
+     <(openssl x509 -in cert-<DOMAIN>.pem -noout -fingerprint -sha256) && echo "cert matches evidence"
 ```
 
 Then DCAP-verify `quote.json` and check its `report_data` — the first 32 bytes are
@@ -274,9 +276,14 @@ published guest-OS release and compare:
 # the release must be the one this CVM runs: vm_config.os_image_hash IS digest.txt
 test "$(sha256sum sha256sum.txt | awk '{print $1}')" = "$(cat digest.txt)"
 
-# from github.com/Dstack-TEE/dstack. -c/-m are required but affect only RTMR0
-cargo run --bin dstack-mr measure -c 1 -m 2G dstack-<version>/metadata.json
+# from github.com/Dstack-TEE/dstack: tdx::tdx_measurements_for_image_dir_without_rtmr0,
+# which needs no QEMU. The `measure` subcommand also computes RTMR0 and so shells out
+# to dstack-acpi-tables.
 ```
+
+Two traps: `MRTD` depends on the host's page-add mode (the deployment is **two-pass**;
+`vm_config.qemu_single_pass_add_pages` is false), and the Go `dstack-mr` models no
+page-add mode so it returns the single-pass value. `-c`/`-m` only affect RTMR0.
 
 > **Where the artifact lives depends on flavour and version**, which is easy to get
 > wrong — `meta-dstack` publishes no `dstack-nvidia` asset below v0.5.6, and it is

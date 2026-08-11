@@ -346,7 +346,7 @@ does not.
    explicitly requested, so a network problem is never reported as a verification
    failure — nor silently as a pass.
 
-   **One dependency of code identity is implemented but not yet populated.**
+   **Code identity's remaining dependency — the OS image — is now pinned.**
    `mr_config_id` is host-chosen, so the compose hash is truthful only because the
    guest OS refuses to boot when it disagrees with the app-compose delivered; the
    verifier therefore also compares the quote's image registers — `MRTD` + `RTMR1` +
