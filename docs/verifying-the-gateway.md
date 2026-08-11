@@ -7,8 +7,10 @@ enclave running code you can read — instead of taking our word for it.
 Everything here is independently checkable. Nothing in it requires trusting 0G, and
 the one command below is a convenience, not the source of truth: the
 [manual procedure](#doing-it-by-hand) needs only `curl`, `openssl`, `jq` and `sha256sum`
-for steps 1 and 3–6. Two steps need one more tool each: step 2 a DCAP quote verifier,
-step 7 `dstack-mr` plus the guest-OS image it measures.
+for steps 1, 4 and 5. The rest need one more thing each: step 2 a DCAP quote verifier;
+steps 3 and 6, which read `report_data` and `mr_config_id` out of the *verified* quote
+body, that verifier's output; and step 7 `dstack-mr` plus the guest-OS image it
+measures.
 
 > **Scope.** This document covers the **gateway** — the 0G-operated enclave that
 > takes your request and seals it to a provider. Verifying the *provider* that runs
@@ -16,9 +18,10 @@ step 7 `dstack-mr` plus the guest-OS image it measures.
 > [`design/trust-chain.md`](./design/trust-chain.md); the gateway performs those checks
 > on your behalf per request. Two of them **reject**: a provider whose TDX quote does not
 > DCAP-verify is not used, and a response whose TEE signature does not verify is not
-> returned to you. Two currently only **warn** — whether the provider's measurement is an
-> audited one, and whether its quote-bound signer matches the on-chain registry — because
-> their allowlist/enforce switches are still off.
+> returned to you. Two currently only **warn**, for different reasons: whether the
+> provider's *measurement* is an audited one cannot be enforced yet at all (the allowlist
+> is empty and needs a shape change first), and whether its quote-bound signer matches the
+> *on-chain* registry is wired with its enforce switch deliberately off.
 
 ---
 
@@ -429,9 +432,11 @@ offline.
 
 ## Doing it by hand
 
-If you would rather not run our binary, steps 1 and 3–6 are four tools — `curl`,
-`openssl`, `jq`, `sha256sum` — and the two that are not are called out where they
-appear: step 2 needs a DCAP verifier, step 7 needs `dstack-mr` and the image. `DOMAIN`
+If you would rather not run our binary, steps 1, 4 and 5 are four tools — `curl`,
+`openssl`, `jq`, `sha256sum`. The others depend on something more, called out where they
+appear: step 2 needs a DCAP verifier, steps 3 and 6 need the verified quote body it
+produces (reading those registers from the unsigned copies in `quote.json` would make the
+exercise circular), and step 7 needs `dstack-mr` and the image. `DOMAIN`
 is the gateway; the checks are numbered as above.
 
 ```bash

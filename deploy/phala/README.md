@@ -224,11 +224,13 @@ The equivalent by hand, for reference or when the tool is unavailable:
 openssl s_client -servername <DOMAIN> -connect <DOMAIN>:443 </dev/null 2>/dev/null \
   | openssl x509 -outform pem > served.pem
 
-# 2. the whole evidence bundle (all of it — sha256sum.txt covers
-#    acme-account.json too, so omitting that file fails the check)
-for f in quote.json sha256sum.txt acme-account.json cert-<DOMAIN>.pem; do
-  curl -sO "https://<DOMAIN>/evidences/$f"
-done
+# 2. the whole evidence bundle (all of it — sha256sum.txt covers acme-account.json
+#    too, so omitting that file fails the check). ONE curl call, not a loop: it reuses
+#    a single connection, and dstack picks a CVM per connection — separate requests can
+#    land on different replicas, each with its own cert, sha256sum.txt and quote, which
+#    fails the check below on a perfectly healthy deployment.
+curl -s --remote-name-all \
+  "https://<DOMAIN>/evidences/"{quote.json,sha256sum.txt,acme-account.json,cert-<DOMAIN>.pem}
 sha256sum -c sha256sum.txt
 
 # 3. the served cert must be the one in the bundle. Compare the WHOLE certificate (the
@@ -644,11 +646,18 @@ and warmer liveness).
   (`ZG_GATEWAY_ONCHAIN`), and each response's §8 TEE signature is verified
   fail-closed against that signer (`ZG_GATEWAY_VERIFY_RESPONSES`). A background
   warmer (`ZG_GATEWAY_WARM`) pre-verifies quotes so requests hit a warm cache.
-  The measurement and on-chain-signer checks only *warn* on a mismatch rather
-  than reject, because their enforce switches (`ZG_GATEWAY_ATTEST_ENFORCE`,
-  `ZG_GATEWAY_ONCHAIN_ENFORCE`) are off — the audited-image allowlist is not
-  wired yet, so enforcing measurements would reject every provider. Response
-  signatures are always fail-closed.
+  Two checks only *warn*, for **different** reasons — worth keeping apart, because one
+  is a switch and the other is not:
+  - the **on-chain signer** check (trust-chain hop 5) is wired and observed;
+    `ZG_GATEWAY_ONCHAIN_ENFORCE` is simply off, so turning it on is a config change.
+  - the **measurement** check (hop 3) cannot be enforced yet at all. Its allowlist is
+    empty, so `ZG_GATEWAY_ATTEST_ENFORCE` would reject every provider — but filling it
+    is not just a matter of supplying values: `attest.Policy` compares all five
+    registers including RTMR3, which carries the per-instance `instance_id`, so an entry
+    pins one CVM rather than one audited version. It needs the same shape change the
+    gateway's own OS-image check already made (see `trust-chain.md` hop 3).
+
+  Response signatures are always fail-closed.
 - If the gateway container is recreated with a new address, restart
   dstack-ingress too — HAProxy resolves the backend name once, at startup.
 - **Zero-downtime upgrades.** A new gateway image is a new `app_id` (above), i.e.

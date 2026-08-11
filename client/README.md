@@ -123,8 +123,12 @@ TLS on the router path.
   enforced). Whether the measurement is an *audited* one is checked against
   `attest.Policy`, but that allowlist is empty today, so the deployed gateway runs that
   part in warn mode — see [`trust-chain.md`](../docs/design/trust-chain.md) hop 3.
-- **Response authenticity** — each response is signed by the TEE key and the
-  signer matches the on-chain `teeSignerAddress`.
+- **Response authenticity** — each response carries a §8 TEE signature, checked
+  fail-closed against the **quote-bound** signer. Opt-in in the library
+  (`-verify-responses`, off by default); the deployed gateway turns it on, so a response
+  whose signature does not verify is not returned. Whether that signer is the one
+  *registered on chain* is a separate hop, and it currently only warns — see
+  [`trust-chain.md`](../docs/design/trust-chain.md) hops 5 and 11.
 - **Routing / confidentiality** — on the router path, the sensitive request
   fields (prompt, tool defs) are sealed to the provider enclave; the router reads
   only the cleartext fields — routing params (model, sampling) and billing
