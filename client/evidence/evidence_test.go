@@ -95,8 +95,8 @@ func newCA(t *testing.T) certPair {
 }
 
 // newLeaf issues a serving certificate for testDomain under ca. Passing a non-nil
-// key reuses it, which is how the same-key/different-bytes (stale evidence) case
-// is built.
+// key reuses it, which is how the same-key/different-bytes (renewal mid-apply)
+// case is built.
 func newLeaf(t *testing.T, ca certPair, serial int64, key *ecdsa.PrivateKey) certPair {
 	t.Helper()
 	if key == nil {
@@ -475,11 +475,14 @@ func TestCheck_ServedCertNotInBundle(t *testing.T) {
 	}
 }
 
-// Same key, different bytes: a renewal the evidence has not caught up with. Still
-// a failure, but reported distinctly so an operator regenerates evidence instead
-// of hunting an attack.
-func TestCheck_StaleEvidenceSameKey(t *testing.T) {
+// Same key, different bytes: a renewal caught between the evidence being
+// regenerated and HAProxy being reloaded, so the bundle holds the fresh
+// certificate and the endpoint still serves the previous one. Still a failure,
+// but reported distinctly so an operator looks at the ingress reload instead of
+// hunting an attack.
+func TestCheck_RenewalMidApplySameKey(t *testing.T) {
 	f := newFixture(t)
+	// Bundle side gets the fresh certificate; the fixture keeps serving the old one.
 	renewed := newLeaf(t, f.ca, 300, f.served.key)
 	f.files[certName(testDomain)] = append(renewed.pemBytes(), f.ca.pemBytes()...)
 	f.finalize(t, nil)
@@ -492,7 +495,7 @@ func TestCheck_StaleEvidenceSameKey(t *testing.T) {
 		t.Errorf("CertMatch = %v, want CertSameKeyDifferentCert", rep.CertMatch)
 	}
 	if rep.Pass() {
-		t.Error("Pass = true on stale evidence")
+		t.Error("Pass = true on a half-applied renewal")
 	}
 }
 
