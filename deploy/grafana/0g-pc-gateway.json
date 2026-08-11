@@ -56,7 +56,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(zg_gateway_http_requests_total{service=~\"$service\", env=~\"$env\"}[$__rate_interval]))",
+          "expr": "sum(rate(zg_gateway_http_requests_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval]))",
           "range": true,
           "refId": "A"
         }
@@ -115,7 +115,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(zg_gateway_http_requests_total{service=~\"$service\", env=~\"$env\",status=~\"5..\"}[$__rate_interval])) / clamp_min(sum(rate(zg_gateway_http_requests_total{service=~\"$service\", env=~\"$env\"}[$__rate_interval])), 1e-9)",
+          "expr": "sum(rate(zg_gateway_http_requests_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\",status=~\"5..\"}[$__rate_interval])) / clamp_min(sum(rate(zg_gateway_http_requests_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval])), 1e-9)",
           "range": true,
           "refId": "A"
         }
@@ -182,7 +182,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(zg_gateway_http_requests_total{service=~\"$service\", env=~\"$env\",status=~\"4..\"}[$__rate_interval])) / clamp_min(sum(rate(zg_gateway_http_requests_total{service=~\"$service\", env=~\"$env\"}[$__rate_interval])), 1e-9)",
+          "expr": "sum(rate(zg_gateway_http_requests_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\",status=~\"4..\"}[$__rate_interval])) / clamp_min(sum(rate(zg_gateway_http_requests_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval])), 1e-9)",
           "range": true,
           "refId": "A"
         }
@@ -249,7 +249,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(zg_gateway_http_requests_in_flight{service=~\"$service\", env=~\"$env\"})",
+          "expr": "sum(zg_gateway_http_requests_in_flight{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"})",
           "range": true,
           "refId": "A"
         }
@@ -307,7 +307,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(zg_gateway_completions_total{service=~\"$service\", env=~\"$env\",result=\"success\"}[$__rate_interval])) / clamp_min(sum(rate(zg_gateway_completions_total{service=~\"$service\", env=~\"$env\"}[$__rate_interval])), 1e-9)",
+          "expr": "sum(rate(zg_gateway_completions_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\",result=\"success\"}[$__rate_interval])) / clamp_min(sum(rate(zg_gateway_completions_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval])), 1e-9)",
           "range": true,
           "refId": "A"
         }
@@ -374,7 +374,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(zg_gateway_response_open_failures_total{service=~\"$service\", env=~\"$env\"}[$__rate_interval]))",
+          "expr": "sum(rate(zg_gateway_response_open_failures_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval]))",
           "range": true,
           "refId": "A"
         }
@@ -437,7 +437,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (route) (rate(zg_gateway_http_requests_total{service=~\"$service\", env=~\"$env\"}[$__rate_interval]))",
+          "expr": "sum by (route) (rate(zg_gateway_http_requests_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval]))",
           "range": true,
           "refId": "A",
           "legendFormat": "{{route}}"
@@ -514,7 +514,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (status) (rate(zg_gateway_http_requests_total{service=~\"$service\", env=~\"$env\"}[$__rate_interval]))",
+          "expr": "sum by (status) (rate(zg_gateway_http_requests_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval]))",
           "range": true,
           "refId": "A",
           "legendFormat": "{{status}}"
@@ -591,7 +591,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le, route) (rate(zg_gateway_http_request_duration_seconds_bucket{service=~\"$service\", env=~\"$env\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le, route) (rate(zg_gateway_http_request_duration_seconds_bucket{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval])))",
           "range": true,
           "refId": "A",
           "legendFormat": "p99 {{route}}"
@@ -602,7 +602,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.90, sum by (le, route) (rate(zg_gateway_http_request_duration_seconds_bucket{service=~\"$service\", env=~\"$env\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.90, sum by (le, route) (rate(zg_gateway_http_request_duration_seconds_bucket{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval])))",
           "range": true,
           "refId": "B",
           "legendFormat": "p90 {{route}}"
@@ -613,7 +613,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le, route) (rate(zg_gateway_http_request_duration_seconds_bucket{service=~\"$service\", env=~\"$env\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le, route) (rate(zg_gateway_http_request_duration_seconds_bucket{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval])))",
           "range": true,
           "refId": "C",
           "legendFormat": "p50 {{route}}"
@@ -690,7 +690,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(zg_gateway_http_requests_in_flight{service=~\"$service\", env=~\"$env\"})",
+          "expr": "sum(zg_gateway_http_requests_in_flight{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"})",
           "range": true,
           "refId": "A",
           "legendFormat": "in-flight"
@@ -780,7 +780,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (result) (rate(zg_gateway_completions_total{service=~\"$service\", env=~\"$env\"}[$__rate_interval]))",
+          "expr": "sum by (result) (rate(zg_gateway_completions_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval]))",
           "range": true,
           "refId": "A",
           "legendFormat": "{{result}}"
@@ -857,7 +857,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (source, stage) (rate(zg_gateway_completions_total{service=~\"$service\", env=~\"$env\",result=\"error\"}[$__rate_interval]))",
+          "expr": "sum by (source, stage) (rate(zg_gateway_completions_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\",result=\"error\"}[$__rate_interval]))",
           "range": true,
           "refId": "A",
           "legendFormat": "{{source}} / {{stage}}"
@@ -947,7 +947,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(zg_gateway_quote_cache_lookups_total{service=~\"$service\", env=~\"$env\",result=\"hit\"}[$__rate_interval])) / clamp_min(sum(rate(zg_gateway_quote_cache_lookups_total{service=~\"$service\", env=~\"$env\"}[$__rate_interval])), 1e-9)",
+          "expr": "sum(rate(zg_gateway_quote_cache_lookups_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\",result=\"hit\"}[$__rate_interval])) / clamp_min(sum(rate(zg_gateway_quote_cache_lookups_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval])), 1e-9)",
           "range": true,
           "refId": "A"
         }
@@ -1014,7 +1014,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (result) (rate(zg_gateway_quote_cache_lookups_total{service=~\"$service\", env=~\"$env\"}[$__rate_interval]))",
+          "expr": "sum by (result) (rate(zg_gateway_quote_cache_lookups_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval]))",
           "range": true,
           "refId": "A",
           "legendFormat": "{{result}}"
@@ -1091,7 +1091,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (result) (rate(zg_gateway_quote_verifications_total{service=~\"$service\", env=~\"$env\"}[$__rate_interval]))",
+          "expr": "sum by (result) (rate(zg_gateway_quote_verifications_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval]))",
           "range": true,
           "refId": "A",
           "legendFormat": "{{result}}"
@@ -1168,7 +1168,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(zg_gateway_quote_verification_duration_seconds_bucket{service=~\"$service\", env=~\"$env\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(zg_gateway_quote_verification_duration_seconds_bucket{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval])))",
           "range": true,
           "refId": "A",
           "legendFormat": "p99"
@@ -1179,7 +1179,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(zg_gateway_quote_verification_duration_seconds_bucket{service=~\"$service\", env=~\"$env\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(zg_gateway_quote_verification_duration_seconds_bucket{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval])))",
           "range": true,
           "refId": "B",
           "legendFormat": "p50"
@@ -1256,7 +1256,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (reason) (rate(zg_gateway_response_verification_failures_total{service=~\"$service\", env=~\"$env\"}[$__rate_interval]))",
+          "expr": "sum by (reason) (rate(zg_gateway_response_verification_failures_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval]))",
           "range": true,
           "refId": "A",
           "legendFormat": "{{reason}}"
@@ -1337,7 +1337,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(zg_gateway_quote_measurement_untrusted_total{service=~\"$service\", env=~\"$env\"}[$__rate_interval]))",
+          "expr": "sum(rate(zg_gateway_quote_measurement_untrusted_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval]))",
           "range": true,
           "refId": "A"
         }
@@ -1400,7 +1400,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(zg_gateway_response_open_failures_total{service=~\"$service\", env=~\"$env\"}[$__rate_interval]))",
+          "expr": "sum(rate(zg_gateway_response_open_failures_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval]))",
           "range": true,
           "refId": "A"
         }
@@ -1476,7 +1476,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "time() - max(zg_gateway_warmer_last_success_timestamp_seconds{service=~\"$service\", env=~\"$env\"})",
+          "expr": "time() - max(zg_gateway_warmer_last_success_timestamp_seconds{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"})",
           "range": true,
           "refId": "A"
         }
@@ -1543,7 +1543,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (result) (rate(zg_gateway_warmer_sweeps_total{service=~\"$service\", env=~\"$env\"}[$__rate_interval]))",
+          "expr": "sum by (result) (rate(zg_gateway_warmer_sweeps_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval]))",
           "range": true,
           "refId": "A",
           "legendFormat": "sweep {{result}}"
@@ -1554,7 +1554,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (result) (rate(zg_gateway_warmer_provider_refreshes_total{service=~\"$service\", env=~\"$env\"}[$__rate_interval]))",
+          "expr": "sum by (result) (rate(zg_gateway_warmer_provider_refreshes_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval]))",
           "range": true,
           "refId": "B",
           "legendFormat": "provider {{result}}"
@@ -1631,7 +1631,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (result) (rate(zg_gateway_collateral_cache_lookups_total{service=~\"$service\", env=~\"$env\"}[$__rate_interval]))",
+          "expr": "sum by (result) (rate(zg_gateway_collateral_cache_lookups_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval]))",
           "range": true,
           "refId": "A",
           "legendFormat": "cache {{result}}"
@@ -1642,7 +1642,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (result) (rate(zg_gateway_collateral_fetches_total{service=~\"$service\", env=~\"$env\"}[$__rate_interval]))",
+          "expr": "sum by (result) (rate(zg_gateway_collateral_fetches_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval]))",
           "range": true,
           "refId": "B",
           "legendFormat": "fetch {{result}}"
@@ -1719,7 +1719,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(zg_gateway_collateral_fetch_duration_seconds_bucket{service=~\"$service\", env=~\"$env\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(zg_gateway_collateral_fetch_duration_seconds_bucket{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval])))",
           "range": true,
           "refId": "A",
           "legendFormat": "p99"
@@ -1730,7 +1730,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(zg_gateway_collateral_fetch_duration_seconds_bucket{service=~\"$service\", env=~\"$env\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(zg_gateway_collateral_fetch_duration_seconds_bucket{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval])))",
           "range": true,
           "refId": "B",
           "legendFormat": "p50"
@@ -1820,10 +1820,10 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "go_goroutines{service=~\"$service\", env=~\"$env\"}",
+          "expr": "go_goroutines{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}",
           "range": true,
           "refId": "A",
-          "legendFormat": "{{instance}}"
+          "legendFormat": "{{instance_id}}"
         }
       ],
       "fieldConfig": {
@@ -1897,10 +1897,10 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "process_resident_memory_bytes{service=~\"$service\", env=~\"$env\"}",
+          "expr": "process_resident_memory_bytes{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}",
           "range": true,
           "refId": "A",
-          "legendFormat": "{{instance}}"
+          "legendFormat": "{{instance_id}}"
         }
       ],
       "fieldConfig": {
@@ -1974,10 +1974,10 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "rate(process_cpu_seconds_total{service=~\"$service\", env=~\"$env\"}[$__rate_interval])",
+          "expr": "rate(process_cpu_seconds_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval])",
           "range": true,
           "refId": "A",
-          "legendFormat": "{{instance}}"
+          "legendFormat": "{{instance_id}}"
         }
       ],
       "fieldConfig": {
@@ -2102,6 +2102,31 @@
         "hide": 0,
         "regex": "",
         "definition": "label_values(zg_gateway_http_requests_total, env)"
+      },
+      {
+        "name": "instance_id",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "label": "Instance",
+        "query": {
+          "query": "label_values(up{service=~\"$service\", env=~\"$env\"}, instance_id)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "includeAll": true,
+        "allValue": ".*",
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "hide": 0,
+        "regex": "",
+        "definition": "label_values(up{service=~\"$service\", env=~\"$env\"}, instance_id)"
       }
     ]
   },
