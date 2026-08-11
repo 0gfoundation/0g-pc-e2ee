@@ -333,7 +333,8 @@ func TestCheckerNote(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New: %v", err)
 		}
-		return c.note()
+		// nil report = the configuration-only note, which is what these cases assert on.
+		return c.note(nil)
 	}
 
 	// Discovery off and nothing supplied: code identity is out of scope entirely.

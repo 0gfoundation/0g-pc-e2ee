@@ -1107,3 +1107,38 @@ func TestCheck_NoDNSDiscoveryCannotFabricateACodeIdentityPass(t *testing.T) {
 		t.Error("Note is empty; a partial result must carry its caveat")
 	}
 }
+
+// The closing note must not qualify a conclusion the run never reached. When the
+// app-compose stage was in scope and did not produce compose text, the caveats that
+// *qualify* code identity ("only as strong as the image pinning…", "NOT compared
+// against a published manifest") presume it exists — saying them is worse than silence,
+// because the reader takes the note as a summary of what was established.
+//
+// This is outcome-dependent, so the configuration-only note cannot get it right: the
+// config here is a perfectly ordinary "fetch the app-compose and compare it" run.
+func TestCheck_NoteSaysCodeIdentityWasNotEstablished(t *testing.T) {
+	f := newFixture(t)
+	// A base domain is supplied, so the app-compose hop is in scope — and the fetch
+	// fails, because nothing serves the guest-agent host.
+	c := f.checker(t, Config{
+		BaseDomain:         "unreachable.invalid",
+		ExpectComposeFiles: []ExpectedCompose{{Label: "release-1", Content: []byte("services: {}\n")}},
+	})
+
+	rep, err := c.Check(context.Background(), testDomain)
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if rep.Code.FetchErr == nil {
+		t.Fatalf("test bug: the app-compose fetch was expected to fail; Code = %+v", rep.Code)
+	}
+	if !strings.Contains(rep.Note, "NOT established") {
+		t.Errorf("note does not say code identity was not established:\n  %s", rep.Note)
+	}
+	for _, presumes := range []string{"only as strong as", "NOT compared"} {
+		if strings.Contains(rep.Note, presumes) {
+			t.Errorf("note contains %q, which presumes code identity was established:\n  %s",
+				presumes, rep.Note)
+		}
+	}
+}

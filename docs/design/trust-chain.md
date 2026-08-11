@@ -7,11 +7,14 @@ integrity, §8 response signature) and [`router-e2e.md`](./router-e2e.md) (trust
 boundary, limitations); this doc assembles them into one chain so a reviewer can
 see there are no gaps — and where the gaps still are.
 
-> Status: every link below is **implemented**, with one exception noted in place — hop 12
-> covers replay client-side only; a server-side freshness field is still TODO. What varies
-> for the rest is whether the deployed gateway **enforces** the link or only **observes**
-> it (warn), which is the distinction [Implementation status](#implementation-status) draws
-> under its table — and the one that matters for what a request actually guarantees.
+> Status: every link below is **implemented**, with two exceptions noted in place. Hop 12
+> covers replay client-side only; a server-side freshness field is still TODO. And hop 3 —
+> the **code root** — cannot be enforced yet at all: its allowlist is empty *and* needs a
+> shape change before it can be filled, so it is not simply a switch left off. For the
+> rest, what varies is whether the deployed gateway **enforces** the link or only
+> **observes** it (warn), which is the distinction
+> [Implementation status](#implementation-status) draws under its table — and the one that
+> matters for what a request actually guarantees.
 
 ## The three trust roots
 

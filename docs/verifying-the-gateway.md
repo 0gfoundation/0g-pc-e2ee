@@ -413,9 +413,13 @@ is the gateway; the checks are numbered as above.
 DOMAIN=pc-gateway.0g.ai
 
 # --- 1. bundle integrity ---
-for f in quote.json sha256sum.txt acme-account.json "cert-$DOMAIN.pem"; do
-  curl -sO "https://$DOMAIN/evidences/$f"
-done
+# NOTE: four separate requests, and on a multi-replica deployment each can land on a
+# different CVM — every replica has its own certificate, its own sha256sum.txt and its
+# own quote, so a mix makes steps 1 and 3 fail on a healthy deployment. curl reuses one
+# connection when given all the URLs at once, which is why this is written as one call.
+# If it still fails, re-run: a real mismatch is stable, a replica split is not.
+curl -s --remote-name-all \
+  "https://$DOMAIN/evidences/"{quote.json,sha256sum.txt,acme-account.json,"cert-$DOMAIN.pem"}
 sha256sum -c sha256sum.txt          # every listed file must be OK
 
 # --- 4. endpoint binding: the cert you are served vs the cert in the bundle ---
@@ -427,8 +431,10 @@ diff <(openssl x509 -in served.pem -noout -fingerprint -sha256) \
      <(openssl x509 -in "cert-$DOMAIN.pem" -noout -fingerprint -sha256) \
   && echo "served certificate is the one in the bundle"
 
-# only if that differs: same key means a renewal the evidence has not caught up with,
-# a different key means you are not talking to the enclave the bundle came from
+# only if that differs: same key means a renewal the evidence has not caught up with.
+# A DIFFERENT key means either a different REPLICA (the two commands above are two
+# connections, and dstack picks a CVM per connection) or not this enclave at all —
+# re-run to tell them apart, or take both from one connection as shown in Current limits.
 diff <(openssl x509 -in served.pem -noout -pubkey) \
      <(openssl x509 -in "cert-$DOMAIN.pem" -noout -pubkey) \
   && echo "same public key: renewed certificate, stale evidence"

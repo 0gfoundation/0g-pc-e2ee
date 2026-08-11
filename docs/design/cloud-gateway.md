@@ -148,7 +148,8 @@ controlled only by that enclave?"**
 
 > **Deployment decision (resolved).** The cert binding that point 2 asks for is
 > **supplied by dstack-ingress's `/evidences`, not by a self-issued gateway
-> quote.** The gateway runs in one dstack app (one CVM) behind dstack-ingress
+> quote.** The gateway runs in one dstack app — one *or more* CVMs, each with its own
+> ingress and therefore its own certificate and quote (§7, `blue-green.md`) — behind dstack-ingress
 > (see `deploy/phala/docker-compose.yml`), whose `/evidences` quote has
 > `report_data = SHA-256(sha256sum.txt)` covering the served certificate, and a
 > `mr_config_id` committing to `compose_hash = SHA-256(the whole app-compose)`

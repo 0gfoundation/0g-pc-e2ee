@@ -560,18 +560,35 @@ const (
 	noteNoOSImage = "the OS image is NOT pinned (the allowlist is empty), so nothing establishes " +
 		"that the guest enforced the compose-hash binding — treat code identity as strong " +
 		"evidence, not proof. Endpoint identity is unaffected"
+	// When the app-compose never got authenticated, the caveats that QUALIFY code
+	// identity (floating tags, an uncompared compose file) presume something that does
+	// not exist. Saying them anyway is worse than silence: the closing note would
+	// discuss the strength of a conclusion the run never reached.
+	noteNoComposeAuthenticated = "code identity was NOT established on this run — the app-compose " +
+		"was not obtained or did not match compose_hash, so nothing above resolved compose_hash " +
+		"to a configuration. Endpoint identity is unaffected"
 )
 
-// note is the Report.Note for this run: the caveats that apply, joined. It depends on
-// the configuration rather than the outcome, so a run that fails early still states
-// what was never in scope.
-func (c *Checker) note() string {
+// note is the Report.Note for this run: the caveats that apply, joined.
+//
+// rep may be nil, which gives the configuration-only note — what was never in scope,
+// available before any check has run so an early return still carries it. Passing the
+// report refines it with what actually happened, which matters in one case the
+// configuration cannot predict: a lookup that was in scope and failed. Check does both,
+// the second via defer, so every return path ends up with the refined form.
+func (c *Checker) note(rep *Report) string {
 	var notes []string
 	cfg := c.cfg
 	noAppCompose := cfg.AppCompose == nil && strings.TrimSpace(cfg.BaseDomain) == "" && cfg.NoDNSDiscovery
+	// Attempted but unauthenticated: the app-compose stage was in scope and did not
+	// produce compose text. Not the same as never asking (noteNoCodeIdentity), and not
+	// something the config knows.
+	unauthenticated := rep != nil && !noAppCompose && rep.Code.ComposeFile == nil
 	switch {
 	case noAppCompose:
 		notes = append(notes, noteNoCodeIdentity)
+	case unauthenticated:
+		notes = append(notes, noteNoComposeAuthenticated)
 	case len(cfg.ExpectComposeFiles) == 0:
 		notes = append(notes, noteNoComposeFileCheck, noteFloatingTag)
 	default:
@@ -608,7 +625,7 @@ func (r Report) Pass() bool {
 // with a port). It returns a Report even on failure — the error return is
 // reserved for a caller mistake (an unusable domain), not for a failed check, so
 // a caller reports per-step results rather than a single opaque error.
-func (c *Checker) Check(ctx context.Context, domain string) (Report, error) {
+func (c *Checker) Check(ctx context.Context, domain string) (rep Report, err error) {
 	host, err := normalizeDomain(domain)
 	if err != nil {
 		return Report{}, err
@@ -619,7 +636,11 @@ func (c *Checker) Check(ctx context.Context, domain string) (Report, error) {
 	if h, _, splitErr := net.SplitHostPort(host); splitErr == nil {
 		name = h
 	}
-	rep := Report{Domain: host, Note: c.note()}
+	rep = Report{Domain: host, Note: c.note(nil)}
+	// Refine the note with the outcome on the way out, however this returns: the
+	// configuration cannot know that an in-scope lookup failed, and the qualifying
+	// caveats presume it did not.
+	defer func() { rep.Note = c.note(&rep) }()
 	sess := c.newSession(name)
 
 	// Step 1 — the manifest, then every file it names. The manifest bytes are kept

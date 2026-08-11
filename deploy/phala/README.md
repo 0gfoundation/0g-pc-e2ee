@@ -159,7 +159,7 @@ non-zero on any failed check, so it drops into a deploy gate:
 # The whole chain, no extra arguments: it derives the platform base domain from the
 # served domain's CNAME chain, fetches app-compose.json for the app_id the quote
 # names, and matches the compose text against the newest 5 published releases.
-go run ./client/cmd/pcverify -gateway <DOMAIN> -pccs-url https://pccs.phala.network
+cd client && go run ./cmd/pcverify -gateway <DOMAIN> -pccs-url https://pccs.phala.network
 ```
 
 The last step defaults to `-releases 5`: the `docker-compose.release.yml` asset from
