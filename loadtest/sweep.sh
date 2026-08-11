@@ -220,9 +220,33 @@ sample_peaks() {
   done
 }
 
+# calibrate reports ns/op for one L1 microbenchmark, pinned to the driver's cores
+# and single-threaded. It is a deterministic, CPU-bound unit of exactly the work
+# this measurement is about (per-frame JCS + AEAD), so it is a yardstick for the
+# host itself.
+#
+# It is run as BOOKENDS, and that is not ceremony. A shared or burstable host can
+# change speed under you between ladders — measured here at 8.6 us/op during one
+# session and 13.3 us/op hours later on the same box, a 55% swing that silently
+# inflates every utilisation figure taken after it and makes two ladders
+# uncomparable. Without a yardstick the drift is invisible and reads as a real
+# effect of whatever was changed between the runs. With one, capacity numbers also
+# become PORTABLE: a host whose calibration is k times this one's carries roughly
+# 1/k the rate, so a result can be moved to other hardware instead of being
+# quoted as an absolute.
+calibrate() {
+  (cd "$repo_root/protocol" && taskset -c "$K6_CORES" env GOMAXPROCS=1 \
+    go test -run '^$' -bench BenchmarkResponseSealFrame -benchtime 2s ./wire/ 2>/dev/null) |
+    awk '/^BenchmarkResponseSealFrame/ { print $3; exit }'
+}
+
 echo "sweep: building gateway + fixture"
 (cd "$repo_root/client" && go build -o "$out_dir/gateway" ./cmd/gateway &&
   go build -o "$out_dir/mockupstream" ./cmd/mockupstream)
+
+echo "sweep: calibrating host (BenchmarkResponseSealFrame, 1 core)"
+calib_before=$(calibrate)
+echo "sweep: calibration before = ${calib_before:-?} ns/op"
 
 echo "sweep: fixture on cores $MOCK_CORES, driver on cores $K6_CORES"
 start_fixture
@@ -374,10 +398,31 @@ for cpus in $GATEWAY_CPU_LIST; do
   done
 done
 
+calib_after=$(calibrate)
+{
+  echo "before_ns_per_op=${calib_before:-unknown}"
+  echo "after_ns_per_op=${calib_after:-unknown}"
+} >"$out_dir/calibration.txt"
+
 echo
 echo "sweep: wrote $csv"
 if command -v column >/dev/null; then
   column -s, -t "$csv"
 else
   cat "$csv"
+fi
+
+echo
+echo "sweep: host calibration ${calib_before:-?} -> ${calib_after:-?} ns/op (BenchmarkResponseSealFrame)"
+# 10% is well outside this benchmark's own run-to-run spread on a quiet host, so
+# past it the rows above were not all taken against the same machine speed and
+# should not be compared with each other — rerun on a quiet host.
+if [[ -n ${calib_before:-} && -n ${calib_after:-} ]]; then
+  awk -v a="$calib_before" -v b="$calib_after" 'BEGIN {
+    if (a <= 0) exit
+    d = (b - a) / a; if (d < 0) d = -d
+    printf "sweep: %s (drift %.1f%%)\n",
+      (d > 0.10 ? "WARNING: the host changed speed mid-sweep — rows are NOT comparable" \
+                : "host speed was stable across the sweep"), d * 100
+  }'
 fi

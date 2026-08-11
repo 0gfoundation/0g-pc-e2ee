@@ -34,6 +34,22 @@ this service. The one-line generalisation, fitted across completion lengths from
 | Shape | 200 ms TTFT, then a 16-byte frame every 40 ms; 512-byte prompt; streaming |
 | Per point | 60 s at a constant arrival rate, open-loop |
 | Build | Go 1.24.7, `-attest=false -onchain=false -warm=false -verify-responses=false` |
+| **Host calibration** | **`ResponseSealFrame` = 8,622 ns/op** — see below |
+
+**Every rate below is tied to that calibration figure, and must be moved with it.**
+This was a shared cloud host, and it changed speed: the same benchmark, same binary,
+same pinned core, measured 13,349 ns/op a few hours after these ladders were taken
+— **55% slower**, which inflated the utilisation of everything run in that later
+window by about half and made runs from the two windows uncomparable. Nothing in a
+latency percentile or a CPU figure reveals that; only the yardstick does, which is
+why `sweep.sh` now brackets every sweep with it and refuses to call rows comparable
+past 10% drift.
+
+The useful consequence is that these numbers are **portable rather than absolute**:
+on a host whose calibration is `k ×` 8,622 ns/op, scale the request rates by `1/k`.
+A modern 3.5 GHz core benchmarking at ~5,000 ns/op should carry roughly 1.7× the
+rates quoted here. Re-run the sweep on the target hardware before promising a
+number to anyone.
 
 Every row was checked for whether it is about the gateway at all: the fixture and
 the driver never exceeded 0.69 and 0.44 of their own core budgets respectively, so
@@ -105,7 +121,28 @@ the extrapolation is worth making at all.
 
 ## RPS is the wrong unit — cost scales with output tokens
 
-Per-request CPU is dominated by per-token work, so the same gateway serves wildly
+### First, what the unit is: one SSE frame
+
+The quantity actually measured is the **SSE frame** — one `data: {...}` event. The
+fixture emits `MOCK_CHUNKS` of them per response and the gateway opens each one and
+re-emits it **1:1**, one `Fprintf` and one `Flush` per frame
+(`openaiproxy.serveStream`), so frames in equal frames out and there is no
+coalescing anywhere on the path.
+
+In OpenAI-compatible streaming a provider sends **one frame per output token** —
+each chunk carries one `choices[0].delta.content` — so for ordinary traffic
+**frames = output tokens** and the two words are used interchangeably below. Two
+caveats on that equality, in the direction that matters:
+
+- A response also carries a role-only opening frame and a `finish_reason` closing
+  frame (plus a usage frame with `stream_options.include_usage`), so frames ≈
+  tokens + 2. Negligible for anything but very short completions.
+- An inference engine that **batches** several tokens into one chunk pays per
+  *chunk*, not per token. Cost tracks frames, so such a provider gets
+  proportionally more RPS out of the same gateway. If you rely on that, verify it
+  against the real provider rather than assuming it.
+
+Per-request CPU is dominated by per-frame work, so the same gateway serves wildly
 different request rates depending on how long the completions are. Three
 completion lengths, one vCPU each, showing the last healthy rate and the first
 that collapsed:
@@ -149,6 +186,30 @@ efficient per token, because the fixed 0.88 ms is a larger share of their cost.
 Quote a rate together with the completion length it assumes, or quote tokens/s and
 name the range.
 
+### Frame count dominates, but frame size is not free
+
+The tables above hold frame size fixed at 16 bytes of content. Varying it at a
+constant 40 req/s and 64 frames, in one calibration-bracketed window (12,258 →
+12,980 ns/op, 6% drift — so the ratios here are sound but the absolute utilisation
+is from the slow window and is *not* comparable to the ladders above):
+
+| bytes of content per frame | cpu | vs 16 B | TTFT p99 | in-flight |
+|---|---|---|---|---|
+| 16 | 0.331 | — | 217 ms | 113 |
+| 128 | 0.364 | +10% | 218 ms | 112 |
+| 512 | 0.477 | +44% | 2,932 ms | 229 |
+
+So **8× the payload costs only ~10% more CPU** — the per-frame envelope work (JSON,
+JCS, base64, HPKE-sealed AEAD setup, the SSE write and its flush) swamps the bytes,
+which is what makes a per-frame model work at all. It stops being cheap by 512
+bytes, where CPU is up 44% and latency has fallen apart at only 48% utilisation.
+
+This matters for interpreting the per-token figure: 16 bytes of content plus the
+chunk's JSON envelope is close to a real single-token OpenAI chunk (~200 bytes on
+the wire), so the 51 µs/token coefficient is measured on a representative frame
+rather than an artificially tiny one. A provider emitting fat multi-token deltas is
+in the +10%-per-8× regime, not a different model.
+
 ### Long completions collapse at lower CPU utilisation
 
 Worth noting for anything above a few hundred tokens: the 256-token shape broke at
@@ -183,6 +244,42 @@ accumulate for that whole window. At a modest 25 req/s that is ~15,700 held
 streams before the first one times out — **~4 GiB**, on a gateway whose CPU is
 nearly idle because no frames are arriving. Sizing RAM purely from the healthy
 steady state under-provisions exactly this failure.
+
+## Computing the RPS for your own traffic
+
+Everything above reduces to two inputs — average output tokens per response, and
+vCPU count:
+
+```
+cpu_ms_per_request  = 0.88 + 0.051 x avg_output_tokens
+knee_rps            = 900 x vCPU x 0.875^(log2(vCPU)) / cpu_ms_per_request
+operating_rps       = 0.65 x knee_rps
+concurrent_streams  = rps x avg_response_seconds
+RSS_MiB             = 17 + 0.26 x concurrent_streams
+```
+
+The `0.875^(log2 vCPU)` term is the sub-linear scaling penalty — it is 1.75× per
+doubling restated per-core, so the multiplier is 1.0 at 1 vCPU, 0.875 at 2 and
+0.766 at 4. Then scale by the host calibration as described above, and derate for
+TLS and the verification flags L2 leaves out.
+
+Worked example — 400-token average completions on a 2-vCPU CVM:
+
+```
+cpu_ms_per_request = 0.88 + 0.051 x 400          = 21.3 ms
+knee_rps           = 900 x 2 x 0.875 / 21.3      = 74 req/s
+operating_rps      = 0.65 x 74                   = 48 req/s
+```
+
+At 48 req/s with ~16 s completions that is ~770 concurrent streams, ~220 MiB.
+
+**The one number to measure in production rather than assume** is the average
+frames per response — the whole answer pivots on it, and it is the input this
+measurement cannot supply. The gateway does not currently expose it: the metrics in
+`client/metrics/metrics.go` count completions, durations and in-flight requests, but
+nothing counts frames. A histogram of frames per streamed response would turn this
+formula into a live capacity readout, and it is a handful of lines next to
+`recordCompletion`.
 
 ## Sizing a CVM
 
