@@ -10,12 +10,14 @@ broker, the router, and the client all depend on, so every participant agrees
 > prompt/tool defs to the enclave) *and* **authenticity** (attestation binding +
 > response-signature verification). It does **not** mean confidentiality alone.
 
-> Status: early / design-stage. `SPEC.md` is normative; APIs will change.
+> Status: **beta** — the wire format is in production on the deployed gateway path.
+> `SPEC.md` is normative; APIs will change.
 
 > **New to the trust model?** Start with the end-to-end
 > [**trust chain**](../docs/design/trust-chain.md) — one diagram of every hop and
 > where its trust bottoms out (hardware / code / on-chain roots), plus what is
-> *not* covered and which links are implemented vs. spec'd.
+> *not* covered and — for each link — whether the deployed gateway **enforces** it or
+> only **observes** it.
 
 ## Why this exists
 

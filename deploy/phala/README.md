@@ -237,7 +237,10 @@ diff <(openssl x509 -in served.pem -noout -fingerprint -sha256) \
      <(openssl x509 -in cert-<DOMAIN>.pem -noout -fingerprint -sha256) && echo "cert matches evidence"
 
 # only if that differs: same key means a renewal the evidence has not caught up with;
-# a different key means this is not the enclave the bundle came from
+# a different key means either a DIFFERENT REPLICA (the curl above and the s_client here
+# are two connections, and dstack picks a CVM per connection) or not this enclave at all.
+# Re-run: a real mismatch is stable, a replica split is not. pcverify avoids this
+# entirely by keeping the whole run on one connection.
 diff <(openssl x509 -in served.pem -noout -pubkey) \
      <(openssl x509 -in cert-<DOMAIN>.pem -noout -pubkey) && echo "same key: stale evidence"
 ```

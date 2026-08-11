@@ -92,9 +92,11 @@ user-facing document states it:
 - The hosted gateway is **tier 2.5** — cheating is *publicly detectable*, not
   *prevented*. Detection requires that somebody actually run the verification;
   a user who skips it is trusting 0G by default.
-- **Endpoint identity is closed**: `pcverify -gateway <domain>` proves the TLS
-  session terminates inside a genuine TDX enclave that minted the certificate
-  your client negotiated.
+- **Endpoint identity is closed**: `pcverify -gateway <domain>` proves the TLS session
+  terminates inside a genuine TDX enclave that minted the certificate served **on the
+  connection `pcverify` made**. One domain can be several CVMs, each with its own key,
+  so that is not automatically the certificate your browser negotiated — see the replica
+  note in [Current limits](docs/verifying-the-gateway.md#current-limits).
 - **Code identity is closed for the images we deploy on.** The OS-image allowlist
   ([`client/evidence/osimages.json`](client/evidence/osimages.json)) carries the
   deployed image, derived from the published guest-OS release and confirmed against a

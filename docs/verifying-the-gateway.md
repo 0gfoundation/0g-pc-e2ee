@@ -40,9 +40,26 @@ go build -o pcverify ./cmd/pcverify     # or: go run ./cmd/pcverify -gateway <do
 `replace` for the in-repo `protocol` module, which `go install` refuses. Clone and
 build.)
 
-Exit code 0 means every check below passed. Non-zero means one did not, and the
-output names which. There is nothing to configure: the tool discovers what it needs
-from the endpoint itself and from public sources.
+Exit code 0 means **no check failed** — which is not quite the same as "every check
+ran". Two lookups are *advisory by default*, because they depend on things that say
+nothing about the deployment: the release lookup reaches GitHub, and locating the
+app-compose reaches DNS and the platform. If either is unavailable, the run marks that
+line `-`, says so in the closing `note:`, and still exits 0. Read the `-` lines and the
+note, not only the exit code.
+
+**Using it as a gate.** Name what must work and those lookups become fatal instead of
+advisory:
+
+```sh
+pcverify -gateway <domain> -releases 5 -base-domain <platform-base-domain>
+# or, with the manifest and the compose text in hand:
+pcverify -gateway <domain> -expect-compose-file ./docker-compose.release.yml -app-compose ./app-compose.json
+```
+
+Asking explicitly is the whole difference: a default lookup that fails is not evidence
+against the deployment, but one you demanded and did not get leaves the claim unmade,
+and the run fails. There is otherwise nothing to configure — the tool discovers what it
+needs from the endpoint itself and from public sources.
 
 Digests below are abbreviated with `…` for readability; a real run prints them in
 full. This is what a pass looks like on today's builds:
@@ -299,6 +316,12 @@ the quote.
 
 Read this section before relying on a `PASS`.
 
+**A `PASS` can contain skipped checks.** The two advisory lookups above (releases, and
+locating the app-compose) degrade to `-` and still exit 0, so a CI gate that reads only
+the exit code treats a GitHub outage as a full pass. Either parse for `-` lines, or make
+the lookups mandatory with the explicit flags shown under
+[The one command](#the-one-command).
+
 **The OS-image allowlist covers the images 0G deploys on, and nothing else.** Step 7
 checks against [`client/evidence/osimages.json`](../client/evidence/osimages.json),
 which is populated — but only with images whose measurements have been derived and
@@ -329,11 +352,28 @@ certificate, so:
   `app_id`. Code identity therefore generalizes across replicas; endpoint identity
   does not — it is established for the connection that was checked.
 
-Within a single run this cannot bite: the bundle and the certificate are fetched over
-**one** connection, so they always describe the same replica. (If that connection is
-recycled mid-run onto a different one, the tool says
-`the connection to … changed mid-run` and asks you to re-run, rather than reporting a
-mismatch it cannot interpret.)
+**Within one `pcverify` run this cannot bite** — the bundle and the certificate ride a
+single connection, so they always describe the same replica; if that connection is
+recycled onto a different one, the tool says `the connection to … changed mid-run` and
+asks you to re-run rather than reporting a mismatch it cannot interpret.
+
+**By hand it very much can.** `curl` and `openssl s_client` are two connections, so on
+an N-replica deployment they land on different CVMs roughly (N-1)/N of the time and step
+4 fails on a perfectly healthy deployment. Either re-run until the two agree — a real
+mismatch is stable, a replica split is not — or take both from one connection, which
+`s_client` can do by carrying the request itself:
+
+```sh
+# ONE connection: the served chain (-showcerts) and a bundle file in the same output.
+# -ign_eof is load-bearing — without it s_client closes at stdin EOF and you get the
+# certificate but no HTTP response.
+printf 'GET /evidences/sha256sum.txt HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n' "$DOMAIN" |
+  openssl s_client -servername "$DOMAIN" -connect "$DOMAIN:443" -showcerts -ign_eof 2>/dev/null
+```
+
+The first `BEGIN CERTIFICATE` block is the leaf that connection served; the body after
+the HTTP headers is that same replica's `sha256sum.txt`. Compare them and you have
+step 4 with no replica ambiguity at all.
 
 If you want coverage of more than one replica, run the check again (a fresh
 connection may land elsewhere); every response also carries `X-0G-Gateway-Instance`
@@ -470,7 +510,7 @@ Release manifests are the `docker-compose.release.yml` asset on
 | `sha256sum -c` mismatch | the bundle was modified after it was hashed, or is being served by something other than the enclave |
 | quote fails DCAP verification | not a genuine TDX quote, or the platform's TCB is out of date |
 | `report_data` does not match the manifest digest | the quote belongs to a different bundle — often a stale quote republished beside regenerated evidence |
-| served certificate is not the one in the bundle | you are not talking to the enclave the bundle came from, **or** the certificate was renewed and the evidence was not regenerated (the tool distinguishes these: a renewal keeps the same public key) |
+| served certificate is not the one in the bundle | three causes, in rising order of seriousness: **(a)** by hand, the two steps hit different replicas — re-run, or take both over one connection (see the replica note in [Current limits](#current-limits)); **(b)** the certificate was renewed and the evidence was not regenerated — a renewal keeps the same public key, which is how you tell; **(c)** you are not talking to the enclave the bundle came from. `pcverify` cannot produce (a). |
 | certificate does not validate | ordinary TLS failure, an interception, or a deliberately untrusted staging certificate |
 | `app-compose` digest does not match `compose_hash` | the manifest is for a different deployment or instance — under blue/green, most often the standby side rather than the live one |
 | compose text matches no published release | **the finding that matters.** The deployment is running something that was not published. Report it. |
