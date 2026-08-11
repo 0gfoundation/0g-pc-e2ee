@@ -7,8 +7,19 @@ integrity, §8 response signature) and [`router-e2e.md`](./router-e2e.md) (trust
 boundary, limitations); this doc assembles them into one chain so a reviewer can
 see there are no gaps — and where the gaps still are.
 
-> Status: design + partial implementation. This doc marks each link as
-> **implemented** or **spec'd, not yet wired** (see [Implementation status](#implementation-status)).
+> Status: every link below is **implemented**; what differs is how far each one is
+> actually carried in the deployed gateway. Four are qualified, and the qualifications are
+> not the same kind:
+>
+> - **hop 3** (the *code root*) — cannot be enforced at all yet: the allowlist is empty
+>   *and* needs a shape change before it can be filled. Not a switch left off.
+> - **hop 5** — wired and observed; its enforce switch is deliberately off.
+> - **hop 11** — enforced, but only because `-verify-responses` is on; it is off by default.
+> - **hop 12** — replay is defeated client-side only; a server-side freshness field is TODO.
+>
+> Everything else is enforced. [Implementation status](#implementation-status) has the
+> per-link detail; the enforced-versus-observed split under its table is what determines
+> what a request actually guarantees.
 
 ## The three trust roots
 
@@ -80,9 +91,11 @@ sequenceDiagram
     Note over C,E: Data plane — response
     E->>E: fresh HPKE-seal choices to client_eph_pub, usage etc into AAD and covered by signature
     E->>E: ECDSA-secp256k1 sign = SHA256(req aad,ct) + SHA256(resp aad,ct)
-    E->>R: sealed response (+ signature)
+    E->>R: sealed response (+ chatKey header naming the cached signature)
     R->>R: read usage for billing (cannot alter, covered by signature)
     R->>C: forward
+    C->>E: GET /v1/proxy/signature/{chatKey} — DIRECT, the router does not proxy this route
+    E-->>C: ChatSignature
     C->>C: open frames (in order, final required) then verify signature: ecrecover accepts on-chain addr only
     C->>App: cleartext response
 ```
@@ -152,36 +165,119 @@ Honest gaps — half the value of this diagram is marking them (see
   chain.
 - **Cloud-gateway mode adds one attested trust party**: plaintext lands in 0G's
   TEE rather than the user's machine, so the gateway itself must be attested —
-  otherwise it degrades to today's plaintext L7 router.
+  otherwise it degrades to today's plaintext L7 router. That attestation is a
+  separate artifact from this chain and is checked separately
+  (`pcverify -gateway`, below), including code identity: the OS-image allowlist that
+  grounds it is populated for the deployed image, so that link is closed for the images
+  listed, and an unlisted one fails rather than being skipped.
 - **Replay**: defeated client-side by a per-request nonce; a server-side
   freshness field in the signed proof is still TODO.
 
 ## Implementation status
 
-The chain is fully *specified* and now largely *wired*, including the on-chain
-identity grounding (hop 5). One link is called out because the code and the spec
-do not line up one-to-one — reading either alone can mislead.
+The chain is fully *specified* and wired, including the on-chain identity grounding
+(hop 5). Read the Status note above for which links are enforced and which only observed:
+the table below says what exists, not how far the deployment carries it, and hop 3 in
+particular is implemented against an allowlist that is still empty.
 
 | Link | Status | Where |
 |------|--------|-------|
 | Hop 2 — TDX quote signature-chain verification | **Implemented.** A real go-tdx-guest DCAP verifier (quote chain → Intel root + QE identity + TCB status) fills the `WithQuoteParser` seam, wired into the sidecar, gateway, and route resolver. The seam stays in `protocol/attest` by design (keeps `protocol` lean/portable); the heavy verifier lives in the client. | `client/dcap/tdxverify.go`, `client/cmd/{sidecar,gateway}/main.go`, #29 / #31 |
-| Hop 3 — measurement allowlist | **Implemented, with a gap.** `Verifier.Verify` checks the measurement against `Policy` in enforce/warn modes (`-attest-enforce`). **The audited-image allowlist is still empty**, so warn mode proceeds on any measurement and enforce rejects every provider — populating the allowlist is the remaining work. | `attest/verify.go`, `client/cmd/gateway/main.go`, #31 |
+| Hop 3 — measurement allowlist | **Implemented, with a gap.** `Verifier.Verify` checks the measurement against `Policy` in enforce/warn modes (`-attest-enforce`). **The audited-image allowlist is still empty**, so warn mode proceeds on any measurement and enforce rejects every provider. Filling it is *not* purely a matter of supplying values — see the note below. | `attest/verify.go`, `client/cmd/gateway/main.go`, #31 |
 | Hop 4 — `report_data` → `enc_pub`/`signer_addr` | **Implemented.** `ParseReportData` (SPEC §4.2 layout). | `attest/reportdata.go` |
 | Hop 5 — `signer_addr == on-chain teeSignerAddress` | **Implemented (warn/enforce).** The route resolver cross-checks the DCAP-quote-bound signer against the provider's *acknowledged* `teeSignerAddress` read from the on-chain InferenceServing registry (`getService`), keyed on the provider's on-chain account — a mapping the untrusted router cannot forge. This is what catches a *genuine* enclave running audited code but operated by an unregistered party ([Why the on-chain root exists](#why-the-on-chain-root-exists)). Enforce skips a missing/unacknowledged/mismatched candidate; warn observes only. Reads the chain over a client-trusted RPC (`-onchain`, `-chain-rpc-url`), not the router. | `client/chain/registry.go`, `client/route` `WithOnChainVerification`, #18 |
 | Hops 6–9 — HPKE seal/open, AAD binding | **Implemented.** | `crypto/`, `wire/` |
 | Hop 11 — signature verify against signer | **Implemented (opt-in, `-verify-responses`).** The client recomputes the §8 ciphertext binding over the on-wire `aad‖ciphertext` it received (non-stream, and streamed via an ordered per-frame aggregate), recovers the EIP-191 signer, and accepts only if it equals `provider.SignerAddr` — the quote-bound signer, itself grounded on-chain when `-onchain` is on (hop 5) — never the self-reported `signing_address`. The signature is fetched **directly from the provider's broker endpoint** (the router does not proxy `/v1/proxy/signature`). Fail-closed; off by default. The versioned signed-text/binding contract is shared with the broker in `protocol/proof` (no drift). | `protocol/proof`, `client/sig`, `client/core` (verify.go), `client/route` (sigfetch.go) |
 
-So today the chain is **closed by design and enforced end-to-end** when `-attest`
-+ `-onchain` are on: the hardware, code, and on-chain roots (hops 2–5) are all
-wired. The one remaining piece is *populating* the measurement allowlist (hop 3),
-which is empty today — until it is filled, hop 3 runs in warn mode (or enforce
-rejects all). Hop 5 turns "an attested enclave" into "the **expected** attested
+So today every link is **wired**, but they are not all **enforced**, and the difference
+matters:
+
+- **Enforced** — hop 2 (quote authenticity, with `-attest`), hop 4 (`report_data` →
+  `enc_pub`), hops 6–9 (seal/open and AAD binding), and hop 11 (the §8 response
+  signature, with `-verify-responses`; fail-closed by construction). A candidate or a
+  response that fails any of these is refused.
+- **Warn only** — hop 3, because the allowlist is empty: warn proceeds on any
+  measurement and enforce would reject every provider, so `-attest-enforce` stays off.
+  And hop 5, whose `-onchain-enforce` is deliberately off while on-chain provider data
+  is still filling in; it is wired and observed, and turning it on is a switch rather
+  than work.
+
+So the **code root is the one root not yet doing its job** — hop 3 is exactly that root.
+Hop 5, once enforced, is what turns "an attested enclave" into "the **expected** attested
 enclave."
 
-**Checking a provider (`client/cmd/pcverify`).** A read-only diagnostic walks
-hops 2–5 for one provider in a single command — DCAP-verify its quote (genuine
-TDX + measurement + report_data) and cross-check the quote-bound signer against
-its acknowledged on-chain `teeSignerAddress`. Use it as the pre-enable gate
+> **Hop 3's allowlist needs a shape change first, not just values.** `Policy`
+> compares the full `Measurement` — all five registers, including **RTMR3**. In
+> dstack, RTMR3 is where per-app *and per-instance* runtime events land, including
+> `instance_id`, which is derived from a random seed at first boot
+> (`Sha256(seed ‖ app_id)`). So RTMR3 differs between two replicas of the *same*
+> deployment, and a full-equality entry pins **one instance**, not one audited
+> version — an allowlist of that shape would need a new entry per CVM, not per
+> upgrade, and could never be published ahead of a deployment.
+>
+> The workable form is the split this branch already makes for the gateway
+> (`attest.BootChain` + `BootChainPolicy`): pin **MRTD + RTMR1 + RTMR2** for the OS
+> image, and pin the application separately and more precisely by its compose hash.
+> Two questions with two lifetimes, so two mechanisms.
+>
+> Note which registers those are. **RTMR0 is excluded as well**, because it records the
+> VM shape (vCPU count, memory, ACPI/device layout) and the shape is not something this
+> check needs to establish: the code that performs the boot-time binding check lives in
+> the firmware, kernel and rootfs, which the three registers above measure. Including it
+> would have cost an entry per (image, VM shape) pair for no gain. So the allowlist is
+> **one entry per image**, computed with `dstack-mr` from the published release and then
+> confirmed against a live quote — never copied off a running machine.
+>
+> Where the expected values are *published* is still open: on-chain alongside the
+> provider registry, or as release assets of the broker repo (which `pcverify`
+> could consume with the same machinery `-releases` already uses for the gateway).
+
+**Checking a provider (`client/cmd/pcverify -provider`).** A read-only diagnostic
+walks hops 2–5 for one provider in a single command — DCAP-verify its quote
+(genuine TDX + measurement + report_data) and cross-check the quote-bound signer
+against its acknowledged on-chain `teeSignerAddress`. Use it as the pre-enable gate
 before flipping the sidecar/gateway into `-attest` / `-onchain`. The provider's
 endpoint is read from the chain (`Service.url`), so only `-provider` is required.
 `-no-quote` restricts the run to the on-chain hop.
+
+**Checking the gateway itself (`pcverify -gateway <domain>`).** The chain above
+covers the *provider* hop; in cloud-gateway mode there is one more attested party
+in front of it, and it is not on this chain — the gateway emits no quote and signs
+no responses. Its identity rests on the dstack-ingress cert-binding quote at
+`/evidences/` ([`cloud-gateway.md` §6.1](./cloud-gateway.md#61-mechanism)), which
+the gateway mode verifies: bundle integrity against its own `sha256sum.txt`, DCAP
+verification of `quote.json`, the `report_data` → manifest binding, and — the step
+that actually ties the quote to the endpoint you are talking to — the **served**
+certificate compared against the bundle's.
+
+It also covers **code identity**, which the provider chain's hop 3 does for the
+broker but which the gateway needs separately: the verified quote's `mr_config_id`
+carries `compose_hash = SHA-256(app-compose.json)` in the clear. The app-compose bytes
+are then located without anything being typed in — the platform base domain from the
+served domain's CNAME chain, the `app_id` from the quote itself (`-base-domain`
+overrides the former, `-app-compose` supplies the bytes from a file instead) — and the
+hash is what makes any source acceptable. The tool authenticates them against
+`compose_hash` before reading them, then compares the `docker_compose_file` they embed
+against the manifest that was published (`-expect-compose-file`, or by default the
+newest published releases).
+
+Underneath that sits the **gateway CVM's own OS image**, which plays the role hop 3
+plays for the broker. `mr_config_id` is written by the untrusted host; the compose hash
+is truthful only because the guest OS refuses to boot when that register disagrees with
+the app-compose actually delivered, so the OS doing that check is part of the chain. The
+tool compares the quote's image registers — `MRTD` + `RTMR1` + `RTMR2`, excluding
+`RTMR3` (the compose hash already pins the app, more precisely) and `RTMR0` (the VM
+shape, which this check does not need) — against an allowlist embedded in the binary
+(`client/evidence/osimages.json`). **That allowlist is populated** for the image the
+gateway is deployed on: the three values were computed with `dstack-mr` from the
+published guest-OS release whose `digest.txt` equals the CVM's `os_image_hash`, and then
+confirmed to equal what a live quote reports. So the step checks rather than reports, and
+an image that is not listed FAILS — a new OS image version needs an entry before it is
+deployed. Hop 3's broker allowlist is a separate, still-open task; unlike this one it
+also needs the shape change described above.
+
+Two further limits are worth stating: the compose hash is only as strong as the image
+pinning inside the compose text — a floating tag keeps it stable while the code changes
+— and waiving chain trust (`-allow-untrusted-cert`) drops the link between the
+connection and the domain, so an interceptor with its own attested CVM would satisfy
+everything else.

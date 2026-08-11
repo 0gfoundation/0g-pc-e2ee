@@ -51,6 +51,33 @@ import (
 // alternative (waiting out the stream) would make every deploy hang for minutes.
 const ShutdownTimeout = 30 * time.Second
 
+// IdleTimeout bounds how long a keep-alive connection may sit between requests.
+// Leaving it unset means there is NO bound, which is easy to misread: net/http
+// falls back to ReadTimeout when IdleTimeout is zero (Server.idleTimeout), and
+// with both zero the serve loop CLEARS the read deadline before waiting for the
+// next request — ReadHeaderTimeout does not start until that request's first byte
+// arrives (see the comment above the bufr.Peek in net/http.(*conn).serve). So the
+// 10s header timeout on these servers never fires on an idle connection: each one
+// holds a goroutine and its read/write buffers until the peer disconnects, which
+// in a fixed-memory CVM nothing else here caps.
+//
+// It is also the only one of the three server timeouts usable on these binaries.
+// WriteTimeout is an absolute deadline from the start of the request, so it would
+// truncate SSE streams — the primary response shape. ReadTimeout is the same for
+// the read side, capping request bodies, and doubles as the idle timeout anyway.
+// IdleTimeout applies only BETWEEN requests, so it can cut neither a stream nor an
+// upload.
+//
+// Sized deliberately LONG, and not to be shrunk casually. The gateway sits behind
+// dstack-ingress's HAProxy, whose backend keep-alive lives in a third-party image
+// we do not configure. A backend that closes idle connections sooner than the
+// proxy in front of it hits the classic reuse race — the proxy dispatches onto a
+// connection already closing — and POST /v1/chat/completions is not idempotent, so
+// HAProxy will not retry it. The symptom would be sporadic 502s at LOW traffic,
+// when connections finally get a chance to idle. 120s sits well above a usual
+// proxy keep-alive (1-60s) while still bounding accumulation.
+const IdleTimeout = 120 * time.Second
+
 // Serve runs srv until an interrupt or termination signal (SIGINT / SIGTERM)
 // arrives, then shuts it down gracefully: it stops accepting new connections and
 // waits up to ShutdownTimeout for in-flight requests to finish before forcing the

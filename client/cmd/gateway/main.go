@@ -215,7 +215,8 @@ func main() {
 	srv := &http.Server{
 		Addr:              *f.Listen,
 		Handler:           newHandler(built.Client, routerTarget, origins, instanceID, logger),
-		ReadHeaderTimeout: 10 * time.Second, // mitigate slow-header (Slowloris) clients
+		ReadHeaderTimeout: 10 * time.Second,     // mitigate slow-header (Slowloris) clients
+		IdleTimeout:       proxycli.IdleTimeout, // bound idle keep-alives; unset means unbounded
 	}
 	// TLS is terminated ahead of this listener, inside the same enclave
 	// (dstack-ingress, over the CVM-internal network — see deploy/phala/), so the
@@ -292,7 +293,8 @@ func startMetrics(listen string, withPprof bool, logger *slog.Logger) (stop func
 	srv := &http.Server{
 		Addr:              listen,
 		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second, // mitigate slow-header (Slowloris) clients
+		ReadHeaderTimeout: 10 * time.Second,     // mitigate slow-header (Slowloris) clients
+		IdleTimeout:       proxycli.IdleTimeout, // bound idle keep-alives; unset means unbounded
 	}
 	go func() {
 		logger.Info("metrics listening", "listen", listen)

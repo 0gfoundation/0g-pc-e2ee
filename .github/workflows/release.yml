@@ -213,7 +213,7 @@ jobs:
           | Image origin | ${IMG_NOTE} |
           | Release compose sha256 | \`${COMPOSE_SHA}\` |
 
-          **Deploy:** upload the attached \`docker-compose.release.yml\` to Phala Cloud. Its exact bytes are what \`app_id\` attests. Verify per \`deploy/phala/README.md\` — the CVM's \`app-compose.json\` \`docker_compose_file\` must be byte-identical to this asset.
+          **Deploy:** upload the attached \`docker-compose.release.yml\` to Phala Cloud. Its exact bytes go into the CVM's app-compose, whose SHA-256 is the \`compose_hash\` the quote's \`mr_config_id\` commits to (\`app_id\` is that hash's leading 20 bytes). Verify per \`deploy/phala/README.md\` — the CVM's \`app-compose.json\` \`docker_compose_file\` must be byte-identical to this asset.
 
           The tag is intentionally not \`v*\`, so it does not retrigger the image build workflow.
           EOF

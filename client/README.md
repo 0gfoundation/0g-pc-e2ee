@@ -6,8 +6,9 @@ to an attested provider enclave: **authenticity** — verify that a response rea
 came from an attested TEE provider — and **confidentiality** — on the router path,
 keep your prompt unreadable to everything between you and the provider enclave.
 
-> Status: early / design-stage. The design lives in [`docs/design`](../docs/design)
-> (see `router-e2e.md`). Interfaces will change.
+> Status: **beta** — the gateway form is deployed; interfaces will change. The design
+> lives in [`docs/design`](../docs/design): `cloud-gateway.md` (the deployed form),
+> `trust-chain.md`, `router-e2e.md`, `request-envelope-and-integrity.md`.
 
 ## One core, three forms
 
@@ -20,6 +21,12 @@ shapes:
 | **Sidecar** | A local process exposing the OpenAI API on `localhost` | You want zero code change — just point your existing OpenAI SDK at it |
 | **In-process SDK** | The core imported as a library | You want it inside your app, no extra process |
 | **Cloud-TEE gateway** | The same core run as an attested server | Browser / thin / no-install clients (introduces one attested trust party) |
+
+> **Which of the three is offered today:** the **gateway** — it is what 0G deploys
+> and what [`docs/verifying-the-gateway.md`](../docs/verifying-the-gateway.md)
+> teaches users to verify. The sidecar and the in-process SDK are built and tested
+> here, but are not currently offered as supported entry points; the table above
+> describes the architecture, not a menu.
 
 Sealing (end-to-end confidentiality) is **required on the router path** (an L7
 reseller router terminates TLS there by design) and **optional on the direct
@@ -39,6 +46,7 @@ signed — see the design doc).
 ```
 core/            # client core: quote + response-signature verification, seal, pin, fallback, key cache
 route/           # gateway route mode: pick the provider per request via the router's route-preview + broker pubkey APIs
+evidence/        # verify a deployed gateway's OWN attestation: /evidences bundle, served cert, code identity, OS image
 openaiproxy/     # shared OpenAI-compatible HTTP handler over core (used by both server forms)
 dstack/          # CVM identity: read instance_id/app_id from the dstack guest agent, and pass it between containers as a file
 cmd/
@@ -55,16 +63,20 @@ sdk/
 > shells over it and must not reimplement seal/verify. The two server forms
 > (`cmd/sidecar`, `cmd/gateway`) share one more layer: `openaiproxy/`, the
 > OpenAI-compatible HTTP handler over `core` (seal request → open response,
-> buffered and streaming). The sidecar serves it as-is; the gateway serves it
-> plus its own operational route (`/healthz`). `cmd/sidecar`,
+> buffered and streaming). The sidecar serves it as-is; the gateway adds `GET /healthz`,
+> a catch-all `/` that proxies to the router for non-inference routes, and — on a
+> separate internal listener the compose never publishes — `GET /metrics` plus an
+> optional pprof (see `-metrics-listen` / `-pprof`). `cmd/sidecar`,
 > `cmd/gateway` and `sdk/go` are Go and share `core/`; `cmd/gateway` is the one
 > form that is **server-run and 0G-operated** (attested), not user-side, despite
 > living here — it runs client-core logic on behalf of browser/thin clients.
 > `sdk/ts` is a separate language stack that cannot share the Go core and stays
 > byte-for-byte aligned only through the frozen wire spec (`protocol/SPEC.md`).
 
-Design docs live at the repo root under
-[`docs/design`](../docs/design) (currently `router-e2e.md`).
+Design docs live at the repo root under [`docs/design`](../docs/design):
+`cloud-gateway.md`, `trust-chain.md`, `router-e2e.md` and
+`request-envelope-and-integrity.md`. The user-facing verification guide is
+[`docs/verifying-the-gateway.md`](../docs/verifying-the-gateway.md).
 
 Depends on **`github.com/0gfoundation/0g-pc-e2ee/protocol`** — the shared wire
 format and verification/sealing crypto used by the broker, the router, and this
@@ -107,10 +119,16 @@ TLS on the router path.
 
 ## What it verifies
 
-- **Attestation** — the provider quote is genuine TEE hardware running the
-  expected measurement (anchored on-chain / against a published baseline).
-- **Response authenticity** — each response is signed by the TEE key and the
-  signer matches the on-chain `teeSignerAddress`.
+- **Attestation** — the provider quote is genuine TEE hardware (DCAP-verified;
+  enforced). Whether the measurement is an *audited* one is checked against
+  `attest.Policy`, but that allowlist is empty today, so the deployed gateway runs that
+  part in warn mode — see [`trust-chain.md`](../docs/design/trust-chain.md) hop 3.
+- **Response authenticity** — each response carries a §8 TEE signature, checked
+  fail-closed against the **quote-bound** signer. Opt-in in the library
+  (`-verify-responses`, off by default); the deployed gateway turns it on, so a response
+  whose signature does not verify is not returned. Whether that signer is the one
+  *registered on chain* is a separate hop, and it currently only warns — see
+  [`trust-chain.md`](../docs/design/trust-chain.md) hops 5 and 11.
 - **Routing / confidentiality** — on the router path, the sensitive request
   fields (prompt, tool defs) are sealed to the provider enclave; the router reads
   only the cleartext fields — routing params (model, sampling) and billing
@@ -118,6 +136,55 @@ TLS on the router path.
 
 See [`docs/design/router-e2e.md`](../docs/design/router-e2e.md) for the full trust
 model, the control-plane / data-plane split, and the encryption-key lifecycle.
+
+## Checking the trust chain yourself
+
+**If you are a user of a 0G-hosted gateway and want to verify it, start here:**
+[**docs/verifying-the-gateway.md**](../docs/verifying-the-gateway.md) — what each check
+proves, what you have to trust and what you do not, and the by-hand procedure for
+auditors who would rather not run our binary.
+
+`cmd/pcverify` is a read-only diagnostic with one mode per attested party:
+
+```sh
+pcverify -provider 0x…            # a provider: DCAP quote + on-chain signer (trust-chain hops 2–5)
+pcverify -gateway <domain>        # the cloud-TEE gateway: its /evidences bundle + served certificate
+```
+
+The gateway mode matters for the third form above, which adds one attested trust
+party: it verifies the dstack-ingress cert-binding quote, confirms the certificate
+the domain **actually serves** is the one that quote committed to, and — given the
+CVM's `app-compose.json` — establishes which configuration booted and whether its
+compose text is the manifest you published (`evidence/`):
+
+```sh
+pcverify -gateway <domain>   # the whole chain, incl. which release is live
+```
+
+`compose_hash` comes from the verified quote's `mr_config_id`; the platform base
+domain is derived from the served domain's CNAME chain and the `app_id` from the
+quote, so the app-compose is located without anything being typed in — and its bytes
+can come from anywhere (`-app-compose <file>`), because the hash anchors them. The
+compose text is then matched against the newest 5 published releases by default
+(`-releases N`, `0` to disable); `-expect-compose-file` pins one manifest instead.
+
+Both modes exit non-zero on a failed check, so either works as a deploy gate. See
+[`docs/design/cloud-gateway.md`](../docs/design/cloud-gateway.md) §10 for what the
+result does and does not cover.
+
+`-allow-untrusted-cert` (gateway mode) is for a hostname on the ACME staging CA. Every
+check runs either way — the evidence fetch does not verify PKI, since it rides the same
+connection whose certificate is being compared — so what the flag decides is whether the
+reported chain-trust failure blocks the verdict. It relaxes no attestation check, but
+chain trust is what ties the connection to the domain you named: waive it and an
+interceptor running its own attested CVM passes everything else. Smoke-test your own
+deployment with it; never audit someone else's.
+
+`-pccs-url` applies to whichever mode verifies a quote, pointing DCAP collateral
+fetches at a PCCS mirror (e.g. `https://pccs.phala.network`) instead of Intel PCS.
+It defaults to Intel PCS — the authority — rather than to a mirror, since a mirror
+can serve older-but-still-valid CRL / TCB Info. Pass it when Intel PCS rate-limits
+a repeated or CI run, or to match the deployment's own collateral source.
 
 ## Related repositories & products
 

@@ -10,18 +10,19 @@
 # to live in this one compose / one CVM. Two more containers ride along:
 # `cvm-identity`, a one-shot init container that tells the others which replica
 # they are, and `prometheus-agent`, which ships telemetry out. Everything below is
-# measured into app_id — including the images, the volumes, and the depends_on
-# edges — so a verifier sees the whole set.
+# measured into compose_hash (and so into app_id, its 20-byte prefix) — including the
+# images, the volumes, and the depends_on edges — so a verifier sees the whole set.
 #
 # What the attestation actually gives you (cloud-gateway.md §6.1):
 # dstack-ingress serves /evidences/ — acme-account.json, cert-<DOMAIN>.pem,
 # sha256sum.txt and quote.json — where
 #   report_data holds SHA-256(sha256sum.txt) (right-padded to 64 bytes), and
 #     sha256sum.txt covers the served certificate
-#   the quote's RTMR chain commits to app_id, the hash of the app-compose
-#     manifest — which embeds THIS file verbatim — recovered by replaying the
-#     event log against the verified quote, and therefore covering BOTH
-#     containers below
+#   the quote's mr_config_id commits to compose_hash — SHA-256 of the app-compose
+#     manifest, which embeds THIS file verbatim, and therefore covers ALL FOUR
+#     containers below. app_id is its leading 20 bytes. mr_config_id is part of
+#     the signed TD report, so reading it needs no event-log replay; see
+#     attest.ComposeHashFromMRConfigID and `pcverify -gateway`
 # So the quote proves "a CVM running exactly this app-compose obtained this
 # certificate inside the TEE". Concluding that the endpoint you are *talking to*
 # is that CVM needs one more step the quote cannot do for you: handshake with
@@ -31,9 +32,9 @@
 # whoever holds the DNS token, which is why the comparison above is the check
 # that matters.
 #
-# This is why the gateway needs no quote of its own: app_id already attests its
-# image, so the gateway exposes no attestation endpoint and signs no responses of
-# its own (inference authenticity rides each provider's SPEC §8 signature).
+# This is why the gateway needs no quote of its own: the compose_hash above already
+# covers its image, so the gateway exposes no attestation endpoint and signs no
+# responses of its own (inference authenticity rides each provider's SPEC §8 signature).
 #
 # Deploy: reference this compose file from the Phala Cloud dashboard, or via the
 # Phala CLI, with the environment and DNS records in README "Serving domain".
@@ -184,10 +185,10 @@ services:
     #
     # DEVELOPMENT: floating `:latest` so a fresh build is picked up on redeploy
     # without editing this file. This DEFEATS the attestation story and MUST be
-    # re-pinned before any attested / production deploy: app_id hashes the
+    # re-pinned before any attested / production deploy: compose_hash covers the
     # app-compose manifest, which embeds this file verbatim, so a floating tag
-    # keeps app_id — and therefore the quote — identical while the code that sees
-    # plaintext user prompts changes underneath it. Restore the digest pin
+    # keeps compose_hash — and therefore app_id and the quote — identical while the
+    # code that sees plaintext user prompts changes underneath it. Restore the digest pin
     # (`ghcr.io/0gfoundation/0g-pc-e2ee-gateway@sha256:<digest>`) and re-pin it
     # deliberately on every upgrade; see README "Pin the image digest".
     image: ghcr.io/0gfoundation/0g-pc-e2ee-gateway:latest

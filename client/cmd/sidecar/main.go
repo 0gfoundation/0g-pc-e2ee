@@ -63,7 +63,8 @@ func main() {
 	srv := &http.Server{
 		Addr:              *f.Listen,
 		Handler:           handler,
-		ReadHeaderTimeout: 10 * time.Second, // mitigate slow-header (Slowloris) clients
+		ReadHeaderTimeout: 10 * time.Second,     // mitigate slow-header (Slowloris) clients
+		IdleTimeout:       proxycli.IdleTimeout, // bound idle keep-alives; unset means unbounded
 	}
 	// Serve until a shutdown signal, then drain in-flight requests gracefully
 	// (shared with the gateway so both forms handle SIGINT/SIGTERM identically). A

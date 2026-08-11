@@ -1,6 +1,7 @@
 package attest
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"os"
@@ -19,12 +20,38 @@ const (
 
 	vecEncPub = "4b2ca0d43e4c6a25ebe0995a65ead819e78c6db879a609309804f1dc4e09894d"
 	vecSigner = "0xd45b4301940b297f76d6e622c1cea2ae660617d4"
+
+	// mr_config_id of the same provider quote: dstack MRConfigV1, so the leading
+	// byte is 0x01 and the next 32 bytes are the compose hash.
+	vecMRConfigID  = "018779f38c1cc5d1e643fbfc7238bae2c227f7ffa4c72c049802942658acfc5bee000000000000000000000000000000"
+	vecComposeHash = "8779f38c1cc5d1e643fbfc7238bae2c227f7ffa4c72c049802942658acfc5bee"
+)
+
+// Expected values for the GATEWAY cert-binding quote in
+// testdata/dstack_gateway_quote_prefix.json. Its report_data and mr_config_id
+// exercise the two dstack layouts the provider vector above does not.
+const (
+	gwMRConfigID = "0155d872aaa9c0b148228ebcf89302a52e7cd3d2529055a892a11715e863086f6a000000000000000000000000000000"
+	// The value our MRCONFIGID parse must produce…
+	gwComposeHash = "55d872aaa9c0b148228ebcf89302a52e7cd3d2529055a892a11715e863086f6a"
+	// …and, independently, what dstack's OWN `compose-hash` / `app-id` runtime
+	// events in the same quote's event log reported. Two producers, one value:
+	// that is what makes this a cross-check rather than a restatement.
+	gwEventLogComposeHash = "55d872aaa9c0b148228ebcf89302a52e7cd3d2529055a892a11715e863086f6a"
+	gwEventLogAppID       = "55d872aaa9c0b148228ebcf89302a52e7cd3d252"
+	// report_data = SHA-256(sha256sum.txt) ‖ 32 zero bytes (the cert binding).
+	gwManifestDigest = "10c8750bc70ff84d6616ff8643990015aea74b3302e639fc74c3ecff90c285ca"
 )
 
 // loadRealQuote reads the KAT fixture and returns the raw quote bytes.
 func loadRealQuote(t *testing.T) []byte {
 	t.Helper()
-	body, err := os.ReadFile("testdata/dstack_quote_prefix.json")
+	return loadQuoteFixture(t, "testdata/dstack_quote_prefix.json")
+}
+
+func loadQuoteFixture(t *testing.T, path string) []byte {
+	t.Helper()
+	body, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read fixture: %v", err)
 	}
@@ -50,10 +77,21 @@ func TestParseTDXQuoteBody_RealVector(t *testing.T) {
 		{"RTMR1", b.Measurement.RTMR1[:], vecRTMR1},
 		{"RTMR2", b.Measurement.RTMR2[:], vecRTMR2},
 		{"RTMR3", b.Measurement.RTMR3[:], vecRTMR3},
+		{"MRCONFIGID", b.MRConfigID[:], vecMRConfigID},
 	} {
 		if got := hex.EncodeToString(tc.got); got != tc.want {
 			t.Errorf("%s = %s, want %s", tc.name, got, tc.want)
 		}
+	}
+
+	// mr_config_id sits between MRTD and RTMR0; extracting the compose hash from it
+	// is what locks that offset.
+	ch, err := ComposeHashFromMRConfigID(b.MRConfigID)
+	if err != nil {
+		t.Fatalf("ComposeHashFromMRConfigID: %v", err)
+	}
+	if got := hex.EncodeToString(ch[:]); got != vecComposeHash {
+		t.Errorf("compose_hash = %s, want %s", got, vecComposeHash)
 	}
 
 	// report_data extracted structurally must decode per §4.2 to the bound keys.
@@ -118,4 +156,53 @@ func TestVerify_RealVector_MeasurementNotAllowed(t *testing.T) {
 	if _, err := v.Verify(raw); !errors.Is(err, ErrUntrustedMeasurement) {
 		t.Errorf("err = %v, want ErrUntrustedMeasurement", err)
 	}
+}
+
+// The gateway cert-binding vector: one real quote that exercises BOTH dstack
+// layouts the provider vector does not — mr_config_id carrying a compose hash,
+// and a report_data that is a bundle digest rather than SPEC §4.2 keys.
+func TestParseTDXQuoteBody_GatewayCertBindingVector(t *testing.T) {
+	b, err := ParseTDXQuoteBody(loadQuoteFixture(t, "testdata/dstack_gateway_quote_prefix.json"))
+	if err != nil {
+		t.Fatalf("ParseTDXQuoteBody: %v", err)
+	}
+	if got := hex.EncodeToString(b.MRConfigID[:]); got != gwMRConfigID {
+		t.Fatalf("MRCONFIGID = %s, want %s", got, gwMRConfigID)
+	}
+
+	// Code identity: compose_hash out of the signed register, plus the app_id the
+	// platform derives from it.
+	ch, err := ComposeHashFromMRConfigID(b.MRConfigID)
+	if err != nil {
+		t.Fatalf("ComposeHashFromMRConfigID: %v", err)
+	}
+	if got := hex.EncodeToString(ch[:]); got != gwComposeHash {
+		t.Errorf("compose_hash = %s, want %s", got, gwComposeHash)
+	}
+	// Cross-check against dstack's own RTMR3 runtime events from the same quote:
+	// our register parse and the platform's event log must agree.
+	if got := hex.EncodeToString(ch[:]); got != gwEventLogComposeHash {
+		t.Errorf("compose_hash = %s, but the event log's compose-hash event says %s", got, gwEventLogComposeHash)
+	}
+	if got := AppIDFromComposeHash(ch); got != gwEventLogAppID {
+		t.Errorf("app_id = %s, but the event log's app-id event says %s", got, gwEventLogAppID)
+	}
+
+	// This report_data is a cert binding, so §4.2 must reject it — and the
+	// evidence-layout check must accept it for the right manifest digest.
+	if _, err := ParseReportData(b.ReportData[:]); !errors.Is(err, ErrMalformedReportData) {
+		t.Errorf("ParseReportData on the gateway vector: err = %v, want ErrMalformedReportData", err)
+	}
+	if got := hex.EncodeToString(b.ReportData[:sha256.Size]); got != gwManifestDigest {
+		t.Errorf("manifest digest = %s, want %s", got, gwManifestDigest)
+	}
+	for i, by := range b.ReportData[sha256.Size:] {
+		if by != 0 {
+			t.Fatalf("cert-binding report_data padding byte %d = 0x%02x, want zero", sha256.Size+i, by)
+		}
+	}
+	// The real sha256sum.txt is not in the fixture (it lives beside the quote in the
+	// bundle, and changes on every certificate renewal), so the preimage half of the
+	// binding is covered by client/evidence's end-to-end test instead. What this
+	// vector locks is the layout: where the digest sits and that the tail is zero.
 }

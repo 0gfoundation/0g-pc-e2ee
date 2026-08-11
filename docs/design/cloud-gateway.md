@@ -1,8 +1,10 @@
 # Cloud-TEE gateway — zero-client-code E2EE with separated validation
 
-> Status: design / discussion. Sibling of [`router-e2e.md`](./router-e2e.md).
-> Some cloud specifics (GCP confidential-compute APIs, dstack feature details)
-> are marked **[verify]** — confirm against current docs before building.
+> Status: **implemented and deployed** for the path described in §5–§7 and §10 steps
+> 1–2; §10 steps 3–4 and §12 are still design. Sibling of
+> [`router-e2e.md`](./router-e2e.md). Remaining cloud specifics (GCP
+> confidential-compute APIs, some dstack feature details) are marked **[verify]** —
+> confirm against current docs before building on them.
 
 ## 1. Goal
 
@@ -146,14 +148,17 @@ controlled only by that enclave?"**
 
 > **Deployment decision (resolved).** The cert binding that point 2 asks for is
 > **supplied by dstack-ingress's `/evidences`, not by a self-issued gateway
-> quote.** The gateway runs in one dstack app (one CVM) behind dstack-ingress
+> quote.** The gateway runs in one dstack app — one *or more* CVMs, each with its own
+> ingress and therefore its own certificate and quote (§7, `blue-green.md`) — behind dstack-ingress
 > (see `deploy/phala/docker-compose.yml`), whose `/evidences` quote has
-> `report_data = SHA-256(sha256sum.txt)` covering the served certificate, and an
-> RTMR chain committing to `app_id = SHA-256(the whole app-compose)` — recovered
-> by replaying the event log against the verified quote, per §4's note in
-> `protocol/attest/dstack.go`, *not* read out of a measurement register. Because
-> `app_id` covers the whole compose, it attests **both** containers (ingress +
-> gateway) at once.
+> `report_data = SHA-256(sha256sum.txt)` covering the served certificate, and a
+> `mr_config_id` committing to `compose_hash = SHA-256(the whole app-compose)`
+> (`app_id` is its leading 20 bytes). That register is part of the signed TD
+> report, so it needs no event-log replay — see
+> `attest.ComposeHashFromMRConfigID`. Because the compose hash covers the whole
+> app-compose, it attests **every** container in the CVM at once — ingress and
+> gateway on the request path, plus the `cvm-identity` init container and the
+> `prometheus-agent` sidecar.
 >
 > What that quote proves is "a CVM running exactly this app-compose obtained this
 > certificate inside the TEE". Getting from there to "the endpoint I am talking to
@@ -164,8 +169,10 @@ controlled only by that enclave?"**
 > 1 rather than deleting it: the artifact exists, but it is **not** consumable by
 > §4's `protocol/attest` path as written. That parser expects
 > `enc_pub‖signer_addr‖version` in `report_data` and fails closed on anything
-> else, so verifying `/evidences` needs a second verifier, which is still to be
-> written.
+> else, so verifying `/evidences` needs a second verifier. That verifier now
+> exists: `attest.EvidenceReportData` / `VerifyEvidenceReportData` for the
+> cert-binding layout, and `client/evidence` for the bundle, the handshake and the
+> certificate comparison — driven by `pcverify -gateway` (§10 step 2).
 >
 > The gateway therefore needs no quote of its own and exposes **no `/quote`
 > route**. The only thing that could have required a distinct gateway quote — a
@@ -174,9 +181,10 @@ controlled only by that enclave?"**
 > signing** (see §6.2), so no gateway quote is needed at all. Inference
 > authenticity rides the provider's own SPEC §8 signature instead.
 
-1. **Cert-binding quote**: a TDX quote from inside the CVM that commits to the
-   served cert and to `app_id`. Emitted by **dstack-ingress** (`/evidences`, see
-   the decision box above), not by a gateway-issued quote API.
+1. **Cert-binding quote**: a TDX quote from inside the CVM that commits to the served
+   cert (via `report_data`) and to the deployment's `compose_hash` (via `mr_config_id`;
+   `app_id` is that hash's leading 20 bytes). Emitted by **dstack-ingress**
+   (`/evidences`, see the decision box above), not by a gateway-issued quote API.
 2. **Bind the TLS cert into that quote**: dstack-ingress puts
    `SHA-256(sha256sum.txt)` (which covers the served cert) in the quote's
    `report_data`, so the quote proves "measurement X controls *this* cert".
@@ -288,8 +296,9 @@ does not.
   response.
 - Depends on **`protocol/attest`** (issue #7) for quote verification on the
   gateway→provider hop. The gateway's *own* cert-binding quote comes from
-  dstack-ingress's `/evidences` (§6.1), whose `report_data` layout `attest` does
-  not currently parse; that verifier is still to be written.
+  dstack-ingress's `/evidences` (§6.1); its `report_data` layout is a second,
+  separate entry point in `attest` (`VerifyEvidenceReportData`) precisely because
+  the §4.2 parser must keep failing closed on it.
 - The **router** must accept the sealed request (0g-router#618) regardless of
   which client form produced it; the gateway is just another such client.
 
@@ -298,14 +307,62 @@ does not.
 1. **Gateway = the shared sidecar handler (`openaiproxy`) in a dstack CVM**, TLS
    terminated in that CVM by dstack-ingress on our own domain (§7,
    `deploy/phala/`). 0-code inference works, and the cert-binding quote is already
-   published at `/evidences/` — but nothing consumes it yet, so validation is
-   still manual. (Tier "2, un-auditable" until step 2 — internal / testing only.)
+   published at `/evidences/`. **Done.** (It was tier "2, un-auditable" while step 2 was
+   outstanding — internal/testing only; step 2 is what lifted it to 2.5.)
 2. **A verifier for that cert-binding quote.** The cert binding itself is done
-   (§6.1); what is missing is code that checks it — DCAP-verify
-   `/evidences/quote.json`, recompute `report_data`, and compare the served cert
-   against the bundle. An operator/CLI can then validate out of band. Inference
-   authenticity is the provider's SPEC §8 signature, verified independently on the
-   gateway→provider hop; the gateway issues no signature of its own. (Tier 2.5.)
+   (§6.1); what was missing is code that checks it. **Endpoint identity is now
+   done** — `pcverify -gateway <domain>` (`client/evidence`, `client/cmd/pcverify`)
+   verifies the bundle against its own `sha256sum.txt`, DCAP-verifies
+   `/evidences/quote.json`, recomputes the `report_data` binding
+   (`attest.VerifyEvidenceReportData`), and compares the **served** certificate
+   against the bundle's, so an operator or auditor validates out of band with one
+   command that exits non-zero on failure. Inference authenticity is the provider's
+   SPEC §8 signature, verified independently on the gateway→provider hop; the
+   gateway issues no signature of its own.
+
+   **Code identity is also done**, via a shorter route than this doc first
+   assumed. The verified quote's **`mr_config_id`** carries the dstack
+   `compose_hash` directly — `0x01 ‖ SHA-256(app-compose.json) ‖ padding`
+   (`dstack-types/src/mr_config.rs`, `MrConfig::V1`) — and that register is inside
+   the signed TD report, so **no event-log replay is needed**: whatever verified
+   the quote already authenticated it. `attest.ComposeHashFromMRConfigID` reads it
+   (failing closed on the V2/V3 layouts, which commit to the hash inside a digest
+   rather than carrying it), and `attest.AppIDFromComposeHash` derives the `app_id`
+   the platform labels by. The `compose-hash` runtime event in RTMR3 carries the
+   same value and is kept only as a cross-check in the KAT.
+
+   From there `pcverify -gateway` closes the chain with no extra arguments: it
+   derives the platform base domain from the served domain's CNAME chain
+   (`evidence.DeriveBaseDomain` — dstack points a served name at `_.<base_domain>`),
+   fetches the app-compose from the guest agent of the `app_id` **the quote itself
+   names**, and checks `sha256 == compose_hash` (`evidence.VerifyAppCompose`) before
+   believing anything in it. `-app-compose` supplies those bytes from a file
+   instead — a deploy record, a release asset, a copy-paste — because the compose
+   hash anchors them; no Phala Cloud API access is required.
+
+   Naming what *should* be running defaults to the newest 5 published releases
+   (`-releases`), so the report says which release is live and flags "none of them";
+   `-expect-compose-file` overrides that with a single pinned manifest. Neither DNS
+   nor GitHub is trusted to decide anything: DNS only *locates* the app-compose (a
+   wrong or hijacked answer yields a failed lookup or a failed binding, never a false
+   pass), and a release asset is only ever compared against text the quote already
+   authenticated. Both lookups are advisory when they happen by default and fatal when
+   explicitly requested, so a network problem is never reported as a verification
+   failure — nor silently as a pass.
+
+   **Code identity's remaining dependency — the OS image — is now pinned.**
+   `mr_config_id` is host-chosen, so the compose hash is truthful only because the
+   guest OS refuses to boot when it disagrees with the app-compose delivered; the
+   verifier therefore also compares the quote's image registers — `MRTD` + `RTMR1` +
+   `RTMR2`, via `attest.BootChainPolicy`, excluding `RTMR3` (`compose_hash` pins the app
+   more precisely) and `RTMR0` (the VM shape, which this check does not need to
+   establish) — against an allowlist embedded in the binary
+   (`client/evidence/osimages.json`). **That allowlist is now populated** for the image
+   the deployment runs, derived from the published guest-OS release and confirmed
+   against a live quote, so the step checks rather than reports. An image that is not
+   listed is a failure, so a new OS image version needs an entry before it is deployed
+   — per version, not per deployment. Hop 3's broker allowlist in `trust-chain.md` is a
+   separate, still-open task.
 3. **Publish `measurement ↔ cert` (transparency log / on-chain) + monitoring**,
    so cheating is publicly detectable without per-user effort.
 4. **Optional tier-3 path**: a WASM verify+seal SDK for clients that want
@@ -315,7 +372,27 @@ does not.
 ## 11. Limitations & caveats
 
 - **Tier 2.5, not tier 3**: detection, not prevention; relies on someone running
-  validation; default-trust for users who skip it. State this in product copy.
+  validation (`pcverify -gateway`); default-trust for users who skip it. The
+  user-facing statement of exactly this — what a pass proves, what remains trusted,
+  and the current limits — is [`../verifying-the-gateway.md`](../verifying-the-gateway.md);
+  keep product copy consistent with it rather than restating it.
+- **The gateway CVM's OS measurement is pinned, with two stated caveats.**
+  `mr_config_id` is
+  host-supplied, and what makes it truthful is the guest refusing to boot when it
+  disagrees with the real `app-compose.json`
+  (dstack `config_id_verifier.rs`) — a check whose integrity rests on `MRTD` / `RTMR1` /
+  `RTMR2` being the audited dstack OS. Those three measure the firmware, kernel and
+  rootfs, i.e. every piece of code performing that check; `RTMR0` is excluded because it
+  records the VM shape, which the check does not depend on, and pinning it would have
+  cost an entry per (image, shape) pair rather than per image. The allowlist
+  (`attest.BootChainPolicy`, `client/evidence/osimages.json`) carries the deployed
+  image, computed with `dstack-mr` from the published guest-OS release matched to the
+  CVM's `os_image_hash` and confirmed against a live quote — so a modified OS image that
+  skipped the boot check no longer passes. The two caveats: the values come from the
+  published release rather than a source rebuild, so that tarball is in the trust path
+  until `reproduce.sh` runs in CI; and `MRTD` also depends on the host's page-add mode
+  (`two_pass_add_pages`), recorded per entry. Both are properties of the derivation, not
+  of what a match proves about the image.
 - **Two enclaves see plaintext** (gateway + provider), vs one for direct-seal.
 - **Metadata** (model, sizes, timing) is visible as in the router path.
 - **The browser origin allowlist is not authentication.** Serving no-install

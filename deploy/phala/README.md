@@ -8,7 +8,8 @@ model (tier 2.5: confidential by default, cheating publicly detectable).
 
 ## How it works
 
-Two containers, one CVM, one measured compose file:
+One CVM, one measured compose file, four containers — the two on the request path
+plus two that only support them:
 
 ```
 client ──TLS──> platform host front end ──> dstack gateway ──passthrough──┐
@@ -16,8 +17,15 @@ client ──TLS──> platform host front end ──> dstack gateway ──pas
                                                                           v
                                        ┌──────────────── this CVM ────────────────┐
                                        │ dstack-ingress ──plaintext──> gateway    │
+                                       │                                          │
+                                       │ cvm-identity (init, exits)               │
+                                       │ prometheus-agent ──metrics out──▶        │
                                        └──────────────────────────────────────────┘
 ```
+
+The two support containers are covered below: [`cvm-identity`](#telling-replicas-apart)
+writes this replica's `instance_id`/`app_id` once at boot and exits, and
+[`prometheus-agent`](#metrics-prometheus) ships telemetry out.
 
 - [dstack-ingress](https://github.com/Dstack-TEE/dstack-examples/tree/main/custom-domain)
   terminates TLS **inside this CVM**: it generates the key in the enclave, gets a
@@ -35,12 +43,12 @@ client ──TLS──> platform host front end ──> dstack gateway ──pas
   `depends_on` covers startup only.)
 - dstack-ingress serves `/evidences/` (`quote.json`, `cert-<DOMAIN>.pem`,
   `acme-account.json`, `sha256sum.txt`). The quote's `report_data` holds
-  `SHA-256(sha256sum.txt)`, and `sha256sum.txt` covers the served certificate;
-  its RTMR chain commits to this app's `app_id`, the hash of the app-compose
-  manifest that embeds this compose file verbatim. So one quote proves *"a CVM
-  running exactly this app-compose obtained this certificate inside the TEE"*,
-  covering both containers. See [Verify](#verify) for the step the quote cannot do
-  for you.
+  `SHA-256(sha256sum.txt)`, and `sha256sum.txt` covers the served certificate; its
+  `mr_config_id` commits to `compose_hash`, the SHA-256 of the app-compose manifest
+  that embeds this compose file verbatim (`app_id` is its leading 20 bytes). So one
+  quote proves *"a CVM running exactly this app-compose obtained this certificate
+  inside the TEE"*, covering all four containers. See [Verify](#verify) for the steps
+  the quote cannot do for you.
 
 ## Serving domain
 
@@ -64,11 +72,12 @@ only symptom is an interpolation error at boot.
 Only variables the compose file actually references reach the container. Setting
 anything else in the CVM environment does nothing; changing what the compose
 references means editing the file, which changes `app_id`. Two optional
-dstack-ingress variables are therefore commented out in the compose rather than
-listed above — `ACME_EMAIL` (optional, and published in the evidence bundle, so
-the address would be world-readable at
-`https://<DOMAIN>/evidences/acme-account.json`) and `ACME_STAGING` (see
-[Deploy](#deploy)).
+dstack-ingress variables are therefore handled differently from the four above.
+`ACME_EMAIL` is **commented out** in the compose — it is optional, and it is published in
+the evidence bundle, so any address there would be world-readable at
+`https://<DOMAIN>/evidences/acme-account.json`. `ACME_STAGING` **is** referenced
+(`${ACME_STAGING:-false}`), precisely so it can be switched by value without editing the
+measured text — see [Deploy](#deploy).
 
 Whoever runs the served zone's DNS creates three CNAMEs **once, before the first
 boot**. They all point into the delegation zone, so they never change again — not
@@ -135,35 +144,186 @@ curl https://<DOMAIN>/healthz
 
 Attestation — this is the part that actually proves something. Fetching the
 bundle is not enough; the load-bearing step is comparing the **served**
-certificate with the one the quote commits to:
+certificate with the one the quote commits to.
+
+> This section is the operator's view. The **user-facing** version — what each check
+> proves, which trust assumptions remain, and the by-hand procedure — is
+> [`docs/verifying-the-gateway.md`](../../docs/verifying-the-gateway.md). Point beta
+> users at that, not at this file.
+
+`pcverify -gateway` does all of that in one command — bundle integrity, DCAP
+verification of `quote.json`, the `report_data` binding, the served-certificate
+comparison, code identity, and the OS image the compose binding rests on — and exits
+non-zero on any failed check, so it drops into a deploy gate:
+
+```sh
+# The whole chain, no extra arguments: it derives the platform base domain from the
+# served domain's CNAME chain, fetches app-compose.json for the app_id the quote
+# names, and matches the compose text against the newest 5 published releases.
+cd client && go run ./cmd/pcverify -gateway <DOMAIN> -pccs-url https://pccs.phala.network
+```
+
+The last step defaults to `-releases 5`: the `docker-compose.release.yml` asset from
+the newest 5 published releases of this repo (`-repo` / `-release-asset` to override;
+drafts and prereleases are skipped). It reports **which** release is live, and its
+interesting answer is "none of them". The repo is public, so no credentials are
+needed — set `GITHUB_TOKEN` only for a private repo or to lift the unauthenticated
+rate limit.
+
+Two ways to change what the compose text is compared against:
+
+```sh
+# a gate: it must be exactly the manifest you deployed
+… -expect-compose-file docker-compose.release.yml
+
+# no comparison at all (offline, or GitHub deliberately out of the loop)
+… -releases 0
+```
+
+Because `-releases` has a default, its failure mode depends on whether you asked for
+it: an unreachable or rate-limited GitHub on a **default** run is reported as
+advisory (`-`) and does not fail, since it says nothing about the deployment, while an
+explicit `-releases N` that cannot be satisfied is fatal. Passing
+`-expect-compose-file` simply overrides the default; passing it *and* an explicit
+`-releases` is rejected, since they answer different questions.
+
+Nothing about the app-compose lookup has to be typed in: the base domain comes from
+DNS (`-base-domain` overrides it, `-no-dns-discovery` turns it off) and the `app_id`
+comes from **the quote**, never from you or from DNS. That last part matters under
+blue/green, where both sides are live under different `app_id`s and picking one by
+hand is how you end up verifying the standby. Use `-app-compose <file>` when the
+guest agent is unreachable or the app's `public_tcbinfo` is off; the bytes are
+anchored by the quote's `compose_hash`, so their source does not have to be trusted.
+
+`-no-dns-discovery` with no `-app-compose` / `-base-domain` leaves the app-compose
+stage with nothing to run on, so code identity is reported as **not checked** — the
+run can still pass on endpoint identity (declining a check is not a failure), and the
+closing note says which case it is in. Combining it with an explicit
+`-expect-compose-file` / `-releases N` is a contradiction and fails: a comparison was
+demanded that cannot be performed.
+
+Add `-allow-untrusted-cert` when checking a hostname brought up against the ACME
+staging CA (`ACME_STAGING=true`): its certificate is correctly bound by the quote but
+deliberately signed by an untrusted CA, so the chain-trust step fails on purpose. Every
+other check runs without the flag; what it decides is whether that one failure blocks
+the verdict.
+
+It relaxes no attestation check, but it is **not** free: chain trust is what ties
+the connection to the domain you named, so waiving it lets an interceptor running
+its *own* attested CVM satisfy every other check — its own quote, its own
+consistent bundle, its own certificate, which then matches that bundle because it
+controls both. The claim narrows to "a genuine TEE minted the certificate served on
+this connection". Fine for smoke-testing a deployment you operate; never for
+auditing an endpoint you do not control, and never on the production hostname. The
+tool prints this caveat on any run that uses the flag.
+
+The equivalent by hand, for reference or when the tool is unavailable:
 
 ```bash
 # 1. the cert the endpoint actually serves
 openssl s_client -servername <DOMAIN> -connect <DOMAIN>:443 </dev/null 2>/dev/null \
   | openssl x509 -outform pem > served.pem
 
-# 2. the whole evidence bundle (all of it — sha256sum.txt covers
-#    acme-account.json too, so omitting that file fails the check)
-for f in quote.json sha256sum.txt acme-account.json cert-<DOMAIN>.pem; do
-  curl -sO "https://<DOMAIN>/evidences/$f"
-done
+# 2. the whole evidence bundle (all of it — sha256sum.txt covers acme-account.json
+#    too, so omitting that file fails the check). ONE curl call, not a loop: it reuses
+#    a single connection, and dstack picks a CVM per connection — separate requests can
+#    land on different replicas, each with its own cert, sha256sum.txt and quote, which
+#    fails the check below on a perfectly healthy deployment.
+curl -s --remote-name-all \
+  "https://<DOMAIN>/evidences/"{quote.json,sha256sum.txt,acme-account.json,cert-<DOMAIN>.pem}
 sha256sum -c sha256sum.txt
 
-# 3. the served cert must be the one in the bundle. Compare public keys: the
-#    bundle carries the full chain, `s_client` gives the leaf.
+# 3. the served cert must be the one in the bundle. Compare the WHOLE certificate (the
+#    bundle carries the full chain, `s_client` gives the leaf): a renewal keeps the key
+#    and changes the bytes, which is a stale bundle rather than a match.
+diff <(openssl x509 -in served.pem -noout -fingerprint -sha256) \
+     <(openssl x509 -in cert-<DOMAIN>.pem -noout -fingerprint -sha256) && echo "cert matches evidence"
+
+# only if that differs: same key means a renewal the evidence has not caught up with;
+# a different key means either a DIFFERENT REPLICA (the curl above and the s_client here
+# are two connections, and dstack picks a CVM per connection) or not this enclave at all.
+# Re-run: a real mismatch is stable, a replica split is not. pcverify avoids this
+# entirely by keeping the whole run on one connection.
 diff <(openssl x509 -in served.pem -noout -pubkey) \
-     <(openssl x509 -in cert-<DOMAIN>.pem -noout -pubkey) && echo "cert matches evidence"
+     <(openssl x509 -in cert-<DOMAIN>.pem -noout -pubkey) && echo "same key: stale evidence"
 ```
 
 Then DCAP-verify `quote.json` and check its `report_data` — the first 32 bytes are
-`SHA-256(sha256sum.txt)`, right-padded to 64. Finally confirm the code: replay the
-event log against the verified quote to recover `app_id`, fetch the CVM's
-`app-compose.json` (Phala Cloud dashboard / API), check its `docker_compose_file`
-is byte-identical to the **`docker-compose.release.yml` from the GitHub Release
-you deployed** (the digest-pinned manifest), and that hashing the manifest
-reproduces that `app_id`. The [`docker-compose.yml`](./docker-compose.yml) checked
-in here carries the floating `:latest` gateway tag for development and will **not**
-match a production `app_id` — the Release asset is the attested artifact.
+`SHA-256(sha256sum.txt)`, right-padded to 64.
+
+Then code identity. `compose_hash` is in the verified quote's **`mr_config_id`** —
+`0x01 ‖ SHA-256(app-compose.json) ‖ zero padding` — so it is read straight out of
+the signed TD report, with no event-log replay (the `compose-hash` runtime event in
+RTMR3 carries the same value if you want a cross-check). `app_id` is its leading 20
+bytes:
+
+```bash
+# app-compose.json, from the platform guest agent (public_tcbinfo defaults on).
+# APP is the app_id from the quote's mr_config_id — not one you pick.
+APP=<app_id>
+curl -s "https://$APP-8090.<cluster>.phala.network/prpc/Info" > info.json
+jq -r '.tcb_info' info.json > tcb.json
+jq -j '.app_compose' tcb.json > app-compose.json   # -j: no trailing newline
+
+# it must hash to the quote's compose_hash — this is what makes the bytes trustworthy
+shasum -a 256 app-compose.json
+
+# then its embedded compose text must be the manifest you deployed
+jq -j '.docker_compose_file' app-compose.json > deployed-compose.yml
+diff deployed-compose.yml docker-compose.release.yml
+```
+
+Finally the OS image, which is what makes the step above mean anything: `mr_config_id`
+is written by the untrusted host, and the compose hash is truthful only because the
+guest OS refuses to boot when that register disagrees with the app-compose it actually
+received (dstack `config_id_verifier.rs`). So the OS doing that check is part of the
+chain, and the quote's `MRTD` + `RTMR1` + `RTMR2` are what identify it — the virtual
+firmware, the kernel, and the cmdline (carrying the rootfs verity hash) plus initrd,
+i.e. every piece of code that performs that boot-time check. Compute them from the
+published guest-OS release and compare:
+
+```bash
+# the release must be the one this CVM runs: vm_config.os_image_hash IS digest.txt.
+# Run this INSIDE the unpacked image directory — the evidence bundle has a sha256sum.txt
+# too, and comparing that one against the image's digest.txt fails every time.
+cd dstack-<version>/
+test "$(sha256sum sha256sum.txt | awk '{print $1}')" = "$(cat digest.txt)"
+
+# from github.com/Dstack-TEE/dstack: tdx::tdx_measurements_for_image_dir_without_rtmr0,
+# which needs no QEMU. The `measure` subcommand also computes RTMR0 and so shells out
+# to dstack-acpi-tables.
+```
+
+Two traps: `MRTD` depends on the host's page-add mode (the deployment is **two-pass**;
+`vm_config.qemu_single_pass_add_pages` is false), and the Go `dstack-mr` models no
+page-add mode so it returns the single-pass value. `-c`/`-m` only affect RTMR0.
+
+> **Where the artifact lives depends on flavour and version**, which is easy to get
+> wrong — `meta-dstack` publishes no `dstack-nvidia` asset below v0.5.6, and it is
+> tempting to conclude the image is unpublished. It is not: nvidia images **before
+> v0.5.6** come from
+> [`nearai/private-ml-sdk`](https://github.com/nearai/private-ml-sdk/releases). That is
+> the split Phala's own verifier encodes (`trust-center`
+> `packages/verifier/src/utils/imageDownloader.ts`, `getNvidiaRepo`). Base and dev
+> flavours below 0.6.0 come from `meta-dstack`; 0.6.0 and later from dstack's own
+> `guest-os-*` releases. Each entry in `osimages.json` records the exact source it was
+> computed from, so a reviewer can fetch the same artifact without rediscovering this.
+
+Two registers are deliberately excluded. `RTMR3` holds the per-app and per-instance
+events, which `compose_hash` already covers more precisely. `RTMR0` records the **VM
+shape** (vCPU, RAM, ACPI/device layout), which this check does not need to establish —
+so an entry is **one per image**, not one per (image, shape) pair, and the `-c`/`-m`
+values above do not affect the result. Once the three values are derived and confirmed
+against a live quote they belong in
+[`client/evidence/osimages.json`](../../client/evidence/osimages.json), which
+`pcverify` embeds so no user ever supplies it.
+
+The [`docker-compose.yml`](./docker-compose.yml) checked in here carries the floating
+`:latest` gateway tag for development and will **not** match a production deployment
+— the Release asset is the attested artifact. And note what a floating tag costs even
+when every check above passes: `compose_hash` stays identical while the image behind
+the tag changes, so code identity is only ever as strong as the pinning in the compose
+text it authenticates.
 
 Skip step 3 and the quote only proves *some* CVM obtained *some* certificate — it
 says nothing about the endpoint you are talking to. Skip the `app-compose.json`
@@ -262,7 +422,8 @@ is not guaranteed bit-identical, so reuse preserves the original digest).
 2. Resolves that commit's gateway image digest (`sha-<full-sha>` tag →
    `@sha256:…`).
 3. Generates `docker-compose.release.yml` by replacing **only** the gateway
-   `image:` line with the `@sha256:` pin — every other byte (env, ingress,
+   `image:` lines — both of them, `gateway` and `cvm-identity`, in one substitution
+   so they cannot disagree — with the `@sha256:` pin; every other byte (env, ingress,
    prometheus) is identical to the compose at that commit, so the two cannot
    drift. A guard fails the run if the gateway is still on a floating tag.
 4. Computes a version `release-YYYY.MM.DD.N` (UTC date; `N` auto-incremented from
@@ -479,17 +640,24 @@ and warmer liveness).
   header and are unaffected by any of this. The default carries two `localhost`
   ports as development conveniences — drop them via the override on a deployment
   that does not need dev hosts reaching this enclave.
-- **Provider verification** is on in verify-and-warn mode. Each provider's TDX
+- **Provider verification** is on, part enforced and part verify-and-warn. Each provider's TDX
   quote is DCAP-verified (`ZG_GATEWAY_ATTEST`), its quote-bound signer is
   cross-checked against the on-chain `teeSignerAddress`
   (`ZG_GATEWAY_ONCHAIN`), and each response's §8 TEE signature is verified
   fail-closed against that signer (`ZG_GATEWAY_VERIFY_RESPONSES`). A background
   warmer (`ZG_GATEWAY_WARM`) pre-verifies quotes so requests hit a warm cache.
-  The measurement and on-chain-signer checks only *warn* on a mismatch rather
-  than reject, because their enforce switches (`ZG_GATEWAY_ATTEST_ENFORCE`,
-  `ZG_GATEWAY_ONCHAIN_ENFORCE`) are off — the audited-image allowlist is not
-  wired yet, so enforcing measurements would reject every provider. Response
-  signatures are always fail-closed.
+  Two checks only *warn*, for **different** reasons — worth keeping apart, because one
+  is a switch and the other is not:
+  - the **on-chain signer** check (trust-chain hop 5) is wired and observed;
+    `ZG_GATEWAY_ONCHAIN_ENFORCE` is simply off, so turning it on is a config change.
+  - the **measurement** check (hop 3) cannot be enforced yet at all. Its allowlist is
+    empty, so `ZG_GATEWAY_ATTEST_ENFORCE` would reject every provider — but filling it
+    is not just a matter of supplying values: `attest.Policy` compares all five
+    registers including RTMR3, which carries the per-instance `instance_id`, so an entry
+    pins one CVM rather than one audited version. It needs the same shape change the
+    gateway's own OS-image check already made (see `trust-chain.md` hop 3).
+
+  Response signatures are always fail-closed.
 - If the gateway container is recreated with a new address, restart
   dstack-ingress too — HAProxy resolves the backend name once, at startup.
 - **Zero-downtime upgrades.** A new gateway image is a new `app_id` (above), i.e.

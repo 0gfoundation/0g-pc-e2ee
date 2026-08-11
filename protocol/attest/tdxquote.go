@@ -23,6 +23,7 @@ const (
 	minQuoteLen = quoteHeaderLen + tdBodyLen // 632
 
 	mrtdOff       = 184
+	mrConfigIDOff = 232
 	rtmr0Off      = 376
 	rtmr1Off      = 424
 	rtmr2Off      = 472
@@ -30,12 +31,21 @@ const (
 	reportDataOff = 568
 )
 
+// mrConfigIDLen is the length of the mr_config_id register (48 bytes, like the
+// measurement registers).
+const mrConfigIDLen = measurementRegLen
+
 // QuoteBody is the structurally-extracted content of a TDX quote: its
-// measurement registers and 64-byte report_data. It carries NO judgment about
-// whether the quote is genuine.
+// measurement registers, mr_config_id, and 64-byte report_data. It carries NO
+// judgment about whether the quote is genuine.
 type QuoteBody struct {
 	Measurement Measurement
-	ReportData  [reportDataLen]byte
+	// MRConfigID is the TD's mr_config_id register. Intel treats it as opaque
+	// config data supplied by the host at TD build time; dstack uses it to commit
+	// to the app's identity — see ComposeHashFromMRConfigID. It sits inside the
+	// signed TD report, so a verified quote authenticates it.
+	MRConfigID [mrConfigIDLen]byte
+	ReportData [reportDataLen]byte
 }
 
 // ParseTDXQuoteBody extracts the measurement registers and report_data from a
@@ -54,6 +64,7 @@ func ParseTDXQuoteBody(raw []byte) (QuoteBody, error) {
 	}
 	var b QuoteBody
 	copy(b.Measurement.MRTD[:], raw[mrtdOff:mrtdOff+measurementRegLen])
+	copy(b.MRConfigID[:], raw[mrConfigIDOff:mrConfigIDOff+mrConfigIDLen])
 	copy(b.Measurement.RTMR0[:], raw[rtmr0Off:rtmr0Off+measurementRegLen])
 	copy(b.Measurement.RTMR1[:], raw[rtmr1Off:rtmr1Off+measurementRegLen])
 	copy(b.Measurement.RTMR2[:], raw[rtmr2Off:rtmr2Off+measurementRegLen])
