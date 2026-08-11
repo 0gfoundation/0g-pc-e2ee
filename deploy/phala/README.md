@@ -234,18 +234,20 @@ curl -s --remote-name-all \
 sha256sum -c sha256sum.txt
 
 # 3. the served cert must be the one in the bundle. Compare the WHOLE certificate (the
-#    bundle carries the full chain, `s_client` gives the leaf): a renewal keeps the key
-#    and changes the bytes, which is a stale bundle rather than a match.
+#    bundle carries the full chain, `s_client` gives the leaf). A renewal can change the
+#    bytes while the two sides are briefly out of step, which is a half-applied renewal
+#    rather than a match.
 diff <(openssl x509 -in served.pem -noout -fingerprint -sha256) \
      <(openssl x509 -in cert-<DOMAIN>.pem -noout -fingerprint -sha256) && echo "cert matches evidence"
 
-# only if that differs: same key means a renewal the evidence has not caught up with;
-# a different key means either a DIFFERENT REPLICA (the curl above and the s_client here
-# are two connections, and dstack picks a CVM per connection) or not this enclave at all.
-# Re-run: a real mismatch is stable, a replica split is not. pcverify avoids this
-# entirely by keeping the whole run on one connection.
-diff <(openssl x509 -in served.pem -noout -pubkey) \
-     <(openssl x509 -in cert-<DOMAIN>.pem -noout -pubkey) && echo "same key: stale evidence"
+# If that differs, re-run rather than reading the public keys: the ingress regenerates
+# the evidence BEFORE reloading haproxy (scripts/dns01.sh run_pass), so mid-renewal the
+# SERVED cert is the stale side — and whether a renewal reuses the key depends on an
+# unpinned certbot default, so a key comparison proves nothing either way. A replica
+# split (the curl above and the s_client here are two connections) also clears on a
+# re-run; a foreign certificate does not. If it survives ten minutes, haproxy_reload is
+# failing — check the ingress log. pcverify avoids the replica half by keeping the whole
+# run on one connection.
 ```
 
 Then DCAP-verify `quote.json` and check its `report_data` — the first 32 bytes are

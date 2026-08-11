@@ -339,11 +339,17 @@ const (
 	// the file is ordered unexpectedly; treated as a failure because the identity
 	// the quote commits to is then not the one being served as the leaf.
 	CertInChain
-	// CertSameKeyDifferentCert: the served certificate carries the same public key
-	// as the bundle's leaf but different bytes — the signature of a *stale bundle*,
-	// e.g. the certificate was renewed (same key) and the evidence has not been
-	// regenerated, or was regenerated without a fresh quote. A failure, but an
-	// operational one, distinct from being served a foreign certificate.
+	// CertSameKeyDifferentCert: the served certificate carries the same public key as
+	// the bundle's leaf but different bytes. Operationally this is a renewal caught
+	// mid-apply, and note which side is stale: dstack-ingress regenerates the evidence
+	// BEFORE it reloads HAProxy (dstack-examples custom-domain scripts/dns01.sh,
+	// run_pass), so the SERVED certificate is normally the one lagging, not the bundle.
+	// A failure either way, but an operational one, distinct from being served a foreign
+	// certificate.
+	//
+	// It is not a reliable *detector* of that state: whether a renewal reuses the key
+	// depends on the certbot default in the ingress image, which the image does not pin,
+	// so a renewal can equally land in the default CertMismatch bucket.
 	CertSameKeyDifferentCert
 )
 
@@ -354,7 +360,7 @@ func (m CertMatch) String() string {
 	case CertInChain:
 		return "served certificate is in the bundle chain but is not its leaf"
 	case CertSameKeyDifferentCert:
-		return "served certificate has the bundle key but different bytes (stale evidence?)"
+		return "served certificate has the bundle key but different bytes (renewal mid-apply?)"
 	default:
 		return "served certificate is not in the bundle"
 	}
@@ -893,9 +899,9 @@ func compareCert(leaf *x509.Certificate, bundle []*x509.Certificate) CertMatch {
 			return CertInChain
 		}
 	}
-	// Same key, different bytes: almost always a renewal the evidence has not
-	// caught up with. Worth naming, because "not in the bundle" would send an
-	// operator hunting for an attack instead of regenerating the evidence.
+	// Same key, different bytes: almost always a renewal caught between the evidence
+	// being regenerated and HAProxy being reloaded. Worth naming, because "not in the
+	// bundle" would send an operator hunting for an attack instead of re-running.
 	if leaf.PublicKeyAlgorithm == bundle[0].PublicKeyAlgorithm && samePublicKey(leaf, bundle[0]) {
 		return CertSameKeyDifferentCert
 	}

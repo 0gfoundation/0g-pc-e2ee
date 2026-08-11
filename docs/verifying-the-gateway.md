@@ -455,19 +455,17 @@ sha256sum -c sha256sum.txt          # every listed file must be OK
 # --- 4. endpoint binding: the cert you are served vs the cert in the bundle ---
 openssl s_client -servername "$DOMAIN" -connect "$DOMAIN:443" </dev/null 2>/dev/null \
   | openssl x509 -outform pem > served.pem
-# the WHOLE certificate, not just its key: a renewal keeps the key and changes the
-# bytes, and that is a stale bundle, not a match (see the failure table below)
+# the WHOLE certificate, not just its key — the two can differ during a renewal, and
+# that is a half-applied renewal, not a match (see the failure table below)
 diff <(openssl x509 -in served.pem -noout -fingerprint -sha256) \
      <(openssl x509 -in "cert-$DOMAIN.pem" -noout -fingerprint -sha256) \
   && echo "served certificate is the one in the bundle"
 
-# only if that differs: same key means a renewal the evidence has not caught up with.
-# A DIFFERENT key means either a different REPLICA (the two commands above are two
-# connections, and dstack picks a CVM per connection) or not this enclave at all —
-# re-run to tell them apart, or take both from one connection as shown in Current limits.
-diff <(openssl x509 -in served.pem -noout -pubkey) \
-     <(openssl x509 -in "cert-$DOMAIN.pem" -noout -pubkey) \
-  && echo "same public key: renewed certificate, stale evidence"
+# If that differs, re-run instead of comparing the two public keys. Whether a renewal
+# reuses the key depends on the certbot default in the ingress image, which the image
+# does not pin, so same-key and different-key renewals are both possible and neither
+# tells you which one you are looking at. Re-running does: a half-applied renewal or a
+# replica split clears within seconds, a foreign certificate does not.
 
 # --- 5. chain trust ---
 openssl s_client -servername "$DOMAIN" -connect "$DOMAIN:443" -verify_return_error \
@@ -549,8 +547,8 @@ Release manifests are the `docker-compose.release.yml` asset on
 |---|---|
 | `sha256sum -c` mismatch | the bundle was modified after it was hashed, or is being served by something other than the enclave |
 | quote fails DCAP verification | not a genuine TDX quote, or the platform's TCB is out of date |
-| `report_data` does not match the manifest digest | the quote belongs to a different bundle — often a stale quote republished beside regenerated evidence |
-| served certificate is not the one in the bundle | three causes, in rising order of seriousness: **(a)** by hand, the two steps hit different replicas — re-run, or take both over one connection (see the replica note in [Current limits](#current-limits)); **(b)** the certificate was renewed and the evidence was not regenerated — a renewal keeps the same public key, which is how you tell; **(c)** you are not talking to the enclave the bundle came from. `pcverify` cannot produce (a). |
+| `report_data` does not match the manifest digest | the quote belongs to a different bundle: by hand, most often the two files came from different replicas (re-run, or take both over one connection); otherwise the manifest was regenerated and the quote beside it was not yet refreshed, which also clears on a re-run |
+| served certificate is not the one in the bundle | three causes, in rising order of seriousness. **(a)** By hand, the two steps hit different replicas — re-run, or take both over one connection (see the replica note in [Current limits](#current-limits)); `pcverify` cannot produce this. **(b)** A renewal is half-applied. dstack-ingress regenerates the evidence **before** it reloads HAProxy, so in this window the *served* certificate is the stale side, not the bundle. Normally seconds; if the reload failed it persists until the next renewal pass (`RENEW_INTERVAL`, 12h by default) and repeats. Re-run — and if it survives ten minutes, read the ingress log rather than suspecting the endpoint. **(c)** You are not talking to the enclave the bundle came from. |
 | certificate does not validate | ordinary TLS failure, an interception, or a deliberately untrusted staging certificate |
 | `app-compose` digest does not match `compose_hash` | the manifest is for a different deployment or instance — under blue/green, most often the standby side rather than the live one |
 | compose text matches no published release | **the finding that matters.** The deployment is running something that was not published. Report it. |
