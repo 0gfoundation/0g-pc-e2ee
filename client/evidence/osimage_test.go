@@ -1,6 +1,7 @@
 package evidence
 
 import (
+	"encoding/hex"
 	"strings"
 	"testing"
 
@@ -150,4 +151,37 @@ func TestCheckOSImage(t *testing.T) {
 // reg builds a full-length register as hex.
 func reg(fill byte) string {
 	return strings.Repeat(string("0123456789abcdef"[fill>>4])+string("0123456789abcdef"[fill&0xf]), 48)
+}
+
+// Guards the embedded allowlist as DATA. Its entries are hand-transcribed hex, and a
+// mistyped or duplicated register would either reject the real deployment or, worse,
+// accept something it should not. None of that is caught by "does it parse".
+func TestBuiltinOSImages_EntriesAreWellFormed(t *testing.T) {
+	imgs, err := BuiltinOSImages()
+	if err != nil {
+		t.Fatalf("BuiltinOSImages: %v", err)
+	}
+	seen := map[attest.BootChain]string{}
+	for _, img := range imgs {
+		// os_image_hash is the release's digest.txt — sha256, so 64 hex characters. It is
+		// how a reviewer finds the artifact these values came from, so a truncated one
+		// makes the entry unauditable even though matching still works.
+		if len(img.OSImageHash) != 64 {
+			t.Errorf("%s: os_image_hash is %d chars, want 64 (sha256 hex): %q",
+				img.Name, len(img.OSImageHash), img.OSImageHash)
+		}
+		if _, err := hex.DecodeString(img.OSImageHash); err != nil {
+			t.Errorf("%s: os_image_hash is not hex: %v", img.Name, err)
+		}
+		// Three registers measuring three different things must not be equal. Equality
+		// is the signature of a copy-paste error, and it would not otherwise fail.
+		bc := img.BootChain
+		if bc.MRTD == bc.RTMR1 || bc.MRTD == bc.RTMR2 || bc.RTMR1 == bc.RTMR2 {
+			t.Errorf("%s: two registers are identical; almost certainly a paste error", img.Name)
+		}
+		if prev, dup := seen[bc]; dup {
+			t.Errorf("%s and %s carry the same boot chain", prev, img.Name)
+		}
+		seen[bc] = img.Name
+	}
 }

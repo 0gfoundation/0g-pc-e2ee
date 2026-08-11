@@ -353,11 +353,12 @@ does not.
    `RTMR2`, via `attest.BootChainPolicy`, excluding `RTMR3` (`compose_hash` pins the app
    more precisely) and `RTMR0` (the VM shape, which this check does not need to
    establish) — against an allowlist embedded in the binary
-   (`client/evidence/osimages.json`). That allowlist ships **empty**, so the step
-   currently reports "not pinned" instead of checking, and every run says code identity
-   is evidence rather than proof. Populating it is the same task as filling hop 3's
-   broker measurement allowlist (`trust-chain.md`), and until then this step is not
-   fully closed.
+   (`client/evidence/osimages.json`). **That allowlist is now populated** for the image
+   the deployment runs, derived from the published guest-OS release and confirmed
+   against a live quote, so the step checks rather than reports. An image that is not
+   listed is a failure, so a new OS image version needs an entry before it is deployed
+   — per version, not per deployment. Hop 3's broker allowlist in `trust-chain.md` is a
+   separate, still-open task.
 3. **Publish `measurement ↔ cert` (transparency log / on-chain) + monitoring**,
    so cheating is publicly detectable without per-user effort.
 4. **Optional tier-3 path**: a WASM verify+seal SDK for clients that want
@@ -371,22 +372,23 @@ does not.
   user-facing statement of exactly this — what a pass proves, what remains trusted,
   and the current limits — is [`../verifying-the-gateway.md`](../verifying-the-gateway.md);
   keep product copy consistent with it rather than restating it.
-- **The gateway CVM's own OS measurement is not yet pinned.** `mr_config_id` is
+- **The gateway CVM's OS measurement is pinned, with two stated caveats.**
+  `mr_config_id` is
   host-supplied, and what makes it truthful is the guest refusing to boot when it
   disagrees with the real `app-compose.json`
   (dstack `config_id_verifier.rs`) — a check whose integrity rests on `MRTD` / `RTMR1` /
   `RTMR2` being the audited dstack OS. Those three measure the firmware, kernel and
   rootfs, i.e. every piece of code performing that check; `RTMR0` is excluded because it
   records the VM shape, which the check does not depend on, and pinning it would have
-  cost an entry per (image, shape) pair rather than per image. The allowlist is plumbed
-  through (`attest.BootChainPolicy`, `client/evidence/osimages.json`) but ships
-  **empty**, so `pcverify` prints the observed registers and compares them against
-  nothing — a modified OS image that skipped the boot check would still pass. Closing it
-  needs the three values computed with `dstack-mr` from the published guest-OS release
-  (matched to the CVM's `os_image_hash`) and confirmed against a live quote, committed
-  here so no user supplies a value — the same *kind* of task as the broker measurement
-  allowlist in `trust-chain.md` hop 3. Until then code identity is strong evidence, not
-  proof.
+  cost an entry per (image, shape) pair rather than per image. The allowlist
+  (`attest.BootChainPolicy`, `client/evidence/osimages.json`) carries the deployed
+  image, computed with `dstack-mr` from the published guest-OS release matched to the
+  CVM's `os_image_hash` and confirmed against a live quote — so a modified OS image that
+  skipped the boot check no longer passes. The two caveats: the values come from the
+  published release rather than a source rebuild, so that tarball is in the trust path
+  until `reproduce.sh` runs in CI; and `MRTD` also depends on the host's page-add mode
+  (`two_pass_add_pages`), recorded per entry. Both are properties of the derivation, not
+  of what a match proves about the image.
 - **Two enclaves see plaintext** (gateway + provider), vs one for direct-seal.
 - **Metadata** (model, sizes, timing) is visible as in the router path.
 - **The browser origin allowlist is not authentication.** Serving no-install

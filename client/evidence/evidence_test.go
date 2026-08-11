@@ -301,6 +301,13 @@ func (f *fixture) checker(t *testing.T, cfg Config) *Checker {
 	if cfg.QuoteParser == nil {
 		cfg.QuoteParser = f.parser()
 	}
+	// The fixture's quote carries synthetic measurements, which will never be in the
+	// real embedded allowlist — and now that the allowlist has entries, nil would mean
+	// "load the builtin" and fail step 7 in every test that never asked about it. An
+	// explicitly empty slice disables the check; the osimage tests exercise it directly.
+	if cfg.OSImages == nil {
+		cfg.OSImages = []OSImage{}
+	}
 	// Deliberately no HTTPClient: leaving it nil is what makes Check build its own
 	// pinned session, so the tests exercise the production transport — one connection
 	// for the whole run, which is the property step 4 depends on. Only DialTLS is

@@ -91,17 +91,20 @@ user-facing document states it:
 - **Endpoint identity is closed**: `pcverify -gateway <domain>` proves the TLS
   session terminates inside a genuine TDX enclave that minted the certificate
   your client negotiated.
-- **Code identity is strong evidence, not proof**, until one gap closes: the
-  OS-image allowlist ([`client/evidence/osimages.json`](client/evidence/osimages.json))
-  ships empty, so nothing yet establishes that the guest enforced the binding
-  between the attestation and the manifest. Every run says which case it is in.
-  See [Current limits](docs/verifying-the-gateway.md#current-limits).
+- **Code identity is closed for the images we deploy on.** The OS-image allowlist
+  ([`client/evidence/osimages.json`](client/evidence/osimages.json)) carries the
+  deployed image, derived from the published guest-OS release and confirmed against a
+  live quote — which is what establishes that the guest enforced the binding between
+  the attestation and the manifest. An image not on that list *fails*, so a new OS
+  version needs an entry before deployment. See
+  [Current limits](docs/verifying-the-gateway.md#current-limits) for the two caveats on
+  how the entries were derived.
 - The **provider** hop — the one the gateway walks on your behalf — is wired end to
   end: DCAP quote verification, the `report_data` binding, and a cross-check of the
   quote-bound signer against the provider's on-chain `teeSignerAddress`. It carries
-  the same shape of gap as the bullet above: its measurement allowlist is empty too,
-  so that link runs in warn mode. [`trust-chain.md`](docs/design/trust-chain.md)
-  marks the status of every link.
+  its measurement allowlist is still empty, so that link runs in warn mode — and,
+  unlike the gateway's, it needs a shape change before it can be filled at all.
+  [`trust-chain.md`](docs/design/trust-chain.md) marks the status of every link.
 
 ## The other end
 

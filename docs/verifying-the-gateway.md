@@ -51,28 +51,28 @@ gateway            pc-gateway.0g.ai
   app name         0g-pc-gateway-a-1
   allowed_envs     ZG_GATEWAY_ROUTER_URL DOMAIN GATEWAY_DOMAIN …
 ✓ compose file       matches release-2026.08.07.1 byte-for-byte
+✓ os image           dstack-nvidia-0.5.4.1
+
+note: code identity is only as strong as the image pinning inside the compose text —
+a floating tag keeps compose_hash stable while the code changes
+
+PASS
+```
+
+A matched `os image` prints only the name. When the image is **not** in the allowlist —
+or the allowlist is empty — the run prints the registers instead, because those are
+what you compare or record:
+
+```
 - os image           not pinned (allowlist is empty; see client/evidence/osimages.json)
   observed mrtd   b24d3b24…
   observed rtmr1  6e1afb74…
   observed rtmr2  89e73ced…
   rtmr0 (vm shape, not pinned) 01361d27…
-
-note: code identity is only as strong as the image pinning inside the compose text —
-a floating tag keeps compose_hash stable while the code changes; the OS image is NOT
-pinned (the allowlist is empty), so nothing establishes that the guest enforced the
-compose-hash binding — treat code identity as strong evidence, not proof. Endpoint
-identity is unaffected
-
-PASS
 ```
 
-The `-` on `os image` is the one step that does not check anything yet, and the
-closing `note` says so on every run — see [Current limits](#current-limits). Once the
-allowlist is populated that line becomes a name, e.g.
-`✓ os image  dstack-0.5.3`, and the note drops the OS-image caveat. The three
-`observed` registers are printed precisely because they are what an auditor records
-while the step is unpinned — `rtmr0` is shown separately because nothing compares it
-(see step 7).
+`rtmr0` is listed apart because nothing compares it (see step 7), and the closing
+`note` gains a sentence saying code identity is then evidence rather than proof.
 
 ---
 
@@ -272,16 +272,22 @@ the quote.
 
 Read this section before relying on a `PASS`.
 
-**The OS-image allowlist is not populated yet.** Step 7 is implemented and runs
-automatically, but
-[`client/evidence/osimages.json`](../client/evidence/osimages.json) currently ships
-empty, so on today's builds the step reports `- os image  not pinned` rather than
-checking anything. While that is the case, a host that booted a *modified* dstack OS —
-one with the `mr_config_id` check removed — could commit to a published release's
-`compose_hash` while running something else, and the run would still report `PASS`.
-**Treat code identity as "strong evidence, not proof" until the allowlist is
-populated.** Endpoint identity (steps 1–5) is unaffected either way, and the run says
-which case you are in — both on the `os image` line and in its closing note.
+**The OS-image allowlist covers the images 0G deploys on, and nothing else.** Step 7
+checks against [`client/evidence/osimages.json`](../client/evidence/osimages.json),
+which is populated — but only with images whose measurements have been derived and
+confirmed against a live quote. An image that is **not** listed is a *failed* check,
+not an unpinned one, so moving a deployment to a new OS image version needs an entry
+added first. Verifying a deployment 0G does not operate may well mean adding its image
+yourself; the run prints the registers to compare and the file documents the
+derivation step by step.
+
+Two residual caveats on the entries. They are computed from the **published** guest-OS
+release rather than from a source rebuild, so that tarball is still in the trust path
+until `reproduce.sh` runs in CI — and `MRTD` additionally depends on the host's
+page-add mode, which each entry records. Neither weakens what a match proves about the
+image; both are written down so nobody has to guess.
+
+Endpoint identity (steps 1–5) does not depend on any of this.
 
 **A run covers the connection it made, and a domain may be served by several
 enclaves.** One `app_id` can be backed by more than one CVM for capacity and

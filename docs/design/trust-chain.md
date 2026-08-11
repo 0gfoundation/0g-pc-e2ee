@@ -157,7 +157,8 @@ Honest gaps — half the value of this diagram is marking them (see
   otherwise it degrades to today's plaintext L7 router. That attestation is a
   separate artifact from this chain and is checked separately
   (`pcverify -gateway`, below), including code identity — though the OS-image
-  allowlist that grounds it ships empty, so that last link is not closed yet.
+  allowlist that grounds it is populated for the deployed image, so that link is closed
+  for the images listed — an unlisted one fails rather than being skipped.
 - **Replay**: defeated client-side by a per-request nonce; a server-side
   freshness field in the signed proof is still TODO.
 
@@ -244,9 +245,13 @@ the app-compose actually delivered, so the OS doing that check is part of the ch
 tool compares the quote's image registers — `MRTD` + `RTMR1` + `RTMR2`, excluding
 `RTMR3` (the compose hash already pins the app, more precisely) and `RTMR0` (the VM
 shape, which this check does not need) — against an allowlist embedded in the binary
-(`client/evidence/osimages.json`). **That allowlist ships empty**,
-so today the step reports "not pinned" and code identity is evidence rather than proof;
-populating it is the same kind of task as filling hop 3's measurement allowlist.
+(`client/evidence/osimages.json`). **That allowlist is populated** for the image the
+gateway is deployed on: the three values were computed with `dstack-mr` from the
+published guest-OS release whose `digest.txt` equals the CVM's `os_image_hash`, and then
+confirmed to equal what a live quote reports. So the step checks rather than reports, and
+an image that is not listed FAILS — a new OS image version needs an entry before it is
+deployed. Hop 3's broker allowlist is a separate, still-open task; unlike this one it
+also needs the shape change described above.
 
 Two further limits are worth stating: the compose hash is only as strong as the image
 pinning inside the compose text — a floating tag keeps it stable while the code changes
