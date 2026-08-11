@@ -245,6 +245,50 @@ streams before the first one times out — **~4 GiB**, on a gateway whose CPU is
 nearly idle because no frames are arriving. Sizing RAM purely from the healthy
 steady state under-provisions exactly this failure.
 
+## Concurrency: the one figure that barely moves
+
+Asked as "how many concurrent streams", the answer is much more stable than the RPS
+one, and the reason is worth seeing. Concurrency is `rps × response seconds`. Longer
+completions cut the sustainable rps and lengthen each response by the same factor,
+so the product cancels:
+
+| avg completion | knee rps, 2 vCPU | response secs | concurrent streams |
+|---|---|---|---|
+| 64 tokens | 380 | 2.8 | ~1,050 |
+| 256 tokens | 113 | 10.4 | ~1,180 |
+| 1024 tokens | 30 | 41.2 | ~1,220 |
+
+All within ±8% of each other. So the honest headline for a 2-vCPU gateway is
+**~1,000 concurrent streams at the knee, ~650 as a steady operating point** — and it
+holds whether the traffic is short chats or long generations.
+
+What that figure is really made of is a **token rate**, not a connection count:
+
+> **concurrent streams ≈ frame throughput ÷ tokens-per-second-per-stream**
+
+A 2-vCPU gateway carries ~24,600 output frames/s at the knee (~16,000 operating).
+The tables above assume each stream is being fed at 25 tokens/s, which is what a
+large model typically emits, giving 24,600 / 25 ≈ 1,000. That divisor is the knob
+that actually moves the answer:
+
+| per-stream output rate | knee concurrency | operating concurrency |
+|---|---|---|
+| 10 tokens/s (slow model, long context) | ~2,500 | ~1,600 |
+| 25 tokens/s (typical) | ~1,000 | ~650 |
+| 50 tokens/s (fast/small model) | ~490 | ~320 |
+| 100 tokens/s | ~250 | ~160 |
+
+**Measured anchor, no extrapolation:** the 2-vCPU ladder held **766 concurrent
+streams** at 63% CPU with p99 TTFT 282 ms — healthy, and the highest concurrency
+this host could offer before its remaining core (the fixture's) became the limit.
+So ~750 concurrent streams on 2 vCPU is *demonstrated*; ~1,000 is the extrapolated
+ceiling.
+
+Memory is not what stops you: 1,000 streams is ~280 MiB, and even 2 GiB holds
+~7,700. Concurrency is bounded by the frame rate the CPU can push, not by how many
+connections can be held open — with the stalled-provider exception noted above,
+which is the one case where held connections alone exhaust RAM.
+
 ## Computing the RPS for your own traffic
 
 Everything above reduces to two inputs — average output tokens per response, and
