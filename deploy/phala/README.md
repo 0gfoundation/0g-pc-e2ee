@@ -230,12 +230,16 @@ for f in quote.json sha256sum.txt acme-account.json cert-<DOMAIN>.pem; do
 done
 sha256sum -c sha256sum.txt
 
-# 3. the served cert must be the one in the bundle. Compare public keys: the
-#    bundle carries the full chain, `s_client` gives the leaf.
-# compare the WHOLE certificate; a renewal keeps the key and changes the bytes, which
-# is a stale bundle rather than a match
+# 3. the served cert must be the one in the bundle. Compare the WHOLE certificate (the
+#    bundle carries the full chain, `s_client` gives the leaf): a renewal keeps the key
+#    and changes the bytes, which is a stale bundle rather than a match.
 diff <(openssl x509 -in served.pem -noout -fingerprint -sha256) \
      <(openssl x509 -in cert-<DOMAIN>.pem -noout -fingerprint -sha256) && echo "cert matches evidence"
+
+# only if that differs: same key means a renewal the evidence has not caught up with;
+# a different key means this is not the enclave the bundle came from
+diff <(openssl x509 -in served.pem -noout -pubkey) \
+     <(openssl x509 -in cert-<DOMAIN>.pem -noout -pubkey) && echo "same key: stale evidence"
 ```
 
 Then DCAP-verify `quote.json` and check its `report_data` — the first 32 bytes are
@@ -627,7 +631,7 @@ and warmer liveness).
   header and are unaffected by any of this. The default carries two `localhost`
   ports as development conveniences — drop them via the override on a deployment
   that does not need dev hosts reaching this enclave.
-- **Provider verification** is on in verify-and-warn mode. Each provider's TDX
+- **Provider verification** is on, part enforced and part verify-and-warn. Each provider's TDX
   quote is DCAP-verified (`ZG_GATEWAY_ATTEST`), its quote-bound signer is
   cross-checked against the on-chain `teeSignerAddress`
   (`ZG_GATEWAY_ONCHAIN`), and each response's §8 TEE signature is verified

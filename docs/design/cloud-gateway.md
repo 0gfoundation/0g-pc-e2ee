@@ -1,8 +1,10 @@
 # Cloud-TEE gateway — zero-client-code E2EE with separated validation
 
-> Status: design / discussion. Sibling of [`router-e2e.md`](./router-e2e.md).
-> Some cloud specifics (GCP confidential-compute APIs, dstack feature details)
-> are marked **[verify]** — confirm against current docs before building.
+> Status: **implemented and deployed** for the path described in §5–§7 and §10 steps
+> 1–2; §10 steps 3–4 and §12 are still design. Sibling of
+> [`router-e2e.md`](./router-e2e.md). Remaining cloud specifics (GCP
+> confidential-compute APIs, some dstack feature details) are marked **[verify]** —
+> confirm against current docs before building on them.
 
 ## 1. Goal
 
@@ -303,8 +305,8 @@ does not.
 1. **Gateway = the shared sidecar handler (`openaiproxy`) in a dstack CVM**, TLS
    terminated in that CVM by dstack-ingress on our own domain (§7,
    `deploy/phala/`). 0-code inference works, and the cert-binding quote is already
-   published at `/evidences/`. (Tier "2, un-auditable" until step 2 — internal /
-   testing only.)
+   published at `/evidences/`. **Done.** (It was tier "2, un-auditable" while step 2 was
+   outstanding — internal/testing only; step 2 is what lifted it to 2.5.)
 2. **A verifier for that cert-binding quote.** The cert binding itself is done
    (§6.1); what was missing is code that checks it. **Endpoint identity is now
    done** — `pcverify -gateway <domain>` (`client/evidence`, `client/cmd/pcverify`)

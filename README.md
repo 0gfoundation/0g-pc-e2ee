@@ -103,13 +103,15 @@ user-facing document states it:
   version needs an entry before deployment. See
   [Current limits](docs/verifying-the-gateway.md#current-limits) for the two caveats on
   how the entries were derived.
-- The **provider** hop — the one the gateway walks on your behalf — is wired end to
-  end: DCAP quote verification, the `report_data` binding, and a cross-check of the
-  quote-bound signer against the provider's on-chain `teeSignerAddress`. Both of those
-  run in **verify-and-warn** mode in the deployed gateway, for different reasons: the
-  measurement allowlist (hop 3) is empty and — unlike the gateway's — needs a shape
-  change before it can be filled at all, while the on-chain check (hop 5) is wired but
-  its enforce switch is deliberately still off.
+- The **provider** hop — the one the gateway walks on your behalf — is wired end to end,
+  and the deployed gateway splits into enforce and warn:
+  - **enforced**: DCAP quote verification with its `report_data` binding (a provider that
+    fails it is not used), and the §8 response signature (a response that does not verify
+    is not returned).
+  - **warn only**: the measurement allowlist (hop 3) — empty, and unlike the gateway's it
+    needs a shape change before it can be filled at all — and the on-chain signer
+    cross-check (hop 5), which is wired with its enforce switch deliberately off.
+
   [`trust-chain.md`](docs/design/trust-chain.md) marks the status of every link.
 
 ## The other end

@@ -7,8 +7,10 @@ integrity, §8 response signature) and [`router-e2e.md`](./router-e2e.md) (trust
 boundary, limitations); this doc assembles them into one chain so a reviewer can
 see there are no gaps — and where the gaps still are.
 
-> Status: design + partial implementation. This doc marks each link as
-> **implemented** or **spec'd, not yet wired** (see [Implementation status](#implementation-status)).
+> Status: every link below is **implemented**. What still varies is whether the deployed
+> gateway **enforces** it or only **observes** it (warn), which is the distinction
+> [Implementation status](#implementation-status) draws under its table — and the one that
+> matters for what a request actually guarantees.
 
 ## The three trust roots
 
@@ -177,11 +179,22 @@ do not line up one-to-one — reading either alone can mislead.
 | Hops 6–9 — HPKE seal/open, AAD binding | **Implemented.** | `crypto/`, `wire/` |
 | Hop 11 — signature verify against signer | **Implemented (opt-in, `-verify-responses`).** The client recomputes the §8 ciphertext binding over the on-wire `aad‖ciphertext` it received (non-stream, and streamed via an ordered per-frame aggregate), recovers the EIP-191 signer, and accepts only if it equals `provider.SignerAddr` — the quote-bound signer, itself grounded on-chain when `-onchain` is on (hop 5) — never the self-reported `signing_address`. The signature is fetched **directly from the provider's broker endpoint** (the router does not proxy `/v1/proxy/signature`). Fail-closed; off by default. The versioned signed-text/binding contract is shared with the broker in `protocol/proof` (no drift). | `protocol/proof`, `client/sig`, `client/core` (verify.go), `client/route` (sigfetch.go) |
 
-So today the chain is **closed by design and enforced end-to-end** when `-attest`
-+ `-onchain` are on: the hardware, code, and on-chain roots (hops 2–5) are all
-wired. The one remaining piece is the measurement allowlist (hop 3), which is empty
-today — until it is filled, hop 3 runs in warn mode (or enforce rejects all). Hop 5
-turns "an attested enclave" into "the **expected** attested enclave."
+So today every link is **wired**, but they are not all **enforced**, and the difference
+matters:
+
+- **Enforced** — hop 2 (quote authenticity, with `-attest`), hop 4 (`report_data` →
+  `enc_pub`), hops 6–9 (seal/open and AAD binding), and hop 11 (the §8 response
+  signature, with `-verify-responses`; fail-closed by construction). A candidate or a
+  response that fails any of these is refused.
+- **Warn only** — hop 3, because the allowlist is empty: warn proceeds on any
+  measurement and enforce would reject every provider, so `-attest-enforce` stays off.
+  And hop 5, whose `-onchain-enforce` is deliberately off while on-chain provider data
+  is still filling in; it is wired and observed, and turning it on is a switch rather
+  than work.
+
+So the **code root is the one root not yet doing its job** — hop 3 is exactly that root.
+Hop 5, once enforced, is what turns "an attested enclave" into "the **expected** attested
+enclave."
 
 > **Hop 3's allowlist needs a shape change first, not just values.** `Policy`
 > compares the full `Measurement` — all five registers, including **RTMR3**. In

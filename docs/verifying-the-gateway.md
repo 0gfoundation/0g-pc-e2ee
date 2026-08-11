@@ -12,10 +12,12 @@ the one command below is a convenience, not the source of truth: the
 > **Scope.** This document covers the **gateway** — the 0G-operated enclave that
 > takes your request and seals it to a provider. Verifying the *provider* that runs
 > the model is a separate chain, documented in
-> [`design/trust-chain.md`](./design/trust-chain.md); the gateway performs those
-> checks on your behalf per request — today in **verify-and-warn** mode, because the
-> provider-side measurement allowlist is not populated yet, so a failing provider check
-> is logged rather than refused.
+> [`design/trust-chain.md`](./design/trust-chain.md); the gateway performs those checks
+> on your behalf per request. Two of them **reject**: a provider whose TDX quote does not
+> DCAP-verify is not used, and a response whose TEE signature does not verify is not
+> returned to you. Two currently only **warn** — whether the provider's measurement is an
+> audited one, and whether its quote-bound signer matches the on-chain registry — because
+> their allowlist/enforce switches are still off.
 
 ---
 
@@ -80,13 +82,15 @@ saw, and exits non-zero:
 
 ```
 ✗ os image           MRTD/RTMR1/RTMR2 match no allowlisted OS image (dstack-nvidia-0.5.4.1)
-  observed mrtd   b24d3b24…
-  observed rtmr1  6e1afb74…
-  observed rtmr2  89e73ced…
+  observed mrtd   3f7c02e1…
+  observed rtmr1  aa1908bd…
+  observed rtmr2  5d64c7f0…
   rtmr0 (vm shape, not pinned) 01361d27…
 ```
 
-`rtmr0` is listed apart because nothing compares it (see step 7).
+The name in parentheses is what the allowlist **contains**, not what was observed — the
+observed registers are the four lines under it, and here they are deliberately unlike the
+entry. `rtmr0` is listed apart because nothing compares it (see step 7).
 
 There is a third state — `- os image  not pinned`, which passes — but only when the
 allowlist is *empty*. A released binary's is not, and `-os-image-allowlist` rejects a
