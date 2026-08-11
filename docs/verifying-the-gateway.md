@@ -6,8 +6,9 @@ enclave running code you can read — instead of taking our word for it.
 
 Everything here is independently checkable. Nothing in it requires trusting 0G, and
 the one command below is a convenience, not the source of truth: the
-[manual procedure](#doing-it-by-hand) uses only `curl`, `openssl`, `jq` and
-`sha256sum`.
+[manual procedure](#doing-it-by-hand) needs only `curl`, `openssl`, `jq` and `sha256sum`
+for steps 1 and 3–6. Two steps need one more tool each: step 2 a DCAP quote verifier,
+step 7 `dstack-mr` plus the guest-OS image it measures.
 
 > **Scope.** This document covers the **gateway** — the 0G-operated enclave that
 > takes your request and seals it to a provider. Verifying the *provider* that runs
@@ -136,7 +137,7 @@ against the manifests published in this repository's releases.
 flowchart TB
     subgraph ROOTS["What you actually trust"]
         INTEL["Intel<br/>TDX attestation root"]
-        OS["dstack OS image<br/>(measured, reproducible,<br/>allowlisted in-binary)"]
+        OS["dstack OS image<br/>(measured + allowlisted in-binary;<br/>published tarball, not yet<br/>a source rebuild)"]
         GH["GitHub<br/>publisher of record"]
         CA["Public CAs<br/>(same as any HTTPS site)"]
     end
@@ -268,14 +269,21 @@ is not compared.
 TDX is broken, this collapses — as does every other confidential-computing claim.
 This is the irreducible assumption.
 
-**The dstack OS image.** Step 7 above. What you are trusting is that the measurements
-in the allowlist really are the audited dstack OS — and that is checkable rather than
-asserted: they are computed from dstack's published guest-OS release with `dstack-mr`
-(and can be re-derived from a source rebuild), and
-[`client/evidence/osimages.json`](../client/evidence/osimages.json) records, for each
-entry, the release it came from — including that release's `digest.txt`, so you can
-fetch the same artifact and recompute. Reviewing what this tool accepts is reviewing
-that file.
+**The dstack OS image, and whoever published it.** Step 7 above. What you are trusting
+is that the measurements in the allowlist really are the audited dstack OS — checkable
+rather than asserted:
+[`client/evidence/osimages.json`](../client/evidence/osimages.json) records, per entry,
+the exact release it was computed from and that release's `digest.txt`, so you can fetch
+the same artifact and recompute with `dstack-mr`.
+
+Note *which* release, though, because it is a second GitHub organisation and not the
+obvious one. dstack's own `meta-dstack` publishes no `dstack-nvidia` asset below v0.5.6,
+so the entry for `dstack-nvidia-0.5.4.1` comes from
+[`nearai/private-ml-sdk`](https://github.com/nearai/private-ml-sdk/releases) — the split
+Phala's own verifier encodes. Trusting that entry therefore means trusting that
+publisher's tarball, which the `digest.txt` check ties down but does not itself audit.
+Closing that gap is a source rebuild (each release ships a `reproduce.sh`), which has not
+been done yet — see [Current limits](#current-limits).
 
 **GitHub, as publisher of record.** Comparing against "the manifests we published"
 means someone must be the publisher. A tampered release asset causes a *mismatch*,
@@ -421,7 +429,9 @@ offline.
 
 ## Doing it by hand
 
-If you would rather not run our binary, the whole procedure is four tools. `DOMAIN`
+If you would rather not run our binary, steps 1 and 3–6 are four tools — `curl`,
+`openssl`, `jq`, `sha256sum` — and the two that are not are called out where they
+appear: step 2 needs a DCAP verifier, step 7 needs `dstack-mr` and the image. `DOMAIN`
 is the gateway; the checks are numbered as above.
 
 ```bash

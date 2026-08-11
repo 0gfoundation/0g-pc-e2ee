@@ -7,14 +7,19 @@ integrity, §8 response signature) and [`router-e2e.md`](./router-e2e.md) (trust
 boundary, limitations); this doc assembles them into one chain so a reviewer can
 see there are no gaps — and where the gaps still are.
 
-> Status: every link below is **implemented**, with two exceptions noted in place. Hop 12
-> covers replay client-side only; a server-side freshness field is still TODO. And hop 3 —
-> the **code root** — cannot be enforced yet at all: its allowlist is empty *and* needs a
-> shape change before it can be filled, so it is not simply a switch left off. For the
-> rest, what varies is whether the deployed gateway **enforces** the link or only
-> **observes** it (warn), which is the distinction
-> [Implementation status](#implementation-status) draws under its table — and the one that
-> matters for what a request actually guarantees.
+> Status: every link below is **implemented**; what differs is how far each one is
+> actually carried in the deployed gateway. Four are qualified, and the qualifications are
+> not the same kind:
+>
+> - **hop 3** (the *code root*) — cannot be enforced at all yet: the allowlist is empty
+>   *and* needs a shape change before it can be filled. Not a switch left off.
+> - **hop 5** — wired and observed; its enforce switch is deliberately off.
+> - **hop 11** — enforced, but only because `-verify-responses` is on; it is off by default.
+> - **hop 12** — replay is defeated client-side only; a server-side freshness field is TODO.
+>
+> Everything else is enforced. [Implementation status](#implementation-status) has the
+> per-link detail; the enforced-versus-observed split under its table is what determines
+> what a request actually guarantees.
 
 ## The three trust roots
 
@@ -170,9 +175,10 @@ Honest gaps — half the value of this diagram is marking them (see
 
 ## Implementation status
 
-The chain is fully *specified* and now largely *wired*, including the on-chain
-identity grounding (hop 5). One link is called out because the code and the spec
-do not line up one-to-one — reading either alone can mislead.
+The chain is fully *specified* and wired, including the on-chain identity grounding
+(hop 5). Read the Status note above for which links are enforced and which only observed:
+the table below says what exists, not how far the deployment carries it, and hop 3 in
+particular is implemented against an allowlist that is still empty.
 
 | Link | Status | Where |
 |------|--------|-------|

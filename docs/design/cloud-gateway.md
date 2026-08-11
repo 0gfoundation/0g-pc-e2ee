@@ -181,9 +181,10 @@ controlled only by that enclave?"**
 > signing** (see §6.2), so no gateway quote is needed at all. Inference
 > authenticity rides the provider's own SPEC §8 signature instead.
 
-1. **Cert-binding quote**: a TDX quote from inside the CVM that commits to the
-   served cert and to `app_id`. Emitted by **dstack-ingress** (`/evidences`, see
-   the decision box above), not by a gateway-issued quote API.
+1. **Cert-binding quote**: a TDX quote from inside the CVM that commits to the served
+   cert (via `report_data`) and to the deployment's `compose_hash` (via `mr_config_id`;
+   `app_id` is that hash's leading 20 bytes). Emitted by **dstack-ingress**
+   (`/evidences`, see the decision box above), not by a gateway-issued quote API.
 2. **Bind the TLS cert into that quote**: dstack-ingress puts
    `SHA-256(sha256sum.txt)` (which covers the served cert) in the quote's
    `report_data`, so the quote proves "measurement X controls *this* cert".
