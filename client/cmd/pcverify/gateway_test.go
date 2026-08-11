@@ -54,8 +54,11 @@ func TestReportGateway(t *testing.T) {
 	certMismatch := passing()
 	certMismatch.CertMatch = evidence.CertMismatch
 
-	stale := passing()
-	stale.CertMatch = evidence.CertSameKeyDifferentCert
+	// Same key, different bytes. dstack-ingress regenerates the evidence before it
+	// reloads HAProxy (scripts/dns01.sh run_pass), so mid-renewal it is the SERVED
+	// certificate that lags the bundle — not the other way round.
+	renewing := passing()
+	renewing.CertMatch = evidence.CertSameKeyDifferentCert
 
 	certUncheckable := passing()
 	certUncheckable.CertErr = errors.New("TLS handshake with pc-gateway.test: i/o timeout")
@@ -77,7 +80,7 @@ func TestReportGateway(t *testing.T) {
 		{name: "quote not genuine", rep: badQuote, wantCode: 1, contains: "not a genuine TDX quote"},
 		{name: "binding mismatch", rep: notBound, wantCode: 1, contains: "quote binds"},
 		{name: "served cert not in bundle", rep: certMismatch, wantCode: 1, contains: "not in the bundle"},
-		{name: "stale evidence", rep: stale, wantCode: 1, contains: "stale evidence"},
+		{name: "renewal mid-apply", rep: renewing, wantCode: 1, contains: "renewal mid-apply"},
 		{name: "cert uncheckable", rep: certUncheckable, wantCode: 1, contains: "i/o timeout"},
 		// Chain trust is its own axis: a failure fails the run by default, and only
 		// -allow-untrusted-cert downgrades it. No attestation check moves either way.
