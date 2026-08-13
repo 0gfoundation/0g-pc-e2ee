@@ -12,11 +12,10 @@ enclave: **confidentiality** (the prompt and tool definitions are sealed) *and*
 **authenticity** (hardware attestation plus a per-response signature). Not
 confidentiality alone.
 
-> **Why this repository is public.** So that the claims above can be *checked*.
-> The security of the product rests on outsiders being able to read the verification
-> code and the wire spec — both here — and the exact manifest that runs in production,
-> which is published as a Release asset (git holds its `:latest` development form). That,
-> rather than community development, is what the openness is for.
+> **Why this repository is public.** So that the claims above can be *checked* — the
+> security of the product rests on outsiders being able to read the verification code, the
+> wire spec, and the exact manifest that runs in production. That, rather than community
+> development, is what the openness is for.
 
 ## The shape of it
 
@@ -45,16 +44,15 @@ flowchart LR
     P ---->|"response signature, fetched DIRECT<br/>(the router does not proxy it)"| GW
 ```
 
-Two containers are omitted for clarity: `cvm-identity`, an init container that names
-this replica and exits, and `prometheus-agent`. All four are inside the measured
-manifest — see [`deploy/phala/README.md`](deploy/phala/README.md).
+Two containers are omitted for clarity: `cvm-identity`, an init container that names this
+replica and exits, and `prometheus-agent`. All four are inside the measured manifest — see
+[`deploy/phala/README.md`](deploy/phala/README.md).
 
-The gateway runs the **same client core** a caller would otherwise run locally —
-verify the provider's attestation quote, seal the request to it, verify the
-signature on the way back — just hosted, so browsers and thin clients get it with
-no install. That is the trade it makes: one more attested party to trust, in
-exchange for zero client-side work. Which is exactly why the gateway publishes
-enough evidence to be checked rather than believed.
+The gateway runs the **same client core** a caller would otherwise run locally — verify the
+provider's attestation quote, seal the request to it, verify the signature on the way back
+— just hosted, so browsers and thin clients get it with no install. The trade: one more
+attested party to trust in exchange for zero client-side work, which is exactly why the
+gateway publishes enough evidence to be checked rather than believed.
 
 ## Start here
 
@@ -63,9 +61,9 @@ enough evidence to be checked rather than believed.
 | **using a 0G-hosted gateway** and want to know whether to trust it | [`docs/verifying-the-gateway.md`](docs/verifying-the-gateway.md) — one command, what a `PASS` does and does not prove, and the same procedure by hand with `curl` / `openssl` / `jq` |
 | **auditing the design** | [`docs/design/trust-chain.md`](docs/design/trust-chain.md) — every hop and where its trust bottoms out → [`protocol/SPEC.md`](protocol/SPEC.md) — the normative wire format → the **`docker-compose.release.yml` attached to a [Release](https://github.com/0gfoundation/0g-pc-e2ee/releases)**, which is the manifest actually hashed into the attestation. The [`deploy/phala/docker-compose.yml`](deploy/phala/docker-compose.yml) in git is the same file with the gateway image left on `:latest` for development — readable, but it will not match a deployment |
 
-Those are the two audiences this repository is written for. The rest of it —
-the gateway implementation, the deployment runbook, the load-test rig — is 0G's
-own engineering, readable but not offered as an entry point.
+Those are the two audiences this repository is written for. The rest of it — the gateway
+implementation, the deployment runbook, the load-test rig — is 0G's own engineering,
+readable but not offered as an entry point.
 
 ## Layout
 
@@ -81,40 +79,28 @@ And three directories that are not modules:
 | | |
 |---|---|
 | [`docs/`](docs/) | [`verifying-the-gateway.md`](docs/verifying-the-gateway.md) for users; [`design/`](docs/design/) for the trust model, the router path, and the request envelope |
-| [`deploy/`](deploy/) | [`phala/`](deploy/phala/) is the CVM deployment. Its `docker-compose.yml` is the *source* of the measured manifest, but carries `:latest` for development — the digest-pinned `docker-compose.release.yml` on a Release is what a deployment actually runs and what the attestation covers; [`grafana/`](deploy/grafana/) is the operational dashboard |
+| [`deploy/`](deploy/) | [`phala/`](deploy/phala/) is the CVM deployment — the source of the measured manifest, with the release/`:latest` distinction noted above; [`grafana/`](deploy/grafana/) is the operational dashboard |
 | [`loadtest/`](loadtest/) | capacity measurement for the gateway. Internal |
 
 ## Status
 
-**Beta.** Interfaces will change. Specifically, and stated the same way the
-user-facing document states it:
+**Beta.** Interfaces will change. The limits are stated in full under
+[Current limits](docs/verifying-the-gateway.md#current-limits); in short:
 
-- The hosted gateway is **tier 2.5** — cheating is *publicly detectable*, not
-  *prevented*. Detection requires that somebody actually run the verification;
-  a user who skips it is trusting 0G by default.
-- **Endpoint identity is closed**: `pcverify -gateway <domain>` proves the TLS session
-  terminates inside a genuine TDX enclave that minted the certificate served **on the
-  connection `pcverify` made**. One domain can be several CVMs, each with its own key,
-  so that is not automatically the certificate your browser negotiated — see the replica
-  note in [Current limits](docs/verifying-the-gateway.md#current-limits).
+- The hosted gateway is **tier 2.5** — cheating is *publicly detectable*, not *prevented*.
+  Detection requires that somebody actually run the verification; a user who skips it is
+  trusting 0G by default.
+- **Endpoint identity is established for the connection that was checked.** One domain can
+  be several CVMs, each with its own key, so a `PASS` does not automatically describe the
+  certificate your browser negotiated.
 - **Code identity is closed for the images we deploy on.** The OS-image allowlist
-  ([`client/evidence/osimages.json`](client/evidence/osimages.json)) carries the
-  deployed image, derived from the published guest-OS release and confirmed against a
-  live quote — which is what establishes that the guest enforced the binding between
-  the attestation and the manifest. An image not on that list *fails*, so a new OS
-  version needs an entry before deployment. See
-  [Current limits](docs/verifying-the-gateway.md#current-limits) for the two caveats on
-  how the entries were derived.
-- The **provider** hop — the one the gateway walks on your behalf — is wired end to end,
-  and the deployed gateway splits into enforce and warn:
-  - **enforced**: DCAP quote verification with its `report_data` binding (a provider that
-    fails it is not used), and the §8 response signature (a response that does not verify
-    is not returned).
-  - **warn only**: the measurement allowlist (hop 3) — empty, and unlike the gateway's it
-    needs a shape change before it can be filled at all — and the on-chain signer
-    cross-check (hop 5), which is wired with its enforce switch deliberately off.
-
-  [`trust-chain.md`](docs/design/trust-chain.md) marks the status of every link.
+  ([`client/evidence/osimages.json`](client/evidence/osimages.json)) carries the deployed
+  image, derived from the published guest-OS release and confirmed against a live quote. An
+  image not on that list *fails*, so a new OS version needs an entry before deployment.
+- On the **provider** hop the gateway walks on your behalf, DCAP quote verification and the
+  §8 response signature are **enforced**; the measurement allowlist and the on-chain signer
+  cross-check are **warn only**. [`trust-chain.md`](docs/design/trust-chain.md) marks the
+  status of every link.
 
 ## The other end
 
