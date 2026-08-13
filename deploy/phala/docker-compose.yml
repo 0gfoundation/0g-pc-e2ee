@@ -344,64 +344,25 @@ services:
       - "ZG_GATEWAY_WARM=true"
       # - "ZG_GATEWAY_WARM_INTERVAL=4m" # optional; 4m is already the default
       #
-      # Ceiling on concurrent sealed inference requests; over it, a request is
-      # refused with 503 + Retry-After instead of being queued. A pile-up
-      # backstop, not a capacity plan: it stops one caller's burst from being
-      # served out of every other caller's latency, on a process every user
-      # shares.
+      # Soft memory limit for the Go runtime, and the input the sealed path's
+      # concurrency ceiling is derived from — ZG_GATEWAY_MAX_INFLIGHT is
+      # deliberately NOT set, so the number comes from one place:
       #
-      # NOT set here, deliberately — it is DERIVED from GOMEMLIMIT below, and there
-      # must be exactly one place the number comes from. Setting both by hand is how
-      # they drift apart: an earlier revision of this file pinned 1024 alongside a
-      # 24 GiB limit, and those two disagree — 1024 slots at peak is ~30 GiB of live
-      # request buffers, i.e. above the very limit set to contain them. The binary's
-      # arithmetic (cmd/gateway/inflight.go) does not make that mistake, so let it do
-      # the division:
+      #   24 GiB / 2 (bodies' share) / ~30 MiB (peak per request) = ~409 in flight
       #
-      #   GOMEMLIMIT 24 GiB / 2 (bodies' share) / ~30 MiB (peak per request) = ~409
+      # It is the SECOND line of defence, not a replacement for that ceiling: the
+      # ceiling bounds LIVE memory by refusing admission, GOMEMLIMIT only absorbs
+      # GARBAGE by collecting harder. And it is soft — Go cannot refuse an
+      # allocation, so a live set genuinely over the limit trades an OOM for a GC
+      # death spiral.
       #
-      # Still attested: GOMEMLIMIT is in this measured block and the formula is in
-      # the measured image, so the cap a deployment runs is fixed by what the
-      # attestation already covers. The effective value is also on the startup log
-      # line and published as zg_gateway_inflight_limit, so it never has to be
-      # inferred.
-      #
-      # Set ZG_GATEWAY_MAX_INFLIGHT explicitly only to override that derivation with
-      # a MEASURED value — an L3 run (in-CVM, behind dstack-ingress) is what produces
-      # one. An explicit value wins over the arithmetic, which is the point: a number
-      # from measurement beats a number from estimation. Until then, watch
-      # zg_gateway_requests_shed_total; any sustained non-zero rate means real
-      # traffic is being turned away, and there are no dashboard panels for it yet
-      # (deploy/grafana), so read it off /metrics.
-      #
-      # Soft memory limit for the Go runtime. Two different jobs, and this is the
-      # SECOND line of defence, not a replacement for the cap above:
-      #
-      #   - the in-flight cap bounds LIVE memory, by refusing admission;
-      #   - GOMEMLIMIT absorbs GARBAGE, by making the collector work harder before
-      #     the heap grows. Go's default GOGC=100 targets a heap about twice the
-      #     live set, so a burst can double past any budget the cap reasoned about.
-      #
-      # It is SOFT: Go cannot refuse an allocation, so if the LIVE set genuinely
-      # exceeds this the runtime collects continuously and the memory still grows —
-      # an OOM trades for a GC death spiral. That is why admission control has to be
-      # the primary bound; this only removes the failure mode where transient
-      # garbage, not real work, is what kills the process.
-      #
-      # 24 GiB of the CVM's 32: ~2 for guest OS and kernel, ~1 for dstack-ingress
-      # plus the metrics agent, and ~5 of slack so the HOST never reaches an OOM
-      # kill (which would take the whole CVM, not just this container).
-      #
-      # THIS NUMBER ASSUMES A 32 GiB CVM, and nothing here can check that — the
-      # shape is chosen at `cvm create` time, not declared in this file. Set above
-      # physical RAM it silently stops existing (the runtime never reaches a limit
-      # it cannot allocate up to, so the OOM killer arrives first) AND the cap
-      # derived from it stays sized for memory the CVM does not have: both defences
-      # fail at once, while this block still reads as though they were configured.
-      # Re-derive it on any resize — unlike the cap, it does not scale itself. See
-      # README "CVM shape — and the one setting that depends on it".
+      # 24 of the CVM's 32 GiB: ~2 guest OS/kernel, ~1 dstack-ingress + metrics
+      # agent, ~5 slack so the HOST never OOM-kills (that takes the whole CVM).
+      # ASSUMES a 32 GiB CVM and nothing here can check it — set above physical RAM
+      # and this limit plus the cap derived from it both fail silently. Re-derive on
+      # resize; it does not scale itself. Rationale, and what going wrong looks
+      # like: README "CVM shape — and the one setting that depends on it".
       - "GOMEMLIMIT=24GiB"
-      #
       # Where to read THIS CVM's own identity (instance_id / app_id): the file the
       # cvm-identity init container wrote, NOT the guest-agent socket. Both env vars
       # are spelled out because this block is measured — a reader should be able to

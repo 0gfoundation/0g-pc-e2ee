@@ -129,6 +129,14 @@ phala cvm create --compose deploy/phala/docker-compose.yml
 |---|---|---|
 | `GOMEMLIMIT` | `24GiB` | **Yes — hardcoded.** 32 GiB less ~2 for guest OS/kernel, ~1 for `dstack-ingress` + the metrics agent, ~5 of slack so the *host* never reaches an OOM kill (which takes the whole CVM, not just one container). |
 | in-flight cap | derived, **~409** | Indirectly: it is `GOMEMLIMIT / 2 / ~30 MiB`, so it follows the line above. Printed as `max_inflight` on the gateway's startup line and published as `zg_gateway_inflight_limit`. |
+
+`ZG_GATEWAY_MAX_INFLIGHT` is deliberately left unset so the cap has a single
+source. Set it only to replace that arithmetic with a **measured** value — an L3
+run is what produces one ([`../../loadtest/`](../../loadtest/)), and measurement
+should beat estimation. Until then the signal to watch is
+`zg_gateway_requests_shed_total`: any sustained non-zero rate means real traffic
+is being turned away. There are no dashboard panels for it yet, so read it off
+`/metrics`.
 | `GOMAXPROCS` | unset | No. A CVM is a VM, so the guest sees its own vCPUs and Go reads them correctly. Only a *container CPU quota* would need it pinned. |
 
 **On resize, `GOMEMLIMIT` must be re-derived by hand.** It is the one number here
