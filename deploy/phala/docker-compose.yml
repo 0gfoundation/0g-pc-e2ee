@@ -390,8 +390,16 @@ services:
       #
       # 24 GiB of the CVM's 32: ~2 for guest OS and kernel, ~1 for dstack-ingress
       # plus the metrics agent, and ~5 of slack so the HOST never reaches an OOM
-      # kill (which would take the whole CVM, not just this container). Re-derive it
-      # if the CVM is resized — unlike the cap, this number does not scale itself.
+      # kill (which would take the whole CVM, not just this container).
+      #
+      # THIS NUMBER ASSUMES A 32 GiB CVM, and nothing here can check that — the
+      # shape is chosen at `cvm create` time, not declared in this file. Set above
+      # physical RAM it silently stops existing (the runtime never reaches a limit
+      # it cannot allocate up to, so the OOM killer arrives first) AND the cap
+      # derived from it stays sized for memory the CVM does not have: both defences
+      # fail at once, while this block still reads as though they were configured.
+      # Re-derive it on any resize — unlike the cap, it does not scale itself. See
+      # README "CVM shape — and the one setting that depends on it".
       - "GOMEMLIMIT=24GiB"
       #
       # Where to read THIS CVM's own identity (instance_id / app_id): the file the

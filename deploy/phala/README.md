@@ -118,6 +118,34 @@ dashboard, or via the CLI, passing the environment above:
 phala cvm create --compose deploy/phala/docker-compose.yml
 ```
 
+### CVM shape — and the one setting that depends on it
+
+> **⚠️ Unverified.** The intended mainnet shape is **16 vCPU / 32 GiB**, but
+> nothing in this repository can confirm what a given CVM was actually created
+> with — the shape is chosen at `cvm create` time, not declared in the compose.
+> Confirm it against the deployment before trusting the arithmetic below.
+
+| Setting | Value | Depends on the shape? |
+|---|---|---|
+| `GOMEMLIMIT` | `24GiB` | **Yes — hardcoded.** 32 GiB less ~2 for guest OS/kernel, ~1 for `dstack-ingress` + the metrics agent, ~5 of slack so the *host* never reaches an OOM kill (which takes the whole CVM, not just one container). |
+| in-flight cap | derived, **~409** | Indirectly: it is `GOMEMLIMIT / 2 / ~30 MiB`, so it follows the line above. Printed as `max_inflight` on the gateway's startup line and published as `zg_gateway_inflight_limit`. |
+| `GOMAXPROCS` | unset | No. A CVM is a VM, so the guest sees its own vCPUs and Go reads them correctly. Only a *container CPU quota* would need it pinned. |
+
+**On resize, `GOMEMLIMIT` must be re-derived by hand.** It is the one number here
+that does not scale itself, and getting it wrong is quiet in both directions:
+
+- **Set above physical RAM** (e.g. `24GiB` left in place on a 16 GiB CVM) and it
+  stops existing — the runtime never reaches a limit it cannot allocate up to, so
+  the OOM killer arrives first, and the derived in-flight cap stays sized for
+  memory the CVM does not have. Both defences fail together, and the compose still
+  *reads* as if they were configured.
+- **Set too low** and the gateway sheds traffic it could have served, since the
+  cap is derived from it.
+
+Neither shows up as an error — the first surfaces as the container disappearing
+under load, the second as `zg_gateway_requests_shed_total` climbing while the CPU
+is idle. Check both after any resize.
+
 When bringing up a **new** hostname, do the first round trips against Let's
 Encrypt's staging CA by setting `ACME_STAGING=true` in the CVM's encrypted
 environment. Keep `ACME_STAGING` **permanently listed in `allowed_envs`** (its

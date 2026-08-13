@@ -14,8 +14,10 @@ const noMemLimit = int64(math.MaxInt64)
 func TestComputeMaxInFlight_CPUTerm(t *testing.T) {
 	for _, tc := range []struct{ cpus, want int }{
 		{1, 256},
+		// 2 cores already reach the memory ceiling, so this is the last point at
+		// which the per-CPU term is what decides. Above it, memory governs — see
+		// maxDefaultInFlight.
 		{2, 512},
-		{4, 1024},
 	} {
 		if got := computeMaxInFlight(tc.cpus, noMemLimit); got != tc.want {
 			t.Errorf("computeMaxInFlight(%d, unset) = %d, want %d", tc.cpus, got, tc.want)
@@ -28,20 +30,32 @@ func TestComputeMaxInFlight_CPUTerm(t *testing.T) {
 // a 16-vCPU box would default to 4096, whose worst-case buffered bodies exceed
 // the RAM such a box has. The default must stop scaling before then.
 func TestComputeMaxInFlight_AbsoluteCeiling(t *testing.T) {
-	for _, cpus := range []int{8, 16, 32, 96} {
+	for _, cpus := range []int{4, 8, 16, 32, 96} {
 		got := computeMaxInFlight(cpus, noMemLimit)
 		if got != maxDefaultInFlight {
 			t.Errorf("computeMaxInFlight(%d, unset) = %d, want the ceiling %d — the default must not "+
-				"scale with cores past the point where worst-case request buffers exceed RAM",
+				"scale with cores past the point where worst-case request memory exceeds RAM",
 				cpus, got, maxDefaultInFlight)
 		}
 	}
-	// State the consequence in bytes, so a future change to either constant has to
-	// confront it: this is the worst-case buffered-body total the ceiling permits.
-	worstCase := int64(maxDefaultInFlight) * int64(openaiproxy.MaxRequestBytes)
-	if worstCase > 16<<30 {
-		t.Errorf("the ceiling permits %d GiB of concurrent request bodies, which no CVM we deploy on "+
-			"can absorb; lower maxDefaultInFlight or openaiproxy.MaxRequestBytes", worstCase>>30)
+
+	// The consequence in bytes, priced with perRequestPeakBytes — the SAME model
+	// the GOMEMLIMIT term uses. An earlier version of this assertion priced it at
+	// 1x MaxRequestBytes, which let a 30 GiB ceiling pass a 16 GiB threshold; the
+	// bound and its test agreed with each other and disagreed with the rest of the
+	// file. Anything that raises maxDefaultInFlight or MaxRequestBytes now has to
+	// confront this number.
+	//
+	// The threshold is what an unconfigured deployment must survive — no
+	// GOMEMLIMIT, so this ceiling is the only bound in play, and the host is
+	// whatever someone happened to run it on.
+	const maxWorstCaseBytes = 16 << 30
+	worstCase := int64(maxDefaultInFlight) * int64(perRequestPeakBytes)
+	if worstCase > maxWorstCaseBytes {
+		t.Errorf("the ceiling permits %d GiB of concurrent request memory (%d slots x %d MiB peak), "+
+			"over the %d GiB an unconfigured deployment must survive; lower maxDefaultInFlight "+
+			"or openaiproxy.MaxRequestBytes",
+			worstCase>>30, maxDefaultInFlight, perRequestPeakBytes>>20, maxWorstCaseBytes>>30)
 	}
 }
 

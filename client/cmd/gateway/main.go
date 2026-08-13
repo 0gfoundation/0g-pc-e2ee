@@ -56,6 +56,7 @@ import (
 	"net/http/pprof"
 	"net/url"
 	"os"
+	"runtime"
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/cmd/internal/proxycli"
@@ -253,8 +254,17 @@ func main() {
 	// that is simply echoed back, nobody can read the config and know what the
 	// gateway settled on. The same value is published as zg_gateway_inflight_limit;
 	// the log is what an operator reaches for first.
+	//
+	// go_memlimit_bytes and gomaxprocs come with it because they are its INPUTS,
+	// and the failure worth catching is a GOMEMLIMIT set above the machine's actual
+	// RAM — which is silent (Go never reaches a limit it cannot allocate up to, so
+	// the OOM killer arrives first) and leaves the cap sized for memory that does
+	// not exist. Logging all three puts the assumption next to what it produced, so
+	// comparing it against the CVM's real shape is a glance rather than an
+	// investigation. math.MaxInt64 means unset.
 	logger.Info("gateway listening", "listen", *f.Listen, "router_url", *f.RouterURL,
-		"cors_allowed_origins", origins, "max_inflight", *maxInFlight)
+		"cors_allowed_origins", origins, "max_inflight", *maxInFlight,
+		"go_memlimit_bytes", currentMemoryLimit(), "gomaxprocs", runtime.GOMAXPROCS(0))
 	err = proxycli.Serve(srv, logger)
 	stopWarmer()
 	stopMetrics()

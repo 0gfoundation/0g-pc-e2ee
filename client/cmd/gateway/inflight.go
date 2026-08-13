@@ -45,13 +45,27 @@ const (
 	// traffic the gateway is still serving fine.
 	inFlightPerCPU = 256
 
-	// maxDefaultInFlight bounds the default no matter how many cores appear. At
-	// openaiproxy.MaxRequestBytes per buffered body this is ~10 GiB of worst-case
-	// request buffer, which a 32 GiB CVM survives with room for GC headroom, the
-	// response side, and its sibling containers. It bounds only the DEFAULT — an
-	// explicit -max-inflight is honored as given, because an operator naming a
-	// number has context this arithmetic does not.
-	maxDefaultInFlight = 1024
+	// maxDefaultInFlight bounds the default no matter how many cores appear. Priced
+	// with perRequestPeakBytes below — the SAME model as the GOMEMLIMIT term, which
+	// is the whole point: an earlier revision priced this bound at 1x
+	// MaxRequestBytes and the other at 3x, so the file disagreed with itself about
+	// what a request costs and the looser number won on every deployment that had
+	// no GOMEMLIMIT set. At 512 the worst case is 512 x 30 MiB = 15 GiB.
+	//
+	// This is the bound that matters MOST, because it is the one that applies when
+	// nothing else is configured — a deployment outside the Phala CVM (local, a
+	// future GCP/AWS host) has no GOMEMLIMIT and lands here. The unconfigured path
+	// is exactly the OOM this cap exists to prevent, so it is the last place to be
+	// generous.
+	//
+	// It bounds only the DEFAULT — an explicit -max-inflight is honored as given,
+	// because an operator naming a number has context this arithmetic does not.
+	//
+	// Note this leaves the per-CPU term above binding only on a single-core host
+	// (256), since 2 cores already reach 512. That is the honest outcome of pricing
+	// both bounds the same way: past one core, memory is what limits concurrency,
+	// not CPU.
+	maxDefaultInFlight = 512
 
 	// minDefaultInFlight floors the memory-derived term. A small GOMEMLIMIT must
 	// not shrink the gateway to a handful of slots, which would be a self-inflicted
@@ -62,12 +76,21 @@ const (
 	// one in-flight request can hold: the buffered body, plus the parsed copy, plus
 	// the sealed and base64'd envelope built from it. Approximate by nature —
 	// it is a budgeting input, not an accounting one.
+	//
+	// EVERY memory bound in this file must be priced with it. Two bounds using two
+	// different factors is not a conservative belt-and-braces arrangement; it is a
+	// file that disagrees with itself, where the looser number silently governs.
 	perRequestPeakFactor = 3
 
 	// memBudgetDivisor is the share of GOMEMLIMIT the request bodies may claim.
 	// Half, because the other half is the response side, the quote/collateral
 	// caches, and the headroom Go's collector needs to not thrash.
 	memBudgetDivisor = 2
+
+	// perRequestPeakBytes is the one place the per-request memory price is
+	// expressed. Both bounds and the test read it, so neither can be re-derived
+	// with a different factor by accident.
+	perRequestPeakBytes = perRequestPeakFactor * openaiproxy.MaxRequestBytes
 )
 
 // defaultMaxInFlight is the built-in ceiling for this process: the per-CPU term,
@@ -95,8 +118,7 @@ func computeMaxInFlight(cpus int, memLimit int64) int {
 	// Only meaningful when a limit is actually set; unset reads as MaxInt64 and
 	// the division would overflow into a no-op anyway.
 	if memLimit > 0 && memLimit < math.MaxInt64 {
-		perRequest := int64(perRequestPeakFactor) * int64(openaiproxy.MaxRequestBytes)
-		fromMem := int(memLimit / memBudgetDivisor / perRequest)
+		fromMem := int(memLimit / memBudgetDivisor / int64(perRequestPeakBytes))
 		if fromMem < minDefaultInFlight {
 			fromMem = minDefaultInFlight
 		}
