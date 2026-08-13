@@ -56,7 +56,6 @@ import (
 	"net/http/pprof"
 	"net/url"
 	"os"
-	"runtime"
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/cmd/internal/proxycli"
@@ -108,32 +107,11 @@ func main() {
 	dstackSocket := flag.String("dstack-socket", proxycli.EnvOr("ZG_GATEWAY_DSTACK_SOCKET", dstack.DefaultSocket),
 		"path to the dstack guest-agent unix socket, read ONCE at startup for the same identity when "+
 			"-identity-file is unset; empty disables the lookup (env ZG_GATEWAY_DSTACK_SOCKET)")
-	// Ceiling on concurrent sealed inference requests (see
-	// openaiproxy.LimitInFlight for why a paid-per-token service still needs
-	// one). The default is deliberately generous rather than tuned: it is a
-	// backstop against pile-up, not a capacity plan. A streamed completion is
-	// held open for its whole token schedule, so healthy in-flight counts sit far
-	// above the arrival rate — loadtest/README.md walks through why — and a cap
-	// set near the measured knee would start refusing traffic the gateway is
-	// still serving fine. Scaled by GOMAXPROCS so it tracks the CVM it is given
-	// instead of a number that silently means something different on a resize.
-	//
-	// GOMAXPROCS is the right input for the deployed form — a CVM is a VM, so the
-	// guest sees exactly its own vCPUs. Under a container CPU QUOTA (`cpus:`) it
-	// is wrong, because this Go version reads the host's core count rather than
-	// the quota — but the fix there is to pin GOMAXPROCS to the quota, not to
-	// hand-tune this cap around a bad reading. Pinning repairs this default for
-	// free AND fixes the scheduler problem the same misreading causes (dozens of
-	// Ps against a two-CPU quota, throttled at every period boundary), which no
-	// value of -max-inflight can. loadtest/docker-compose.yml pins it for exactly
-	// that second reason; a quota-constrained deployment should do the same.
-	//
-	// Replace it with a measured value once L3 (in-CVM, behind dstack-ingress)
-	// has a real knee to point at; until then, too high is the safer error, since
-	// too high merely fails to help while too low turns a healthy gateway into a
-	// 503 source.
-	defaultMaxInFlight := 256 * runtime.GOMAXPROCS(0)
-	maxInFlight := flag.Int("max-inflight", proxycli.EnvIntOr("ZG_GATEWAY_MAX_INFLIGHT", defaultMaxInFlight),
+	// Ceiling on concurrent sealed inference requests — see
+	// openaiproxy.LimitInFlight for why a paid-per-token service still needs one,
+	// and defaultMaxInFlight for how the built-in number is derived and why it is
+	// bounded on two axes rather than one.
+	maxInFlight := flag.Int("max-inflight", proxycli.EnvIntOr("ZG_GATEWAY_MAX_INFLIGHT", defaultMaxInFlight()),
 		"max concurrent sealed inference requests; excess is refused with 503 + Retry-After rather than queued. "+
 			"0 disables the cap (load-test rigs measuring the unbounded knee) (env ZG_GATEWAY_MAX_INFLIGHT)")
 	// Mount the Go runtime profiler on the metrics listener. OFF by default and
