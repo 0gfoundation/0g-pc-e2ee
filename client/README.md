@@ -168,7 +168,10 @@ can come from anywhere (`-app-compose <file>`), because the hash anchors them. T
 compose text is then matched against the newest 5 published releases by default
 (`-releases N`, `0` to disable); `-expect-compose-file` pins one manifest instead.
 
-Both modes exit non-zero on a failed check, so either works as a deploy gate. See
+Both modes exit non-zero on a failed check, so either works as a deploy gate. Gateway
+mode further separates "failed" (1) from "did not run" (3), so a skipped lookup cannot
+read as a full pass; `-strict` makes every check mandatory and turns the latter into the
+former. See
 [`docs/design/cloud-gateway.md`](../docs/design/cloud-gateway.md) §10 for what the
 result does and does not cover.
 

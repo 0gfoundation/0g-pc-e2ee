@@ -58,6 +58,14 @@
 // run (an unreachable or rate-limited API says nothing about the deployment), while an
 // explicit -releases N that cannot be satisfied is fatal. Same rule as DNS discovery.
 //
+// -strict ends that degradation for every optional lookup at once. It is the flag for
+// a gate: without it the only way to make a lookup mandatory is to also supply its
+// input (-releases N, -base-domain …), which conflates "I require this check" with
+// "here is where to look" and leaves a CI author who does not know the platform base
+// domain unable to harden the run at all. -strict requires the checks and lets
+// discovery keep finding the values. It is rejected together with -releases 0, which
+// asks to skip the one comparison whose failure is the finding that matters.
+//
 // -allow-untrusted-cert accepts a served certificate that does not chain to a public
 // root, for ACME-staging deployments. It is purely a verdict decision: the evidence
 // fetch never verifies PKI in the first place (it rides the same connection whose
@@ -96,8 +104,21 @@
 //
 // Both modes make NO changes and send NOTHING beyond reads: the chain RPC and the
 // provider's public /quote, or the public evidence files and one TLS handshake,
-// plus whatever DCAP collateral the verifier fetches. Exit code is non-zero on any
-// failed check, so either drops into CI or a deploy gate.
+// plus whatever DCAP collateral the verifier fetches.
+//
+// # Exit codes
+//
+//	0  every check ran and passed
+//	1  a check failed
+//	2  caller mistake (bad flags, an unusable domain, an unreadable file)
+//	3  gateway mode: nothing failed, but a check did not RUN
+//
+// 3 exists because "nothing I checked was wrong" is a weaker claim than "I checked
+// everything", and a gate reading only zero/non-zero cannot tell them apart — which
+// would let a GitHub outage read as a full pass on the one check that catches a
+// deployment running unpublished code. A run that skips something says so on screen
+// and returns 3; -strict turns that into 1 instead. Treat 3 as failure in a gate
+// unless a partial verification is genuinely acceptable there.
 package main
 
 import (
@@ -152,6 +173,7 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 	noDNSDiscovery := fs.Bool("no-dns-discovery", false, "gateway mode: do not derive the platform base domain from DNS; check only what was passed in")
 	expectComposeFile := fs.String("expect-compose-file", "", "gateway mode: path to the docker-compose manifest this deployment should be running (a digest-pinned docker-compose.release.yml), compared against the authenticated app-compose's docker_compose_file. Overrides the default -releases lookup")
 	releases := fs.Int("releases", defaultReleases, "gateway mode: accept the deployment if its compose text matches any of the newest N published releases, and report which one. 0 disables the lookup")
+	strict := fs.Bool("strict", false, "gateway mode: require every check to RUN, not merely to not fail — a lookup that cannot be completed (releases, app-compose) fails the run (exit 1) instead of degrading to an advisory \"-\" (exit 3). Demands the checks without demanding their inputs, so discovery still supplies them")
 	releaseRepo := fs.String("repo", defaultReleaseRepo, "gateway mode: owner/name to read releases from, with -releases")
 	releaseAsset := fs.String("release-asset", defaultReleaseAsset, "gateway mode: release asset holding the deployment manifest, with -releases")
 	timeout := fs.Duration("timeout", 30*time.Second, "overall timeout")
@@ -193,6 +215,7 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 			// failed release lookup is fatal.
 			releasesSet:      flagSet(fs, "releases"),
 			expectComposeSet: flagSet(fs, "expect-compose-file"),
+			strict:           *strict,
 		}
 		// The release lookup happens during construction, so it shares the run's deadline.
 		ctx, cancel := context.WithTimeout(ctx, *timeout)
@@ -202,7 +225,7 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 			fmt.Fprintf(out, "pcverify: %v\n", err)
 			return 2
 		}
-		return reportGateway(ctx, out, ec, *gateway, *allowUntrustedCert, expect)
+		return reportGateway(ctx, out, ec, *gateway, *allowUntrustedCert, *strict, expect)
 	}
 
 	reg, err := chain.NewOnChainRegistry(chain.Config{RPCURL: *chainRPCURL, ContractAddress: *servingContract})

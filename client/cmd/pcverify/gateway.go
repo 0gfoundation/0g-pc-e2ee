@@ -40,6 +40,12 @@ type gatewayConfig struct {
 	// fatal when it cannot be satisfied, while the default degrades to advisory.
 	releasesSet      bool
 	expectComposeSet bool
+	// strict turns "no check failed" into "every check ran and passed". The optional
+	// lookups stop degrading to advisory, so a run that could not reach GitHub or
+	// could not locate the app-compose fails instead of printing "-" and exiting 0.
+	// It demands the checks WITHOUT demanding their inputs: DNS discovery still finds
+	// the base domain, it just may no longer come up empty.
+	strict bool
 }
 
 // expectSource records how the "what should be running" side was resolved, so the
@@ -126,6 +132,11 @@ func newEvidenceChecker(ctx context.Context, out io.Writer, g gatewayConfig) (*e
 	switch {
 	case g.expectComposeSet && g.releasesSet:
 		return nil, expect, fmt.Errorf("-expect-compose-file pins one manifest and -releases matches a set; pass one")
+	// -strict demands every check; -releases 0 with no pinned manifest disables the
+	// one check whose failure is the finding that matters. Rejecting the pair is the
+	// only reading that does not silently break one of the two instructions.
+	case g.strict && !pinned && g.releases <= 0:
+		return nil, expect, fmt.Errorf("-strict requires a compose comparison; drop -releases 0 or pass -expect-compose-file")
 	case pinned:
 		b, err := os.ReadFile(g.expectComposePath)
 		if err != nil {
@@ -139,12 +150,14 @@ func newEvidenceChecker(ctx context.Context, out io.Writer, g gatewayConfig) (*e
 		fmt.Fprintf(out, "expected compose   %s\n", expect.Label)
 		// Not explicitly asked for: the lookup reaches GitHub, and an unreachable or
 		// rate-limited API says nothing about the deployment. Degrade to advisory rather
-		// than fail, exactly as a DNS-discovered app-compose lookup does.
-		expect.Advisory = !g.releasesSet
-		// Explicit iff the operator typed -releases. Passing the default through as
-		// "explicit" would let a successful GitHub lookup harden the unrelated
-		// DNS-discovered app-compose lookup — see evidence.CodeIdentity.OK.
-		cfg.ExpectComposeExplicit = g.releasesSet
+		// than fail, exactly as a DNS-discovered app-compose lookup does. -strict is the
+		// caller saying they want the claim made or the run failed, so it ends the
+		// degradation without their having to name the count.
+		expect.Advisory = !g.releasesSet && !g.strict
+		// Explicit iff the operator typed -releases (or -strict). Passing the bare
+		// default through as "explicit" would let a successful GitHub lookup harden the
+		// unrelated DNS-discovered app-compose lookup — see evidence.CodeIdentity.OK.
+		cfg.ExpectComposeExplicit = g.releasesSet || g.strict
 		files, err := fetchReleaseComposeFiles(ctx, newGitHubClient(g.timeout), g.releaseRepo, g.releaseAsset, g.releases, out)
 		switch {
 		case err != nil && expect.Advisory:
@@ -159,16 +172,59 @@ func newEvidenceChecker(ctx context.Context, out io.Writer, g gatewayConfig) (*e
 	return c, expect, err
 }
 
-// reportGateway prints the per-step result of verifying a gateway's evidence
-// bundle and returns the process exit code (0 pass, 1 any failed check).
+// incompleteReason names the first check that did NOT run in a run that failed
+// nothing, or "" when every check ran. It is derived from the report rather than
+// observed from the printing, so the verdict cannot drift from what a reader is told,
+// and it names the reason rather than returning a bare bool because the verdict line
+// has to point at the specific gap — "something was skipped" sends a reader hunting.
+//
+// This is the distinction exit code 3 exists to carry: "nothing I checked was wrong"
+// is a weaker claim than "I checked everything", and a gate that reads only
+// zero/non-zero cannot tell them apart. Deliberate skips count — -releases 0 and
+// -no-dns-discovery are choices to check less, not reasons to call a run complete.
+func incompleteReason(rep evidence.Report, expect expectSource) string {
+	// The OS image grounds step 6: without it, compose_hash is a register the
+	// untrusted host wrote. An empty allowlist reports "not pinned" and passes.
+	if !rep.OSImage.Configured {
+		return "the OS image was not pinned"
+	}
+	// Mirrors reportCodeIdentity's branches, in its order.
+	code := rep.Code
+	switch {
+	case code.HashErr != nil:
+		return "compose_hash was not recovered, so code identity did not run"
+	case code.NoSource:
+		return "no app-compose was available, so code identity did not run"
+	case code.FetchErr != nil:
+		return "the app-compose could not be fetched"
+	// Before !ExpectRequested: a failed lookup leaves that false too, and "the lookup
+	// failed" is the more useful of the two readings.
+	case expect.Err != nil:
+		return "the release lookup failed, so no published manifest was compared"
+	case !code.ExpectRequested:
+		return "no published manifest was compared"
+	}
+	return ""
+}
+
+// reportGateway prints the per-step result of verifying a gateway's evidence bundle
+// and returns the process exit code: 0 every check ran and passed, 1 a check failed,
+// 3 nothing failed but something did not run (see incompleteRun). 2 is reserved for
+// a caller mistake, which is why "incomplete" could not have it.
+//
+// strict collapses 3 into 1: the caller asked for a complete run, so an incomplete
+// one is a failed one. Most of that is already enforced upstream through
+// Config.ExpectComposeExplicit — this is the backstop that makes the guarantee hold
+// for every "-" line rather than only the ones that flag reaches.
 //
 // allowUntrustedCert downgrades the chain-trust step (step 5) from a failure to a
 // note. It exists for ACME-staging deployments, whose certificates are correctly
 // bound by the quote but signed by an untrusted CA on purpose
 // (deploy/phala/README.md). It relaxes no attestation check, but it does narrow the
 // claim — an interceptor running its own attested CVM would satisfy everything
-// else — so a run that uses it prints that caveat rather than a bare PASS.
-func reportGateway(ctx context.Context, out io.Writer, ec evidenceChecker, domain string, allowUntrustedCert bool, expect expectSource) int {
+// else — so a run that uses it prints that caveat rather than a bare PASS, and is
+// incomplete for the same reason: the domain binding went unestablished.
+func reportGateway(ctx context.Context, out io.Writer, ec evidenceChecker, domain string, allowUntrustedCert, strict bool, expect expectSource) int {
 	rep, err := ec.Check(ctx, domain)
 	if err != nil {
 		fmt.Fprintf(out, "pcverify: %v\n", err)
@@ -291,11 +347,31 @@ func reportGateway(ctx context.Context, out io.Writer, ec evidenceChecker, domai
 			"  production hostname, where this check should pass without the flag.\n", rep.Domain)
 	}
 
-	if rep.Pass() && (trustOK || allowUntrustedCert) {
-		fmt.Fprintln(out, "\nPASS")
-		return 0
+	if !rep.Pass() || !(trustOK || allowUntrustedCert) {
+		return fail(out)
 	}
-	return fail(out)
+	reason := incompleteReason(rep, expect)
+	// Waiving chain trust leaves the connection untied to the name asked for, so that
+	// run did not cover everything either — the warning above says so at length, and
+	// the verdict should agree with it. Checked second: an actual skipped check is the
+	// more actionable thing to name.
+	if reason == "" && !trustOK {
+		reason = "chain trust was waived, so the connection was not tied to the domain"
+	}
+	switch {
+	case reason != "" && strict:
+		fmt.Fprintf(out, "\n-strict requires every check to run, and one did not: %s.\n"+
+			"  Supply what it needs, or drop -strict to accept a partial run.\n", reason)
+		return fail(out)
+	case reason != "":
+		// Named on screen, not just implied by the exit code: the failure mode this
+		// guards against is a reader taking "not FAIL" for "verified".
+		fmt.Fprintf(out, "\nPASS (INCOMPLETE) — no check failed, but %s,\n"+
+			"  so this is not a full verification. Re-run with -strict to make it fatal.\n", reason)
+		return 3
+	}
+	fmt.Fprintln(out, "\nPASS")
+	return 0
 }
 
 // reportCodeIdentity prints the mr_config_id → compose_hash → app-compose →

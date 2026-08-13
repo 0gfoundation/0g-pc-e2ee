@@ -36,25 +36,35 @@ go build -o pcverify ./cmd/pcverify     # or: go run ./cmd/pcverify -gateway <do
 `replace` for the in-repo `protocol` module, which `go install` refuses. Clone and
 build.)
 
-Exit code 0 means **no check failed** — not quite the same as "every check ran". Two
-lookups are *advisory by default*, because they reach things that say nothing about the
-deployment: the release lookup reaches GitHub, and locating the app-compose reaches DNS
-and the platform. If either is unavailable, the run marks that line `-`, says so in the
-closing `note:`, and still exits 0. Read the `-` lines and the note, not only the exit
-code.
+**Read the exit code, and read which one.** Two lookups are *advisory by default*,
+because they reach things that say nothing about the deployment: the release lookup
+reaches GitHub, and locating the app-compose reaches DNS and the platform. A run where
+one of those is unavailable failed nothing, but it also did not check everything, and
+those are different claims:
 
-**Using it as a gate.** Name what must work and those lookups become fatal instead of
-advisory:
+| Exit | Means |
+|---|---|
+| `0` | every check ran and passed |
+| `1` | a check failed |
+| `2` | caller mistake — bad flags, an unusable domain, an unreadable file |
+| `3` | nothing failed, but a check did not **run** |
+
+A `3` prints `PASS (INCOMPLETE)` and names the gap. Treat it as a failure in a gate
+unless a partial verification is genuinely acceptable there.
+
+**Using it as a gate.** `-strict` makes every check mandatory, turning a `3` into a `1`:
 
 ```sh
-pcverify -gateway <domain> -releases 5 -base-domain <platform-base-domain>
-# or, with the manifest and the compose text in hand:
-pcverify -gateway <domain> -expect-compose-file ./docker-compose.release.yml -app-compose ./app-compose.json
+pcverify -gateway <domain> -strict
 ```
 
-A default lookup that fails is not evidence against the deployment; one you demanded and
-did not get leaves the claim unmade, and the run fails. There is otherwise nothing to
-configure — the tool discovers what it needs from the endpoint and from public sources.
+That demands the checks without demanding their inputs — discovery still finds the
+platform base domain and the published releases, they just may no longer come up empty.
+Supplying the inputs yourself works too, and is the offline form:
+
+```sh
+pcverify -gateway <domain> -expect-compose-file ./docker-compose.release.yml -app-compose ./app-compose.json
+```
 
 Digests below are abbreviated with `…` for readability; a real run prints them in
 full. This is what a pass looks like on today's builds:
@@ -304,11 +314,12 @@ the quote.
 
 Read this section before relying on a `PASS`.
 
-**A `PASS` can contain skipped checks.** The two advisory lookups above (releases, and
-locating the app-compose) degrade to `-` and still exit 0, so a CI gate that reads only
-the exit code treats a GitHub outage as a full pass. Either parse for `-` lines, or make
-the lookups mandatory with the explicit flags shown under
-[The one command](#the-one-command).
+**A pass can still contain skipped checks** — it just cannot be a `0`. The two advisory
+lookups (releases, and locating the app-compose) degrade to `-` and exit **3**, so a gate
+that treats only non-zero as failure is already safe, while one that tests `-eq 0` is
+safest. Run with `-strict` to make the skips fatal outright. What you must not do is
+treat `3` as success: an unreachable GitHub would then read as a full pass on the very
+check that catches a deployment running unpublished code.
 
 **The OS-image allowlist covers the images 0G deploys on, and nothing else.** Step 7
 checks against [`client/evidence/osimages.json`](../client/evidence/osimages.json), which
