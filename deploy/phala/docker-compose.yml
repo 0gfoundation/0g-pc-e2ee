@@ -1,84 +1,56 @@
 # Phala Cloud (dstack) deployment for the 0G-PC cloud-TEE gateway.
 #
-# This runs the `gateway` — the SAME client core as the sidecar, but server-run
-# and 0G-operated, meant to run inside an attested CVM (see
-# docs/design/cloud-gateway.md §5.3/§6) — on OUR OWN domain, behind dstack-ingress.
+# Runs the `gateway` — the same client core as the sidecar, but server-run and
+# 0G-operated — inside an attested CVM, behind dstack-ingress. dstack-ingress
+# terminates TLS *inside this CVM* (the key is generated in the enclave and never
+# leaves it) and forwards plaintext to the gateway over the compose network, so the
+# gateway must NOT do TLS and the two have to share one compose / one CVM. Two more
+# containers ride along: `cvm-identity`, a one-shot init container naming this
+# replica, and `prometheus-agent`.
 #
-# dstack-ingress terminates TLS *inside this CVM* (the key is generated in the
-# enclave and never leaves it) and forwards plaintext to the gateway over the
-# compose network, so the gateway itself must NOT do TLS. Those two therefore have
-# to live in this one compose / one CVM. Two more containers ride along:
-# `cvm-identity`, a one-shot init container that tells the others which replica
-# they are, and `prometheus-agent`, which ships telemetry out. Everything below is
-# measured into compose_hash (and so into app_id, its 20-byte prefix) — including the
-# images, the volumes, and the depends_on edges — so a verifier sees the whole set.
+# EVERY byte below is measured into compose_hash (and so into app_id, its 20-byte
+# prefix) — images, volumes, depends_on, env blocks. Editing this file, comments
+# included, changes app_id.
 #
-# What the attestation actually gives you (cloud-gateway.md §6.1):
-# dstack-ingress serves /evidences/ — acme-account.json, cert-<DOMAIN>.pem,
-# sha256sum.txt and quote.json — where
-#   report_data holds SHA-256(sha256sum.txt) (right-padded to 64 bytes), and
-#     sha256sum.txt covers the served certificate
-#   the quote's mr_config_id commits to compose_hash — SHA-256 of the app-compose
-#     manifest, which embeds THIS file verbatim, and therefore covers ALL FOUR
-#     containers below. app_id is its leading 20 bytes. mr_config_id is part of
-#     the signed TD report, so reading it needs no event-log replay; see
-#     attest.ComposeHashFromMRConfigID and `pcverify -gateway`
-# So the quote proves "a CVM running exactly this app-compose obtained this
-# certificate inside the TEE". Concluding that the endpoint you are *talking to*
-# is that CVM needs one more step the quote cannot do for you: handshake with
-# <DOMAIN> and check the served cert equals cert-<DOMAIN>.pem in the bundle. The
-# CAA record dstack-ingress publishes (pinned to its own ACME account) stops a
-# THIRD PARTY obtaining a different cert for the name; it does not constrain
-# whoever holds the DNS token, which is why the comparison above is the check
-# that matters.
+# What the attestation proves, how to check it, and the rationale behind the
+# settings here:
+#   docs/design/cloud-gateway.md §5.3/§6  — design and trust model
+#   docs/verifying-the-gateway.md         — how a user verifies a deployment
+#   deploy/phala/README.md                — operator runbook, env, and Notes
 #
-# This is why the gateway needs no quote of its own: the compose_hash above already
-# covers its image, so the gateway exposes no attestation endpoint and signs no
-# responses of its own (inference authenticity rides each provider's SPEC §8 signature).
-#
-# Deploy: reference this compose file from the Phala Cloud dashboard, or via the
-# Phala CLI, with the environment and DNS records in README "Serving domain".
+# Deploy: reference this file from the Phala Cloud dashboard or the Phala CLI, with
+# the environment and DNS records in README "Serving domain".
 
 services:
-  # cvm-identity publishes THIS CVM's identity (instance_id / app_id) to the other
-  # containers, then exits. It is an init container, not a service.
+  # Publishes THIS CVM's identity (instance_id / app_id) to the others, then exits.
+  # An init container, not a service.
   #
-  # It exists because several CVMs can back one app_id (deploy/phala/blue-green.md
-  # "Scaling one side") and the platform picks which one a connection reaches — so
-  # every container here is byte-identical to its counterpart in the sibling
-  # replica and cannot say which one it is. The gateway needs that for its log
-  # fields and metric labels; the Prometheus agent below needs it or its
-  # self-scrape series collide with the sibling's in the shared remote-write store.
-  # Neither can work it out alone: the answer lives behind the guest-agent socket,
-  # and compose interpolation (deploy time) cannot see a value the runtime assigns
-  # per CVM.
-  #
-  # Concentrating the lookup here is also what lets the GATEWAY drop that socket.
-  # The guest agent is a privileged surface — it derives keys and issues quotes —
-  # and this container touches it for one call, then exits, whereas the gateway
-  # runs for the life of the CVM handling user prompts.
+  # Several CVMs can back one app_id (blue-green.md "Scaling one side"), and every
+  # container here is byte-identical to its counterpart in the sibling replica, so
+  # none can tell which one it is: the answer lives behind the guest-agent socket and
+  # compose interpolation cannot see a value the runtime assigns per CVM. Doing the
+  # lookup here is also what lets the GATEWAY drop that socket — the guest agent
+  # derives keys and issues quotes, and this container touches it for one call and
+  # exits, whereas the gateway runs for the life of the CVM handling user prompts.
   cvm-identity:
-    # The SAME image as the gateway, which already contains this binary: a second
-    # image would be a second digest to pin and a second supply-chain item for a
-    # verifier to audit, for ~100 lines of code. Keep this pin identical to the
-    # gateway's below — they are one artifact.
+    # The SAME image as the gateway, which already contains this binary — a second
+    # image would be a second digest to pin and a second supply-chain item to audit.
+    # Keep this pin identical to the gateway's below; they are one artifact.
     image: ghcr.io/0gfoundation/0g-pc-e2ee-gateway:latest
     # `entrypoint:`, not `command:`: the image's ENTRYPOINT is the gateway and it
-    # declares no CMD, so a `command:` would be appended to it instead of replacing
-    # it. Root, because the shared volume below is created root-owned by docker and
-    # the image's default user is `nonroot`.
+    # declares no CMD, so a `command:` would be appended to it rather than replace
+    # it. Root, because the shared volume is created root-owned by docker and the
+    # image's default user is `nonroot`.
     entrypoint: ["/usr/local/bin/cvmid"]
     user: "0:0"
     command:
       - "-out-identity"
       - "/run/identity/identity.json"
-      # One file_sd document per scrape job — they must not share one, or each job
+      # One file_sd document per scrape job — they must NOT share one, or each job
       # would discover the other's target. These carry the identity as TARGET
-      # labels, which is the only mechanism that also reaches `up` and the other
-      # per-scrape series: Prometheus builds those from target labels alone, never
-      # from the exposition, so nothing the exporter itself stamps can label them.
-      # `up` per replica is the signal most worth alerting on, which is why BOTH
-      # jobs go through here rather than the gateway labelling its own metrics.
+      # labels, the only mechanism that also reaches `up` and the other per-scrape
+      # series (Prometheus builds those from target labels alone, never from the
+      # exposition), which is why both jobs go through here.
       - "-prom-sd"
       - "/run/identity/sd/gateway.json=gateway:9464"
       - "-prom-sd"
@@ -86,94 +58,71 @@ services:
     # Runs once. `unless-stopped` would restart it forever after each clean exit.
     restart: "no"
     volumes:
-      # dstack-ingress mounts this socket too, and always has (cert binding, below).
-      # What is new here is only that this container holds it BRIEFLY — it makes one
-      # call and exits — so the set of LONG-LIVED holders is unchanged by adding it.
+      # dstack-ingress mounts this socket too, and always has. What is new here is
+      # only that this container holds it BRIEFLY, so the set of long-lived holders
+      # is unchanged.
       - /var/run/dstack.sock:/var/run/dstack.sock
       - identity:/run/identity
 
   dstack-ingress:
     # Official upstream image, v2.3 — the first release with the DNS-01
-    # DELEGATION_ZONE feature (Dstack-TEE/dstack-examples #104/#108). Public on
-    # Docker Hub; pinned by digest so app_id commits to this exact image.
+    # DELEGATION_ZONE feature (Dstack-TEE/dstack-examples #104/#108). Pinned by
+    # digest so app_id commits to this exact image.
     image: dstacktee/dstack-ingress:2.3@sha256:527c53523b9226782a11dbd800a3ff55e8a1f0b88e6224e8f7e4db7419769fbe
     restart: unless-stopped
-    # Start after the gateway is HEALTHY, not merely created: HAProxy resolves the
-    # `gateway` backend name once at startup (see the gateway's expose note), so
-    # bringing it up before the gateway serves risks a dead backend on first boot.
-    # This closes the startup race only — it does NOT cover the gateway being
-    # recreated with a new address later; that still needs an ingress restart (see
-    # the gateway note). depends_on is part of the measured compose text (app_id).
+    # HEALTHY, not merely created: HAProxy resolves the `gateway` backend name once
+    # at startup, so coming up before the gateway serves risks a dead backend on
+    # first boot. This closes the startup race only — a gateway recreated with a new
+    # address later still needs an ingress restart.
     depends_on:
       gateway:
         condition: service_healthy
     ports:
-      # Publishes 443 on the CVM so the dstack gateway can reach HAProxy in here.
-      # The gateway passes any SNI it holds no wildcard cert for straight through
-      # at L4 and takes the target from the `_dstack-app-address` TXT record
-      # (`<app_id>:<port>`, port 443 by default), so TLS is never terminated
-      # outside this CVM. NOTE: the platform host's own front end forwards only
-      # SNI suffixes it has been configured for — a new domain suffix has to be
-      # allowlisted by Phala first, see README "Serving domain".
+      # Publishes 443 on the CVM so the dstack gateway can reach HAProxy in here. It
+      # passes SNI it holds no wildcard cert for straight through at L4, taking the
+      # target from the `_dstack-app-address` TXT record, so TLS is never terminated
+      # outside this CVM. NOTE: the platform forwards only SNI suffixes it has been
+      # configured for — a new domain suffix must be allowlisted by Phala first.
       - "443:443"
     environment:
       - DNS_PROVIDER=cloudflare
       # `:?` on purpose: an unset var must fail the deploy loudly. An empty
-      # DELEGATION_ZONE in particular is not a no-op — it switches the container
-      # out of delegation mode, at which point it tries to write records into the
-      # SERVED domain's own zone with a token that has no access there.
+      # DELEGATION_ZONE in particular is not a no-op — it switches the container out
+      # of delegation mode, at which point it tries to write records into the SERVED
+      # domain's own zone with a token that has no access there.
       - DOMAIN=${DOMAIN:?set DOMAIN, e.g. pc-gateway.example.com}
       - GATEWAY_DOMAIN=${GATEWAY_DOMAIN:?set GATEWAY_DOMAIN, e.g. _.<cluster>.phala.network}
       - DELEGATION_ZONE=${DELEGATION_ZONE:?set DELEGATION_ZONE, the zone this container may write}
       - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:?set CLOUDFLARE_API_TOKEN, scoped to DELEGATION_ZONE only}
       - TARGET_ENDPOINT=gateway:8443 # forward decrypted traffic to the gateway
-      # DNS setup pre-check mode. Default `wait`: block on boot until the served
-      # CNAMEs resolve to `<name>.<DOMAIN>.<DELEGATION_ZONE>` (a strict, one-hop
-      # match), then proceed. That is correct for a single instance whose served
-      # CNAMEs point straight at its own delegation zone.
-      #
-      # Blue/green (deploy/phala/blue-green.md) runs each side under its OWN
-      # sub-zone (DELEGATION_ZONE=a.<zone> / b.<zone>) while the served CNAMEs stay
-      # pinned at the base zone and an operator-owned CNAME inside the base zone
-      # selects the live side. The served CNAME's immediate target is then the base
-      # name, not `<name>.…a/b.<zone>`, so the one-hop pre-check never matches and a
-      # side would block in `wait`. Set `DNS_SETUP_MODE=print` on those sides: it
-      # skips only this container's own pre-check (dnsguide.py returns immediately)
-      # and proceeds to issue the cert — Let's Encrypt and the dstack gateway both
-      # use normal resolution, which follows the full CNAME chain, so issuance and
-      # routing still work. Injected, so the measured text is identical either way,
-      # but DNS_SETUP_MODE must be listed in allowed_envs — keep it listed
-      # permanently and toggle by value, since allowed_envs is itself part of the
-      # measured app-compose (editing the list changes app_id).
+      # Default `wait` blocks on boot until the served CNAMEs resolve to
+      # `<name>.<DOMAIN>.<DELEGATION_ZONE>` — a strict one-hop match, correct for a
+      # single instance. Blue/green (blue-green.md) runs each side under its own
+      # sub-zone while the served CNAMEs stay pinned at the base zone, so the one-hop
+      # pre-check never matches and a side would block: set DNS_SETUP_MODE=print
+      # there, which skips only this container's pre-check (issuance and routing use
+      # normal resolution, which follows the full chain). Keep DNS_SETUP_MODE listed
+      # in allowed_envs permanently and toggle by VALUE — allowed_envs is itself
+      # measured, so editing the list changes app_id.
       - DNS_SETUP_MODE=${DNS_SETUP_MODE:-wait}
-      # Least privilege: the container manages every record it needs INSIDE the
-      # delegation zone (our token controls it), so the token needs NO access to
-      # the served domain's own zone. The operator creates three static CNAMEs in
-      # the served zone ONCE, before the first boot, all pointing into the
-      # delegation zone — and never touches DNS again, not even when the app id
-      # changes:
-      #   pc-gateway.example.com                     CNAME  pc-gateway.example.com.<DELEGATION_ZONE>
-      #   _dstack-app-address.pc-gateway.example.com CNAME  _dstack-app-address.pc-gateway.example.com.<DELEGATION_ZONE>
-      #   _acme-challenge.pc-gateway.example.com     CNAME  _acme-challenge.pc-gateway.example.com.<DELEGATION_ZONE>
-      # ACME_EMAIL is deliberately NOT declared here — a var absent from this block
-      # is never passed to the container, and this one is optional and PUBLISHED:
-      # the ACME account document is part of the evidence bundle, so any address
-      # here is world-readable at https://<DOMAIN>/evidences/acme-account.json.
-      # Declaring it also changes app_id. Leave it out unless a contact on the ACME
-      # account is actually wanted.
+      # Least privilege: the container manages every record it needs inside the
+      # delegation zone, so the token needs NO access to the served domain's own
+      # zone. The operator creates three static CNAMEs there once, before first boot
+      # — see README "Serving domain" — and never touches DNS again, not even when
+      # app_id changes.
+      #
+      # ACME_EMAIL is deliberately NOT declared: a var absent from this block is
+      # never passed to the container, and this one is optional and PUBLISHED — the
+      # ACME account document is part of the evidence bundle, so any address here is
+      # world-readable at https://<DOMAIN>/evidences/acme-account.json.
       # - ACME_EMAIL=${ACME_EMAIL:-}
       #
-      # ACME_STAGING picks Let's Encrypt's staging CA. Injected, defaulting to
-      # false = real, publicly-trusted certs — byte-for-byte the behaviour of
-      # leaving it unset, which entrypoint.sh already defaults to "false". Keep
-      # ACME_STAGING listed in allowed_envs permanently and set ACME_STAGING=true in
-      # the CVM's encrypted env to bring up a NEW hostname against the staging CA
-      # first: staging's rate limits are far higher, so iterate there instead of
-      # burning the 5-duplicate-certs-per-week budget on the real hostname. Staging
-      # certs are untrusted (smoke tests only). Toggle by VALUE, not by editing
-      # allowed_envs — the list is part of the measured app-compose. Because only
-      # the injected value changes, a staging run and a production run share app_id;
-      # the served cert's issuer (LE staging vs real) is what distinguishes them.
+      # Staging CA, defaulting to false = real, publicly-trusted certs. Set
+      # ACME_STAGING=true in the encrypted env to bring up a NEW hostname first:
+      # staging's rate limits are far higher than the 5-duplicate-certs-per-week
+      # budget, and its certs are untrusted (smoke tests only). Toggle by value, not
+      # by editing allowed_envs; a staging and a production run share app_id, and the
+      # served cert's issuer is what distinguishes them.
       - ACME_STAGING=${ACME_STAGING:-false}
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock # in-enclave attestation + cert binding
@@ -186,212 +135,133 @@ services:
     # DEVELOPMENT: floating `:latest` so a fresh build is picked up on redeploy
     # without editing this file. This DEFEATS the attestation story and MUST be
     # re-pinned before any attested / production deploy: compose_hash covers the
-    # app-compose manifest, which embeds this file verbatim, so a floating tag
-    # keeps compose_hash — and therefore app_id and the quote — identical while the
-    # code that sees plaintext user prompts changes underneath it. Restore the digest pin
-    # (`ghcr.io/0gfoundation/0g-pc-e2ee-gateway@sha256:<digest>`) and re-pin it
-    # deliberately on every upgrade; see README "Pin the image digest".
+    # app-compose manifest, which embeds this file verbatim, so a floating tag keeps
+    # compose_hash — and therefore app_id and the quote — identical while the code
+    # that sees plaintext user prompts changes underneath it. Restore the digest pin
+    # (`…-gateway@sha256:<digest>`) and re-pin deliberately on every upgrade; see
+    # README "Pin the image digest".
     image: ghcr.io/0gfoundation/0g-pc-e2ee-gateway:latest
     restart: unless-stopped
-    # Wait for the identity file to exist, so the gateway's very first log line
-    # already carries instance_id — it reads the file ONCE at startup, so a race
-    # here would cost the dimension for the whole life of the process, not just for
-    # a moment. cvm-identity exits 0 even when the guest agent does not answer
-    # (writing no identity file), precisely so a telemetry problem cannot hold the
-    # gateway down; it exits non-zero only if the volume is not writable, which is a
-    # broken deploy. depends_on is part of the measured compose (app_id).
+    # Wait for the identity file, so the gateway's first log line already carries
+    # instance_id — it reads the file ONCE at startup, so a race here costs the
+    # dimension for the life of the process. cvm-identity exits 0 even when the guest
+    # agent does not answer (writing no identity file), precisely so a telemetry
+    # problem cannot hold the gateway down; it exits non-zero only if the volume is
+    # not writable, which is a broken deploy.
     depends_on:
       cvm-identity:
         condition: service_completed_successfully
-    # Deliberately NOT published to the host: a published 8443 would also be
-    # served at `<app-id>-8443.<base_domain>`, where the dstack gateway (not this
-    # CVM) terminates TLS — the same requests, but outside our own enclave and
-    # under a cert with no binding to this app. dstack-ingress reaches the
-    # gateway over the compose network instead.
-    #
-    # HAProxy resolves `gateway` once at startup, so if this container is ever
-    # recreated with a new address, restart dstack-ingress too.
+    # Deliberately NOT published to the host: a published 8443 would also be served
+    # at `<app-id>-8443.<base_domain>`, where the dstack gateway — not this CVM —
+    # terminates TLS, under a cert with no binding to this app. dstack-ingress
+    # reaches the gateway over the compose network instead.
     expose:
       - "8443"
       - "9464" # internal Prometheus /metrics (see ZG_GATEWAY_METRICS_LISTEN below)
-    # The gateway serves GET /healthz ("ok"); the image is distroless (no shell,
-    # no curl), so the probe is the gateway binary itself — `gateway -health`
-    # does one GET /healthz to its own ZG_GATEWAY_LISTEN port and exits 0/1. This
-    # is what lets dstack-ingress gate on `condition: service_healthy` below, so
-    # it does not resolve/forward to the gateway until the gateway is actually
-    # serving. Part of the measured compose text (app_id).
+    # The image is distroless (no shell, no curl), so the probe is the gateway binary
+    # itself: `gateway -health` does one GET /healthz against its own listen port.
+    # This is what lets dstack-ingress gate on `service_healthy` above.
     healthcheck:
       test: ["CMD", "/usr/local/bin/gateway", "-health"]
       interval: 10s
       timeout: 3s
       retries: 3
-      # Grace before failures count: the gateway must parse config, dial the
-      # router, and (with -warm) prime the quote cache before it is "up".
+      # Grace before failures count: the gateway must parse config, dial the router,
+      # and (with -warm) prime the quote cache before it is "up".
       start_period: 30s
-    # Same env-var contract as the sidecar (flag > env var > default). This block
-    # is part of the compose text app_id commits to.
+    # Same env-var contract as the sidecar (flag > env var > default). Values are
+    # spelled out rather than left to the binary's defaults because this block is
+    # measured — a reader should see the configuration app_id commits to. See README
+    # "Notes" for the reasoning behind each setting.
     environment:
-      # Same as the binary's own default (`:8443`), stated explicitly because this
-      # block is measured: the address dstack-ingress forwards to should be
-      # readable here rather than implied. It must stay all-interfaces — a
-      # localhost bind (as the sidecar uses) would be unreachable across the
-      # compose network.
+      # Must stay all-interfaces: a localhost bind (as the sidecar uses) would be
+      # unreachable across the compose network.
       - "ZG_GATEWAY_LISTEN=0.0.0.0:8443"
-      # Serve Prometheus /metrics on a SEPARATE internal listener. Like the gateway
-      # itself this port is never published to the host and dstack-ingress does not
-      # front it, so it is reachable only over the compose network — by the
-      # prometheus-agent sidecar below (which scrapes `gateway:9464`). Binding
-      # 0.0.0.0 is what lets that co-located container reach it across the compose
-      # network (a localhost bind would be container-local). Empty/unset disables
-      # the endpoint entirely; the sidecar binary leaves it unset.
+      # Prometheus /metrics on a separate internal listener, never published to the
+      # host and not fronted by dstack-ingress, so it is reachable only over the
+      # compose network — by the prometheus-agent below. Empty/unset disables it.
       - "ZG_GATEWAY_METRICS_LISTEN=0.0.0.0:9464"
-      # The gateway routes per request and derives each provider's enc key +
-      # signer from the broker, so no provider/key is configured up front. The
-      # router base URL is deploy-time injectable so staging and prod can share
-      # this file: the value below is the measured text, but the ${...} form lets
-      # an encrypted-env override win at boot. Unset (prod) → the 0G production
-      # router; set ZG_GATEWAY_ROUTER_URL in the CVM's encrypted environment
-      # (staging) → that URL. The interpolation happens INSIDE the CVM, so the
-      # variable must also be listed in the app's allowed_envs — dstack drops any
-      # encrypted var that is not, surfacing only as a boot-time interpolation
-      # error. Because the measured text is the ${...} form (identical for both),
-      # staging and prod share app_id: attestation does NOT distinguish which
-      # router was used. That is acceptable here only because the router is
-      # untrusted by construction — every provider is verified by TDX quote and
-      # on-chain signer (ATTEST/ONCHAIN below), so a swapped router cannot forge a
-      # provider; the blast radius is routing/availability, not confidentiality.
+      # The gateway routes per request and derives each provider's enc key + signer
+      # from the broker, so no provider or key is configured up front. Unset (prod) →
+      # the 0G production router; inject ZG_GATEWAY_ROUTER_URL via the encrypted env
+      # (staging) → that URL, listing it in allowed_envs or dstack drops it. The
+      # measured text is the ${…} form, so staging and prod share app_id: attestation
+      # does not distinguish which router was used, which is acceptable only because
+      # the router is untrusted by construction.
       - "ZG_GATEWAY_ROUTER_URL=${ZG_GATEWAY_ROUTER_URL:-https://router-api.0g.ai}"
-      # Browser origin allowlist (CORS). Spelled out here rather than left to the
-      # binary's built-in default precisely BECAUSE this block is measured: which
-      # web origins may drive sealed inference through this enclave is a
-      # trust-relevant parameter, so app_id should commit to the list a reader can
-      # see, not to "whatever the image happens to default to". Keep it in sync with
-      # openaiproxy.DefaultAllowedOriginsCSV: the 0G first-party app origins, so a
-      # page allowed to call the router directly can swap its base URL to this
-      # gateway, and deliberately NOT every origin the router accepts (its list also
-      # carries third-party-hosted preview/deploy origins, which don't get to drive
-      # sealed inference through an enclave by default). The ${...} form lets an
-      # encrypted-env override win at boot without changing app_id — list
-      # ZG_GATEWAY_ALLOWED_ORIGINS in allowed_envs or dstack drops it. An empty value
-      # allows no origin, which turns browser access off entirely (SDK / server-side
-      # callers are unaffected: they send no Origin header).
-      #
-      # NOTE the localhost entries are development conveniences: they let a page
-      # served from a developer's machine seal through this enclave. Drop them via
-      # the override for any deployment that does not need that.
+      # Browser origin allowlist (CORS): the 0G first-party app origins, and
+      # deliberately not every origin the router accepts. Keep in sync with
+      # openaiproxy.DefaultAllowedOriginsCSV. An empty value turns browser access off
+      # entirely; SDK and server-side callers send no Origin header and are
+      # unaffected. The localhost entries are development conveniences — drop them via
+      # the override on any deployment that does not need them.
       - "ZG_GATEWAY_ALLOWED_ORIGINS=${ZG_GATEWAY_ALLOWED_ORIGINS:-https://0g.ai,https://*.0g.ai,http://localhost:3000,http://localhost:5173}"
-      # Request fields sealed end-to-end to the provider (must include
-      # "messages"). Defaults to the binary's built-in set; uncomment to override.
+      # Request fields sealed end-to-end to the provider (must include "messages"),
+      # and cleartext fields excluded from the AAD (an empty value binds everything).
+      # Both default to the binary's built-in sets; uncomment to override.
       # - "ZG_GATEWAY_SEAL_FIELDS=messages"
-      # Cleartext fields excluded from the AAD (intermediary-mutable, untrusted);
-      # an empty value binds everything. Defaults to the built-in set; uncomment
-      # to override.
       # - "ZG_GATEWAY_UNBOUND_FIELDS="
-      # DCAP-verify each provider's TDX quote and seal only to the verified enc
-      # key, instead of trusting the router-supplied pubkey endpoint. Enabled
-      # here: quote authenticity (genuine TDX, TCB up to date, report_data
-      # binding) is enforced per request; a provider that fails it is rejected.
+      # DCAP-verify each provider's TDX quote and seal only to the verified enc key,
+      # instead of trusting the router-supplied pubkey endpoint. Enforced per request:
+      # a provider that fails is rejected.
       - "ZG_GATEWAY_ATTEST=true"
-      # With ZG_GATEWAY_ATTEST, reject a provider whose measurement is not in the
-      # allowlist instead of only warning. The audited-image allowlist is not
-      # wired yet (empty), so enforce currently rejects ALL providers — leave it
-      # off until the allowlist lands, so ATTEST runs in verify-and-warn mode.
+      # Reject a provider whose measurement is not in the allowlist instead of only
+      # warning. The audited-image allowlist is not wired yet (empty), so enforce
+      # would reject ALL providers — leave off until it lands.
       # - "ZG_GATEWAY_ATTEST_ENFORCE=true"
       # Cross-check each provider's quote-bound TEE signer against its acknowledged
-      # on-chain teeSignerAddress (InferenceServing registry). Requires
-      # ZG_GATEWAY_ATTEST. Enabled here. The RPC + contract default to 0G mainnet
-      # (evmrpc.0g.ai / 0x47340d900bdFec2BD393c626E12ea0656F938d84), so they stay
-      # implicit; uncomment and override BOTH together for testnet or your own node.
+      # on-chain teeSignerAddress. The RPC + contract default to 0G mainnet, so they
+      # stay implicit; override BOTH together for testnet or your own node.
       - "ZG_GATEWAY_ONCHAIN=true"
       # - "ZG_GATEWAY_CHAIN_RPC_URL=https://evmrpc.0g.ai"
       # - "ZG_GATEWAY_SERVING_CONTRACT=0x47340d900bdFec2BD393c626E12ea0656F938d84"
-      # With ZG_GATEWAY_ONCHAIN, skip a provider whose on-chain signer is
-      # missing/unacknowledged/mismatched instead of only warning. Left OFF: ONCHAIN
-      # runs in verify-and-warn mode, so a provider with incomplete on-chain data is
-      # logged but still served. Flip to true to reject those providers outright.
+      # Skip a provider whose on-chain signer is missing/unacknowledged/mismatched
+      # instead of only warning. Left OFF: verify-and-warn.
       # - "ZG_GATEWAY_ONCHAIN_ENFORCE=true"
-      # Verify each response's §8 TEE signature (trust-chain hop 11): fetch the
-      # signature straight from the provider's broker and check it fail-closed
-      # against the quote-bound signer, which ZG_GATEWAY_ONCHAIN additionally
-      # grounds on chain. Requires ZG_GATEWAY_ATTEST. Enabled here, so a response
-      # whose signature does not verify is rejected rather than returned.
+      # Verify each response's §8 TEE signature (trust-chain hop 11) fail-closed
+      # against the quote-bound signer. A response that does not verify is rejected.
       - "ZG_GATEWAY_VERIFY_RESPONSES=true"
-      # Fetch Intel PCS collateral (TCB Info, QE Identity, PCK CRL) from Phala's
-      # hosted PCCS instead of api.trustedservices.intel.com. This CVM runs on
-      # Phala infrastructure, so its own PCCS is the closest, most reliable source
-      # (Intel PCS is reachable but historically rate-limited/flaky). Only the host
-      # is swapped: collateral stays Intel-signed wherever it is served, and
-      # verification checks its validity window, so a hostile mirror can neither
-      # forge collateral nor serve expired collateral, and withholding it fails
-      # closed. What it CAN do is serve older-but-still-valid CRL / TCB Info,
-      # delaying an observed revocation or TCB downgrade by up to its nextUpdate —
-      # a bounded freshness delegation, not a free one. The SGX root-CA CRL still
-      # comes from Intel (a different host). Requires ZG_GATEWAY_ATTEST.
+      # Fetch Intel PCS collateral from Phala's hosted PCCS instead of Intel's
+      # (closest source on this infrastructure; Intel PCS is historically flaky).
+      # Only the host is swapped — collateral stays Intel-signed and its validity
+      # window is checked, so a hostile mirror can neither forge nor serve expired
+      # collateral, and withholding it fails closed. It CAN serve
+      # older-but-still-valid CRL / TCB Info, delaying an observed revocation by up
+      # to its nextUpdate: a bounded freshness delegation, not a free one.
       - "ZG_GATEWAY_PCCS_URL=https://pccs.phala.network"
-      # How long DCAP collateral is memoized by URL, so it is not re-fetched for
-      # every provider and every warmer sweep. Bounds revocation lag (a cached CRL
-      # delays seeing a fresh revocation until it expires); defaults to 1h, set 0
-      # to disable. Uncomment to override.
+      # How long DCAP collateral is memoized by URL. Bounds revocation lag; defaults
+      # to 1h, 0 disables.
       # - "ZG_GATEWAY_COLLATERAL_TTL=1h"
-      # Run a background warmer that pre-verifies every provider's quote and
-      # refreshes it ahead of expiry, so requests hit a warm cache instead of
-      # paying the DCAP verify (quote fetch + collateral) inline. Requires
-      # ZG_GATEWAY_ATTEST and ZG_GATEWAY_ONCHAIN (the endpoint is resolved on
-      # chain) — both are on above, so this starts cleanly; enabling it while
-      # ZG_GATEWAY_ONCHAIN was off would exit(1) into a restart loop, with the
-      # ingress up and healthy in front of it. Enabled here. The interval is left
-      # implicit at its 4m default, under the ~5m quote-cache TTL.
+      # Background warmer: pre-verify every provider's quote ahead of expiry so
+      # requests hit a warm cache instead of paying the DCAP verify inline. Requires
+      # ZG_GATEWAY_ATTEST *and* ZG_GATEWAY_ONCHAIN — both on above, so this starts
+      # cleanly; enabling it with ONCHAIN off would exit(1) into a restart loop with
+      # the ingress up and healthy in front of it. Interval left at its 4m default,
+      # under the ~5m quote-cache TTL.
       - "ZG_GATEWAY_WARM=true"
       # - "ZG_GATEWAY_WARM_INTERVAL=4m" # optional; 4m is already the default
       #
-      # Where to read THIS CVM's own identity (instance_id / app_id): the file the
-      # cvm-identity init container wrote, NOT the guest-agent socket. Both env vars
-      # are spelled out because this block is measured — a reader should be able to
-      # see, without consulting the binary's defaults, that the long-lived container
-      # handling user prompts opens no privileged runtime socket. The empty
-      # ZG_GATEWAY_DSTACK_SOCKET is the load-bearing half of that statement: unset it
-      # and the binary's own default would reinstate the socket path as a fallback.
+      # Read this CVM's identity from the file cvm-identity wrote, NOT the
+      # guest-agent socket. The empty ZG_GATEWAY_DSTACK_SOCKET is load-bearing: unset
+      # it and the binary's default would reinstate the socket path as a fallback,
+      # giving the prompt-handling container a privileged runtime surface back.
       - "ZG_GATEWAY_IDENTITY_FILE=/run/identity/identity.json"
       - "ZG_GATEWAY_DSTACK_SOCKET="
-      # NOTE there is no switch here for the X-0G-Gateway-Instance response header:
-      # the gateway returns the serving replica's id to callers unconditionally,
-      # whenever it knows it (the same convention as a CDN's X-Served-By). It was
-      # briefly a toggle; that was dropped because the setting would have lived in
-      # the encrypted environment, so turning it on means restarting the deployment
-      # — which nobody does mid-incident, making it a knob that is off exactly when
-      # it is wanted. What it discloses is the fleet shape, and the id itself is
-      # already public (the platform routes to it by name at
-      # <instance_id>-443s.<base_domain>).
     volumes:
-      # Identity in, read-only, as a plain JSON file — deliberately NOT the
-      # guest-agent socket. That socket also derives keys and issues quotes, and
-      # THIS container is the one that handles user prompts for the life of the
-      # CVM, so it gets the derived file instead. (dstack-ingress does mount the
-      # socket, for cert binding; the point is not that nothing holds it, but that
-      # the prompt-handling container does not.)
+      # Identity in, read-only, as a plain JSON file — deliberately not the
+      # guest-agent socket, which also derives keys and issues quotes.
       - identity:/run/identity:ro
-    # The gateway itself holds no secret: no pinned provider key, and no TLS
-    # material — the cert and its key belong to dstack-ingress above, generated
-    # in-enclave via ACME and kept in the cert-data volume.
+    # The gateway itself holds no secret: no pinned provider key, and no TLS material
+    # — the cert and its key belong to dstack-ingress above.
 
-  # prometheus-agent scrapes the gateway's internal /metrics over the CVM docker
-  # network and remote_writes the samples to a central store (the same shape other
-  # 0G services use: a co-located Prometheus that scrapes locally and pushes out).
-  # It runs in AGENT MODE (--enable-feature=agent): no local TSDB, no query API —
-  # this CVM is ephemeral, the durable copy lives in the remote store — it only
-  # scrapes and forwards. It has neither `ports:` nor `expose:`, so like the
-  # gateway's metrics port it is reachable only from within the compose network.
-  #
-  # Config comes from a compose `config` (agent.yml, below) — no init container.
-  # Prometheus does not expand env vars in its own config, so the remote_write
-  # url/username/password are ${VAR} interpolated by COMPOSE from the deploy env
-  # (the Phala env file). The measured compose text keeps only the ${VAR}
-  # references, never the values, so nothing sensitive enters the attestation.
+  # Scrapes the gateway's internal /metrics over the CVM docker network and
+  # remote_writes to a central store. AGENT MODE (--enable-feature=agent): no local
+  # TSDB, no query API — this CVM is ephemeral, the durable copy lives in the remote
+  # store. Neither `ports:` nor `expose:`, so it is reachable only from within the
+  # compose network.
   prometheus-agent:
-    # Pinned by digest (the multi-arch index digest for v2.55.1) so app_id commits
-    # to this exact image — like dstack-ingress above, and unlike the gateway's dev
-    # :latest. A version tag alone is mutable; the digest is what makes the measured
-    # compose reproducible. Re-pin deliberately on any upgrade
+    # Pinned by digest (the multi-arch index digest for v2.55.1) so app_id commits to
+    # this exact image. Re-pin deliberately on any upgrade
     # (`docker buildx imagetools inspect prom/prometheus:<tag>`).
     image: prom/prometheus:v2.55.1@sha256:2659f4c2ebb718e7695cb9b25ffa7d6be64db013daba13e05c875451cf51b0d3
     restart: unless-stopped
@@ -402,16 +272,10 @@ services:
       # Compose mounts this 0444, so the agent (uid 65534/nobody) can read it.
       - source: prom_agent_config
         target: /etc/prometheus/agent.yml
-    # The file_sd documents cvm-identity wrote, carrying this CVM's identity as the
-    # target labels for both scrape jobs. Read-only: nothing here writes them.
     volumes:
       - identity:/run/identity:ro
-    # Now load-bearing, not just tidy: BOTH jobs discover their targets from those
-    # documents, so until they exist this agent scrapes nothing at all. cvm-identity
-    # always writes them (unlabelled if the guest agent did not answer) and exits
-    # non-zero only if it cannot, which fails the deploy rather than starting a
-    # blind agent. Prometheus would also pick up a late file on its own — it watches
-    # these paths — but gating removes the gap entirely.
+    # Load-bearing, not just tidy: both jobs discover their targets from the file_sd
+    # documents cvm-identity writes, so until those exist this agent scrapes nothing.
     depends_on:
       cvm-identity:
         condition: service_completed_successfully
@@ -422,55 +286,29 @@ volumes:
   identity: # this CVM's instance_id/app_id, written once by cvm-identity, read-only everywhere else
 
 configs:
-  # agent.yml, rendered by COMPOSE (not Prometheus): the ${...} refs below are
-  # interpolated from the deploy env (the Phala env file) at parse time, so the
-  # measured compose text holds only the references, never the values. All three
-  # vars must be listed in the app's allowed_envs or dstack drops them. Phala's
-  # env injection is encrypted to the enclave, and the password only ever lives
-  # inside this CVM's own config — adequate for a single-tenant enclave and a
-  # write-only metrics credential (a docker `secret` would only narrow in-CVM
-  # exposure, not worth the extra compose dependency here).
-  #
-  # Targets use docker service names on the CVM network: `gateway:9464` for the
-  # app, `localhost:9090` for the agent's own metrics (self-scrape surfaces
-  # remote_write health — queue length, send failures — which is otherwise hard to
-  # see from outside the enclave).
+  # agent.yml, rendered by COMPOSE (not Prometheus, which does not expand env vars in
+  # its own config): the ${…} refs are interpolated from the deploy env at parse time,
+  # so the measured compose text holds only the references, never the values. All
+  # three vars must be listed in the app's allowed_envs or dstack drops them.
   prom_agent_config:
     content: |
       global:
         scrape_interval: 15s
         external_labels:
-          # Stamped on every series the agent pushes, so a shared remote-write
-          # store can tell this gateway's metrics apart from other services
-          # (service) and this deployment's environment apart from the other
-          # (env). env is ${VAR}-interpolated by compose from the env file, so one
-          # compose serves both staging and mainnet; :? fails the deploy loudly if
-          # it is unset (it checks non-empty only, not that the value is one of the
-          # two — a typo still yields a wrong label).
-          #
-          # These labels CANNOT separate replicas: two CVMs of one app_id run this
-          # exact config, so every label here is identical between them. Per-CVM
-          # separation comes from the per-job file_sd target labels below.
+          # Stamped on every series pushed, so a shared store can tell this
+          # gateway apart from other services (service) and this deployment's
+          # environment from the other (env). These CANNOT separate replicas —
+          # two CVMs of one app_id run this exact config — which is what the
+          # per-job file_sd target labels below are for.
           service: 0g-pc-gateway
           env: "${ZG_PROM_ENV:?set staging or mainnet}"
       scrape_configs:
-        # BOTH jobs get their per-replica identity as TARGET labels, from the file_sd
-        # documents cvm-identity wrote. Nothing is labelled exporter-side.
-        #
-        # That is not a style choice. Prometheus synthesises `up`,
-        # scrape_duration_seconds, scrape_samples_scraped,
-        # scrape_samples_post_metric_relabeling and scrape_series_added from TARGET
-        # labels alone — they never pass through the scraped process — so a label the
-        # exporter stamps on its own series cannot reach them. `up` is the extreme
-        # case: it exists precisely when the exposition could NOT be read. Leaving
-        # either job on static_configs would leave all five byte-identical between
-        # two replicas of one app_id, landing the collision on the signal you would
-        # most want to alert on per replica.
-        #
-        # file_sd is also what makes this an init container rather than an ordering
-        # problem: Prometheus watches these paths and reloads on change, with no
-        # restart and no env-var plumbing (a container's environment cannot be
-        # written from outside once it exists).
+        # Both jobs take their per-replica identity as TARGET labels from the
+        # documents cvm-identity wrote; nothing is labelled exporter-side.
+        # Prometheus synthesises `up` and the scrape_* series from target labels
+        # alone, so a label the exporter stamps on its own series cannot reach
+        # them — static_configs here would leave all five byte-identical between
+        # two replicas, colliding on the signal most worth alerting on.
         - job_name: gateway
           file_sd_configs:
             - files: ["/run/identity/sd/gateway.json"]
