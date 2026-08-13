@@ -41,24 +41,25 @@ import (
 // caller may have sent exactly one request. Retry-After: 1 marks it retryable,
 // and OpenAI-compatible clients already back off on both codes.
 //
-// max <= 0 disables the cap and returns h unchanged, so a caller can wire this
-// unconditionally (the load-test rig and local runs turn it off to measure the
-// unbounded knee; see the -max-inflight flag).
+// maxInFlight <= 0 disables the cap and returns h unchanged, so a caller can
+// wire this unconditionally (the load-test rig and local runs turn it off to
+// measure the unbounded knee; see the -max-inflight flag).
 //
 // Mount it INSIDE the credential gate: a request with no credential, or a mgmt
 // key, is rejected on shape alone and must not consume a slot that a real
 // request could have had.
+//
 // Publishing the configured ceiling as a metric is the CALLER's job (see
 // metrics.SetInFlightLimit), not this constructor's: a process has one ceiling
 // but may build several handlers, and a gauge written from here would report
 // whichever was built last.
-func LimitInFlight(max int, h http.Handler) http.Handler {
-	if max <= 0 {
+func LimitInFlight(maxInFlight int, h http.Handler) http.Handler {
+	if maxInFlight <= 0 {
 		return h
 	}
 	// Buffered channel as a counting semaphore: a send takes a slot, a receive
 	// returns one. Nothing is ever read out of it, so the values are irrelevant.
-	slots := make(chan struct{}, max)
+	slots := make(chan struct{}, maxInFlight)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		select {
 		case slots <- struct{}{}:

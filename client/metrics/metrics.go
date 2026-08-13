@@ -73,8 +73,14 @@ var (
 
 	// Overload shedding (openaiproxy.LimitInFlight) — the sealed inference path's
 	// concurrency ceiling. The limit is exported alongside the counter so an alert
-	// can be written against the ratio (in-flight approaching the cap) instead of
-	// hardcoding a number that only the deployment knows.
+	// can watch headroom (in-flight approaching the cap) without hardcoding a
+	// number only the deployment knows.
+	//
+	// Mind the scope mismatch if you write that ratio: http_requests_in_flight
+	// counts EVERY request (health probes, the router passthrough), while this
+	// limit bounds only the sealed path. Those extras are short-lived and sealed
+	// requests are the long-held ones, so the ratio is a good approximation of
+	// headroom — but it is an approximation, and it reads slightly high.
 	inFlightLimit = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "inflight_limit",
 		Help: "Configured max concurrent sealed inference requests; 0 when the cap is disabled.",

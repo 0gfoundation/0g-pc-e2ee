@@ -118,6 +118,12 @@ func main() {
 	// still serving fine. Scaled by GOMAXPROCS so it tracks the CVM it is given
 	// instead of a number that silently means something different on a resize.
 	//
+	// GOMAXPROCS is the right input for the deployed form — a CVM is a VM, so the
+	// guest sees exactly its own vCPUs. It is NOT the right input under a
+	// container CPU QUOTA (`cpus:`), which this Go version does not read: there
+	// the default would size itself to the host's cores instead. Anyone running
+	// the gateway that way should set this explicitly, as loadtest/ does.
+	//
 	// Replace it with a measured value once L3 (in-CVM, behind dstack-ingress)
 	// has a real knee to point at; until then, too high is the safer error, since
 	// too high merely fails to help while too low turns a healthy gateway into a
@@ -242,7 +248,7 @@ func main() {
 	// one ceiling, the constructor may be called more than once (tests).
 	metrics.SetInFlightLimit(*maxInFlight)
 	if *maxInFlight <= 0 {
-		logger.Warn("sealed-inference concurrency cap disabled; overload will queue in the runtime instead of being shed",
+		logger.Warn("sealed-inference concurrency cap disabled; nothing bounds concurrent requests, so overload degrades every in-flight request instead of shedding the excess",
 			"max_inflight", *maxInFlight)
 	}
 
