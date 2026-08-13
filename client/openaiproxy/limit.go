@@ -1,10 +1,31 @@
 package openaiproxy
 
 import (
+	"math/rand/v2"
 	"net/http"
+	"strconv"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 )
+
+// retryAfterMinSeconds / retryAfterSpreadSeconds bound the Retry-After a shed
+// request receives: a uniform pick from [min, min+spread).
+//
+// The floor is above 1s deliberately. A slot frees when an in-flight request
+// finishes, and on this path those are completions — seconds at best, a whole
+// token schedule at worst — so "retry in 1 second" mostly buys another shed, and
+// a client that honors it politely still hammers.
+const (
+	retryAfterMinSeconds    = 2
+	retryAfterSpreadSeconds = 4 // → 2..5s
+)
+
+// retryAfterSeconds picks a jittered retry delay. math/rand is right here: this
+// spreads a retry wave, it does not protect a secret, and a predictable delay
+// costs an attacker nothing they could not get by simply retrying.
+func retryAfterSeconds() int {
+	return retryAfterMinSeconds + rand.IntN(retryAfterSpreadSeconds)
+}
 
 // LimitInFlight bounds how many requests may be inside h at once, refusing the
 // excess immediately (503) rather than admitting them.
@@ -38,8 +59,16 @@ import (
 // slow 200 is not.
 //
 // 503, not 429. This says "the server is full", not "you sent too much" — the
-// caller may have sent exactly one request. Retry-After: 1 marks it retryable,
-// and OpenAI-compatible clients already back off on both codes.
+// caller may have sent exactly one request. Retry-After marks it retryable, and
+// OpenAI-compatible clients already back off on both codes. The value is
+// JITTERED: overload sheds many callers within the same moment, so one fixed
+// delay would gather them into a synchronized wave that arrives together and
+// sheds together. A spread costs nothing and breaks the lockstep.
+//
+// The shed is also marked on the request (markShed) so the access log can tell
+// it apart from a 503 that means the gateway is broken. Both are 5xx, and
+// without the marker the one response proving the limiter WORKED would be logged
+// at the same severity as the ones proving it did not.
 //
 // maxInFlight <= 0 disables the cap and returns h unchanged, so a caller can
 // wire this unconditionally (the load-test rig and local runs turn it off to
@@ -65,9 +94,10 @@ func LimitInFlight(maxInFlight int, h http.Handler) http.Handler {
 		case slots <- struct{}{}:
 		default:
 			metrics.RequestShed()
+			markShed(r.Context())
 			// Set before the status line, like every other header the proxy
 			// emits on an error path.
-			w.Header().Set("Retry-After", "1")
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfterSeconds()))
 			WriteError(w, http.StatusServiceUnavailable, "gateway",
 				"gateway at capacity; retry shortly")
 			return

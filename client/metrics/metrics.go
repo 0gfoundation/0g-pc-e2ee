@@ -85,9 +85,12 @@ var (
 		Namespace: namespace, Subsystem: subsystem, Name: "inflight_limit",
 		Help: "Configured max concurrent sealed inference requests; 0 when the cap is disabled.",
 	})
+	// Sheds also land in http_requests_total{status="503"}, so a naive 5xx alert
+	// pages on the limiter doing its job. Subtract this series to get faults
+	// alone; the access log makes the same split with shed=true at Warn.
 	requestsShed = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "requests_shed_total",
-		Help: "Sealed inference requests refused with 503 because the in-flight limit was reached.",
+		Help: "Sealed inference requests refused with 503 because the in-flight limit was reached. Also counted in http_requests_total{status=\"503\"} — subtract this to isolate genuine faults.",
 	})
 
 	// Completion outcome (openaiproxy) — attributes each chat completion to where

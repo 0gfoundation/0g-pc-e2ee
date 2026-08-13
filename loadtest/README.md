@@ -186,7 +186,9 @@ percentile in the summary is directly about it.
   unbounded gateway, which is what the rig does by default; the number the cap
   should eventually be set to is an output of these runs, not an input.
 
-`deploy/grafana/0g-pc-gateway.json` already plots these.
+`deploy/grafana/0g-pc-gateway.json` plots the first three. It does **not** yet
+have panels for `requests_shed_total` / `inflight_limit` — read those off
+`:9464` directly, and do not take an empty dashboard for a quiet one.
 
 **When you want to know *why*, profile.** The compose sets `ZG_GATEWAY_PPROF=true`,
 which mounts the Go profiler on the metrics listener (never published in a real

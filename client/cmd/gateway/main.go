@@ -119,10 +119,14 @@ func main() {
 	// instead of a number that silently means something different on a resize.
 	//
 	// GOMAXPROCS is the right input for the deployed form — a CVM is a VM, so the
-	// guest sees exactly its own vCPUs. It is NOT the right input under a
-	// container CPU QUOTA (`cpus:`), which this Go version does not read: there
-	// the default would size itself to the host's cores instead. Anyone running
-	// the gateway that way should set this explicitly, as loadtest/ does.
+	// guest sees exactly its own vCPUs. Under a container CPU QUOTA (`cpus:`) it
+	// is wrong, because this Go version reads the host's core count rather than
+	// the quota — but the fix there is to pin GOMAXPROCS to the quota, not to
+	// hand-tune this cap around a bad reading. Pinning repairs this default for
+	// free AND fixes the scheduler problem the same misreading causes (dozens of
+	// Ps against a two-CPU quota, throttled at every period boundary), which no
+	// value of -max-inflight can. loadtest/docker-compose.yml pins it for exactly
+	// that second reason; a quota-constrained deployment should do the same.
 	//
 	// Replace it with a measured value once L3 (in-CVM, behind dstack-ingress)
 	// has a real knee to point at; until then, too high is the safer error, since
