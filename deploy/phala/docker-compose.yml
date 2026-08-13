@@ -344,6 +344,21 @@ services:
       - "ZG_GATEWAY_WARM=true"
       # - "ZG_GATEWAY_WARM_INTERVAL=4m" # optional; 4m is already the default
       #
+      # Ceiling on concurrent sealed inference requests; over it, a request is
+      # refused with 503 + Retry-After instead of being queued. Left at the
+      # binary's default (256 x GOMAXPROCS), spelled out here only as a comment
+      # because setting it would pin a number this block cannot re-derive when the
+      # CVM is resized — the default scales with the vCPUs the CVM actually gets.
+      #
+      # This is a pile-up backstop, not a capacity plan: it stops one caller's
+      # burst from being served out of every other caller's latency, on a process
+      # every user shares. Set it explicitly once an L3 run (in-CVM, behind
+      # dstack-ingress) gives a measured knee — until then a too-high cap merely
+      # fails to help, while a too-low one turns a healthy gateway into a 503
+      # source. Watch zg_gateway_requests_shed_total: any sustained non-zero rate
+      # means real traffic is being turned away.
+      # - "ZG_GATEWAY_MAX_INFLIGHT=512"
+      #
       # Where to read THIS CVM's own identity (instance_id / app_id): the file the
       # cvm-identity init container wrote, NOT the guest-agent socket. Both env vars
       # are spelled out because this block is measured — a reader should be able to

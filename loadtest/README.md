@@ -178,6 +178,13 @@ percentile in the summary is directly about it.
   the gateway or to its upstream. The client can only see "it broke".
 - `zg_gateway_http_request_duration_seconds` — server-side latency, so the gap
   against the client's view is queueing and network.
+- `zg_gateway_requests_shed_total` / `zg_gateway_inflight_limit` — the sealed
+  path's concurrency ceiling (`-max-inflight`, default `256 × GOMAXPROCS`) and
+  how many requests it refused. **If shed is non-zero, the run measured the cap,
+  not the gateway** — the 503s look like errors in `gateway_failed` and the knee
+  lands wherever the ceiling is. Set `ZG_GATEWAY_MAX_INFLIGHT=0` to measure an
+  unbounded gateway, which is what the rig does by default; the number the cap
+  should eventually be set to is an output of these runs, not an input.
 
 `deploy/grafana/0g-pc-gateway.json` already plots these.
 

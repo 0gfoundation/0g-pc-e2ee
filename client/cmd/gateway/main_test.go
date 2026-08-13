@@ -27,6 +27,12 @@ func routeClient() *core.Client {
 	return core.NewWithResolver(route.New("http://router.unused"))
 }
 
+// noInFlightCap is the max-inflight value newHandler gets in tests that are not
+// about overload: 0 disables the concurrency cap, so these keep exercising the
+// routing/CORS/streaming paths exactly as they did before the cap existed. The
+// cap's own behavior is tested in openaiproxy (limit_test.go).
+const noInFlightCap = 0
+
 // discardLogger is a logger the operational-route tests hand to newHandler when
 // they don't assert on the access log; TestGatewayAccessLog uses its own buffer.
 func discardLogger() *slog.Logger {
@@ -54,7 +60,7 @@ func mustURL(t *testing.T, raw string) *url.URL {
 }
 
 func TestGatewayHealthz(t *testing.T) {
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), testOrigins(), "", discardLogger()))
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), testOrigins(), "", noInFlightCap, discardLogger()))
 	defer gw.Close()
 
 	resp, err := http.Get(gw.URL + "/healthz")
@@ -74,7 +80,7 @@ func TestGatewayHealthz(t *testing.T) {
 // unreachable, so reaching the core would surface as a 502, not the 401/403 the
 // gate returns), while /healthz stays open for the container probe.
 func TestGatewayAuthGateWiring(t *testing.T) {
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), testOrigins(), "", discardLogger()))
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), testOrigins(), "", noInFlightCap, discardLogger()))
 	defer gw.Close()
 
 	post := func(t *testing.T, auth string) int {
@@ -119,7 +125,7 @@ func TestGatewayAuthGateWiring(t *testing.T) {
 // error against an unreachable one, and it must derive the port from the same
 // -listen value the server binds.
 func TestGatewayHealthProbe(t *testing.T) {
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), testOrigins(), "", discardLogger()))
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), testOrigins(), "", noInFlightCap, discardLogger()))
 	defer gw.Close()
 
 	// Healthy: probe the live server's /healthz directly.
@@ -218,7 +224,7 @@ func TestGatewayRouteMode(t *testing.T) {
 	defer router.Close()
 
 	client := core.NewWithResolver(route.New(router.URL))
-	gw := httptest.NewServer(newHandler(client, mustURL(t, router.URL), testOrigins(), "", discardLogger()))
+	gw := httptest.NewServer(newHandler(client, mustURL(t, router.URL), testOrigins(), "", noInFlightCap, discardLogger()))
 	defer gw.Close()
 
 	userReq := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`
@@ -303,7 +309,7 @@ func TestGatewayRoutesOtherRequestsToRouter(t *testing.T) {
 	router := httptest.NewServer(routerMux)
 	defer router.Close()
 
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, router.URL), testOrigins(), "", discardLogger()))
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, router.URL), testOrigins(), "", noInFlightCap, discardLogger()))
 	defer gw.Close()
 
 	req, _ := http.NewRequest(http.MethodGet, gw.URL+"/v1/models?limit=1", nil)
@@ -351,7 +357,7 @@ func TestGatewayRouterPassthroughUnreachable(t *testing.T) {
 	deadURL := dead.URL
 	dead.Close()
 
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, deadURL), testOrigins(), "", discardLogger()))
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, deadURL), testOrigins(), "", noInFlightCap, discardLogger()))
 	defer gw.Close()
 
 	resp, err := http.Get(gw.URL + "/v1/models")
@@ -413,7 +419,7 @@ func TestGatewayAccessLog(t *testing.T) {
 		http.Error(w, "nope", http.StatusNotImplemented)
 	}))
 	defer upstream.Close()
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, upstream.URL), testOrigins(), "", logger))
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, upstream.URL), testOrigins(), "", noInFlightCap, logger))
 	defer gw.Close()
 
 	// A health probe must not produce a log line.
