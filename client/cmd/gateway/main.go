@@ -248,8 +248,13 @@ func main() {
 	// (shared with the sidecar so both forms handle SIGTERM identically — the
 	// dstack/Phala deployment sends it on every redeploy). ListenAndServe's clean
 	// shutdown is folded into a nil return; only a real listen failure is an error.
+	// max_inflight is on this line because the deployed value is DERIVED (from
+	// GOMEMLIMIT and the core count — see defaultMaxInFlight), so unlike a flag
+	// that is simply echoed back, nobody can read the config and know what the
+	// gateway settled on. The same value is published as zg_gateway_inflight_limit;
+	// the log is what an operator reaches for first.
 	logger.Info("gateway listening", "listen", *f.Listen, "router_url", *f.RouterURL,
-		"cors_allowed_origins", origins)
+		"cors_allowed_origins", origins, "max_inflight", *maxInFlight)
 	err = proxycli.Serve(srv, logger)
 	stopWarmer()
 	stopMetrics()
