@@ -265,11 +265,16 @@ a gateway fault. The 65536 default is far above anything a single gateway carrie
 
 ## Known gaps worth testing next
 
-- **No admission control.** The gateway has no concurrency limit or rate limit
-  (issue #20), so past saturation it does not shed load — everything slows together
-  until requests time out. The ramp will show this as a latency cliff rather than a
-  rising 503 rate. Whether to add a max-in-flight limit that returns 503 is a
-  decision this measurement should inform.
+- **The admission-control ceiling is a placeholder.** The gateway now sheds past
+  a max-in-flight limit (`-max-inflight` / `ZG_GATEWAY_MAX_INFLIGHT`, default
+  `256 × GOMAXPROCS`) — over it, a sealed request gets 503 + `Retry-After`
+  instead of joining a pile-up. But that default was chosen to be safely
+  *out of the way*, not from any measurement: **producing the number that should
+  replace it is the job of an L3 run.** Note the rig disables the cap
+  (`MAX_INFLIGHT=0`) precisely so it can find the unbounded knee, which is the
+  input to that decision. Per-account fairness is still absent (issue #20) — a
+  global ceiling stops a pile-up, it does not stop one account from being the
+  cause of it.
 - **Long-lived streams.** `core.providerTimeout` is 10m30s, and each in-flight
   stream holds a goroutine, a connection to the router, and buffers. Memory, not
   CPU, may be the real ceiling for high-`MOCK_CHUNKS` shapes — watch the heap
