@@ -90,6 +90,70 @@ func TestReport_WithQuote(t *testing.T) {
 	}
 }
 
+// Provider mode is where the audited boot chains have to come FROM: the allowlist is
+// empty, so the only way a first entry ever gets recorded is by reading it off a run
+// against a provider. That makes printing all three pinned registers the point of the
+// step, not decoration — MRTD alone said a check had not happened without letting
+// anyone do something about it.
+func TestReport_PrintsTheBootChainInAllowlistShape(t *testing.T) {
+	var m attest.Measurement
+	for i := range m.MRTD {
+		m.MRTD[i], m.RTMR1[i], m.RTMR2[i] = 0x3f, 0xaa, 0x5d
+		m.RTMR0[i], m.RTMR3[i] = 0x01, 0x77
+	}
+	acked := chain.ServiceInfo{URL: "https://prov.example/v1", Signer: signer, Acknowledged: true}
+
+	var out bytes.Buffer
+	code := report(context.Background(), &out, stubService{info: acked},
+		stubQuote{v: attest.Verified{SignerAddr: signer, Measurement: m}}, prov, "0xcontract", "", "")
+	// An unconfigured allowlist is not a verdict on the provider, so the run still
+	// passes on the hops it did check.
+	if code != 0 {
+		t.Fatalf("code = %d, want 0\n%s", code, out.String())
+	}
+	got := out.String()
+
+	for _, want := range []string{
+		"- boot chain",                 // not compared, and not dressed up as a ✓
+		"no allowlist configured",      // says why, so nobody reads it as a pass
+		strings.Repeat("3f", 48),       // mrtd
+		strings.Repeat("aa", 48),       // rtmr1
+		strings.Repeat("5d", 48),       // rtmr2
+		"rtmr0 (vm shape, not pinned)", // shown, labelled as not compared
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output missing %q:\n%s", want, got)
+		}
+	}
+	// RTMR3 must NOT be offered: it carries per-instance events, so pasting it into an
+	// entry is exactly the mistake that kept this allowlist unfillable.
+	if strings.Contains(got, strings.Repeat("77", 48)) {
+		t.Errorf("RTMR3 must not be printed as an allowlist value:\n%s", got)
+	}
+}
+
+// A configured allowlist that the provider misses is a finding, and must fail the run
+// rather than print observed registers and pass. Guards the branch that only becomes
+// reachable once providerBootChains is populated.
+func TestReport_BootChainMismatchFails(t *testing.T) {
+	restore := providerBootChains
+	providerBootChains = []attest.BootChain{attest.BootChainOf(attest.Measurement{})}
+	t.Cleanup(func() { providerBootChains = restore })
+
+	acked := chain.ServiceInfo{URL: "https://prov.example/v1", Signer: signer, Acknowledged: true}
+	var out bytes.Buffer
+	// MeasurementTrusted false with a non-empty allowlist: the provider's image is not
+	// one that was audited.
+	code := report(context.Background(), &out, stubService{info: acked},
+		stubQuote{v: attest.Verified{SignerAddr: signer}}, prov, "0xcontract", "", "")
+	if code != 1 {
+		t.Errorf("code = %d, want 1\n%s", code, out.String())
+	}
+	if !strings.Contains(out.String(), "matches no audited image") {
+		t.Errorf("output must name the mismatch:\n%s", out.String())
+	}
+}
+
 // -endpoint overrides the on-chain URL.
 func TestReport_EndpointOverride(t *testing.T) {
 	var out bytes.Buffer

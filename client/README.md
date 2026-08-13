@@ -120,9 +120,11 @@ TLS on the router path.
 ## What it verifies
 
 - **Attestation** — the provider quote is genuine TEE hardware (DCAP-verified;
-  enforced). Whether the measurement is an *audited* one is checked against
-  `attest.Policy`, but that allowlist is empty today, so the deployed gateway runs that
-  part in warn mode — see [`trust-chain.md`](../docs/design/trust-chain.md) hop 3.
+  enforced). Whether it runs an *audited* image is checked against
+  `attest.BootChainPolicy` — one entry per OS image — but that allowlist is empty today,
+  so the deployed gateway runs that part in warn mode; `pcverify -provider` prints the
+  observed boot chain in the shape an entry wants. See
+  [`trust-chain.md`](../docs/design/trust-chain.md) hop 3.
 - **Response authenticity** — each response carries a §8 TEE signature, checked
   fail-closed against the **quote-bound** signer. Opt-in in the library
   (`-verify-responses`, off by default); the deployed gateway turns it on, so a response

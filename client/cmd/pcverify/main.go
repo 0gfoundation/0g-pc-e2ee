@@ -4,12 +4,20 @@
 // # -provider: the provider trust chain
 //
 // Checks a provider against docs/design/trust-chain.md in one shot: it
-// DCAP-verifies the provider's TDX quote (hops 2–4 — genuine TDX, measurement,
+// DCAP-verifies the provider's TDX quote (hops 2–4 — genuine TDX, boot chain,
 // report_data) and grounds the quote-bound signer in the on-chain
 // InferenceServing registry (hop 5 — SPEC §4.4 step 3). It is the pre-enable gate
 // for the sidecar/gateway -onchain / -attest modes: run it against the chain and
 // provider you will point them at to confirm the whole chain lines up before
 // flipping on enforcement.
+//
+// Hop 3 currently REPORTS rather than checks: the audited-image allowlist
+// (providerBootChains) is empty, so the run prints the observed boot chain — MRTD,
+// RTMR1, RTMR2, the three registers an entry pins — in the shape an allowlist entry
+// wants. That is deliberate: those values have to be read off a real provider before
+// any allowlist can exist, so this is where the first entry comes from. RTMR3 is not
+// printed as a candidate value; it carries per-instance events and pinning it would
+// pin one CVM (see attest.BootChain). RTMR0 is shown, labelled as not compared.
 //
 //	pcverify -provider 0x... [-chain-rpc-url ...] [-serving-contract 0x...]
 //	         [-endpoint https://...] [-expect-signer 0x...] [-no-quote]
@@ -283,9 +291,27 @@ func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecke
 			return fail(out)
 		}
 		fmt.Fprintf(out, "%s quote            genuine TDX (DCAP verified)\n", mark(true))
-		fmt.Fprintf(out, "  measurement MRTD %x\n", v.Measurement.MRTD[:])
-		if !v.MeasurementTrusted {
-			fmt.Fprintf(out, "  note             measurement not in allowlist (none configured)\n")
+		// The boot chain, in the shape an allowlist entry wants — MRTD + RTMR1 + RTMR2,
+		// the registers attest.BootChain pins. Printing MRTD alone was enough to see
+		// that a check did not happen and not enough to do anything about it: nobody
+		// could derive an entry from this tool's output, which is the only way the
+		// values get recorded in the first place. Gateway mode has printed all three
+		// for that reason (reportBootChain), and this is the same need on the hop that
+		// still has no allowlist.
+		switch {
+		case v.MeasurementTrusted:
+			// A clean match needs only to say so; the registers are the reader's next
+			// action only when there is one.
+			fmt.Fprintf(out, "%s boot chain       in the audited allowlist\n", mark(true))
+		case len(providerBootChains) == 0:
+			fmt.Fprintf(out, "- boot chain       not compared (no allowlist configured)\n")
+			reportBootChain(out, attest.BootChainOf(v.Measurement))
+			reportShapeRegister(out, v.Measurement)
+		default:
+			fmt.Fprintf(out, "%s boot chain       matches no audited image\n", mark(false))
+			reportBootChain(out, attest.BootChainOf(v.Measurement))
+			reportShapeRegister(out, v.Measurement)
+			ok = false
 		}
 		fmt.Fprintf(out, "  report_data enc  %x\n", v.EncPub)
 		fmt.Fprintf(out, "  report_data sgnr %s\n", v.SignerAddr)
@@ -315,10 +341,24 @@ func mark(ok bool) string {
 	return "✗"
 }
 
+// providerBootChains is the audited broker OS-image allowlist for -provider mode:
+// one entry per image, as attest.BootChain (MRTD + RTMR1 + RTMR2) rather than a full
+// Measurement, so an entry pins a version rather than a single CVM.
+//
+// It is empty, and that is the remaining half of trust-chain hop 3. The shape can now
+// be filled — these values are computable from a reproducible build before any
+// deployment exists — but WHERE they are published is still open: on-chain beside the
+// provider registry, or as broker release assets (which this tool could consume with
+// the same machinery -releases already uses for the gateway). Until that is decided
+// the run reports the observed boot chain instead of comparing it, so that whoever
+// records the first entry is copying rather than transcribing.
+var providerBootChains []attest.BootChain
+
 // dcapChecker is the real quoteChecker: it GETs the provider's /quote and
 // DCAP-verifies it (genuine TDX + TCB + report_data binding). Measurement runs in
-// warn mode so the tool reports an out-of-allowlist measurement rather than
-// erroring — the allowlist is not yet populated (see proxycli/newVerifier).
+// warn mode so the tool REPORTS an out-of-allowlist boot chain rather than erroring:
+// a read-only diagnostic should print what it saw, and with providerBootChains empty
+// enforce mode would refuse every provider without saying anything about any of them.
 type dcapChecker struct {
 	http     *http.Client
 	verifier *attest.Verifier
@@ -332,7 +372,7 @@ func newDCAPChecker(pccsURL string) *dcapChecker {
 	return &dcapChecker{
 		http: &http.Client{Timeout: 20 * time.Second},
 		verifier: attest.New(
-			attest.Policy{},
+			attest.BootChainPolicy{Allowed: providerBootChains},
 			attest.WithQuoteParser(dcap.NewQuoteParser(dcap.Config{PCCSBaseURL: pccsURL})),
 			attest.WithMeasurementMode(attest.ModeWarn),
 		),

@@ -11,8 +11,9 @@ see there are no gaps — and where the gaps still are.
 > actually carried in the deployed gateway. Four are qualified, and the qualifications are
 > not the same kind:
 >
-> - **hop 3** (the *code root*) — cannot be enforced at all yet: the allowlist is empty
->   *and* needs a shape change before it can be filled. Not a switch left off.
+> - **hop 3** (the *code root*) — the allowlist is empty. It now has a shape that can
+>   be filled (one entry per OS image, `attest.BootChain`), so what remains is deciding
+>   where the values are published — not a code change.
 > - **hop 5** — wired and observed; its enforce switch is deliberately off.
 > - **hop 11** — enforced, but only because `-verify-responses` is on; it is off by default.
 > - **hop 12** — replay is defeated client-side only; a server-side freshness field is TODO.
@@ -106,7 +107,7 @@ sequenceDiagram
 |---|-----|--------|--------------------------|------|
 | 1 | Router returns candidates | Router forges/swaps a quote | Router is **not trusted**; it only relays. A forgery is caught at hop 2. | — (explicitly untrusted) |
 | 2 | Verify quote authenticity | Fake TEE / software impersonating one | Quote signature chain verifies to the Intel root | Hardware |
-| 3 | Measurement check | Routed to a genuine TEE running **malicious** code | Measurement must be in the audited allowlist | Code |
+| 3 | Boot-chain check | Routed to a genuine TEE running **malicious** code | The quote's boot chain (MRTD + RTMR1 + RTMR2) must be in the audited allowlist | Code |
 | 4 | Extract & bind `enc_pub` | MITM injects its own recipient key | `enc_pub` is read from the **verified quote's** `report_data`, no side channel | Hardware |
 | 5 | On-chain identity check | An unknown/substituted enclave | `signer_addr` must equal on-chain `teeSignerAddress` (router cannot forge chain state) | On-chain |
 | 6 | Request confidentiality | Router reads the prompt | HPKE seal to `enc_pub`; only the enclave's private key (derived in-TEE, never exported) can open | Hardware |
@@ -183,7 +184,7 @@ particular is implemented against an allowlist that is still empty.
 | Link | Status | Where |
 |------|--------|-------|
 | Hop 2 — TDX quote signature-chain verification | **Implemented.** A real go-tdx-guest DCAP verifier (quote chain → Intel root + QE identity + TCB status) fills the `WithQuoteParser` seam, wired into the sidecar, gateway, and route resolver. The seam stays in `protocol/attest` by design (keeps `protocol` lean/portable); the heavy verifier lives in the client. | `client/dcap/tdxverify.go`, `client/cmd/{sidecar,gateway}/main.go`, #29 / #31 |
-| Hop 3 — measurement allowlist | **Implemented, with a gap.** `Verifier.Verify` checks the measurement against `Policy` in enforce/warn modes (`-attest-enforce`). **The audited-image allowlist is still empty**, so warn mode proceeds on any measurement and enforce rejects every provider. Filling it is *not* purely a matter of supplying values — see the note below. | `attest/verify.go`, `client/cmd/gateway/main.go`, #31 |
+| Hop 3 — boot-chain allowlist | **Implemented, allowlist empty.** `Verifier.Verify` compares the quote's `BootChain` (MRTD + RTMR1 + RTMR2) against `BootChainPolicy` in enforce/warn modes (`-attest-enforce`). **The audited-image allowlist is still empty**, so warn mode proceeds on any image and enforce rejects every provider — reporting `ErrMeasurementPolicyNotConfigured`, which names the unfinished configuration rather than blaming the enclave. What remains is where the values are published, not the mechanism. | `attest/verify.go`, `attest/measurement.go`, `client/cmd/gateway/main.go`, #31 |
 | Hop 4 — `report_data` → `enc_pub`/`signer_addr` | **Implemented.** `ParseReportData` (SPEC §4.2 layout). | `attest/reportdata.go` |
 | Hop 5 — `signer_addr == on-chain teeSignerAddress` | **Implemented (warn/enforce).** The route resolver cross-checks the DCAP-quote-bound signer against the provider's *acknowledged* `teeSignerAddress` read from the on-chain InferenceServing registry (`getService`), keyed on the provider's on-chain account — a mapping the untrusted router cannot forge. This is what catches a *genuine* enclave running audited code but operated by an unregistered party ([Why the on-chain root exists](#why-the-on-chain-root-exists)). Enforce skips a missing/unacknowledged/mismatched candidate; warn observes only. Reads the chain over a client-trusted RPC (`-onchain`, `-chain-rpc-url`), not the router. | `client/chain/registry.go`, `client/route` `WithOnChainVerification`, #18 |
 | Hops 6–9 — HPKE seal/open, AAD binding | **Implemented.** | `crypto/`, `wire/` |
@@ -196,41 +197,50 @@ matters:
   `enc_pub`), hops 6–9 (seal/open and AAD binding), and hop 11 (the §8 response
   signature, with `-verify-responses`; fail-closed by construction). A candidate or a
   response that fails any of these is refused.
-- **Warn only** — hop 3, because the allowlist is empty: warn proceeds on any
-  measurement and enforce would reject every provider, so `-attest-enforce` stays off.
-  And hop 5, whose `-onchain-enforce` is deliberately off while on-chain provider data
-  is still filling in; it is wired and observed, and turning it on is a switch rather
-  than work.
+- **Warn only** — hop 3, because the allowlist is empty: warn proceeds on any image and
+  enforce would reject every provider, so `-attest-enforce` stays off. And hop 5, whose
+  `-onchain-enforce` is deliberately off while on-chain provider data is still filling
+  in; it is wired and observed, and turning it on is a switch rather than work.
 
 So the **code root is the one root not yet doing its job** — hop 3 is exactly that root.
 Hop 5, once enforced, is what turns "an attested enclave" into "the **expected** attested
 enclave."
 
-> **Hop 3's allowlist needs a shape change first, not just values.** `Policy`
-> compares the full `Measurement` — all five registers, including **RTMR3**. In
-> dstack, RTMR3 is where per-app *and per-instance* runtime events land, including
-> `instance_id`, which is derived from a random seed at first boot
-> (`Sha256(seed ‖ app_id)`). So RTMR3 differs between two replicas of the *same*
-> deployment, and a full-equality entry pins **one instance**, not one audited
-> version — an allowlist of that shape would need a new entry per CVM, not per
-> upgrade, and could never be published ahead of a deployment.
+Both are now blocked on *values*, not on mechanism. Hop 3's allowlist takes one entry per
+OS image (`attest.BootChain`), computable from a reproducible build before any deployment
+exists, and `pcverify -provider` prints an observed boot chain in exactly that shape — so
+recording the first entry is a copy. What is still open is **where those values are
+published**: on-chain beside the provider registry, or as broker release assets.
+
+> **Why the allowlist stayed empty, and what changed.** It used to compare the full
+> `Measurement` — all five registers, including **RTMR3**. In dstack, RTMR3 is where
+> per-app *and per-instance* runtime events land, including `instance_id`, derived from
+> a random seed at first boot (`Sha256(seed ‖ app_id)`). So RTMR3 differs between two
+> replicas of the *same* deployment, and a full-equality entry pinned **one instance**,
+> not one audited version: an allowlist of that shape needed a new entry per CVM rather
+> than per upgrade, and could never be published ahead of a deployment. It was
+> unfillable, not merely unfilled.
 >
-> The workable form is the split this branch already makes for the gateway
-> (`attest.BootChain` + `BootChainPolicy`): pin **MRTD + RTMR1 + RTMR2** for the OS
-> image, and pin the application separately and more precisely by its compose hash.
-> Two questions with two lifetimes, so two mechanisms.
+> `Verifier` now uses the same split the gateway already made (`attest.BootChain` +
+> `BootChainPolicy`): pin **MRTD + RTMR1 + RTMR2** for the OS image, and leave the
+> application to its compose hash. Two questions with two lifetimes, so two mechanisms.
+> **RTMR0 is excluded too**, because it records the VM shape (vCPU count, memory,
+> ACPI/device layout), which this check does not need to establish — the code performing
+> the boot-time binding check lives in the firmware, kernel and rootfs, which the three
+> registers above measure. Including it would have cost an entry per (image, VM shape)
+> pair for no gain.
 >
-> Note which registers those are. **RTMR0 is excluded as well**, because it records the
-> VM shape (vCPU count, memory, ACPI/device layout) and the shape is not something this
-> check needs to establish: the code that performs the boot-time binding check lives in
-> the firmware, kernel and rootfs, which the three registers above measure. Including it
-> would have cost an entry per (image, VM shape) pair for no gain. So the allowlist is
-> **one entry per image**, computed with `dstack-mr` from the published release and then
-> confirmed against a live quote — never copied off a running machine.
+> So the allowlist is **one entry per image**, computed with `dstack-mr` from the
+> published release and confirmed against a live quote — never copied off a running
+> machine. `attest.Policy` remains only as a deprecated type, documenting why the
+> obvious shape does not work.
 >
-> Where the expected values are *published* is still open: on-chain alongside the
-> provider registry, or as release assets of the broker repo (which `pcverify`
-> could consume with the same machinery `-releases` already uses for the gateway).
+> One half is still missing: pinning the application by compose hash needs the quote's
+> `mr_config_id`, which the `quoteParser` seam does not return, so the provider path
+> cannot do it yet. The gateway pins it separately (`client/evidence`). And where the
+> expected values are *published* remains open: on-chain alongside the provider
+> registry, or as release assets of the broker repo (which `pcverify` could consume
+> with the same machinery `-releases` already uses for the gateway).
 
 **Checking a provider (`client/cmd/pcverify -provider`).** A read-only diagnostic
 walks hops 2–5 for one provider in a single command — DCAP-verify its quote
@@ -273,8 +283,8 @@ gateway is deployed on: the three values were computed with `dstack-mr` from the
 published guest-OS release whose `digest.txt` equals the CVM's `os_image_hash`, and then
 confirmed to equal what a live quote reports. So the step checks rather than reports, and
 an image that is not listed FAILS — a new OS image version needs an entry before it is
-deployed. Hop 3's broker allowlist is a separate, still-open task; unlike this one it
-also needs the shape change described above.
+deployed. Hop 3's broker allowlist is a separate, still-open task — it now uses the same
+mechanism, and what it lacks is values and a place to publish them.
 
 Two further limits are worth stating: the compose hash is only as strong as the image
 pinning inside the compose text — a floating tag keeps it stable while the code changes

@@ -22,7 +22,7 @@ func TestVerify_Success(t *testing.T) {
 	encPub := sampleEncPub()
 	rd := makeReportData(encPub, sampleSigner(), ReportDataVersion, [reservedLen]byte{})
 
-	v := New(Policy{Allowed: []Measurement{good}}, WithQuoteParser(fakeParser(good, rd, nil)))
+	v := New(BootChainPolicy{Allowed: []BootChain{BootChainOf(good)}}, WithQuoteParser(fakeParser(good, rd, nil)))
 	got, err := v.Verify([]byte("raw-quote"))
 	if err != nil {
 		t.Fatalf("Verify: unexpected error: %v", err)
@@ -40,7 +40,7 @@ func TestVerify_Success(t *testing.T) {
 
 func TestVerify_NotConfiguredFailsClosed(t *testing.T) {
 	// New without WithQuoteParser must reject every quote.
-	v := New(Policy{Allowed: []Measurement{mkMeasurement(0xaa)}})
+	v := New(BootChainPolicy{Allowed: []BootChain{BootChainOf(mkMeasurement(0xaa))}})
 	if _, err := v.Verify([]byte("raw-quote")); !errors.Is(err, ErrQuoteVerifierNotConfigured) {
 		t.Errorf("err = %v, want ErrQuoteVerifierNotConfigured", err)
 	}
@@ -51,15 +51,79 @@ func TestVerify_UntrustedMeasurement(t *testing.T) {
 	served := mkMeasurement(0xbb) // genuine quote, but unaudited code
 	rd := makeReportData(sampleEncPub(), sampleSigner(), ReportDataVersion, [reservedLen]byte{})
 
-	v := New(Policy{Allowed: []Measurement{allowed}}, WithQuoteParser(fakeParser(served, rd, nil)))
+	v := New(BootChainPolicy{Allowed: []BootChain{BootChainOf(allowed)}}, WithQuoteParser(fakeParser(served, rd, nil)))
 	if _, err := v.Verify([]byte("raw-quote")); !errors.Is(err, ErrUntrustedMeasurement) {
 		t.Errorf("err = %v, want ErrUntrustedMeasurement", err)
 	}
 }
 
+// The point of pinning the boot chain instead of the full Measurement: two replicas
+// of ONE deployment differ in RTMR3 (dstack extends it with instance-id, derived from
+// a per-CVM random seed at first boot) and in RTMR0 (VM shape), and both must satisfy
+// the SAME allowlist entry. Under the old full-equality Policy each replica needed its
+// own entry, which is why the provider allowlist could not be populated at all —
+// entries would have had to be minted per CVM, after the CVM existed.
+func TestVerify_OneEntryCoversEveryReplicaOfAnImage(t *testing.T) {
+	audited := mkMeasurement(0xaa)
+	rd := makeReportData(sampleEncPub(), sampleSigner(), ReportDataVersion, [reservedLen]byte{})
+	v := func(served Measurement) *Verifier {
+		return New(BootChainPolicy{Allowed: []BootChain{BootChainOf(audited)}},
+			WithQuoteParser(fakeParser(served, rd, nil)))
+	}
+
+	replica := audited
+	replica.RTMR3[0] ^= 0xff // a different instance of the same image
+	replica.RTMR0[0] ^= 0xff // …on a differently-shaped VM
+	got, err := v(replica).Verify([]byte("raw-quote"))
+	if err != nil {
+		t.Fatalf("a second replica of the audited image must verify: %v", err)
+	}
+	if !got.MeasurementTrusted {
+		t.Error("MeasurementTrusted = false for a replica of the audited image")
+	}
+
+	// The registers that DO identify the image must still be compared: a changed
+	// kernel is a different image, not a different replica.
+	other := audited
+	other.RTMR1[0] ^= 0x01
+	if _, err := v(other).Verify([]byte("raw-quote")); !errors.Is(err, ErrUntrustedMeasurement) {
+		t.Errorf("err = %v, want ErrUntrustedMeasurement for a changed RTMR1", err)
+	}
+}
+
+// Enforcing against an empty allowlist rejects every provider. That is correct, but
+// it is a configuration that was never finished — not a verdict on the enclave — and
+// the two must not arrive as the same error, or turning enforcement on reads as
+// "every provider runs unaudited code".
+func TestVerify_EnforceWithEmptyAllowlistNamesTheConfigGap(t *testing.T) {
+	served := mkMeasurement(0xaa)
+	rd := makeReportData(sampleEncPub(), sampleSigner(), ReportDataVersion, [reservedLen]byte{})
+
+	v := New(BootChainPolicy{}, WithQuoteParser(fakeParser(served, rd, nil)))
+	_, err := v.Verify([]byte("raw-quote"))
+	if !errors.Is(err, ErrMeasurementPolicyNotConfigured) {
+		t.Errorf("err = %v, want ErrMeasurementPolicyNotConfigured", err)
+	}
+	// Still fail-closed: an unconfigured policy must never yield a Verified.
+	if errors.Is(err, ErrUntrustedMeasurement) {
+		t.Error("an empty allowlist must not be reported as an untrusted measurement")
+	}
+
+	// ModeWarn keeps proceeding, flagged — the rollout bridge, unchanged.
+	warn := New(BootChainPolicy{}, WithQuoteParser(fakeParser(served, rd, nil)),
+		WithMeasurementMode(ModeWarn))
+	got, err := warn.Verify([]byte("raw-quote"))
+	if err != nil {
+		t.Fatalf("ModeWarn with an empty allowlist: %v", err)
+	}
+	if got.MeasurementTrusted {
+		t.Error("MeasurementTrusted = true with no allowlist configured")
+	}
+}
+
 func TestVerify_ParserErrorPropagates(t *testing.T) {
 	sentinel := errors.New("bad TDX signature")
-	v := New(Policy{Allowed: []Measurement{mkMeasurement(0xaa)}}, WithQuoteParser(fakeParser(Measurement{}, nil, sentinel)))
+	v := New(BootChainPolicy{Allowed: []BootChain{BootChainOf(mkMeasurement(0xaa))}}, WithQuoteParser(fakeParser(Measurement{}, nil, sentinel)))
 	_, err := v.Verify([]byte("raw-quote"))
 	if !errors.Is(err, sentinel) {
 		t.Errorf("err = %v, want it to wrap the parser error", err)
@@ -72,14 +136,14 @@ func TestVerify_MalformedReportDataRejected(t *testing.T) {
 	// wrong version → must still fail closed at the binding step.
 	bad := makeReportData(sampleEncPub(), sampleSigner(), ReportDataVersion+1, [reservedLen]byte{})
 
-	v := New(Policy{Allowed: []Measurement{good}}, WithQuoteParser(fakeParser(good, bad, nil)))
+	v := New(BootChainPolicy{Allowed: []BootChain{BootChainOf(good)}}, WithQuoteParser(fakeParser(good, bad, nil)))
 	if _, err := v.Verify([]byte("raw-quote")); !errors.Is(err, ErrMalformedReportData) {
 		t.Errorf("err = %v, want ErrMalformedReportData", err)
 	}
 }
 
 func TestVerify_EmptyQuote(t *testing.T) {
-	v := New(Policy{Allowed: []Measurement{mkMeasurement(0xaa)}}, WithQuoteParser(fakeParser(mkMeasurement(0xaa), nil, nil)))
+	v := New(BootChainPolicy{Allowed: []BootChain{BootChainOf(mkMeasurement(0xaa))}}, WithQuoteParser(fakeParser(mkMeasurement(0xaa), nil, nil)))
 	if _, err := v.Verify(nil); err == nil {
 		t.Error("Verify(nil) = nil error, want non-nil")
 	}
@@ -91,7 +155,7 @@ func TestVerify_EmptyQuote(t *testing.T) {
 func TestVerify_MeasurementCheckedBeforeBinding(t *testing.T) {
 	served := mkMeasurement(0xbb)
 	bad := makeReportData(sampleEncPub(), sampleSigner(), ReportDataVersion+1, [reservedLen]byte{})
-	v := New(Policy{Allowed: []Measurement{mkMeasurement(0xaa)}}, WithQuoteParser(fakeParser(served, bad, nil)))
+	v := New(BootChainPolicy{Allowed: []BootChain{BootChainOf(mkMeasurement(0xaa))}}, WithQuoteParser(fakeParser(served, bad, nil)))
 	if _, err := v.Verify([]byte("raw-quote")); !errors.Is(err, ErrUntrustedMeasurement) {
 		t.Errorf("err = %v, want ErrUntrustedMeasurement (measurement checked first)", err)
 	}
@@ -100,7 +164,7 @@ func TestVerify_MeasurementCheckedBeforeBinding(t *testing.T) {
 func TestVerify_WarnMode_AcceptsUntrustedMeasurement(t *testing.T) {
 	served := mkMeasurement(0xbb) // genuine quote, unaudited code
 	rd := makeReportData(sampleEncPub(), sampleSigner(), ReportDataVersion, [reservedLen]byte{})
-	v := New(Policy{Allowed: []Measurement{mkMeasurement(0xaa)}},
+	v := New(BootChainPolicy{Allowed: []BootChain{BootChainOf(mkMeasurement(0xaa))}},
 		WithQuoteParser(fakeParser(served, rd, nil)), WithMeasurementMode(ModeWarn))
 
 	got, err := v.Verify([]byte("raw-quote"))
@@ -119,7 +183,7 @@ func TestVerify_WarnMode_AcceptsUntrustedMeasurement(t *testing.T) {
 func TestVerify_WarnMode_TrustedWhenAllowlisted(t *testing.T) {
 	good := mkMeasurement(0xaa)
 	rd := makeReportData(sampleEncPub(), sampleSigner(), ReportDataVersion, [reservedLen]byte{})
-	v := New(Policy{Allowed: []Measurement{good}},
+	v := New(BootChainPolicy{Allowed: []BootChain{BootChainOf(good)}},
 		WithQuoteParser(fakeParser(good, rd, nil)), WithMeasurementMode(ModeWarn))
 	got, err := v.Verify([]byte("raw-quote"))
 	if err != nil {
@@ -133,13 +197,13 @@ func TestVerify_WarnMode_TrustedWhenAllowlisted(t *testing.T) {
 // Warn mode must NOT relax quote authenticity or report_data validity.
 func TestVerify_WarnMode_StillEnforcesAuthenticityAndBinding(t *testing.T) {
 	sentinel := errors.New("bad TDX signature")
-	vAuth := New(Policy{}, WithQuoteParser(fakeParser(Measurement{}, nil, sentinel)), WithMeasurementMode(ModeWarn))
+	vAuth := New(BootChainPolicy{}, WithQuoteParser(fakeParser(Measurement{}, nil, sentinel)), WithMeasurementMode(ModeWarn))
 	if _, err := vAuth.Verify([]byte("raw-quote")); !errors.Is(err, sentinel) {
 		t.Errorf("warn mode must still fail on bad quote: %v", err)
 	}
 
 	badRD := makeReportData(sampleEncPub(), sampleSigner(), ReportDataVersion+1, [reservedLen]byte{})
-	vBind := New(Policy{}, WithQuoteParser(fakeParser(mkMeasurement(0xbb), badRD, nil)), WithMeasurementMode(ModeWarn))
+	vBind := New(BootChainPolicy{}, WithQuoteParser(fakeParser(mkMeasurement(0xbb), badRD, nil)), WithMeasurementMode(ModeWarn))
 	if _, err := vBind.Verify([]byte("raw-quote")); !errors.Is(err, ErrMalformedReportData) {
 		t.Errorf("warn mode must still fail on malformed report_data: %v", err)
 	}

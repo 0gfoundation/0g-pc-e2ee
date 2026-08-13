@@ -468,8 +468,13 @@ func newVerifier(label string, enforce bool, pccsURL string, collateralTTL time.
 	}
 	logger.Info("TDX quote verification enabled", "label", label, "enforce", enforce, "allowlist", "empty",
 		"collateral_source", collateralSource(pccsURL), "collateral_ttl", collateralTTL)
+	// TODO: load the audited broker boot chains. The allowlist now has a shape that
+	// CAN be filled — one entry per OS image, computed from a reproducible build and
+	// publishable before a deployment exists (attest.BootChain) — so what remains is
+	// deciding where the values are published: on-chain beside the provider registry,
+	// or as broker release assets. Until then this stays empty and `enforce` off.
 	return attest.New(
-		attest.Policy{}, // TODO: load the audited broker-image measurement allowlist
+		attest.BootChainPolicy{},
 		attest.WithQuoteParser(dcap.NewQuoteParser(dcap.Config{
 			PCCSBaseURL:   pccsURL,
 			CollateralTTL: collateralTTL,

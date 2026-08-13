@@ -659,12 +659,12 @@ and warmer liveness).
   is a switch and the other is not:
   - the **on-chain signer** check (trust-chain hop 5) is wired and observed;
     `ZG_GATEWAY_ONCHAIN_ENFORCE` is simply off, so turning it on is a config change.
-  - the **measurement** check (hop 3) cannot be enforced yet at all. Its allowlist is
-    empty, so `ZG_GATEWAY_ATTEST_ENFORCE` would reject every provider — but filling it
-    is not just a matter of supplying values: `attest.Policy` compares all five
-    registers including RTMR3, which carries the per-instance `instance_id`, so an entry
-    pins one CVM rather than one audited version. It needs the same shape change the
-    gateway's own OS-image check already made (see `trust-chain.md` hop 3).
+  - the **boot-chain** check (hop 3) has an empty allowlist, so
+    `ZG_GATEWAY_ATTEST_ENFORCE` would reject every provider. It now compares the boot
+    chain (MRTD + RTMR1 + RTMR2) rather than all five registers — the same split the
+    gateway's own OS-image check makes — so an entry pins one audited image instead of
+    one CVM, and the allowlist can be filled. What is still open is where the values are
+    published (see `trust-chain.md` hop 3).
 
   Response signatures are always fail-closed.
 - If the gateway container is recreated with a new address, restart
