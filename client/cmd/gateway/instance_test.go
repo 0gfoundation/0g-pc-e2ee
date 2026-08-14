@@ -16,7 +16,7 @@ import (
 // that wanted it.
 func TestInstanceHeaderStampedOnEveryResponse(t *testing.T) {
 	const id = "aa11bb22cc33dd44"
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), testOrigins(), id, discardLogger()))
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), testOrigins(), id, noInFlightCap, discardLogger()))
 	defer gw.Close()
 
 	t.Run("healthz", func(t *testing.T) {
@@ -70,7 +70,7 @@ func TestInstanceHeaderStampedOnEveryResponse(t *testing.T) {
 // run, or a deployment that wired neither identity source). It must serve
 // normally, without a header naming an empty replica.
 func TestInstanceHeaderAbsentWithoutIdentity(t *testing.T) {
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), testOrigins(), "", discardLogger()))
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), testOrigins(), "", noInFlightCap, discardLogger()))
 	defer gw.Close()
 
 	resp, err := http.Get(gw.URL + "/healthz")
@@ -88,7 +88,7 @@ func TestInstanceHeaderAbsentWithoutIdentity(t *testing.T) {
 // Access-Control-Expose-Headers. It is advertised unconditionally (see
 // corsExposeHeaders), so this holds even on a gateway that stamps nothing.
 func TestInstanceHeaderExposedToBrowsers(t *testing.T) {
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), testOrigins(), "", discardLogger()))
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), testOrigins(), "", noInFlightCap, discardLogger()))
 	defer gw.Close()
 
 	req, err := http.NewRequest(http.MethodGet, gw.URL+"/healthz", nil)

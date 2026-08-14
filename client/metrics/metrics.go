@@ -71,6 +71,28 @@ var (
 		Help: "HTTP requests currently being served.",
 	})
 
+	// Overload shedding (openaiproxy.LimitInFlight) — the sealed inference path's
+	// concurrency ceiling. The limit is exported alongside the counter so an alert
+	// can watch headroom (in-flight approaching the cap) without hardcoding a
+	// number only the deployment knows.
+	//
+	// Mind the scope mismatch if you write that ratio: http_requests_in_flight
+	// counts EVERY request (health probes, the router passthrough), while this
+	// limit bounds only the sealed path. Those extras are short-lived and sealed
+	// requests are the long-held ones, so the ratio is a good approximation of
+	// headroom — but it is an approximation, and it reads slightly high.
+	inFlightLimit = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "inflight_limit",
+		Help: "Configured max concurrent sealed inference requests; 0 when the cap is disabled.",
+	})
+	// Sheds also land in http_requests_total{status="503"}, so a naive 5xx alert
+	// pages on the limiter doing its job. Subtract this series to get faults
+	// alone; the access log makes the same split with shed=true at Warn.
+	requestsShed = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "requests_shed_total",
+		Help: "Sealed inference requests refused with 503 because the in-flight limit was reached. Also counted in http_requests_total{status=\"503\"} — subtract this to isolate genuine faults.",
+	})
+
 	// Completion outcome (openaiproxy) — attributes each chat completion to where
 	// a failure originated (core.Error.Source/Stage), so a gateway-side fault is
 	// distinguishable from a router/provider one without parsing logs.
@@ -143,7 +165,7 @@ func init() {
 	registry.MustRegister(
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
-		httpRequests, httpDuration, httpInFlight,
+		httpRequests, httpDuration, httpInFlight, inFlightLimit, requestsShed,
 		completions, openFailures, verificationFailures,
 		quoteVerify, quoteVerifyDuration, quoteCache, measurementUntrusted,
 		warmerSweeps, warmerProviderRefresh, warmerLastSuccess,
@@ -184,6 +206,17 @@ func HTTPRequest(route, method string, status int, dur time.Duration) {
 // IncInFlight / DecInFlight bracket a request for the in-flight gauge.
 func IncInFlight() { httpInFlight.Inc() }
 func DecInFlight() { httpInFlight.Dec() }
+
+// SetInFlightLimit publishes the configured concurrency ceiling (0 = disabled).
+// Called once at wiring time, so the series exists before any load arrives —
+// otherwise an alert on the in-flight/limit ratio would have no denominator on a
+// gateway that has not yet been busy.
+func SetInFlightLimit(n int) { inFlightLimit.Set(float64(n)) }
+
+// RequestShed records one request refused because the gateway was at capacity.
+// Worth alerting on at any sustained non-zero rate: it means real requests are
+// being turned away, which is the intended behavior but never a steady state.
+func RequestShed() { requestsShed.Inc() }
 
 // Completion records one chat-completion outcome. For a success, source and
 // stage are "none"; for a failure they carry core.Error.Source()/Stage.

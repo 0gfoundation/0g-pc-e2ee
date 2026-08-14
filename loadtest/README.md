@@ -178,8 +178,19 @@ percentile in the summary is directly about it.
   the gateway or to its upstream. The client can only see "it broke".
 - `zg_gateway_http_request_duration_seconds` — server-side latency, so the gap
   against the client's view is queueing and network.
+- `zg_gateway_requests_shed_total` / `zg_gateway_inflight_limit` — the sealed
+  path's concurrency ceiling and how many requests it refused. **If shed is
+  non-zero, the run measured the cap, not the gateway** — the 503s look like
+  errors in `gateway_failed` and the knee lands wherever the ceiling is. Set
+  `ZG_GATEWAY_MAX_INFLIGHT=0` to measure an unbounded gateway, which is what the
+  rig does by default; the number the cap should eventually be set to is an
+  output of these runs, not an input. Don't infer the ceiling from a formula —
+  the effective value is derived (see below) and is printed on the gateway's
+  startup line as `max_inflight`, as well as published as `inflight_limit`.
 
-`deploy/grafana/0g-pc-gateway.json` already plots these.
+`deploy/grafana/0g-pc-gateway.json` plots the first three. It does **not** yet
+have panels for `requests_shed_total` / `inflight_limit` — read those off
+`:9464` directly, and do not take an empty dashboard for a quiet one.
 
 **When you want to know *why*, profile.** The compose sets `ZG_GATEWAY_PPROF=true`,
 which mounts the Go profiler on the metrics listener (never published in a real
@@ -256,11 +267,33 @@ a gateway fault. The 65536 default is far above anything a single gateway carrie
 
 ## Known gaps worth testing next
 
-- **No admission control.** The gateway has no concurrency limit or rate limit
-  (issue #20), so past saturation it does not shed load — everything slows together
-  until requests time out. The ramp will show this as a latency cliff rather than a
-  rising 503 rate. Whether to add a max-in-flight limit that returns 503 is a
-  decision this measurement should inform.
+- **The admission-control ceiling is derived, not measured.** The gateway sheds
+  past a max-in-flight limit (`-max-inflight` / `ZG_GATEWAY_MAX_INFLIGHT`) — over
+  it, a sealed request gets 503 + `Retry-After` instead of joining a pile-up. But
+  when neither flag nor env var is set, the effective number comes from
+  arithmetic in `client/cmd/gateway/inflight.go`, and every input to it is an
+  **estimate**:
+
+  | bound | value | binds when |
+  |---|---|---|
+  | per-CPU | `256 × GOMAXPROCS` | single-core hosts only |
+  | absolute ceiling | `512` (≈15 GiB worst-case request memory) | no `GOMEMLIMIT` set |
+  | `GOMEMLIMIT`-derived | `GOMEMLIMIT / 2 / ~30 MiB` | a limit is set — **409** on the Phala CVM's 24 GiB |
+
+  All three are priced at ~30 MiB peak memory per in-flight request
+  (`perRequestPeakFactor × MaxRequestBytes`), which is itself a guess at how much
+  a request costs while it is being buffered, parsed and sealed. **Producing a
+  measured number to replace the whole chain is the job of an L3 run** — and note
+  the rig disables the cap (`MAX_INFLIGHT=0`) precisely so it can find the
+  unbounded knee, which is the input to that decision.
+
+  Two things worth measuring alongside the knee, since both are currently
+  assumptions rather than observations: the **actual** peak heap per in-flight
+  request (which is what `perRequestPeakFactor` guesses), and whether
+  `GOMEMLIMIT` is doing anything useful under overload or just spinning the
+  collector.
+- **Per-account fairness is still absent** (issue #20). A global ceiling stops a
+  pile-up; it does not stop one account from being the cause of it.
 - **Long-lived streams.** `core.providerTimeout` is 10m30s, and each in-flight
   stream holds a goroutine, a connection to the router, and buffers. Memory, not
   CPU, may be the real ceiling for high-`MOCK_CHUNKS` shapes — watch the heap

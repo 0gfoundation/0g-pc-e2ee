@@ -22,8 +22,12 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
-// maxRequestBytes caps the request body the proxy will read.
-const maxRequestBytes = 10 << 20 // 10 MiB
+// MaxRequestBytes caps the request body the proxy will read. It is read fully
+// into memory before anything else happens (Register below), so it is also the
+// dominant term in what one in-flight request can COST in memory — which is why
+// it is exported: the gateway sizes its concurrency ceiling from it, and a copy
+// of the number over there could drift from this one.
+const MaxRequestBytes = 10 << 20 // 10 MiB
 
 // headerResKey mirrors the provider's ZG-Res-Key response header. The proxy
 // re-emits the handle the core captured under the same name, so the front end's
@@ -199,7 +203,7 @@ func Register(mux *http.ServeMux, c *core.Client, opts ...Option) {
 		opt(&o)
 	}
 	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBytes))
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxRequestBytes))
 		if err != nil {
 			var tooLarge *http.MaxBytesError
 			if errors.As(err, &tooLarge) {

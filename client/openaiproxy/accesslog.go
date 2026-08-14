@@ -1,6 +1,7 @@
 package openaiproxy
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"log/slog"
@@ -69,6 +70,13 @@ func LogRequests(logger *slog.Logger, h http.Handler) http.Handler {
 		id := requestID(r)
 		w.Header().Set(requestIDHeader, id)
 
+		// Carry a marker the overload limiter can set from further down the chain
+		// (see markShed). A pointer in the context is the same mechanism the core
+		// uses for ResponseMeta, and it is the only one available here: the limiter
+		// runs INSIDE this wrapper, so it cannot hand anything back up, and a
+		// response header would have to be sent to the caller to be readable.
+		r, shed := withShedFlag(r)
+
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		start := time.Now()
 		h.ServeHTTP(rec, r)
@@ -78,14 +86,24 @@ func LogRequests(logger *slog.Logger, h http.Handler) http.Handler {
 
 		// Level tracks status so a fronting log system (Phala today, GCP Cloud
 		// Logging later) maps 5xx to error and 4xx to warning severity for free.
+		//
+		// A shed request is the exception: it is a 503, but it is the limiter
+		// working, not the gateway failing — logging it at Error would put the one
+		// response that means "we protected ourselves correctly" in the same bucket
+		// as the ones that mean "we are broken", and an operator would learn to
+		// ignore the bucket. It is logged at Warn, alongside the 4xx refusals it
+		// resembles (the credential gate's), and carries shed=true so the two are
+		// still separable.
 		level := slog.LevelInfo
 		switch {
+		case shed.load():
+			level = slog.LevelWarn
 		case rec.status >= 500:
 			level = slog.LevelError
 		case rec.status >= 400:
 			level = slog.LevelWarn
 		}
-		logger.LogAttrs(r.Context(), level, "request",
+		attrs := []slog.Attr{
 			slog.String("request_id", id),
 			slog.String("method", r.Method),
 			slog.String("path", r.URL.Path),
@@ -94,7 +112,11 @@ func LogRequests(logger *slog.Logger, h http.Handler) http.Handler {
 			slog.Int("bytes_out", rec.bytes),
 			slog.Bool("provider_pinned", r.Header.Get(providerPinHeader) != ""),
 			slog.Bool("stream", rec.streamed()),
-		)
+		}
+		if shed.load() {
+			attrs = append(attrs, slog.Bool("shed", true))
+		}
+		logger.LogAttrs(r.Context(), level, "request", attrs...)
 	})
 }
 
@@ -172,4 +194,36 @@ func (s *statusRecorder) Flush() {
 // response Content-Type the handler set (serveStream sets text/event-stream).
 func (s *statusRecorder) streamed() bool {
 	return s.Header().Get("Content-Type") == "text/event-stream"
+}
+
+// shedFlagKey keys the per-request overload marker in the request context.
+type shedFlagKey struct{}
+
+// shedFlag is a one-way per-request marker: the overload limiter sets it, the
+// access log reads it. It exists because the limiter runs INSIDE LogRequests and
+// so has no way to hand a verdict back up — a bare 503 is indistinguishable
+// there from a genuine fault, which is the distinction the whole shed-vs-fail
+// design rests on.
+//
+// One request is handled by one goroutine, and the limiter sets this before the
+// handler returns while the log reads it after — so the two never race and this
+// needs no lock.
+type shedFlag struct{ shed bool }
+
+func (f *shedFlag) load() bool { return f != nil && f.shed }
+
+// withShedFlag returns r carrying a fresh marker, plus the marker itself.
+func withShedFlag(r *http.Request) (*http.Request, *shedFlag) {
+	f := &shedFlag{}
+	return r.WithContext(context.WithValue(r.Context(), shedFlagKey{}, f)), f
+}
+
+// markShed records that this request was refused for capacity rather than
+// failing. A no-op when the request did not come through LogRequests (the
+// sidecar mounts the proxy without it), so the limiter can call it
+// unconditionally.
+func markShed(ctx context.Context) {
+	if f, ok := ctx.Value(shedFlagKey{}).(*shedFlag); ok {
+		f.shed = true
+	}
 }
