@@ -142,6 +142,13 @@ services:
       # http://localhost:9464/debug/pprof/profile?seconds=30` during a run is the
       # fastest way to see where the throughput went.
       - "ZG_GATEWAY_PPROF=true"
+      # No concurrency cap. The rig exists to find where this gateway's own knee
+      # is; with the production default in place the run would find the CAP
+      # instead — its 503s counting as errors in `gateway_failed` and the knee
+      # landing wherever the ceiling was set. The cap's value is an OUTPUT of
+      # these runs, so it must not be an input to them. Override to a real number
+      # only when deliberately measuring the cap's own behaviour under overload.
+      - "ZG_GATEWAY_MAX_INFLIGHT=${ZG_GATEWAY_MAX_INFLIGHT:-0}"
     healthcheck:
       test: ["CMD", "/usr/local/bin/gateway", "-health"]
       interval: 10s

@@ -239,6 +239,25 @@ services:
       - "ZG_GATEWAY_WARM=true"
       # - "ZG_GATEWAY_WARM_INTERVAL=4m" # optional; 4m is already the default
       #
+      # Soft memory limit for the Go runtime, and the input the sealed path's
+      # concurrency ceiling is derived from — ZG_GATEWAY_MAX_INFLIGHT is
+      # deliberately NOT set, so the number comes from one place:
+      #
+      #   24 GiB / 2 (bodies' share) / ~30 MiB (peak per request) = ~409 in flight
+      #
+      # It is the SECOND line of defence, not a replacement for that ceiling: the
+      # ceiling bounds LIVE memory by refusing admission, GOMEMLIMIT only absorbs
+      # GARBAGE by collecting harder. And it is soft — Go cannot refuse an
+      # allocation, so a live set genuinely over the limit trades an OOM for a GC
+      # death spiral.
+      #
+      # 24 of the CVM's 32 GiB: ~2 guest OS/kernel, ~1 dstack-ingress + metrics
+      # agent, ~5 slack so the HOST never OOM-kills (that takes the whole CVM).
+      # ASSUMES a 32 GiB CVM and nothing here can check it — set above physical RAM
+      # and this limit plus the cap derived from it both fail silently. Re-derive on
+      # resize; it does not scale itself. Rationale, and what going wrong looks
+      # like: README "CVM shape — and the one setting that depends on it".
+      - "GOMEMLIMIT=24GiB"
       # Read this CVM's identity from the file cvm-identity wrote, NOT the
       # guest-agent socket. The empty ZG_GATEWAY_DSTACK_SOCKET is load-bearing: unset
       # it and the binary's default would reinstate the socket path as a fallback,

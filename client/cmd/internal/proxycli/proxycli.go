@@ -514,6 +514,27 @@ func EnvOr(key, def string) string { return envOr(key, def) }
 // treatment of an unparseable value as every shared flag here.
 func EnvBool(key string, def bool) bool { return envBool(key, def) }
 
+// EnvIntOr is EnvOr's integer counterpart, for a binary registering its OWN
+// integer flag (the gateway's -max-inflight): same precedence, same fail-loud
+// treatment of a set-but-unparseable value.
+func EnvIntOr(key string, def int) int { return envInt(key, def) }
+
+// envInt parses an integer environment variable. An unset variable falls back to
+// def; a set-but-unparseable one is fatal rather than silently defaulting, so a
+// typo in a concurrency ceiling cannot quietly restore the built-in value while
+// the operator believes they changed it.
+func envInt(key string, def int) int {
+	v, ok := os.LookupEnv(key)
+	if !ok {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		log.Fatalf("invalid %s=%q: must be an integer", key, v)
+	}
+	return n
+}
+
 // envBool parses a boolean environment variable (accepting the same forms as
 // the -flag=bool syntax: 1/t/T/TRUE/true, 0/f/F/FALSE/false, etc.). An unset
 // variable falls back to def; a set-but-unparseable value is fatal rather than

@@ -36,8 +36,13 @@
 // (openaiproxy.RequireInferenceCredential in newHandler): a cheap presence/shape check
 // that sheds missing-credential and mgmt-key traffic before the seal/route work,
 // while the router stays the authoritative auth/billing point and re-validates
-// every forwarded credential. The remaining multi-tenant concerns (per-user
-// billing attribution, rate limiting; issue #20) are a later step. Trusting the
+// every forwarded credential. That path also carries a process-wide concurrency
+// ceiling (openaiproxy.LimitInFlight): paying per token bounds what a caller
+// spends, not what they occupy, and this gateway is a shared CPU-bound process.
+// The remaining multi-tenant concerns — per-user billing attribution, and
+// per-account fairness rather than a global ceiling (issue #20) — are a later
+// step; the router's per-account limiter is what bounds a single account's
+// request rate today. Trusting the
 // router's returned endpoint (vs resolving it on chain) is tracked in issue #18.
 package main
 
@@ -51,6 +56,7 @@ import (
 	"net/http/pprof"
 	"net/url"
 	"os"
+	"runtime"
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/cmd/internal/proxycli"
@@ -102,6 +108,13 @@ func main() {
 	dstackSocket := flag.String("dstack-socket", proxycli.EnvOr("ZG_GATEWAY_DSTACK_SOCKET", dstack.DefaultSocket),
 		"path to the dstack guest-agent unix socket, read ONCE at startup for the same identity when "+
 			"-identity-file is unset; empty disables the lookup (env ZG_GATEWAY_DSTACK_SOCKET)")
+	// Ceiling on concurrent sealed inference requests — see
+	// openaiproxy.LimitInFlight for why a paid-per-token service still needs one,
+	// and defaultMaxInFlight for how the built-in number is derived and why it is
+	// bounded on two axes rather than one.
+	maxInFlight := flag.Int("max-inflight", proxycli.EnvIntOr("ZG_GATEWAY_MAX_INFLIGHT", defaultMaxInFlight()),
+		"max concurrent sealed inference requests; excess is refused with 503 + Retry-After rather than queued. "+
+			"0 disables the cap (load-test rigs measuring the unbounded knee) (env ZG_GATEWAY_MAX_INFLIGHT)")
 	// Mount the Go runtime profiler on the metrics listener. OFF by default and
 	// deliberately not a production knob: it is the fastest way to find where a
 	// load test's throughput is going (`go tool pprof
@@ -212,9 +225,19 @@ func main() {
 	}
 	stopMetrics := startMetrics(*metricsListen, *pprofOn, logger)
 
+	// Publish the ceiling before any load arrives, so an alert on
+	// in-flight-approaching-the-cap has a denominator on a gateway that has not
+	// been busy yet. Set here rather than inside LimitInFlight: the process has
+	// one ceiling, the constructor may be called more than once (tests).
+	metrics.SetInFlightLimit(*maxInFlight)
+	if *maxInFlight <= 0 {
+		logger.Warn("sealed-inference concurrency cap disabled; nothing bounds concurrent requests, so overload degrades every in-flight request instead of shedding the excess",
+			"max_inflight", *maxInFlight)
+	}
+
 	srv := &http.Server{
 		Addr:              *f.Listen,
-		Handler:           newHandler(built.Client, routerTarget, origins, instanceID, logger),
+		Handler:           newHandler(built.Client, routerTarget, origins, instanceID, *maxInFlight, logger),
 		ReadHeaderTimeout: 10 * time.Second,     // mitigate slow-header (Slowloris) clients
 		IdleTimeout:       proxycli.IdleTimeout, // bound idle keep-alives; unset means unbounded
 	}
@@ -226,8 +249,22 @@ func main() {
 	// (shared with the sidecar so both forms handle SIGTERM identically — the
 	// dstack/Phala deployment sends it on every redeploy). ListenAndServe's clean
 	// shutdown is folded into a nil return; only a real listen failure is an error.
+	// max_inflight is on this line because the deployed value is DERIVED (from
+	// GOMEMLIMIT and the core count — see defaultMaxInFlight), so unlike a flag
+	// that is simply echoed back, nobody can read the config and know what the
+	// gateway settled on. The same value is published as zg_gateway_inflight_limit;
+	// the log is what an operator reaches for first.
+	//
+	// go_memlimit_bytes and gomaxprocs come with it because they are its INPUTS,
+	// and the failure worth catching is a GOMEMLIMIT set above the machine's actual
+	// RAM — which is silent (Go never reaches a limit it cannot allocate up to, so
+	// the OOM killer arrives first) and leaves the cap sized for memory that does
+	// not exist. Logging all three puts the assumption next to what it produced, so
+	// comparing it against the CVM's real shape is a glance rather than an
+	// investigation. math.MaxInt64 means unset.
 	logger.Info("gateway listening", "listen", *f.Listen, "router_url", *f.RouterURL,
-		"cors_allowed_origins", origins)
+		"cors_allowed_origins", origins, "max_inflight", *maxInFlight,
+		"go_memlimit_bytes", currentMemoryLimit(), "gomaxprocs", runtime.GOMAXPROCS(0))
 	err = proxycli.Serve(srv, logger)
 	stopWarmer()
 	stopMetrics()
@@ -373,7 +410,10 @@ func runHealthCheck(listen string) int {
 // id (openaiproxy.StampInstance). It is empty only when the identity lookup found
 // nothing — a local run, or a deployment that wired neither source — in which case
 // no stamping middleware is wired at all.
-func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, instanceID string, logger *slog.Logger) http.Handler {
+//
+// maxInFlight caps concurrent sealed inference requests (0 disables it); see the
+// -max-inflight flag and openaiproxy.LimitInFlight.
+func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, instanceID string, maxInFlight int, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	// Mount the sealed inference path behind the gateway's front-door credential
 	// gate. The gate is a cheap presence/shape check (reject missing credentials
@@ -383,7 +423,17 @@ func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, 
 	// and the catch-all metadata passthrough below is discovery the router already
 	// governs. The sidecar shares openaiproxy but is single-user, so it never
 	// mounts this gate.
-	mux.Handle("POST /v1/chat/completions", openaiproxy.RequireInferenceCredential(openaiproxy.Handler(c)))
+	//
+	// The concurrency cap sits INSIDE the credential gate: a request with no
+	// credential or a mgmt key is rejected on shape alone, and must not hold a
+	// slot a real request could have used. It covers this route only — /healthz
+	// is the container's own probe and a 503 there would kill the CVM rather than
+	// protect it, and the catch-all below is cheap metadata the router already
+	// governs. The expensive work (seal, route preview, DCAP on a cold cache,
+	// streams held open for their whole schedule) is all on this path.
+	mux.Handle("POST /v1/chat/completions",
+		openaiproxy.RequireInferenceCredential(
+			openaiproxy.LimitInFlight(maxInFlight, openaiproxy.Handler(c))))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte("ok\n"))
