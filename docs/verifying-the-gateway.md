@@ -45,7 +45,7 @@ those are different claims:
 | Exit | Means |
 |---|---|
 | `0` | every check ran and passed |
-| `1` | a check failed |
+| `1` | a check failed — including one you *demanded* that could not be completed |
 | `2` | caller mistake — bad flags, an unusable domain, an unreadable file |
 | `3` | nothing failed, but a check did not **run** |
 

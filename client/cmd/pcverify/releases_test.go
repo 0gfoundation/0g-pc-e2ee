@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -264,10 +265,69 @@ func TestNewEvidenceChecker_ReleaseLookupFailure(t *testing.T) {
 	t.Run("explicit is fatal", func(t *testing.T) {
 		g := base
 		g.releasesSet = true
-		if _, _, err := newEvidenceChecker(context.Background(), &bytes.Buffer{}, g); err == nil {
-			t.Error("an explicitly requested lookup that failed must be fatal")
+		_, _, err := newEvidenceChecker(context.Background(), &bytes.Buffer{}, g)
+		if err == nil {
+			t.Fatal("an explicitly requested lookup that failed must be fatal")
+		}
+		// Fatal as a FAILED CHECK, not as a caller mistake — see errLookupRequired.
+		var required errLookupRequired
+		if !errors.As(err, &required) {
+			t.Errorf("err = %v (%T), want an errLookupRequired", err, err)
 		}
 	})
+
+	t.Run("strict is fatal", func(t *testing.T) {
+		g := base // releasesSet stays false; -strict is what demands the lookup
+		g.strict = true
+		_, _, err := newEvidenceChecker(context.Background(), &bytes.Buffer{}, g)
+		if err == nil {
+			t.Fatal("-strict must not let a failed release lookup through")
+		}
+		var required errLookupRequired
+		if !errors.As(err, &required) {
+			t.Errorf("err = %v (%T), want an errLookupRequired", err, err)
+		}
+	})
+}
+
+// The exit code for a demanded-but-unobtainable lookup, end to end through run().
+//
+// This is the scenario -strict exists for — an unreachable or rate-limited GitHub, at
+// 60 requests/hour per IP on shared runners — and it must land on 1 ("a check failed"),
+// never 2 ("caller mistake"). A gate that branches on the two to tell "my invocation is
+// wrong" from "the deployment did not verify" would otherwise be sent the wrong way in
+// exactly the case the flag was added for.
+//
+// It goes through run() deliberately: the bug this covers was in the mapping from
+// newEvidenceChecker's error to an exit code, which no test of either half could see.
+func TestRun_DemandedLookupFailureExitsOne(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// What rate limiting actually looks like.
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	t.Cleanup(srv.Close)
+	old := githubAPI
+	githubAPI = srv.URL
+	t.Cleanup(func() { githubAPI = old })
+
+	for _, tc := range []struct {
+		name string
+		args []string
+		want int
+	}{
+		{"strict", []string{"-gateway", "pc-gateway.test", "-strict"}, 1},
+		{"explicit releases", []string{"-gateway", "pc-gateway.test", "-releases", "3"}, 1},
+		// Still a caller mistake: these two instructions contradict each other, and the
+		// run is rejected before any lookup is attempted.
+		{"strict with the comparison off", []string{"-gateway", "pc-gateway.test", "-strict", "-releases", "0"}, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			if got := run(context.Background(), &out, tc.args); got != tc.want {
+				t.Errorf("exit = %d, want %d\n%s", got, tc.want, out.String())
+			}
+		})
+	}
 }
 
 // Naming a file is the more specific instruction, so it wins over the -releases

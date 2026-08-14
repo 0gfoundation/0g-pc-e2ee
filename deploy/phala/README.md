@@ -183,7 +183,8 @@ Two ways to change what the compose text is compared against:
 Because `-releases` has a default, its failure mode depends on whether you asked for
 it: an unreachable or rate-limited GitHub on a **default** run is reported as
 advisory (`-`) and does not fail, since it says nothing about the deployment, while an
-explicit `-releases N` that cannot be satisfied is fatal. Passing
+explicit `-releases N` that cannot be satisfied is fatal — exit **1**, a check that could
+not be made, not exit 2, which is reserved for a mistake in the invocation. Passing
 `-expect-compose-file` simply overrides the default; passing it *and* an explicit
 `-releases` is rejected, since they answer different questions.
 

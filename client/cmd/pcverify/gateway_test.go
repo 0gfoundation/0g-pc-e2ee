@@ -25,7 +25,7 @@ func (s stubEvidence) Check(context.Context, string) (evidence.Report, error) {
 //
 // The code-identity and os-image fields are populated rather than left zero: a report
 // with neither describes a run that skipped both, which is exit 3 (see
-// incompleteRun), not a pass. Cases that want a partial run clear them explicitly.
+// incompleteReason), not a pass. Cases that want a partial run clear them explicitly.
 func passing() evidence.Report {
 	return evidence.Report{
 		Domain: "pc-gateway.test",

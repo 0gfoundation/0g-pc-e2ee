@@ -117,7 +117,9 @@
 // # Exit codes
 //
 //	0  every check ran and passed
-//	1  a check failed
+//	1  a check failed — including a lookup the caller DEMANDED (-strict, or an
+//	   explicit -releases N) that could not be completed: the flags were usable, the
+//	   claim just could not be made
 //	2  caller mistake (bad flags, an unusable domain, an unreadable file)
 //	3  gateway mode: nothing failed, but a check did not RUN
 //
@@ -131,6 +133,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -231,6 +234,13 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 		ec, expect, err := newEvidenceChecker(ctx, out, gcfg)
 		if err != nil {
 			fmt.Fprintf(out, "pcverify: %v\n", err)
+			// A lookup the caller demanded and did not get is a failed check, not a
+			// caller mistake: the run could not make a claim it was told to make. Every
+			// other setup failure here really is exit 2.
+			var required errLookupRequired
+			if errors.As(err, &required) {
+				return fail(out)
+			}
 			return 2
 		}
 		return reportGateway(ctx, out, ec, *gateway, *allowUntrustedCert, *strict, expect)

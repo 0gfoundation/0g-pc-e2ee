@@ -8,14 +8,16 @@ const measurementRegLen = 48
 // (runtime-extended measurements). Two enclaves with identical Measurement are
 // running the same measured boot chain.
 //
-// Fixed-size arrays make Measurement comparable with ==, so allowlist matching
-// is a plain equality check with no per-field loop.
+// Fixed-size arrays make Measurement comparable with ==, so matching is a plain
+// equality check with no per-field loop.
 //
-// Which registers must match to call a provider "the audited image" is a policy
-// question — a stricter policy might pin only MRTD, a looser one might ignore an
-// RTMR that carries only benign runtime data. This skeleton pins ALL of them
-// (full equality), the most conservative choice; relaxing it is a deliberate,
-// reviewable Policy change, never a silent default.
+// This is the full observation, NOT the thing an allowlist compares. Which registers
+// identify "the audited image" is a policy question, and pinning all five is not the
+// conservative answer it looks like: RTMR3 carries per-instance events, so a
+// full-equality entry pins one CVM rather than one image. Verifier therefore compares
+// BootChain — see that type for which registers are excluded and why. Measurement
+// stays whole because a verifier still wants to report what it saw, RTMR0 and RTMR3
+// included.
 type Measurement struct {
 	MRTD  [measurementRegLen]byte
 	RTMR0 [measurementRegLen]byte

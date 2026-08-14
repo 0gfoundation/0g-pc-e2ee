@@ -65,6 +65,21 @@ type expectSource struct {
 // blue/green pair, few enough that "matches none of them" stays a strong signal.
 const defaultReleases = 5
 
+// errLookupRequired marks a lookup the caller DEMANDED — with -strict, or with an
+// explicit -releases N — that could not be completed.
+//
+// It exists to keep the exit codes honest. Setup failures otherwise mean "caller
+// mistake" (exit 2): unusable flags, an unreadable file, a domain that is not a
+// domain. A GitHub outage or a 403 from rate limiting is none of those — the flags
+// were fine and the claim simply could not be made, which is a failed check (exit 1).
+// Collapsing the two would point a CI gate at the wrong branch precisely in the
+// scenario -strict exists for, since the unauthenticated GitHub API allows 60
+// requests/hour per IP and shared runners do hit it.
+type errLookupRequired struct{ err error }
+
+func (e errLookupRequired) Error() string { return e.err.Error() }
+func (e errLookupRequired) Unwrap() error { return e.err }
+
 // flagSet reports whether name was passed on the command line, rather than holding
 // its default.
 func flagSet(fs *flag.FlagSet, name string) bool {
@@ -163,7 +178,9 @@ func newEvidenceChecker(ctx context.Context, out io.Writer, g gatewayConfig) (*e
 		case err != nil && expect.Advisory:
 			expect.Err = err
 		case err != nil:
-			return nil, expect, err
+			// Demanded and not obtained. Typed, so run() can exit 1 rather than folding
+			// it in with the caller mistakes — see errLookupRequired.
+			return nil, expect, errLookupRequired{err}
 		default:
 			cfg.ExpectComposeFiles = files
 		}
@@ -209,7 +226,7 @@ func incompleteReason(rep evidence.Report, expect expectSource) string {
 
 // reportGateway prints the per-step result of verifying a gateway's evidence bundle
 // and returns the process exit code: 0 every check ran and passed, 1 a check failed,
-// 3 nothing failed but something did not run (see incompleteRun). 2 is reserved for
+// 3 nothing failed but something did not run (see incompleteReason). 2 is reserved for
 // a caller mistake, which is why "incomplete" could not have it.
 //
 // strict collapses 3 into 1: the caller asked for a complete run, so an incomplete
