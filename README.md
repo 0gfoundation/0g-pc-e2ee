@@ -12,11 +12,6 @@ enclave: **confidentiality** (the prompt and tool definitions are sealed) *and*
 **authenticity** (hardware attestation plus a per-response signature). Not
 confidentiality alone.
 
-> **Why this repository is public.** So that the claims above can be *checked* — the
-> security of the product rests on outsiders being able to read the verification code, the
-> wire spec, and the exact manifest that runs in production. That, rather than community
-> development, is what the openness is for.
-
 ## The shape of it
 
 ```mermaid
