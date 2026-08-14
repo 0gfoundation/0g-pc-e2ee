@@ -34,7 +34,9 @@ const (
 	signer = "0x99887766554433221100ffeeddccbbaa99887766"
 )
 
-// On-chain-only (qc == nil): the earlier tool's behavior.
+// On-chain-only (qc == nil, i.e. -no-quote): the on-chain hop passes, but hops 2–4
+// never ran, so the best available verdict is 3. A clean 0 here would be the tool
+// claiming an enclave was checked when no quote was even fetched.
 func TestReport_OnChainOnly(t *testing.T) {
 	cases := []struct {
 		name         string
@@ -42,8 +44,8 @@ func TestReport_OnChainOnly(t *testing.T) {
 		expectSigner string
 		wantCode     int
 	}{
-		{"acknowledged", stubService{info: chain.ServiceInfo{Signer: signer, Acknowledged: true}}, "", 0},
-		{"expected matches", stubService{info: chain.ServiceInfo{Signer: signer, Acknowledged: true}}, strings.ToUpper(signer), 0},
+		{"acknowledged", stubService{info: chain.ServiceInfo{Signer: signer, Acknowledged: true}}, "", 3},
+		{"expected matches", stubService{info: chain.ServiceInfo{Signer: signer, Acknowledged: true}}, strings.ToUpper(signer), 3},
 		{"expected mismatch", stubService{info: chain.ServiceInfo{Signer: signer, Acknowledged: true}}, "0x0000000000000000000000000000000000000001", 1},
 		{"unacknowledged", stubService{info: chain.ServiceInfo{Signer: signer, Acknowledged: false}}, "", 1},
 		{"lookup error", stubService{err: errors.New("rpc down")}, "", 1},
@@ -51,7 +53,7 @@ func TestReport_OnChainOnly(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var out bytes.Buffer
-			code := report(context.Background(), &out, tc.svc, nil, prov, "0xcontract", "", tc.expectSigner)
+			code := report(context.Background(), &out, tc.svc, nil, prov, "0xcontract", "", tc.expectSigner, false)
 			if code != tc.wantCode {
 				t.Errorf("code = %d, want %d\n%s", code, tc.wantCode, out.String())
 			}
@@ -69,7 +71,9 @@ func TestReport_WithQuote(t *testing.T) {
 		wantCode int
 		contains string
 	}{
-		{"all pass", stubService{info: acked}, stubQuote{v: attest.Verified{SignerAddr: signer}}, 0, "PASS"},
+		// 3, not 0: hop 3's allowlist is empty, so the boot chain was never compared.
+		// Every provider-mode run is incomplete until providerBootChains is populated.
+		{"hops pass, hop 3 never ran", stubService{info: acked}, stubQuote{v: attest.Verified{SignerAddr: signer}}, 3, "PASS (INCOMPLETE)"},
 		{"quote signer mismatch", stubService{info: acked},
 			stubQuote{v: attest.Verified{SignerAddr: "0x0000000000000000000000000000000000000002"}}, 1, "FAIL"},
 		{"quote fetch/verify error", stubService{info: acked}, stubQuote{err: errors.New("not a genuine TDX quote")}, 1, "FAIL"},
@@ -79,7 +83,7 @@ func TestReport_WithQuote(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var out bytes.Buffer
-			code := report(context.Background(), &out, tc.svc, tc.qc, prov, "0xcontract", "", "")
+			code := report(context.Background(), &out, tc.svc, tc.qc, prov, "0xcontract", "", "", false)
 			if code != tc.wantCode {
 				t.Errorf("code = %d, want %d\n%s", code, tc.wantCode, out.String())
 			}
@@ -105,11 +109,11 @@ func TestReport_PrintsTheBootChainInAllowlistShape(t *testing.T) {
 
 	var out bytes.Buffer
 	code := report(context.Background(), &out, stubService{info: acked},
-		stubQuote{v: attest.Verified{SignerAddr: signer, Measurement: m}}, prov, "0xcontract", "", "")
-	// An unconfigured allowlist is not a verdict on the provider, so the run still
-	// passes on the hops it did check.
-	if code != 0 {
-		t.Fatalf("code = %d, want 0\n%s", code, out.String())
+		stubQuote{v: attest.Verified{SignerAddr: signer, Measurement: m}}, prov, "0xcontract", "", "", false)
+	// An unconfigured allowlist is not a verdict on the provider — nothing FAILED — but
+	// it is a check that did not run, which is exit 3.
+	if code != 3 {
+		t.Fatalf("code = %d, want 3\n%s", code, out.String())
 	}
 	got := out.String()
 
@@ -145,7 +149,7 @@ func TestReport_BootChainMismatchFails(t *testing.T) {
 	// MeasurementTrusted false with a non-empty allowlist: the provider's image is not
 	// one that was audited.
 	code := report(context.Background(), &out, stubService{info: acked},
-		stubQuote{v: attest.Verified{SignerAddr: signer}}, prov, "0xcontract", "", "")
+		stubQuote{v: attest.Verified{SignerAddr: signer}}, prov, "0xcontract", "", "", false)
 	if code != 1 {
 		t.Errorf("code = %d, want 1\n%s", code, out.String())
 	}
@@ -154,13 +158,76 @@ func TestReport_BootChainMismatchFails(t *testing.T) {
 	}
 }
 
+// Provider mode must carry the same verdict contract as gateway mode. It is the mode
+// where the gap is easiest to miss: gateway mode needs a GitHub outage to skip
+// something, while here hop 3 is skipped on EVERY run, so a gate that trusts exit 0
+// would be told "verified" by a run that never checked the code root at all.
+func TestReport_ProviderVerdicts(t *testing.T) {
+	acked := chain.ServiceInfo{URL: "https://prov.example/v1", Signer: signer, Acknowledged: true}
+	good := stubQuote{v: attest.Verified{SignerAddr: signer}}
+
+	t.Run("allowlist populated and matched is a clean 0", func(t *testing.T) {
+		restore := providerBootChains
+		providerBootChains = []attest.BootChain{attest.BootChainOf(attest.Measurement{})}
+		t.Cleanup(func() { providerBootChains = restore })
+
+		var out bytes.Buffer
+		trusted := stubQuote{v: attest.Verified{SignerAddr: signer, MeasurementTrusted: true}}
+		if code := report(context.Background(), &out, stubService{info: acked}, trusted,
+			prov, "0xcontract", "", "", false); code != 0 {
+			t.Errorf("code = %d, want 0 — every hop ran and passed\n%s", code, out.String())
+		}
+		if strings.Contains(out.String(), "INCOMPLETE") {
+			t.Errorf("a fully-checked run must not be marked incomplete:\n%s", out.String())
+		}
+	})
+
+	t.Run("strict turns the empty allowlist into a failure", func(t *testing.T) {
+		var out bytes.Buffer
+		code := report(context.Background(), &out, stubService{info: acked}, good,
+			prov, "0xcontract", "", "", true)
+		if code != 1 {
+			t.Errorf("code = %d, want 1 under -strict\n%s", code, out.String())
+		}
+		if !strings.Contains(out.String(), "hop 3") {
+			t.Errorf("the failure must name the gap:\n%s", out.String())
+		}
+	})
+
+	t.Run("a real failure stays 1, not 3", func(t *testing.T) {
+		var out bytes.Buffer
+		bad := stubQuote{v: attest.Verified{SignerAddr: "0x0000000000000000000000000000000000000002"}}
+		if code := report(context.Background(), &out, stubService{info: acked}, bad,
+			prov, "0xcontract", "", "", false); code != 1 {
+			t.Errorf("code = %d, want 1\n%s", code, out.String())
+		}
+		if strings.Contains(out.String(), "INCOMPLETE") {
+			t.Errorf("a failed check must not be reported as merely incomplete:\n%s", out.String())
+		}
+	})
+}
+
+// -strict demands every check; -no-quote switches hops 2-4 off. Rejected as a caller
+// mistake, the same way -strict with -releases 0 is.
+func TestRun_StrictRejectsNoQuote(t *testing.T) {
+	var out bytes.Buffer
+	code := run(context.Background(), &out, []string{"-provider", prov, "-strict", "-no-quote"})
+	if code != 2 {
+		t.Errorf("exit = %d, want 2\n%s", code, out.String())
+	}
+	if !strings.Contains(out.String(), "-no-quote") {
+		t.Errorf("the rejection must name the conflicting flag:\n%s", out.String())
+	}
+}
+
 // -endpoint overrides the on-chain URL.
 func TestReport_EndpointOverride(t *testing.T) {
 	var out bytes.Buffer
 	svc := stubService{info: chain.ServiceInfo{URL: "https://from-chain/v1", Signer: signer, Acknowledged: true}}
-	code := report(context.Background(), &out, svc, stubQuote{v: attest.Verified{SignerAddr: signer}}, prov, "0xc", "https://override/v1", "")
-	if code != 0 {
-		t.Fatalf("code = %d, want 0\n%s", code, out.String())
+	code := report(context.Background(), &out, svc, stubQuote{v: attest.Verified{SignerAddr: signer}}, prov, "0xc", "https://override/v1", "", false)
+	// 3 because hop 3 never ran; this test is about the endpoint line, not the verdict.
+	if code != 3 {
+		t.Fatalf("code = %d, want 3\n%s", code, out.String())
 	}
 	if !strings.Contains(out.String(), "https://override/v1 (from -endpoint)") {
 		t.Errorf("expected endpoint override in output:\n%s", out.String())

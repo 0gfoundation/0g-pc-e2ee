@@ -121,7 +121,7 @@
 //	   explicit -releases N) that could not be completed: the flags were usable, the
 //	   claim just could not be made
 //	2  caller mistake (bad flags, an unusable domain, an unreadable file)
-//	3  gateway mode: nothing failed, but a check did not RUN
+//	3  nothing failed, but a check did not RUN
 //
 // 3 exists because "nothing I checked was wrong" is a weaker claim than "I checked
 // everything", and a gate reading only zero/non-zero cannot tell them apart — which
@@ -129,6 +129,12 @@
 // deployment running unpublished code. A run that skips something says so on screen
 // and returns 3; -strict turns that into 1 instead. Treat 3 as failure in a gate
 // unless a partial verification is genuinely acceptable there.
+//
+// Both modes use it, and provider mode reaches it far more easily: hop 3's audited
+// allowlist is empty, so the boot-chain comparison never runs and EVERY provider-mode
+// run is a 3 today. That is the honest report — the code root is not doing its job yet
+// — and it means -strict cannot pass in provider mode until the allowlist is
+// populated. -no-quote is a 3 for the same reason: it skips hops 2–4 by request.
 package main
 
 import (
@@ -184,7 +190,7 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 	noDNSDiscovery := fs.Bool("no-dns-discovery", false, "gateway mode: do not derive the platform base domain from DNS; check only what was passed in")
 	expectComposeFile := fs.String("expect-compose-file", "", "gateway mode: path to the docker-compose manifest this deployment should be running (a digest-pinned docker-compose.release.yml), compared against the authenticated app-compose's docker_compose_file. Overrides the default -releases lookup")
 	releases := fs.Int("releases", defaultReleases, "gateway mode: accept the deployment if its compose text matches any of the newest N published releases, and report which one. 0 disables the lookup")
-	strict := fs.Bool("strict", false, "gateway mode: require every check to RUN, not merely to not fail — a lookup that cannot be completed (releases, app-compose) fails the run (exit 1) instead of degrading to an advisory \"-\" (exit 3). Demands the checks without demanding their inputs, so discovery still supplies them")
+	strict := fs.Bool("strict", false, "require every check to RUN, not merely to not fail: anything that would report an advisory \"-\" (exit 3) fails the run instead (exit 1). Gateway mode — a releases or app-compose lookup that cannot be completed; it demands the checks without demanding their inputs, so discovery still supplies them. Provider mode — hop 3, which cannot pass today because the audited allowlist is empty")
 	releaseRepo := fs.String("repo", defaultReleaseRepo, "gateway mode: owner/name to read releases from, with -releases")
 	releaseAsset := fs.String("release-asset", defaultReleaseAsset, "gateway mode: release asset holding the deployment manifest, with -releases")
 	timeout := fs.Duration("timeout", 30*time.Second, "overall timeout")
@@ -252,6 +258,14 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 		return 2
 	}
 
+	// -strict demands every check; -no-quote switches off hops 2–4. Same contradiction
+	// as -strict with -releases 0, and rejected the same way rather than by silently
+	// honouring one of the two.
+	if *strict && *noQuote {
+		fmt.Fprintln(out, "pcverify: -strict requires the quote hops; drop -no-quote")
+		return 2
+	}
+
 	var qc quoteChecker
 	if !*noQuote {
 		qc = newDCAPChecker(*pccsURL)
@@ -259,15 +273,29 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 
 	ctx, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
-	return report(ctx, out, reg, qc, *provider, *servingContract, *endpoint, *expectSigner)
+	return report(ctx, out, reg, qc, *provider, *servingContract, *endpoint, *expectSigner, *strict)
 }
 
-// report runs the checks and prints a per-hop result, returning the process exit
-// code (0 pass, 1 failed check). It takes interfaces so tests drive it without a
-// live chain or provider.
-func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecker, provider, contract, endpointOverride, expectSigner string) int {
+// report runs the checks and prints a per-hop result, returning the process exit code
+// on the same contract as gateway mode: 0 every check ran and passed, 1 a check
+// failed, 3 nothing failed but a check did not run (see verdict). It takes interfaces
+// so tests drive it without a live chain or provider.
+//
+// Provider mode is where "did not run" is the STANDING state rather than an
+// occasional one: hop 3's allowlist is empty, so the boot-chain comparison never
+// happens and every run is incomplete until providerBootChains is populated. That is
+// the more likely way a CI gate is misled — a gateway-mode skip needs a GitHub outage,
+// this one needs nothing at all.
+func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecker, provider, contract, endpointOverride, expectSigner string, strict bool) int {
 	fmt.Fprintf(out, "provider           %s\n", provider)
 	fmt.Fprintf(out, "contract           %s\n", contract)
+
+	// What this run did not cover, for the verdict. -no-quote is a deliberate skip of
+	// hops 2–4, which is still a skip: the run says nothing about the enclave.
+	skipped := ""
+	if qc == nil {
+		skipped = "the quote hops (2-4) did not run (-no-quote), so nothing here is about the enclave"
+	}
 
 	info, err := sr.ServiceInfo(ctx, provider)
 	if err != nil {
@@ -317,6 +345,10 @@ func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecke
 			fmt.Fprintf(out, "- boot chain       not compared (no allowlist configured)\n")
 			reportBootChain(out, attest.BootChainOf(v.Measurement))
 			reportShapeRegister(out, v.Measurement)
+			// The code root did not run. Reported, so the verdict cannot be 0 — this is
+			// exactly the "- read as ✓" mistake the exit codes exist to prevent, and here
+			// it fires on every run rather than on a bad day.
+			skipped = "the boot chain was not compared (hop 3: no audited allowlist configured)"
 		default:
 			fmt.Fprintf(out, "%s boot chain       matches no audited image\n", mark(false))
 			reportBootChain(out, attest.BootChainOf(v.Measurement))
@@ -332,11 +364,7 @@ func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecke
 		ok = ok && match
 	}
 
-	if ok {
-		fmt.Fprintln(out, "\nPASS")
-		return 0
-	}
-	return fail(out)
+	return verdict(out, !ok, skipped, strict)
 }
 
 func fail(out io.Writer) int {

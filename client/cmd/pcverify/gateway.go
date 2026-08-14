@@ -375,16 +375,31 @@ func reportGateway(ctx context.Context, out io.Writer, ec evidenceChecker, domai
 	if reason == "" && !trustOK {
 		reason = "chain trust was waived, so the connection was not tied to the domain"
 	}
-	switch {
-	case reason != "" && strict:
-		fmt.Fprintf(out, "\n-strict requires every check to run, and one did not: %s.\n"+
-			"  Supply what it needs, or drop -strict to accept a partial run.\n", reason)
+	return verdict(out, false, reason, strict)
+}
+
+// verdict turns "did anything fail" and "did anything not run" into the exit code, and
+// says which on screen. Both modes go through it so their contracts cannot drift: the
+// distinction it carries — "nothing I checked was wrong" is weaker than "I checked
+// everything" — is not a property of the gateway, and a gate that learns it from one
+// mode must not be surprised by the other.
+//
+// skipped names the gap, or is empty when every check ran. It is printed rather than
+// left to the exit code because the failure mode being guarded against is a reader
+// taking "not FAIL" for "verified"; "something was skipped" would only send them
+// hunting.
+func verdict(out io.Writer, failed bool, skipped string, strict bool) int {
+	if failed {
 		return fail(out)
-	case reason != "":
-		// Named on screen, not just implied by the exit code: the failure mode this
-		// guards against is a reader taking "not FAIL" for "verified".
+	}
+	switch {
+	case skipped != "" && strict:
+		fmt.Fprintf(out, "\n-strict requires every check to run, and one did not: %s.\n"+
+			"  Supply what it needs, or drop -strict to accept a partial run.\n", skipped)
+		return fail(out)
+	case skipped != "":
 		fmt.Fprintf(out, "\nPASS (INCOMPLETE) — no check failed, but %s,\n"+
-			"  so this is not a full verification. Re-run with -strict to make it fatal.\n", reason)
+			"  so this is not a full verification. Re-run with -strict to make it fatal.\n", skipped)
 		return 3
 	}
 	fmt.Fprintln(out, "\nPASS")
