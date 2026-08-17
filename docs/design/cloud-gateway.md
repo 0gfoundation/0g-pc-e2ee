@@ -148,7 +148,10 @@ controlled only by that enclave?"**
 
 > **Deployment decision (resolved).** The cert binding that point 2 asks for is
 > **supplied by dstack-ingress's `/evidences`, not by a self-issued gateway
-> quote.** The gateway runs in one dstack app — one *or more* CVMs, each with its own
+> quote.** (dstack-ingress *produces* the bundle; the gateway *serves* it over HTTP,
+> so that the responses can carry CORS headers the upstream image cannot send — see
+> `deploy/phala/README.md` "Public evidence bundle". A self-authenticating bundle does
+> not trust its transport, so this does not move the quote's origin.) The gateway runs in one dstack app — one *or more* CVMs, each with its own
 > ingress and therefore its own certificate and quote (§7, `blue-green.md`) — behind dstack-ingress
 > (see `deploy/phala/docker-compose.yml`), whose `/evidences` quote has
 > `report_data = SHA-256(sha256sum.txt)` covering the served certificate, and a
@@ -402,7 +405,13 @@ does not.
   deployment via `ZG_GATEWAY_ALLOWED_ORIGINS`). It constrains which *web pages* a browser will let
   talk to the gateway; it constrains nothing else, because only browsers enforce it
   — any non-browser caller simply omits or forges `Origin`. Authorization remains
-  the front-door credential gate plus the router's authoritative validation.
+  the front-door credential gate plus the router's authoritative validation. The
+  public evidence bundle is the one route deliberately outside that allowlist: it
+  answers `Access-Control-Allow-Origin: *`, because it is static public data any
+  `curl` already fetches and gating it on first-party origins would put "the evidence
+  is checkable by anyone" out of reach of every web client (issue #73). Serving it
+  from the gateway rather than from dstack-ingress changes nothing about what the
+  bundle proves — it is self-authenticating, so the transport is not trusted.
 - **A second container in the CVM opens the dstack guest-agent socket** —
   `cvm-identity`, an init container that reads this CVM's `instance_id` / `app_id`
   once at boot, writes them to a shared volume, and exits
