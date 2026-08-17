@@ -46,10 +46,11 @@ func setResKey(w http.ResponseWriter, meta *core.ResponseMeta) {
 	}
 }
 
-// headerProvider names the provider that served a response. The gateway ORIGINATES
-// it from the address the client itself pinned (core.ResponseMeta.Provider) rather
-// than forwarding the upstream's same-named header — see setProvider. The name is
-// kept as the router's so existing clients keep reading the field they already
+// headerProvider names the provider a request was routed to. The gateway
+// ORIGINATES it from the address the client itself pinned
+// (core.ResponseMeta.Provider) rather than forwarding the upstream's same-named
+// header — see setProvider for what the value does and does not assert. The name
+// is kept as the router's so existing clients keep reading the field they already
 // read; only its provenance changes, from an assertion to a fact.
 const headerProvider = "X-Provider"
 
@@ -59,8 +60,14 @@ const headerProvider = "X-Provider"
 // fault attribution (and its legacy alias), the per-IP rate-limit counters with
 // their reset/Retry-After hints, and the request-correlation id for bug reports.
 //
-// Two headers are deliberately absent because the gateway emits its own instead of
-// relaying the upstream's: ZG-Res-Key (setResKey) and X-Provider (setProvider).
+// Two headers are absent from the list but still reach the user, by different
+// routes and for different reasons. ZG-Res-Key is RELAYED, just not from here:
+// setResKey re-emits the upstream's value out of core.ResponseMeta, which is where
+// the core captured it. X-Provider is ORIGINATED: setProvider ignores the
+// upstream's same-named header entirely and emits the client's own routing pin.
+// The distinction is the point — one is the provider's value carried faithfully,
+// the other is ours because the upstream's could not be trusted to state it.
+//
 // Everything not on this list stays inside the gateway, so an upstream header can
 // never leak untrusted or identifying detail to the user by default.
 var passthroughResponseHeaders = []string{
@@ -76,9 +83,22 @@ var passthroughResponseHeaders = []string{
 	"X-RateLimit-Reset-Day",
 }
 
-// setProvider emits the address of the provider that actually served this
-// response: the one the client resolved, sealed to, and pinned the route to with
-// X-0G-Provider-Address.
+// setProvider emits the address the client resolved, sealed this request to, and
+// pinned the route to with X-0G-Provider-Address.
+//
+// Read that literally: it is where the request was ADDRESSED, not proof of who
+// produced the bytes. A sealed response is HPKE-sealed to the client's ephemeral
+// public key, which travels in the envelope's cleartext, so opening one proves
+// possession of that key — which the router saw — and not the provider's identity.
+// Only the §8 signature establishes who answered, and only when the deployment
+// enables it (-verify-responses, off by default). So with verification off this
+// header answers "who did we address" and cannot answer "who replied"; with it on,
+// a response that reaches the caller at all is one whose signature recovered to the
+// grounded signer, and the two coincide.
+//
+// Being careful here is the same discipline as the change itself: the previous
+// value was wrong because it stated more than the system knew, and a doc comment
+// that overstates what this one means would reintroduce that at the layer above.
 //
 // It replaces forwarding the router's own X-Provider, which was an
 // unauthenticated assertion the gateway never checked against its own pin. Nothing
@@ -98,9 +118,19 @@ var passthroughResponseHeaders = []string{
 // docs/design/trust-chain.md hop 5), not of this header.
 //
 // Like setResKey it must run before WriteHeader or the first body byte, and it
-// emits nothing when the meta carries no address — a failed request, or
-// direct-broker mode, where there is no router to pin through. Absent beats
-// fabricated.
+// emits nothing when the meta carries no address: direct-broker mode, where there
+// is no router to pin through, and every failed request, since the core records
+// this only on the path that produced a delivered response.
+//
+// That second case is a deliberate trade, not an oversight. An error is not always
+// "nobody answered" — a 429 means a provider did — so dropping the header there
+// does cost a caller the attribution it used to get on a rate limit. But what it
+// used to get was the router's unverified claim, and the honest replacement is not
+// available: with the fallback chain, a request may have tried several candidates,
+// and naming one of them would raise the same question this change exists to close
+// — which provider is this, really. Absent beats both fabricated and ambiguous.
+// The error envelope's _0g.source and the passed-through ZG-Failure-Source still
+// attribute the failure to the router or the provider side.
 func setProvider(w http.ResponseWriter, meta *core.ResponseMeta) {
 	if meta != nil && meta.Provider != "" {
 		w.Header().Set(headerProvider, meta.Provider)

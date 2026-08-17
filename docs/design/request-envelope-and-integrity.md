@@ -361,7 +361,7 @@ checklist for the D0 follow-up (router repo, not this module).
 | `reasoning` → `reasoning_content` mirror | Enclave or client normalization | Content transform |
 | Buffer final `usage` chunk to fold in trace | Revisit with response framing / per-frame sealing | Interacts with streaming frame layout |
 | Header rewrites (Content-Type, X-Request-ID, …) | Header layer — unchanged | Not in body AAD |
-| Router's `X-Provider` (which provider served this) | Not relayed — the gateway emits its own, from the address it pinned | Freely mutable is fine for transport metadata, but this one is shown to a user as an *identity*; see below |
+| Router's `X-Provider` (its claim about where it routed) | Not relayed — the gateway emits its own, from the address it pinned | Freely mutable is fine for transport metadata, but this one is shown to a user as an *identity*; see below |
 
 Pattern: **headers** (routing directives, auth, trace transport) stay at the HTTP
 layer, freely mutable; **content** transforms (search, files, annotations,
@@ -372,19 +372,25 @@ as untrusted.
 
 **One header is not just transport.** "Freely mutable at the header layer" is the
 right disposition for a correlation id or a content type, because nothing downstream
-treats those as claims about identity. `X-Provider` is different: it answers *which
-provider served you*, and a user reads it as a fact about the trust chain. Leaving it
-mutable costs nothing in confidentiality or integrity — the routing is pinned, and a
-response that opens and verifies came from the pinned provider whatever the header
-says — but it does let the router state something untrue about a route it executed
-correctly, with no other link in the chain positioned to notice, precisely because
-nothing was tampered with. So the gateway does not relay it: it emits its own, from
+treats those as claims about identity. `X-Provider` is different: a user reads it as
+a fact about the trust chain — *which provider am I talking to*. Leaving it mutable
+costs nothing in confidentiality or integrity — the routing is pinned, and with §8
+verification on, a response that reaches the caller came from the pinned provider
+whatever the header says — but it does let the router state something untrue about a
+route it executed correctly, with no other link in the chain positioned to notice,
+precisely because nothing was tampered with. So the gateway does not relay it: it emits its own, from
 the address it resolved and pinned (`core.ResponseMeta.Provider`, surfaced by
 `openaiproxy.setProvider`), which makes "this field names the provider we sealed to"
 true by construction rather than by a comparison someone has to remember to make.
-Whether that address is *additionally* grounded on-chain is a property of the
-deployment's trust mode, not of the header — see
-[`trust-chain.md`](./trust-chain.md) hop 5.
+Note what that sentence does and does not say. It names where the request was
+**addressed**, not who produced the bytes: a sealed response is HPKE-sealed to the
+client's ephemeral key, which travels in cleartext, so opening one proves possession
+of that key and not the sender's identity. Who *answered* is established by the §8
+signature (hop 11, `-verify-responses`) and whether that answerer is the registered
+provider by the on-chain grounding (hop 5, `-onchain-enforce`) — both properties of
+the deployment's trust mode, not of this header. Anything presenting the field as a
+verified identity therefore depends on those modes being on; the header alone
+guarantees only that the router did not get to choose the value.
 
 The general lesson for this table: ask not only whether a mutation can break the
 seal, but whether the mutated value is later **displayed as a claim**. Those two

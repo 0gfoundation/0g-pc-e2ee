@@ -25,9 +25,15 @@ type ResponseMeta struct {
 	// signature), which the caller treats as "no handle", not an error.
 	ResKey string
 
-	// Provider is the router-facing address of the provider this response came from
-	// — Provider.Address, the value the client itself resolved and sent as the
+	// Provider is the router-facing address this request was ADDRESSED to —
+	// Provider.Address, the value the client itself resolved and sent as the
 	// X-0G-Provider-Address routing pin, NOT anything the upstream reported back.
+	//
+	// It is where the request went, not proof of who answered: a sealed response is
+	// HPKE-sealed to the client's ephemeral key, which travels in cleartext, so
+	// opening one does not identify the sender. Only §8 verification
+	// (WithResponseVerification) establishes that, and it is off by default — a
+	// caller that surfaces this value should say what it means accordingly.
 	//
 	// That distinction is the point of surfacing it. The router also states a served
 	// provider in its own X-Provider response header, but that is an unauthenticated
