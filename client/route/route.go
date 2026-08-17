@@ -126,11 +126,6 @@ type Router struct {
 	// makes a negative result fail-closed (skip the candidate) instead of a warn.
 	registry       chain.SignerRegistry
 	onchainEnforce bool
-	// onchainTolerateRPCFailure relaxes enforce mode when the registry lookup itself
-	// fails: the candidate is used with a warning, its signer unchecked, instead of
-	// being skipped. The zero value is the strict reading, so a caller gets "enforce
-	// means the chain was actually read" without asking for it.
-	onchainTolerateRPCFailure bool
 	// quoteCache memoizes DCAP-verified results (enc_pub/signer) per endpoint, and
 	// quoteSF collapses concurrent misses for the same endpoint into a single
 	// verification so a cold/expired key can't stampede the expensive quote+
@@ -228,12 +223,18 @@ func WithQuoteVerification(v *attest.Verifier, logger *slog.Logger) Option {
 //
 // enforce=false is observe-only: a missing/unacknowledged/mismatched on-chain
 // signer (or an RPC failure) is logged and the candidate is still used, mirroring
-// attest warn mode for staged rollout. enforce=true is fail-closed on a VERDICT
-// about the provider — an unacknowledged or mismatched signer skips the candidate
-// so core falls back to the next — and also when the lookup could not be
-// performed at all, so "enforce" means the chain was actually read. A deployment
-// that would rather answer the request than refuse it relaxes that second part
-// with WithOnChainTolerateRPCFailure.
+// attest warn mode for staged rollout.
+//
+// enforce=true is fail-closed on every negative — an unacknowledged or mismatched
+// signer, and equally a lookup that could not be performed at all — so enforce
+// means the chain was actually READ, never merely consulted. There is deliberately
+// no knob to relax the second case: a check that can lapse whenever an adversary
+// degrades one RPC endpoint is not a check anything may call proven, and since the
+// deployment's env block is measured into the CVM attestation, such a knob could
+// not be flipped mid-incident any faster than enforce itself can be turned off.
+// The two negatives are still COUNTED apart, because they call for different
+// responses — a mismatch is a signal about a provider, a lookup failure a signal
+// about our own chain RPC.
 //
 // logger nil uses slog.Default() (or the logger a prior WithQuoteVerification
 // set).
@@ -251,32 +252,6 @@ func WithOnChainVerification(reg chain.SignerRegistry, enforce bool, logger *slo
 			r.logger = logger
 		}
 	}
-}
-
-// WithOnChainTolerateRPCFailure relaxes enforce mode for the one negative that is
-// not about the provider: when the chain RPC cannot be read at all (transport
-// failure, past the cache's grace window), the candidate is used with a warning,
-// its signer unchecked, instead of being skipped.
-//
-// Which way to set it is a real trade, not a formality. While it is OFF, the chain
-// RPC is a hard dependency of the data plane: the lookup runs on the request path
-// for every candidate, so an unreachable RPC fails every request — an outage
-// caused by our own dependency rather than by anything wrong with a provider.
-// While it is ON, an adversary who can merely degrade that RPC — far easier than
-// compromising a provider — silently switches hop 5 off and re-opens the
-// look-alike-enclave attack it exists to close, with no signal to the user.
-//
-// It is off by default because the second failure is the worse one: the first is
-// visible, bounded, and pages someone, while the second is silent and indefinite.
-// The retry, single-flight, and grace-window machinery in front of the lookup
-// exists to make the first one rare. And anything that reports provider identity
-// as *proven* must either leave this off or surface the per-request grounding
-// state — claiming proof while this is on is the same class of error as passing an
-// unverified value along under a verified name.
-//
-// It has no effect without enforce: warn mode is observe-only by definition.
-func WithOnChainTolerateRPCFailure(tolerate bool) Option {
-	return func(r *Router) { r.onchainTolerateRPCFailure = tolerate }
 }
 
 // New returns a Router that talks to the given router base URL (empty uses
@@ -590,13 +565,11 @@ const (
 // bound into the (DCAP-verified) quote must equal the provider's acknowledged
 // teeSignerAddress in the on-chain InferenceServing registry.
 //
-// Enforce mode is fail-closed on a VERDICT (mismatch or unacknowledged) — the
-// candidate is skipped and core falls back — and, by default, on a failure of the
-// lookup itself, so enforce means the chain was actually read rather than merely
-// consulted. The two are still counted apart, because they call for different
-// responses: a mismatch is a signal about a provider, a lookup failure is a
-// signal about our own chain RPC. onchainTolerateRPCFailure trades the second one
-// away for availability; see WithOnChainTolerateRPCFailure for what that costs.
+// Enforce mode is fail-closed on every negative: a VERDICT about the provider
+// (mismatch or unacknowledged) and equally a failure of the lookup itself, so
+// enforce means the chain was actually read rather than merely consulted. The two
+// are still counted apart, because they call for different responses: a mismatch is
+// a signal about a provider, a lookup failure is a signal about our own chain RPC.
 //
 // Warn mode is observe-only throughout (log and proceed), mirroring attest warn
 // mode for staged rollout.
@@ -680,22 +653,22 @@ func (r *Router) onchainVerdict(outcome groundingOutcome, msg string) (grounding
 }
 
 // onchainLookupFailed handles a negative that is about our own chain RPC rather
-// than the provider. Under enforce it is fail-closed like any other negative, so
-// enforce means the chain was actually read; onchainTolerateRPCFailure trades that
-// away for availability (see WithOnChainTolerateRPCFailure). Under warn it logs and
-// proceeds, like every other observe-only outcome.
+// than the provider: fail-closed under enforce (an unread chain is not a pass),
+// observe-only under warn like every other outcome.
 //
 // Either way the outcome is reported as lookup_failed rather than as a verdict, so
-// a chain-RPC problem never shows up in the metrics as a provider accusation.
+// a chain-RPC problem never shows up in the metrics as a provider accusation. That
+// distinction is the whole point of keeping this separate from onchainVerdict — it
+// buys attribution, not leniency, and the two need different alerts and different
+// fixes.
 func (r *Router) onchainLookupFailed(providerAddr string, cause error) (groundingOutcome, error) {
 	metrics.OnChainGrounding(string(groundingLookupFailed))
 	msg := fmt.Sprintf("on-chain signer lookup for provider %s failed", providerAddr)
-	if r.onchainEnforce && !r.onchainTolerateRPCFailure {
+	if r.onchainEnforce {
 		return groundingLookupFailed, upstream(0, fmt.Errorf("%s: %w", msg, cause))
 	}
-	r.logger.Warn("on-chain signer lookup failed; using the candidate with its signer unchecked",
-		"detail", msg, "err", cause,
-		"enforce", r.onchainEnforce, "tolerate_rpc_failure", r.onchainTolerateRPCFailure)
+	r.logger.Warn("on-chain signer lookup failed; proceeding with the signer unchecked (onchain warn mode)",
+		"detail", msg, "err", cause)
 	return groundingLookupFailed, nil
 }
 

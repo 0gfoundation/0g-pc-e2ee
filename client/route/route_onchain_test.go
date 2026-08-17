@@ -141,32 +141,15 @@ func TestGroundSignerOnChain_LookupFailureProceedsUnderWarn(t *testing.T) {
 	}
 }
 
-// An operator can trade that property away for availability.
-func TestGroundSignerOnChain_LookupFailureToleratedWhenAsked(t *testing.T) {
+// The class split buys attribution, not leniency: a lookup failure is fail-closed
+// like any other negative under enforce, but must never be recorded as a verdict
+// about the provider — our RPC's bad day is not an accusation.
+func TestGroundSignerOnChain_LookupFailureIsNotReportedAsAVerdict(t *testing.T) {
 	reg := &stubRegistry{err: errors.New("rpc down")}
 	r := newOnChainRouter(reg, true)
-	r.onchainTolerateRPCFailure = true
-	outcome, err := r.groundSignerOnChain(context.Background(), ocProvider, ocSigner)
-	if err != nil {
-		t.Errorf("with tolerate-rpc-failure, an unreadable chain should proceed, got %v", err)
-	}
-	if outcome != groundingLookupFailed {
-		t.Errorf("outcome = %s, want %s (tolerating it does not make it a success)", outcome, groundingLookupFailed)
-	}
-}
-
-// Tolerating an RPC failure must not soften a verdict about the provider — those
-// are exactly what enforce is for.
-func TestGroundSignerOnChain_TolerateRPCFailureDoesNotExcuseMismatch(t *testing.T) {
-	reg := &stubRegistry{signer: ocOther, ack: true}
-	r := newOnChainRouter(reg, true)
-	r.onchainTolerateRPCFailure = true
-	outcome, err := r.groundSignerOnChain(context.Background(), ocProvider, ocSigner)
-	if err == nil {
-		t.Error("a mismatch must still fail-closed when RPC failures are tolerated")
-	}
-	if outcome != groundingMismatch {
-		t.Errorf("outcome = %s, want %s", outcome, groundingMismatch)
+	outcome, _ := r.groundSignerOnChain(context.Background(), ocProvider, ocSigner)
+	if outcome == groundingMismatch || outcome == groundingNotAcknowledged {
+		t.Errorf("outcome = %s: a chain-RPC failure must not be attributed to the provider", outcome)
 	}
 }
 
@@ -249,14 +232,12 @@ func TestGroundSignerOnChain_StaleMismatchWithFailedRevalidation(t *testing.T) {
 		t.Errorf("outcome = %s, want %s (no fresh evidence is not a verdict)", outcome, groundingLookupFailed)
 	}
 	if err == nil {
-		t.Error("enforce: no fresh evidence should fail-closed by default")
+		t.Error("enforce: no fresh evidence should fail-closed")
 	}
 
-	// Tolerating RPC failures covers this path too: it is the same "we could not
-	// read the chain" class, arrived at one step later.
-	rTolerant := newOnChainRouter(newReg(), true)
-	rTolerant.onchainTolerateRPCFailure = true
-	if _, err := rTolerant.groundSignerOnChain(context.Background(), ocProvider, ocSigner); err != nil {
-		t.Errorf("with tolerate-rpc-failure this should proceed, got %v", err)
+	// Warn mode proceeds, as it does on every negative.
+	rWarn := newOnChainRouter(newReg(), false)
+	if _, err := rWarn.groundSignerOnChain(context.Background(), ocProvider, ocSigner); err != nil {
+		t.Errorf("warn: should proceed, got %v", err)
 	}
 }
