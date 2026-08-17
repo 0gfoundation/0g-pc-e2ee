@@ -85,21 +85,25 @@ func (r *Router) listProviderAddrs(ctx context.Context) ([]string, error) {
 // actually refreshed. On failure it evicts any stale entry so a provider that has
 // gone bad (TCB downgrade, unreachable, revoked) is not served from cache until
 // its TTL lapses.
-func (r *Router) refreshQuote(ctx context.Context, endpoint string) error {
+// It returns the signer the fresh quote bound, so a caller can check it against
+// the chain the way a request would rather than assuming a successful refresh
+// means a usable provider.
+func (r *Router) refreshQuote(ctx context.Context, endpoint string) (signer string, err error) {
 	quoteURL, err := deriveQuoteURL(endpoint)
 	if err != nil {
-		return err
+		return "", err
 	}
-	if _, err := r.verifyAndCache(ctx, quoteURL); err != nil {
+	res, err := r.verifyAndCache(ctx, quoteURL)
+	if err != nil {
 		// Evict on a genuine verification failure (provider gone bad), but NOT when
 		// our own context was cancelled (e.g. shutdown): that says nothing about the
 		// provider and must not drop a still-good entry.
 		if ctx.Err() == nil {
 			r.quoteCache.del(quoteURL)
 		}
-		return err
+		return "", err
 	}
-	return nil
+	return res.signer, nil
 }
 
 // WarmState describes what the most recently completed warmer sweep found. It is
@@ -166,6 +170,10 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 		r.logger.Warn("warmer: list providers failed", "err", err)
 		// A sweep that could not even enumerate providers prepared none of them, which
 		// is the honest readiness answer — not "unknown", and certainly not "ready".
+		// The gauge has to move with it: leaving it at the last sweep's count would
+		// let the alert built on it stay green while /readyz reports not-ready, which
+		// is the one combination guaranteed to waste an operator's time.
+		metrics.WarmerReadyProviders(0)
 		r.setWarmState(WarmState{At: time.Now()})
 		return
 	}
@@ -184,7 +192,8 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 			continue
 		}
 		prepared := true
-		if err := r.refreshQuote(ctx, info.URL); err != nil {
+		quoteSigner, err := r.refreshQuote(ctx, info.URL)
+		if err != nil {
 			metrics.WarmerProviderRefresh("verify_failed")
 			r.logger.Warn("warmer: verify failed", "provider", addr, "endpoint", info.URL, "err", err)
 			prepared = false
@@ -205,14 +214,28 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 		// failure here only means the next request may pay the RPC itself (or, if the
 		// chain is unreachable, fall back on the cache's grace window).
 		if r.registry != nil {
-			if _, err := r.registry.RefreshSigner(ctx, addr); err != nil {
+			got, err := r.registry.RefreshSigner(ctx, addr)
+			switch {
+			case err != nil:
 				metrics.WarmerSignerRefresh("failed")
 				r.logger.Warn("warmer: signer refresh failed", "provider", addr, "err", err)
-				// Under enforce a request could not use this provider either, so it does not
-				// count as prepared. This is the case that makes a chain-RPC outage visible
-				// to a deployment gate instead of only to a metric.
-				prepared = false
-			} else {
+				// Only enforce mode turns this into "a request could not use this provider".
+				// Under warn the request path proceeds ungrounded, so calling the provider
+				// unprepared here would make /readyz refuse a cutover to a side that is in
+				// fact serving every request — reporting OUR chain RPC's problem as the
+				// standby's.
+				prepared = prepared && !r.onchainEnforce
+			case quoteSigner != "" && !signerAgrees(got, quoteSigner):
+				// The lookup worked and disagreed. Ask the same question a request asks,
+				// rather than treating "the RPC answered" as success: an unacknowledged or
+				// mismatched signer is a provider enforce would skip, so counting it ready
+				// would send traffic to a side where every request fails.
+				metrics.WarmerSignerRefresh("mismatch")
+				r.logger.Warn("warmer: on-chain signer does not vouch for the quote-bound signer",
+					"provider", addr, "quote_signer", quoteSigner,
+					"onchain_signer", got.Address, "acknowledged", got.Acknowledged)
+				prepared = prepared && !r.onchainEnforce
+			default:
 				metrics.WarmerSignerRefresh("ok")
 			}
 		}

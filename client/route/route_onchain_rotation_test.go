@@ -173,3 +173,44 @@ func TestProvider_MismatchAgainstFreshQuote_DoesNotReverify(t *testing.T) {
 
 // Sanity: the stub registry the rotation tests use satisfies the real interface.
 var _ chain.SignerRegistry = (*stubRegistry)(nil)
+
+// The re-verification must be rate-limited, not merely gated on "the quote was
+// cached". Re-verifying REFILLS the cache entry, so the cached-quote condition is
+// true again on the very next request: without a throttle, a provider that keeps
+// mismatching — a stuck registration, or one arranging it — forces a live quote
+// fetch plus DCAP verify on every request, which is exactly the cost the guard is
+// supposed to prevent.
+func TestProvider_ReverificationIsRateLimited(t *testing.T) {
+	var quoteHits int32
+	srv := rotatingQuoteServer(t, &quoteHits)
+	m := qvMeasurement(0xaa)
+	rd := mutableReportData(t, qvSignerHex)
+	// The chain names someone else and keeps naming them: every request mismatches.
+	reg := &stubRegistry{signer: rotatedSignerStr, ack: true}
+
+	r := New(srv.URL,
+		WithQuoteVerification(rotatingVerifier(t, m, &rd), discardLogger()),
+		WithOnChainVerification(reg, true, discardLogger()))
+
+	quoteURL, err := deriveQuoteURL(srv.URL)
+	if err != nil {
+		t.Fatalf("deriveQuoteURL: %v", err)
+	}
+
+	for i := 0; i < 5; i++ {
+		// Seed a cached quote each round, as a live gateway's cache would hold one.
+		r.quoteCache.put(quoteURL, mustHex(t, qvEncPubHex), qvSignerStr)
+		cands, err := r.Resolve(context.Background(), wire.Request{})
+		if err != nil {
+			t.Fatalf("round %d: Resolve: %v", i, err)
+		}
+		if _, err := cands.Provider(context.Background(), 0); err == nil {
+			t.Fatalf("round %d: want fail-closed on a persistent mismatch", i)
+		}
+	}
+
+	// One re-verification total, not one per request.
+	if got := atomic.LoadInt32(&quoteHits); got != 1 {
+		t.Errorf("quote fetches = %d across 5 mismatching requests, want 1 (throttled)", got)
+	}
+}

@@ -58,11 +58,13 @@ func (f *fakeRegistry) setSigner(signer string) {
 // newTestCache builds a cachedRegistry with a controllable clock.
 func newTestCache(inner SignerRegistry, ttl, grace time.Duration, now *time.Time) *cachedRegistry {
 	return &cachedRegistry{
-		inner:   inner,
-		ttl:     ttl,
-		grace:   grace,
-		entries: map[string]cacheEntry{},
-		now:     func() time.Time { return *now },
+		inner:    inner,
+		ttl:      ttl,
+		grace:    grace,
+		cooldown: FailureCooldown,
+		entries:  map[string]cacheEntry{},
+		failures: map[string]failure{},
+		now:      func() time.Time { return *now },
 	}
 }
 
@@ -102,7 +104,11 @@ func TestCached_Expiry(t *testing.T) {
 	}
 }
 
-func TestCached_ErrorsNotCached(t *testing.T) {
+// A failure never becomes a cached VALUE — nothing is stored to be served as
+// though it were a reading. It does start a cooldown, so the retry comes on the
+// next request after that lapses rather than immediately; the point is that the
+// registry never begins answering from a failed lookup, at any distance in time.
+func TestCached_ErrorsNeverBecomeCachedValues(t *testing.T) {
 	inner := &fakeRegistry{err: errors.New("rpc down")}
 	now := time.Unix(1000, 0)
 	c := newTestCache(inner, time.Minute, DefaultGrace, &now)
@@ -111,9 +117,13 @@ func TestCached_ErrorsNotCached(t *testing.T) {
 		if _, err := c.AcknowledgedSigner(context.Background(), "0xP"); err == nil {
 			t.Fatal("want error")
 		}
+		now = now.Add(FailureCooldown + time.Second)
 	}
 	if inner.callCount() != 2 {
-		t.Errorf("inner called %d times, want 2 (errors not cached)", inner.callCount())
+		t.Errorf("inner called %d times, want 2 (a lapsed cooldown retries)", inner.callCount())
+	}
+	if _, ok := c.load("0xp"); ok {
+		t.Error("a failed lookup must not leave a cache entry behind")
 	}
 }
 
@@ -296,5 +306,123 @@ func TestCached_ZeroTTLDisables(t *testing.T) {
 	c := Cached(inner, 0, DefaultGrace)
 	if c != SignerRegistry(inner) {
 		t.Error("Cached with non-positive TTL should return the inner registry unchanged")
+	}
+}
+
+// The grace window prevents FAILURE; the cooldown prevents COST. Without it every
+// request during an outage pays the inner registry's full retry budget before
+// falling back to the stale value, which for a per-candidate lookup on the request
+// path is seconds of hang per request.
+func TestCached_CooldownSkipsLiveCallsDuringAnOutage(t *testing.T) {
+	inner := &fakeRegistry{signer: "0xabc", ack: true}
+	now := time.Unix(1000, 0)
+	c := newTestCache(inner, time.Minute, 30*time.Minute, &now)
+	c.cooldown = FailureCooldown
+
+	if _, err := c.AcknowledgedSigner(context.Background(), "0xP"); err != nil {
+		t.Fatal(err)
+	}
+	inner.setErr(errors.New("rpc down"))
+	now = now.Add(2 * time.Minute) // past TTL, inside grace
+
+	// First call after expiry attempts the chain and falls back to the stale entry.
+	if got, err := c.AcknowledgedSigner(context.Background(), "0xP"); err != nil || !got.Stale {
+		t.Fatalf("first call: got (%+v, %v), want the stale entry", got, err)
+	}
+	attempts := inner.callCount()
+
+	// Subsequent calls inside the cooldown must answer from the stale entry without
+	// touching the chain at all.
+	for i := 0; i < 3; i++ {
+		got, err := c.AcknowledgedSigner(context.Background(), "0xP")
+		if err != nil || !got.Stale || got.Address != "0xabc" {
+			t.Fatalf("call %d: got (%+v, %v), want the stale entry", i, got, err)
+		}
+	}
+	if inner.callCount() != attempts {
+		t.Errorf("inner called %d more times during the cooldown, want 0",
+			inner.callCount()-attempts)
+	}
+
+	// Past the cooldown it probes again, so a recovery is picked up.
+	now = now.Add(FailureCooldown + time.Second)
+	if _, err := c.AcknowledgedSigner(context.Background(), "0xP"); err != nil {
+		t.Fatal(err)
+	}
+	if inner.callCount() <= attempts {
+		t.Error("want a fresh probe once the cooldown lapsed")
+	}
+}
+
+// With no cached entry to fall back on, the cooldown still applies: failing fast
+// beats hanging for the retry budget on every request.
+func TestCached_CooldownWithoutAStaleEntryFailsFast(t *testing.T) {
+	inner := &fakeRegistry{err: errors.New("rpc down")}
+	now := time.Unix(1000, 0)
+	c := newTestCache(inner, time.Minute, 30*time.Minute, &now)
+	c.cooldown = FailureCooldown
+
+	if _, err := c.AcknowledgedSigner(context.Background(), "0xP"); err == nil {
+		t.Fatal("want error")
+	}
+	if got := inner.callCount(); got != 1 {
+		t.Fatalf("inner called %d times, want 1", got)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := c.AcknowledgedSigner(context.Background(), "0xP"); err == nil {
+			t.Fatal("want the remembered error")
+		}
+	}
+	if got := inner.callCount(); got != 1 {
+		t.Errorf("inner called %d times, want 1 (cooldown suppresses the retries)", got)
+	}
+}
+
+// A success ends the outage for that provider, so the next expiry must go straight
+// to a live read rather than waiting out a cooldown that no longer applies.
+func TestCached_SuccessClearsTheCooldown(t *testing.T) {
+	inner := &fakeRegistry{err: errors.New("rpc down")}
+	now := time.Unix(1000, 0)
+	c := newTestCache(inner, time.Minute, 30*time.Minute, &now)
+	c.cooldown = FailureCooldown
+
+	if _, err := c.AcknowledgedSigner(context.Background(), "0xP"); err == nil {
+		t.Fatal("want error")
+	}
+	inner.setErr(nil)
+	inner.setSigner("0xabc")
+	now = now.Add(FailureCooldown + time.Second)
+	if _, err := c.AcknowledgedSigner(context.Background(), "0xP"); err != nil {
+		t.Fatal(err)
+	}
+	// Entry is fresh now; expire it and confirm the next lookup reads through
+	// immediately rather than being suppressed by the old failure mark.
+	now = now.Add(2 * time.Minute)
+	before := inner.callCount()
+	if _, err := c.AcknowledgedSigner(context.Background(), "0xP"); err != nil {
+		t.Fatal(err)
+	}
+	if inner.callCount() != before+1 {
+		t.Error("a success should have cleared the failure mark")
+	}
+}
+
+// RefreshSigner is the evidence path: it must reach the chain even mid-outage,
+// because the alternative is condemning a provider on no evidence.
+func TestCached_RefreshIgnoresTheCooldown(t *testing.T) {
+	inner := &fakeRegistry{err: errors.New("rpc down")}
+	now := time.Unix(1000, 0)
+	c := newTestCache(inner, time.Minute, 30*time.Minute, &now)
+	c.cooldown = FailureCooldown
+
+	if _, err := c.AcknowledgedSigner(context.Background(), "0xP"); err == nil {
+		t.Fatal("want error")
+	}
+	before := inner.callCount()
+	if _, err := c.RefreshSigner(context.Background(), "0xP"); err == nil {
+		t.Fatal("want error")
+	}
+	if inner.callCount() != before+1 {
+		t.Error("RefreshSigner must attempt the chain despite the cooldown")
 	}
 }

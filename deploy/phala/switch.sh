@@ -271,6 +271,10 @@ side_app_addr() { # a|b
     | awk -F'\t' '$2=="TXT"{print $3; exit}' | sed 's/^"//; s/"$//'
 }
 
+http_status() { # url -> the HTTP status code, or 000 if unreachable
+  curl -sSk -o /dev/null -w '%{http_code}' --max-time 10 "$1" 2>/dev/null || echo 000
+}
+
 http_ok() { # url -> 0 if HTTP 2xx. -k: we check reachability/health, not cert
   # validity (that is covered by the evidence bundle and the fingerprint check),
   # and staging/per-side endpoints legitimately serve a cert for another name.
@@ -290,11 +294,11 @@ http_ok() { # url -> 0 if HTTP 2xx. -k: we check reachability/health, not cert
 # enforced, a side that cannot read the chain answers nothing, and traffic must stay
 # on the live side, which is still serving from a warm cache. Point --probe-url at
 # /healthz to fall back to the weaker liveness-only gate.
-platform_probe_url() { # a|b
+platform_probe_url() { # a|b [path] -> defaults to PROBE_PATH
   [ -n "$PLATFORM_BASE" ] || return 0
   local addr; addr="$(side_app_addr "$1")"   # "<app_id>:443"
   [ -n "$addr" ] || return 0
-  echo "https://${addr%%:*}-443s.${PLATFORM_BASE}${PROBE_PATH}"
+  echo "https://${addr%%:*}-443s.${PLATFORM_BASE}${2:-$PROBE_PATH}"
 }
 
 public_health_ok() { http_ok "https://${DOMAIN}${HEALTH_PATH}"; }
@@ -434,6 +438,21 @@ cmd_switch() {
   local probe="$PROBE_URL"
   [ -z "$probe" ] && probe="$(platform_probe_url "$target")"
   if [ -n "$probe" ]; then
+    # A side that PREDATES readiness gating does not serve PROBE_PATH at all: the
+    # path falls through its catch-all to the router, which answers about itself.
+    # That must not read as "not ready" — most of the time the target is an older
+    # image precisely because this is a ROLLBACK, the emergency path, and burning
+    # the full probe window before refusing it is the worst possible moment to be
+    # strict. A 404 means the route is absent (old image) and we degrade to
+    # HEALTH_PATH loudly; a 503 means the route is present and answering
+    # not-ready, which is a real verdict and is retried.
+    if [ -z "$PROBE_URL" ] && [ "$(http_status "$probe")" = "404" ]; then
+      local health_probe; health_probe="$(platform_probe_url "$target" "$HEALTH_PATH")"
+      warn "side ${target} does not serve ${PROBE_PATH} (404) — it predates readiness gating"
+      warn "falling back to ${HEALTH_PATH}: this only checks the process is up, NOT that it can"
+      warn "serve. It cannot tell you whether that side can reach providers or the chain."
+      probe="$health_probe"
+    fi
     info "probing target side ${target} directly: $probe"
     info "  (up to ${PROBE_RETRIES} attempts ${PROBE_INTERVAL}s apart — a cold side must finish its first warmer sweep)"
     local pi probe_ok=0

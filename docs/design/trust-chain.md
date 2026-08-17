@@ -182,10 +182,14 @@ an outage ever has to be ridden out.
 
 What keeps the strict default affordable is the machinery in front of the lookup:
 bounded retry with backoff under a short per-attempt deadline, single-flighted
-refreshes, a 5-minute cache the warmer refreshes ahead of expiry, and a 30-minute
-grace window that keeps serving a last-known-good reading through an outage
-(`chain.Cached`). A blip never reaches the decision at all; only a sustained
-outage does.
+refreshes, a 5-minute cache the warmer refreshes ahead of expiry, a 30-minute
+grace window that keeps serving a last-known-good reading through an outage, and a
+30-second cooldown after a failure that suppresses further live attempts
+(`chain.Cached`). The cooldown is what makes the grace window worth having: the
+window alone prevents the request from FAILING, but every request would still pay
+the full retry budget before falling back to it — seconds of hang, per grounded
+candidate, for the whole outage. A blip never reaches the decision at all; only a
+sustained outage does, and it is answered immediately rather than slowly.
 
 What this buys the layers above: under `-onchain-enforce`, grounding cannot
 silently lapse. A response that was served is a response whose provider's signer

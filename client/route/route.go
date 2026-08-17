@@ -132,6 +132,11 @@ type Router struct {
 	// collateral path. Used only on the quote-verification path (verifier != nil).
 	quoteCache *quoteCache
 	quoteSF    singleflight.Group
+	// reverifiedAt stamps the last recovery re-verification per quote URL, bounding
+	// how often a mismatching provider can make us pay a live DCAP verify — see
+	// mayReverifyQuote.
+	reverifyMu   sync.Mutex
+	reverifiedAt map[string]time.Time
 	// warmState is the outcome of the most recent completed warmer sweep — how many
 	// providers it prepared end to end — read by a caller that needs to know whether
 	// this process can serve anything at all (see WarmState).
@@ -374,18 +379,28 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 		// quote, is the other half of "never reject on stale evidence": a broker
 		// upgrade rotates enc_pub and signer together, so our cached pair can name the
 		// old enclave while the chain already names the new one. Re-read the quote and
-		// ground once more before ruling. (Only worth doing when the quote was cached
-		// — a freshly verified one is already the best evidence available — which also
-		// stops a hostile provider from forcing a DCAP verification per request.)
+		// ground once more before ruling. Only when the quote was cached — a freshly
+		// verified one is already the best evidence available — and reverifiedKeys
+		// additionally rate-limits itself, without which this would run a live DCAP
+		// verify on EVERY request against a provider that keeps mismatching, since the
+		// re-verification refills the very cache entry that gates it.
 		if err != nil && outcome == groundingMismatch && quoteCached {
 			freshEnc, freshSigner, rerr := c.router.reverifiedKeys(ctx, prov.Endpoint)
 			if rerr == nil && freshSigner != signer {
 				c.router.logger.Info("re-verified quote after an on-chain signer mismatch; the cached quote had rotated",
 					"provider", prov.Address, "cached_signer", signer, "fresh_signer", freshSigner)
 				encPub, signer = freshEnc, freshSigner
-				_, err = c.router.groundSignerOnChain(ctx, prov.Address, signer)
+				outcome, err = c.router.groundSignerOnChain(ctx, prov.Address, signer)
+				// Same asymmetry as the chain-side revalidate: what the fresh evidence said
+				// is the verdict, and the superseded one was never a verdict at all.
+				metrics.OnChainRevalidation(revalidationResult(outcome))
 			}
 		}
+		// Recorded once, HERE, on the outcome that actually stood. Recording inside
+		// groundSignerOnChain would have counted the superseded mismatch too, and
+		// mismatch is the metric documented as an accusation worth paging on — so every
+		// benign broker rotation would have raised one.
+		metrics.OnChainGrounding(string(outcome))
 		if err != nil {
 			return core.Provider{}, err
 		}
@@ -464,17 +479,52 @@ func (r *Router) verifiedKeysCached(ctx context.Context, endpoint string) (_ cry
 //
 // It is deliberately NOT on the happy path: a quote verification is expensive and
 // rate-limit-sensitive, so it runs only when the alternative is rejecting the
-// provider outright.
+// provider outright — and even then at most once per quote TTL per provider.
+//
+// That rate limit is load-bearing, not belt-and-braces. The caller only reaches
+// here when the quote came from the cache, which reads like a bound on its own,
+// but a re-verification REFILLS that cache entry — so the next request is a cache
+// hit again, and a provider that keeps mismatching (a stuck registration, or one
+// arranging it) would force a live quote fetch plus DCAP verify on every single
+// request. Throttling on the quote URL bounds the cost to what a normal refresh
+// already costs, while still catching a rotation within one TTL.
 func (r *Router) reverifiedKeys(ctx context.Context, endpoint string) (crypto.PublicKey, string, error) {
 	quoteURL, err := deriveQuoteURL(endpoint)
 	if err != nil {
 		return nil, "", upstream(0, fmt.Errorf("provider endpoint: %w", err))
+	}
+	if !r.mayReverifyQuote(quoteURL) {
+		return nil, "", upstream(0, fmt.Errorf("quote re-verification for %s throttled", quoteURL))
 	}
 	res, err := r.verifyAndCache(ctx, quoteURL)
 	if err != nil {
 		return nil, "", err
 	}
 	return res.encPub, res.signer, nil
+}
+
+// mayReverifyQuote reports whether a recovery re-verification for quoteURL is due,
+// and stamps it when it is. One per quote TTL: long enough that a mismatching
+// provider cannot turn the recovery path into a per-request DCAP verify, short
+// enough that a genuine rotation is picked up on the same schedule an ordinary
+// cache refresh would have picked it up.
+func (r *Router) mayReverifyQuote(quoteURL string) bool {
+	window := r.quoteCache.ttl
+	if window <= 0 {
+		window = defaultQuoteTTL
+	}
+	now := time.Now()
+
+	r.reverifyMu.Lock()
+	defer r.reverifyMu.Unlock()
+	if last, ok := r.reverifiedAt[quoteURL]; ok && now.Before(last.Add(window)) {
+		return false
+	}
+	if r.reverifiedAt == nil {
+		r.reverifiedAt = make(map[string]time.Time)
+	}
+	r.reverifiedAt[quoteURL] = now
+	return true
 }
 
 // verifyAndCache runs (or joins, via singleflight) the verification for quoteURL
@@ -613,7 +663,6 @@ func (r *Router) groundSignerOnChain(ctx context.Context, providerAddr, signer s
 		// than the cache TTL and the grace window is carrying the deployment.
 		outcome = groundingOKStale
 	}
-	metrics.OnChainGrounding(string(outcome))
 	return outcome, nil
 }
 
@@ -637,6 +686,22 @@ func (r *Router) revalidate(ctx context.Context, providerAddr, signer string) (c
 	return fresh, nil
 }
 
+// revalidationResult labels a revalidation by what the fresh evidence concluded,
+// so the quote-side recovery and the chain-side one report in the same vocabulary.
+// It keys off the OUTCOME, not the returned error: warn mode returns nil for a
+// mismatch it merely logged, so an error-based reading would file a surviving
+// disagreement as a clean recovery.
+func revalidationResult(outcome groundingOutcome) string {
+	switch outcome {
+	case groundingOK, groundingOKStale:
+		return "ok"
+	case groundingLookupFailed:
+		return "lookup_failed"
+	default:
+		return "negative"
+	}
+}
+
 // signerAgrees reports whether an on-chain reading positively vouches for the
 // quote-bound signer. Anything less — unacknowledged, or a different address — is
 // a negative, so a caller can test "is this good?" without spelling out each way
@@ -649,7 +714,6 @@ func signerAgrees(onchain chain.Signer, signer string) bool {
 // onchainVerdict handles a negative that IS about the provider: fail-closed under
 // enforce, observe-only under warn.
 func (r *Router) onchainVerdict(outcome groundingOutcome, msg string) (groundingOutcome, error) {
-	metrics.OnChainGrounding(string(outcome))
 	if r.onchainEnforce {
 		return outcome, upstream(0, errors.New(msg))
 	}
@@ -667,7 +731,6 @@ func (r *Router) onchainVerdict(outcome groundingOutcome, msg string) (grounding
 // buys attribution, not leniency, and the two need different alerts and different
 // fixes.
 func (r *Router) onchainLookupFailed(providerAddr string, cause error) (groundingOutcome, error) {
-	metrics.OnChainGrounding(string(groundingLookupFailed))
 	msg := fmt.Sprintf("on-chain signer lookup for provider %s failed", providerAddr)
 	if r.onchainEnforce {
 		return groundingLookupFailed, upstream(0, fmt.Errorf("%s: %w", msg, cause))

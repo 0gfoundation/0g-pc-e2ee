@@ -363,6 +363,14 @@ not-ready for a while. Keep this separate from `VERIFY_*`, which sizes the
 *post-switch* check against the route cache — the two measure unrelated things.
 To fall back to the weaker liveness-only gate, point `--probe-url` at `/healthz`.
 
+> **Rolling back to a side that predates `/readyz`.** That side does not serve the
+> route at all — the path falls through its catch-all to the router, which answers
+> about itself. `switch.sh` detects the 404 and degrades to `/healthz` with a loud
+> warning rather than failing the gate, because the target of a rollback is an older
+> image by definition and the emergency path is the worst place to be strict. A
+> `503` is different: the route exists and is answering not-ready, which is a real
+> verdict, so it keeps retrying and ultimately refuses.
+
 ### Reaching the standby at all
 
 `https://<DOMAIN>/healthz` always hits the **live** side, so verifying the

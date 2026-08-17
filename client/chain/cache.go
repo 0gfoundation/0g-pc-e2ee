@@ -41,8 +41,19 @@ const DefaultGrace = 30 * time.Minute
 // struggling — the same protection the quote path gets from its own singleflight
 // group.
 //
-// Only successful lookups are cached; errors are not, so a transient failure is
-// retried on the next request rather than pinned for a TTL. A non-positive ttl
+// Failure cooldown. A failed lookup is remembered for FailureCooldown, and while
+// it is remembered the live call is skipped entirely: a stale entry is served at
+// once, or the recorded error returned at once. Without this the grace window
+// still prevents failure but not COST — the inner registry retries with backoff
+// before giving up, so every request would pay the full retry budget (seconds)
+// per grounded candidate, serially, for the whole outage. The point of the window
+// is that an unreachable chain stops mattering, and a request that hangs for ten
+// seconds and then succeeds has not stopped mattering. Recovery still happens
+// promptly: one probe per cooldown, plus the warmer's own sweep, and any success
+// clears the mark.
+//
+// Only successful lookups become cached VALUES; a failure is never stored as
+// though it were a reading, it only starts the cooldown above. A non-positive ttl
 // disables caching entirely (every call reads through). A non-positive grace
 // disables the grace window, restoring strict fail-on-error behavior.
 func Cached(inner SignerRegistry, ttl, grace time.Duration) SignerRegistry {
@@ -50,13 +61,21 @@ func Cached(inner SignerRegistry, ttl, grace time.Duration) SignerRegistry {
 		return inner
 	}
 	return &cachedRegistry{
-		inner:   inner,
-		ttl:     ttl,
-		grace:   grace,
-		entries: make(map[string]cacheEntry),
-		now:     time.Now,
+		inner:    inner,
+		ttl:      ttl,
+		grace:    grace,
+		cooldown: FailureCooldown,
+		entries:  make(map[string]cacheEntry),
+		failures: make(map[string]failure),
+		now:      time.Now,
 	}
 }
+
+// FailureCooldown is how long a failed lookup suppresses further live attempts
+// for the same provider. Sized so an outage costs one probe per provider per
+// half-minute instead of one per request, while a recovery is picked up within
+// that same half-minute.
+const FailureCooldown = 30 * time.Second
 
 type cacheEntry struct {
 	signer       string
@@ -64,20 +83,31 @@ type cacheEntry struct {
 	expires      time.Time
 }
 
+// failure remembers the last failed lookup for a provider, so the cooldown can
+// answer immediately with the same error instead of paying the retry budget again.
+type failure struct {
+	at  time.Time
+	err error
+}
+
 type cachedRegistry struct {
-	inner   SignerRegistry
-	ttl     time.Duration
-	grace   time.Duration
-	now     func() time.Time
-	mu      sync.Mutex
-	entries map[string]cacheEntry
-	sf      singleflight.Group
+	inner    SignerRegistry
+	ttl      time.Duration
+	grace    time.Duration
+	cooldown time.Duration
+	now      func() time.Time
+	mu       sync.Mutex
+	entries  map[string]cacheEntry
+	failures map[string]failure
+	sf       singleflight.Group
 }
 
 // AcknowledgedSigner returns a fresh cached entry when there is one, otherwise
 // refreshes from the chain. If that refresh fails and an expired entry is still
 // within the grace window, the expired value is returned with Stale set rather
-// than failing the caller.
+// than failing the caller. While a recent failure is in cooldown the live attempt
+// is skipped altogether, so an ongoing outage is answered immediately — from the
+// stale entry when there is one, otherwise with the error the last attempt gave.
 func (c *cachedRegistry) AcknowledgedSigner(ctx context.Context, providerAddr string) (Signer, error) {
 	key := strings.ToLower(providerAddr)
 	now := c.now()
@@ -86,21 +116,67 @@ func (c *cachedRegistry) AcknowledgedSigner(ctx context.Context, providerAddr st
 		return Signer{Address: e.signer, Acknowledged: e.acknowledged}, nil
 	}
 
+	if f, ok := c.recentFailure(key, now); ok {
+		if stale, ok := c.staleWithinGrace(key, now); ok {
+			return stale, nil
+		}
+		return Signer{}, f.err
+	}
+
 	got, err := c.refresh(ctx, providerAddr)
 	if err == nil {
 		return got, nil
 	}
+	c.recordFailure(key, now, err)
 	if stale, ok := c.staleWithinGrace(key, now); ok {
 		return stale, nil
 	}
 	return Signer{}, err
 }
 
-// RefreshSigner reads through to the chain, bypassing both the cache and the
-// grace window, and caches a success. A caller uses it when it needs evidence it
-// is willing to act NEGATIVELY on — see the asymmetry documented on Cached.
+// RefreshSigner reads through to the chain, bypassing the cache, the grace window
+// AND the failure cooldown, and caches a success. A caller uses it when it needs
+// evidence it is willing to act NEGATIVELY on — see the asymmetry documented on
+// Cached — and that is worth the full retry budget even mid-outage, because the
+// alternative is condemning a provider on no evidence. It stays cheap in aggregate
+// because it runs only when a reading and a quote disagree, not on the ordinary
+// path.
 func (c *cachedRegistry) RefreshSigner(ctx context.Context, providerAddr string) (Signer, error) {
-	return c.refresh(ctx, providerAddr)
+	got, err := c.refresh(ctx, providerAddr)
+	if err != nil {
+		c.recordFailure(strings.ToLower(providerAddr), c.now(), err)
+	}
+	return got, err
+}
+
+// recentFailure reports a failure still inside the cooldown, so a caller can
+// answer without attempting the chain again.
+func (c *cachedRegistry) recentFailure(key string, now time.Time) (failure, bool) {
+	if c.cooldown <= 0 {
+		return failure{}, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	f, ok := c.failures[key]
+	if !ok || !now.Before(f.at.Add(c.cooldown)) {
+		return failure{}, false
+	}
+	return f, true
+}
+
+func (c *cachedRegistry) recordFailure(key string, now time.Time, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.failures == nil {
+		c.failures = make(map[string]failure)
+	}
+	c.failures[key] = failure{at: now, err: err}
+}
+
+func (c *cachedRegistry) clearFailure(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.failures, key)
 }
 
 // refresh performs a single-flighted live lookup and caches a success. Callers
@@ -123,6 +199,10 @@ func (c *cachedRegistry) refresh(ctx context.Context, providerAddr string) (Sign
 			acknowledged: got.Acknowledged,
 			expires:      c.now().Add(c.ttl),
 		})
+		// A success ends the outage as far as this provider is concerned; drop the mark
+		// so the next expiry goes straight to a live read rather than waiting out a
+		// cooldown that no longer describes reality.
+		c.clearFailure(key)
 		return got, nil
 	})
 	select {

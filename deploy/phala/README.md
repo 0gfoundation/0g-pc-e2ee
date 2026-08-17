@@ -803,8 +803,9 @@ and warmer liveness).
     enforce means the chain was actually read rather than merely consulted; if a
     chain-RPC outage ever has to be ridden out, the lever is turning enforce off. A
     blip will not get that far — `eth_call` retries, the reading is cached 5m, the
-    warmer refreshes ahead of expiry, and a 30m grace window serves the last
-    known-good value — so watch `lookup_failed` and
+    warmer refreshes ahead of expiry, a 30m grace window serves the last known-good
+    value, and a 30s cooldown after a failed lookup keeps an ongoing outage from
+    costing every request the retry budget — so watch `lookup_failed` and
     `warmer_signer_refreshes_total{result="failed"}` for the sustained case. A provider
     is never rejected on a stale or cached reading without a live re-read first, so a
     broker upgrade rotating its signer does not read as an attack (see

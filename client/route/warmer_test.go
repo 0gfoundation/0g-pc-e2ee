@@ -285,3 +285,68 @@ func TestWarmer_NoopWithoutVerifier(t *testing.T) {
 		t.Errorf("warmer without verifier should be a no-op: hits = %d, want 0", got)
 	}
 }
+
+// A lookup that SUCCEEDS but does not vouch for the quote-bound signer is not a
+// prepared provider: enforce would skip it, so counting it ready would send
+// traffic to a side where every request fails. The warmer has to ask the same
+// question a request asks, not merely "did the RPC answer".
+func TestWarmer_UnacknowledgedSignerIsNotReadyUnderEnforce(t *testing.T) {
+	var hits, status int32
+	srv := warmerServer(t, &hits, []string{"0xa"}, &status)
+	reg := &countingRegistry{signer: qvSignerStr, ack: false} // answers, but vouches for nobody
+	r := New(srv.URL,
+		WithQuoteVerification(qvVerifier(t), discardLogger()),
+		WithOnChainVerification(reg, true, discardLogger()))
+
+	r.WarmOnce(context.Background(), fakeResolver{url: srv.URL})
+	if s := r.WarmState(); s.Ready != 0 {
+		t.Errorf("WarmState = %+v, want Ready 0 (the chain acknowledges no signer)", s)
+	}
+}
+
+// Same for a signer that disagrees with the quote.
+func TestWarmer_MismatchedSignerIsNotReadyUnderEnforce(t *testing.T) {
+	var hits, status int32
+	srv := warmerServer(t, &hits, []string{"0xa"}, &status)
+	reg := &countingRegistry{signer: "0x0000000000000000000000000000000000000009", ack: true}
+	r := New(srv.URL,
+		WithQuoteVerification(qvVerifier(t), discardLogger()),
+		WithOnChainVerification(reg, true, discardLogger()))
+
+	r.WarmOnce(context.Background(), fakeResolver{url: srv.URL})
+	if s := r.WarmState(); s.Ready != 0 {
+		t.Errorf("WarmState = %+v, want Ready 0 (chain and quote name different signers)", s)
+	}
+}
+
+// Under WARN mode the request path proceeds ungrounded, so a chain problem must
+// not make this side look unusable — reporting our own RPC's bad day as the
+// standby's would block a cutover to a process serving every request fine. The
+// shipped compose runs warn mode, so this is the live configuration.
+func TestWarmer_ChainProblemsDoNotBlockReadinessUnderWarn(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		reg  *countingRegistry
+		down bool
+	}{
+		{"unacknowledged", &countingRegistry{signer: qvSignerStr, ack: false}, false},
+		{"mismatch", &countingRegistry{signer: "0x0000000000000000000000000000000000000009", ack: true}, false},
+		{"rpc down", &countingRegistry{signer: qvSignerStr, ack: true}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits, status int32
+			srv := warmerServer(t, &hits, []string{"0xa"}, &status)
+			if tc.down {
+				tc.reg.failing.Store(true)
+			}
+			r := New(srv.URL,
+				WithQuoteVerification(qvVerifier(t), discardLogger()),
+				WithOnChainVerification(tc.reg, false, discardLogger())) // warn
+
+			r.WarmOnce(context.Background(), fakeResolver{url: srv.URL})
+			if s := r.WarmState(); s.Ready != 1 {
+				t.Errorf("WarmState = %+v, want Ready 1: warn mode serves this provider fine", s)
+			}
+		})
+	}
+}
