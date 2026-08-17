@@ -91,7 +91,7 @@ func qvServer(t *testing.T, quoteStatus int) *httptest.Server {
 func TestProvider_QuoteVerification_EnforceSuccess(t *testing.T) {
 	srv := qvServer(t, 0)
 	m := qvMeasurement(0xaa)
-	v := attest.New(attest.Policy{Allowed: []attest.Measurement{m}},
+	v := attest.New(attest.BootChainPolicy{Allowed: []attest.BootChain{attest.BootChainOf(m)}},
 		attest.WithQuoteParser(qvParser(m, qvReportData(t))))
 	r := New(srv.URL, WithQuoteVerification(v, slog.New(slog.NewTextHandler(bytes.NewBuffer(nil), nil))))
 
@@ -121,7 +121,7 @@ func TestProvider_QuoteVerification_EnforceRejectsUntrusted(t *testing.T) {
 	srv := qvServer(t, 0)
 	served := qvMeasurement(0xbb)
 	allowed := qvMeasurement(0xaa)
-	v := attest.New(attest.Policy{Allowed: []attest.Measurement{allowed}},
+	v := attest.New(attest.BootChainPolicy{Allowed: []attest.BootChain{attest.BootChainOf(allowed)}},
 		attest.WithQuoteParser(qvParser(served, qvReportData(t)))) // ModeEnforce (default)
 	r := New(srv.URL, WithQuoteVerification(v, nil))
 
@@ -139,7 +139,7 @@ func TestProvider_QuoteVerification_WarnAcceptsAndLogs(t *testing.T) {
 	served := qvMeasurement(0xbb) // not in allowlist
 	var logbuf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logbuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
-	v := attest.New(attest.Policy{Allowed: []attest.Measurement{qvMeasurement(0xaa)}},
+	v := attest.New(attest.BootChainPolicy{Allowed: []attest.BootChain{attest.BootChainOf(qvMeasurement(0xaa))}},
 		attest.WithQuoteParser(qvParser(served, qvReportData(t))),
 		attest.WithMeasurementMode(attest.ModeWarn))
 	r := New(srv.URL, WithQuoteVerification(v, logger))
@@ -160,7 +160,7 @@ func TestProvider_QuoteVerification_WarnAcceptsAndLogs(t *testing.T) {
 func TestProvider_QuoteVerification_QuoteEndpointError(t *testing.T) {
 	srv := qvServer(t, http.StatusServiceUnavailable)
 	m := qvMeasurement(0xaa)
-	v := attest.New(attest.Policy{Allowed: []attest.Measurement{m}},
+	v := attest.New(attest.BootChainPolicy{Allowed: []attest.BootChain{attest.BootChainOf(m)}},
 		attest.WithQuoteParser(qvParser(m, qvReportData(t))))
 	r := New(srv.URL, WithQuoteVerification(v, nil))
 

@@ -219,9 +219,17 @@ Two ways to change what the compose text is compared against:
 Because `-releases` has a default, its failure mode depends on whether you asked for
 it: an unreachable or rate-limited GitHub on a **default** run is reported as
 advisory (`-`) and does not fail, since it says nothing about the deployment, while an
-explicit `-releases N` that cannot be satisfied is fatal. Passing
+explicit `-releases N` that cannot be satisfied is fatal — exit **1**, a check that could
+not be made, not exit 2, which is reserved for a mistake in the invocation. Passing
 `-expect-compose-file` simply overrides the default; passing it *and* an explicit
 `-releases` is rejected, since they answer different questions.
+
+An advisory skip is not a clean pass, though, and the exit code says so: **0** every
+check ran and passed, **1** a check failed, **2** caller mistake, **3** nothing failed
+but something did not run. A `3` prints `PASS (INCOMPLETE)` and names the gap. Use
+`-strict` in a gate to make every check mandatory — it turns a `3` into a `1` and
+demands the checks without demanding their inputs, so DNS and release discovery still
+supply them. `-strict` with `-releases 0` is rejected as a contradiction.
 
 Nothing about the app-compose lookup has to be typed in: the base domain comes from
 DNS (`-base-domain` overrides it, `-no-dns-discovery` turns it off) and the `app_id`
@@ -232,11 +240,11 @@ guest agent is unreachable or the app's `public_tcbinfo` is off; the bytes are
 anchored by the quote's `compose_hash`, so their source does not have to be trusted.
 
 `-no-dns-discovery` with no `-app-compose` / `-base-domain` leaves the app-compose
-stage with nothing to run on, so code identity is reported as **not checked** — the
-run can still pass on endpoint identity (declining a check is not a failure), and the
-closing note says which case it is in. Combining it with an explicit
-`-expect-compose-file` / `-releases N` is a contradiction and fails: a comparison was
-demanded that cannot be performed.
+stage with nothing to run on, so code identity is reported as **not checked** — the run
+can still pass on endpoint identity (declining a check is not a failure), exiting 3
+rather than 0, and the closing note says which case it is in. Combining it with an
+explicit `-expect-compose-file` / `-releases N` — or with `-strict` — is a contradiction
+and fails: a comparison was demanded that cannot be performed.
 
 Add `-allow-untrusted-cert` when checking a hostname brought up against the ACME
 staging CA (`ACME_STAGING=true`): its certificate is correctly bound by the quote but
@@ -688,12 +696,12 @@ and warmer liveness).
   is a switch and the other is not:
   - the **on-chain signer** check (trust-chain hop 5) is wired and observed;
     `ZG_GATEWAY_ONCHAIN_ENFORCE` is simply off, so turning it on is a config change.
-  - the **measurement** check (hop 3) cannot be enforced yet at all. Its allowlist is
-    empty, so `ZG_GATEWAY_ATTEST_ENFORCE` would reject every provider — but filling it
-    is not just a matter of supplying values: `attest.Policy` compares all five
-    registers including RTMR3, which carries the per-instance `instance_id`, so an entry
-    pins one CVM rather than one audited version. It needs the same shape change the
-    gateway's own OS-image check already made (see `trust-chain.md` hop 3).
+  - the **boot-chain** check (hop 3) has an empty allowlist, so
+    `ZG_GATEWAY_ATTEST_ENFORCE` would reject every provider. It now compares the boot
+    chain (MRTD + RTMR1 + RTMR2) rather than all five registers — the same split the
+    gateway's own OS-image check makes — so an entry pins one audited image instead of
+    one CVM, and the allowlist can be filled. What is still open is where the values are
+    published (see `trust-chain.md` hop 3).
 
   Response signatures are always fail-closed.
 - If the gateway container is recreated with a new address, restart

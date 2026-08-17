@@ -8,14 +8,16 @@ const measurementRegLen = 48
 // (runtime-extended measurements). Two enclaves with identical Measurement are
 // running the same measured boot chain.
 //
-// Fixed-size arrays make Measurement comparable with ==, so allowlist matching
-// is a plain equality check with no per-field loop.
+// Fixed-size arrays make Measurement comparable with ==, so matching is a plain
+// equality check with no per-field loop.
 //
-// Which registers must match to call a provider "the audited image" is a policy
-// question — a stricter policy might pin only MRTD, a looser one might ignore an
-// RTMR that carries only benign runtime data. This skeleton pins ALL of them
-// (full equality), the most conservative choice; relaxing it is a deliberate,
-// reviewable Policy change, never a silent default.
+// This is the full observation, NOT the thing an allowlist compares. Which registers
+// identify "the audited image" is a policy question, and pinning all five is not the
+// conservative answer it looks like: RTMR3 carries per-instance events, so a
+// full-equality entry pins one CVM rather than one image. Verifier therefore compares
+// BootChain — see that type for which registers are excluded and why. Measurement
+// stays whole because a verifier still wants to report what it saw, RTMR0 and RTMR3
+// included.
 type Measurement struct {
 	MRTD  [measurementRegLen]byte
 	RTMR0 [measurementRegLen]byte
@@ -101,27 +103,19 @@ func (p BootChainPolicy) Permits(b BootChain) bool {
 // Configured reports whether the policy holds any expected value at all.
 func (p BootChainPolicy) Configured() bool { return len(p.Allowed) > 0 }
 
-// Policy is the client-held trust policy for quote verification. Allowed is the
-// allowlist of acceptable measurements — the audited 0gfoundation/broker
-// image(s). It MUST come from a source the client trusts independently of the
-// request path (a reproducible build it can recompute, or a governance-signed /
-// on-chain published value): NEVER from the router or the provider, which would
-// let an attacker vouch for its own image.
+// Policy was the client-held allowlist of full Measurements. Verifier no longer
+// uses it, and nothing should: full equality includes RTMR3, which dstack extends
+// with per-INSTANCE events, so one entry pins one CVM rather than one audited
+// version. An allowlist of that shape needs a new entry per replica, cannot be
+// published before a deployment exists, and would have to be regenerated on every
+// scale-out — which is why the provider-side allowlist stayed empty rather than
+// merely unpopulated.
 //
-// An empty Allowed permits nothing: with no acceptable measurement configured,
-// every quote is rejected (fail-closed). This mirrors the WithQuoteParser
-// default — an unconfigured Verifier trusts nothing.
+// Deprecated: use BootChainPolicy, which pins the OS image (one entry per image,
+// computable from a reproducible build) and leaves the application to the compose
+// hash. The type is retained because protocol/ is the module every participant
+// depends on, so removing an exported name is a breaking change for callers this
+// repository cannot see.
 type Policy struct {
 	Allowed []Measurement
-}
-
-// permits reports whether m is in the allowlist. An empty allowlist permits
-// nothing.
-func (p Policy) permits(m Measurement) bool {
-	for _, a := range p.Allowed {
-		if a == m {
-			return true
-		}
-	}
-	return false
 }

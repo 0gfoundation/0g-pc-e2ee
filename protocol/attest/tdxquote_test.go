@@ -136,7 +136,7 @@ func TestVerify_RealVector_AllowlistMatch(t *testing.T) {
 		t.Fatalf("ParseTDXQuoteBody: %v", err)
 	}
 
-	v := New(Policy{Allowed: []Measurement{b.Measurement}}, WithQuoteParser(structuralParser))
+	v := New(BootChainPolicy{Allowed: []BootChain{BootChainOf(b.Measurement)}}, WithQuoteParser(structuralParser))
 	got, err := v.Verify(raw)
 	if err != nil {
 		t.Fatalf("Verify: %v", err)
@@ -152,7 +152,7 @@ func TestVerify_RealVector_AllowlistMatch(t *testing.T) {
 func TestVerify_RealVector_MeasurementNotAllowed(t *testing.T) {
 	raw := loadRealQuote(t)
 	// Allowlist a different measurement → the real quote's measurement misses.
-	v := New(Policy{Allowed: []Measurement{mkMeasurement(0x00)}}, WithQuoteParser(structuralParser))
+	v := New(BootChainPolicy{Allowed: []BootChain{BootChainOf(mkMeasurement(0x00))}}, WithQuoteParser(structuralParser))
 	if _, err := v.Verify(raw); !errors.Is(err, ErrUntrustedMeasurement) {
 		t.Errorf("err = %v, want ErrUntrustedMeasurement", err)
 	}

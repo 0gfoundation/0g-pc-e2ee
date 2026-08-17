@@ -463,9 +463,17 @@ func (r *Router) verifyQuoteAt(ctx context.Context, quoteURL string) (encPub cry
 	}
 	if !verified.MeasurementTrusted {
 		metrics.MeasurementUntrusted()
-		r.logger.Warn("sealing to provider whose measurement is not in the allowlist (attest warn mode)",
+		// All three registers the allowlist compares, not MRTD alone: an operator
+		// reading this line is looking at the only place the observed boot chain
+		// appears, so it should carry enough to record an entry rather than enough to
+		// know one is missing. RTMR3/RTMR0 are deliberately absent — see
+		// attest.BootChain.
+		bc := attest.BootChainOf(verified.Measurement)
+		r.logger.Warn("sealing to provider whose boot chain is not in the allowlist (attest warn mode)",
 			"quote_url", quoteURL,
-			"mrtd", fmt.Sprintf("%x", verified.Measurement.MRTD[:]),
+			"mrtd", fmt.Sprintf("%x", bc.MRTD[:]),
+			"rtmr1", fmt.Sprintf("%x", bc.RTMR1[:]),
+			"rtmr2", fmt.Sprintf("%x", bc.RTMR2[:]),
 			"signer_addr", verified.SignerAddr)
 	}
 	return verified.EncPub, verified.SignerAddr, nil

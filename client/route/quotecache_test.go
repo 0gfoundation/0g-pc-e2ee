@@ -21,7 +21,7 @@ import (
 func qvVerifier(t *testing.T) *attest.Verifier {
 	t.Helper()
 	m := qvMeasurement(0xaa)
-	return attest.New(attest.Policy{Allowed: []attest.Measurement{m}},
+	return attest.New(attest.BootChainPolicy{Allowed: []attest.BootChain{attest.BootChainOf(m)}},
 		attest.WithQuoteParser(qvParser(m, qvReportData(t))))
 }
 

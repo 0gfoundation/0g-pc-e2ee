@@ -4,12 +4,20 @@
 // # -provider: the provider trust chain
 //
 // Checks a provider against docs/design/trust-chain.md in one shot: it
-// DCAP-verifies the provider's TDX quote (hops 2–4 — genuine TDX, measurement,
+// DCAP-verifies the provider's TDX quote (hops 2–4 — genuine TDX, boot chain,
 // report_data) and grounds the quote-bound signer in the on-chain
 // InferenceServing registry (hop 5 — SPEC §4.4 step 3). It is the pre-enable gate
 // for the sidecar/gateway -onchain / -attest modes: run it against the chain and
 // provider you will point them at to confirm the whole chain lines up before
 // flipping on enforcement.
+//
+// Hop 3 currently REPORTS rather than checks: the audited-image allowlist
+// (providerBootChains) is empty, so the run prints the observed boot chain — MRTD,
+// RTMR1, RTMR2, the three registers an entry pins — in the shape an allowlist entry
+// wants. That is deliberate: those values have to be read off a real provider before
+// any allowlist can exist, so this is where the first entry comes from. RTMR3 is not
+// printed as a candidate value; it carries per-instance events and pinning it would
+// pin one CVM (see attest.BootChain). RTMR0 is shown, labelled as not compared.
 //
 //	pcverify -provider 0x... [-chain-rpc-url ...] [-serving-contract 0x...]
 //	         [-endpoint https://...] [-expect-signer 0x...] [-no-quote]
@@ -58,6 +66,14 @@
 // run (an unreachable or rate-limited API says nothing about the deployment), while an
 // explicit -releases N that cannot be satisfied is fatal. Same rule as DNS discovery.
 //
+// -strict ends that degradation for every optional lookup at once. It is the flag for
+// a gate: without it the only way to make a lookup mandatory is to also supply its
+// input (-releases N, -base-domain …), which conflates "I require this check" with
+// "here is where to look" and leaves a CI author who does not know the platform base
+// domain unable to harden the run at all. -strict requires the checks and lets
+// discovery keep finding the values. It is rejected together with -releases 0, which
+// asks to skip the one comparison whose failure is the finding that matters.
+//
 // -allow-untrusted-cert accepts a served certificate that does not chain to a public
 // root, for ACME-staging deployments. It is purely a verdict decision: the evidence
 // fetch never verifies PKI in the first place (it rides the same connection whose
@@ -96,12 +112,34 @@
 //
 // Both modes make NO changes and send NOTHING beyond reads: the chain RPC and the
 // provider's public /quote, or the public evidence files and one TLS handshake,
-// plus whatever DCAP collateral the verifier fetches. Exit code is non-zero on any
-// failed check, so either drops into CI or a deploy gate.
+// plus whatever DCAP collateral the verifier fetches.
+//
+// # Exit codes
+//
+//	0  every check ran and passed
+//	1  a check failed — including a lookup the caller DEMANDED (-strict, or an
+//	   explicit -releases N) that could not be completed: the flags were usable, the
+//	   claim just could not be made
+//	2  caller mistake (bad flags, an unusable domain, an unreadable file)
+//	3  nothing failed, but a check did not RUN
+//
+// 3 exists because "nothing I checked was wrong" is a weaker claim than "I checked
+// everything", and a gate reading only zero/non-zero cannot tell them apart — which
+// would let a GitHub outage read as a full pass on the one check that catches a
+// deployment running unpublished code. A run that skips something says so on screen
+// and returns 3; -strict turns that into 1 instead. Treat 3 as failure in a gate
+// unless a partial verification is genuinely acceptable there.
+//
+// Both modes use it, and provider mode reaches it far more easily: hop 3's audited
+// allowlist is empty, so the boot-chain comparison never runs and EVERY provider-mode
+// run is a 3 today. That is the honest report — the code root is not doing its job yet
+// — and it means -strict cannot pass in provider mode until the allowlist is
+// populated. -no-quote is a 3 for the same reason: it skips hops 2–4 by request.
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -152,6 +190,7 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 	noDNSDiscovery := fs.Bool("no-dns-discovery", false, "gateway mode: do not derive the platform base domain from DNS; check only what was passed in")
 	expectComposeFile := fs.String("expect-compose-file", "", "gateway mode: path to the docker-compose manifest this deployment should be running (a digest-pinned docker-compose.release.yml), compared against the authenticated app-compose's docker_compose_file. Overrides the default -releases lookup")
 	releases := fs.Int("releases", defaultReleases, "gateway mode: accept the deployment if its compose text matches any of the newest N published releases, and report which one. 0 disables the lookup")
+	strict := fs.Bool("strict", false, "require every check to RUN, not merely to not fail: anything that would report an advisory \"-\" (exit 3) fails the run instead (exit 1). Gateway mode — a releases or app-compose lookup that cannot be completed; it demands the checks without demanding their inputs, so discovery still supplies them. Provider mode — hop 3, which cannot pass today because the audited allowlist is empty")
 	releaseRepo := fs.String("repo", defaultReleaseRepo, "gateway mode: owner/name to read releases from, with -releases")
 	releaseAsset := fs.String("release-asset", defaultReleaseAsset, "gateway mode: release asset holding the deployment manifest, with -releases")
 	timeout := fs.Duration("timeout", 30*time.Second, "overall timeout")
@@ -193,6 +232,7 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 			// failed release lookup is fatal.
 			releasesSet:      flagSet(fs, "releases"),
 			expectComposeSet: flagSet(fs, "expect-compose-file"),
+			strict:           *strict,
 		}
 		// The release lookup happens during construction, so it shares the run's deadline.
 		ctx, cancel := context.WithTimeout(ctx, *timeout)
@@ -200,14 +240,29 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 		ec, expect, err := newEvidenceChecker(ctx, out, gcfg)
 		if err != nil {
 			fmt.Fprintf(out, "pcverify: %v\n", err)
+			// A lookup the caller demanded and did not get is a failed check, not a
+			// caller mistake: the run could not make a claim it was told to make. Every
+			// other setup failure here really is exit 2.
+			var required errLookupRequired
+			if errors.As(err, &required) {
+				return fail(out)
+			}
 			return 2
 		}
-		return reportGateway(ctx, out, ec, *gateway, *allowUntrustedCert, expect)
+		return reportGateway(ctx, out, ec, *gateway, *allowUntrustedCert, *strict, expect)
 	}
 
 	reg, err := chain.NewOnChainRegistry(chain.Config{RPCURL: *chainRPCURL, ContractAddress: *servingContract})
 	if err != nil {
 		fmt.Fprintf(out, "pcverify: %v\n", err)
+		return 2
+	}
+
+	// -strict demands every check; -no-quote switches off hops 2–4. Same contradiction
+	// as -strict with -releases 0, and rejected the same way rather than by silently
+	// honouring one of the two.
+	if *strict && *noQuote {
+		fmt.Fprintln(out, "pcverify: -strict requires the quote hops; drop -no-quote")
 		return 2
 	}
 
@@ -218,15 +273,29 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 
 	ctx, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
-	return report(ctx, out, reg, qc, *provider, *servingContract, *endpoint, *expectSigner)
+	return report(ctx, out, reg, qc, *provider, *servingContract, *endpoint, *expectSigner, *strict)
 }
 
-// report runs the checks and prints a per-hop result, returning the process exit
-// code (0 pass, 1 failed check). It takes interfaces so tests drive it without a
-// live chain or provider.
-func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecker, provider, contract, endpointOverride, expectSigner string) int {
+// report runs the checks and prints a per-hop result, returning the process exit code
+// on the same contract as gateway mode: 0 every check ran and passed, 1 a check
+// failed, 3 nothing failed but a check did not run (see verdict). It takes interfaces
+// so tests drive it without a live chain or provider.
+//
+// Provider mode is where "did not run" is the STANDING state rather than an
+// occasional one: hop 3's allowlist is empty, so the boot-chain comparison never
+// happens and every run is incomplete until providerBootChains is populated. That is
+// the more likely way a CI gate is misled — a gateway-mode skip needs a GitHub outage,
+// this one needs nothing at all.
+func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecker, provider, contract, endpointOverride, expectSigner string, strict bool) int {
 	fmt.Fprintf(out, "provider           %s\n", provider)
 	fmt.Fprintf(out, "contract           %s\n", contract)
+
+	// What this run did not cover, for the verdict. -no-quote is a deliberate skip of
+	// hops 2–4, which is still a skip: the run says nothing about the enclave.
+	skipped := ""
+	if qc == nil {
+		skipped = "the quote hops (2-4) did not run (-no-quote), so nothing here is about the enclave"
+	}
 
 	info, err := sr.ServiceInfo(ctx, provider)
 	if err != nil {
@@ -260,9 +329,31 @@ func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecke
 			return fail(out)
 		}
 		fmt.Fprintf(out, "%s quote            genuine TDX (DCAP verified)\n", mark(true))
-		fmt.Fprintf(out, "  measurement MRTD %x\n", v.Measurement.MRTD[:])
-		if !v.MeasurementTrusted {
-			fmt.Fprintf(out, "  note             measurement not in allowlist (none configured)\n")
+		// The boot chain, in the shape an allowlist entry wants — MRTD + RTMR1 + RTMR2,
+		// the registers attest.BootChain pins. Printing MRTD alone was enough to see
+		// that a check did not happen and not enough to do anything about it: nobody
+		// could derive an entry from this tool's output, which is the only way the
+		// values get recorded in the first place. Gateway mode has printed all three
+		// for that reason (reportBootChain), and this is the same need on the hop that
+		// still has no allowlist.
+		switch {
+		case v.MeasurementTrusted:
+			// A clean match needs only to say so; the registers are the reader's next
+			// action only when there is one.
+			fmt.Fprintf(out, "%s boot chain       in the audited allowlist\n", mark(true))
+		case len(providerBootChains) == 0:
+			fmt.Fprintf(out, "- boot chain       not compared (no allowlist configured)\n")
+			reportBootChain(out, attest.BootChainOf(v.Measurement))
+			reportShapeRegister(out, v.Measurement)
+			// The code root did not run. Reported, so the verdict cannot be 0 — this is
+			// exactly the "- read as ✓" mistake the exit codes exist to prevent, and here
+			// it fires on every run rather than on a bad day.
+			skipped = "the boot chain was not compared (hop 3: no audited allowlist configured)"
+		default:
+			fmt.Fprintf(out, "%s boot chain       matches no audited image\n", mark(false))
+			reportBootChain(out, attest.BootChainOf(v.Measurement))
+			reportShapeRegister(out, v.Measurement)
+			ok = false
 		}
 		fmt.Fprintf(out, "  report_data enc  %x\n", v.EncPub)
 		fmt.Fprintf(out, "  report_data sgnr %s\n", v.SignerAddr)
@@ -273,11 +364,7 @@ func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecke
 		ok = ok && match
 	}
 
-	if ok {
-		fmt.Fprintln(out, "\nPASS")
-		return 0
-	}
-	return fail(out)
+	return verdict(out, !ok, skipped, strict)
 }
 
 func fail(out io.Writer) int {
@@ -292,10 +379,24 @@ func mark(ok bool) string {
 	return "✗"
 }
 
+// providerBootChains is the audited broker OS-image allowlist for -provider mode:
+// one entry per image, as attest.BootChain (MRTD + RTMR1 + RTMR2) rather than a full
+// Measurement, so an entry pins a version rather than a single CVM.
+//
+// It is empty, and that is the remaining half of trust-chain hop 3. The shape can now
+// be filled — these values are computable from a reproducible build before any
+// deployment exists — but WHERE they are published is still open: on-chain beside the
+// provider registry, or as broker release assets (which this tool could consume with
+// the same machinery -releases already uses for the gateway). Until that is decided
+// the run reports the observed boot chain instead of comparing it, so that whoever
+// records the first entry is copying rather than transcribing.
+var providerBootChains []attest.BootChain
+
 // dcapChecker is the real quoteChecker: it GETs the provider's /quote and
 // DCAP-verifies it (genuine TDX + TCB + report_data binding). Measurement runs in
-// warn mode so the tool reports an out-of-allowlist measurement rather than
-// erroring — the allowlist is not yet populated (see proxycli/newVerifier).
+// warn mode so the tool REPORTS an out-of-allowlist boot chain rather than erroring:
+// a read-only diagnostic should print what it saw, and with providerBootChains empty
+// enforce mode would refuse every provider without saying anything about any of them.
 type dcapChecker struct {
 	http     *http.Client
 	verifier *attest.Verifier
@@ -309,7 +410,7 @@ func newDCAPChecker(pccsURL string) *dcapChecker {
 	return &dcapChecker{
 		http: &http.Client{Timeout: 20 * time.Second},
 		verifier: attest.New(
-			attest.Policy{},
+			attest.BootChainPolicy{Allowed: providerBootChains},
 			attest.WithQuoteParser(dcap.NewQuoteParser(dcap.Config{PCCSBaseURL: pccsURL})),
 			attest.WithMeasurementMode(attest.ModeWarn),
 		),

@@ -19,8 +19,13 @@ func (s stubEvidence) Check(context.Context, string) (evidence.Report, error) {
 	return s.rep, s.err
 }
 
-// passing is the report shape of a fully successful run, which each case below
-// then breaks in one place.
+// passing is the report shape of a fully successful run — one where every check both
+// ran and passed, which is what exit 0 now means. Each case below then breaks it in
+// one place.
+//
+// The code-identity and os-image fields are populated rather than left zero: a report
+// with neither describes a run that skipped both, which is exit 3 (see
+// incompleteReason), not a pass. Cases that want a partial run clear them explicitly.
 func passing() evidence.Report {
 	return evidence.Report{
 		Domain: "pc-gateway.test",
@@ -29,9 +34,26 @@ func passing() evidence.Report {
 			{Name: "cert-pc-gateway.test.pem"},
 		},
 		CertMatch: evidence.CertExact,
+		Code: evidence.CodeIdentity{
+			Requested:       true,
+			Source:          "55d872aa…-8090.in1.phala.network",
+			ExpectRequested: true,
+			MatchedExpect:   "release-2026.08.07.1",
+		},
+		OSImage: evidence.OSImageCheck{Configured: true, Matched: "dstack-nvidia-0.5.4.1"},
 		// A representative note; the real strings live in client/evidence.
 		Note: "code identity is only as strong as the image pinning inside the compose text",
 	}
+}
+
+// partial is a run that failed nothing and checked less than everything: the OS image
+// is unpinned and no manifest comparison happened. It is the shape exit 3 names.
+func partial() evidence.Report {
+	rep := passing()
+	rep.Code.ExpectRequested = false
+	rep.Code.MatchedExpect = ""
+	rep.OSImage = evidence.OSImageCheck{}
+	return rep
 }
 
 func TestReportGateway(t *testing.T) {
@@ -85,12 +107,14 @@ func TestReportGateway(t *testing.T) {
 		// Chain trust is its own axis: a failure fails the run by default, and only
 		// -allow-untrusted-cert downgrades it. No attestation check moves either way.
 		{name: "untrusted chain fails by default", rep: untrusted, wantCode: 1, contains: "unknown authority"},
-		{name: "untrusted chain allowed", rep: untrusted, allowUntrusted: true, wantCode: 0, contains: "-allow-untrusted-cert"},
+		// Waived trust is a pass that does not cover the domain binding, which is
+		// precisely the "passed, but not fully" state exit 3 exists to name.
+		{name: "untrusted chain allowed is incomplete", rep: untrusted, allowUntrusted: true, wantCode: 3, contains: "-allow-untrusted-cert"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var out bytes.Buffer
-			code := reportGateway(context.Background(), &out, stubEvidence{rep: tc.rep}, "pc-gateway.test", tc.allowUntrusted, expectSource{})
+			code := reportGateway(context.Background(), &out, stubEvidence{rep: tc.rep}, "pc-gateway.test", tc.allowUntrusted, false, expectSource{})
 			if code != tc.wantCode {
 				t.Errorf("code = %d, want %d\n%s", code, tc.wantCode, out.String())
 			}
@@ -108,9 +132,11 @@ func TestReportGateway_WaivedTrustWarns(t *testing.T) {
 	rep := passing()
 	rep.ChainTrustErr = errors.New("x509: certificate signed by unknown authority")
 
+	// 3, not 0: nothing failed, but the domain binding went unestablished, so the
+	// verdict has to agree with the warning rather than read as a full pass.
 	var out bytes.Buffer
-	if code := reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", true, expectSource{}); code != 0 {
-		t.Fatalf("code = %d, want 0\n%s", code, out.String())
+	if code := reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", true, false, expectSource{}); code != 3 {
+		t.Fatalf("code = %d, want 3\n%s", code, out.String())
 	}
 	for _, want := range []string{"warning", "waived", "does NOT establish"} {
 		if !strings.Contains(out.String(), want) {
@@ -122,7 +148,7 @@ func TestReportGateway_WaivedTrustWarns(t *testing.T) {
 // …and a run whose trust actually validates must NOT print that warning.
 func TestReportGateway_TrustedRunHasNoWarning(t *testing.T) {
 	var out bytes.Buffer
-	if code := reportGateway(context.Background(), &out, stubEvidence{rep: passing()}, "pc-gateway.test", true, expectSource{}); code != 0 {
+	if code := reportGateway(context.Background(), &out, stubEvidence{rep: passing()}, "pc-gateway.test", true, false, expectSource{}); code != 0 {
 		t.Fatalf("code = %d, want 0\n%s", code, out.String())
 	}
 	if strings.Contains(out.String(), "warning") {
@@ -138,7 +164,7 @@ func TestReportGateway_PassStatesItsCaveats(t *testing.T) {
 		"the compose-hash binding — treat code identity as strong evidence, not proof"
 
 	var out bytes.Buffer
-	if code := reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", false, expectSource{}); code != 0 {
+	if code := reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", false, false, expectSource{}); code != 0 {
 		t.Fatalf("code = %d, want 0\n%s", code, out.String())
 	}
 	if !strings.Contains(out.String(), "not proof") {
@@ -146,8 +172,8 @@ func TestReportGateway_PassStatesItsCaveats(t *testing.T) {
 	}
 }
 
-// An unpinned OS image is reported as advisory, and a mismatch as a failure — the exit
-// code follows OSImageCheck.OK, so the two must not look alike on screen either.
+// An unpinned OS image is reported as advisory (a check that did not run — exit 3),
+// and a mismatch as a failure (exit 1). The two must not look alike on screen either.
 func TestReportGateway_OSImage(t *testing.T) {
 	unpinned := passing()
 	unpinned.OSImage = evidence.OSImageCheck{Configured: false}
@@ -165,7 +191,7 @@ func TestReportGateway_OSImage(t *testing.T) {
 		wantCode int
 		contains string
 	}{
-		{"not pinned is advisory", unpinned, 0, "not pinned"},
+		{"not pinned is incomplete, not a failure", unpinned, 3, "not pinned"},
 		{"mismatch fails", mismatch, 1, "no allowlisted OS image"},
 		{"match names the image", matched, 0, "dstack-nvidia-0.5.4.1 (1 vCPU)"},
 	}
@@ -173,7 +199,7 @@ func TestReportGateway_OSImage(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var out bytes.Buffer
 			code := reportGateway(context.Background(), &out, stubEvidence{rep: tc.rep},
-				"pc-gateway.test", false, expectSource{})
+				"pc-gateway.test", false, false, expectSource{})
 			if code != tc.wantCode {
 				t.Errorf("code = %d, want %d\n%s", code, tc.wantCode, out.String())
 			}
@@ -184,16 +210,135 @@ func TestReportGateway_OSImage(t *testing.T) {
 	}
 	// The observed registers appear where they are actionable, and not otherwise.
 	var out bytes.Buffer
-	reportGateway(context.Background(), &out, stubEvidence{rep: matched}, "pc-gateway.test", false, expectSource{})
+	reportGateway(context.Background(), &out, stubEvidence{rep: matched}, "pc-gateway.test", false, false, expectSource{})
 	if strings.Contains(out.String(), "observed mrtd") {
 		t.Errorf("a clean match should not dump registers:\n%s", out.String())
+	}
+}
+
+// The three verdicts have to stay distinguishable, because the whole point of exit 3
+// is that a gate reading only zero/non-zero cannot tell "verified" from "checked less
+// than everything". -strict collapses 3 into 1 and must never touch 0 or an actual
+// failure.
+func TestReportGateway_StrictAndIncompleteVerdicts(t *testing.T) {
+	failed := passing()
+	failed.BindingErr = errors.New("manifest digest aa…, quote binds bb…")
+
+	for _, tc := range []struct {
+		name     string
+		rep      evidence.Report
+		strict   bool
+		wantCode int
+		present  []string
+		absent   []string
+	}{
+		{
+			name: "complete run passes", rep: passing(), wantCode: 0,
+			present: []string{"PASS"}, absent: []string{"INCOMPLETE", "-strict"},
+		},
+		{
+			name: "complete run passes under strict too", rep: passing(), strict: true, wantCode: 0,
+			present: []string{"PASS"}, absent: []string{"INCOMPLETE"},
+		},
+		{
+			// Nothing is wrong; something simply was not checked. It must say which.
+			name: "partial run is 3 and names the gap", rep: partial(), wantCode: 3,
+			present: []string{"PASS (INCOMPLETE)", "the OS image was not pinned", "-strict"},
+		},
+		{
+			name: "strict turns a partial run into a failure", rep: partial(), strict: true, wantCode: 1,
+			present: []string{"-strict requires every check to run", "the OS image was not pinned", "FAIL"},
+			absent:  []string{"PASS"},
+		},
+		{
+			// A real failure stays 1 either way — strict must not disguise one as the other.
+			name: "failure is 1 without strict", rep: failed, wantCode: 1,
+			present: []string{"FAIL"}, absent: []string{"INCOMPLETE"},
+		},
+		{
+			name: "failure is still 1 under strict", rep: failed, strict: true, wantCode: 1,
+			present: []string{"FAIL"}, absent: []string{"INCOMPLETE"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var out bytes.Buffer
+			got := reportGateway(context.Background(), &out, stubEvidence{rep: tc.rep},
+				"pc-gateway.test", false, tc.strict, expectSource{})
+			if got != tc.wantCode {
+				t.Errorf("exit = %d, want %d\n%s", got, tc.wantCode, out.String())
+			}
+			for _, s := range tc.present {
+				if !strings.Contains(out.String(), s) {
+					t.Errorf("output missing %q:\n%s", s, out.String())
+				}
+			}
+			for _, s := range tc.absent {
+				if strings.Contains(out.String(), s) {
+					t.Errorf("output must not contain %q:\n%s", s, out.String())
+				}
+			}
+		})
+	}
+}
+
+// Each way a run can come up short has to name itself, or a reader gets exit 3 with
+// nothing to act on. The reason is also what a failing -strict run prints.
+func TestIncompleteReason_NamesTheSpecificGap(t *testing.T) {
+	withCode := func(f func(*evidence.CodeIdentity)) evidence.Report {
+		rep := passing()
+		f(&rep.Code)
+		return rep
+	}
+
+	for _, tc := range []struct {
+		name   string
+		rep    evidence.Report
+		expect expectSource
+		want   string
+	}{
+		{"complete", passing(), expectSource{}, ""},
+		{"os image unpinned", partial(), expectSource{}, "the OS image was not pinned"},
+		{
+			"no app-compose source",
+			withCode(func(c *evidence.CodeIdentity) { c.NoSource = true }),
+			expectSource{}, "no app-compose was available, so code identity did not run",
+		},
+		{
+			"app-compose fetch failed",
+			withCode(func(c *evidence.CodeIdentity) { c.FetchErr = errors.New("no CNAME chain") }),
+			expectSource{}, "the app-compose could not be fetched",
+		},
+		{
+			"compose hash unavailable",
+			withCode(func(c *evidence.CodeIdentity) { c.HashErr = errors.New("layout") }),
+			expectSource{}, "compose_hash was not recovered, so code identity did not run",
+		},
+		{
+			// A failed release lookup also leaves ExpectRequested false, and this is the
+			// more useful of the two readings, so it must win.
+			"release lookup failed",
+			withCode(func(c *evidence.CodeIdentity) { c.ExpectRequested = false; c.MatchedExpect = "" }),
+			expectSource{Err: errors.New("GitHub API rate limit exceeded")},
+			"the release lookup failed, so no published manifest was compared",
+		},
+		{
+			"comparison switched off",
+			withCode(func(c *evidence.CodeIdentity) { c.ExpectRequested = false; c.MatchedExpect = "" }),
+			expectSource{}, "no published manifest was compared",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := incompleteReason(tc.rep, tc.expect); got != tc.want {
+				t.Errorf("incompleteReason = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
 // An unusable domain is a caller error (exit 2), not a failed check (exit 1).
 func TestReportGateway_CheckerError(t *testing.T) {
 	var out bytes.Buffer
-	code := reportGateway(context.Background(), &out, stubEvidence{err: errors.New("evidence: empty domain")}, "", false, expectSource{})
+	code := reportGateway(context.Background(), &out, stubEvidence{err: errors.New("evidence: empty domain")}, "", false, false, expectSource{})
 	if code != 2 {
 		t.Errorf("code = %d, want 2\n%s", code, out.String())
 	}
@@ -207,6 +352,12 @@ func TestRun_ModeSelection(t *testing.T) {
 	}{
 		{"neither mode", []string{}, 2},
 		{"both modes", []string{"-provider", prov, "-gateway", "pc-gateway.test"}, 2},
+		// -strict demands every check; -releases 0 disables the one whose failure is the
+		// finding that matters. Honouring both is impossible, so say so up front rather
+		// than silently dropping one of the two instructions.
+		{"strict with the comparison switched off", []string{
+			"-gateway", "pc-gateway.test", "-strict", "-releases", "0",
+		}, 2},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -263,11 +414,12 @@ func TestRun_GatewayModeNeedsNoChain(t *testing.T) {
 	}
 }
 
-// A failed app-compose lookup is a "-" and exit 0 when it was only discovery, and a
-// "✗" with exit 1 when the caller asked for it. The distinction must key off
-// ExpectExplicit, not ExpectRequested: -releases defaults to a nonzero count, so a
-// DEFAULT comparison normally has candidates, and keying off "candidates exist" made a
-// DNS failure fatal or advisory depending on whether GitHub happened to be reachable.
+// A failed app-compose lookup is a "-" and exit 3 (advisory: nothing failed, but a
+// check did not run) when it was only discovery, and a "✗" with exit 1 when the caller
+// asked for it. The distinction must key off ExpectExplicit, not ExpectRequested:
+// -releases defaults to a nonzero count, so a DEFAULT comparison normally has
+// candidates, and keying off "candidates exist" made a DNS failure fatal or advisory
+// depending on whether GitHub happened to be reachable.
 func TestReportGateway_DiscoveredLookupFailureIsAdvisory(t *testing.T) {
 	lookupFailed := errors.New("no CNAME chain to a dstack base domain")
 
@@ -288,13 +440,13 @@ func TestReportGateway_DiscoveredLookupFailureIsAdvisory(t *testing.T) {
 		{
 			name:     "discovery only",
 			mutate:   func(*evidence.Report) {},
-			wantCode: 0, wantMark: "- app-compose",
+			wantCode: 3, wantMark: "- app-compose",
 		},
 		{
 			// The bug: a default -releases lookup succeeded, so ExpectRequested is true.
 			name:     "default compose comparison also ran",
 			mutate:   func(r *evidence.Report) { r.Code.ExpectRequested = true },
-			wantCode: 0, wantMark: "- app-compose",
+			wantCode: 3, wantMark: "- app-compose",
 		},
 		{
 			name: "comparison explicitly requested",
@@ -309,7 +461,7 @@ func TestReportGateway_DiscoveredLookupFailureIsAdvisory(t *testing.T) {
 			rep := base()
 			tc.mutate(&rep)
 			var out bytes.Buffer
-			got := reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", false,
+			got := reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", false, false,
 				expectSource{Label: "newest 5 release(s)"})
 			if got != tc.wantCode {
 				t.Errorf("exit = %d, want %d\n%s", got, tc.wantCode, out.String())
@@ -340,8 +492,9 @@ func TestReportCodeIdentity_NeverMarksWorkThatDidNotHappen(t *testing.T) {
 		{
 			name: "no source, default comparison had candidates",
 			code: evidence.CodeIdentity{NoSource: true, ExpectRequested: true},
-			// Opting out is not a failure, but nothing may be claimed.
-			wantCode: 0,
+			// Opting out is not a failure, but nothing may be claimed — so exit 3, the
+			// code for "ran clean, checked less than everything", never 0.
+			wantCode: 3,
 			absent:   []string{"✓ app-compose", "✓ compose file", "byte-for-byte"},
 			present:  []string{"- app-compose", "not checked"},
 		},
@@ -369,7 +522,7 @@ func TestReportCodeIdentity_NeverMarksWorkThatDidNotHappen(t *testing.T) {
 			rep.Code = tc.code
 			var out bytes.Buffer
 			got := reportGateway(context.Background(), &out, stubEvidence{rep: rep},
-				"pc-gateway.test", false, expectSource{Label: "newest 5 release(s)"})
+				"pc-gateway.test", false, false, expectSource{Label: "newest 5 release(s)"})
 			if got != tc.wantCode {
 				t.Errorf("exit = %d, want %d\n%s", got, tc.wantCode, out.String())
 			}

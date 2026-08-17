@@ -120,9 +120,11 @@ TLS on the router path.
 ## What it verifies
 
 - **Attestation** — the provider quote is genuine TEE hardware (DCAP-verified;
-  enforced). Whether the measurement is an *audited* one is checked against
-  `attest.Policy`, but that allowlist is empty today, so the deployed gateway runs that
-  part in warn mode — see [`trust-chain.md`](../docs/design/trust-chain.md) hop 3.
+  enforced). Whether it runs an *audited* image is checked against
+  `attest.BootChainPolicy` — one entry per OS image — but that allowlist is empty today,
+  so the deployed gateway runs that part in warn mode; `pcverify -provider` prints the
+  observed boot chain in the shape an entry wants. See
+  [`trust-chain.md`](../docs/design/trust-chain.md) hop 3.
 - **Response authenticity** — each response carries a §8 TEE signature, checked
   fail-closed against the **quote-bound** signer. Opt-in in the library
   (`-verify-responses`, off by default); the deployed gateway turns it on, so a response
@@ -168,7 +170,12 @@ can come from anywhere (`-app-compose <file>`), because the hash anchors them. T
 compose text is then matched against the newest 5 published releases by default
 (`-releases N`, `0` to disable); `-expect-compose-file` pins one manifest instead.
 
-Both modes exit non-zero on a failed check, so either works as a deploy gate. See
+Both modes exit non-zero on a failed check, so either works as a deploy gate, and both
+separate "failed" (1) from "did not run" (3) so a skipped check cannot read as a full
+pass. `-strict` makes every check mandatory and turns the latter into the former. Note
+that **provider mode returns 3 on every run today**: hop 3's audited allowlist is empty,
+so the boot chain is never compared — the code root is not doing its job yet, and the
+exit code says so rather than rounding up to 0. See
 [`docs/design/cloud-gateway.md`](../docs/design/cloud-gateway.md) §10 for what the
 result does and does not cover.
 

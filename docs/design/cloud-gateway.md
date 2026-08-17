@@ -347,8 +347,9 @@ does not.
    wrong or hijacked answer yields a failed lookup or a failed binding, never a false
    pass), and a release asset is only ever compared against text the quote already
    authenticated. Both lookups are advisory when they happen by default and fatal when
-   explicitly requested, so a network problem is never reported as a verification
-   failure — nor silently as a pass.
+   explicitly requested (or under `-strict`), so a network problem is never reported as
+   a verification failure — nor silently as a pass: an advisory skip exits **3**, the
+   code for "nothing failed, and not everything ran", never 0.
 
    **Code identity's remaining dependency — the OS image — is now pinned.**
    `mr_config_id` is host-chosen, so the compose hash is truthful only because the

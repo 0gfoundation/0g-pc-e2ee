@@ -53,7 +53,7 @@ func TestNewQuoteParser_DoesNotExtractFromUnverified(t *testing.T) {
 // NewQuoteParser is accepted by protocol/attest.WithQuoteParser (the seam) and
 // drives Verify end to end. Verification still fails closed on bad input.
 func TestQuoteParser_PlugsIntoSeam(t *testing.T) {
-	v := attest.New(attest.Policy{}, attest.WithQuoteParser(NewQuoteParser(Config{Getter: failGetter{}})))
+	v := attest.New(attest.BootChainPolicy{}, attest.WithQuoteParser(NewQuoteParser(Config{Getter: failGetter{}})))
 	if _, err := v.Verify([]byte("garbage")); err == nil {
 		t.Fatal("expected verification error through the seam, got nil")
 	}

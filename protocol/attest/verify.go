@@ -15,10 +15,17 @@ var (
 	// real quote parser. The default parser rejects everything, so a no-op
 	// verification can never silently trust a quote.
 	ErrQuoteVerifierNotConfigured = errors.New("attest: no quote parser configured (fail-closed)")
-	// ErrUntrustedMeasurement is returned when a genuine quote's measurement is
-	// not in the Policy allowlist — i.e. the enclave runs code the client has
-	// not audited.
-	ErrUntrustedMeasurement = errors.New("attest: quote measurement not in allowlist")
+	// ErrUntrustedMeasurement is returned when a genuine quote's boot chain is not
+	// in the BootChainPolicy allowlist — i.e. the enclave runs an OS image the
+	// client has not audited.
+	ErrUntrustedMeasurement = errors.New("attest: quote boot chain not in allowlist")
+	// ErrMeasurementPolicyNotConfigured is returned under ModeEnforce when the
+	// allowlist is empty. Enforcing against nothing rejects every provider, which
+	// is correct (fail-closed) but says nothing about the providers — it is an
+	// unfinished configuration, not a finding about the enclave. Distinguishing it
+	// is what stops "enforce is on and the allowlist is empty" from being read, one
+	// provider at a time, as "every provider runs unaudited code".
+	ErrMeasurementPolicyNotConfigured = errors.New("attest: measurement enforcement requested with an empty allowlist")
 )
 
 // quoteParser is the seam over raw TDX quote handling: it parses the quote
@@ -39,15 +46,18 @@ func notConfigured([]byte) (Measurement, [64]byte, error) {
 	return Measurement{}, [64]byte{}, ErrQuoteVerifierNotConfigured
 }
 
-// MeasurementMode selects what Verify does when an authenticated quote's
-// measurement is NOT in the Policy allowlist. Quote authenticity (genuine TDX +
+// MeasurementMode selects what Verify does when an authenticated quote's boot
+// chain is NOT in the BootChainPolicy allowlist. Quote authenticity (genuine TDX +
 // signature) and report_data binding are ALWAYS enforced regardless of mode;
 // this knob only governs the measurement-allowlist decision.
 type MeasurementMode int
 
 const (
 	// ModeEnforce (the zero value, and the secure default) rejects a quote whose
-	// measurement is not allowlisted: the enclave runs unaudited code.
+	// boot chain is not allowlisted: the enclave runs an unaudited image. An empty
+	// allowlist rejects everything under this mode — see
+	// ErrMeasurementPolicyNotConfigured, which names that case rather than blaming
+	// the provider for it.
 	ModeEnforce MeasurementMode = iota
 	// ModeWarn accepts such a quote but marks Verified.MeasurementTrusted false,
 	// leaving it to the caller to log and decide. Use it as a rollout bridge
@@ -55,10 +65,10 @@ const (
 	ModeWarn
 )
 
-// Verifier verifies provider quotes against a fixed Policy. It is immutable
-// after New and safe for concurrent use.
+// Verifier verifies provider quotes against a fixed BootChainPolicy. It is
+// immutable after New and safe for concurrent use.
 type Verifier struct {
-	policy Policy
+	policy BootChainPolicy
 	parse  quoteParser
 	mode   MeasurementMode
 }
@@ -84,10 +94,10 @@ func WithQuoteParser(p quoteParser) Option {
 	}
 }
 
-// New returns a Verifier that accepts quotes whose measurement is in policy's
+// New returns a Verifier that accepts quotes whose boot chain is in policy's
 // allowlist. It defaults to the fail-closed parser, so a caller that forgets to
 // supply one rejects every quote rather than trusting it.
-func New(policy Policy, opts ...Option) *Verifier {
+func New(policy BootChainPolicy, opts ...Option) *Verifier {
 	v := &Verifier{policy: policy, parse: notConfigured}
 	for _, o := range opts {
 		o(v)
@@ -107,13 +117,16 @@ type Verified struct {
 	// it but does not know the chain; the route resolver does that check (see
 	// client/route WithOnChainVerification).
 	SignerAddr string
-	// Measurement is the quote's measurement, surfaced for logging/audit.
+	// Measurement is the quote's full register set, surfaced for logging/audit.
+	// BootChainOf projects it onto the registers the allowlist actually compares.
 	Measurement Measurement
-	// MeasurementTrusted reports whether Measurement is in the Policy allowlist.
-	// It is always true under ModeEnforce (a false would have errored). Under
-	// ModeWarn it may be false: the quote is genuine and EncPub/SignerAddr are
-	// safely bound, but the enclave runs code the client has not audited — the
-	// caller MUST log this before proceeding.
+	// MeasurementTrusted reports whether BootChainOf(Measurement) is in the
+	// BootChainPolicy allowlist. It is always true under ModeEnforce (a false would
+	// have errored). Under ModeWarn it may be false: the quote is genuine and
+	// EncPub/SignerAddr are safely bound, but the enclave runs an image the client
+	// has not audited — the caller MUST log this before proceeding. It is also
+	// false, under ModeWarn, when no allowlist is configured at all; the two are
+	// distinguishable only under ModeEnforce, via the error.
 	MeasurementTrusted bool
 }
 
@@ -121,12 +134,21 @@ type Verified struct {
 //
 //  1. parse — verify it is a genuine, signed TDX quote and extract its
 //     measurement + report_data (the quoteParser seam).
-//  2. allowlist — the measurement MUST be one the client audited (Policy);
-//     under ModeWarn a miss is tolerated and flagged instead (see MeasurementMode).
+//  2. allowlist — the quote's BOOT CHAIN (MRTD + RTMR1 + RTMR2) must be one the
+//     client audited (BootChainPolicy); under ModeWarn a miss is tolerated and
+//     flagged instead (see MeasurementMode).
 //  3. binding — decode report_data (§4.2) for enc_pub + signer_addr.
 //
 // Steps 1 and 3 are always fail-closed: any failure returns an error and no
 // Verified. Only step 2's allowlist decision is softened by ModeWarn.
+//
+// Step 2 compares the boot chain rather than the full Measurement because RTMR3
+// carries per-INSTANCE events (see BootChain): a full-equality entry pins one CVM,
+// so an allowlist of that shape needed an entry per replica and could never be
+// published ahead of a deployment. This is the OS-image half of the code root; the
+// application half is the compose hash in mr_config_id, which this seam does not
+// surface yet — the gateway pins it separately (client/evidence), and the provider
+// path cannot until quoteParser returns it.
 func (v *Verifier) Verify(rawQuote []byte) (Verified, error) {
 	if len(rawQuote) == 0 {
 		return Verified{}, fmt.Errorf("attest: empty quote")
@@ -138,12 +160,17 @@ func (v *Verifier) Verify(rawQuote []byte) (Verified, error) {
 		return Verified{}, fmt.Errorf("attest: quote verification: %w", err)
 	}
 
-	// 2. Measurement allowlist — the load-bearing defense against a router that
+	// 2. Boot-chain allowlist — the load-bearing defense against a router that
 	// routes to an enclave running unaudited (malicious) code. Under ModeEnforce
 	// a miss is fatal (checked before trusting any key the quote carries); under
 	// ModeWarn it is recorded on the result for the caller to log and decide.
-	trusted := v.policy.permits(measurement)
+	trusted := v.policy.Permits(BootChainOf(measurement))
 	if !trusted && v.mode == ModeEnforce {
+		// An empty allowlist rejects every provider. Still fail-closed, but report it
+		// as the configuration gap it is rather than as a verdict on this enclave.
+		if !v.policy.Configured() {
+			return Verified{}, ErrMeasurementPolicyNotConfigured
+		}
 		return Verified{}, ErrUntrustedMeasurement
 	}
 
