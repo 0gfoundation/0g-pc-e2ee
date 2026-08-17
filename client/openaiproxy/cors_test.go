@@ -282,7 +282,7 @@ func TestCORSActualRequestAllowed(t *testing.T) {
 	// Expose-Headers is what makes these readable from fetch(); without it a
 	// browser sees only the CORS-safelisted response headers.
 	expose := rec.Header().Get("Access-Control-Expose-Headers")
-	for _, name := range append([]string{headerResKey}, passthroughResponseHeaders...) {
+	for _, name := range append([]string{headerResKey, headerProvider}, passthroughResponseHeaders...) {
 		if !strings.Contains(expose, name) {
 			t.Errorf("Expose-Headers %q missing %s", expose, name)
 		}
@@ -292,11 +292,11 @@ func TestCORSActualRequestAllowed(t *testing.T) {
 // TestCORSExposeHeadersTracksPassthrough is the anti-drift check: Expose-Headers
 // must be DERIVED from the passthrough set, so adding a header the proxy re-emits
 // automatically makes it readable by browser JS instead of silently invisible.
-// The two proxy-originated headers (ZG-Res-Key, X-0G-Gateway-Instance) lead the
-// list; everything after them is the passthrough set, in order.
+// The three proxy-originated headers (ZG-Res-Key, X-Provider, X-0G-Gateway-Instance)
+// lead the list; everything after them is the passthrough set, in order.
 func TestCORSExposeHeadersTracksPassthrough(t *testing.T) {
 	got := strings.Split(corsExposeHeaders, ", ")
-	want := append([]string{headerResKey, HeaderGatewayInstance}, passthroughResponseHeaders...)
+	want := append([]string{headerResKey, headerProvider, HeaderGatewayInstance}, passthroughResponseHeaders...)
 	if len(got) != len(want) {
 		t.Fatalf("Expose-Headers has %d entries, want %d (the proxy-originated headers + every passthrough header)", len(got), len(want))
 	}

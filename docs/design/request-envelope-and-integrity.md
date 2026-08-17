@@ -360,7 +360,8 @@ checklist for the D0 follow-up (router repo, not this module).
 | Inject `url_citation` annotations | Enclave (inside the boundary) | Content transform |
 | `reasoning` → `reasoning_content` mirror | Enclave or client normalization | Content transform |
 | Buffer final `usage` chunk to fold in trace | Revisit with response framing / per-frame sealing | Interacts with streaming frame layout |
-| Header rewrites (Content-Type, X-Request-ID, X-Provider, …) | Header layer — unchanged | Not in body AAD |
+| Header rewrites (Content-Type, X-Request-ID, …) | Header layer — unchanged | Not in body AAD |
+| Router's `X-Provider` (which provider served this) | Not relayed — the gateway emits its own, from the address it pinned | Freely mutable is fine for transport metadata, but this one is shown to a user as an *identity*; see below |
 
 Pattern: **headers** (routing directives, auth, trace transport) stay at the HTTP
 layer, freely mutable; **content** transforms (search, files, annotations,
@@ -368,6 +369,26 @@ reasoning) move inside the trust boundary; **bound params** (`model`) are resolv
 at an endpoint, never mutated in transit; genuinely intermediary-owned metadata
 (`x_0g_trace`) is either signed by the enclave or declared `unbound` and treated
 as untrusted.
+
+**One header is not just transport.** "Freely mutable at the header layer" is the
+right disposition for a correlation id or a content type, because nothing downstream
+treats those as claims about identity. `X-Provider` is different: it answers *which
+provider served you*, and a user reads it as a fact about the trust chain. Leaving it
+mutable costs nothing in confidentiality or integrity — the routing is pinned, and a
+response that opens and verifies came from the pinned provider whatever the header
+says — but it does let the router state something untrue about a route it executed
+correctly, with no other link in the chain positioned to notice, precisely because
+nothing was tampered with. So the gateway does not relay it: it emits its own, from
+the address it resolved and pinned (`core.ResponseMeta.Provider`, surfaced by
+`openaiproxy.setProvider`), which makes "this field names the provider we sealed to"
+true by construction rather than by a comparison someone has to remember to make.
+Whether that address is *additionally* grounded on-chain is a property of the
+deployment's trust mode, not of the header — see
+[`trust-chain.md`](./trust-chain.md) hop 5.
+
+The general lesson for this table: ask not only whether a mutation can break the
+seal, but whether the mutated value is later **displayed as a claim**. Those two
+questions have different answers, and only the first one is about AAD.
 
 ---
 

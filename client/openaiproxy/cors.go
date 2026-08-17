@@ -148,9 +148,11 @@ func isHeaderToken(s string) bool {
 const corsMaxAge = "43200"
 
 // corsExposeHeaders is derived from the SAME list the proxy actually re-emits
-// (passthroughResponseHeaders) plus the two headers the proxy originates itself —
-// ZG-Res-Key, which setResKey surfaces separately, and HeaderGatewayInstance,
-// which StampInstance sets when the gateway is configured to identify its replica.
+// (passthroughResponseHeaders) plus the three headers the proxy originates itself —
+// ZG-Res-Key, which setResKey surfaces separately; X-Provider, which setProvider
+// emits from the client's own routing pin rather than forwarding the router's
+// same-named claim; and HeaderGatewayInstance, which StampInstance sets when the
+// gateway is configured to identify its replica.
 // Deriving it instead of restating it is what keeps the two from drifting: a
 // header added to the passthrough set becomes readable by browser JS
 // automatically, and one removed stops being advertised. Without this, fetch()
@@ -162,7 +164,8 @@ const corsMaxAge = "43200"
 // gateway usually does not send it: Access-Control-Expose-Headers naming a header
 // the response does not carry is a no-op, and making the advertisement depend on
 // the toggle would put a deployment flag into the CORS answer for no gain.
-var corsExposeHeaders = strings.Join(append([]string{headerResKey, HeaderGatewayInstance}, passthroughResponseHeaders...), ", ")
+var corsExposeHeaders = strings.Join(append(
+	[]string{headerResKey, headerProvider, HeaderGatewayInstance}, passthroughResponseHeaders...), ", ")
 
 // ParseOrigins splits a comma-separated origin allowlist into trimmed, non-empty
 // patterns. An empty (or all-blank) value yields nil — no origin matches, i.e.
