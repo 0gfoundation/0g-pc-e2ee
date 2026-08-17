@@ -41,8 +41,13 @@ writes this replica's `instance_id`/`app_id` once at boot and exits, and
   where HAProxy resolves the `gateway` backend before it exists. (A *later*
   recreation of the gateway with a new address still needs an ingress restart —
   `depends_on` covers startup only.)
-- dstack-ingress serves `/evidences/` (`quote.json`, `cert-<DOMAIN>.pem`,
-  `acme-account.json`, `sha256sum.txt`). The quote's `report_data` holds
+- dstack-ingress **produces** the evidence bundle (`quote.json`, `cert-<DOMAIN>.pem`,
+  `acme-account.json`, `sha256sum.txt`) onto the shared `evidences` volume, and the
+  **gateway serves it** at `/evidences/` from a read-only mount of that volume
+  (`EVIDENCE_SERVER=false` / `ZG_GATEWAY_EVIDENCE_DIR` in the compose). Same path,
+  same bytes, plus the `Access-Control-Allow-Origin: *` that the upstream image had no
+  way to send — see [Public evidence bundle](#public-evidence-bundle-evidences) below.
+  The quote's `report_data` holds
   `SHA-256(sha256sum.txt)`, and `sha256sum.txt` covers the served certificate; its
   `mr_config_id` commits to `compose_hash`, the SHA-256 of the app-compose manifest
   that embeds this compose file verbatim (`app_id` is its leading 20 bytes). So one
@@ -405,6 +410,67 @@ TLS then terminates in the Phala-operated dstack gateway under a shared cluster
 wildcard certificate, so there is **no binding to our app** and none of the
 attestation above applies. Development only.
 
+## Public evidence bundle (`/evidences/`)
+
+The four files are **produced by dstack-ingress** and **served by the gateway**. Two
+compose settings make that split:
+
+| Setting | Container | Effect |
+|---|---|---|
+| `EVIDENCE_SERVER=false` | dstack-ingress | stops its built-in `mini_httpd` **and** the HAProxy path ACL in front of it. Bundle *generation* is unconditional upstream, so the volume's contents are unchanged. |
+| `ZG_GATEWAY_EVIDENCE_DIR=/evidences` | gateway | serves that volume (mounted `:ro`) at `/evidences/`, with `Access-Control-Allow-Origin: *`. |
+
+**Why.** The upstream ingress image sends no CORS header on those responses and
+exposes no knob to add one — it is a pinned digest — so no web page could read the
+bundle whose entire purpose is public verification ([#73](https://github.com/0gfoundation/0g-pc-e2ee/issues/73)).
+`curl` and `pcverify` were unaffected, which is why it stayed invisible. The move
+also drops a connection-level routing quirk: the HAProxy ACL matched on the **first
+16 bytes of a connection**, so on a reused keep-alive connection a bundle fetch and
+an API call could not both be served.
+
+**Why the wildcard is safe, and why it is separate from `ZG_GATEWAY_ALLOWED_ORIGINS`.**
+The bundle is static public data with no cookie, no credential, and no per-caller
+variation; `*` is mutually exclusive with `Access-Control-Allow-Credentials`, so
+browsers send these requests without ambient credentials. Anyone can already `curl`
+the same bytes. The origin allowlist, by contrast, governs *who may drive sealed
+inference through the enclave* — a narrower, trust-relevant decision — so the two
+policies are deliberately not the same list, and the evidence route is wired ahead of
+the CORS middleware rather than through it.
+
+**Why serving it from the gateway is not a trust regression.** The bundle is
+self-authenticating: the quote is TDX-signed, its `report_data` commits to
+`sha256sum.txt`, which covers the certificate and the ACME account, and the
+endpoint-binding step compares the published certificate against the one the
+caller's *own* TLS session negotiated. Tampering fails verification and withholding
+fails closed, so which container hands over the bytes is not part of what is proven.
+The mount is read-only: the container that serves the bundle cannot rewrite what the
+ingress attested to.
+
+**Operationally:** files are read per request, so a certificate renewal is picked up
+with no restart. Before the ingress finishes its first ACME run the bundle is empty
+and `/evidences/` answers 404 (previously: a 503 from HAProxy with no backend).
+`pcverify` and every published `curl` recipe are unchanged — the path is
+`/evidences/` and must stay there; it is hardcoded in `client/evidence` and in
+third-party verifiers.
+
+**Still browser-unreachable:** endpoint binding. JS cannot read the peer certificate
+of its own TLS connection — no API exposes it — so a web page can establish *code*
+identity from the bundle but not *endpoint* identity. `pcverify` remains the only
+complete check.
+
+Neither variable is a `${…}` reference, so **`allowed_envs` is unchanged** and blue /
+green stay identical on that axis (`blue-green.md`). Both sides do need the same
+compose, as always. Smoke-test after deploying:
+
+```sh
+# the header must be present, and identical from any origin (or none)
+curl -sSI -H 'Origin: https://example.invalid' "https://<DOMAIN>/evidences/quote.json" \
+  | grep -i access-control-allow-origin      # expect: access-control-allow-origin: *
+
+# and the unchanged command-line path must still work end to end
+pcverify -gateway <DOMAIN>
+```
+
 ## Pin the image digest
 
 > **Development phase:** the checked-in compose currently references the gateway
@@ -653,11 +719,14 @@ and warmer liveness).
   are the secrets to supply, but the `cert-data` volume holds material just as
   sensitive — the TLS private key and the ACME account key. It never leaves the
   CVM; do not snapshot or export it. The `evidences` volume is public by design.
-- **Attestation** comes entirely from dstack-ingress's `/evidences/`. The gateway
-  exposes no attestation endpoint of its own and signs no responses of its own:
-  its `app_id`-covered image is already attested by the ingress cert-binding
-  quote, and inference authenticity rides each provider's own SPEC §8 signature
-  (verified via `ZG_GATEWAY_VERIFY_RESPONSES`). See
+- **Attestation** comes entirely from dstack-ingress's evidence bundle — it *produces*
+  every byte of it, including the quote; the gateway only *serves* the finished bundle
+  over HTTP (see [Public evidence bundle](#public-evidence-bundle-evidences), and note
+  that a self-authenticating bundle does not trust whoever transports it). The gateway
+  emits no quote of its own and signs no responses of its own: its `app_id`-covered
+  image is already attested by the ingress cert-binding quote, and inference
+  authenticity rides each provider's own SPEC §8 signature (verified via
+  `ZG_GATEWAY_VERIFY_RESPONSES`). See
   [`cloud-gateway.md`](../../docs/design/cloud-gateway.md) §6.
 - The gateway holds no pinned provider key: it routes per request and derives
   each provider's enc key + signer from the broker. The router base URL is

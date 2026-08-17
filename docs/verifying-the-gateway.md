@@ -164,7 +164,11 @@ load-bearing.
 The enclave publishes an *evidence bundle* at `https://<domain>/evidences/`. It is
 produced by **dstack-ingress**, which runs in the same CVM and terminates your TLS; the
 gateway process issues no quote of its own, because one quote over the whole CVM already
-covers it. So "the quote" below is always the ingress's cert-binding quote.
+covers it. So "the quote" below is always the ingress's cert-binding quote. (The gateway
+container is what *serves* those files, so that they carry
+`Access-Control-Allow-Origin: *` and a web page can read them too. That is a transport
+detail: every check below is a cryptographic one on the bytes, so none of them trusts
+whoever handed them over.)
 
 | File | What it is |
 |------|-----------|
