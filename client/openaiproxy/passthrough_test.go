@@ -83,8 +83,13 @@ func TestSetPassthrough(t *testing.T) {
 	setPassthrough(rec, src)
 	got := rec.Header()
 
-	if got.Get("X-Provider") != "0xprovider" {
-		t.Errorf("X-Provider not surfaced: %q", got.Get("X-Provider"))
+	// X-Provider is NOT relayed. The router's version of it is an unauthenticated
+	// assertion about where it routed, which the gateway never checked against its own
+	// pin — so the gateway emits its own (setProvider) rather than forwarding this one.
+	// A router that routed honestly but misreported the address would otherwise have
+	// its claim passed through untouched.
+	if got.Get("X-Provider") != "" {
+		t.Errorf("the router's X-Provider must not be relayed, got %q", got.Get("X-Provider"))
 	}
 	if got.Get("Zg-Failure-Source") != "upstream" {
 		t.Errorf("ZG-Failure-Source not surfaced: %q", got.Get("Zg-Failure-Source"))
@@ -122,5 +127,55 @@ func TestUpstreamHeader(t *testing.T) {
 	}
 	if got := upstreamHeader(errors.New("plain")); got != nil {
 		t.Errorf("upstreamHeader(non-core err) should be nil, got %v", got)
+	}
+}
+
+// TestSetProvider checks the gateway-originated provider header: it carries the
+// address the CLIENT pinned, from core.ResponseMeta, and never anything the
+// upstream said about itself.
+func TestSetProvider(t *testing.T) {
+	rec := httptest.NewRecorder()
+	setProvider(rec, &core.ResponseMeta{Provider: "0xpinned"})
+	if got := rec.Header().Get("X-Provider"); got != "0xpinned" {
+		t.Errorf("X-Provider = %q, want the pinned address", got)
+	}
+}
+
+// This is the issue's acceptance criterion, stated as a test: a router that routes
+// honestly but LIES about where it routed must not be able to put its lie in front
+// of the user. The upstream header block names one provider, the client pinned
+// another; the user must see the pin.
+func TestSetProvider_IgnoresUpstreamClaim(t *testing.T) {
+	rec := httptest.NewRecorder()
+	upstream := http.Header{"X-Provider": {"0xrouter-lied"}}
+
+	// Both run on the success path, in this order.
+	setPassthrough(rec, upstream)
+	setProvider(rec, &core.ResponseMeta{Provider: "0xpinned"})
+
+	got := rec.Header().Values("X-Provider")
+	if len(got) != 1 || got[0] != "0xpinned" {
+		t.Errorf("X-Provider = %v, want exactly [0xpinned] — the router's claim must not survive", got)
+	}
+}
+
+// Absent beats fabricated: with no pinned address (direct-broker mode, where there
+// is no router to pin through) the header is omitted rather than guessed at. Same
+// for a nil meta, which is the failed-request shape.
+func TestSetProvider_OmittedWithoutAPin(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		meta *core.ResponseMeta
+	}{
+		{"no address", &core.ResponseMeta{}},
+		{"nil meta", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			setProvider(rec, tc.meta)
+			if got := rec.Header().Get("X-Provider"); got != "" {
+				t.Errorf("X-Provider = %q, want absent", got)
+			}
+		})
 	}
 }

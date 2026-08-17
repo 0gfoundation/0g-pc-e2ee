@@ -46,19 +46,33 @@ func setResKey(w http.ResponseWriter, meta *core.ResponseMeta) {
 	}
 }
 
+// headerProvider names the provider a request was routed to. The gateway
+// ORIGINATES it from the address the client itself pinned
+// (core.ResponseMeta.Provider) rather than forwarding the upstream's same-named
+// header — see setProvider for what the value does and does not assert. The name
+// is kept as the router's so existing clients keep reading the field they already
+// read; only its provenance changes, from an assertion to a fact.
+const headerProvider = "X-Provider"
+
 // passthroughResponseHeaders is the curated set of upstream (router) response
 // headers the gateway surfaces back to its own user. All are non-sensitive
 // operational metadata a thin client needs to behave correctly: the broker's
-// fault attribution (and its legacy alias), the served-provider address, the
-// per-IP rate-limit counters with their reset/Retry-After hints, and the
-// request-correlation id for bug reports. ZG-Res-Key is deliberately absent —
-// setResKey surfaces it separately. Everything not on this list stays inside the
-// gateway, so an upstream header can never leak untrusted or identifying detail
-// to the user by default.
+// fault attribution (and its legacy alias), the per-IP rate-limit counters with
+// their reset/Retry-After hints, and the request-correlation id for bug reports.
+//
+// Two headers are absent from the list but still reach the user, by different
+// routes and for different reasons. ZG-Res-Key is RELAYED, just not from here:
+// setResKey re-emits the upstream's value out of core.ResponseMeta, which is where
+// the core captured it. X-Provider is ORIGINATED: setProvider ignores the
+// upstream's same-named header entirely and emits the client's own routing pin.
+// The distinction is the point — one is the provider's value carried faithfully,
+// the other is ours because the upstream's could not be trusted to state it.
+//
+// Everything not on this list stays inside the gateway, so an upstream header can
+// never leak untrusted or identifying detail to the user by default.
 var passthroughResponseHeaders = []string{
 	"ZG-Failure-Source",
 	"X-ZG-Failure-Source",
-	"X-Provider",
 	"Retry-After",
 	"X-Request-ID",
 	"X-RateLimit-Limit-Requests",
@@ -67,6 +81,62 @@ var passthroughResponseHeaders = []string{
 	"X-RateLimit-Limit-Day",
 	"X-RateLimit-Remaining-Day",
 	"X-RateLimit-Reset-Day",
+}
+
+// setProvider emits the address the client resolved, sealed this request to, and
+// pinned the route to with X-0G-Provider-Address.
+//
+// Read that literally: it is what the request was SEALED TO and PINNED TO, not
+// proof of who produced the bytes. The response is HPKE-sealed to the client's
+// ephemeral public key, which the request carries in its `_e2ee` block —
+// AAD-protected, so an intermediary cannot swap it, but readable, and reading it is
+// all one needs to seal a response the client will open (HPKE base mode does not
+// authenticate the sender). Who answered is established by the §8 signature, and
+// only when the deployment enables it (-verify-responses, off by default).
+//
+// So with verification off this header answers "who did we address" and cannot
+// answer "who replied"; with it on, a response that reaches the caller at all is
+// one whose signature recovered to the grounded signer, and the two coincide.
+//
+// Being careful here is the same discipline as the change itself: the previous
+// value was wrong because it stated more than the system knew, and a doc comment
+// that overstates what this one means would reintroduce that at the layer above.
+//
+// It replaces forwarding the router's own X-Provider, which was an
+// unauthenticated assertion the gateway never checked against its own pin. Nothing
+// in the trust chain would have caught a router that routed honestly and then
+// misreported where it had routed: the response signature still verifies, because
+// the routing was never changed. The value was therefore wrong in exactly the case
+// a user would most want it right, and re-emitting it from the pin makes "this
+// field names the provider we sealed to" true by construction instead of by a
+// runtime comparison that could be forgotten.
+//
+// What it asserts is available before any byte of the body, which is why it can be
+// set on the streaming path too: the claim is "we sealed this to X and pinned the
+// route to X", which is settled once a provider is chosen. It is deliberately not
+// a claim that X's §8 signature verified — that is decided after the final frame,
+// long after headers must be flushed. Whether the pinned address is additionally
+// grounded on-chain is a property of the deployment's trust mode (see
+// docs/design/trust-chain.md hop 5), not of this header.
+//
+// Like setResKey it must run before WriteHeader or the first body byte, and it
+// emits nothing when the meta carries no address: direct-broker mode, where there
+// is no router to pin through, and every failed request, since the core records
+// this only on the path that produced a delivered response.
+//
+// That second case is a deliberate trade, not an oversight. An error is not always
+// "nobody answered" — a 429 means a provider did — so dropping the header there
+// does cost a caller the attribution it used to get on a rate limit. But what it
+// used to get was the router's unverified claim, and the honest replacement is not
+// available: with the fallback chain, a request may have tried several candidates,
+// and naming one of them would raise the same question this change exists to close
+// — which provider is this, really. Absent beats both fabricated and ambiguous.
+// The error envelope's _0g.source and the passed-through ZG-Failure-Source still
+// attribute the failure to the router or the provider side.
+func setProvider(w http.ResponseWriter, meta *core.ResponseMeta) {
+	if meta != nil && meta.Provider != "" {
+		w.Header().Set(headerProvider, meta.Provider)
+	}
 }
 
 // setPassthrough re-emits the curated subset of an upstream response header
@@ -251,6 +321,7 @@ func Register(mux *http.ServeMux, c *core.Client, opts ...Option) {
 		}
 		setPassthrough(w, meta.Header)
 		setResKey(w, meta)
+		setProvider(w, meta)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(out)
 	})
@@ -385,9 +456,12 @@ func serveStream(ctx context.Context, w http.ResponseWriter, c *core.Client, req
 			return
 		}
 		// The core records the metadata at stream commit, before the first frame
-		// reaches this callback, so it is available here before we write headers.
+		// reaches this callback, so it is available here before we write headers —
+		// including which provider the stream committed to, which is settled at that
+		// point and cannot change for the rest of the stream.
 		setPassthrough(w, meta.Header)
 		setResKey(w, meta)
+		setProvider(w, meta)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.Header().Set("X-Accel-Buffering", "no") // ask a fronting proxy (nginx) not to buffer

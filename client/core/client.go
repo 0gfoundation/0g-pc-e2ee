@@ -442,7 +442,7 @@ func (c *Client) completeOnce(ctx context.Context, provider Provider, req wire.R
 	// independent §8 audit and a curated header subset to its own user. Recorded
 	// only here, on the success path, so a discarded fallback attempt never leaves
 	// stale metadata behind.
-	recordMeta(ctx, resp.Header)
+	recordMeta(ctx, provider, resp.Header)
 	return out, false, nil
 }
 
