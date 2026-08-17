@@ -382,10 +382,12 @@ precisely because nothing was tampered with. So the gateway does not relay it: i
 the address it resolved and pinned (`core.ResponseMeta.Provider`, surfaced by
 `openaiproxy.setProvider`), which makes "this field names the provider we sealed to"
 true by construction rather than by a comparison someone has to remember to make.
-Note what that sentence does and does not say. It names where the request was
-**addressed**, not who produced the bytes: a sealed response is HPKE-sealed to the
-client's ephemeral key, which travels in cleartext, so opening one proves possession
-of that key and not the sender's identity. Who *answered* is established by the §8
+Note what that sentence does and does not say. It names what the request was
+**sealed to and pinned to**, not who produced the bytes: the response is HPKE-sealed
+to `client_eph_pub` (SPEC §7), which the request carries in `_e2ee` (SPEC §5) —
+AAD-protected, so an intermediary cannot swap it, but readable, and reading it is all
+one needs to seal a response the client will open, since HPKE base mode does not
+authenticate the sender. Who *answered* is established by the §8
 signature (hop 11, `-verify-responses`) and whether that answerer is the registered
 provider by the on-chain grounding (hop 5, `-onchain-enforce`) — both properties of
 the deployment's trust mode, not of this header. Anything presenting the field as a

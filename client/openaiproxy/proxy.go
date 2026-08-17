@@ -86,15 +86,17 @@ var passthroughResponseHeaders = []string{
 // setProvider emits the address the client resolved, sealed this request to, and
 // pinned the route to with X-0G-Provider-Address.
 //
-// Read that literally: it is where the request was ADDRESSED, not proof of who
-// produced the bytes. A sealed response is HPKE-sealed to the client's ephemeral
-// public key, which travels in the envelope's cleartext, so opening one proves
-// possession of that key — which the router saw — and not the provider's identity.
-// Only the §8 signature establishes who answered, and only when the deployment
-// enables it (-verify-responses, off by default). So with verification off this
-// header answers "who did we address" and cannot answer "who replied"; with it on,
-// a response that reaches the caller at all is one whose signature recovered to the
-// grounded signer, and the two coincide.
+// Read that literally: it is what the request was SEALED TO and PINNED TO, not
+// proof of who produced the bytes. The response is HPKE-sealed to the client's
+// ephemeral public key, which the request carries in its `_e2ee` block —
+// AAD-protected, so an intermediary cannot swap it, but readable, and reading it is
+// all one needs to seal a response the client will open (HPKE base mode does not
+// authenticate the sender). Who answered is established by the §8 signature, and
+// only when the deployment enables it (-verify-responses, off by default).
+//
+// So with verification off this header answers "who did we address" and cannot
+// answer "who replied"; with it on, a response that reaches the caller at all is
+// one whose signature recovered to the grounded signer, and the two coincide.
 //
 // Being careful here is the same discipline as the change itself: the previous
 // value was wrong because it stated more than the system knew, and a doc comment

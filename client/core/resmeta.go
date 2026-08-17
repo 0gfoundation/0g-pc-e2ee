@@ -16,8 +16,8 @@ type responseMetaKey struct{}
 //
 // It carries the ZG-Res-Key handle, so a front end (the sidecar or gateway) can
 // re-expose it to its own user, who can then fetch the §8 signature from the
-// broker and audit it independently; the provider this response actually came
-// from; and the raw upstream header block. None of it is key material, so
+// broker and audit it independently; the provider this request was sealed to and
+// pinned to; and the raw upstream header block. None of it is key material, so
 // surfacing it is safe even on the multi-tenant gateway.
 type ResponseMeta struct {
 	// ResKey is the provider's ZG-Res-Key response header (the broker's chatKey).
@@ -25,15 +25,22 @@ type ResponseMeta struct {
 	// signature), which the caller treats as "no handle", not an error.
 	ResKey string
 
-	// Provider is the router-facing address this request was ADDRESSED to —
-	// Provider.Address, the value the client itself resolved and sent as the
+	// Provider is the router-facing address this request was SEALED TO and PINNED TO
+	// — Provider.Address, the value the client itself resolved and sent as the
 	// X-0G-Provider-Address routing pin, NOT anything the upstream reported back.
 	//
-	// It is where the request went, not proof of who answered: a sealed response is
-	// HPKE-sealed to the client's ephemeral key, which travels in cleartext, so
-	// opening one does not identify the sender. Only §8 verification
-	// (WithResponseVerification) establishes that, and it is off by default — a
-	// caller that surfaces this value should say what it means accordingly.
+	// Say it that way, not "the provider that served this response", because only
+	// the first is established here. The response is HPKE-sealed to client_eph_pub
+	// (SPEC §7), which the request carries in its `_e2ee` block (SPEC §5):
+	// AAD-protected, so an intermediary cannot SWAP it, but plainly READABLE — and
+	// reading it is all one needs to seal a response the client will open, since HPKE
+	// base mode does not authenticate the sender. What binds the delivered bytes to
+	// this provider is the §8 signature (trust-chain hop 11,
+	// WithResponseVerification), which is OFF by default.
+	//
+	// So: with verification on, sealed-to and served-by coincide, and a caller may
+	// say either. With it off, only the pin is established, and a caller that
+	// presents this as "who served you" is stating more than it knows.
 	//
 	// That distinction is the point of surfacing it. The router also states a served
 	// provider in its own X-Provider response header, but that is an unauthenticated
@@ -73,9 +80,9 @@ func WithResponseMeta(ctx context.Context, m *ResponseMeta) context.Context {
 }
 
 // recordMeta stores per-response metadata into the sink carried by ctx, if one is
-// attached: the ZG-Res-Key handle, the address of the provider this response came
-// from, and a clone of the full header block for a front end to surface a curated
-// subset. It is called only on the path that produces the response the caller
+// attached: the ZG-Res-Key handle, the address this attempt was sealed to and
+// pinned to, and a clone of the full header block for a front end to surface a
+// curated subset. It is called only on the path that produces the response the caller
 // receives — the successful non-stream attempt, or a committed stream — so the
 // recorded data always matches the delivered response and is never left stale by a
 // discarded fallback attempt. A missing ZG-Res-Key records the empty string.
