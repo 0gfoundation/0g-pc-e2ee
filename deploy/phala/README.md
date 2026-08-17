@@ -453,6 +453,15 @@ and `/evidences/` answers 404 (previously: a 503 from HAProxy with no backend).
 `/evidences/` and must stay there; it is hardcoded in `client/evidence` and in
 third-party verifiers.
 
+A `ZG_GATEWAY_EVIDENCE_DIR` that is missing or unreadable **fails the gateway's boot**
+instead of serving 404s quietly: an unreachable bundle has no signal otherwise, which
+is how #73 survived as long as it did. An *empty* directory passes — that is the
+normal pre-ACME state — so the check is presence and readability only, never contents.
+Note the blast radius: the gateway exiting takes the endpoint down entirely, which is
+the right trade for a path that comes from the measured compose right next to the
+volume it names (a mismatch is a deploy error, caught on the first staging boot), but
+it is why the check stays that narrow.
+
 **Still browser-unreachable:** endpoint binding. JS cannot read the peer certificate
 of its own TLS connection — no API exposes it — so a web page can establish *code*
 identity from the bundle but not *endpoint* identity. `pcverify` remains the only

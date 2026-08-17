@@ -220,6 +220,18 @@ func main() {
 		}
 	}
 
+	// Same stance for the evidence bundle's directory: a mount this process cannot
+	// read would answer 404 to every verifier and look, from outside, exactly like
+	// the CORS hole this route exists to close (#73) — silent, and with no signal
+	// until someone tries to verify the deployment. See checkEvidenceDir for why the
+	// check is narrow, and for the blast radius of exiting here.
+	if *evidenceDir != "" {
+		if err := checkEvidenceDir(*evidenceDir); err != nil {
+			logger.Error("invalid -evidence-dir", "dir", *evidenceDir, "err", err)
+			os.Exit(1)
+		}
+	}
+
 	// Start the background quote-cache warmer (a no-op unless -warm is set) so
 	// requests hit a warm cache instead of paying the DCAP verify inline; stop it
 	// on shutdown before the process exits.
@@ -273,8 +285,14 @@ func main() {
 	// not exist. Logging all three puts the assumption next to what it produced, so
 	// comparing it against the CVM's real shape is a glance rather than an
 	// investigation. math.MaxInt64 means unset.
+	//
+	// evidence_dir is on this line because the route is invisible otherwise: it is
+	// mounted or not depending on one env var, and an operator debugging "why does
+	// /evidences 404" needs to see which side of that the process is on. Empty means
+	// the route is not mounted at all.
 	logger.Info("gateway listening", "listen", *f.Listen, "router_url", *f.RouterURL,
 		"cors_allowed_origins", origins, "max_inflight", *maxInFlight,
+		"evidence_dir", *evidenceDir,
 		"go_memlimit_bytes", currentMemoryLimit(), "gomaxprocs", runtime.GOMAXPROCS(0))
 	err = proxycli.Serve(srv, logger)
 	stopWarmer()

@@ -1,11 +1,57 @@
 package main
 
 import (
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 )
+
+// checkEvidenceDir verifies that a configured bundle directory is present and
+// readable BY THIS PROCESS, so a bad mount fails the boot instead of answering 404
+// to every verifier. A silently unreachable evidence bundle is the exact class of
+// bug issue #73 is about, and it has no signal: `pcverify` reports a fetch error
+// that looks like a hundred other things, and nobody notices for weeks.
+//
+// It deliberately does NOT require the bundle to be POPULATED. The gateway comes up
+// before dstack-ingress finishes its first ACME run — the ingress gates on the
+// gateway's health, so it must — and an empty directory is the normal early state.
+//
+// Blast radius, stated rather than glossed: main exits on a failure here, which
+// takes the whole endpoint down (no sealed inference either), not just this route.
+// That is the right trade for a value that comes from the measured compose next to
+// the volume it names — a mismatch is a deploy error, caught on the first staging
+// boot, not something that appears in steady state — but it is exactly why the check
+// stays this narrow: presence and readability, never contents.
+func checkEvidenceDir(dir string) error {
+	// Open, not Stat: this also catches a directory this uid cannot traverse. The
+	// gateway image runs as `nonroot` while the volume and its files are created by
+	// the (root) ingress container, so "can the serving process actually read it" is a
+	// different question from "does it exist".
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%s is not a directory", dir)
+	}
+	// Opening a directory can succeed without read permission on it; the first read
+	// is what proves the index and every file lookup under it will work. An empty
+	// directory returns io.EOF here, which is the expected pre-ACME state above.
+	if _, err := f.Readdirnames(1); err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("read %s: %w", dir, err)
+	}
+	return nil
+}
 
 // evidencePrefix is the PUBLIC path of the evidence bundle, and it is a
 // compatibility constant, not a choice: pcverify builds its requests as

@@ -241,6 +241,52 @@ func TestEvidenceNoTraversal(t *testing.T) {
 	}
 }
 
+// checkEvidenceDir is what turns a bad mount into a boot failure instead of a
+// bundle that 404s forever. An EMPTY directory must pass: the gateway starts before
+// dstack-ingress has finished its first ACME run.
+func TestCheckEvidenceDir(t *testing.T) {
+	t.Run("populated", func(t *testing.T) {
+		if err := checkEvidenceDir(evidenceBundle(t)); err != nil {
+			t.Errorf("checkEvidenceDir(populated) = %v, want nil", err)
+		}
+	})
+	t.Run("empty is fine (pre-ACME)", func(t *testing.T) {
+		if err := checkEvidenceDir(t.TempDir()); err != nil {
+			t.Errorf("checkEvidenceDir(empty) = %v, want nil", err)
+		}
+	})
+	t.Run("missing", func(t *testing.T) {
+		if err := checkEvidenceDir(filepath.Join(t.TempDir(), "nope")); err == nil {
+			t.Error("checkEvidenceDir(missing) = nil, want an error")
+		}
+	})
+	t.Run("not a directory", func(t *testing.T) {
+		file := filepath.Join(t.TempDir(), "quote.json")
+		if err := os.WriteFile(file, []byte("{}"), 0o644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if err := checkEvidenceDir(file); err == nil {
+			t.Error("checkEvidenceDir(file) = nil, want an error")
+		}
+	})
+	t.Run("unreadable", func(t *testing.T) {
+		// The case that motivates opening the directory rather than stat-ing it: the
+		// gateway runs as `nonroot` while the ingress creates the volume as root. Skipped
+		// as root, where the mode is not enforced.
+		if os.Geteuid() == 0 {
+			t.Skip("running as root; directory mode is not enforced")
+		}
+		dir := t.TempDir()
+		if err := os.Chmod(dir, 0o000); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) }) // so TempDir cleanup can remove it
+		if err := checkEvidenceDir(dir); err == nil {
+			t.Error("checkEvidenceDir(unreadable) = nil, want an error")
+		}
+	})
+}
+
 // With no -evidence-dir the route is not mounted at all, so /evidences falls
 // through to the catch-all like any other unknown path. That is what keeps a local
 // run (and any deployment where dstack-ingress still serves the bundle) unchanged.
