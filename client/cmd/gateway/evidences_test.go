@@ -241,6 +241,33 @@ func TestEvidenceNoTraversal(t *testing.T) {
 	}
 }
 
+// What an EMPTY bundle directory actually answers — the state between the gateway
+// coming up and dstack-ingress finishing its first ACME run. The index is a 200 with
+// nothing in it; only the individual files 404. This is pinned because
+// deploy/phala/README.md documents it for exactly the person watching a first deploy,
+// and a doc claim nothing tests is a doc claim that drifts.
+func TestEvidenceEmptyBundle(t *testing.T) {
+	gw := evidenceGateway(t, t.TempDir())
+
+	resp, err := http.Get(gw.URL + "/evidences/")
+	if err != nil {
+		t.Fatalf("get index: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("GET /evidences/ on an empty bundle = %d, want 200 (an empty index)", resp.StatusCode)
+	}
+
+	missing, err := http.Get(gw.URL + "/evidences/quote.json")
+	if err != nil {
+		t.Fatalf("get quote.json: %v", err)
+	}
+	defer missing.Body.Close()
+	if missing.StatusCode != http.StatusNotFound {
+		t.Errorf("GET /evidences/quote.json on an empty bundle = %d, want 404", missing.StatusCode)
+	}
+}
+
 // checkEvidenceDir is what turns a bad mount into a boot failure instead of a
 // bundle that 404s forever. An EMPTY directory must pass: the gateway starts before
 // dstack-ingress has finished its first ACME run.
@@ -269,7 +296,51 @@ func TestCheckEvidenceDir(t *testing.T) {
 			t.Error("checkEvidenceDir(file) = nil, want an error")
 		}
 	})
-	t.Run("unreadable", func(t *testing.T) {
+	t.Run("partial bundle (mid-ACME)", func(t *testing.T) {
+		// acme-account.json lands before the quote exists, so a directory holding only
+		// some of the four files must still pass — the check tolerates absence.
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "acme-account.json"), []byte("{}"), 0o644); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if err := checkEvidenceDir(dir); err != nil {
+			t.Errorf("checkEvidenceDir(partial) = %v, want nil", err)
+		}
+	})
+	t.Run("unreadable quote.json", func(t *testing.T) {
+		// The gap this closes: upstream chmods 644 onto acme-account.json and
+		// cert-<domain>.pem but writes quote.json and sha256sum.txt with a bare shell
+		// redirect, so their mode rides the ingress container's umask. A readable
+		// DIRECTORY holding an unreadable quote.json would otherwise pass the boot check
+		// and 403 every verifier.
+		if os.Geteuid() == 0 {
+			t.Skip("running as root; file mode is not enforced")
+		}
+		dir := evidenceBundle(t)
+		quote := filepath.Join(dir, "quote.json")
+		if err := os.Chmod(quote, 0o000); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(quote, 0o644) })
+		if err := checkEvidenceDir(dir); err == nil {
+			t.Error("checkEvidenceDir(unreadable quote.json) = nil, want an error")
+		}
+	})
+	t.Run("unreadable sha256sum.txt", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("running as root; file mode is not enforced")
+		}
+		dir := evidenceBundle(t)
+		manifest := filepath.Join(dir, "sha256sum.txt")
+		if err := os.Chmod(manifest, 0o000); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(manifest, 0o644) })
+		if err := checkEvidenceDir(dir); err == nil {
+			t.Error("checkEvidenceDir(unreadable sha256sum.txt) = nil, want an error")
+		}
+	})
+	t.Run("unreadable directory", func(t *testing.T) {
 		// The case that motivates opening the directory rather than stat-ing it: the
 		// gateway runs as `nonroot` while the ingress creates the volume as root. Skipped
 		// as root, where the mode is not enforced.

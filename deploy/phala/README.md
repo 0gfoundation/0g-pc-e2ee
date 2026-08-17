@@ -447,18 +447,38 @@ The mount is read-only: the container that serves the bundle cannot rewrite what
 ingress attested to.
 
 **Operationally:** files are read per request, so a certificate renewal is picked up
-with no restart. Before the ingress finishes its first ACME run the bundle is empty
-and `/evidences/` answers 404 (previously: a 503 from HAProxy with no backend).
-`pcverify` and every published `curl` recipe are unchanged — the path is
-`/evidences/` and must stay there; it is hardcoded in `client/evidence` and in
+with no restart. `pcverify` and every published `curl` recipe are unchanged — the path
+is `/evidences/` and must stay there; it is hardcoded in `client/evidence` and in
 third-party verifiers.
 
-A `ZG_GATEWAY_EVIDENCE_DIR` that is missing or unreadable **fails the gateway's boot**
-instead of serving 404s quietly: an unreachable bundle has no signal otherwise, which
-is how #73 survived as long as it did. An *empty* directory passes — that is the
-normal pre-ACME state — so the check is presence and readability only, never contents.
-Note the blast radius: the gateway exiting takes the endpoint down entirely, which is
-the right trade for a path that comes from the measured compose right next to the
+**What a first deploy looks like.** The gateway comes up before dstack-ingress has
+finished its first ACME run (it must — the ingress gates on the gateway's health), so
+for the first minutes the bundle is empty. In that window:
+
+| request | answer |
+|---|---|
+| `/evidences/` | **200** with an empty directory index — *not* a 404 |
+| `/evidences/quote.json` | 404, and likewise for the other three files |
+
+(Previously HAProxy answered 503 here, because the ingress does not start its evidence
+server until the bundle is finalized.) A file that exists but the gateway cannot read
+answers **403**, not 404 — so the access log separates "not written yet" from "written
+and unreachable" without anyone having to guess.
+
+**Fail-loud on a bad mount.** A `ZG_GATEWAY_EVIDENCE_DIR` that is missing, not a
+directory, or unreadable **fails the gateway's boot** rather than serving 404s quietly:
+an unreachable bundle has no signal otherwise, which is how #73 survived as long as it
+did. The check also opens `quote.json` and `sha256sum.txt` when they exist, because
+upstream chmods 644 onto `acme-account.json` and `cert-<DOMAIN>.pem` but writes those
+two with a bare shell redirect — their mode rides the ingress container's umask, so
+they are the two the gateway's `nonroot` uid could lose access to without anything else
+changing, and they are the two that matter most (the quote, and the manifest its
+`report_data` commits to). Absent files are skipped, so the empty and partially-written
+states above still pass; it is presence and readability only, never contents. Note it
+is a *boot*-time check: a renewal rewrites both files under the same umask, so a mode
+regression at ~60 days shows up as 403s rather than a failed boot. Note also the blast
+radius — the gateway exiting takes the endpoint down entirely, not just this route,
+which is the right trade for a path that sits in the measured compose next to the
 volume it names (a mismatch is a deploy error, caught on the first staging boot), but
 it is why the check stays that narrow.
 

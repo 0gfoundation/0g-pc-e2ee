@@ -4,26 +4,46 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 )
 
-// checkEvidenceDir verifies that a configured bundle directory is present and
-// readable BY THIS PROCESS, so a bad mount fails the boot instead of answering 404
-// to every verifier. A silently unreachable evidence bundle is the exact class of
-// bug issue #73 is about, and it has no signal: `pcverify` reports a fetch error
-// that looks like a hundred other things, and nobody notices for weeks.
+// evidenceUmaskFiles are the bundle files whose mode is NOT set explicitly by
+// dstack-ingress. It chmods 644 onto `acme-account.json` and `cert-<domain>.pem`
+// (both arrive via `cp`), but writes these two with a plain shell redirect — so
+// their mode is whatever the ingress container's umask happens to be, and these are
+// the two the gateway's `nonroot` uid could lose access to without anything else
+// changing. They are also the two that matter most: the quote itself and the
+// manifest its report_data commits to.
+var evidenceUmaskFiles = []string{"quote.json", "sha256sum.txt"}
+
+// checkEvidenceDir verifies that a configured bundle directory, and the files whose
+// readability is not guaranteed by upstream, can actually be read BY THIS PROCESS —
+// so a bad mount fails the boot instead of answering 404/403 to every verifier. A
+// silently unreachable evidence bundle is the exact class of bug issue #73 is about,
+// and it has no signal: `pcverify` reports a fetch error that looks like a hundred
+// other things, and nobody notices for weeks.
 //
 // It deliberately does NOT require the bundle to be POPULATED. The gateway comes up
 // before dstack-ingress finishes its first ACME run — the ingress gates on the
-// gateway's health, so it must — and an empty directory is the normal early state.
+// gateway's health, so it must — and an empty directory, or one holding only some of
+// the four files, is the normal early state. An absent file is therefore skipped; an
+// existing one that cannot be OPENED is a hard failure.
+//
+// This is a BOOT-time check, and that bound is real: a renewal rewrites both files
+// under the same umask, so a mode regression at ~60 days would not be caught here.
+// It does at least surface distinguishably — http.FileServer maps a permission error
+// to 403, not 404 — so the access log separates "not written yet" from "written and
+// unreadable" without anyone having to guess.
 //
 // Blast radius, stated rather than glossed: main exits on a failure here, which
 // takes the whole endpoint down (no sealed inference either), not just this route.
-// That is the right trade for a value that comes from the measured compose next to
+// That is the right trade for a mount that comes from the measured compose next to
 // the volume it names — a mismatch is a deploy error, caught on the first staging
 // boot, not something that appears in steady state — but it is exactly why the check
 // stays this narrow: presence and readability, never contents.
@@ -49,6 +69,20 @@ func checkEvidenceDir(dir string) error {
 	// directory returns io.EOF here, which is the expected pre-ACME state above.
 	if _, err := f.Readdirnames(1); err != nil && !errors.Is(err, io.EOF) {
 		return fmt.Errorf("read %s: %w", dir, err)
+	}
+	// A readable directory does not imply readable files: these two get no explicit
+	// chmod upstream (see evidenceUmaskFiles). Without this, an unreadable quote.json
+	// would pass the boot check and 403 every verifier — back to a deployment that
+	// looks healthy while verification is entirely broken.
+	for _, name := range evidenceUmaskFiles {
+		ef, err := os.Open(filepath.Join(dir, name))
+		if errors.Is(err, fs.ErrNotExist) {
+			continue // not written yet: the pre-ACME state this check tolerates
+		}
+		if err != nil {
+			return err
+		}
+		ef.Close()
 	}
 	return nil
 }
@@ -79,9 +113,10 @@ const evidenceMaxAge = "43200"
 
 // evidenceRoute serves the public attestation evidence bundle out of dir — the
 // `evidences` volume dstack-ingress writes, mounted read-only here — and delegates
-// every other path to next. With dir empty it returns next unchanged: a local run
-// and the sidecar have no bundle, and an empty directory served at /evidences/
-// would answer 404 where the request should reach the router catch-all instead.
+// every other path to next. With dir unset ("") it returns next unchanged rather than
+// mounting an empty route: a local run and the sidecar have no bundle, and a mounted
+// route answers every /evidences path itself (200 for the index, 404 for a file),
+// which would shadow the catch-all those requests should reach instead.
 //
 // WHY THE GATEWAY SERVES THIS AT ALL. The bundle is produced by dstack-ingress and
 // used to be served by it too, from a mini_httpd behind an HAProxy path ACL. That
