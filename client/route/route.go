@@ -132,6 +132,11 @@ type Router struct {
 	// collateral path. Used only on the quote-verification path (verifier != nil).
 	quoteCache *quoteCache
 	quoteSF    singleflight.Group
+	// warmState is the outcome of the most recent completed warmer sweep — how many
+	// providers it prepared end to end — read by a caller that needs to know whether
+	// this process can serve anything at all (see WarmState).
+	warmMu    sync.Mutex
+	warmState WarmState
 }
 
 // Option customizes a Router.

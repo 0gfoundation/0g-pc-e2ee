@@ -163,6 +163,12 @@ var (
 		Help: "Per-provider on-chain signer refreshes by the warmer, by result (ok|failed). " +
 			"A sustained failed rate means requests are paying the chain RPC themselves.",
 	}, []string{"result"})
+	warmerReadyProviders = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "warmer_ready_providers",
+		Help: "Providers the last warmer sweep prepared end to end (endpoint + quote + " +
+			"on-chain signer). Zero while the process is up means no request could be " +
+			"served — alert on it; it is also what the blue/green standby probe gates on.",
+	})
 	warmerLastSuccess = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "warmer_last_success_timestamp_seconds",
 		Help: "Unix time of the last completed warmer sweep; alert if it stops advancing.",
@@ -192,7 +198,8 @@ func init() {
 		completions, openFailures, verificationFailures,
 		quoteVerify, quoteVerifyDuration, quoteCache, measurementUntrusted,
 		onchainGrounding, onchainRevalidations,
-		warmerSweeps, warmerProviderRefresh, warmerSignerRefresh, warmerLastSuccess,
+		warmerSweeps, warmerProviderRefresh, warmerSignerRefresh,
+		warmerReadyProviders, warmerLastSuccess,
 		collateralCache, collateralFetch, collateralFetchDuration,
 	)
 }
@@ -213,7 +220,7 @@ func Handler() http.Handler {
 // paths the gateway reverse-proxies to the router — collapses to "other".
 func RouteLabel(path string) string {
 	switch path {
-	case "/v1/chat/completions", "/healthz":
+	case "/v1/chat/completions", "/healthz", "/readyz":
 		return path
 	default:
 		return "other"
@@ -286,6 +293,10 @@ func OnChainRevalidation(result string) { onchainRevalidations.WithLabelValues(r
 // WarmerSignerRefresh records one provider's on-chain signer refresh by the
 // warmer (result: ok|failed).
 func WarmerSignerRefresh(result string) { warmerSignerRefresh.WithLabelValues(result).Inc() }
+
+// WarmerReadyProviders records how many providers the last sweep prepared end to
+// end (endpoint resolved, quote verified, on-chain signer read).
+func WarmerReadyProviders(n int) { warmerReadyProviders.Set(float64(n)) }
 
 // WarmerSweep records the outcome of one warmer sweep.
 func WarmerSweep(result string) { warmerSweeps.WithLabelValues(result).Inc() }

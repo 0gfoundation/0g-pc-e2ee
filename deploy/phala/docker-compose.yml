@@ -159,6 +159,14 @@ services:
     # The image is distroless (no shell, no curl), so the probe is the gateway binary
     # itself: `gateway -health` does one GET /healthz against its own listen port.
     # This is what lets dstack-ingress gate on `service_healthy` above.
+    #
+    # /healthz deliberately asserts only "this process is serving HTTP" — NOT that
+    # any provider is reachable. Because the ingress's startup depends on it, a
+    # broader check would keep the ingress down (and its certificate unissued) on a
+    # boot during an upstream outage, instead of coming up and returning honest
+    # errors. The gateway serves /readyz for the stronger question; that is what the
+    # blue/green cutover probes on the standby before moving traffic (blue-green.md,
+    # "Health-checking the standby side").
     healthcheck:
       test: ["CMD", "/usr/local/bin/gateway", "-health"]
       interval: 10s

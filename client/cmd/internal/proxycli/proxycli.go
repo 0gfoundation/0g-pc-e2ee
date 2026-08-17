@@ -423,6 +423,55 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 	return b
 }
 
+// warmStateMaxAge bounds how old the last warmer sweep may be before Readiness
+// stops trusting it. At three intervals (12m by default) a single missed or slow
+// sweep does not flap the answer, while a warmer that has actually stalled — or a
+// process whose sweeps keep failing to enumerate anything — turns not-ready well
+// before an operator would notice by hand.
+const warmStateMaxAge = 3
+
+// Readiness reports whether this process could currently serve a sealed request,
+// as distinct from whether its HTTP server is up. It returns nil when there is
+// nothing to assert — no warmer configured, so no sweep data exists — and callers
+// treat a nil func as "always ready".
+//
+// The signal is the last warmer sweep: at least one provider prepared end to end
+// (endpoint resolved, quote verified, on-chain signer read) and the sweep recent
+// enough to believe. That covers, in one predicate, every reason a freshly started
+// side would fail every request — router catalog unreachable, provider quote
+// endpoints down, chain RPC unreadable — without probing anything itself, so the
+// check costs a mutex and stays safe to call on every poll.
+//
+// It exists for the blue/green standby probe: with on-chain grounding enforced, a
+// side that cannot read the chain serves nothing, and the deploy must not point
+// traffic at it while the live side is still serving from a warm cache. It is
+// deliberately NOT what the container healthcheck asks — see the /healthz vs
+// /readyz split in cmd/gateway.
+func (b *Built) Readiness() func() error {
+	if b.warmInterval <= 0 || b.resolver == nil || b.router == nil {
+		return nil
+	}
+	router, interval := b.router, b.warmInterval
+	return func() error { return readinessFromWarmState(router.WarmState(), interval) }
+}
+
+// readinessFromWarmState is the decision Readiness makes, split from the plumbing
+// so it can be exercised across every sweep state without a live warmer. The
+// reasons are phrased for a human reading a failed probe: switch.sh prints the
+// body, and "0 of 7 prepared" calls for a different look than "no sweep yet".
+func readinessFromWarmState(s route.WarmState, interval time.Duration) error {
+	if s.At.IsZero() {
+		return errors.New("no warmer sweep has completed yet")
+	}
+	if age := time.Since(s.At); age > warmStateMaxAge*interval {
+		return fmt.Errorf("last warmer sweep was %s ago (interval %s)", age.Truncate(time.Second), interval)
+	}
+	if s.Ready == 0 {
+		return fmt.Errorf("no provider is usable: 0 of %d prepared by the last sweep", s.Total)
+	}
+	return nil
+}
+
 // StartWarmer launches the background quote-cache warmer in a goroutine and
 // returns a stop function the caller defers (or calls before exit) to halt the
 // loop and wait for it to drain on shutdown. When -warm was not configured it

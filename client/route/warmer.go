@@ -102,6 +102,42 @@ func (r *Router) refreshQuote(ctx context.Context, endpoint string) error {
 	return nil
 }
 
+// WarmState describes what the most recently completed warmer sweep found. It is
+// the process's answer to "could I serve a sealed request right now?", which is a
+// different question from "is my HTTP server up": a sweep that prepared nothing
+// means every candidate a request materializes would fail, whatever the cause —
+// the router catalog unreachable, provider quote endpoints down, or the chain RPC
+// unreadable. A deployment gate (the blue/green standby probe) wants exactly this,
+// so it never sends traffic to a side that cannot verify anybody.
+type WarmState struct {
+	// At is when the sweep finished. Zero means no sweep has completed yet — a
+	// just-started process, which a caller should treat as not-ready rather than as
+	// ready-by-default.
+	At time.Time
+	// Ready counts providers the sweep prepared END TO END: endpoint resolved, quote
+	// verified and cached, and (when on-chain grounding is configured) the signer
+	// read from the chain. A provider counted here is one a request could actually
+	// be sealed to.
+	Ready int
+	// Total is how many providers the router's catalog listed, so a caller can tell
+	// "nobody is ready" from "there is nobody".
+	Total int
+}
+
+// WarmState returns the outcome of the most recently completed sweep. Safe for
+// concurrent use; the zero value means no sweep has finished yet.
+func (r *Router) WarmState() WarmState {
+	r.warmMu.Lock()
+	defer r.warmMu.Unlock()
+	return r.warmState
+}
+
+func (r *Router) setWarmState(s WarmState) {
+	r.warmMu.Lock()
+	r.warmState = s
+	r.warmMu.Unlock()
+}
+
 // WarmOnce enumerates providers and (re)verifies each so the quote cache is hot,
 // cutting first-request latency. It is a no-op unless quote verification is
 // configured (WithQuoteVerification) and an EndpointResolver is supplied. Per
@@ -109,20 +145,36 @@ func (r *Router) refreshQuote(ctx context.Context, endpoint string) error {
 // serving endpoint from the on-chain registry, then runs the SAME verify+cache
 // path a request uses (so the cache keys align); a failure evicts any stale
 // entry. Individual failures are logged and skipped, never fatal to the sweep.
+//
+// It also records a WarmState for the sweep, so a caller can ask whether this
+// process is currently able to serve anything at all.
 func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 	if r.verifier == nil || endpoints == nil {
 		return
 	}
 	addrs, err := r.listProviderAddrs(ctx)
 	if err != nil {
+		if ctx.Err() != nil {
+			// The enumeration failed because WE are shutting down, which says nothing
+			// about this process's ability to serve. Leave the counters and the warm
+			// state untouched, exactly as the per-provider loop below does — otherwise a
+			// clean shutdown would publish "0 providers ready" on its way out and make a
+			// healthy process look broken to anything reading readiness.
+			return
+		}
 		metrics.WarmerSweep("list_failed")
 		r.logger.Warn("warmer: list providers failed", "err", err)
+		// A sweep that could not even enumerate providers prepared none of them, which
+		// is the honest readiness answer — not "unknown", and certainly not "ready".
+		r.setWarmState(WarmState{At: time.Now()})
 		return
 	}
+	ready := 0
 	for _, addr := range addrs {
 		if ctx.Err() != nil {
 			// A cancelled sweep is neither a success nor a provider failure; leave the
-			// sweep counters untouched and let the next tick record a clean outcome.
+			// sweep counters AND the warm state untouched, so a shutdown cannot make a
+			// healthy process look unready on its way out.
 			return
 		}
 		info, err := endpoints.ServiceInfo(ctx, addr)
@@ -131,9 +183,11 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 			r.logger.Warn("warmer: resolve endpoint failed", "provider", addr, "err", err)
 			continue
 		}
+		prepared := true
 		if err := r.refreshQuote(ctx, info.URL); err != nil {
 			metrics.WarmerProviderRefresh("verify_failed")
 			r.logger.Warn("warmer: verify failed", "provider", addr, "endpoint", info.URL, "err", err)
+			prepared = false
 		} else {
 			metrics.WarmerProviderRefresh("ok")
 		}
@@ -154,15 +208,24 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 			if _, err := r.registry.RefreshSigner(ctx, addr); err != nil {
 				metrics.WarmerSignerRefresh("failed")
 				r.logger.Warn("warmer: signer refresh failed", "provider", addr, "err", err)
+				// Under enforce a request could not use this provider either, so it does not
+				// count as prepared. This is the case that makes a chain-RPC outage visible
+				// to a deployment gate instead of only to a metric.
+				prepared = false
 			} else {
 				metrics.WarmerSignerRefresh("ok")
 			}
+		}
+		if prepared {
+			ready++
 		}
 	}
 	// The sweep ran to completion (individual provider failures are counted above,
 	// not fatal); stamp the liveness gauge so an alert can fire if sweeps stall.
 	metrics.WarmerSweep("ok")
 	metrics.WarmerSweepSucceeded()
+	metrics.WarmerReadyProviders(ready)
+	r.setWarmState(WarmState{At: time.Now(), Ready: ready, Total: len(addrs)})
 }
 
 // RunWarmer warms once immediately, then re-warms every interval until ctx is

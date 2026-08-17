@@ -74,11 +74,22 @@
 #   SIDE_A_LABEL     sub-zone label for side a      (default: a)
 #   SIDE_B_LABEL     sub-zone label for side b      (default: b)
 #   TXT_PREFIX       app-address record prefix      (default: _dstack-app-address)
-#   HEALTH_PATH      public health path             (default: /healthz)
+#   HEALTH_PATH      public health path             (default: /healthz — post-switch check)
+#   PROBE_PATH       standby readiness path         (default: /readyz — pre-switch gate 2)
 #   TTL              CNAME TTL in seconds           (default: 60)
 #   VERIFY_RETRIES   post-switch health attempts    (default: 20; window must outlast the route cache)
 #   VERIFY_INTERVAL  seconds between attempts       (default: 6)
-#   PROBE_RETRIES    pre-switch target probe tries  (default: 5, VERIFY_INTERVAL apart)
+#   PROBE_RETRIES    pre-switch target probe tries  (default: 30, PROBE_INTERVAL apart)
+#   PROBE_INTERVAL   seconds between probe attempts (default: 10)
+#
+# The two probes measure different things on purpose. The post-switch check
+# (HEALTH_PATH + VERIFY_*) asks "did traffic land on the new side yet", so its
+# window is sized to the DNS TTL and the dstack gateway's route cache. The
+# pre-switch gate (PROBE_PATH + PROBE_*) asks "can the standby actually serve",
+# which means waiting out its first warmer sweep — provider quotes DCAP-verified
+# one at a time, collateral fetched cold, each provider's on-chain signer read — so
+# its window is minutes, not one TTL. Sharing a knob between them would tie a
+# provider-readiness timeout to a DNS timescale.
 #
 # This is a bash script (arrays, [[ ]], ${BASH_SOURCE}). If it was started with a
 # POSIX shell — `sh switch.sh` runs under dash on Debian/Ubuntu/WSL and chokes on
@@ -268,16 +279,22 @@ http_ok() { # url -> 0 if HTTP 2xx. -k: we check reachability/health, not cert
   [[ "$code" =~ ^2[0-9][0-9]$ ]]
 }
 
-# A per-side health URL that reaches THAT side directly, by app-id, via the dstack
-# gateway's platform hostname (<app_id>-443s.<PLATFORM_BASE>). The `s` = TLS
+# A per-side READINESS URL that reaches THAT side directly, by app-id, via the
+# dstack gateway's platform hostname (<app_id>-443s.<PLATFORM_BASE>). The `s` = TLS
 # passthrough to the side's own ingress; routing is by the app-id in the hostname,
 # independent of the custom domain's _dstack-app-address, so it hits the target
 # side even before any traffic points at it. Empty if PLATFORM_BASE is unset.
+#
+# It probes PROBE_PATH (/readyz), not HEALTH_PATH (/healthz): the question before a
+# cutover is not "is that process up" but "can it serve" — with on-chain grounding
+# enforced, a side that cannot read the chain answers nothing, and traffic must stay
+# on the live side, which is still serving from a warm cache. Point --probe-url at
+# /healthz to fall back to the weaker liveness-only gate.
 platform_probe_url() { # a|b
   [ -n "$PLATFORM_BASE" ] || return 0
   local addr; addr="$(side_app_addr "$1")"   # "<app_id>:443"
   [ -n "$addr" ] || return 0
-  echo "https://${addr%%:*}-443s.${PLATFORM_BASE}${HEALTH_PATH}"
+  echo "https://${addr%%:*}-443s.${PLATFORM_BASE}${PROBE_PATH}"
 }
 
 public_health_ok() { http_ok "https://${DOMAIN}${HEALTH_PATH}"; }
@@ -403,20 +420,28 @@ cmd_switch() {
     warn "between them. Blue/green needs two DIFFERENT gateway images."
   fi
 
-  # Gate 2: verify the TARGET side is healthy BEFORE we send it any traffic.
-  # Prefer an explicit --probe-url; otherwise, if PLATFORM_BASE is set, probe the
-  # target's own app-id endpoint, which reaches it directly regardless of where
-  # traffic currently points.
+  # Gate 2: verify the TARGET side can actually SERVE before we send it any
+  # traffic — /readyz, not /healthz (see platform_probe_url). Prefer an explicit
+  # --probe-url; otherwise, if PLATFORM_BASE is set, probe the target's own app-id
+  # endpoint, which reaches it directly regardless of where traffic currently points.
+  #
+  # The window (PROBE_RETRIES x PROBE_INTERVAL, ~5min by default) is sized to a COLD
+  # FIRST WARMER SWEEP on the standby, not to a DNS TTL: that sweep DCAP-verifies
+  # each provider's quote one at a time, fetches Intel collateral cold, and reads
+  # each provider's on-chain signer. A fresh side is legitimately not-ready for a
+  # while, and cutting the wait short here would just switch to a side that has not
+  # finished proving it can serve anyone.
   local probe="$PROBE_URL"
   [ -z "$probe" ] && probe="$(platform_probe_url "$target")"
   if [ -n "$probe" ]; then
     info "probing target side ${target} directly: $probe"
+    info "  (up to ${PROBE_RETRIES} attempts ${PROBE_INTERVAL}s apart — a cold side must finish its first warmer sweep)"
     local pi probe_ok=0
     for ((pi=1; pi<=PROBE_RETRIES; pi++)); do
       if http_ok "$probe"; then probe_ok=1; break; fi
       if [ "$pi" -lt "$PROBE_RETRIES" ]; then
-        log "  probe attempt ${pi}/${PROBE_RETRIES} failed, retrying in ${VERIFY_INTERVAL}s"
-        sleep "$VERIFY_INTERVAL"
+        log "  probe attempt ${pi}/${PROBE_RETRIES} failed, retrying in ${PROBE_INTERVAL}s"
+        sleep "$PROBE_INTERVAL"
       fi
     done
     [ "$probe_ok" = 1 ] || die "target-side probe failed after ${PROBE_RETRIES} attempts ($probe) — refusing to switch"
@@ -609,7 +634,9 @@ HEALTH_PATH="${HEALTH_PATH:-/healthz}"
 TTL="${TTL:-60}"
 VERIFY_RETRIES="${VERIFY_RETRIES:-20}"   # ~2x TTL by default, to outlast the gateway route cache
 VERIFY_INTERVAL="${VERIFY_INTERVAL:-6}"
-PROBE_RETRIES="${PROBE_RETRIES:-5}"      # pre-switch target probe attempts before refusing to switch
+PROBE_PATH="${PROBE_PATH:-/readyz}"      # standby readiness path (gate 2); /healthz is liveness only
+PROBE_RETRIES="${PROBE_RETRIES:-30}"     # pre-switch target probe attempts before refusing to switch
+PROBE_INTERVAL="${PROBE_INTERVAL:-10}"   # seconds between them: 30x10s ≈ 5min, enough for a cold first sweep
 
 # Switch-layer record names (in the delegation zone) that this script owns.
 SERVING_ALIAS="${DOMAIN}.${DELEGATION_ZONE}"           # static -> GATEWAY_DOMAIN (set by `setup`)

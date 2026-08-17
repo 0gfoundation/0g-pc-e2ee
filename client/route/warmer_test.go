@@ -3,6 +3,7 @@ package route
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -31,10 +32,16 @@ type countingRegistry struct {
 	refreshes int32
 	signer    string
 	ack       bool
+	// failing, when set, makes every lookup fail — the shape of an unreachable chain
+	// RPC, which a sweep must not count as a prepared provider.
+	failing atomic.Bool
 }
 
 func (c *countingRegistry) AcknowledgedSigner(context.Context, string) (chain.Signer, error) {
 	atomic.AddInt32(&c.n, 1)
+	if c.failing.Load() {
+		return chain.Signer{}, errors.New("rpc down")
+	}
 	return chain.Signer{Address: c.signer, Acknowledged: c.ack}, nil
 }
 
@@ -148,6 +155,85 @@ func TestWarmer_EvictsOnRefreshFailure(t *testing.T) {
 	r.WarmOnce(context.Background(), res)                     // refresh fails → evict
 	if _, _, ok := r.quoteCache.get(quoteURL); ok {
 		t.Error("stale entry should be evicted after a failed refresh")
+	}
+}
+
+// A provider counts as prepared only when the whole chain of preconditions a
+// request needs is satisfied. A deployment gate reads this number, so an
+// unreachable chain RPC has to show up in it — otherwise a side that can verify
+// nobody would still look ready to cut traffic over to.
+func TestWarmer_WarmStateCountsOnlyFullyPreparedProviders(t *testing.T) {
+	var hits, status int32
+	srv := warmerServer(t, &hits, []string{"0xa"}, &status)
+	reg := &countingRegistry{signer: qvSignerStr, ack: true}
+	r := New(srv.URL,
+		WithQuoteVerification(qvVerifier(t), discardLogger()),
+		WithOnChainVerification(reg, true, discardLogger()))
+	res := fakeResolver{url: srv.URL}
+
+	r.WarmOnce(context.Background(), res)
+	s := r.WarmState()
+	if s.At.IsZero() {
+		t.Fatal("a completed sweep must stamp WarmState.At")
+	}
+	if s.Ready != 1 || s.Total != 1 {
+		t.Errorf("WarmState = %+v, want Ready 1 of 1", s)
+	}
+
+	// The quote endpoint goes down: nothing is servable, so nothing is ready.
+	atomic.StoreInt32(&status, http.StatusServiceUnavailable)
+	r.WarmOnce(context.Background(), res)
+	if s := r.WarmState(); s.Ready != 0 || s.Total != 1 {
+		t.Errorf("WarmState = %+v, want Ready 0 of 1 once quotes fail", s)
+	}
+
+	// Quotes recover but the chain does not: under enforce a request still could not
+	// use this provider, so it must not count as ready.
+	atomic.StoreInt32(&status, 0)
+	reg.failing.Store(true)
+	r.WarmOnce(context.Background(), res)
+	if s := r.WarmState(); s.Ready != 0 {
+		t.Errorf("WarmState = %+v, want Ready 0 while the chain RPC is unreadable", s)
+	}
+}
+
+// A sweep that cannot even enumerate providers prepared none of them — the honest
+// readiness answer, and not one that should leave a previous "ready" standing.
+func TestWarmer_WarmStateRecordedWhenListFails(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	r := New(srv.URL, WithQuoteVerification(qvVerifier(t), discardLogger()))
+
+	r.WarmOnce(context.Background(), fakeResolver{url: srv.URL})
+	s := r.WarmState()
+	if s.At.IsZero() {
+		t.Error("a failed enumeration should still stamp a sweep time")
+	}
+	if s.Ready != 0 {
+		t.Errorf("WarmState = %+v, want Ready 0", s)
+	}
+}
+
+// Shutdown must not make a healthy process look unready on its way out.
+func TestWarmer_CancelledSweepLeavesWarmStateAlone(t *testing.T) {
+	var hits, status int32
+	srv := warmerServer(t, &hits, []string{"0xa"}, &status)
+	r := New(srv.URL, WithQuoteVerification(qvVerifier(t), discardLogger()))
+	res := fakeResolver{url: srv.URL}
+
+	r.WarmOnce(context.Background(), res)
+	before := r.WarmState()
+	if before.Ready != 1 {
+		t.Fatalf("setup: WarmState = %+v, want Ready 1", before)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.WarmOnce(ctx, res)
+	if got := r.WarmState(); got != before {
+		t.Errorf("WarmState = %+v after a cancelled sweep, want it untouched (%+v)", got, before)
 	}
 }
 
