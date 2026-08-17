@@ -32,6 +32,7 @@ package metrics
 import (
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -222,9 +223,17 @@ func RouteLabel(path string) string {
 	switch path {
 	case "/v1/chat/completions", "/healthz", "/readyz":
 		return path
-	default:
-		return "other"
 	}
+	// The public evidence bundle, collapsed to ONE label rather than one per file:
+	// it is a template, and the filenames are attacker-suppliable (a 404 for any
+	// path under the prefix would otherwise mint a series). Worth separating from
+	// "other" because it is the only unauthenticated, cacheable, browser-reachable
+	// route the gateway serves — traffic to it says something different from traffic
+	// bound for the router, and it must be visible when a verifier page hammers it.
+	if path == "/evidences" || strings.HasPrefix(path, "/evidences/") {
+		return "/evidences/"
+	}
+	return "other"
 }
 
 // HTTPRequest records one completed HTTP request: its count (by route/method/

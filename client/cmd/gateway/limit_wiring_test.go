@@ -39,7 +39,7 @@ func blockedGateway(t *testing.T, maxInFlight int) (gw *httptest.Server, entered
 	router := httptest.NewServer(routerMux)
 
 	client := core.NewWithResolver(route.New(router.URL))
-	gw = httptest.NewServer(newHandler(client, mustURL(t, router.URL), testOrigins(), "", maxInFlight, nil, discardLogger()))
+	gw = httptest.NewServer(newHandler(client, mustURL(t, router.URL), testOrigins(), "", "", maxInFlight, nil, discardLogger()))
 
 	// Cleanup runs LIFO, and Close blocks on in-flight requests — so the parked
 	// handler must be released before either server is closed, which means

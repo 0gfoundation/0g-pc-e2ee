@@ -23,6 +23,14 @@ func TestRouteLabel(t *testing.T) {
 		"/../etc/passwd":             "other",
 		"/v1/chat/completions/extra": "other",
 		"":                           "other",
+		// The evidence bundle collapses to ONE label, filename and all: the names are
+		// caller-suppliable (any 404 under the prefix would otherwise mint a series).
+		"/evidences":                     "/evidences/",
+		"/evidences/":                    "/evidences/",
+		"/evidences/quote.json":          "/evidences/",
+		"/evidences/cert-example.io.pem": "/evidences/",
+		"/evidences/../etc/passwd":       "/evidences/",
+		"/evidencesfoo":                  "other", // prefix match must not be a substring match
 	}
 	for path, want := range cases {
 		if got := RouteLabel(path); got != want {

@@ -122,9 +122,31 @@ services:
       # by editing allowed_envs; a staging and a production run share app_id, and the
       # served cert's issuer is what distinguishes them.
       - ACME_STAGING=${ACME_STAGING:-false}
+      # Stop serving /evidences/ from THIS container; the gateway serves the same
+      # bytes at the same path instead (ZG_GATEWAY_EVIDENCE_DIR below). The bundle is
+      # still WRITTEN here — this flag gates only the built-in mini_httpd and the
+      # HAProxy path ACL in front of it, while the collect/finalize steps that produce
+      # quote.json, sha256sum.txt, cert-<DOMAIN>.pem and acme-account.json are
+      # unconditional.
+      #
+      # Why: this image adds no CORS header to those responses and exposes no knob to
+      # add one (it is a pinned upstream digest), so no web page could read the bundle
+      # whose entire purpose is public verification — issue #73. Moving the route to
+      # the gateway puts the response headers in this repo. It also removes a
+      # connection-level routing quirk: the ACL matched on the FIRST 16 bytes of a
+      # connection, so on a reused keep-alive connection a bundle fetch and an API
+      # call could not both be served.
+      #
+      # Trust is unaffected — the bundle is self-authenticating (TDX-signed quote,
+      # report_data over sha256sum.txt, and the served certificate compared against
+      # the caller's own TLS session), so which container hands over the bytes is not
+      # part of what is proven. See client/cmd/gateway/evidences.go.
+      - EVIDENCE_SERVER=false
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock # in-enclave attestation + cert binding
       - cert-data:/etc/letsencrypt
+      # Writable here: this container PRODUCES the bundle. The gateway mounts the same
+      # volume read-only and is what serves it.
       - evidences:/evidences
 
   gateway:
@@ -285,10 +307,22 @@ services:
       # giving the prompt-handling container a privileged runtime surface back.
       - "ZG_GATEWAY_IDENTITY_FILE=/run/identity/identity.json"
       - "ZG_GATEWAY_DSTACK_SOCKET="
+      # Serve the public evidence bundle at /evidences/ out of the volume
+      # dstack-ingress writes (EVIDENCE_SERVER=false above hands the route over), with
+      # Access-Control-Allow-Origin: * so browser verifiers can read it — issue #73.
+      # The wildcard is independent of ZG_GATEWAY_ALLOWED_ORIGINS above and must stay
+      # that way: that list governs who may drive SEALED INFERENCE through the
+      # enclave, while this is static public data any `curl` already fetches. Empty
+      # unmounts the route entirely. See client/cmd/gateway/evidences.go.
+      - "ZG_GATEWAY_EVIDENCE_DIR=/evidences"
     volumes:
       # Identity in, read-only, as a plain JSON file — deliberately not the
       # guest-agent socket, which also derives keys and issues quotes.
       - identity:/run/identity:ro
+      # The evidence bundle, READ-ONLY: this container publishes it and must never be
+      # able to rewrite what dstack-ingress attested to. Files are read per request,
+      # so a certificate renewal is picked up with no restart.
+      - evidences:/evidences:ro
     # The gateway itself holds no secret: no pinned provider key, and no TLS material
     # — the cert and its key belong to dstack-ingress above.
 
@@ -319,7 +353,7 @@ services:
 
 volumes:
   cert-data: # SECRET: holds the TLS private key and the ACME account key
-  evidences: # public evidence bundle served at /evidences/
+  evidences: # public evidence bundle: written by dstack-ingress, served at /evidences/ by the gateway
   identity: # this CVM's instance_id/app_id, written once by cvm-identity, read-only everywhere else
 
 configs:

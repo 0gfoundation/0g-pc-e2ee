@@ -27,8 +27,9 @@
 //
 // The gateway emits no attestation quote and signs no responses of its own.
 // Endpoint/code identity comes from the in-CVM cert-binding attestation that
-// dstack-ingress publishes at /evidences — its quote commits to app_id, which
-// covers this gateway image too (see deploy/phala/ and
+// dstack-ingress produces and this process serves at /evidences (-evidence-dir; see
+// evidenceRoute for why the serving side moved here) — its quote commits to app_id,
+// which covers this gateway image too (see deploy/phala/ and
 // docs/design/cloud-gateway.md §6). Inference authenticity rides the provider's
 // own SPEC §8 response signature, which the gateway verifies
 // (ZG_GATEWAY_VERIFY_RESPONSES). So the gateway exposes no /quote route. The
@@ -91,6 +92,16 @@ func main() {
 		"comma-separated browser origin allowlist for CORS: exact origins (https://app.example.com), "+
 			"\"*.\" wildcards (https://*.0g.ai — subdomains only, not the apex), or \"*\" for any; "+
 			"empty allows no origin, disabling browser access (env ZG_GATEWAY_ALLOWED_ORIGINS)")
+	// Directory holding the public attestation evidence bundle to serve at
+	// /evidences/ — in the TEE deployment, the `evidences` volume dstack-ingress
+	// writes, mounted read-only. Empty (the default) mounts no such route, which is
+	// right for a local run and for any deployment where the ingress still serves
+	// the bundle itself. Why the gateway serves public attestation data at all, and
+	// why that does not weaken the trust story: evidenceRoute.
+	evidenceDir := flag.String("evidence-dir", proxycli.EnvOr("ZG_GATEWAY_EVIDENCE_DIR", ""),
+		"directory to serve the public attestation evidence bundle from at /evidences/ (the read-only "+
+			"dstack-ingress `evidences` volume); empty mounts no such route. Served with "+
+			"Access-Control-Allow-Origin: * so browser verifiers can read it (env ZG_GATEWAY_EVIDENCE_DIR)")
 	// Where this CVM's own identity comes from. A gateway app can be backed by
 	// several replicas sharing one app_id, so without it a merged log stream and a
 	// shared metrics store cannot tell them apart.
@@ -209,6 +220,18 @@ func main() {
 		}
 	}
 
+	// Same stance for the evidence bundle's directory: a mount this process cannot
+	// read would answer 404 to every verifier and look, from outside, exactly like
+	// the CORS hole this route exists to close (#73) — silent, and with no signal
+	// until someone tries to verify the deployment. See checkEvidenceDir for why the
+	// check is narrow, and for the blast radius of exiting here.
+	if *evidenceDir != "" {
+		if err := checkEvidenceDir(*evidenceDir); err != nil {
+			logger.Error("invalid -evidence-dir", "dir", *evidenceDir, "err", err)
+			os.Exit(1)
+		}
+	}
+
 	// Start the background quote-cache warmer (a no-op unless -warm is set) so
 	// requests hit a warm cache instead of paying the DCAP verify inline; stop it
 	// on shutdown before the process exits.
@@ -237,7 +260,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              *f.Listen,
-		Handler:           newHandler(built.Client, routerTarget, origins, instanceID, *maxInFlight, built.Readiness(), logger),
+		Handler:           newHandler(built.Client, routerTarget, origins, instanceID, *evidenceDir, *maxInFlight, built.Readiness(), logger),
 		ReadHeaderTimeout: 10 * time.Second,     // mitigate slow-header (Slowloris) clients
 		IdleTimeout:       proxycli.IdleTimeout, // bound idle keep-alives; unset means unbounded
 	}
@@ -262,8 +285,14 @@ func main() {
 	// not exist. Logging all three puts the assumption next to what it produced, so
 	// comparing it against the CVM's real shape is a glance rather than an
 	// investigation. math.MaxInt64 means unset.
+	//
+	// evidence_dir is on this line because the route is invisible otherwise: it is
+	// mounted or not depending on one env var, and an operator debugging "why does
+	// /evidences 404" needs to see which side of that the process is on. Empty means
+	// the route is not mounted at all.
 	logger.Info("gateway listening", "listen", *f.Listen, "router_url", *f.RouterURL,
 		"cors_allowed_origins", origins, "max_inflight", *maxInFlight,
+		"evidence_dir", *evidenceDir,
 		"go_memlimit_bytes", currentMemoryLimit(), "gomaxprocs", runtime.GOMAXPROCS(0))
 	err = proxycli.Serve(srv, logger)
 	stopWarmer()
@@ -414,10 +443,14 @@ func runHealthCheck(listen string) int {
 // maxInFlight caps concurrent sealed inference requests (0 disables it); see the
 // -max-inflight flag and openaiproxy.LimitInFlight.
 //
+// evidenceDir, when non-empty, mounts the public attestation bundle at /evidences/
+// from that directory (see evidenceRoute). Empty leaves the route unmounted, so
+// those paths fall through to the catch-all like any other unknown path.
+//
 // ready backs GET /readyz: nil means there is nothing to assert (no warmer
 // configured) and the route always answers ready. See proxycli.Built.Readiness and
 // the /healthz vs /readyz split at the routes below.
-func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, instanceID string, maxInFlight int, ready func() error, logger *slog.Logger) http.Handler {
+func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, instanceID, evidenceDir string, maxInFlight int, ready func() error, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	// Mount the sealed inference path behind the gateway's front-door credential
 	// gate. The gate is a cheap presence/shape check (reject missing credentials
@@ -472,7 +505,9 @@ func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, 
 	// The gateway exposes no /quote route: it emits no attestation quote of its
 	// own. Endpoint/code identity comes from dstack-ingress's in-CVM cert-binding
 	// attestation (/evidences, which commits to app_id and so covers this image);
-	// see docs/design/cloud-gateway.md §6.
+	// see docs/design/cloud-gateway.md §6. The gateway does SERVE that bundle when
+	// -evidence-dir is set — dstack-ingress produces it, this process publishes it
+	// with an origin-independent CORS header (evidenceRoute, mounted below).
 	//
 	// Everything else — the router's non-sealed OpenAI surface (model catalog,
 	// discovery) a thin client needs — is reverse-proxied to the router as-is. The
@@ -489,5 +524,12 @@ func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, 
 	// StampInstance sits OUTSIDE CORS so a preflight — answered by CORS without
 	// ever reaching the mux — carries the header too, and inside the access log so
 	// the middleware order stays "log everything that happens below it".
-	return openaiproxy.LogRequests(logger, openaiproxy.StampInstance(instanceID, openaiproxy.CORS(allowedOrigins, mux)))
+	//
+	// evidenceRoute sits between StampInstance and CORS: the public evidence bundle
+	// answers EVERY origin (`*`), which is a different policy from the sealed API's
+	// allowlist and must not be filtered through it, while still being logged and
+	// still carrying the serving replica's id. See evidenceRoute.
+	return openaiproxy.LogRequests(logger,
+		openaiproxy.StampInstance(instanceID,
+			evidenceRoute(evidenceDir, openaiproxy.CORS(allowedOrigins, mux))))
 }
