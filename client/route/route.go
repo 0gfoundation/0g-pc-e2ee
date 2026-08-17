@@ -126,6 +126,10 @@ type Router struct {
 	// makes a negative result fail-closed (skip the candidate) instead of a warn.
 	registry       chain.SignerRegistry
 	onchainEnforce bool
+	// onchainRequireLookup makes enforce mode fail-closed on a registry LOOKUP
+	// failure too, not just on a verdict about the provider. Off by default: see
+	// onchainLookupFailed for why an RPC outage should degrade rather than sever.
+	onchainRequireLookup bool
 	// quoteCache memoizes DCAP-verified results (enc_pub/signer) per endpoint, and
 	// quoteSF collapses concurrent misses for the same endpoint into a single
 	// verification so a cold/expired key can't stampede the expensive quote+
@@ -223,9 +227,16 @@ func WithQuoteVerification(v *attest.Verifier, logger *slog.Logger) Option {
 //
 // enforce=false is observe-only: a missing/unacknowledged/mismatched on-chain
 // signer (or an RPC failure) is logged and the candidate is still used, mirroring
-// attest warn mode for staged rollout. enforce=true is fail-closed: any negative
-// skips the candidate so core falls back to the next. logger nil uses
-// slog.Default() (or the logger a prior WithQuoteVerification set).
+// attest warn mode for staged rollout. enforce=true is fail-closed on a VERDICT
+// about the provider — an unacknowledged or mismatched signer skips the candidate
+// so core falls back to the next.
+//
+// A failure of the lookup ITSELF is deliberately not in that class: it says
+// nothing about the provider, and since every candidate of every request is
+// grounded on the request path, treating it as fatal turns a chain-RPC outage
+// into a total outage. It degrades to observe-only unless the operator opts in
+// with WithOnChainRequireLookup. logger nil uses slog.Default() (or the logger a
+// prior WithQuoteVerification set).
 func WithOnChainVerification(reg chain.SignerRegistry, enforce bool, logger *slog.Logger) Option {
 	return func(r *Router) {
 		if reg == nil {
@@ -240,6 +251,19 @@ func WithOnChainVerification(reg chain.SignerRegistry, enforce bool, logger *slo
 			r.logger = logger
 		}
 	}
+}
+
+// WithOnChainRequireLookup extends enforce mode to registry LOOKUP failures: a
+// candidate whose on-chain signer could not be read at all is skipped, rather
+// than used ungrounded with a warning. It is off by default because the lookup is
+// on the request path for every candidate, so an unreachable chain RPC would fail
+// every request — an outage caused by our own dependency rather than by anything
+// wrong with a provider. Turn it on for a deployment that would rather refuse
+// service than serve a request whose provider identity it could not confirm.
+//
+// It has no effect without enforce: warn mode is observe-only by definition.
+func WithOnChainRequireLookup(require bool) Option {
+	return func(r *Router) { r.onchainRequireLookup = require }
 }
 
 // New returns a Router that talks to the given router base URL (empty uses
@@ -326,12 +350,13 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 	// compromised router could point that at a key it controls and MITM the
 	// prompt (the reason quote verification exists).
 	var (
-		encPub crypto.PublicKey
-		signer string
-		err    error
+		encPub      crypto.PublicKey
+		signer      string
+		quoteCached bool
+		err         error
 	)
 	if c.router.verifier != nil {
-		encPub, signer, err = c.router.verifiedKeys(ctx, prov.Endpoint)
+		encPub, signer, quoteCached, err = c.router.verifiedKeysCached(ctx, prov.Endpoint)
 	} else {
 		var pubkeyURL string
 		pubkeyURL, err = derivePubkeyURL(prov.Endpoint)
@@ -351,7 +376,24 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 	// check). Keyed on prov.Address (the provider's on-chain account), whose
 	// Address→teeSigner mapping the untrusted router cannot forge.
 	if c.router.registry != nil {
-		if err := c.router.groundSignerOnChain(ctx, prov.Address, signer); err != nil {
+		outcome, err := c.router.groundSignerOnChain(ctx, prov.Address, signer)
+		// A mismatch about to cost this candidate its place, decided against a CACHED
+		// quote, is the other half of "never reject on stale evidence": a broker
+		// upgrade rotates enc_pub and signer together, so our cached pair can name the
+		// old enclave while the chain already names the new one. Re-read the quote and
+		// ground once more before ruling. (Only worth doing when the quote was cached
+		// — a freshly verified one is already the best evidence available — which also
+		// stops a hostile provider from forcing a DCAP verification per request.)
+		if err != nil && outcome == groundingMismatch && quoteCached {
+			freshEnc, freshSigner, rerr := c.router.reverifiedKeys(ctx, prov.Endpoint)
+			if rerr == nil && freshSigner != signer {
+				c.router.logger.Info("re-verified quote after an on-chain signer mismatch; the cached quote had rotated",
+					"provider", prov.Address, "cached_signer", signer, "fresh_signer", freshSigner)
+				encPub, signer = freshEnc, freshSigner
+				_, err = c.router.groundSignerOnChain(ctx, prov.Address, signer)
+			}
+		}
+		if err != nil {
 			return core.Provider{}, err
 		}
 	}
@@ -379,12 +421,24 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 }
 
 // verifiedKeys returns the DCAP-verified enc_pub + signer for a candidate
+// endpoint, discarding the provenance flag. See verifiedKeysCached.
+func (r *Router) verifiedKeys(ctx context.Context, endpoint string) (crypto.PublicKey, string, error) {
+	encPub, signer, _, err := r.verifiedKeysCached(ctx, endpoint)
+	return encPub, signer, err
+}
+
+// verifiedKeysCached returns the DCAP-verified enc_pub + signer for a candidate
 // endpoint, from the cache when fresh, otherwise by verifying its quote. It
 // collapses concurrent misses for the same endpoint into ONE verification
 // (quote fetch + go-tdx-guest + Intel PCS collateral is expensive and
 // rate-limit-sensitive) via singleflight; the rest share the result. Errors are
 // not cached, so a transient failure is retried on the next request.
-func (r *Router) verifiedKeys(ctx context.Context, endpoint string) (crypto.PublicKey, string, error) {
+//
+// cached reports that the keys came from the quote cache rather than a live
+// verification, i.e. that they may lag the provider by up to the quote TTL. A
+// caller about to REJECT a provider over these keys uses it to decide whether a
+// re-verification could change the verdict (see reverifiedKeys).
+func (r *Router) verifiedKeysCached(ctx context.Context, endpoint string) (_ crypto.PublicKey, _ string, cached bool, _ error) {
 	// Key the cache + singleflight by the DERIVED quote URL, not the raw endpoint,
 	// so different endpoint spellings for the same provider (bare origin, /v1, full
 	// chat URL, trailing slash) — and, importantly, the warmer's chain-sourced URL
@@ -392,13 +446,37 @@ func (r *Router) verifiedKeys(ctx context.Context, endpoint string) (crypto.Publ
 	// host. Deriving up front also fails a malformed endpoint before any lookup.
 	quoteURL, err := deriveQuoteURL(endpoint)
 	if err != nil {
-		return nil, "", upstream(0, fmt.Errorf("provider endpoint: %w", err))
+		return nil, "", false, upstream(0, fmt.Errorf("provider endpoint: %w", err))
 	}
 	if encPub, signer, ok := r.quoteCache.get(quoteURL); ok {
 		metrics.QuoteCacheLookup(true)
-		return encPub, signer, nil
+		return encPub, signer, true, nil
 	}
 	metrics.QuoteCacheLookup(false)
+	res, err := r.verifyAndCache(ctx, quoteURL)
+	if err != nil {
+		return nil, "", false, err
+	}
+	return res.encPub, res.signer, false, nil
+}
+
+// reverifiedKeys forces a live re-verification of endpoint's quote, bypassing the
+// cache, and returns the keys the fresh quote binds. It exists for one situation:
+// a cached quote is about to cost a provider its candidacy, and the cached copy
+// may itself be the thing that is wrong. A broker upgrade rotates enc_pub and
+// signer together, so for up to the quote TTL our cached pair names the OLD
+// enclave while the chain already names the new one — a benign rollout that
+// looks exactly like a signer mismatch. Re-reading the quote before ruling turns
+// that window from a rejection into a refresh.
+//
+// It is deliberately NOT on the happy path: a quote verification is expensive and
+// rate-limit-sensitive, so it runs only when the alternative is rejecting the
+// provider outright.
+func (r *Router) reverifiedKeys(ctx context.Context, endpoint string) (crypto.PublicKey, string, error) {
+	quoteURL, err := deriveQuoteURL(endpoint)
+	if err != nil {
+		return nil, "", upstream(0, fmt.Errorf("provider endpoint: %w", err))
+	}
 	res, err := r.verifyAndCache(ctx, quoteURL)
 	if err != nil {
 		return nil, "", err
@@ -479,43 +557,129 @@ func (r *Router) verifyQuoteAt(ctx context.Context, quoteURL string) (encPub cry
 	return verified.EncPub, verified.SignerAddr, nil
 }
 
+// groundingOutcome classifies one grounding attempt. The split that matters is
+// between the two negatives: a VERDICT is a statement about the provider (the
+// chain and the quote disagree, or the chain acknowledges nobody) and is the
+// reason enforce mode exists; a lookup failure is a statement about OUR OWN chain
+// RPC, and rejecting a provider over it converts our infrastructure's bad day
+// into the user's failed request.
+type groundingOutcome string
+
+const (
+	groundingOK              groundingOutcome = "ok"
+	groundingOKStale         groundingOutcome = "ok_stale"
+	groundingMismatch        groundingOutcome = "mismatch"
+	groundingNotAcknowledged groundingOutcome = "not_acknowledged"
+	groundingLookupFailed    groundingOutcome = "lookup_failed"
+)
+
 // groundSignerOnChain enforces SPEC §4.4 step 3 / trust-chain hop 5: the signer
 // bound into the (DCAP-verified) quote must equal the provider's acknowledged
-// teeSignerAddress in the on-chain InferenceServing registry. Enforce mode is
-// fail-closed on every negative — lookup error, unacknowledged signer, or
-// mismatch — so the candidate is skipped and core falls back. Warn mode is
-// observe-only (log and proceed), mirroring attest warn mode for staged rollout.
-func (r *Router) groundSignerOnChain(ctx context.Context, providerAddr, signer string) error {
-	onchain, acknowledged, err := r.registry.AcknowledgedSigner(ctx, providerAddr)
+// teeSignerAddress in the on-chain InferenceServing registry.
+//
+// Enforce mode is fail-closed on a VERDICT (mismatch or unacknowledged) — the
+// candidate is skipped and core falls back. A lookup failure is treated
+// separately: by default it degrades to observe-only even under enforce, because
+// the registry lookup sits on the request path for every candidate, so a chain
+// RPC outage would otherwise fail every candidate of every request — a total
+// self-inflicted outage. onchainRequireLookup opts into the strict reading for a
+// deployment that would rather fail than serve ungrounded.
+//
+// Warn mode is observe-only throughout (log and proceed), mirroring attest warn
+// mode for staged rollout.
+//
+// A negative is never returned on stale evidence: see revalidate.
+func (r *Router) groundSignerOnChain(ctx context.Context, providerAddr, signer string) (groundingOutcome, error) {
+	got, err := r.registry.AcknowledgedSigner(ctx, providerAddr)
 	if err != nil {
-		return r.onchainFail(fmt.Sprintf("on-chain signer lookup for provider %s failed", providerAddr), err)
+		return r.onchainLookupFailed(providerAddr, err)
 	}
-	if !acknowledged {
-		return r.onchainFail(fmt.Sprintf("provider %s has no acknowledged on-chain TEE signer", providerAddr), nil)
+	// A negative computed from a stale reading is not a verdict. The grace window
+	// keeps an expired entry alive across an RPC outage, and a broker upgrade
+	// rotates the signer — so a stale entry disagreeing with a freshly quoted
+	// signer is the expected shape of a benign rollout, indistinguishable from an
+	// attack if we rule on it. Get fresh evidence before saying no.
+	if got.Stale && !signerAgrees(got, signer) {
+		got, err = r.revalidate(ctx, providerAddr, signer)
+		if err != nil {
+			return r.onchainLookupFailed(providerAddr, err)
+		}
 	}
-	if !strings.EqualFold(strings.TrimSpace(onchain), strings.TrimSpace(signer)) {
-		return r.onchainFail(fmt.Sprintf(
+	switch {
+	case !got.Acknowledged:
+		return r.onchainVerdict(groundingNotAcknowledged,
+			fmt.Sprintf("provider %s has no acknowledged on-chain TEE signer", providerAddr))
+	case !signerAgrees(got, signer):
+		return r.onchainVerdict(groundingMismatch, fmt.Sprintf(
 			"quote signer %s does not match on-chain teeSignerAddress %s for provider %s",
-			signer, onchain, providerAddr), nil)
+			signer, got.Address, providerAddr))
 	}
-	return nil
+	outcome := groundingOK
+	if got.Stale {
+		// A match confirmed against a stale entry still stands — staleness is only
+		// disqualifying for a negative — but it is worth counting separately, since a
+		// sustained ok_stale rate means the chain RPC has been unreachable for longer
+		// than the cache TTL and the grace window is carrying the deployment.
+		outcome = groundingOKStale
+	}
+	metrics.OnChainGrounding(string(outcome))
+	return outcome, nil
 }
 
-// onchainFail turns a failed on-chain signer check into either a fail-closed
-// skip (enforce) or an observe-only warning (warn), per onchainEnforce.
-func (r *Router) onchainFail(msg string, cause error) error {
-	if r.onchainEnforce {
-		if cause != nil {
-			return upstream(0, fmt.Errorf("%s: %w", msg, cause))
-		}
-		return upstream(0, errors.New(msg))
+// revalidate re-reads the signer live, bypassing the cache and its grace window,
+// and reports what the fresh evidence says. Only the freshly read value is
+// returned: acting on the stale one after going to the trouble of refuting it
+// would defeat the point.
+func (r *Router) revalidate(ctx context.Context, providerAddr, signer string) (chain.Signer, error) {
+	fresh, err := r.registry.RefreshSigner(ctx, providerAddr)
+	if err != nil {
+		metrics.OnChainRevalidation("lookup_failed")
+		return chain.Signer{}, err
 	}
-	if cause != nil {
-		r.logger.Warn("on-chain signer check failed; proceeding (onchain warn mode)", "detail", msg, "err", cause)
+	if signerAgrees(fresh, signer) {
+		metrics.OnChainRevalidation("ok")
+		r.logger.Info("on-chain signer disagreed while stale but agrees when read live; treating as a rotation, not a mismatch",
+			"provider", providerAddr, "signer", signer)
 	} else {
-		r.logger.Warn("on-chain signer check failed; proceeding (onchain warn mode)", "detail", msg)
+		metrics.OnChainRevalidation("negative")
 	}
-	return nil
+	return fresh, nil
+}
+
+// signerAgrees reports whether an on-chain reading positively vouches for the
+// quote-bound signer. Anything less — unacknowledged, or a different address — is
+// a negative, so a caller can test "is this good?" without spelling out each way
+// it could be bad.
+func signerAgrees(onchain chain.Signer, signer string) bool {
+	return onchain.Acknowledged &&
+		strings.EqualFold(strings.TrimSpace(onchain.Address), strings.TrimSpace(signer))
+}
+
+// onchainVerdict handles a negative that IS about the provider: fail-closed under
+// enforce, observe-only under warn.
+func (r *Router) onchainVerdict(outcome groundingOutcome, msg string) (groundingOutcome, error) {
+	metrics.OnChainGrounding(string(outcome))
+	if r.onchainEnforce {
+		return outcome, upstream(0, errors.New(msg))
+	}
+	r.logger.Warn("on-chain signer check failed; proceeding (onchain warn mode)", "detail", msg)
+	return outcome, nil
+}
+
+// onchainLookupFailed handles a negative that is about our own chain RPC rather
+// than the provider. It fails the candidate only when the operator has explicitly
+// asked for that (onchainRequireLookup under enforce); otherwise it logs and
+// proceeds ungrounded, so an RPC blip degrades the trust chain instead of
+// severing the data plane.
+func (r *Router) onchainLookupFailed(providerAddr string, cause error) (groundingOutcome, error) {
+	metrics.OnChainGrounding(string(groundingLookupFailed))
+	msg := fmt.Sprintf("on-chain signer lookup for provider %s failed", providerAddr)
+	if r.onchainEnforce && r.onchainRequireLookup {
+		return groundingLookupFailed, upstream(0, fmt.Errorf("%s: %w", msg, cause))
+	}
+	r.logger.Warn("on-chain signer lookup failed; proceeding ungrounded", "detail", msg, "err", cause,
+		"enforce", r.onchainEnforce, "require_lookup", r.onchainRequireLookup)
+	return groundingLookupFailed, nil
 }
 
 // fetchQuote GETs and decodes a provider's /v1/quote reply into raw TDX quote

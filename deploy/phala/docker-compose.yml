@@ -215,7 +215,21 @@ services:
       # - "ZG_GATEWAY_SERVING_CONTRACT=0x47340d900bdFec2BD393c626E12ea0656F938d84"
       # Skip a provider whose on-chain signer is missing/unacknowledged/mismatched
       # instead of only warning. Left OFF: verify-and-warn.
+      #
+      # Before turning this on, read onchain_grounding_total from /metrics: warn
+      # mode is exactly the baseline that says whether enforce is safe here. Every
+      # outcome other than ok/ok_stale becomes a skipped candidate once it is on,
+      # and if all candidates are skipped the request fails.
       # - "ZG_GATEWAY_ONCHAIN_ENFORCE=true"
+      #
+      # With enforce on, also skip a provider whose on-chain signer could not be
+      # READ at all (chain RPC down past the cache's grace window), rather than
+      # proceeding ungrounded with a warning. Left OFF deliberately: the lookup is
+      # on the request path for every candidate, so an unreachable RPC would fail
+      # every request — an outage caused by our own dependency, not by a provider.
+      # Turn it on only if refusing service is preferable to serving a request whose
+      # provider identity could not be confirmed.
+      # - "ZG_GATEWAY_ONCHAIN_REQUIRE_LOOKUP=true"
       # Verify each response's §8 TEE signature (trust-chain hop 11) fail-closed
       # against the quote-bound signer. A response that does not verify is rejected.
       - "ZG_GATEWAY_VERIFY_RESPONSES=true"

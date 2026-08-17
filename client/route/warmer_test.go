@@ -23,16 +23,24 @@ func (f fakeResolver) ServiceInfo(context.Context, string) (chain.ServiceInfo, e
 	return chain.ServiceInfo{URL: f.url, Signer: qvSignerStr, Acknowledged: true}, nil
 }
 
-// countingRegistry counts AcknowledgedSigner calls (to check grounding warming).
+// countingRegistry counts lookups, split by whether they went through the cache
+// (AcknowledgedSigner) or forced a live read (RefreshSigner) — the warmer must do
+// the latter, or a still-fresh entry would satisfy it and nothing gets warmed.
 type countingRegistry struct {
-	n      int32
-	signer string
-	ack    bool
+	n         int32
+	refreshes int32
+	signer    string
+	ack       bool
 }
 
-func (c *countingRegistry) AcknowledgedSigner(context.Context, string) (string, bool, error) {
+func (c *countingRegistry) AcknowledgedSigner(context.Context, string) (chain.Signer, error) {
 	atomic.AddInt32(&c.n, 1)
-	return c.signer, c.ack, nil
+	return chain.Signer{Address: c.signer, Acknowledged: c.ack}, nil
+}
+
+func (c *countingRegistry) RefreshSigner(ctx context.Context, providerAddr string) (chain.Signer, error) {
+	atomic.AddInt32(&c.refreshes, 1)
+	return c.AcknowledgedSigner(ctx, providerAddr)
 }
 
 // warmerServer serves /v1/providers (the given addresses) and /v1/quote (counted
@@ -154,6 +162,12 @@ func TestWarmer_WarmsGroundingCache(t *testing.T) {
 	r.WarmOnce(context.Background(), fakeResolver{url: srv.URL})
 	if got := atomic.LoadInt32(&reg.n); got != 1 {
 		t.Errorf("grounding warm calls = %d, want 1", got)
+	}
+	// It must be a FORCED read: an ordinary lookup is satisfied by a still-fresh
+	// entry, so the sweep would warm nothing and the entry would expire on its own
+	// schedule — the phase-luck this refresh-ahead exists to remove.
+	if got := atomic.LoadInt32(&reg.refreshes); got != 1 {
+		t.Errorf("grounding refreshes = %d, want 1 (the warmer must force a live read)", got)
 	}
 }
 

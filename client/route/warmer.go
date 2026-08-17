@@ -137,12 +137,25 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 		} else {
 			metrics.WarmerProviderRefresh("ok")
 		}
-		// Warm the on-chain signer-grounding cache too (when configured), so the
-		// first real request pays neither the DCAP verify nor the registry RPC.
-		// Best-effort: the request path does the authoritative grounding.
+		// Refresh the on-chain signer-grounding cache too (when configured), so the
+		// first real request pays neither the DCAP verify nor the registry RPC. This
+		// uses RefreshSigner rather than an ordinary lookup on purpose: an ordinary
+		// lookup is satisfied by a still-fresh entry and so would warm nothing, which
+		// left the entry to expire on its own schedule — the sweep interval and the
+		// registry TTL are independently phased, so whether a request found a warm
+		// entry came down to luck. Forcing the read each sweep makes it a true
+		// refresh-ahead (interval under TTL ⇒ always warm), and it costs one eth_call
+		// per provider per sweep.
+		//
+		// Still best-effort: the request path does the authoritative grounding, and a
+		// failure here only means the next request may pay the RPC itself (or, if the
+		// chain is unreachable, fall back on the cache's grace window).
 		if r.registry != nil {
-			if _, _, err := r.registry.AcknowledgedSigner(ctx, addr); err != nil {
-				r.logger.Warn("warmer: signer lookup failed", "provider", addr, "err", err)
+			if _, err := r.registry.RefreshSigner(ctx, addr); err != nil {
+				metrics.WarmerSignerRefresh("failed")
+				r.logger.Warn("warmer: signer refresh failed", "provider", addr, "err", err)
+			} else {
+				metrics.WarmerSignerRefresh("ok")
 			}
 		}
 	}

@@ -64,12 +64,56 @@ const getServiceSelector = "15a52302"
 // or misconfigured RPC returning an unbounded body.
 const maxRPCBodyBytes = 1 << 20
 
+// RPC attempt policy. The lookup sits on the REQUEST path (the route resolver
+// grounds every candidate it materializes), so the shape that matters is "absorb
+// a blip quickly", not "wait a long time for one attempt": a hung RPC is worse
+// for a user than a fast failure, because the candidate loop pays it once per
+// candidate, serially. Hence a short per-attempt deadline and a couple of quick
+// retries rather than a single long one.
+const (
+	// rpcAttempts is the total number of eth_call attempts per lookup.
+	rpcAttempts = 3
+	// rpcAttemptTimeout bounds ONE attempt. The caller's context still applies and
+	// wins when it is shorter.
+	rpcAttemptTimeout = 3 * time.Second
+	// rpcRetryBackoff is the pause before the second attempt; it doubles for each
+	// attempt after that.
+	rpcRetryBackoff = 200 * time.Millisecond
+	// rpcTotalTimeout is the belt-and-braces ceiling on the HTTP client, covering
+	// the whole retry sequence in case a per-attempt deadline is somehow not
+	// honored. It is not the operative bound — rpcAttemptTimeout is.
+	rpcTotalTimeout = 15 * time.Second
+)
+
+// Signer is a provider's on-chain TEE signer as of one lookup, plus the
+// provenance a caller needs to decide how much weight to put on it.
+type Signer struct {
+	// Address is the acknowledged teeSignerAddress. Meaningful only when
+	// Acknowledged is true.
+	Address string
+	// Acknowledged mirrors the contract's teeSignerAcknowledged. A caller MUST
+	// trust Address only when this is true.
+	Acknowledged bool
+	// Stale reports that the value came from a cache entry past its TTL, kept
+	// usable by the grace window because the refresh RPC failed. A stale reading is
+	// good enough to CONFIRM that a quote-bound signer matches, and never good
+	// enough to REJECT one — see the asymmetry documented on Cached.
+	Stale bool
+}
+
 // SignerRegistry looks up a provider's on-chain, acknowledged TEE signer address.
 // providerAddr is the provider's account address (the same value the router
 // advertises as the routing pin). Callers MUST trust the returned signer only
-// when acknowledged is true.
+// when Signer.Acknowledged is true.
 type SignerRegistry interface {
-	AcknowledgedSigner(ctx context.Context, providerAddr string) (signer string, acknowledged bool, err error)
+	// AcknowledgedSigner returns the provider's acknowledged TEE signer, which may
+	// come from a cache and may be Stale (see Signer.Stale).
+	AcknowledgedSigner(ctx context.Context, providerAddr string) (Signer, error)
+	// RefreshSigner returns a reading taken live from the chain, bypassing any
+	// cache — including the grace window, so it never returns a Stale value. A
+	// caller about to REJECT a provider on the strength of a lookup calls this
+	// first, so a benign signer rotation cannot be indicted by a stale cache entry.
+	RefreshSigner(ctx context.Context, providerAddr string) (Signer, error)
 }
 
 // Config configures an OnChainRegistry.
@@ -112,7 +156,7 @@ func NewOnChainRegistry(cfg Config) (*OnChainRegistry, error) {
 	}
 	httpc := cfg.HTTPClient
 	if httpc == nil {
-		httpc = &http.Client{Timeout: 15 * time.Second}
+		httpc = &http.Client{Timeout: rpcTotalTimeout}
 	}
 	blockTag := cfg.BlockTag
 	if blockTag == "" {
@@ -127,13 +171,26 @@ func NewOnChainRegistry(cfg Config) (*OnChainRegistry, error) {
 }
 
 // AcknowledgedSigner reads getService(providerAddr) and returns its
-// teeSignerAddress and teeSignerAcknowledged.
-func (r *OnChainRegistry) AcknowledgedSigner(ctx context.Context, providerAddr string) (string, bool, error) {
+// teeSignerAddress and teeSignerAcknowledged. The reading is always live — this
+// type holds no cache — so the returned Signer is never Stale.
+func (r *OnChainRegistry) AcknowledgedSigner(ctx context.Context, providerAddr string) (Signer, error) {
 	raw, err := r.getServiceRaw(ctx, providerAddr)
 	if err != nil {
-		return "", false, err
+		return Signer{}, err
 	}
-	return decodeService(raw)
+	signer, acknowledged, err := decodeService(raw)
+	if err != nil {
+		return Signer{}, err
+	}
+	return Signer{Address: signer, Acknowledged: acknowledged}, nil
+}
+
+// RefreshSigner is AcknowledgedSigner: this registry reads through to the chain
+// on every call, so there is no cache for a refresh to bypass. The method exists
+// so *OnChainRegistry satisfies SignerRegistry on its own, unwrapped — a caller
+// that skips chain.Cached still gets the same contract.
+func (r *OnChainRegistry) RefreshSigner(ctx context.Context, providerAddr string) (Signer, error) {
+	return r.AcknowledgedSigner(ctx, providerAddr)
 }
 
 // ServiceInfo is the subset of a provider's on-chain Service a caller needs to
@@ -189,7 +246,14 @@ type jsonRPCResponse struct {
 }
 
 // ethCall performs eth_call(to=contract, data=calldata) at the configured block
-// and returns the decoded return bytes.
+// and returns the decoded return bytes, retrying a TRANSIENT failure up to
+// rpcAttempts times with a doubling backoff.
+//
+// Only transport failures and retryable HTTP statuses (429, 5xx) are retried: a
+// JSON-RPC application error ("execution reverted") and a malformed/undecodable
+// reply are deterministic, so repeating them just multiplies the latency the
+// caller's request pays. The caller's context is honored between attempts, so a
+// cancelled or expired request stops retrying immediately.
 func (r *OnChainRegistry) ethCall(ctx context.Context, calldata string) ([]byte, error) {
 	reqBody, err := json.Marshal(jsonRPCRequest{
 		JSONRPC: "2.0",
@@ -203,36 +267,79 @@ func (r *OnChainRegistry) ethCall(ctx context.Context, calldata string) ([]byte,
 	if err != nil {
 		return nil, fmt.Errorf("chain: marshal eth_call: %w", err)
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, r.rpcURL, strings.NewReader(string(reqBody)))
+
+	backoff := rpcRetryBackoff
+	var lastErr error
+	for attempt := 0; attempt < rpcAttempts; attempt++ {
+		if attempt > 0 {
+			// Wait out the backoff, but abandon the sequence the moment the caller
+			// gives up — its deadline bounds the whole lookup, not just one attempt.
+			t := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return nil, fmt.Errorf("chain: eth_call: %w (last error: %v)", ctx.Err(), lastErr)
+			case <-t.C:
+			}
+			backoff *= 2
+		}
+		out, retryable, err := r.ethCallOnce(ctx, reqBody)
+		if err == nil {
+			return out, nil
+		}
+		lastErr = err
+		if !retryable || ctx.Err() != nil {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("chain: eth_call failed after %d attempts: %w", rpcAttempts, lastErr)
+}
+
+// ethCallOnce runs a single eth_call attempt under its own short deadline
+// (rpcAttemptTimeout, or the caller's remaining budget when that is shorter). It
+// reports whether the failure is worth another attempt.
+func (r *OnChainRegistry) ethCallOnce(ctx context.Context, reqBody []byte) (out []byte, retryable bool, err error) {
+	attemptCtx, cancel := context.WithTimeout(ctx, rpcAttemptTimeout)
+	defer cancel()
+
+	httpReq, err := http.NewRequestWithContext(attemptCtx, http.MethodPost, r.rpcURL, strings.NewReader(string(reqBody)))
 	if err != nil {
-		return nil, fmt.Errorf("chain: build eth_call request: %w", err)
+		return nil, false, fmt.Errorf("chain: build eth_call request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
 	resp, err := r.http.Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("chain: eth_call request: %w", err)
+		// A transport failure (refused, reset, DNS, attempt deadline) is the classic
+		// blip another attempt clears.
+		return nil, true, fmt.Errorf("chain: eth_call request: %w", err)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxRPCBodyBytes))
 	if err != nil {
-		return nil, fmt.Errorf("chain: read eth_call response: %w", err)
+		return nil, true, fmt.Errorf("chain: read eth_call response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("chain: eth_call returned HTTP %d", resp.StatusCode)
+		return nil, retryableStatus(resp.StatusCode), fmt.Errorf("chain: eth_call returned HTTP %d", resp.StatusCode)
 	}
 	var rpcResp jsonRPCResponse
 	if err := json.Unmarshal(body, &rpcResp); err != nil {
-		return nil, fmt.Errorf("chain: decode eth_call response: %w", err)
+		return nil, false, fmt.Errorf("chain: decode eth_call response: %w", err)
 	}
 	if rpcResp.Error != nil {
-		return nil, fmt.Errorf("chain: eth_call error %d: %s", rpcResp.Error.Code, rpcResp.Error.Message)
+		return nil, false, fmt.Errorf("chain: eth_call error %d: %s", rpcResp.Error.Code, rpcResp.Error.Message)
 	}
-	out, err := hex.DecodeString(strings.TrimPrefix(rpcResp.Result, "0x"))
+	decoded, err := hex.DecodeString(strings.TrimPrefix(rpcResp.Result, "0x"))
 	if err != nil {
-		return nil, fmt.Errorf("chain: decode eth_call result hex: %w", err)
+		return nil, false, fmt.Errorf("chain: decode eth_call result hex: %w", err)
 	}
-	return out, nil
+	return decoded, false, nil
+}
+
+// retryableStatus reports whether an RPC endpoint's HTTP status is worth another
+// attempt: a rate limit or a server-side error may clear, a 4xx will not.
+func retryableStatus(status int) bool {
+	return status == http.StatusTooManyRequests || (status >= 500 && status <= 599)
 }
 
 // decodeService extracts teeSignerAddress and teeSignerAcknowledged from the

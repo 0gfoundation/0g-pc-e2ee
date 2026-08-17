@@ -696,6 +696,15 @@ and warmer liveness).
   is a switch and the other is not:
   - the **on-chain signer** check (trust-chain hop 5) is wired and observed;
     `ZG_GATEWAY_ONCHAIN_ENFORCE` is simply off, so turning it on is a config change.
+    Read `onchain_grounding_total` from `/metrics` before flipping it: warn mode is
+    the baseline that says whether enforce is safe here, since every outcome other
+    than `ok`/`ok_stale` becomes a skipped candidate. Note the two negatives are not
+    the same thing — `mismatch`/`not_acknowledged` are verdicts about the provider
+    and are what enforce is for, while `lookup_failed` is our own chain RPC and stays
+    observe-only unless `ZG_GATEWAY_ONCHAIN_REQUIRE_LOOKUP` is set. A provider is
+    never rejected on a stale or cached reading without a live re-read first, so a
+    broker upgrade rotating its signer does not read as an attack (see
+    `trust-chain.md`, "Operating the on-chain root").
   - the **boot-chain** check (hop 3) has an empty allowlist, so
     `ZG_GATEWAY_ATTEST_ENFORCE` would reject every provider. It now compares the boot
     chain (MRTD + RTMR1 + RTMR2) rather than all five registers — the same split the

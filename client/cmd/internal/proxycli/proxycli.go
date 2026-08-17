@@ -147,6 +147,15 @@ func serve(srv *http.Server, logger *slog.Logger, sigCh <-chan os.Signal) error 
 // minutes trades a stale-signer window for far fewer chain RPCs per request.
 const onchainCacheTTL = 5 * time.Minute
 
+// onchainCacheGrace is how long past onchainCacheTTL an entry stays usable when
+// the chain RPC is failing (chain.Cached's grace window). It is generous on
+// purpose: the value it protects is near-static, while the outage it prevents is
+// total — the resolver grounds every candidate on the request path, so without a
+// grace window an unreachable RPC fails every request. A stale reading can only
+// ever CONFIRM a signer, never condemn one, so lengthening it does not widen what
+// a stale entry is allowed to decide.
+const onchainCacheGrace = 30 * time.Minute
+
 // NewLogger builds the process logger both proxy binaries share: human-readable
 // text records to stdout, at Info and above. Centralizing it here keeps the
 // sidecar and gateway on one format, level, and sink so their logs don't drift.
@@ -170,13 +179,17 @@ type Flags struct {
 	attestEnforce    *bool
 	onchainOn        *bool
 	onchainEnforce   *bool
-	verifyResponses  *bool
-	chainRPCURL      *string
-	servingContract  *string
-	warmOn           *bool
-	warmInterval     *time.Duration
-	pccsURL          *string
-	collateralTTL    *time.Duration
+	// onchainRequireLookup extends enforce to registry LOOKUP failures. It is a
+	// separate flag because the two negatives are different things: a mismatch is
+	// about the provider, an unreachable RPC is about us.
+	onchainRequireLookup *bool
+	verifyResponses      *bool
+	chainRPCURL          *string
+	servingContract      *string
+	warmOn               *bool
+	warmInterval         *time.Duration
+	pccsURL              *string
+	collateralTTL        *time.Duration
 }
 
 // defaultWarmInterval is the refresh-ahead period the background quote-cache
@@ -223,6 +236,8 @@ func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen string) *Flags {
 			fmt.Sprintf("cross-check each provider's quote-bound TEE signer against its acknowledged on-chain teeSignerAddress in the InferenceServing registry (SPEC §4.4 step 3); requires -attest (env %s)", env("ONCHAIN"))),
 		onchainEnforce: fs.Bool("onchain-enforce", envBool(env("ONCHAIN_ENFORCE"), false),
 			fmt.Sprintf("with -onchain, skip a provider whose on-chain signer is missing/unacknowledged/mismatched instead of only warning (env %s)", env("ONCHAIN_ENFORCE"))),
+		onchainRequireLookup: fs.Bool("onchain-require-lookup", envBool(env("ONCHAIN_REQUIRE_LOOKUP"), false),
+			fmt.Sprintf("with -onchain-enforce, also skip a provider whose on-chain signer could NOT BE READ (RPC failure, past the cache's grace window) instead of proceeding ungrounded with a warning; off by default because the lookup is on the request path for every candidate, so an unreachable chain RPC would fail every request (env %s)", env("ONCHAIN_REQUIRE_LOOKUP"))),
 		verifyResponses: fs.Bool("verify-responses", envBool(env("VERIFY_RESPONSES"), false),
 			fmt.Sprintf("verify each response's §8 TEE signature (trust-chain hop 11), fetched directly from the provider's broker endpoint, fail-closed against the quote-bound signer; requires -attest, and -onchain additionally grounds that signer on-chain (env %s)", env("VERIFY_RESPONSES"))),
 		chainRPCURL: fs.String("chain-rpc-url", envOr(env("CHAIN_RPC_URL"), chain.DefaultChainRPCURL),
@@ -312,6 +327,10 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 		logger.Error("-onchain-enforce requires -onchain")
 		os.Exit(1)
 	}
+	if *f.onchainRequireLookup && !*f.onchainEnforce {
+		logger.Error("-onchain-require-lookup requires -onchain-enforce (warn mode is observe-only by definition)")
+		os.Exit(1)
+	}
 	if *f.onchainOn && !*f.attestOn {
 		logger.Error("-onchain requires -attest (the signer must come from a verified quote)")
 		os.Exit(1)
@@ -364,8 +383,12 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 			os.Exit(1)
 		}
 		resolver = reg
-		routeOpts = append(routeOpts, route.WithOnChainVerification(chain.Cached(reg, onchainCacheTTL), *f.onchainEnforce, logger))
-		logger.Info("on-chain signer grounding enabled", "label", label, "enforce", *f.onchainEnforce, "contract", *f.servingContract)
+		routeOpts = append(routeOpts,
+			route.WithOnChainVerification(chain.Cached(reg, onchainCacheTTL, onchainCacheGrace), *f.onchainEnforce, logger),
+			route.WithOnChainRequireLookup(*f.onchainRequireLookup))
+		logger.Info("on-chain signer grounding enabled", "label", label,
+			"enforce", *f.onchainEnforce, "require_lookup", *f.onchainRequireLookup,
+			"contract", *f.servingContract, "cache_ttl", onchainCacheTTL, "cache_grace", onchainCacheGrace)
 	}
 	coreOpts := []core.Option{
 		core.WithSealFields(sealFields),
