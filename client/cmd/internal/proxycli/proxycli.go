@@ -179,17 +179,17 @@ type Flags struct {
 	attestEnforce    *bool
 	onchainOn        *bool
 	onchainEnforce   *bool
-	// onchainRequireLookup extends enforce to registry LOOKUP failures. It is a
-	// separate flag because the two negatives are different things: a mismatch is
-	// about the provider, an unreachable RPC is about us.
-	onchainRequireLookup *bool
-	verifyResponses      *bool
-	chainRPCURL          *string
-	servingContract      *string
-	warmOn               *bool
-	warmInterval         *time.Duration
-	pccsURL              *string
-	collateralTTL        *time.Duration
+	// onchainTolerateRPCFailure relaxes enforce when the chain RPC cannot be read at
+	// all. It is a separate flag because the two negatives are different things: a
+	// mismatch is about the provider, an unreachable RPC is about us.
+	onchainTolerateRPCFailure *bool
+	verifyResponses           *bool
+	chainRPCURL               *string
+	servingContract           *string
+	warmOn                    *bool
+	warmInterval              *time.Duration
+	pccsURL                   *string
+	collateralTTL             *time.Duration
 }
 
 // defaultWarmInterval is the refresh-ahead period the background quote-cache
@@ -236,8 +236,8 @@ func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen string) *Flags {
 			fmt.Sprintf("cross-check each provider's quote-bound TEE signer against its acknowledged on-chain teeSignerAddress in the InferenceServing registry (SPEC §4.4 step 3); requires -attest (env %s)", env("ONCHAIN"))),
 		onchainEnforce: fs.Bool("onchain-enforce", envBool(env("ONCHAIN_ENFORCE"), false),
 			fmt.Sprintf("with -onchain, skip a provider whose on-chain signer is missing/unacknowledged/mismatched instead of only warning (env %s)", env("ONCHAIN_ENFORCE"))),
-		onchainRequireLookup: fs.Bool("onchain-require-lookup", envBool(env("ONCHAIN_REQUIRE_LOOKUP"), false),
-			fmt.Sprintf("with -onchain-enforce, also skip a provider whose on-chain signer could NOT BE READ (RPC failure, past the cache's grace window) instead of proceeding ungrounded with a warning; off by default because the lookup is on the request path for every candidate, so an unreachable chain RPC would fail every request (env %s)", env("ONCHAIN_REQUIRE_LOOKUP"))),
+		onchainTolerateRPCFailure: fs.Bool("onchain-tolerate-rpc-failure", envBool(env("ONCHAIN_TOLERATE_RPC_FAILURE"), false),
+			fmt.Sprintf("with -onchain-enforce, use a provider even when its on-chain signer could NOT BE READ at all (chain RPC unreachable, past the cache's grace window) instead of skipping it — its signer goes unchecked. Off by default, so -onchain-enforce means the chain was actually read; turning it on keeps serving through a chain-RPC outage, at the cost of letting anyone who can degrade that RPC silently switch the check off (env %s)", env("ONCHAIN_TOLERATE_RPC_FAILURE"))),
 		verifyResponses: fs.Bool("verify-responses", envBool(env("VERIFY_RESPONSES"), false),
 			fmt.Sprintf("verify each response's §8 TEE signature (trust-chain hop 11), fetched directly from the provider's broker endpoint, fail-closed against the quote-bound signer; requires -attest, and -onchain additionally grounds that signer on-chain (env %s)", env("VERIFY_RESPONSES"))),
 		chainRPCURL: fs.String("chain-rpc-url", envOr(env("CHAIN_RPC_URL"), chain.DefaultChainRPCURL),
@@ -327,9 +327,11 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 		logger.Error("-onchain-enforce requires -onchain")
 		os.Exit(1)
 	}
-	if *f.onchainRequireLookup && !*f.onchainEnforce {
-		logger.Error("-onchain-require-lookup requires -onchain-enforce (warn mode is observe-only by definition)")
-		os.Exit(1)
+	if *f.onchainTolerateRPCFailure && !*f.onchainEnforce {
+		// Inert rather than contradictory — warn mode already proceeds on every
+		// negative — so this is a note, not a startup failure. Exiting here would turn
+		// a harmless combination into a restart loop behind a healthy ingress.
+		logger.Info("-onchain-tolerate-rpc-failure has no effect without -onchain-enforce (warn mode already proceeds)")
 	}
 	if *f.onchainOn && !*f.attestOn {
 		logger.Error("-onchain requires -attest (the signer must come from a verified quote)")
@@ -385,9 +387,9 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 		resolver = reg
 		routeOpts = append(routeOpts,
 			route.WithOnChainVerification(chain.Cached(reg, onchainCacheTTL, onchainCacheGrace), *f.onchainEnforce, logger),
-			route.WithOnChainRequireLookup(*f.onchainRequireLookup))
+			route.WithOnChainTolerateRPCFailure(*f.onchainTolerateRPCFailure))
 		logger.Info("on-chain signer grounding enabled", "label", label,
-			"enforce", *f.onchainEnforce, "require_lookup", *f.onchainRequireLookup,
+			"enforce", *f.onchainEnforce, "tolerate_rpc_failure", *f.onchainTolerateRPCFailure,
 			"contract", *f.servingContract, "cache_ttl", onchainCacheTTL, "cache_grace", onchainCacheGrace)
 	}
 	coreOpts := []core.Option{

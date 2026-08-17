@@ -160,17 +160,33 @@ chain's acknowledged `teeSignerAddress` — so its failure modes are about the
 *readings*, not only about the provider. Two properties keep enforce mode from
 becoming a liability:
 
-**A lookup failure is not a verdict.** The registry lookup sits on the request
-path for every candidate the resolver materializes, so treating an unreachable
-chain RPC as fatal converts *our own* dependency's bad day into every user's
-failed request. A failed lookup therefore degrades to observe-only even under
-`-onchain-enforce`, logged and counted (`onchain_grounding_total{outcome=
-"lookup_failed"}`); a deployment that would rather refuse service than serve
-ungrounded opts in with `-onchain-require-lookup`. Only a *verdict* about the
-provider — an unacknowledged or mismatched signer — is fail-closed. Against
-transient failure the lookup also retries with backoff under a short per-attempt
-deadline, single-flights concurrent misses, and keeps an expired entry usable for
-a grace window (`chain.Cached`) so an outage degrades rather than severs.
+**A lookup failure is not a verdict — but it is not a pass either.** Under
+`-onchain-enforce` an unreadable chain fails the candidate, so "enforce" means the
+chain was actually read rather than merely consulted. What the split buys is
+*attribution*, not leniency: the outcome is recorded as `onchain_grounding_total
+{outcome="lookup_failed"}` rather than as `mismatch`, so a problem with our own RPC
+never shows up in the metrics as an accusation against a provider, and the two get
+different alerts and different fixes.
+
+The alternative — proceeding when the chain cannot be read — is available as
+`-onchain-tolerate-rpc-failure`, and it is off by default because of an asymmetry
+in the failure modes. With it off, a chain-RPC outage is an outage: visible,
+bounded, and it pages someone. With it on, anyone who can merely *degrade* that
+RPC — far easier than compromising a provider — silently switches hop 5 off and
+re-opens the look-alike-enclave attack it exists to close, for as long as they care
+to, with nothing surfacing to the user. A visible outage is the better failure.
+
+What keeps the strict default affordable is the machinery in front of the lookup:
+bounded retry with backoff under a short per-attempt deadline, single-flighted
+refreshes, a 5-minute cache the warmer refreshes ahead of expiry, and a 30-minute
+grace window that keeps serving a last-known-good reading through an outage
+(`chain.Cached`). A blip never reaches the decision at all; only a sustained
+outage does.
+
+One consequence worth stating plainly: **anything that reports provider identity
+as *proven* must either leave `-onchain-tolerate-rpc-failure` off or surface the
+per-request grounding state.** Claiming proof while it is on is the same class of
+error as passing an unverified value along under a verified name.
 
 **Stale evidence may confirm, never condemn.** A cached reading that *agrees*
 with the quote is accepted as-is. A cached reading that *disagrees* is re-read
@@ -243,7 +259,7 @@ particular is implemented against an allowlist that is still empty.
 | Hop 2 — TDX quote signature-chain verification | **Implemented.** A real go-tdx-guest DCAP verifier (quote chain → Intel root + QE identity + TCB status) fills the `WithQuoteParser` seam, wired into the sidecar, gateway, and route resolver. The seam stays in `protocol/attest` by design (keeps `protocol` lean/portable); the heavy verifier lives in the client. | `client/dcap/tdxverify.go`, `client/cmd/{sidecar,gateway}/main.go`, #29 / #31 |
 | Hop 3 — boot-chain allowlist | **Implemented, allowlist empty.** `Verifier.Verify` compares the quote's `BootChain` (MRTD + RTMR1 + RTMR2) against `BootChainPolicy` in enforce/warn modes (`-attest-enforce`). **The audited-image allowlist is still empty**, so warn mode proceeds on any image and enforce rejects every provider — reporting `ErrMeasurementPolicyNotConfigured`, which names the unfinished configuration rather than blaming the enclave. What remains is where the values are published, not the mechanism. | `attest/verify.go`, `attest/measurement.go`, `client/cmd/gateway/main.go`, #31 |
 | Hop 4 — `report_data` → `enc_pub`/`signer_addr` | **Implemented.** `ParseReportData` (SPEC §4.2 layout). | `attest/reportdata.go` |
-| Hop 5 — `signer_addr == on-chain teeSignerAddress` | **Implemented (warn/enforce).** The route resolver cross-checks the DCAP-quote-bound signer against the provider's *acknowledged* `teeSignerAddress` read from the on-chain InferenceServing registry (`getService`), keyed on the provider's on-chain account — a mapping the untrusted router cannot forge. This is what catches a *genuine* enclave running audited code but operated by an unregistered party ([Why the on-chain root exists](#why-the-on-chain-root-exists)). Enforce skips a missing/unacknowledged/mismatched candidate; warn observes only. A failed *lookup* is a separate class — it says nothing about the provider, so it degrades to observe-only unless `-onchain-require-lookup` is set, and a negative is never returned on stale or cached evidence without a live re-read ([Operating the on-chain root](#operating-the-on-chain-root)). Reads the chain over a client-trusted RPC (`-onchain`, `-chain-rpc-url`), not the router. | `client/chain/registry.go`, `client/route` `WithOnChainVerification`, #18 |
+| Hop 5 — `signer_addr == on-chain teeSignerAddress` | **Implemented (warn/enforce).** The route resolver cross-checks the DCAP-quote-bound signer against the provider's *acknowledged* `teeSignerAddress` read from the on-chain InferenceServing registry (`getService`), keyed on the provider's on-chain account — a mapping the untrusted router cannot forge. This is what catches a *genuine* enclave running audited code but operated by an unregistered party ([Why the on-chain root exists](#why-the-on-chain-root-exists)). Enforce skips a missing/unacknowledged/mismatched candidate; warn observes only. A failed *lookup* is fail-closed too (so enforce means the chain was actually read) but counted as its own class rather than as a provider accusation, and can be traded for availability with `-onchain-tolerate-rpc-failure`; a negative is never returned on stale or cached evidence without a live re-read ([Operating the on-chain root](#operating-the-on-chain-root)). Reads the chain over a client-trusted RPC (`-onchain`, `-chain-rpc-url`), not the router. | `client/chain/registry.go`, `client/route` `WithOnChainVerification`, #18 |
 | Hops 6–9 — HPKE seal/open, AAD binding | **Implemented.** | `crypto/`, `wire/` |
 | Hop 11 — signature verify against signer | **Implemented (opt-in, `-verify-responses`).** The client recomputes the §8 ciphertext binding over the on-wire `aad‖ciphertext` it received (non-stream, and streamed via an ordered per-frame aggregate), recovers the EIP-191 signer, and accepts only if it equals `provider.SignerAddr` — the quote-bound signer, itself grounded on-chain when `-onchain` is on (hop 5) — never the self-reported `signing_address`. The signature is fetched **directly from the provider's broker endpoint** (the router does not proxy `/v1/proxy/signature`). Fail-closed; off by default. The versioned signed-text/binding contract is shared with the broker in `protocol/proof` (no drift). | `protocol/proof`, `client/sig`, `client/core` (verify.go), `client/route` (sigfetch.go) |
 

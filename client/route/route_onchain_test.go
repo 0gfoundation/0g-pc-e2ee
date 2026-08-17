@@ -112,41 +112,61 @@ func TestGroundSignerOnChain_VerdictsFailClosedUnderEnforce(t *testing.T) {
 	}
 }
 
-// A lookup failure says nothing about the provider. Under enforce it must still
-// proceed by default, because the lookup is on the request path for every
-// candidate: failing it would turn a chain-RPC outage into a total outage.
-func TestGroundSignerOnChain_LookupFailureDegradesByDefault(t *testing.T) {
-	for _, enforce := range []bool{false, true} {
-		reg := &stubRegistry{err: errors.New("rpc down")}
-		r := newOnChainRouter(reg, enforce)
-		outcome, err := r.groundSignerOnChain(context.Background(), ocProvider, ocSigner)
-		if err != nil {
-			t.Errorf("enforce=%v: a lookup failure should proceed ungrounded, got %v", enforce, err)
-		}
-		if outcome != groundingLookupFailed {
-			t.Errorf("enforce=%v: outcome = %s, want %s", enforce, outcome, groundingLookupFailed)
-		}
+// Under enforce, a lookup failure is fail-closed by default: "enforce" should mean
+// the chain was actually read, not merely consulted. It is still reported as
+// lookup_failed rather than as a verdict, so a chain problem never reads as a
+// provider accusation.
+func TestGroundSignerOnChain_LookupFailureFailsClosedUnderEnforce(t *testing.T) {
+	reg := &stubRegistry{err: errors.New("rpc down")}
+	r := newOnChainRouter(reg, true)
+	outcome, err := r.groundSignerOnChain(context.Background(), ocProvider, ocSigner)
+	if err == nil {
+		t.Error("enforce: an unreadable chain should fail-closed by default")
+	}
+	if outcome != groundingLookupFailed {
+		t.Errorf("outcome = %s, want %s (not a verdict about the provider)", outcome, groundingLookupFailed)
 	}
 }
 
-// ...unless the operator explicitly asks for the strict reading.
-func TestGroundSignerOnChain_LookupFailureFailsClosedWhenRequired(t *testing.T) {
+// Warn mode proceeds on a lookup failure like it does on every other negative.
+func TestGroundSignerOnChain_LookupFailureProceedsUnderWarn(t *testing.T) {
 	reg := &stubRegistry{err: errors.New("rpc down")}
-	r := newOnChainRouter(reg, true)
-	r.onchainRequireLookup = true
+	r := newOnChainRouter(reg, false)
 	outcome, err := r.groundSignerOnChain(context.Background(), ocProvider, ocSigner)
-	if err == nil {
-		t.Error("with require-lookup, a lookup failure should fail-closed")
+	if err != nil {
+		t.Errorf("warn: a lookup failure should proceed, got %v", err)
 	}
 	if outcome != groundingLookupFailed {
 		t.Errorf("outcome = %s, want %s", outcome, groundingLookupFailed)
 	}
-	// Warn mode stays observe-only regardless of the strict knob.
-	reg2 := &stubRegistry{err: errors.New("rpc down")}
-	rWarn := newOnChainRouter(reg2, false)
-	rWarn.onchainRequireLookup = true
-	if _, err := rWarn.groundSignerOnChain(context.Background(), ocProvider, ocSigner); err != nil {
-		t.Errorf("warn mode should stay observe-only, got %v", err)
+}
+
+// An operator can trade that property away for availability.
+func TestGroundSignerOnChain_LookupFailureToleratedWhenAsked(t *testing.T) {
+	reg := &stubRegistry{err: errors.New("rpc down")}
+	r := newOnChainRouter(reg, true)
+	r.onchainTolerateRPCFailure = true
+	outcome, err := r.groundSignerOnChain(context.Background(), ocProvider, ocSigner)
+	if err != nil {
+		t.Errorf("with tolerate-rpc-failure, an unreadable chain should proceed, got %v", err)
+	}
+	if outcome != groundingLookupFailed {
+		t.Errorf("outcome = %s, want %s (tolerating it does not make it a success)", outcome, groundingLookupFailed)
+	}
+}
+
+// Tolerating an RPC failure must not soften a verdict about the provider — those
+// are exactly what enforce is for.
+func TestGroundSignerOnChain_TolerateRPCFailureDoesNotExcuseMismatch(t *testing.T) {
+	reg := &stubRegistry{signer: ocOther, ack: true}
+	r := newOnChainRouter(reg, true)
+	r.onchainTolerateRPCFailure = true
+	outcome, err := r.groundSignerOnChain(context.Background(), ocProvider, ocSigner)
+	if err == nil {
+		t.Error("a mismatch must still fail-closed when RPC failures are tolerated")
+	}
+	if outcome != groundingMismatch {
+		t.Errorf("outcome = %s, want %s", outcome, groundingMismatch)
 	}
 }
 
@@ -209,21 +229,34 @@ func TestGroundSignerOnChain_StaleMismatchSurvivesRevalidation(t *testing.T) {
 	}
 }
 
-// If the revalidation itself cannot reach the chain, we have no fresh evidence —
-// so the result is a lookup failure, not a mismatch verdict.
+// If the revalidation itself cannot reach the chain, we have no fresh evidence.
+// The stale entry disagrees, so we cannot confirm; it is stale, so we may not
+// condemn. That is a lookup failure, not a mismatch verdict — and under enforce it
+// is fail-closed as such, without ever being recorded as an accusation against the
+// provider.
 func TestGroundSignerOnChain_StaleMismatchWithFailedRevalidation(t *testing.T) {
-	reg := &stubRegistry{
-		signer:     ocOther,
-		ack:        true,
-		stale:      true,
-		refreshErr: errors.New("rpc down"),
+	newReg := func() *stubRegistry {
+		return &stubRegistry{
+			signer:     ocOther,
+			ack:        true,
+			stale:      true,
+			refreshErr: errors.New("rpc down"),
+		}
 	}
-	r := newOnChainRouter(reg, true)
+	r := newOnChainRouter(newReg(), true)
 	outcome, err := r.groundSignerOnChain(context.Background(), ocProvider, ocSigner)
 	if outcome != groundingLookupFailed {
 		t.Errorf("outcome = %s, want %s (no fresh evidence is not a verdict)", outcome, groundingLookupFailed)
 	}
-	if err != nil {
-		t.Errorf("without require-lookup this should proceed ungrounded, got %v", err)
+	if err == nil {
+		t.Error("enforce: no fresh evidence should fail-closed by default")
+	}
+
+	// Tolerating RPC failures covers this path too: it is the same "we could not
+	// read the chain" class, arrived at one step later.
+	rTolerant := newOnChainRouter(newReg(), true)
+	rTolerant.onchainTolerateRPCFailure = true
+	if _, err := rTolerant.groundSignerOnChain(context.Background(), ocProvider, ocSigner); err != nil {
+		t.Errorf("with tolerate-rpc-failure this should proceed, got %v", err)
 	}
 }

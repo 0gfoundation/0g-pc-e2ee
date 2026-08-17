@@ -222,14 +222,19 @@ services:
       # and if all candidates are skipped the request fails.
       # - "ZG_GATEWAY_ONCHAIN_ENFORCE=true"
       #
-      # With enforce on, also skip a provider whose on-chain signer could not be
-      # READ at all (chain RPC down past the cache's grace window), rather than
-      # proceeding ungrounded with a warning. Left OFF deliberately: the lookup is
-      # on the request path for every candidate, so an unreachable RPC would fail
-      # every request — an outage caused by our own dependency, not by a provider.
-      # Turn it on only if refusing service is preferable to serving a request whose
-      # provider identity could not be confirmed.
-      # - "ZG_GATEWAY_ONCHAIN_REQUIRE_LOOKUP=true"
+      # With enforce on, keep using a provider even when its on-chain signer could
+      # not be READ at all (chain RPC unreachable past the cache's 30m grace window)
+      # — its signer goes unchecked for that request. Left OFF, which is what makes
+      # ONCHAIN_ENFORCE mean "the chain was actually read".
+      #
+      # The trade, both directions: OFF makes the chain RPC a hard dependency, so a
+      # sustained outage fails requests (a blip does not — retry, the 5m cache, the
+      # warmer's refresh-ahead and the grace window absorb those). ON keeps serving
+      # through such an outage, but then anyone who can merely degrade that RPC
+      # silently switches hop 5 off for as long as they like, with nothing surfacing
+      # to the user. Do not turn this on while anything presents the provider address
+      # as verified.
+      # - "ZG_GATEWAY_ONCHAIN_TOLERATE_RPC_FAILURE=true"
       # Verify each response's §8 TEE signature (trust-chain hop 11) fail-closed
       # against the quote-bound signer. A response that does not verify is rejected.
       - "ZG_GATEWAY_VERIFY_RESPONSES=true"
