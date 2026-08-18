@@ -41,7 +41,7 @@ func evidenceGateway(t *testing.T, dir string) *httptest.Server {
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	t.Cleanup(router.Close)
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, router.URL), testOrigins(), "", dir, noInFlightCap, discardLogger()))
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, router.URL), testOrigins(), "", dir, noInFlightCap, nil, discardLogger()))
 	t.Cleanup(gw.Close)
 	return gw
 }
@@ -368,7 +368,7 @@ func TestEvidenceRouteUnmountedWhenUnset(t *testing.T) {
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	defer router.Close()
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, router.URL), testOrigins(), "", "", noInFlightCap, discardLogger()))
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, router.URL), testOrigins(), "", "", noInFlightCap, nil, discardLogger()))
 	defer gw.Close()
 
 	resp, err := http.Get(gw.URL + "/evidences/quote.json")

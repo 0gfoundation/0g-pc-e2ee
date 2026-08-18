@@ -31,6 +31,14 @@
 //
 //   - -out-identity: {"instance_id","app_id","app_name","compose_hash"}, read by
 //     the gateway (client/dstack.ReadIdentityFile).
+//   - -out-app-compose: this CVM's `app-compose.json`, verbatim. The gateway reads
+//     it to describe its own container list (GET /v1/gateway/identity) after
+//     checking its SHA-256 against the compose_hash in the cert-binding quote —
+//     which is the only reason these unverified bytes are safe to hand over, and
+//     why they are copied byte-for-byte here rather than decoded and re-encoded.
+//     Same motivation as the identity file: the manifest is behind the same
+//     privileged socket, and fetching it here keeps the long-running gateway off
+//     that socket.
 //   - -prom-sd PATH=TARGET, repeatable: a Prometheus file_sd document pinning
 //     TARGET with the identity as TARGET LABELS. Prometheus watches the file and
 //     picks it up without a restart, which is what makes this an init container
@@ -72,6 +80,9 @@ func main() {
 		"path to the dstack guest-agent unix socket to read this CVM's identity from")
 	outIdentity := flag.String("out-identity", "",
 		"write the identity as JSON to this path (read by the gateway); empty skips it")
+	outAppCompose := flag.String("out-app-compose", "",
+		"write this CVM's app-compose.json verbatim to this path (read by the gateway to describe "+
+			"its own container list, after checking it against the quote's compose_hash); empty skips it")
 	var promSD promSDFlag
 	flag.Var(&promSD, "prom-sd",
 		"PATH=TARGET: write a Prometheus file_sd document to PATH pinning TARGET (e.g. "+
@@ -80,8 +91,8 @@ func main() {
 			"discover the other's target")
 	flag.Parse()
 
-	if *outIdentity == "" && len(promSD) == 0 {
-		fmt.Fprintln(os.Stderr, "cvmid: nothing to do: set -out-identity and/or -prom-sd")
+	if *outIdentity == "" && *outAppCompose == "" && len(promSD) == 0 {
+		fmt.Fprintln(os.Stderr, "cvmid: nothing to do: set -out-identity, -out-app-compose and/or -prom-sd")
 		os.Exit(2)
 	}
 
@@ -114,9 +125,38 @@ func main() {
 				fmt.Fprintf(os.Stderr, "cvmid: %v\n", err)
 				os.Exit(1)
 			}
-		} else if err := clearIdentityFile(*outIdentity); err != nil {
+		} else if err := clearStaleFile(*outIdentity); err != nil {
 			fmt.Fprintf(os.Stderr, "cvmid: %v\n", err)
 			os.Exit(1)
+		}
+	}
+	// The manifest, on the same terms as the identity above: written when the agent
+	// answers, and REMOVED when it does not, so a file left by an earlier boot can
+	// never be read as this one's. That matters more here than for the identity —
+	// a stale app-compose describes a container list the CVM is not running, and it
+	// would be read as current. The gateway re-checks these bytes against the
+	// quote's compose_hash before using them, so a stale file is caught there too;
+	// removing it is what keeps the failure legible instead of a hash mismatch.
+	//
+	// A fetch failure is exit 0 (the endpoint degrades to no container list — see
+	// the exit-code note above), a write failure exit 1 (a volume that is not
+	// mounted the way the compose says).
+	if *outAppCompose != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), dstack.DefaultTimeout)
+		raw, err := dstack.FetchAppCompose(ctx, *socket)
+		cancel()
+		switch {
+		case err != nil:
+			fmt.Fprintf(os.Stderr, "cvmid: app-compose unavailable, not publishing one: %v\n", err)
+			if err := clearStaleFile(*outAppCompose); err != nil {
+				fmt.Fprintf(os.Stderr, "cvmid: %v\n", err)
+				os.Exit(1)
+			}
+		default:
+			if err := dstack.PublishFile(*outAppCompose, raw); err != nil {
+				fmt.Fprintf(os.Stderr, "cvmid: %v\n", err)
+				os.Exit(1)
+			}
 		}
 	}
 	for _, sd := range promSD {
@@ -158,13 +198,13 @@ func (f *promSDFlag) Set(v string) error {
 	return nil
 }
 
-// clearIdentityFile removes a leftover identity file, treating an already-absent
-// one as success. Failing to remove one IS an error worth exiting on: it means
-// the volume is not writable the way the compose says, the same condition the
-// write path exits for.
-func clearIdentityFile(path string) error {
+// clearStaleFile removes a leftover output file, treating an already-absent one as
+// success. Failing to remove one IS an error worth exiting on: it means the volume
+// is not writable the way the compose says, the same condition the write path exits
+// for.
+func clearStaleFile(path string) error {
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("removing stale identity file %s: %w", path, err)
+		return fmt.Errorf("removing stale file %s: %w", path, err)
 	}
 	return nil
 }

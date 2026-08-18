@@ -236,11 +236,17 @@ func appIDHost(appID, baseDomain string) string {
 	return fmt.Sprintf("%s-%d.%s", strings.ToLower(strings.TrimSpace(appID)), guestAgentPort, strings.ToLower(d))
 }
 
-// matchExpected finds the candidate whose compose text equals got, returning its
+// MatchCompose finds the candidate whose compose text equals got, returning its
 // label. When none matches it reports how many were tried plus the diff against the
 // FIRST candidate — callers pass them newest-first, and the newest release is the
 // one an operator most likely meant to be running.
-func matchExpected(got []byte, candidates []ExpectedCompose) (string, error) {
+//
+// Exported for the same reason as CheckOSImage: the gateway reports which release
+// it corresponds to and pcverify verifies the same thing, and the two must not be
+// able to disagree about what "matches" means. The comparison is byte-exact modulo
+// line endings (diffComposeFile) — a field-by-field comparison would accept texts
+// the hash-anchored check rejects.
+func MatchCompose(got []byte, candidates []ExpectedCompose) (string, error) {
 	for _, c := range candidates {
 		if diffComposeFile(got, c.Content) == nil {
 			return c.Label, nil

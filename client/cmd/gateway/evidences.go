@@ -20,7 +20,12 @@ import (
 // the two the gateway's `nonroot` uid could lose access to without anything else
 // changing. They are also the two that matter most: the quote itself and the
 // manifest its report_data commits to.
-var evidenceUmaskFiles = []string{"quote.json", "sha256sum.txt"}
+var evidenceUmaskFiles = []string{evidenceQuoteFile, "sha256sum.txt"}
+
+// evidenceQuoteFile is the bundle's cert-binding quote. Named here because two
+// routes want it: this one serves it to outside verifiers, and the identity
+// endpoint reads the same file to learn what this CVM is (see identity.go).
+const evidenceQuoteFile = "quote.json"
 
 // checkEvidenceDir verifies that a configured bundle directory, and the files whose
 // readability is not guaranteed by upstream, can actually be read BY THIS PROCESS —

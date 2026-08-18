@@ -130,8 +130,17 @@ type OSImageCheck struct {
 // check is unavailable, and Report.Note is where that is disclosed.
 func (o OSImageCheck) OK() bool { return !o.Configured || o.Err == nil }
 
-// checkOSImage compares the verified quote's boot chain against the allowlist.
-func checkOSImage(allowed []OSImage, m attest.Measurement) OSImageCheck {
+// CheckOSImage compares a quote's boot chain against the allowlist.
+//
+// Exported because two callers must reach the same verdict from the same
+// allowlist: Check runs it as step 7 of a verification, and the gateway runs it
+// over its own quote to say which OS image it is running. A second implementation
+// of "is this image one we accept" would be a second answer.
+//
+// The caller is responsible for the quote being genuine. Check verifies first;
+// the gateway's self-description does not, which is why what it publishes is a
+// claim about itself rather than evidence — see cmd/gateway's identity endpoint.
+func CheckOSImage(allowed []OSImage, m attest.Measurement) OSImageCheck {
 	out := OSImageCheck{Configured: len(allowed) > 0, Observed: attest.BootChainOf(m)}
 	if !out.Configured {
 		return out

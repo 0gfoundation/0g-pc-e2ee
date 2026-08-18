@@ -220,6 +220,41 @@ Closing the "which endpoint did my request hit" gap is exactly what tier 3
 (client code) does; by choosing "0 client code" we accept detection instead of
 prevention.
 
+### 6.3 The gateway's self-description is *not* part of this plane
+
+`GET /v1/gateway/identity` returns what this CVM says it is: `app_id`,
+`compose_hash`, the OS image its boot chain matched, the container list from its
+`app-compose.json`, and which published release that compose text equals. It exists
+because a browser panel has to be able to *show* what it is connected to, and a
+browser cannot compute any of it: parsing a TDX quote, fetching Intel collateral and
+reading the platform's `app-compose` are all cross-origin, and the load-bearing step
+— comparing the served TLS certificate against the one the quote binds — is
+impossible in JavaScript, which cannot see its own connection's peer certificate.
+
+**It carries no evidential weight, and the implementation is written to keep it that
+way.** The gateway signs nothing here and does not DCAP-verify its own quote — doing
+so would prove nothing to a caller, since a gateway willing to lie about these values
+would equally happily lie about having verified them. The response contains no
+`"verified"` field of any shape. What makes it worth serving is that every value is
+independently rederivable: `pcverify -gateway <domain>` reaches the same ones from
+the published bundle, and it is the artifact to point at when the question is "is
+this true?" rather than "what is this?".
+
+Two properties follow, and both are enforced in code (`client/cmd/gateway/identity.go`):
+
+- **The container list comes only from authenticated bytes.** The `app-compose.json`
+  is checked against the quote's `compose_hash` before anything is read out of it; a
+  mismatch reports `containers: null` rather than a list. Publishing a container list
+  out of unchecked bytes would be the gateway vouching for itself, which is precisely
+  what §6.2 says it must not do.
+- **`containers[].source` distinguishes what can be traced from what cannot.** All
+  four containers are covered by `compose_hash`, but only the images built from this
+  repository correspond to a GitHub release; third-party images (`dstack-ingress`,
+  `prometheus`) get a digest and never a release link.
+
+This does not reopen the "no `/quote` route" decision: publishing a parsed
+*description* of an attestation is a different act from signing one.
+
 ## 7. Deployment: use dstack, not hand-rolled confidential TLS
 
 The hard parts of §5.3/§6 — terminating TLS in a TEE, proving the cert is
