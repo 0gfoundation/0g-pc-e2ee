@@ -6,8 +6,10 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
+	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 )
 
 type stubRegistry struct {
@@ -308,5 +310,97 @@ func TestGroundSignerOnChain_RevalidationIsRateLimited(t *testing.T) {
 	}
 	if reg.refreshs != 1 {
 		t.Errorf("refreshed %d times across 5 requests, want 1 (rate-limited)", reg.refreshs)
+	}
+}
+
+// One revalidation is one count. The failure branch used to record its own
+// lookup_failed on top of the caller's, so a single failed re-read showed up
+// twice — and the comment right beside it claimed the opposite, which is how it
+// survived: the rule ("the caller records one revalidation") was stated as
+// unconditional while one branch quietly broke it.
+func TestGroundSignerOnChain_FailedRevalidationCountedOnce(t *testing.T) {
+	const series = `zg_gateway_onchain_revalidations_total{result="lookup_failed"}`
+	before := metricValue(t, series)
+
+	reg := &stubRegistry{
+		signer:     ocOther,
+		ack:        true,
+		cached:     true,
+		refreshErr: errors.New("rpc down"),
+	}
+	r := newOnChainRouter(reg, true)
+	outcome, _ := r.groundSignerOnChain(context.Background(), ocProvider, ocSigner)
+	if outcome.outcome != groundingLookupFailed || !outcome.revalidated {
+		t.Fatalf("setup: got %+v, want a revalidated lookup_failed", outcome)
+	}
+	// The caller records; this test drives groundSignerOnChain directly, so emit the
+	// caller's count the same way Provider does.
+	metrics.OnChainRevalidation(revalidationResult(outcome.outcome))
+
+	if delta := metricValue(t, series) - before; delta != 1 {
+		t.Errorf("recorded %v revalidations for one re-read, want 1", delta)
+	}
+}
+
+// A re-read that failed says nothing about the provider, so it must not spend the
+// whole window. Otherwise a rotation that coincides with one RPC blip is judged a
+// mismatch for the rest of that window even after the chain recovers: the cached
+// entry still disagrees and nothing is allowed to look again — filing our own
+// outage under the metric documented as an accusation.
+func TestGroundSignerOnChain_FailedRevalidationDoesNotBurnTheWindow(t *testing.T) {
+	clock := time.Unix(1000, 0)
+	reg := &stubRegistry{
+		signer:     ocOther, // cached, pre-rotation
+		ack:        true,
+		cached:     true,
+		refreshErr: errors.New("rpc down"),
+	}
+	r := newOnChainRouter(reg, true)
+	r.signerRevalidate.now = func() time.Time { return clock }
+
+	// t0: the chain is unreachable, so the disagreement is unresolved.
+	outcome, err := r.groundSignerOnChain(context.Background(), ocProvider, ocSigner)
+	if err == nil || outcome.outcome != groundingLookupFailed {
+		t.Fatalf("t0: got (%+v, %v), want a fail-closed lookup_failed", outcome, err)
+	}
+
+	// The chain comes back moments later, agreeing with the rotated quote.
+	reg.refreshErr = nil
+	reg.refresh = &chain.Signer{Address: ocSigner, Acknowledged: true}
+	clock = clock.Add(reverifyFailureBackoff + time.Second)
+
+	outcome, err = r.groundSignerOnChain(context.Background(), ocProvider, ocSigner)
+	if err != nil {
+		t.Fatalf("after recovery: want the provider accepted, got %v", err)
+	}
+	if outcome.outcome != groundingOK {
+		t.Errorf("outcome = %s, want %s — the blip should not have cost the window",
+			outcome.outcome, groundingOK)
+	}
+}
+
+// The window still holds for a re-read that CONCLUDED something: a provider that
+// really does keep disagreeing must not get a chain RPC per request just because
+// the previous attempt succeeded in refuting it.
+func TestGroundSignerOnChain_ConcludedRevalidationKeepsTheWindow(t *testing.T) {
+	clock := time.Unix(1000, 0)
+	reg := &stubRegistry{
+		signer:  ocOther,
+		ack:     true,
+		cached:  true,
+		refresh: &chain.Signer{Address: ocOther, Acknowledged: true}, // still disagrees
+	}
+	r := newOnChainRouter(reg, true)
+	r.signerRevalidate.now = func() time.Time { return clock }
+
+	if _, err := r.groundSignerOnChain(context.Background(), ocProvider, ocSigner); err == nil {
+		t.Fatal("want fail-closed")
+	}
+	clock = clock.Add(reverifyFailureBackoff + time.Second) // past the FAILURE backoff...
+	if _, err := r.groundSignerOnChain(context.Background(), ocProvider, ocSigner); err == nil {
+		t.Fatal("want fail-closed")
+	}
+	if reg.refreshs != 1 {
+		t.Errorf("refreshed %d times, want 1 (a conclusive re-read holds the full window)", reg.refreshs)
 	}
 }

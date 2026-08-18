@@ -671,6 +671,13 @@ func (r *Router) groundSignerOnChain(ctx context.Context, providerAddr, signer s
 		revalidated = true
 		got, err = r.revalidate(ctx, providerAddr, signer)
 		if err != nil {
+			// Symmetric with the quote side: the re-read concluded nothing about the
+			// provider, so holding the full window would spend it on our own RPC's bad
+			// second. Without this, a rotation that coincides with one blip is judged a
+			// mismatch for the rest of the window even after the chain recovers — the
+			// cached entry still disagrees, and nothing is allowed to go look again.
+			// That files our problem under the metric documented as an accusation.
+			r.signerRevalidate.reschedule(providerAddr, reverifyFailureBackoff)
 			res, ferr := r.onchainLookupFailed(providerAddr, err)
 			res.revalidated = true
 			return res, ferr
@@ -703,7 +710,9 @@ func (r *Router) groundSignerOnChain(ctx context.Context, providerAddr, signer s
 func (r *Router) revalidate(ctx context.Context, providerAddr, signer string) (chain.Signer, error) {
 	fresh, err := r.registry.RefreshSigner(ctx, providerAddr)
 	if err != nil {
-		metrics.OnChainRevalidation("lookup_failed")
+		// Not counted here either — the rule below is unconditional, and this branch
+		// used to break it, double-counting every failed re-read. The caller reports
+		// this as a lookup_failed revalidation like any other outcome.
 		return chain.Signer{}, err
 	}
 	if signerAgrees(fresh, signer) {
