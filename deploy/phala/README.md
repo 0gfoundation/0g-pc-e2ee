@@ -515,10 +515,15 @@ could not do anyway, since JS cannot see its own connection's peer certificate
 | Setting | Container | Effect |
 |---|---|---|
 | `-out-app-compose /run/identity/app-compose.json` | cvm-identity | publishes this CVM's `app-compose.json` verbatim on the shared `identity` volume, from the same guest-agent call that yields the identity file. |
-| `ZG_GATEWAY_IDENTITY_ENDPOINT=true` | gateway | mounts the route. `false` removes it entirely. |
-| `ZG_GATEWAY_APP_COMPOSE_FILE=/run/identity/app-compose.json` | gateway | where the container list comes from. |
+| `ZG_GATEWAY_APP_COMPOSE_FILE=/run/identity/app-compose.json` | gateway | where the container list comes from. Spelled out here, not defaulted in the binary, because the path is a contract between containers: it appears three times in the compose, and splitting it between YAML and Go is how a renamed volume becomes a silently empty list. |
 | `ZG_GATEWAY_PLATFORM_BASE_DOMAIN=${GATEWAY_DOMAIN}` | gateway | fallback source for the same manifest, consulted only when the file is unreadable. Empty disables it. |
-| `ZG_GATEWAY_IDENTITY_RELEASES=5` | gateway | how many published releases the deployed compose text is compared against for `matched_release`. `0` disables the GitHub lookup. |
+
+Two more knobs are left at their built-in defaults and appear in the compose only as
+commented-out lines, per this file's convention of stating what *differs* from the
+default: `ZG_GATEWAY_IDENTITY_ENDPOINT` (on — set `false` to remove the route
+entirely) and `ZG_GATEWAY_IDENTITY_RELEASES` (`5`, matching pcverify's own default —
+set `0` for a CVM with no egress to GitHub, which then reports `matched_release:
+null`).
 
 **It is not evidence, and the code is written to keep it that way.** The gateway signs
 nothing here and does not DCAP-verify its own quote; the response carries no

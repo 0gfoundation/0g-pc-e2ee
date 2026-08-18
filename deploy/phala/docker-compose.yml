@@ -306,11 +306,17 @@ services:
       # client/cmd/gateway/identity.go before extending what it reports.
       #
       # It publishes nothing that is not already public: the quote is under
-      # /evidences/ and the compose text is a GitHub release asset. Set to false to
-      # remove the route entirely.
-      - "ZG_GATEWAY_IDENTITY_ENDPOINT=true"
+      # /evidences/ and the compose text is a GitHub release asset. On by default;
+      # uncomment to remove the route entirely.
+      # - "ZG_GATEWAY_IDENTITY_ENDPOINT=false"
+      #
       # Where its container list comes from: the manifest cvm-identity published on
-      # the shared volume above. Read once, hash-checked against the quote.
+      # the shared volume above. Read once, hash-checked against the quote. Set here
+      # rather than defaulted in the binary because this path is a CONTRACT BETWEEN
+      # CONTAINERS — it appears three times in this file (the -out-app-compose
+      # argument, the `identity` volume, this line) and splitting it between YAML and
+      # Go is how a renamed volume turns into a silently empty container list. Same
+      # shape as ZG_GATEWAY_IDENTITY_FILE below, deliberately.
       - "ZG_GATEWAY_APP_COMPOSE_FILE=/run/identity/app-compose.json"
       # Fallback for the one case the file cannot cover: a replica whose init
       # container predates -out-app-compose, which is exactly what a rolling
@@ -319,11 +325,13 @@ services:
       # the same value the ingress gets.
       - "ZG_GATEWAY_PLATFORM_BASE_DOMAIN=${GATEWAY_DOMAIN:-}"
       # How many published releases the deployed compose text is compared against,
-      # byte-for-byte, for matched_release. The same lookup pcverify makes, so the
+      # byte-for-byte, for matched_release — the same lookup pcverify makes, so the
       # release this panel NAMES and the release pcverify CONFIRMS cannot disagree.
-      # Unauthenticated GitHub allows 60 requests/hour per IP; this runs once per
-      # boot (plus a bounded retry), not per request. 0 disables the lookup.
-      - "ZG_GATEWAY_IDENTITY_RELEASES=5"
+      # Defaults to 5, which is also pcverify's default. Unauthenticated GitHub
+      # allows 60 requests/hour per IP; this runs once per boot (plus a bounded
+      # retry), not per request. Uncomment to disable the lookup — for a CVM with no
+      # egress to GitHub, which then reports matched_release: null.
+      # - "ZG_GATEWAY_IDENTITY_RELEASES=0"
     volumes:
       # Identity in, read-only, as a plain JSON file — deliberately not the
       # guest-agent socket, which also derives keys and issues quotes.
