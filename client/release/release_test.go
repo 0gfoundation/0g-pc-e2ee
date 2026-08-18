@@ -220,6 +220,48 @@ func TestGitHubToken_PrefersGITHUB_TOKEN(t *testing.T) {
 	}
 }
 
+// Rate limiting is the likeliest failure for an unauthenticated run — 60 requests
+// an hour per IP, and CI runners share addresses — and a bare 403 does not say what
+// to do about it. The hint is the only part of this error a human acts on, so it is
+// worth a test rather than being left to the first person who hits it.
+func TestFetchComposeAssets_RateLimitHint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-RateLimit-Remaining", "0")
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	t.Cleanup(srv.Close)
+
+	cfg := Config{HTTP: NewHTTPClient(10 * time.Second), Repo: "o/r", APIBase: srv.URL}
+	_, err := FetchComposeAssets(context.Background(), cfg, 1, nil)
+	if err == nil || !strings.Contains(err.Error(), "GITHUB_TOKEN") {
+		t.Errorf("err = %v, want it to name the token that lifts the limit", err)
+	}
+
+	// A 403 that is NOT rate limiting must not claim it is.
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	t.Cleanup(plain.Close)
+	cfg.APIBase = plain.URL
+	_, err = FetchComposeAssets(context.Background(), cfg, 1, nil)
+	if err == nil || strings.Contains(err.Error(), "GITHUB_TOKEN") {
+		t.Errorf("err = %v, want a plain status error", err)
+	}
+}
+
+// An asset larger than the cap is refused rather than truncated: a truncated
+// manifest would fail the byte-for-byte comparison and look like a deployment
+// mismatch instead of a transport problem.
+func TestFetchComposeAssets_OversizedAsset(t *testing.T) {
+	f := newGHFixture(t, map[string]string{"r1": strings.Repeat("x", maxAssetBytes+1)})
+	f.setReleases(f.release("r1", DefaultAsset, false, false))
+
+	if _, err := FetchComposeAssets(context.Background(), f.config(), 1, nil); err == nil ||
+		!strings.Contains(err.Error(), "larger than") {
+		t.Errorf("err = %v, want a size complaint", err)
+	}
+}
+
 // An empty Repo/Asset means "the ones this repository publishes", so a caller that
 // only wants the defaults does not have to restate them.
 func TestConfigDefaults(t *testing.T) {

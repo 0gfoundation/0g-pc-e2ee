@@ -453,10 +453,12 @@ func (c *identityCache) store(res buildResult) {
 // finished its first ACME run yet", which resolves in tens of seconds; the cap
 // keeps a permanently unavailable source (a rate-limited GitHub) down to a few
 // requests an hour.
-const (
-	identityRetryStart = 15 * time.Second
-	identityRetryMax   = 10 * time.Minute
-)
+// identityRetryStart is a var, not a const, for one reason: the test that pins
+// the loop's whole point — that a source appearing after boot is picked up —
+// would otherwise have to wait the real 15 seconds to observe one iteration.
+var identityRetryStart = 15 * time.Second
+
+const identityRetryMax = 10 * time.Minute
 
 // startIdentity assembles the document in the background and returns the cache
 // plus a stop function for shutdown.

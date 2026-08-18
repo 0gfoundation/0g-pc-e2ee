@@ -1,15 +1,18 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -441,6 +444,17 @@ func TestClassifySource(t *testing.T) {
 			t.Errorf("classifySource(%q) = %q, want %q", image, got, want)
 		}
 	}
+	// A configured repo moves the namespace with it rather than the default being
+	// baked in — a fork publishing its own images must not have all of them read as
+	// third-party, and ours must not stay privileged under someone else's repo.
+	for image, want := range map[string]string{
+		"ghcr.io/acme/fork-gateway":               sourceOwn,
+		"ghcr.io/0gfoundation/0g-pc-e2ee-gateway": sourceThirdParty,
+	} {
+		if got := classifySource(image, "acme/fork"); got != want {
+			t.Errorf("classifySource(%q, acme/fork) = %q, want %q", image, got, want)
+		}
+	}
 }
 
 // --- the route ---
@@ -706,6 +720,190 @@ func TestStartIdentity_AnswersBeforeAssembly(t *testing.T) {
 			t.Fatal("the assembly never completed with every source available locally")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// The reason the retry loop exists, and until now the one thing about it nothing
+// pinned: dstack-ingress writes quote.json only after its first ACME run, so a
+// gateway that boots first MUST pick the file up afterwards on its own. A build
+// that only ever ran once would pass every other test in this file and leave the
+// deployed endpoint reporting nulls forever.
+func TestStartIdentity_ConvergesWhenTheQuoteAppears(t *testing.T) {
+	// Shorten the first backoff so one iteration is observable; the loop's real
+	// pacing is not what this is about.
+	old := identityRetryStart
+	identityRetryStart = 10 * time.Millisecond
+	t.Cleanup(func() { identityRetryStart = old })
+
+	f := newIdentityFixture(t, deployedComposeText)
+	quote, err := os.ReadFile(f.quotePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(f.quotePath); err != nil { // the pre-ACME state
+		t.Fatal(err)
+	}
+
+	logger, logged := recordingLogger()
+	cache, stop := startIdentity(f.config(), logger)
+	t.Cleanup(stop)
+
+	// Whatever it serves in the meantime must be honest and uncached.
+	body, complete := cache.Doc()
+	if body == nil || complete || !strings.Contains(string(body), `"app_id": null`) {
+		t.Fatalf("before the quote exists the cache must serve an incomplete document, got complete=%v:\n%s", complete, body)
+	}
+
+	// Synchronize on the LOG, not on a sleep: this line is written only after a pass
+	// that failed, so reaching it proves the first attempt really ran and really came
+	// up empty. Writing the quote before that point would let the first pass succeed
+	// on its own and the test would pass without the retry loop existing at all —
+	// which is exactly what it did before this was tightened.
+	waitFor(t, "the first pass to run and report itself incomplete", func() bool {
+		return strings.Contains(logged(), "incomplete, will retry")
+	})
+
+	// The ingress finishes its ACME run.
+	writeFile(t, f.quotePath, quote)
+
+	waitFor(t, "the assembly to converge once the quote appears", func() bool {
+		body, complete := cache.Doc()
+		return complete && strings.Contains(string(body), f.appID)
+	})
+}
+
+// Shutdown must not wait out the backoff. stopIdentity runs on the SIGTERM path,
+// after the server has drained, so a builder parked on a ten-minute timer with no
+// cancellation would hold the whole process there — the platform would then SIGKILL
+// a gateway that had already finished serving.
+func TestStartIdentity_StopReturnsDuringBackoff(t *testing.T) {
+	old := identityRetryStart
+	identityRetryStart = time.Hour // long enough that only cancellation can end it
+	t.Cleanup(func() { identityRetryStart = old })
+
+	f := newIdentityFixture(t, deployedComposeText)
+	if err := os.Remove(f.quotePath); err != nil { // guarantees a pending pass
+		t.Fatal(err)
+	}
+	logger, logged := recordingLogger()
+	_, stop := startIdentity(f.config(), logger)
+	waitFor(t, "the builder to park on its backoff", func() bool {
+		return strings.Contains(logged(), "incomplete, will retry")
+	})
+
+	done := make(chan struct{})
+	go func() { stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stop() did not return while the builder was waiting to retry; shutdown would block for the whole backoff")
+	}
+}
+
+// recordingLogger returns a logger and a threadsafe reader of what it has written
+// so far. The background assembly logs from its own goroutine, so the buffer needs
+// the lock — without it this is a data race under -race, not merely a flake.
+func recordingLogger() (*slog.Logger, func() string) {
+	w := &lockedBuffer{}
+	return slog.New(slog.NewTextHandler(w, nil)), w.String
+}
+
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// waitFor polls cond until it holds, failing with what it was waiting for.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// A quote whose mr_config_id does not carry the compose hash in the clear (dstack's
+// v2/v3 layouts commit to it inside a digest). Nothing about re-reading the same
+// file can change that, so it must settle rather than retry — and the OS image,
+// which comes from different registers, must survive it.
+func TestBuildIdentity_UnreadableMRConfigIsSettled(t *testing.T) {
+	f := newIdentityFixture(t, deployedComposeText)
+	raw := make([]byte, fxQuoteLen)
+	raw[fxMRConfigOff] = 2 // v2: the hash is inside a keccak digest
+	img := testOSImage()
+	copy(raw[fxMRTDOff:], img.BootChain.MRTD[:])
+	copy(raw[fxRTMR1Off:], img.BootChain.RTMR1[:])
+	copy(raw[fxRTMR2Off:], img.BootChain.RTMR2[:])
+	body, err := json.Marshal(map[string]string{"quote": hex.EncodeToString(raw)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, f.quotePath, body)
+
+	res := buildFixture(t, f.config())
+	if res.doc.AppID != nil || res.doc.ComposeHash != nil {
+		t.Errorf("app_id/compose_hash = %v/%v, want null: this layout does not expose the hash",
+			res.doc.AppID, res.doc.ComposeHash)
+	}
+	if res.doc.Containers != nil {
+		t.Error("containers must be null: with no compose_hash there is nothing to authenticate the manifest against")
+	}
+	if res.doc.OSImage == nil {
+		t.Error("os_image = null; it comes from the boot-chain registers and does not depend on the compose hash")
+	}
+	if len(res.pending) != 0 {
+		t.Errorf("pending = %v; re-reading the same quote will never yield a compose hash", res.pending)
+	}
+}
+
+// A quote.json that is not a quote. Unlike an absent one this is not a state the
+// deployment grows out of by itself, but it is retried anyway: the ingress writes
+// the file as part of finalizing the bundle, so a truncated read is plausible.
+// What must NOT happen is the endpoint failing.
+func TestBuildIdentity_MalformedQuoteFile(t *testing.T) {
+	f := newIdentityFixture(t, deployedComposeText)
+	writeFile(t, f.quotePath, []byte(`{"quote":"not hex"}`))
+
+	res := buildFixture(t, f.config())
+	if res.doc.AppID != nil || res.doc.OSImage != nil || res.doc.Containers != nil {
+		t.Errorf("doc = %+v, want every quote-derived field null", res.doc)
+	}
+	if len(res.pending) == 0 {
+		t.Error("pending is empty; a half-written bundle is worth another look")
+	}
+}
+
+// Bytes that pass the compose_hash check but do not parse as a compose file. The
+// hash says they are this deployment's manifest, so this is a "we cannot read our
+// own manifest" bug — and it still must report null rather than an empty list,
+// which would read as "this deployment runs no containers".
+func TestBuildIdentity_AuthenticatedButUnparseableCompose(t *testing.T) {
+	f := newIdentityFixture(t, "this is not a compose file, but it is not empty either\n")
+
+	res := buildFixture(t, f.config())
+	if res.doc.Containers != nil {
+		t.Errorf("containers = %+v, want null", res.doc.Containers)
+	}
+	if res.doc.ComposeHash == nil {
+		t.Error("compose_hash = null; the quote is fine, only the text inside the manifest is not")
+	}
+	if len(res.pending) != 0 {
+		t.Errorf("pending = %v; the bytes are authenticated and will not parse differently next time", res.pending)
 	}
 }
 
