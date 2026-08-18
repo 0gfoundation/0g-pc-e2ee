@@ -2,6 +2,7 @@ package dstack
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -229,4 +230,72 @@ func TestFetchInfoDropsBadAppIDOnly(t *testing.T) {
 	if info.AppID != "" {
 		t.Errorf("AppID = %q, want dropped", info.AppID)
 	}
+}
+
+// appComposeJSON is a stand-in app-compose: what matters is that the bytes come
+// back EXACTLY as the agent delivered them, since they are the preimage of the
+// compose hash a quote commits to.
+const appComposeJSON = `{"name":"0g-pc-gateway","docker_compose_file":"services:\n  gateway:\n    image: ghcr.io/0g/gw@sha256:abc\n"}`
+
+// serveTCBInfo starts a fake agent whose Info reply carries tcbInfo verbatim as
+// the value of "tcb_info".
+func serveTCBInfo(t *testing.T, tcbInfo string) string {
+	t.Helper()
+	return serveSocket(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"instance_id":"aa11","app_id":"bb22","tcb_info":`+tcbInfo+`}`)
+	}))
+}
+
+// The agent has shipped tcb_info both as a nested object and as a JSON string
+// holding the same document. Both must yield the same app-compose bytes: a
+// deployment serving the other shape is not a reason to lose the container list.
+func TestFetchAppCompose(t *testing.T) {
+	for name, tcbInfo := range map[string]string{
+		"object": `{"app_compose":` + mustJSONString(t, appComposeJSON) + `}`,
+		"string": mustJSONString(t, `{"app_compose":`+mustJSONString(t, appComposeJSON)+`}`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := FetchAppCompose(context.Background(), serveTCBInfo(t, tcbInfo))
+			if err != nil {
+				t.Fatalf("FetchAppCompose: %v", err)
+			}
+			// Byte-for-byte: a re-marshalled document would still be "equal" JSON and
+			// would still fail every hash comparison downstream.
+			if string(got) != appComposeJSON {
+				t.Errorf("app-compose = %q, want the bytes the agent sent", got)
+			}
+		})
+	}
+}
+
+func TestFetchAppComposeErrors(t *testing.T) {
+	for name, tcbInfo := range map[string]string{
+		// public_tcbinfo off: dstack returns an empty tcb_info rather than an error.
+		"empty tcb_info":    `""`,
+		"null tcb_info":     `null`,
+		"tcb_info not json": `"{{{"`,
+		"no app_compose":    `{"mrtd":"…"}`,
+		"empty app_compose": `{"app_compose":""}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := FetchAppCompose(context.Background(), serveTCBInfo(t, tcbInfo)); err == nil {
+				t.Error("expected an error")
+			}
+		})
+	}
+	t.Run("no socket", func(t *testing.T) {
+		if _, err := FetchAppCompose(context.Background(), filepath.Join(t.TempDir(), "absent.sock")); err == nil {
+			t.Error("expected an error when the socket is absent")
+		}
+	})
+}
+
+// mustJSONString quotes s as a JSON string literal.
+func mustJSONString(t *testing.T, s string) string {
+	t.Helper()
+	b, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }

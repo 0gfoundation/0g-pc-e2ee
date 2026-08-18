@@ -723,7 +723,7 @@ func (c *Checker) Check(ctx context.Context, domain string) (rep Report, err err
 	// Step 7 — is the OS that enforced step 6's binding one we accept? Only meaningful
 	// once the quote verified; before that there is no measurement to compare.
 	if rep.QuoteErr == nil {
-		rep.OSImage = checkOSImage(c.osImages, rep.Measurement)
+		rep.OSImage = CheckOSImage(c.osImages, rep.Measurement)
 	} else {
 		rep.OSImage = OSImageCheck{Configured: len(c.osImages) > 0,
 			Err: errors.New("not checked: the quote did not verify")}
@@ -802,7 +802,7 @@ func (c *Checker) checkCodeIdentity(ctx context.Context, rep *Report) {
 	code.ComposeFile = []byte(ac.DockerComposeFile)
 
 	if code.ExpectRequested {
-		code.MatchedExpect, code.ExpectErr = matchExpected(code.ComposeFile, c.cfg.ExpectComposeFiles)
+		code.MatchedExpect, code.ExpectErr = MatchCompose(code.ComposeFile, c.cfg.ExpectComposeFiles)
 	}
 }
 

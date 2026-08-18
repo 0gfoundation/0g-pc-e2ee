@@ -46,6 +46,15 @@ services:
     command:
       - "-out-identity"
       - "/run/identity/identity.json"
+      # This CVM's app-compose.json, verbatim, for the gateway's self-description
+      # endpoint (GET /v1/gateway/identity, issue #78) — it is what names the
+      # containers running in here. It comes from the same guest-agent call as the
+      # identity above, so publishing it costs nothing extra and keeps the gateway
+      # off that socket. The gateway checks these bytes against the compose_hash in
+      # the attestation quote before reading anything out of them; an absent or
+      # stale file costs the container list and nothing else.
+      - "-out-app-compose"
+      - "/run/identity/app-compose.json"
       # One file_sd document per scrape job — they must NOT share one, or each job
       # would discover the other's target. These carry the identity as TARGET
       # labels, the only mechanism that also reaches `up` and the other per-scrape
@@ -287,6 +296,34 @@ services:
       # enclave, while this is static public data any `curl` already fetches. Empty
       # unmounts the route entirely. See client/cmd/gateway/evidences.go.
       - "ZG_GATEWAY_EVIDENCE_DIR=/evidences"
+      # This CVM's self-description at /v1/gateway/identity — app_id, compose_hash,
+      # OS image, the container list, and which published release this deployment
+      # is (issue #78). It exists so a browser panel can SHOW what it is connected
+      # to; it is NOT evidence, and nothing in it is signed by this gateway. Every
+      # value is independently rederivable with `pcverify -gateway <DOMAIN>`, which
+      # additionally does the step a browser cannot do at all — comparing the served
+      # TLS certificate against the one the quote binds. See
+      # client/cmd/gateway/identity.go before extending what it reports.
+      #
+      # It publishes nothing that is not already public: the quote is under
+      # /evidences/ and the compose text is a GitHub release asset. Set to false to
+      # remove the route entirely.
+      - "ZG_GATEWAY_IDENTITY_ENDPOINT=true"
+      # Where its container list comes from: the manifest cvm-identity published on
+      # the shared volume above. Read once, hash-checked against the quote.
+      - "ZG_GATEWAY_APP_COMPOSE_FILE=/run/identity/app-compose.json"
+      # Fallback for the one case the file cannot cover: a replica whose init
+      # container predates -out-app-compose, which is exactly what a rolling
+      # blue/green upgrade looks like mid-flight. Only consulted when the file is
+      # unreadable. The leading "_." of a GATEWAY_DOMAIN is stripped, so this takes
+      # the same value the ingress gets.
+      - "ZG_GATEWAY_PLATFORM_BASE_DOMAIN=${GATEWAY_DOMAIN:-}"
+      # How many published releases the deployed compose text is compared against,
+      # byte-for-byte, for matched_release. The same lookup pcverify makes, so the
+      # release this panel NAMES and the release pcverify CONFIRMS cannot disagree.
+      # Unauthenticated GitHub allows 60 requests/hour per IP; this runs once per
+      # boot (plus a bounded retry), not per request. 0 disables the lookup.
+      - "ZG_GATEWAY_IDENTITY_RELEASES=5"
     volumes:
       # Identity in, read-only, as a plain JSON file — deliberately not the
       # guest-agent socket, which also derives keys and issues quotes.

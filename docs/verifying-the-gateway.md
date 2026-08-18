@@ -258,6 +258,66 @@ compared.
 
 ---
 
+## What the gateway says about itself
+
+A deployment also serves a one-line summary of its own identity:
+
+```sh
+curl -s https://<gateway-domain>/v1/gateway/identity
+```
+
+```jsonc
+{
+  "instance_id": "…",             // which replica answered
+  "app_id": "55d872aa…",          // from the quote's mr_config_id
+  "compose_hash": "55d872aa…",
+  "os_image": "dstack-nvidia-0.5.4.1",   // null if it matched no allowlisted image
+  "matched_release": { "tag": "release-2026.08.07.1", "url": "https://github.com/…" },
+  "containers": [
+    { "name": "gateway", "image": "ghcr.io/0gfoundation/0g-pc-e2ee-gateway",
+      "digest": "sha256:9c41ab7e…", "source": "0g-release" },
+    { "name": "dstack-ingress", "image": "dstacktee/dstack-ingress",
+      "digest": "sha256:527c5352…", "source": "third-party" }
+  ],
+  "evidence_url": "/evidences/",
+  "verify": "self-reported by this gateway; verify independently with: pcverify -gateway <domain>"
+}
+```
+
+**This is the gateway describing itself, and it proves nothing.** Nothing in it is
+signed by the gateway, and the gateway does not verify its own quote — a deployment
+willing to lie about these values would equally happily lie about having checked
+them. Treat it the way you would treat a server's version banner: useful for knowing
+*what* you are looking at, worthless for deciding *whether it is true*.
+
+What makes it useful anyway is that `pcverify -gateway <domain>` derives every one of
+these values independently, from the evidence bundle plus a DCAP verification, and
+does the step that cannot be done from a web page at all — comparing the certificate
+the connection actually served against the one the quote binds. **If the two ever
+disagree, the endpoint is wrong and `pcverify` is right.**
+
+Two fields are worth reading carefully:
+
+- **`os_image: null`** means the boot chain matched no entry in the allowlist — *or*
+  that the allowlist was empty and nothing was checked. The endpoint does not
+  distinguish them; `pcverify` does, and reports the second as an incomplete run
+  (exit 3) rather than a pass.
+- **`containers[].source`** says whether an image can be traced to a published
+  release of this repository. All of them are covered by `compose_hash` either way;
+  `third-party` simply means there is no release of ours to compare it against, and
+  the endpoint will never invent one.
+
+`matched_release` is `null` for a deployment whose compose text is not byte-identical
+to a published release asset — expected for a development deployment, since the
+checked-in `docker-compose.yml` carries `:latest` and only the release asset is
+digest-pinned. There is no approximate matching.
+
+The endpoint may be switched off (`ZG_GATEWAY_IDENTITY_ENDPOINT=false`), and nothing
+in this document depends on it: every value it reports is in the evidence bundle and
+the published releases already.
+
+---
+
 ## Trust assumptions, stated plainly
 
 **Intel.** The attestation root. If Intel's signing infrastructure is compromised or

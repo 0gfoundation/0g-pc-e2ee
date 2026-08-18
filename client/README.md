@@ -64,6 +64,8 @@ sdk/
 > (`cmd/sidecar`, `cmd/gateway`) share one more layer: `openaiproxy/`, the
 > OpenAI-compatible HTTP handler over `core` (seal request → open response,
 > buffered and streaming). The sidecar serves it as-is; the gateway adds `GET /healthz`,
+> the public attestation bundle at `/evidences/`, its own self-description at
+> `GET /v1/gateway/identity` (display material, not evidence — see `identity.go`),
 > a catch-all `/` that proxies to the router for non-inference routes, and — on a
 > separate internal listener the compose never publishes — `GET /metrics` plus an
 > optional pprof (see `-metrics-listen` / `-pprof`). `cmd/sidecar`,
@@ -178,6 +180,14 @@ so the boot chain is never compared — the code root is not doing its job yet, 
 exit code says so rather than rounding up to 0. See
 [`docs/design/cloud-gateway.md`](../docs/design/cloud-gateway.md) §10 for what the
 result does and does not cover.
+
+A deployed gateway also *describes itself* at `GET /v1/gateway/identity` — the same
+`app_id`, `compose_hash`, OS image, container list and matching release, assembled
+server-side so a browser panel can display them (`cmd/gateway/identity.go`). That
+endpoint is **not** a substitute for this tool and does not try to be: it verifies
+nothing, signs nothing, and exists only so there is something to show. `pcverify`
+rederives every one of those values independently — and does the endpoint binding, the
+one step no web page can perform. If the two disagree, `pcverify` is right.
 
 `-allow-untrusted-cert` (gateway mode) is for a hostname on the ACME staging CA. Every
 check runs either way — the evidence fetch does not verify PKI, since it rides the same
