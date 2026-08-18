@@ -171,43 +171,119 @@ The allowlist is then **a list of image digests we publish**, not a list of expe
 measurement registers — much cheaper, because we already know our own digests and
 would otherwise need reproducible builds to predict an RTMR.
 
-### Three conditions, all load-bearing
+### The OS-image half is still required
 
-**1. Digests, not tags — a tag-only reference must fail.** The staging sample pins
-`image: …:latest`. A floating tag keeps `compose_hash` stable while the code behind
-it changes, so an allowlist keyed on names proves nothing. This is the same caveat
-`pcverify` already prints for the gateway, and why `containerRef.Digest` keeps an
-empty value visible instead of hiding it. Under this scheme it has to be an
-outright failure, not a note.
-
-**2. The OS-image allowlist is still required.** It is tempting to read
-"allowlist images instead of measurements" as replacing the measurement check. It
-does not: what makes `mr_config_id` trustworthy in the first place is that the
-guest OS enforces the binding between the attestation and the manifest. That is
-established by MRTD/RTMR1/RTMR2 matching an audited OS image. Drop it and the rest
-of the chain is self-asserted. The two checks are **complementary halves**:
+It is tempting to read "allowlist images instead of measurements" as replacing the
+measurement check. It does not: what makes `mr_config_id` trustworthy in the first
+place is that the guest OS enforces the binding between the attestation and the
+manifest, and that is established by MRTD/RTMR1/RTMR2 matching an audited OS image.
+Drop it and everything downstream is self-asserted. The two are complementary
+halves:
 
 | Registers | Establishes |
 |---|---|
 | MRTD / RTMR1 / RTMR2 | which guest OS — and thus that the manifest binding is enforced |
 | `mr_config_id` → compose → digests | which application code |
 
-Note the staging broker runs `dstack-nvidia-dev-0.5.7-…`, a **dev** image, and a
-different one from the gateway's. Provider OS images need their own allowlist
-entries, and a dev image should not be among them for production.
+Providers run the same platform as the gateway, so this reuses the existing
+machinery: `evidence.CheckOSImage` is exported precisely so two callers reach one
+verdict from one allowlist. Three details:
 
-**3. The policy must cover the whole app-compose, not just images.** The staging
-sample carries `DSTACK_AUTHORIZED_KEYS` in `allowed_envs`, plus a pre-launch script
-that writes `authorized_keys` and sets a root password. An enclave someone can SSH
-into does not keep a prompt confidential, regardless of which image it runs. It also
-sets `public_logs` / `public_sysinfo` true.
+- **Keep provider and gateway entries separate** (two lists, or a role tag).
+  Sharing one list means adding an entry for a provider silently widens what is
+  acceptable for the gateway. Free now, annoying later.
+- **Expect version drift.** The gateway runs `dstack-nvidia-0.5.4.1`; the staging
+  broker runs `dstack-nvidia-dev-0.5.7-…`. Even once both are release images they
+  will not upgrade in lockstep — the allowlist is a list for exactly this reason. A
+  **dev** image should not be an entry for production.
+- **Fail closed on a non-dstack quote.** The broker has GCP and AliCloud TEE
+  backends besides Phala. Those carry no compose hash in `mr_config_id` and this
+  whole route does not apply; an unrecognized layout must be rejected, not waved
+  through.
 
-That sample is a template deployment, not the real broker — but it shows the review
-surface. At minimum the policy should cover `allowed_envs`, `pre_launch_script`,
-`key_provider`, and the log/sysinfo exposure flags. For 0G-operated providers the
-cleanest rule is what we use for the gateway: **byte-for-byte match against a
-published manifest**, falling back to digest-plus-policy only for providers whose
-manifest we do not publish.
+### What byte-matching would have covered, and what replaces it
+
+For the gateway we match the compose text byte-for-byte against a published
+manifest. That single check pins everything at once: image digests, `allowed_envs`,
+the pre-launch script, and any deploy-time interpolation.
+
+We do **not** publish per-provider manifests — providers differ from one another,
+and pinning each one would mean a release for every config change. That is a
+deliberate trade, and the cost is precise: **everything the byte-match used to pin
+now needs saying out loud.** The list below is not extra hardening piled on top; it
+is the byte-match, itemized.
+
+The organizing question is not "are there extra containers" — an init container that
+writes a volume and exits is ordinary infrastructure, the same shape as the
+gateway's own `cvm-identity`. It is:
+
+> **Does anything in this compose let unmeasured content influence what the enclave
+> does?**
+
+Three channels:
+
+| Channel | What it looks like |
+|---|---|
+| Interactive access | `DSTACK_AUTHORIZED_KEYS` in `allowed_envs`; a pre-launch script that writes `authorized_keys` or sets a root password |
+| Unpinned code | a tag-only image reference — the app image, and equally `alpine:3.18` in a helper |
+| **Unmeasured configuration** | `${VAR}` interpolation landing in a file the app reads |
+
+The third is the subtle one, because it looks like plumbing. A real example:
+
+```yaml
+config-init:
+  image: alpine:3.18
+  environment: [ CONFIG_B64_1=${CONFIG_B64_1} ]
+  command: [ sh, -c, 'echo "$$CONFIG_B64_1" | base64 -d > /config/config-1.yaml' ]
+```
+
+`compose_hash` commits to the literal text `${CONFIG_B64_1}` — that a variable is
+here, not what it holds. The value arrives at deploy time. So the broker's runtime
+configuration sits outside the attestation, and an operator can change it without
+moving `compose_hash`. Note this evades both other checks: the image is correct, and
+the variable name looks nothing like credential injection.
+
+The fix keeps the pattern and makes the content measured — a literal hash in the
+compose text, verified by the init container:
+
+```yaml
+  environment:
+    - CONFIG_B64_1=${CONFIG_B64_1}
+    - CONFIG_SHA256=9f2a…c41e            # literal — committed by compose_hash
+  command:
+    - sh
+    - -c
+    - |
+      echo "$$CONFIG_B64_1" | base64 -d > /config/config-1.yaml
+      echo "$$CONFIG_SHA256  /config/config-1.yaml" | sha256sum -c - || exit 1
+```
+
+The value is still supplied at deploy time; substituting it is now detectable. And
+the per-provider difference collapses to that one hash literal, so the *shape* stays
+uniform and a policy check can be mechanical: every interpolation that lands in a
+file has a paired `_SHA256` literal, and the script actually checks it.
+
+### Decision: enforce digest pinning, defer the rest
+
+**Only condition one is enforced in code for now: an image reference without a
+digest fails.** It earns that place because without it nothing downstream means
+anything — a floating tag keeps `compose_hash` stable while the code behind it
+changes, so every other check is defeated by it alone. It is also deployment
+discipline rather than a policy engine, which is the cheapest kind of rule to hold.
+
+The rest — `allowed_envs`, `pre_launch_script`, the interpolation-hash rule,
+`public_logs`/`public_sysinfo` — becomes a **provider launch checklist**, reviewed by
+a person, not code.
+
+The reason that is proportionate today: every provider is 0G-operated, so "the
+operator can reach inside" describes our own team. Those are internal-controls
+questions, and a checklist is the right instrument for internal controls.
+
+**Revisit when third-party providers join.** At that point the same items stop being
+internal controls and become admission criteria, and a checklist is no longer the
+right instrument — they have to be mechanical. That is also when hop 3 genuinely
+needs to stop being warn-only. Until then the panel reports the provider's
+measurement as **observed (◐)**, which is the honest state.
 
 ### Separately: report_data has not migrated
 
@@ -273,8 +349,13 @@ reads as a deploy rather than as a substitution.
 1. Panel renders what already exists (§7 rows marked available), with the §3 ladder
    and the §2 rule about which chain each check belongs to.
 2. Correct the two "coarse token count" lines (§4).
-3. Provider identity endpoint — unblocks the broker hop.
-4. Hop 3 policy (§6): digest pinning enforced, provider OS entries, app-compose
-   policy beyond images.
-5. Chain B, if and when we choose to sell it: nonce + transcript + commit–reveal,
+3. `report_data` migration to the SPEC §4.2 layout. Listed here rather than left to
+   the protocol work because it gates the rest: the observed broker publishes only
+   the ASCII signer address, so there is no quote-bound `enc_pub` to seal against
+   and hop 3 cannot matter in production until it lands.
+4. Provider identity endpoint — unblocks the broker hop of the panel.
+5. Hop 3, enforced half (§6): digest pinning, provider OS-image entries kept
+   separate from the gateway's, non-dstack quotes rejected.
+6. Hop 3, checklist half (§6): written down as a provider launch review, not code.
+7. Chain B, if and when we choose to sell it: nonce + transcript + commit–reveal,
    together.
