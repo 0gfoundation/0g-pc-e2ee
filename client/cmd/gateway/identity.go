@@ -244,9 +244,14 @@ func buildIdentity(ctx context.Context, cfg identityConfig, logger *slog.Logger)
 	if haveHash {
 		raw, source, err := loadAppCompose(ctx, cfg, deref(res.doc.AppID))
 		switch {
-		case err != nil:
+		// Configured but not readable yet — nothing orders cvm-identity before this
+		// process, so retry.
+		case err != nil && !errors.Is(err, errNoAppComposeSource):
 			res.pending = append(res.pending, "app-compose: "+err.Error())
 			logger.Warn("identity: app-compose unavailable, reporting no container list", "err", err)
+		// Not configured at all: a settled answer, not a gap. See errNoAppComposeSource.
+		case err != nil:
+			logger.Info("identity: no app-compose source configured, reporting no container list")
 		default:
 			ac, err := evidence.VerifyAppCompose(raw, composeHash)
 			if err != nil {
@@ -394,10 +399,22 @@ func loadAppCompose(ctx context.Context, cfg identityConfig, appID string) ([]by
 		errs = append(errs, fmt.Errorf("platform %s: %w", cfg.BaseDomain, err))
 	}
 	if len(errs) == 0 {
-		errs = append(errs, errors.New("no app-compose source configured"))
+		return nil, "", errNoAppComposeSource
 	}
 	return nil, "", errors.Join(errs...)
 }
+
+// errNoAppComposeSource means neither manifest source was configured, as opposed
+// to being configured and unavailable.
+//
+// The difference decides whether the assembly retries. Both paths are fixed at
+// startup, so "nothing configured" cannot become true later — recording it as
+// pending would leave the builder looping at its backoff cap for the life of the
+// process, warning every pass, and would keep the document permanently marked
+// incomplete (and so served no-cache) over a configuration choice that was
+// deliberate. A configured-but-unreadable source is the opposite: cvm-identity may
+// simply not have written the file yet, since nothing orders it before the gateway.
+var errNoAppComposeSource = errors.New("no app-compose source configured")
 
 // identityCache holds the assembled document. It is rebuilt in the background
 // until nothing is pending, then never again: every value in it is fixed for the
@@ -508,6 +525,17 @@ func identityHandler(cache *identityCache) http.Handler {
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
+		// This response DOES vary by Origin — the CORS middleware reflects the
+		// request's Origin into Access-Control-Allow-Origin — but that middleware only
+		// SAYS so when the request carried one. Cacheable-and-unmarked is the dangerous
+		// combination: a shared cache would store the no-Origin variant (a curl, an
+		// uptime probe, a warmer) and replay it, header-less, to the browser panel,
+		// which then blocks it for the whole max-age. /evidences/ sidesteps this by
+		// pairing `no-cache` with a request-independent `*`; this route caches, so it
+		// has to declare the variance itself. Add, not Set: Vary is a list, other
+		// middleware contributes to it, and a duplicated entry is harmless where a
+		// missing one is not.
+		w.Header().Add("Vary", "Origin")
 		if complete {
 			w.Header().Set("Cache-Control", identityCompleteMaxAge)
 		} else {

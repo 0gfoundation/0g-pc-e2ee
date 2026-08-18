@@ -384,6 +384,31 @@ func TestBuildIdentity_ReleasesZeroIsSettled(t *testing.T) {
 	}
 }
 
+// A deployment that configures no manifest source has ANSWERED: containers is null
+// and the assembly is done. Recording it as pending would leave the background
+// builder retrying an unsatisfiable lookup for the life of the process — both paths
+// are fixed at startup — and would keep the document permanently incomplete, and so
+// permanently uncacheable, over a deliberate configuration choice.
+func TestBuildIdentity_NoAppComposeSourceIsSettled(t *testing.T) {
+	f := newIdentityFixture(t, deployedComposeText)
+	cfg := f.config()
+	cfg.AppComposePath = "" // and BaseDomain was never set
+
+	res := buildFixture(t, cfg)
+	if res.doc.Containers != nil {
+		t.Errorf("containers = %+v, want null", res.doc.Containers)
+	}
+	if len(res.pending) != 0 {
+		t.Errorf("pending = %v; an unconfigured source can never become configured, so retrying it never ends", res.pending)
+	}
+	// A configured-but-missing file is the opposite case, and must still be retried:
+	// nothing orders cvm-identity ahead of the gateway.
+	cfg.AppComposePath = filepath.Join(f.dir, "not-written-yet.json")
+	if res := buildFixture(t, cfg); len(res.pending) == 0 {
+		t.Error("pending is empty for a configured file that is not there yet; cvm-identity may still be writing it")
+	}
+}
+
 func TestLoadAppCompose_ReportsEverySourceItTried(t *testing.T) {
 	cfg := identityConfig{AppComposePath: filepath.Join(t.TempDir(), "absent.json")}
 	_, _, err := loadAppCompose(context.Background(), cfg, "")
@@ -475,6 +500,35 @@ func TestIdentityRoute_ServesTheDocument(t *testing.T) {
 	}
 	if doc.Verify == "" {
 		t.Error("the response must carry the caveat that these values are self-reported")
+	}
+}
+
+// The response is cacheable AND its Access-Control-Allow-Origin is reflected from
+// the request, so it has to declare that it varies by Origin — including on the
+// requests that carry none. Without this a shared cache stores the header-less
+// variant a curl or an uptime probe fetched and replays it to the browser panel,
+// which blocks it for the whole max-age.
+func TestIdentityRoute_VariesByOrigin(t *testing.T) {
+	gw := identityGateway(t, assembledCache(t))
+
+	for _, origin := range []string{"", "https://0g.ai"} {
+		t.Run("origin="+origin, func(t *testing.T) {
+			var resp *http.Response
+			if origin == "" {
+				r, err := http.Get(gw.URL + identityPath)
+				if err != nil {
+					t.Fatalf("GET: %v", err)
+				}
+				resp = r
+			} else {
+				resp = getWithOrigin(t, gw.URL+identityPath, origin)
+			}
+			defer resp.Body.Close()
+			if !strings.Contains(strings.ToLower(strings.Join(resp.Header.Values("Vary"), ",")), "origin") {
+				t.Errorf("Vary = %v, want it to name Origin — this response is cacheable and its CORS header is per-origin",
+					resp.Header.Values("Vary"))
+			}
+		})
 	}
 }
 
