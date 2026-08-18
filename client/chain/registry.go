@@ -99,6 +99,16 @@ type Signer struct {
 	// good enough to CONFIRM that a quote-bound signer matches, and never good
 	// enough to REJECT one — see the asymmetry documented on Cached.
 	Stale bool
+	// Cached reports that the value came from a cache entry at all, whether or not
+	// it was past its TTL. Stale implies Cached; the reverse does not hold.
+	//
+	// The distinction matters to a caller deciding whether a disagreement is a
+	// VERDICT. "Within its TTL" is not the same as "true right now": a within-TTL
+	// entry can still be minutes old, and a provider that rotated its signer in that
+	// window disagrees for a reason that has nothing to do with it being the wrong
+	// provider. So a caller that would reject on a disagreement should re-read live
+	// whenever this is set, not only when Stale is.
+	Cached bool
 }
 
 // SignerRegistry looks up a provider's on-chain, acknowledged TEE signer address.

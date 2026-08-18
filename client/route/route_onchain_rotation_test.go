@@ -214,3 +214,46 @@ func TestProvider_ReverificationIsRateLimited(t *testing.T) {
 		t.Errorf("quote fetches = %d across 5 mismatching requests, want 1 (throttled)", got)
 	}
 }
+
+// Warn mode is the SHIPPED configuration, and the rotation recovery has to run
+// there too. It is not only about the verdict: the stale quote carries a stale
+// enc_pub, so without re-verifying, warn mode goes on sealing to an enclave that
+// has rotated and the request fails at the provider — while every request also
+// files a `mismatch`, the counter whose whole purpose is to say whether enforce is
+// safe to turn on yet.
+func TestProvider_RotationRecoveryRunsInWarnMode(t *testing.T) {
+	var quoteHits int32
+	srv := rotatingQuoteServer(t, &quoteHits)
+	m := qvMeasurement(0xaa)
+	rd := mutableReportData(t, rotatedSignerHex) // the live quote has rotated
+	reg := &stubRegistry{signer: rotatedSignerStr, ack: true}
+
+	r := New(srv.URL,
+		WithQuoteVerification(rotatingVerifier(t, m, &rd), discardLogger()),
+		WithOnChainVerification(reg, false, discardLogger())) // WARN
+
+	quoteURL, err := deriveQuoteURL(srv.URL)
+	if err != nil {
+		t.Fatalf("deriveQuoteURL: %v", err)
+	}
+	r.quoteCache.put(quoteURL, mustHex(t, qvEncPubHex), qvSignerStr) // pre-rotation
+
+	cands, err := r.Resolve(context.Background(), wire.Request{})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	prov, err := cands.Provider(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("warn mode should still materialize the provider: %v", err)
+	}
+	// The functional half: without the recovery this would still be the stale
+	// signer, and the request would be sealed to an enc_pub the provider has
+	// rotated away from.
+	if prov.SignerAddr != rotatedSignerStr {
+		t.Errorf("SignerAddr = %s, want the re-verified %s — warn mode skipped the recovery",
+			prov.SignerAddr, rotatedSignerStr)
+	}
+	if got := atomic.LoadInt32(&quoteHits); got != 1 {
+		t.Errorf("quote fetches = %d, want 1 (the recovery ran)", got)
+	}
+}

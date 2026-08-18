@@ -14,6 +14,10 @@ type stubRegistry struct {
 	signer string
 	ack    bool
 	stale  bool
+	// cached marks a reading that came from the cache but is still within its TTL —
+	// the case a naive "only re-read when Stale" rule misses, since a within-TTL
+	// entry can still predate a rotation.
+	cached bool
 	err    error
 
 	// refresh, when set, is what a live RefreshSigner returns instead of the
@@ -31,7 +35,10 @@ func (s *stubRegistry) AcknowledgedSigner(context.Context, string) (chain.Signer
 	if s.err != nil {
 		return chain.Signer{}, s.err
 	}
-	return chain.Signer{Address: s.signer, Acknowledged: s.ack, Stale: s.stale}, nil
+	return chain.Signer{
+		Address: s.signer, Acknowledged: s.ack,
+		Stale: s.stale, Cached: s.cached || s.stale, // Stale implies Cached
+	}, nil
 }
 
 func (s *stubRegistry) RefreshSigner(ctx context.Context, providerAddr string) (chain.Signer, error) {
@@ -67,8 +74,8 @@ func TestGroundSignerOnChain_Match(t *testing.T) {
 		if err != nil {
 			t.Errorf("enforce=%v: match should pass, got %v", enforce, err)
 		}
-		if outcome != groundingOK {
-			t.Errorf("enforce=%v: outcome = %s, want %s", enforce, outcome, groundingOK)
+		if outcome.outcome != groundingOK {
+			t.Errorf("enforce=%v: outcome = %s, want %s", enforce, outcome.outcome, groundingOK)
 		}
 	}
 }
@@ -99,8 +106,8 @@ func TestGroundSignerOnChain_VerdictsFailClosedUnderEnforce(t *testing.T) {
 			if err == nil {
 				t.Errorf("enforce: %s should fail-closed, got nil", tc.name)
 			}
-			if outcome != tc.want {
-				t.Errorf("outcome = %s, want %s", outcome, tc.want)
+			if outcome.outcome != tc.want {
+				t.Errorf("outcome = %s, want %s", outcome.outcome, tc.want)
 			}
 			// warn: observe-only (proceed).
 			reg2 := tc.reg
@@ -123,8 +130,8 @@ func TestGroundSignerOnChain_LookupFailureFailsClosedUnderEnforce(t *testing.T) 
 	if err == nil {
 		t.Error("enforce: an unreadable chain should fail-closed by default")
 	}
-	if outcome != groundingLookupFailed {
-		t.Errorf("outcome = %s, want %s (not a verdict about the provider)", outcome, groundingLookupFailed)
+	if outcome.outcome != groundingLookupFailed {
+		t.Errorf("outcome = %s, want %s (not a verdict about the provider)", outcome.outcome, groundingLookupFailed)
 	}
 }
 
@@ -136,8 +143,8 @@ func TestGroundSignerOnChain_LookupFailureProceedsUnderWarn(t *testing.T) {
 	if err != nil {
 		t.Errorf("warn: a lookup failure should proceed, got %v", err)
 	}
-	if outcome != groundingLookupFailed {
-		t.Errorf("outcome = %s, want %s", outcome, groundingLookupFailed)
+	if outcome.outcome != groundingLookupFailed {
+		t.Errorf("outcome = %s, want %s", outcome.outcome, groundingLookupFailed)
 	}
 }
 
@@ -148,8 +155,8 @@ func TestGroundSignerOnChain_LookupFailureIsNotReportedAsAVerdict(t *testing.T) 
 	reg := &stubRegistry{err: errors.New("rpc down")}
 	r := newOnChainRouter(reg, true)
 	outcome, _ := r.groundSignerOnChain(context.Background(), ocProvider, ocSigner)
-	if outcome == groundingMismatch || outcome == groundingNotAcknowledged {
-		t.Errorf("outcome = %s: a chain-RPC failure must not be attributed to the provider", outcome)
+	if outcome.outcome == groundingMismatch || outcome.outcome == groundingNotAcknowledged {
+		t.Errorf("outcome = %s: a chain-RPC failure must not be attributed to the provider", outcome.outcome)
 	}
 }
 
@@ -162,8 +169,8 @@ func TestGroundSignerOnChain_StaleMatchNeedsNoRevalidation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a stale match should pass, got %v", err)
 	}
-	if outcome != groundingOKStale {
-		t.Errorf("outcome = %s, want %s", outcome, groundingOKStale)
+	if outcome.outcome != groundingOKStale {
+		t.Errorf("outcome = %s, want %s", outcome.outcome, groundingOKStale)
 	}
 	if reg.refreshs != 0 {
 		t.Errorf("refreshed %d times, want 0 (nothing to refute)", reg.refreshs)
@@ -185,8 +192,8 @@ func TestGroundSignerOnChain_StaleMismatchRevalidatesAndPasses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a stale disagreement that a live read resolves must not reject: %v", err)
 	}
-	if outcome != groundingOK {
-		t.Errorf("outcome = %s, want %s (the fresh read is not stale)", outcome, groundingOK)
+	if outcome.outcome != groundingOK {
+		t.Errorf("outcome = %s, want %s (the fresh read is not stale)", outcome.outcome, groundingOK)
 	}
 	if reg.refreshs != 1 {
 		t.Errorf("refreshed %d times, want exactly 1", reg.refreshs)
@@ -207,8 +214,8 @@ func TestGroundSignerOnChain_StaleMismatchSurvivesRevalidation(t *testing.T) {
 	if err == nil {
 		t.Error("a mismatch confirmed by a live read should fail-closed")
 	}
-	if outcome != groundingMismatch {
-		t.Errorf("outcome = %s, want %s", outcome, groundingMismatch)
+	if outcome.outcome != groundingMismatch {
+		t.Errorf("outcome = %s, want %s", outcome.outcome, groundingMismatch)
 	}
 }
 
@@ -228,8 +235,8 @@ func TestGroundSignerOnChain_StaleMismatchWithFailedRevalidation(t *testing.T) {
 	}
 	r := newOnChainRouter(newReg(), true)
 	outcome, err := r.groundSignerOnChain(context.Background(), ocProvider, ocSigner)
-	if outcome != groundingLookupFailed {
-		t.Errorf("outcome = %s, want %s (no fresh evidence is not a verdict)", outcome, groundingLookupFailed)
+	if outcome.outcome != groundingLookupFailed {
+		t.Errorf("outcome = %s, want %s (no fresh evidence is not a verdict)", outcome.outcome, groundingLookupFailed)
 	}
 	if err == nil {
 		t.Error("enforce: no fresh evidence should fail-closed")
@@ -239,5 +246,67 @@ func TestGroundSignerOnChain_StaleMismatchWithFailedRevalidation(t *testing.T) {
 	rWarn := newOnChainRouter(newReg(), false)
 	if _, err := rWarn.groundSignerOnChain(context.Background(), ocProvider, ocSigner); err != nil {
 		t.Errorf("warn: should proceed, got %v", err)
+	}
+}
+
+// "Within its TTL" is not "true right now": a cached entry can be minutes old and
+// still predate a rotation. Ruling on it would reject a healthy provider for as
+// long as the entry lives, so a disagreement with ANY cached reading gets a live
+// re-read — not only one whose TTL happened to lapse.
+func TestGroundSignerOnChain_FreshCachedMismatchAlsoRevalidates(t *testing.T) {
+	reg := &stubRegistry{
+		signer:  ocOther, // cached, within TTL, but pre-rotation
+		ack:     true,
+		cached:  true,
+		refresh: &chain.Signer{Address: ocSigner, Acknowledged: true},
+	}
+	r := newOnChainRouter(reg, true)
+	outcome, err := r.groundSignerOnChain(context.Background(), ocProvider, ocSigner)
+	if err != nil {
+		t.Fatalf("a cached disagreement a live read resolves must not reject: %v", err)
+	}
+	if outcome.outcome != groundingOK {
+		t.Errorf("outcome = %s, want %s", outcome.outcome, groundingOK)
+	}
+	if reg.refreshs != 1 {
+		t.Errorf("refreshed %d times, want 1", reg.refreshs)
+	}
+}
+
+// A reading taken live needs no second opinion: it IS the fresh evidence, so a
+// disagreement is a verdict straight away.
+func TestGroundSignerOnChain_LiveMismatchNeedsNoRevalidation(t *testing.T) {
+	reg := &stubRegistry{signer: ocOther, ack: true} // not cached
+	r := newOnChainRouter(reg, true)
+	outcome, err := r.groundSignerOnChain(context.Background(), ocProvider, ocSigner)
+	if err == nil {
+		t.Error("a live mismatch should fail-closed")
+	}
+	if outcome.outcome != groundingMismatch {
+		t.Errorf("outcome = %s, want %s", outcome.outcome, groundingMismatch)
+	}
+	if reg.refreshs != 0 {
+		t.Errorf("refreshed %d times, want 0 (the reading was already live)", reg.refreshs)
+	}
+}
+
+// A provider that keeps disagreeing must not turn the re-read into a chain RPC
+// per request: the rate limit is what makes "prefer evidence over a verdict"
+// affordable rather than a lever to pull.
+func TestGroundSignerOnChain_RevalidationIsRateLimited(t *testing.T) {
+	reg := &stubRegistry{
+		signer:  ocOther,
+		ack:     true,
+		cached:  true,
+		refresh: &chain.Signer{Address: ocOther, Acknowledged: true}, // still disagrees
+	}
+	r := newOnChainRouter(reg, true)
+	for i := 0; i < 5; i++ {
+		if _, err := r.groundSignerOnChain(context.Background(), ocProvider, ocSigner); err == nil {
+			t.Fatalf("round %d: want fail-closed", i)
+		}
+	}
+	if reg.refreshs != 1 {
+		t.Errorf("refreshed %d times across 5 requests, want 1 (rate-limited)", reg.refreshs)
 	}
 }

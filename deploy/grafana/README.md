@@ -94,6 +94,11 @@ highest-signal ones:
   provider at all, so it can serve nothing. This is the shape of a cold start during
   an upstream outage; it is also what the blue/green standby probe (`/readyz`) gates
   the cutover on, so a firing alert here explains a refused switch.
+- `rate(zg_gateway_warmer_signer_refreshes_total{result="mismatch"}[5m]) > 0` — the
+  warmer found a provider whose on-chain signer does not vouch for its quote-bound
+  one. Under enforce that provider is unusable, and enough of them turn `/readyz`
+  red and hold back a blue/green cutover; it is the same condition as a grounding
+  `mismatch`, seen from the sweep rather than from a request.
 - `rate(zg_gateway_onchain_revalidations_total{result="ok"}[5m]) > 0` — informational
   rather than a page: a stale or cached reading disagreed but a live re-read agreed,
   which is the signature of a benign broker-signer rotation. Worth noticing during a

@@ -161,8 +161,10 @@ var (
 	}, []string{"result"})
 	warmerSignerRefresh = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "warmer_signer_refreshes_total",
-		Help: "Per-provider on-chain signer refreshes by the warmer, by result (ok|failed). " +
-			"A sustained failed rate means requests are paying the chain RPC themselves.",
+		Help: "Per-provider on-chain signer refreshes by the warmer, by result " +
+			"(ok|failed|mismatch). failed is our chain RPC; mismatch is the chain declining " +
+			"to vouch for the quote-bound signer, which under enforce makes that provider " +
+			"unusable and can hold back a blue/green cutover.",
 	}, []string{"result"})
 	warmerReadyProviders = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "warmer_ready_providers",
@@ -300,7 +302,9 @@ func OnChainGrounding(outcome string) { onchainGrounding.WithLabelValues(outcome
 func OnChainRevalidation(result string) { onchainRevalidations.WithLabelValues(result).Inc() }
 
 // WarmerSignerRefresh records one provider's on-chain signer refresh by the
-// warmer (result: ok|failed).
+// warmer: ok, failed (our chain RPC could not be read), or mismatch (it was read
+// and did not vouch for the quote-bound signer). The last is the one that marks a
+// provider unprepared under enforce, so it is not a variant of failed.
 func WarmerSignerRefresh(result string) { warmerSignerRefresh.WithLabelValues(result).Inc() }
 
 // WarmerReadyProviders records how many providers the last sweep prepared end to

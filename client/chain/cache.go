@@ -113,7 +113,7 @@ func (c *cachedRegistry) AcknowledgedSigner(ctx context.Context, providerAddr st
 	now := c.now()
 
 	if e, ok := c.load(key); ok && now.Before(e.expires) {
-		return Signer{Address: e.signer, Acknowledged: e.acknowledged}, nil
+		return Signer{Address: e.signer, Acknowledged: e.acknowledged, Cached: true}, nil
 	}
 
 	if f, ok := c.recentFailure(key, now); ok {
@@ -190,7 +190,13 @@ func (c *cachedRegistry) refresh(ctx context.Context, providerAddr string) (Sign
 		// the call with its own per-attempt deadlines. Each caller still honors its
 		// OWN context in the select below.
 		lookupCtx := context.WithoutCancel(ctx)
-		got, err := c.inner.AcknowledgedSigner(lookupCtx, providerAddr)
+		// RefreshSigner, not AcknowledgedSigner: this function's whole contract is "read
+		// live". Asking the inner registry for a possibly-cached value and then clearing
+		// the provenance flags below would MANUFACTURE freshness — handing a caller that
+		// is willing to reject on this reading something it must not reject on. Harmless
+		// with the unwrapped *OnChainRegistry the binaries use, where the two are the
+		// same call, and wrong the moment anyone nests a cache.
+		got, err := c.inner.RefreshSigner(lookupCtx, providerAddr)
 		if err != nil {
 			return Signer{}, err
 		}
@@ -212,9 +218,8 @@ func (c *cachedRegistry) refresh(ctx context.Context, providerAddr string) (Sign
 		if res.Err != nil {
 			return Signer{}, res.Err
 		}
-		// A shared result is never Stale: it came from a live read. Rebuild it rather
-		// than trusting the inner value's flag, so a nested cache cannot leak its own
-		// staleness through a refresh.
+		// A shared result is neither Stale nor Cached: it came from a live read, and
+		// every caller coalesced onto it gets the same live evidence.
 		got := res.Val.(Signer)
 		return Signer{Address: got.Address, Acknowledged: got.Acknowledged}, nil
 	}
@@ -230,7 +235,7 @@ func (c *cachedRegistry) staleWithinGrace(key string, now time.Time) (Signer, bo
 	if !ok || !now.Before(e.expires.Add(c.grace)) {
 		return Signer{}, false
 	}
-	return Signer{Address: e.signer, Acknowledged: e.acknowledged, Stale: true}, true
+	return Signer{Address: e.signer, Acknowledged: e.acknowledged, Stale: true, Cached: true}, true
 }
 
 func (c *cachedRegistry) load(key string) (cacheEntry, bool) {
