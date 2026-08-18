@@ -143,15 +143,15 @@ func TestStaleIdentityFileIsRemoved(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 	// The identity-unavailable branch of main: nothing to write, so clear it.
-	if err := clearIdentityFile(path); err != nil {
-		t.Fatalf("clearIdentityFile: %v", err)
+	if err := clearStaleFile(path); err != nil {
+		t.Fatalf("clearStaleFile: %v", err)
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("stale identity file survived (stat err = %v)", err)
 	}
 	// Idempotent: a boot that never had an identity must not fail on the absence.
-	if err := clearIdentityFile(path); err != nil {
-		t.Errorf("clearIdentityFile on a missing file = %v, want nil", err)
+	if err := clearStaleFile(path); err != nil {
+		t.Errorf("clearStaleFile on a missing file = %v, want nil", err)
 	}
 }
 

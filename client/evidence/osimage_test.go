@@ -91,7 +91,7 @@ func TestCheckOSImage(t *testing.T) {
 	}
 
 	t.Run("match names the entry", func(t *testing.T) {
-		got := checkOSImage(allowed, m)
+		got := CheckOSImage(allowed, m)
 		if !got.OK() || got.Err != nil {
 			t.Fatalf("err = %v", got.Err)
 		}
@@ -106,7 +106,7 @@ func TestCheckOSImage(t *testing.T) {
 	t.Run("RTMR0 must not affect the result", func(t *testing.T) {
 		reshaped := m
 		reshaped.RTMR0 = mkMeasurement(0x55).RTMR0
-		if got := checkOSImage(allowed, reshaped); !got.OK() {
+		if got := CheckOSImage(allowed, reshaped); !got.OK() {
 			t.Errorf("a differing RTMR0 (a different VM shape) broke the match: %v", got.Err)
 		}
 	})
@@ -115,13 +115,13 @@ func TestCheckOSImage(t *testing.T) {
 		// Same OS image, different app: RTMR3 differs and the check must still pass.
 		other := m
 		other.RTMR3 = mkMeasurement(0x77).RTMR3
-		if got := checkOSImage(allowed, other); !got.OK() {
+		if got := CheckOSImage(allowed, other); !got.OK() {
 			t.Errorf("a differing RTMR3 broke the boot-chain match: %v", got.Err)
 		}
 	})
 
 	t.Run("no match fails and lists what was expected", func(t *testing.T) {
-		got := checkOSImage(allowed, mkMeasurement(0x44))
+		got := CheckOSImage(allowed, mkMeasurement(0x44))
 		if got.OK() {
 			t.Fatal("OK() = true for an unlisted OS image")
 		}
@@ -135,7 +135,7 @@ func TestCheckOSImage(t *testing.T) {
 	})
 
 	t.Run("empty allowlist is unavailable, not a failure", func(t *testing.T) {
-		got := checkOSImage(nil, m)
+		got := CheckOSImage(nil, m)
 		if got.Configured {
 			t.Error("Configured = true for an empty allowlist")
 		}

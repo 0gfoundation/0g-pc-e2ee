@@ -26,7 +26,7 @@ import (
 //
 // Preview is the first upstream call the core makes on the sealed path, which is
 // why blocking it is enough — no sealing or provider key material is involved.
-func blockedGateway(t *testing.T, maxInFlight int) (gw *httptest.Server, entered <-chan struct{}) {
+func blockedGateway(t *testing.T, maxInFlight int, identity *identityCache) (gw *httptest.Server, entered <-chan struct{}) {
 	t.Helper()
 	release := make(chan struct{})
 	reached := make(chan struct{}, 8)
@@ -39,7 +39,7 @@ func blockedGateway(t *testing.T, maxInFlight int) (gw *httptest.Server, entered
 	router := httptest.NewServer(routerMux)
 
 	client := core.NewWithResolver(route.New(router.URL))
-	gw = httptest.NewServer(newHandler(client, mustURL(t, router.URL), testOrigins(), "", "", maxInFlight, nil, discardLogger()))
+	gw = httptest.NewServer(newHandler(client, mustURL(t, router.URL), testOrigins(), "", "", maxInFlight, identity, nil, discardLogger()))
 
 	// Cleanup runs LIFO, and Close blocks on in-flight requests — so the parked
 	// handler must be released before either server is closed, which means
@@ -84,7 +84,7 @@ func post(t *testing.T, gw *httptest.Server, auth string) int {
 // credential-less request must still be answered 401 by the gate — a 503 here
 // would mean junk traffic can exhaust the capacity reserved for real requests.
 func TestGatewayCap_CredentialGateRunsFirst(t *testing.T) {
-	gw, entered := blockedGateway(t, 1)
+	gw, entered := blockedGateway(t, 1, nil)
 
 	go func() { _ = postAsync(gw, "Bearer sk-holder") }()
 	select {
@@ -107,7 +107,7 @@ func TestGatewayCap_CredentialGateRunsFirst(t *testing.T) {
 // Without this, deleting the LimitInFlight wrapper from newHandler would leave
 // the suite green.
 func TestGatewayCap_SealedRouteIsCapped(t *testing.T) {
-	gw, entered := blockedGateway(t, 1)
+	gw, entered := blockedGateway(t, 1, nil)
 
 	go func() { _ = postAsync(gw, "Bearer sk-holder") }()
 	select {
@@ -127,7 +127,7 @@ func TestGatewayCap_SealedRouteIsCapped(t *testing.T) {
 // there would fail the healthcheck and have the platform restart the very
 // gateway that was merely busy — turning a load spike into an outage.
 func TestGatewayCap_HealthzIsNotCapped(t *testing.T) {
-	gw, entered := blockedGateway(t, 1)
+	gw, entered := blockedGateway(t, 1, nil)
 
 	go func() { _ = postAsync(gw, "Bearer sk-holder") }()
 	select {

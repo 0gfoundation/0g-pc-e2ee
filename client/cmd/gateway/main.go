@@ -32,8 +32,13 @@
 // which covers this gateway image too (see deploy/phala/ and
 // docs/design/cloud-gateway.md §6). Inference authenticity rides the provider's
 // own SPEC §8 response signature, which the gateway verifies
-// (ZG_GATEWAY_VERIFY_RESPONSES). So the gateway exposes no /quote route. The
-// sealed inference path carries a front-door credential gate
+// (ZG_GATEWAY_VERIFY_RESPONSES). So the gateway exposes no /quote route. It does
+// serve a self-DESCRIPTION at /v1/gateway/identity (app_id, compose hash, OS image,
+// container list, matching release — see identity.go), which is display material for
+// a browser panel and deliberately not evidence: it is parsed, not signed, and every
+// value in it is what pcverify independently rederives.
+//
+// The sealed inference path carries a front-door credential gate
 // (openaiproxy.RequireInferenceCredential in newHandler): a cheap presence/shape check
 // that sheds missing-credential and mgmt-key traffic before the seal/route work,
 // while the router stays the authoritative auth/billing point and re-validates
@@ -57,12 +62,14 @@ import (
 	"net/http/pprof"
 	"net/url"
 	"os"
+	"path/filepath"
 	"runtime"
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/cmd/internal/proxycli"
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/dstack"
+	"github.com/0gfoundation/0g-pc-e2ee/client/evidence"
 	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 )
@@ -137,6 +144,49 @@ func main() {
 		"serve the Go runtime profiler at /debug/pprof/ on the -metrics-listen address (requires -metrics-listen). "+
 			"For load testing and diagnosis only — it exposes process internals, so never enable it on a listener "+
 			"reachable from outside the CVM (env ZG_GATEWAY_PPROF)")
+	// The self-description endpoint (GET /v1/gateway/identity, issue #78): what this
+	// CVM is, assembled server-side from its own quote and manifest so a browser
+	// panel does not have to reimplement pcverify in JavaScript — which it could not
+	// do anyway, since JS cannot see its own connection's peer certificate. ON by
+	// default: it publishes nothing that /evidences/ and the published releases do
+	// not already make public, and a panel that silently shows nothing is worse than
+	// one that shows nulls. The switch is here for a deployment that wants the
+	// surface gone entirely.
+	//
+	// It is a DESCRIPTION, not a proof — see identity.go's header before extending
+	// what it reports.
+	identityOn := flag.Bool("identity-endpoint", proxycli.EnvBool("ZG_GATEWAY_IDENTITY_ENDPOINT", true),
+		"serve this CVM's self-description at "+identityPath+" (app_id, compose_hash, OS image, "+
+			"container list, matching release). Public, unauthenticated, and NOT evidence — every "+
+			"value is independently rederivable with pcverify (env ZG_GATEWAY_IDENTITY_ENDPOINT)")
+	// Where the endpoint's container list comes from: the manifest cmd/cvmid wrote to
+	// the shared identity volume. Preferred over the platform lookup below because it
+	// needs no network, no third-party host and no DNS — and, like -identity-file, it
+	// keeps the gateway off the guest-agent socket. The bytes are checked against the
+	// quote's compose_hash before anything is read out of them, so an absent or stale
+	// file costs the container list and nothing else.
+	appComposeFile := flag.String("app-compose-file", proxycli.EnvOr("ZG_GATEWAY_APP_COMPOSE_FILE", ""),
+		"path to the app-compose.json written by cmd/cvmid, read for "+identityPath+"'s container "+
+			"list after checking it against the quote's compose_hash; empty falls back to "+
+			"-platform-base-domain (env ZG_GATEWAY_APP_COMPOSE_FILE)")
+	// The fallback: the platform's per-app guest-agent host,
+	// `<app_id>-8090.<base_domain>`. For a replica whose init container predates
+	// -out-app-compose — the shape a rolling blue/green upgrade has — and for nothing
+	// else. Empty (the default) disables it, which is right for a local run and for
+	// any deployment where the file is present.
+	platformBaseDomain := flag.String("platform-base-domain", proxycli.EnvOr("ZG_GATEWAY_PLATFORM_BASE_DOMAIN", ""),
+		"dstack platform base domain (e.g. in1.phala.network) to fetch this app's app-compose from "+
+			"when -app-compose-file is unavailable; empty disables the fallback "+
+			"(env ZG_GATEWAY_PLATFORM_BASE_DOMAIN)")
+	// How many published releases the deployed compose text is compared against for
+	// the endpoint's matched_release. The same lookup, and the same byte-for-byte
+	// comparison, that `pcverify -releases N` performs — so the release the panel
+	// names and the release pcverify confirms cannot disagree. 0 disables the GitHub
+	// call, which is the setting for a CVM with no egress to it.
+	identityReleases := flag.Int("identity-releases", proxycli.EnvIntOr("ZG_GATEWAY_IDENTITY_RELEASES", defaultIdentityReleases),
+		"how many published releases to compare the deployed compose text against for "+
+			identityPath+"'s matched_release; 0 disables the GitHub lookup "+
+			"(env ZG_GATEWAY_IDENTITY_RELEASES)")
 	// -health turns the binary into its OWN container health probe: it makes one
 	// GET /healthz to the -listen port, prints the result, and exits 0 (healthy)
 	// or 1 — it starts no server. The image is distroless (no shell, no curl,
@@ -232,6 +282,42 @@ func main() {
 		}
 	}
 
+	// Assemble this CVM's self-description in the background (see identity.go). It
+	// deliberately does not gate startup: every input is optional, the first pass is
+	// two file reads plus one GitHub call, and a slow or unreachable lookup must
+	// delay serving by nothing at all. stopIdentity joins the builder at shutdown.
+	//
+	// A missing -evidence-dir leaves QuotePath empty, which turns off app_id,
+	// compose_hash and os_image together — they all come out of the same quote — and
+	// the endpoint then reports the instance id and nulls. That is the local-run
+	// shape, and it is a legitimate one: the route stays honest about knowing
+	// nothing rather than being absent.
+	var identity *identityCache
+	stopIdentity := func() {}
+	if *identityOn {
+		// The embedded allowlist. A failure here is a mistake in THIS repository (a
+		// malformed osimages.json), not anything about the deployment — loud, but never
+		// fatal: an operational display must not be able to take the inference path
+		// down. The endpoint then reports os_image as null.
+		osImages, err := evidence.BuiltinOSImages()
+		if err != nil {
+			logger.Error("embedded OS-image allowlist is malformed; identity will report no OS image", "err", err)
+		}
+		quotePath := ""
+		if *evidenceDir != "" {
+			quotePath = filepath.Join(*evidenceDir, evidenceQuoteFile)
+		}
+		identity, stopIdentity = startIdentity(identityConfig{
+			InstanceID:     instanceID,
+			QuotePath:      quotePath,
+			AppComposePath: *appComposeFile,
+			BaseDomain:     *platformBaseDomain,
+			Releases:       *identityReleases,
+			OSImages:       osImages,
+			Timeout:        identityLookupTimeout,
+		}, logger)
+	}
+
 	// Start the background quote-cache warmer (a no-op unless -warm is set) so
 	// requests hit a warm cache instead of paying the DCAP verify inline; stop it
 	// on shutdown before the process exits.
@@ -260,7 +346,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              *f.Listen,
-		Handler:           newHandler(built.Client, routerTarget, origins, instanceID, *evidenceDir, *maxInFlight, built.Readiness(), logger),
+		Handler:           newHandler(built.Client, routerTarget, origins, instanceID, *evidenceDir, *maxInFlight, identity, built.Readiness(), logger),
 		ReadHeaderTimeout: 10 * time.Second,     // mitigate slow-header (Slowloris) clients
 		IdleTimeout:       proxycli.IdleTimeout, // bound idle keep-alives; unset means unbounded
 	}
@@ -290,12 +376,18 @@ func main() {
 	// mounted or not depending on one env var, and an operator debugging "why does
 	// /evidences 404" needs to see which side of that the process is on. Empty means
 	// the route is not mounted at all.
+	//
+	// identity_endpoint is here for the same reason, and it is the more confusing of
+	// the two when it is off: the endpoint answers 200 with nulls when its SOURCES
+	// are missing and 404s (via the router catch-all) when the route itself is off,
+	// which are very different diagnoses for the same-looking symptom.
 	logger.Info("gateway listening", "listen", *f.Listen, "router_url", *f.RouterURL,
 		"cors_allowed_origins", origins, "max_inflight", *maxInFlight,
-		"evidence_dir", *evidenceDir,
+		"evidence_dir", *evidenceDir, "identity_endpoint", *identityOn,
 		"go_memlimit_bytes", currentMemoryLimit(), "gomaxprocs", runtime.GOMAXPROCS(0))
 	err = proxycli.Serve(srv, logger)
 	stopWarmer()
+	stopIdentity()
 	stopMetrics()
 	if err != nil {
 		logger.Error("gateway server exited", "err", err)
@@ -447,10 +539,15 @@ func runHealthCheck(listen string) int {
 // from that directory (see evidenceRoute). Empty leaves the route unmounted, so
 // those paths fall through to the catch-all like any other unknown path.
 //
+// identity, when non-nil, mounts this CVM's self-description at
+// /v1/gateway/identity. Nil leaves the route unmounted — the same fall-through as
+// an unset evidenceDir — which is what -identity-endpoint=false and every test
+// that is not about the route get.
+//
 // ready backs GET /readyz: nil means there is nothing to assert (no warmer
 // configured) and the route always answers ready. See proxycli.Built.Readiness and
 // the /healthz vs /readyz split at the routes below.
-func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, instanceID, evidenceDir string, maxInFlight int, ready func() error, logger *slog.Logger) http.Handler {
+func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, instanceID, evidenceDir string, maxInFlight int, identity *identityCache, ready func() error, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	// Mount the sealed inference path behind the gateway's front-door credential
 	// gate. The gate is a cheap presence/shape check (reject missing credentials
@@ -502,6 +599,24 @@ func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, 
 		}
 		_, _ = w.Write([]byte("ready\n"))
 	})
+	// This CVM's self-description, for a browser panel that wants to show what it is
+	// connected to (issue #78). Three deliberate placements:
+	//
+	// OUTSIDE the credential gate — it publishes only what /evidences/ and the
+	// published releases already make public, so there is nothing here to authorize
+	// and a verification panel must be able to load before anyone signs in.
+	//
+	// OUTSIDE the in-flight cap — it is a pre-assembled constant served from memory,
+	// and letting it consume a slot would price a static read against the sealed
+	// inference the cap exists to protect.
+	//
+	// INSIDE the CORS allowlist, unlike /evidences/. The bundle answers `*` because
+	// any verifier must be able to fetch it; this endpoint is a convenience for the
+	// first-party panel, and the values in it are always independently obtainable
+	// from the bundle, so widening the origin policy for it would buy nothing.
+	if identity != nil {
+		mux.Handle("GET "+identityPath, identityHandler(identity))
+	}
 	// The gateway exposes no /quote route: it emits no attestation quote of its
 	// own. Endpoint/code identity comes from dstack-ingress's in-CVM cert-binding
 	// attestation (/evidences, which commits to app_id and so covers this image);

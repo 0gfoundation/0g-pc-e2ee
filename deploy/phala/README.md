@@ -54,6 +54,11 @@ writes this replica's `instance_id`/`app_id` once at boot and exits, and
   quote proves *"a CVM running exactly this app-compose obtained this certificate
   inside the TEE"*, covering all four containers. See [Verify](#verify) for the steps
   the quote cannot do for you.
+- The gateway also **describes itself** at `/v1/gateway/identity` — the `app_id`,
+  OS image, container list and matching release read out of the same quote and
+  manifest — so a browser panel can display what it is connected to. That endpoint
+  is convenience, not proof: see
+  [Gateway self-description](#gateway-self-description-v1gatewayidentity) below.
 
 ## Serving domain
 
@@ -497,6 +502,60 @@ curl -sSI -H 'Origin: https://example.invalid' "https://<DOMAIN>/evidences/quote
   | grep -i access-control-allow-origin      # expect: access-control-allow-origin: *
 
 # and the unchanged command-line path must still work end to end
+pcverify -gateway <DOMAIN>
+```
+
+## Gateway self-description (`/v1/gateway/identity`)
+
+A public, unauthenticated route that answers "what is this CVM?" in one request, so a
+browser panel can show it without reimplementing `pcverify` in JavaScript — which it
+could not do anyway, since JS cannot see its own connection's peer certificate
+([#78](https://github.com/0gfoundation/0g-pc-e2ee/issues/78)).
+
+| Setting | Container | Effect |
+|---|---|---|
+| `-out-app-compose /run/identity/app-compose.json` | cvm-identity | publishes this CVM's `app-compose.json` verbatim on the shared `identity` volume, from the same guest-agent call that yields the identity file. |
+| `ZG_GATEWAY_APP_COMPOSE_FILE=/run/identity/app-compose.json` | gateway | where the container list comes from. Spelled out here, not defaulted in the binary, because the path is a contract between containers: it appears three times in the compose, and splitting it between YAML and Go is how a renamed volume becomes a silently empty list. |
+| `ZG_GATEWAY_PLATFORM_BASE_DOMAIN=${GATEWAY_DOMAIN}` | gateway | fallback source for the same manifest, consulted only when the file is unreadable. Empty disables it. |
+
+Two more knobs are left at their built-in defaults and appear in the compose only as
+commented-out lines, per this file's convention of stating what *differs* from the
+default: `ZG_GATEWAY_IDENTITY_ENDPOINT` (on — set `false` to remove the route
+entirely) and `ZG_GATEWAY_IDENTITY_RELEASES` (`5`, matching pcverify's own default —
+set `0` for a CVM with no egress to GitHub, which then reports `matched_release:
+null`).
+
+**It is not evidence, and the code is written to keep it that way.** The gateway signs
+nothing here and does not DCAP-verify its own quote; the response carries no
+`"verified"` field. Every value is independently rederivable with `pcverify -gateway
+<DOMAIN>`, which is the artifact to point anyone at who asks whether it is *true*
+rather than what it *is*. See `docs/verifying-the-gateway.md` and
+`client/cmd/gateway/identity.go`.
+
+**Assembled once, in the background.** Nothing blocks startup and nothing is computed
+per request: the document is built after boot, cached in memory, and served with
+`Cache-Control: public, max-age=300`. A source that is not available yet — the quote
+appears only after dstack-ingress's first ACME run — is retried with backoff, and the
+route answers 200 with `null` fields meanwhile. It never 500s, and it never consumes a
+slot from the sealed path's in-flight cap.
+
+**The container list is hash-checked before it is published.** The `app-compose.json`
+must hash to the `compose_hash` in the quote; a mismatch (a stale volume, a redeploy
+whose init container did not re-run) reports `containers: null` and logs an error
+rather than publishing a list from unauthenticated bytes.
+
+**CORS differs from `/evidences/` on purpose.** The bundle answers every origin (`*`)
+because any verifier must be able to fetch it; this route rides
+`ZG_GATEWAY_ALLOWED_ORIGINS` instead, since it is a convenience for the first-party
+panel and its values are always obtainable from the bundle regardless.
+
+`GATEWAY_DOMAIN` was already referenced by dstack-ingress, so **`allowed_envs` is
+unchanged**. Smoke-test after deploying:
+
+```sh
+curl -s "https://<DOMAIN>/v1/gateway/identity" | jq
+
+# the app_id it reports must be the one pcverify derives from the quote
 pcverify -gateway <DOMAIN>
 ```
 

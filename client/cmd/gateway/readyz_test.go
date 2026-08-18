@@ -14,7 +14,7 @@ import (
 func readyzBody(t *testing.T, ready func() error) (int, string) {
 	t.Helper()
 	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"),
-		testOrigins(), "", "", noInFlightCap, ready, discardLogger()))
+		testOrigins(), "", "", noInFlightCap, nil, ready, discardLogger()))
 	defer gw.Close()
 
 	resp, err := http.Get(gw.URL + "/readyz")
@@ -73,7 +73,7 @@ func TestReadyz_NotServedByRouterPassthrough(t *testing.T) {
 	defer router.Close()
 
 	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, router.URL),
-		testOrigins(), "", "", noInFlightCap,
+		testOrigins(), "", "", noInFlightCap, nil,
 		func() error { return errors.New("not ready") }, discardLogger()))
 	defer gw.Close()
 
@@ -94,7 +94,7 @@ func TestReadyz_NotServedByRouterPassthrough(t *testing.T) {
 // compose gates dstack-ingress startup on, so it must stay independent.
 func TestHealthz_UnaffectedByReadiness(t *testing.T) {
 	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"),
-		testOrigins(), "", "", noInFlightCap,
+		testOrigins(), "", "", noInFlightCap, nil,
 		func() error { return errors.New("not ready") }, discardLogger()))
 	defer gw.Close()
 

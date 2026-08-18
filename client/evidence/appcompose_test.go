@@ -450,7 +450,7 @@ func TestMatchExpected(t *testing.T) {
 	third := []byte("services:\n  gateway:\n    image: x@sha256:ccc\n")
 
 	t.Run("single candidate match", func(t *testing.T) {
-		label, err := matchExpected(live, []ExpectedCompose{{Label: "release-1", Content: live}})
+		label, err := MatchCompose(live, []ExpectedCompose{{Label: "release-1", Content: live}})
 		if err != nil || label != "release-1" {
 			t.Errorf("label = %q, err = %v", label, err)
 		}
@@ -458,7 +458,7 @@ func TestMatchExpected(t *testing.T) {
 	t.Run("matches a later candidate", func(t *testing.T) {
 		// Newest first; the deployment is running the older one. Reporting WHICH is the
 		// point — "it is release-2, not the newest" is actionable.
-		label, err := matchExpected(live, []ExpectedCompose{
+		label, err := MatchCompose(live, []ExpectedCompose{
 			{Label: "release-3", Content: third},
 			{Label: "release-2", Content: live},
 		})
@@ -467,13 +467,13 @@ func TestMatchExpected(t *testing.T) {
 		}
 	})
 	t.Run("single candidate mismatch names it", func(t *testing.T) {
-		_, err := matchExpected(live, []ExpectedCompose{{Label: "release-9", Content: other}})
+		_, err := MatchCompose(live, []ExpectedCompose{{Label: "release-9", Content: other}})
 		if err == nil || !strings.Contains(err.Error(), "release-9") {
 			t.Errorf("err = %v, want it to name the candidate", err)
 		}
 	})
 	t.Run("no candidate matches", func(t *testing.T) {
-		_, err := matchExpected(live, []ExpectedCompose{
+		_, err := MatchCompose(live, []ExpectedCompose{
 			{Label: "release-3", Content: third},
 			{Label: "release-2", Content: other},
 		})
@@ -488,7 +488,7 @@ func TestMatchExpected(t *testing.T) {
 		}
 	})
 	t.Run("no candidates supplied", func(t *testing.T) {
-		if _, err := matchExpected(live, nil); err == nil {
+		if _, err := MatchCompose(live, nil); err == nil {
 			t.Error("expected an error with no candidates")
 		}
 	})
