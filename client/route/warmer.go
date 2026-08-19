@@ -263,6 +263,16 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 			ready++
 		}
 	}
+	// Re-checked HERE as well as at the top of the loop, because the loop can also be
+	// left by finishing its LAST provider while the context is already cancelled — the
+	// guard above never runs again, and the sweep would fall through to publish
+	// "0 of N prepared" on its way out. That is the same false unready this function
+	// takes care to avoid everywhere else (see the list_failed path and the loop
+	// guard), and it lands on the metric an alert pages on plus the WarmState /readyz
+	// answers from, so a concurrent probe during a deploy would see it too.
+	if ctx.Err() != nil {
+		return
+	}
 	// The sweep ran to completion (individual provider failures are counted above,
 	// not fatal); stamp the liveness gauge so an alert can fire if sweeps stall.
 	metrics.WarmerSweep("ok")

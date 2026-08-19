@@ -355,3 +355,65 @@ func TestWarmer_ChainProblemsDoNotBlockReadinessUnderWarn(t *testing.T) {
 		})
 	}
 }
+
+// A sweep cancelled while working on its LAST provider leaves the loop by exhausting
+// it, not through the in-loop guard, so the guard has to be repeated after the loop.
+// Without it the sweep falls through and publishes "0 of N prepared" on shutdown —
+// the alert series and the WarmState /readyz answers from, both wrong, and reachable
+// on every deploy rather than in some corner.
+func TestWarmer_CancelDuringLastProviderDoesNotPublishSweep(t *testing.T) {
+	var hits, status int32
+	// One provider, so cancelling while its quote is in flight cancels the sweep on
+	// its way out of the last iteration.
+	srv := warmerServer(t, &hits, []string{"0xa"}, &status)
+	res := fakeResolver{url: srv.URL}
+
+	// The registry cancels the sweep from inside the per-provider work, once the
+	// loop's top-of-iteration guard has already let the only provider through.
+	ctx, cancel := context.WithCancel(context.Background())
+	reg := &cancellingRegistry{cancel: cancel}
+	r := New(srv.URL, WithQuoteVerification(qvVerifier(t), discardLogger()),
+		WithOnChainVerification(reg, false, discardLogger()))
+
+	r.WarmOnce(context.Background(), res) // prime, so a real Ready count exists to clobber
+	primed := r.WarmState()
+	if primed.Ready != 1 {
+		t.Fatalf("setup: WarmState = %+v, want Ready 1", primed)
+	}
+
+	// Armed only now: cancelling during the priming sweep would leave ctx already done
+	// at the next sweep's entry, where the loop's own guard catches it — testing the
+	// guard that was already there instead of the one after the loop.
+	reg.arm()
+	sweeps := metricValue(t, `zg_gateway_warmer_sweeps_total{result="ok"}`)
+	r.WarmOnce(ctx, res)
+
+	if got := r.WarmState(); got.At != primed.At || got.Ready != primed.Ready {
+		t.Errorf("WarmState = %+v after a sweep cancelled on its last provider, want its result untouched (%+v)",
+			got, primed)
+	}
+	if got := metricValue(t, `zg_gateway_warmer_sweeps_total{result="ok"}`); got != sweeps {
+		t.Errorf("warmer_sweeps_total{result=ok} moved by %v, want 0: a cancelled sweep is not a success", got-sweeps)
+	}
+}
+
+// cancellingRegistry cancels the sweep's context from inside the per-provider work,
+// after the loop's top-of-iteration guard has already let that provider through. It
+// stays inert until armed, so a priming sweep can run to completion first.
+type cancellingRegistry struct {
+	cancel context.CancelFunc
+	armed  atomic.Bool
+}
+
+func (c *cancellingRegistry) arm() { c.armed.Store(true) }
+
+func (c *cancellingRegistry) AcknowledgedSigner(context.Context, string) (chain.Signer, error) {
+	return chain.Signer{Address: qvSignerStr, Acknowledged: true}, nil
+}
+
+func (c *cancellingRegistry) RefreshSigner(ctx context.Context, addr string) (chain.Signer, error) {
+	if c.armed.Load() {
+		c.cancel()
+	}
+	return chain.Signer{Address: qvSignerStr, Acknowledged: true}, nil
+}
