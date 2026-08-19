@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -402,5 +403,38 @@ func TestGroundSignerOnChain_ConcludedRevalidationKeepsTheWindow(t *testing.T) {
 	}
 	if reg.refreshs != 1 {
 		t.Errorf("refreshed %d times, want 1 (a conclusive re-read holds the full window)", reg.refreshs)
+	}
+}
+
+// The rate limiter's key comes from the untrusted router, and every comparison on
+// a provider address elsewhere is case-insensitive. Keyed on the raw spelling, the
+// same provider capitalized differently was a NEW key with a fresh allowance — so
+// the party choosing the spelling could step around the limit, and each step is a
+// live RefreshSigner: an eth_call that bypasses chain.FailureCooldown, against the
+// one chain RPC endpoint this deployment has. The trigger needs no compromised
+// enclave, just a preview pairing provider A's address with provider B's endpoint.
+func TestGroundSignerOnChain_RevalidationLimitSurvivesCaseTricks(t *testing.T) {
+	reg := &stubRegistry{
+		signer:  ocOther,
+		ack:     true,
+		cached:  true,
+		refresh: &chain.Signer{Address: ocOther, Acknowledged: true}, // keeps disagreeing
+	}
+	r := newOnChainRouter(reg, true)
+
+	spellings := []string{
+		ocProvider,
+		strings.ToUpper("0x") + strings.ToUpper(ocProvider[2:]), // EIP-55-ish shouting
+		strings.ToUpper(ocProvider[:20]) + ocProvider[20:],      // mixed case
+		"  " + ocProvider + "  ",                                // padded
+	}
+	for i, addr := range spellings {
+		if _, err := r.groundSignerOnChain(context.Background(), addr, ocSigner); err == nil {
+			t.Fatalf("spelling %d: want fail-closed", i)
+		}
+	}
+	if reg.refreshs != 1 {
+		t.Errorf("refreshed %d times across %d spellings of one address, want 1",
+			reg.refreshs, len(spellings))
 	}
 }

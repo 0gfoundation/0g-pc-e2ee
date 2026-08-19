@@ -339,8 +339,13 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 	// Address is the routing pin core sends so the router forwards to exactly this
 	// provider; without it the router could re-route to a provider whose key can't
 	// open the sealed request. Skip such a candidate rather than pin to nothing.
-	if prov.Address == "" {
-		return core.Provider{}, upstream(0, fmt.Errorf("route preview candidate has no address"))
+	// Well-formed, not merely non-empty. This value is the routing pin AND the key
+	// for the per-provider limiter below, and it is chosen by the untrusted router:
+	// validating it here is what bounds that key space to real addresses instead of
+	// letting an adversary grow the map with strings of its own invention.
+	if !isAddress(prov.Address) {
+		return core.Provider{}, upstream(0, fmt.Errorf(
+			"route preview candidate has no usable address (got %q)", prov.Address))
 	}
 	if prov.Endpoint == "" {
 		return core.Provider{}, upstream(0, fmt.Errorf("route preview candidate has no endpoint"))
@@ -658,7 +663,14 @@ func (r *Router) groundSignerOnChain(ctx context.Context, providerAddr, signer s
 	// before saying no; the rate limit keeps a provider that keeps disagreeing from
 	// turning that into a chain RPC per request.
 	revalidated := false
-	if got.Cached && !signerAgrees(got, signer) && r.signerRevalidate.allow(providerAddr, signerRevalidateWindow) {
+	// chain.ProviderKey, not providerAddr: this address comes from the untrusted
+	// router, and every comparison on it elsewhere is case-insensitive. Keying the
+	// limiter on the raw spelling made "the same provider, differently capitalized" a
+	// fresh key with a fresh allowance — so the rate limit, whose whole job is to stop
+	// a disagreeing provider costing us a chain RPC per request, could be stepped
+	// around by the party choosing the spelling.
+	if got.Cached && !signerAgrees(got, signer) &&
+		r.signerRevalidate.allow(chain.ProviderKey(providerAddr), signerRevalidateWindow) {
 		revalidated = true
 		got, err = r.revalidate(ctx, providerAddr, signer)
 		if err != nil {
@@ -978,7 +990,11 @@ func deriveV1Base(endpoint string) (string, error) {
 	default:
 		base += "/v1"
 	}
-	return u.Scheme + "://" + u.Host + base, nil
+	// Lower-case the scheme and host: both are case-insensitive per RFC 3986, and
+	// this string is a CACHE AND LIMITER KEY. Carrying the router's capitalization
+	// through would make one provider several keys — a fresh quote-cache miss and a
+	// fresh re-verification allowance per spelling, each costing a DCAP verify.
+	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Host) + base, nil
 }
 
 // derivePubkeyURL turns a provider endpoint into the broker's e2ee pubkey URL.

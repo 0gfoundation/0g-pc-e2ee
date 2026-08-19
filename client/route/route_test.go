@@ -689,17 +689,31 @@ func TestResolveNoProvidersIs503(t *testing.T) {
 	assertStageStatus(t, err, core.StageUpstream, http.StatusServiceUnavailable)
 }
 
-// A candidate with no address can't be pinned, so the router could re-route the
-// sealed request to a provider that can't decrypt it — materializing it fails so
-// core skips it.
-func TestResolveRejectsMissingAddress(t *testing.T) {
-	broker := newMockBroker(t)
-	router := newMockRouter(t, broker)
-	router.previewAddress = "" // preview returns a head candidate with no address
+// A candidate without a USABLE address can't be pinned, so the router could
+// re-route the sealed request to a provider that can't decrypt it — materializing
+// it fails so core skips it.
+//
+// "Usable" is well-formed, not merely non-empty: this router-chosen string is also
+// the key of a per-provider rate limiter, so accepting arbitrary text would let the
+// router mint keys — and with them fresh allowances — at will.
+func TestResolveRejectsUnusableAddress(t *testing.T) {
+	for _, tc := range []struct{ name, addr string }{
+		{"empty", ""},
+		{"not hex", "0xZZZZccddeeff00112233445566778899aabbccdd"},
+		{"too short", "0xaabb"},
+		{"no 0x prefix", "aabbccddeeff00112233445566778899aabbccdd"},
+		{"padded with spaces", " 0xaabbccddeeff00112233445566778899aabbccdd "},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			broker := newMockBroker(t)
+			router := newMockRouter(t, broker)
+			router.previewAddress = tc.addr
 
-	_, err := resolveHead(context.Background(), New(router.srv.URL), chatReq())
-	if err == nil || !strings.Contains(err.Error(), "no address") {
-		t.Fatalf("want missing-address error, got %v", err)
+			_, err := resolveHead(context.Background(), New(router.srv.URL), chatReq())
+			if err == nil || !strings.Contains(err.Error(), "usable address") {
+				t.Fatalf("want unusable-address error, got %v", err)
+			}
+		})
 	}
 }
 

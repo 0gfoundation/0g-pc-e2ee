@@ -2,7 +2,6 @@ package chain
 
 import (
 	"context"
-	"strings"
 	"sync"
 	"time"
 
@@ -96,7 +95,7 @@ type cachedRegistry struct {
 // is skipped altogether, so an ongoing outage is answered immediately — from the
 // stale entry when there is one, otherwise with the error the last attempt gave.
 func (c *cachedRegistry) AcknowledgedSigner(ctx context.Context, providerAddr string) (Signer, error) {
-	key := strings.ToLower(providerAddr)
+	key := ProviderKey(providerAddr)
 	now := c.now()
 
 	if e, ok := c.load(key); ok && now.Before(e.expires) {
@@ -136,7 +135,7 @@ func (c *cachedRegistry) AcknowledgedSigner(ctx context.Context, providerAddr st
 func (c *cachedRegistry) RefreshSigner(ctx context.Context, providerAddr string) (Signer, error) {
 	got, err := c.refresh(ctx, providerAddr)
 	if err != nil {
-		c.noteFailure(ctx, strings.ToLower(providerAddr), c.now(), err)
+		c.noteFailure(ctx, ProviderKey(providerAddr), c.now(), err)
 	}
 	return got, err
 }
@@ -194,7 +193,7 @@ func (c *cachedRegistry) clearFailure(key string) {
 // window stays that small: it is bounded by one lookup, and the caller-side rate
 // limit (route.signerRevalidate) means the next disagreement gets its own read.
 func (c *cachedRegistry) refresh(ctx context.Context, providerAddr string) (Signer, error) {
-	key := strings.ToLower(providerAddr)
+	key := ProviderKey(providerAddr)
 	ch := c.sf.DoChan(key, func() (any, error) {
 		// Detach from whichever caller happened to lead so its cancellation cannot
 		// fail the lookup for everyone coalesced onto it; the inner registry bounds

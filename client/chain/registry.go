@@ -114,6 +114,24 @@ type Signer struct {
 	Cached bool
 }
 
+// ProviderKey canonicalizes a provider address for use as a MAP KEY — caches,
+// rate limiters, anything keyed per provider.
+//
+// It exists because these addresses arrive from the untrusted router and are
+// compared case-insensitively everywhere else (EIP-55 vs lowercase are the same
+// address). A keyed structure that does not agree with that comparison is not a
+// per-provider structure at all: the same provider under a different spelling
+// becomes a second key, which for a rate limiter means the limit does not apply,
+// and for a cache means the entry is never found. Every keyed lookup on a provider
+// address must go through here so the key space cannot drift between packages.
+//
+// It canonicalizes only; a caller that needs the address to be WELL-FORMED must
+// check that separately (route.isAddress), which is what keeps an adversary from
+// growing these maps with keys of its own invention.
+func ProviderKey(providerAddr string) string {
+	return strings.ToLower(strings.TrimSpace(providerAddr))
+}
+
 // SignerRegistry looks up a provider's on-chain, acknowledged TEE signer address.
 // providerAddr is the provider's account address (the same value the router
 // advertises as the routing pin). Callers MUST trust the returned signer only
