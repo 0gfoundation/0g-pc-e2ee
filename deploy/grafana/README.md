@@ -90,10 +90,18 @@ highest-signal ones:
   chain RPC could not be read, past the retry AND the cache's grace window. Under
   `ZG_GATEWAY_ONCHAIN_ENFORCE` these are refused requests; in warn mode they are
   the baseline that says whether enforce is safe to turn on yet.
-- `min(zg_gateway_warmer_ready_providers) == 0` — a replica is up but has no usable
-  provider at all, so it can serve nothing. This is the shape of a cold start during
-  an upstream outage; it is also what the blue/green standby probe (`/readyz`) gates
-  the cutover on, so a firing alert here explains a refused switch.
+- `min by(instance)(zg_gateway_warmer_ready_providers) == 0 and on(instance)
+  sum by(instance)(zg_gateway_warmer_sweeps_total) > 0` — a replica is up but has no
+  usable provider at all, so it can serve nothing. This is the shape of a cold start
+  during an upstream outage; it is also what the blue/green standby probe (`/readyz`)
+  gates the cutover on, so a firing alert here explains a refused switch. The gauge is
+  registered unconditionally but only ever set by a warmer sweep, so **without `-warm`
+  it reads a constant 0** and a bare `== 0` would page forever on a healthy replica;
+  the `and on(instance)` clause restricts it to replicas that have actually swept.
+  Gated on sweep *attempts* rather than on `warmer_last_success_timestamp_seconds`
+  deliberately: a replica whose every sweep fails outright never stamps a success, and
+  that is the case most worth paging on, not one to suppress. Shipped compose sets
+  `ZG_GATEWAY_WARM=true`, so the clause is a no-op there.
 - `rate(zg_gateway_warmer_signer_refreshes_total{result="mismatch"}[5m]) > 0` — the
   warmer found a provider whose on-chain signer does not vouch for its quote-bound
   one. Under enforce that provider is unusable, and enough of them turn `/readyz`

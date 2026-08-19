@@ -443,7 +443,7 @@ cmd_switch() {
   if [ -n "$probe" ]; then
     info "probing target side ${target} directly: $probe"
     info "  (up to ${PROBE_RETRIES} attempts ${PROBE_INTERVAL}s apart — a cold side must finish its first warmer sweep)"
-    local pi probe_ok=0 status
+    local pi probe_ok=0 status fell_back=0
     for ((pi=1; pi<=PROBE_RETRIES; pi++)); do
       status="$(http_status "$probe")"
       case "$status" in
@@ -458,11 +458,22 @@ cmd_switch() {
           # then burn the whole window on an image that was never going to serve it.
           # A 503 is different — the route exists and says not-ready, a real verdict.
           if [ -n "$PROBE_URL" ]; then break; fi   # operator chose this URL; respect it
-          warn "side ${target} does not serve ${PROBE_PATH} (404) — it predates readiness gating"
-          warn "falling back to ${HEALTH_PATH}: this only checks the process is up, NOT that it can"
-          warn "serve. It cannot tell you whether that side can reach providers or the chain."
-          probe="$(platform_probe_url "$target" "$HEALTH_PATH")"
-          continue   # retry immediately against the fallback, without burning an interval
+          # Fall back ONCE. The immediate retry below skips the interval on purpose, so
+          # re-entering this arm every attempt would spend the whole PROBE_RETRIES budget
+          # in a tight loop — the ~5min window collapsing into about a second, and the
+          # three warnings printed once per attempt. Past the first fallback a 404 is an
+          # ordinary failure of HEALTH_PATH (a custom HEALTH_PATH that side does not
+          # serve, say), so it falls through to the interval sleep and keeps waiting.
+          if [ "$fell_back" = 1 ]; then
+            log "  probe attempt ${pi}/${PROBE_RETRIES} got 404 on the ${HEALTH_PATH} fallback too"
+          else
+            fell_back=1
+            warn "side ${target} does not serve ${PROBE_PATH} (404) — it predates readiness gating"
+            warn "falling back to ${HEALTH_PATH}: this only checks the process is up, NOT that it can"
+            warn "serve. It cannot tell you whether that side can reach providers or the chain."
+            probe="$(platform_probe_url "$target" "$HEALTH_PATH")"
+            continue   # retry immediately against the fallback, without burning an interval
+          fi
           ;;
       esac
       if [ "$pi" -lt "$PROBE_RETRIES" ]; then

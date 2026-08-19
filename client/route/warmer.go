@@ -245,16 +245,30 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 				// fact serving every request — reporting OUR chain RPC's problem as the
 				// standby's.
 				prepared = prepared && !r.onchainEnforce
-			case quoteSigner != "" && !signerAgrees(got, quoteSigner):
+			case !got.Acknowledged || (quoteSigner != "" && !signerAgrees(got, quoteSigner)):
 				// The lookup worked and disagreed. Ask the same question a request asks,
 				// rather than treating "the RPC answered" as success: an unacknowledged or
 				// mismatched signer is a provider enforce would skip, so counting it ready
 				// would send traffic to a side where every request fails.
+				//
+				// !Acknowledged is tested on its own, ahead of the comparison, because it
+				// needs no quote to interpret: a chain that vouches for NOBODY fails hop 5
+				// whatever the quote says. Folding it into signerAgrees alone made it
+				// reachable only with a quote signer in hand, so an unacknowledged provider
+				// whose quote refresh had also failed was counted "ok" — hiding the second,
+				// independent reason that provider can never become ready behind the first.
 				metrics.WarmerSignerRefresh("mismatch")
 				r.logger.Warn("warmer: on-chain signer does not vouch for the quote-bound signer",
 					"provider", addr, "quote_signer", quoteSigner,
 					"onchain_signer", got.Address, "acknowledged", got.Acknowledged)
 				prepared = prepared && !r.onchainEnforce
+			case quoteSigner == "":
+				// The chain acknowledges someone, but refreshQuote failed above so there is
+				// no quote-bound signer to compare it against. Its own bucket rather than
+				// "ok": nothing was actually checked, and "ok" is the series an operator
+				// reads as "agreement confirmed". prepared is already false from
+				// verify_failed, which is the metric that says why.
+				metrics.WarmerSignerRefresh("unchecked")
 			default:
 				metrics.WarmerSignerRefresh("ok")
 			}
@@ -262,6 +276,16 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 		if prepared {
 			ready++
 		}
+	}
+	// Re-checked HERE as well as at the top of the loop, because the loop can also be
+	// left by finishing its LAST provider while the context is already cancelled — the
+	// guard above never runs again, and the sweep would fall through to publish
+	// "0 of N prepared" on its way out. That is the same false unready this function
+	// takes care to avoid everywhere else (see the list_failed path and the loop
+	// guard), and it lands on the metric an alert pages on plus the WarmState /readyz
+	// answers from, so a concurrent probe during a deploy would see it too.
+	if ctx.Err() != nil {
+		return
 	}
 	// The sweep ran to completion (individual provider failures are counted above,
 	// not fatal); stamp the liveness gauge so an alert can fire if sweeps stall.

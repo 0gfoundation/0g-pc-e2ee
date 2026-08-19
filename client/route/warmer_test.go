@@ -355,3 +355,120 @@ func TestWarmer_ChainProblemsDoNotBlockReadinessUnderWarn(t *testing.T) {
 		})
 	}
 }
+
+// A sweep cancelled while working on its LAST provider leaves the loop by exhausting
+// it, not through the in-loop guard, so the guard has to be repeated after the loop.
+// Without it the sweep falls through and publishes "0 of N prepared" on shutdown —
+// the alert series and the WarmState /readyz answers from, both wrong, and reachable
+// on every deploy rather than in some corner.
+func TestWarmer_CancelDuringLastProviderDoesNotPublishSweep(t *testing.T) {
+	var hits, status int32
+	// One provider, so cancelling while its quote is in flight cancels the sweep on
+	// its way out of the last iteration.
+	srv := warmerServer(t, &hits, []string{"0xa"}, &status)
+	res := fakeResolver{url: srv.URL}
+
+	// The registry cancels the sweep from inside the per-provider work, once the
+	// loop's top-of-iteration guard has already let the only provider through.
+	ctx, cancel := context.WithCancel(context.Background())
+	reg := &cancellingRegistry{cancel: cancel}
+	r := New(srv.URL, WithQuoteVerification(qvVerifier(t), discardLogger()),
+		WithOnChainVerification(reg, false, discardLogger()))
+
+	r.WarmOnce(context.Background(), res) // prime, so a real Ready count exists to clobber
+	primed := r.WarmState()
+	if primed.Ready != 1 {
+		t.Fatalf("setup: WarmState = %+v, want Ready 1", primed)
+	}
+
+	// Armed only now: cancelling during the priming sweep would leave ctx already done
+	// at the next sweep's entry, where the loop's own guard catches it — testing the
+	// guard that was already there instead of the one after the loop.
+	reg.arm()
+	sweeps := metricValue(t, `zg_gateway_warmer_sweeps_total{result="ok"}`)
+	r.WarmOnce(ctx, res)
+
+	if got := r.WarmState(); got.At != primed.At || got.Ready != primed.Ready {
+		t.Errorf("WarmState = %+v after a sweep cancelled on its last provider, want its result untouched (%+v)",
+			got, primed)
+	}
+	if got := metricValue(t, `zg_gateway_warmer_sweeps_total{result="ok"}`); got != sweeps {
+		t.Errorf("warmer_sweeps_total{result=ok} moved by %v, want 0: a cancelled sweep is not a success", got-sweeps)
+	}
+}
+
+// cancellingRegistry cancels the sweep's context from inside the per-provider work,
+// after the loop's top-of-iteration guard has already let that provider through. It
+// stays inert until armed, so a priming sweep can run to completion first.
+type cancellingRegistry struct {
+	cancel context.CancelFunc
+	armed  atomic.Bool
+}
+
+func (c *cancellingRegistry) arm() { c.armed.Store(true) }
+
+func (c *cancellingRegistry) AcknowledgedSigner(context.Context, string) (chain.Signer, error) {
+	return chain.Signer{Address: qvSignerStr, Acknowledged: true}, nil
+}
+
+func (c *cancellingRegistry) RefreshSigner(ctx context.Context, addr string) (chain.Signer, error) {
+	if c.armed.Load() {
+		c.cancel()
+	}
+	return chain.Signer{Address: qvSignerStr, Acknowledged: true}, nil
+}
+
+// A chain reading that acknowledges nobody must count as a mismatch even when the
+// quote refresh failed first and left no quote-bound signer to compare against.
+// Folding !Acknowledged into the comparison alone made it reachable only with a
+// quote in hand, so this provider — unusable under enforce for TWO independent
+// reasons — was counted "ok" on the signer axis, hiding the chain-side reason
+// behind the quote-side one.
+func TestWarmer_UnacknowledgedCountsAsMismatchWhenQuoteRefreshFailed(t *testing.T) {
+	var hits, status int32
+	srv := warmerServer(t, &hits, []string{"0xa"}, &status)
+	atomic.StoreInt32(&status, http.StatusInternalServerError) // quote refresh fails
+	reg := &countingRegistry{signer: qvSignerStr, ack: false}  // chain vouches for nobody
+	r := New(srv.URL,
+		WithQuoteVerification(qvVerifier(t), discardLogger()),
+		WithOnChainVerification(reg, false, discardLogger()))
+
+	before := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="mismatch"}`)
+	okBefore := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="ok"}`)
+	r.WarmOnce(context.Background(), fakeResolver{url: srv.URL})
+
+	if got := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="mismatch"}`); got != before+1 {
+		t.Errorf("mismatch counter moved by %v, want 1 (the chain acknowledged nobody)", got-before)
+	}
+	if got := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="ok"}`); got != okBefore {
+		t.Errorf("ok counter moved by %v, want 0: nothing agreed here", got-okBefore)
+	}
+}
+
+// The narrower case the new bucket exists for: the chain DID acknowledge someone, so
+// it is not a mismatch, but the quote refresh failed so no comparison happened. That
+// is neither "ok" (nothing was confirmed) nor "mismatch" (nothing disagreed).
+func TestWarmer_NoQuoteSignerCountsAsUnchecked(t *testing.T) {
+	var hits, status int32
+	srv := warmerServer(t, &hits, []string{"0xa"}, &status)
+	atomic.StoreInt32(&status, http.StatusInternalServerError) // quote refresh fails
+	reg := &countingRegistry{signer: qvSignerStr, ack: true}   // chain acknowledges someone
+	r := New(srv.URL,
+		WithQuoteVerification(qvVerifier(t), discardLogger()),
+		WithOnChainVerification(reg, false, discardLogger()))
+
+	before := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="unchecked"}`)
+	okBefore := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="ok"}`)
+	mmBefore := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="mismatch"}`)
+	r.WarmOnce(context.Background(), fakeResolver{url: srv.URL})
+
+	if got := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="unchecked"}`); got != before+1 {
+		t.Errorf("unchecked counter moved by %v, want 1", got-before)
+	}
+	if got := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="ok"}`); got != okBefore {
+		t.Errorf("ok counter moved by %v, want 0: no comparison was made", got-okBefore)
+	}
+	if got := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="mismatch"}`); got != mmBefore {
+		t.Errorf("mismatch counter moved by %v, want 0: nothing disagreed", got-mmBefore)
+	}
+}
