@@ -3,6 +3,7 @@ package route
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -23,16 +24,30 @@ func (f fakeResolver) ServiceInfo(context.Context, string) (chain.ServiceInfo, e
 	return chain.ServiceInfo{URL: f.url, Signer: qvSignerStr, Acknowledged: true}, nil
 }
 
-// countingRegistry counts AcknowledgedSigner calls (to check grounding warming).
+// countingRegistry counts lookups, split by whether they went through the cache
+// (AcknowledgedSigner) or forced a live read (RefreshSigner) — the warmer must do
+// the latter, or a still-fresh entry would satisfy it and nothing gets warmed.
 type countingRegistry struct {
-	n      int32
-	signer string
-	ack    bool
+	n         int32
+	refreshes int32
+	signer    string
+	ack       bool
+	// failing, when set, makes every lookup fail — the shape of an unreachable chain
+	// RPC, which a sweep must not count as a prepared provider.
+	failing atomic.Bool
 }
 
-func (c *countingRegistry) AcknowledgedSigner(context.Context, string) (string, bool, error) {
+func (c *countingRegistry) AcknowledgedSigner(context.Context, string) (chain.Signer, error) {
 	atomic.AddInt32(&c.n, 1)
-	return c.signer, c.ack, nil
+	if c.failing.Load() {
+		return chain.Signer{}, errors.New("rpc down")
+	}
+	return chain.Signer{Address: c.signer, Acknowledged: c.ack}, nil
+}
+
+func (c *countingRegistry) RefreshSigner(ctx context.Context, providerAddr string) (chain.Signer, error) {
+	atomic.AddInt32(&c.refreshes, 1)
+	return c.AcknowledgedSigner(ctx, providerAddr)
 }
 
 // warmerServer serves /v1/providers (the given addresses) and /v1/quote (counted
@@ -143,6 +158,90 @@ func TestWarmer_EvictsOnRefreshFailure(t *testing.T) {
 	}
 }
 
+// A provider counts as prepared only when the whole chain of preconditions a
+// request needs is satisfied. A deployment gate reads this number, so an
+// unreachable chain RPC has to show up in it — otherwise a side that can verify
+// nobody would still look ready to cut traffic over to.
+func TestWarmer_WarmStateCountsOnlyFullyPreparedProviders(t *testing.T) {
+	var hits, status int32
+	srv := warmerServer(t, &hits, []string{"0xa"}, &status)
+	reg := &countingRegistry{signer: qvSignerStr, ack: true}
+	r := New(srv.URL,
+		WithQuoteVerification(qvVerifier(t), discardLogger()),
+		WithOnChainVerification(reg, true, discardLogger()))
+	res := fakeResolver{url: srv.URL}
+
+	r.WarmOnce(context.Background(), res)
+	s := r.WarmState()
+	if s.At.IsZero() {
+		t.Fatal("a completed sweep must stamp WarmState.At")
+	}
+	if s.Ready != 1 || s.Total != 1 {
+		t.Errorf("WarmState = %+v, want Ready 1 of 1", s)
+	}
+
+	// The quote endpoint goes down: nothing is servable, so nothing is ready.
+	atomic.StoreInt32(&status, http.StatusServiceUnavailable)
+	r.WarmOnce(context.Background(), res)
+	if s := r.WarmState(); s.Ready != 0 || s.Total != 1 {
+		t.Errorf("WarmState = %+v, want Ready 0 of 1 once quotes fail", s)
+	}
+
+	// Quotes recover but the chain does not: under enforce a request still could not
+	// use this provider, so it must not count as ready.
+	atomic.StoreInt32(&status, 0)
+	reg.failing.Store(true)
+	r.WarmOnce(context.Background(), res)
+	if s := r.WarmState(); s.Ready != 0 {
+		t.Errorf("WarmState = %+v, want Ready 0 while the chain RPC is unreadable", s)
+	}
+}
+
+// A sweep that cannot even enumerate providers prepared none of them — the honest
+// readiness answer, and not one that should leave a previous "ready" standing.
+func TestWarmer_WarmStateRecordedWhenListFails(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+	r := New(srv.URL, WithQuoteVerification(qvVerifier(t), discardLogger()))
+
+	r.WarmOnce(context.Background(), fakeResolver{url: srv.URL})
+	s := r.WarmState()
+	if s.At.IsZero() {
+		t.Error("a failed enumeration should still stamp a sweep time")
+	}
+	if s.Ready != 0 {
+		t.Errorf("WarmState = %+v, want Ready 0", s)
+	}
+}
+
+// Shutdown must not make a healthy process look unready on its way out.
+func TestWarmer_CancelledSweepLeavesWarmStateAlone(t *testing.T) {
+	var hits, status int32
+	srv := warmerServer(t, &hits, []string{"0xa"}, &status)
+	r := New(srv.URL, WithQuoteVerification(qvVerifier(t), discardLogger()))
+	res := fakeResolver{url: srv.URL}
+
+	r.WarmOnce(context.Background(), res)
+	before := r.WarmState()
+	if before.Ready != 1 {
+		t.Fatalf("setup: WarmState = %+v, want Ready 1", before)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.WarmOnce(ctx, res)
+
+	// The READINESS fields must survive: a shutdown must not publish "nothing is
+	// ready" on its way out. Started does advance — a sweep really did begin — and
+	// that only ever makes the process look more current, never less.
+	got := r.WarmState()
+	if got.At != before.At || got.Ready != before.Ready || got.Total != before.Total {
+		t.Errorf("WarmState = %+v after a cancelled sweep, want its result untouched (%+v)", got, before)
+	}
+}
+
 func TestWarmer_WarmsGroundingCache(t *testing.T) {
 	var hits, status int32
 	srv := warmerServer(t, &hits, []string{"0xa"}, &status)
@@ -154,6 +253,12 @@ func TestWarmer_WarmsGroundingCache(t *testing.T) {
 	r.WarmOnce(context.Background(), fakeResolver{url: srv.URL})
 	if got := atomic.LoadInt32(&reg.n); got != 1 {
 		t.Errorf("grounding warm calls = %d, want 1", got)
+	}
+	// It must be a FORCED read: an ordinary lookup is satisfied by a still-fresh
+	// entry, so the sweep would warm nothing and the entry would expire on its own
+	// schedule — the phase-luck this refresh-ahead exists to remove.
+	if got := atomic.LoadInt32(&reg.refreshes); got != 1 {
+		t.Errorf("grounding refreshes = %d, want 1 (the warmer must force a live read)", got)
 	}
 }
 
@@ -183,5 +288,187 @@ func TestWarmer_NoopWithoutVerifier(t *testing.T) {
 	New(srv.URL).WarmOnce(context.Background(), fakeResolver{url: srv.URL})
 	if got := atomic.LoadInt32(&hits); got != 0 {
 		t.Errorf("warmer without verifier should be a no-op: hits = %d, want 0", got)
+	}
+}
+
+// A lookup that SUCCEEDS but does not vouch for the quote-bound signer is not a
+// prepared provider: enforce would skip it, so counting it ready would send
+// traffic to a side where every request fails. The warmer has to ask the same
+// question a request asks, not merely "did the RPC answer".
+func TestWarmer_UnacknowledgedSignerIsNotReadyUnderEnforce(t *testing.T) {
+	var hits, status int32
+	srv := warmerServer(t, &hits, []string{"0xa"}, &status)
+	reg := &countingRegistry{signer: qvSignerStr, ack: false} // answers, but vouches for nobody
+	r := New(srv.URL,
+		WithQuoteVerification(qvVerifier(t), discardLogger()),
+		WithOnChainVerification(reg, true, discardLogger()))
+
+	r.WarmOnce(context.Background(), fakeResolver{url: srv.URL})
+	if s := r.WarmState(); s.Ready != 0 {
+		t.Errorf("WarmState = %+v, want Ready 0 (the chain acknowledges no signer)", s)
+	}
+}
+
+// Same for a signer that disagrees with the quote.
+func TestWarmer_MismatchedSignerIsNotReadyUnderEnforce(t *testing.T) {
+	var hits, status int32
+	srv := warmerServer(t, &hits, []string{"0xa"}, &status)
+	reg := &countingRegistry{signer: "0x0000000000000000000000000000000000000009", ack: true}
+	r := New(srv.URL,
+		WithQuoteVerification(qvVerifier(t), discardLogger()),
+		WithOnChainVerification(reg, true, discardLogger()))
+
+	r.WarmOnce(context.Background(), fakeResolver{url: srv.URL})
+	if s := r.WarmState(); s.Ready != 0 {
+		t.Errorf("WarmState = %+v, want Ready 0 (chain and quote name different signers)", s)
+	}
+}
+
+// Under WARN mode the request path proceeds ungrounded, so a chain problem must
+// not make this side look unusable — reporting our own RPC's bad day as the
+// standby's would block a cutover to a process serving every request fine. The
+// shipped compose runs warn mode, so this is the live configuration.
+func TestWarmer_ChainProblemsDoNotBlockReadinessUnderWarn(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		reg  *countingRegistry
+		down bool
+	}{
+		{"unacknowledged", &countingRegistry{signer: qvSignerStr, ack: false}, false},
+		{"mismatch", &countingRegistry{signer: "0x0000000000000000000000000000000000000009", ack: true}, false},
+		{"rpc down", &countingRegistry{signer: qvSignerStr, ack: true}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits, status int32
+			srv := warmerServer(t, &hits, []string{"0xa"}, &status)
+			if tc.down {
+				tc.reg.failing.Store(true)
+			}
+			r := New(srv.URL,
+				WithQuoteVerification(qvVerifier(t), discardLogger()),
+				WithOnChainVerification(tc.reg, false, discardLogger())) // warn
+
+			r.WarmOnce(context.Background(), fakeResolver{url: srv.URL})
+			if s := r.WarmState(); s.Ready != 1 {
+				t.Errorf("WarmState = %+v, want Ready 1: warn mode serves this provider fine", s)
+			}
+		})
+	}
+}
+
+// A sweep cancelled while working on its LAST provider leaves the loop by exhausting
+// it, not through the in-loop guard, so the guard has to be repeated after the loop.
+// Without it the sweep falls through and publishes "0 of N prepared" on shutdown —
+// the alert series and the WarmState /readyz answers from, both wrong, and reachable
+// on every deploy rather than in some corner.
+func TestWarmer_CancelDuringLastProviderDoesNotPublishSweep(t *testing.T) {
+	var hits, status int32
+	// One provider, so cancelling while its quote is in flight cancels the sweep on
+	// its way out of the last iteration.
+	srv := warmerServer(t, &hits, []string{"0xa"}, &status)
+	res := fakeResolver{url: srv.URL}
+
+	// The registry cancels the sweep from inside the per-provider work, once the
+	// loop's top-of-iteration guard has already let the only provider through.
+	ctx, cancel := context.WithCancel(context.Background())
+	reg := &cancellingRegistry{cancel: cancel}
+	r := New(srv.URL, WithQuoteVerification(qvVerifier(t), discardLogger()),
+		WithOnChainVerification(reg, false, discardLogger()))
+
+	r.WarmOnce(context.Background(), res) // prime, so a real Ready count exists to clobber
+	primed := r.WarmState()
+	if primed.Ready != 1 {
+		t.Fatalf("setup: WarmState = %+v, want Ready 1", primed)
+	}
+
+	// Armed only now: cancelling during the priming sweep would leave ctx already done
+	// at the next sweep's entry, where the loop's own guard catches it — testing the
+	// guard that was already there instead of the one after the loop.
+	reg.arm()
+	sweeps := metricValue(t, `zg_gateway_warmer_sweeps_total{result="ok"}`)
+	r.WarmOnce(ctx, res)
+
+	if got := r.WarmState(); got.At != primed.At || got.Ready != primed.Ready {
+		t.Errorf("WarmState = %+v after a sweep cancelled on its last provider, want its result untouched (%+v)",
+			got, primed)
+	}
+	if got := metricValue(t, `zg_gateway_warmer_sweeps_total{result="ok"}`); got != sweeps {
+		t.Errorf("warmer_sweeps_total{result=ok} moved by %v, want 0: a cancelled sweep is not a success", got-sweeps)
+	}
+}
+
+// cancellingRegistry cancels the sweep's context from inside the per-provider work,
+// after the loop's top-of-iteration guard has already let that provider through. It
+// stays inert until armed, so a priming sweep can run to completion first.
+type cancellingRegistry struct {
+	cancel context.CancelFunc
+	armed  atomic.Bool
+}
+
+func (c *cancellingRegistry) arm() { c.armed.Store(true) }
+
+func (c *cancellingRegistry) AcknowledgedSigner(context.Context, string) (chain.Signer, error) {
+	return chain.Signer{Address: qvSignerStr, Acknowledged: true}, nil
+}
+
+func (c *cancellingRegistry) RefreshSigner(ctx context.Context, addr string) (chain.Signer, error) {
+	if c.armed.Load() {
+		c.cancel()
+	}
+	return chain.Signer{Address: qvSignerStr, Acknowledged: true}, nil
+}
+
+// A chain reading that acknowledges nobody must count as a mismatch even when the
+// quote refresh failed first and left no quote-bound signer to compare against.
+// Folding !Acknowledged into the comparison alone made it reachable only with a
+// quote in hand, so this provider — unusable under enforce for TWO independent
+// reasons — was counted "ok" on the signer axis, hiding the chain-side reason
+// behind the quote-side one.
+func TestWarmer_UnacknowledgedCountsAsMismatchWhenQuoteRefreshFailed(t *testing.T) {
+	var hits, status int32
+	srv := warmerServer(t, &hits, []string{"0xa"}, &status)
+	atomic.StoreInt32(&status, http.StatusInternalServerError) // quote refresh fails
+	reg := &countingRegistry{signer: qvSignerStr, ack: false}  // chain vouches for nobody
+	r := New(srv.URL,
+		WithQuoteVerification(qvVerifier(t), discardLogger()),
+		WithOnChainVerification(reg, false, discardLogger()))
+
+	before := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="mismatch"}`)
+	okBefore := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="ok"}`)
+	r.WarmOnce(context.Background(), fakeResolver{url: srv.URL})
+
+	if got := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="mismatch"}`); got != before+1 {
+		t.Errorf("mismatch counter moved by %v, want 1 (the chain acknowledged nobody)", got-before)
+	}
+	if got := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="ok"}`); got != okBefore {
+		t.Errorf("ok counter moved by %v, want 0: nothing agreed here", got-okBefore)
+	}
+}
+
+// The narrower case the new bucket exists for: the chain DID acknowledge someone, so
+// it is not a mismatch, but the quote refresh failed so no comparison happened. That
+// is neither "ok" (nothing was confirmed) nor "mismatch" (nothing disagreed).
+func TestWarmer_NoQuoteSignerCountsAsUnchecked(t *testing.T) {
+	var hits, status int32
+	srv := warmerServer(t, &hits, []string{"0xa"}, &status)
+	atomic.StoreInt32(&status, http.StatusInternalServerError) // quote refresh fails
+	reg := &countingRegistry{signer: qvSignerStr, ack: true}   // chain acknowledges someone
+	r := New(srv.URL,
+		WithQuoteVerification(qvVerifier(t), discardLogger()),
+		WithOnChainVerification(reg, false, discardLogger()))
+
+	before := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="unchecked"}`)
+	okBefore := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="ok"}`)
+	mmBefore := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="mismatch"}`)
+	r.WarmOnce(context.Background(), fakeResolver{url: srv.URL})
+
+	if got := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="unchecked"}`); got != before+1 {
+		t.Errorf("unchecked counter moved by %v, want 1", got-before)
+	}
+	if got := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="ok"}`); got != okBefore {
+		t.Errorf("ok counter moved by %v, want 0: no comparison was made", got-okBefore)
+	}
+	if got := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="mismatch"}`); got != mmBefore {
+		t.Errorf("mismatch counter moved by %v, want 0: nothing disagreed", got-mmBefore)
 	}
 }

@@ -190,6 +190,9 @@ services:
     # The image is distroless (no shell, no curl), so the probe is the gateway binary
     # itself: `gateway -health` does one GET /healthz against its own listen port.
     # This is what lets dstack-ingress gate on `service_healthy` above.
+    # /healthz asserts only that the process is serving, deliberately — the stronger
+    # "can it serve" question is /readyz, which the blue/green cutover probes and
+    # this must NOT become (blue-green.md, "Health-checking the standby side").
     healthcheck:
       test: ["CMD", "/usr/local/bin/gateway", "-health"]
       interval: 10s
@@ -246,6 +249,9 @@ services:
       # - "ZG_GATEWAY_SERVING_CONTRACT=0x47340d900bdFec2BD393c626E12ea0656F938d84"
       # Skip a provider whose on-chain signer is missing/unacknowledged/mismatched
       # instead of only warning. Left OFF: verify-and-warn.
+      # It also covers a signer that could not be READ at all, and there is no knob
+      # to relax that. Read onchain_grounding_total before enabling; see README
+      # "Notes" for what to look for and why there is no third option.
       # - "ZG_GATEWAY_ONCHAIN_ENFORCE=true"
       # Verify each response's §8 TEE signature (trust-chain hop 11) fail-closed
       # against the quote-bound signer. A response that does not verify is rejected.
