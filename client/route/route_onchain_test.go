@@ -64,7 +64,12 @@ func newOnChainRouter(reg *stubRegistry, enforce bool) *Router {
 }
 
 const (
-	ocProvider = "0xaabbccddeeff00112233445566778899aabbccdd"
+	// Mixed case on purpose. The router returns EIP-55 checksummed addresses, so an
+	// all-lowercase fixture is a spelling the production path rarely sees — and every
+	// key derived from this address is canonicalized, so a lowercase fixture cannot
+	// tell a canonicalized key from a raw one. That blind spot hid a limiter whose
+	// read and write used different keys.
+	ocProvider = "0xAaBbCcDdEeFf00112233445566778899AaBbCcDd"
 	ocSigner   = "0x99887766554433221100ffeeddccbbaa99887766"
 	ocOther    = "0x0000000000000000000000000000000000000001"
 )
@@ -424,8 +429,8 @@ func TestGroundSignerOnChain_RevalidationLimitSurvivesCaseTricks(t *testing.T) {
 
 	spellings := []string{
 		ocProvider,
-		strings.ToUpper("0x") + strings.ToUpper(ocProvider[2:]), // EIP-55-ish shouting
-		strings.ToUpper(ocProvider[:20]) + ocProvider[20:],      // mixed case
+		strings.ToUpper("0x") + strings.ToUpper(ocProvider[2:]), // shouted
+		strings.ToLower(ocProvider),                             // the canonical key itself
 		"  " + ocProvider + "  ",                                // padded
 	}
 	for i, addr := range spellings {

@@ -868,7 +868,13 @@ and warmer liveness).
     `warmer_signer_refreshes_total{result="failed"}` for the sustained case. A provider
     is never rejected on a stale or cached reading without a live re-read first, so a
     broker upgrade rotating its signer does not read as an attack (see
-    `trust-chain.md`, "What hop 5 concludes, and what it does not").
+    `trust-chain.md`, "What hop 5 concludes, and what it does not"). Read a `mismatch`
+    together with the log line beside it rather than on its own: the counter cannot say
+    whether the recovery re-verification ran, and only a mismatch that survived one is
+    an accusation. The three are logged apart — "could not re-verify … the mismatch
+    stands on the cached quote" (throttled or the quote fetch failed), "the cached quote
+    had rotated" (benign, and it resolves), and "the quote signer had not rotated and
+    the mismatch stands" (live quote, live chain read, still disagreeing).
   - the **boot-chain** check (hop 3) has an empty allowlist, so
     `ZG_GATEWAY_ATTEST_ENFORCE` would reject every provider. It now compares the boot
     chain (MRTD + RTMR1 + RTMR2) rather than all five registers — the same split the

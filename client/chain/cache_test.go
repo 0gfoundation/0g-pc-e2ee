@@ -481,3 +481,54 @@ func TestCached_LiveCallerStillRecordsFailures(t *testing.T) {
 		t.Error("a real failure on a live context must start the cooldown")
 	}
 }
+
+// Both maps are keyed on a provider address the untrusted router chose, and
+// neither has a natural eviction — entries are only overwritten, failures only
+// cleared by a success. A router pairing invented addresses with one real
+// endpoint must not be able to grow either without bound.
+func TestCached_BoundsItsKeySpace(t *testing.T) {
+	now := time.Unix(1000, 0)
+	inner := &fakeRegistry{signer: "0xabc", ack: true}
+	c := newTestCache(inner, time.Minute, DefaultGrace, &now)
+
+	// A modest overshoot past the cap: the claim is that the map stops growing, and
+	// each rejected insert sweeps the full map, so a large overshoot only buys a slow
+	// test.
+	const overshoot = 64
+	invented := func(i int) string { return ProviderKey(hexAddr(i)) }
+	for i := 0; i < maxCachedProviders+overshoot; i++ {
+		c.AcknowledgedSigner(context.Background(), invented(i))
+	}
+	if got := len(c.entries); got > maxCachedProviders {
+		t.Errorf("entries holds %d, want at most %d", got, maxCachedProviders)
+	}
+
+	inner.setErr(errors.New("rpc down"))
+	for i := maxCachedProviders; i < maxCachedProviders*2+overshoot; i++ {
+		c.AcknowledgedSigner(context.Background(), invented(i))
+	}
+	if got := len(c.failures); got > maxCachedProviders {
+		t.Errorf("failures holds %d, want at most %d", got, maxCachedProviders)
+	}
+
+	// The cap is not a permanent wedge: once the entries it is holding have gone
+	// inert, the sweep frees them and a real provider is cached again.
+	now = now.Add(time.Minute + DefaultGrace + FailureCooldown + time.Second)
+	inner.setErr(nil)
+	if _, err := c.AcknowledgedSigner(context.Background(), "0xreal"); err != nil {
+		t.Fatalf("lookup after everything went inert: %v", err)
+	}
+	if _, ok := c.load(ProviderKey("0xreal")); !ok {
+		t.Error("a real provider was not cached after the swept maps had room again")
+	}
+}
+
+func hexAddr(i int) string {
+	const hex = "0123456789ABCDEF"
+	var b [40]byte
+	for j := 39; j >= 0; j-- {
+		b[j] = hex[i&0xf]
+		i >>= 4
+	}
+	return "0x" + string(b[:])
+}

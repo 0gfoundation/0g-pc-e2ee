@@ -174,7 +174,44 @@ func (c *cachedRegistry) recordFailure(key string, now time.Time, err error) {
 	if c.failures == nil {
 		c.failures = make(map[string]failure)
 	}
+	if _, held := c.failures[key]; !held &&
+		!room(c.failures, now, func(f failure) time.Time { return f.at.Add(c.cooldown) }) {
+		return
+	}
 	c.failures[key] = failure{at: now, err: err}
+}
+
+// maxCachedProviders caps how many providers each map tracks. Keys are provider
+// addresses the untrusted router chose, and neither map has a natural eviction —
+// entries are only overwritten, failures only cleared by a success — so without a
+// bound a router pairing invented addresses with one real endpoint grows both
+// without limit. Every entry does go inert at a known time, though (an entry past
+// expires+grace is never returned; a failure past the cooldown never suppresses
+// anything), so the sweep is free and holds the maps to providers that are
+// actually live. The cap is orders of magnitude above any real provider count.
+const maxCachedProviders = 4096
+
+// room reports whether a NEW key may be added, sweeping inert entries first when
+// the map is full. Declining is always safe here: both maps are optimizations, and
+// the worst a skipped write costs is a live lookup that would otherwise have been
+// answered from memory.
+func room[V any](m map[string]V, now time.Time, deadline func(V) time.Time) bool {
+	if len(m) < maxCachedProviders {
+		return true
+	}
+	sweepExpired(m, now, deadline)
+	return len(m) < maxCachedProviders
+}
+
+// sweepExpired deletes every entry whose deadline has passed. It is only used on
+// maps whose entries go inert at a known time, so a swept entry and a missing one
+// mean the same thing to every reader.
+func sweepExpired[V any](m map[string]V, now time.Time, deadline func(V) time.Time) {
+	for k, v := range m {
+		if !now.Before(deadline(v)) {
+			delete(m, k)
+		}
+	}
 }
 
 func (c *cachedRegistry) clearFailure(key string) {
@@ -258,5 +295,9 @@ func (c *cachedRegistry) load(key string) (cacheEntry, bool) {
 func (c *cachedRegistry) store(key string, e cacheEntry) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if _, held := c.entries[key]; !held &&
+		!room(c.entries, c.now(), func(e cacheEntry) time.Time { return e.expires.Add(c.grace) }) {
+		return
+	}
 	c.entries[key] = e
 }

@@ -409,12 +409,29 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 		// configuration, so this is the path that runs today.
 		if g.outcome == groundingMismatch && quoteCached {
 			freshEnc, freshSigner, rerr := c.router.reverifiedKeys(ctx, prov.Endpoint)
-			if rerr == nil && freshSigner != signer {
+			// All three arms say something, because a mismatch that survives to the
+			// metric is `onchain_grounding_total{outcome="mismatch"}` — the counter the
+			// runbook pages on as an accusation against a provider. Unlogged, "the
+			// recovery could not run" and "the recovery ran and the accusation stood"
+			// reach the operator as the same number, and only the second one is evidence.
+			switch {
+			case rerr != nil:
+				// Throttled, or the quote fetch failed: our side of the call concluded
+				// nothing. The mismatch below is the CACHED quote's, never re-checked.
+				c.router.logger.Warn("could not re-verify the quote after an on-chain signer mismatch; the mismatch stands on the cached quote",
+					"provider", prov.Address, "cached_signer", signer, "err", rerr)
+			case freshSigner != signer:
 				c.router.logger.Info("re-verified quote after an on-chain signer mismatch; the cached quote had rotated",
 					"provider", prov.Address, "cached_signer", signer, "fresh_signer", freshSigner)
 				encPub, signer = freshEnc, freshSigner
 				g, err = c.router.groundSignerOnChain(ctx, prov.Address, signer)
 				g.revalidated = true
+			default:
+				// Live quote, live chain read (groundSignerOnChain revalidates its own
+				// cached readings), and they still disagree. This is the one shape of
+				// mismatch that is actually an accusation.
+				c.router.logger.Warn("re-verified quote after an on-chain signer mismatch; the quote signer had not rotated and the mismatch stands",
+					"provider", prov.Address, "signer", signer)
 			}
 		}
 		// Both counters are recorded once, HERE, on the conclusion that actually stood.
@@ -668,9 +685,12 @@ func (r *Router) groundSignerOnChain(ctx context.Context, providerAddr, signer s
 	// limiter on the raw spelling made "the same provider, differently capitalized" a
 	// fresh key with a fresh allowance — so the rate limit, whose whole job is to stop
 	// a disagreeing provider costing us a chain RPC per request, could be stepped
-	// around by the party choosing the spelling.
+	// around by the party choosing the spelling. Bound to ONE variable used by both
+	// the read and the write below: keying them differently is not a weaker limit but
+	// a broken one, since the backoff would land where nothing reads it.
+	key := chain.ProviderKey(providerAddr)
 	if got.Cached && !signerAgrees(got, signer) &&
-		r.signerRevalidate.allow(chain.ProviderKey(providerAddr), signerRevalidateWindow) {
+		r.signerRevalidate.allow(key, signerRevalidateWindow) {
 		revalidated = true
 		got, err = r.revalidate(ctx, providerAddr, signer)
 		if err != nil {
@@ -680,7 +700,7 @@ func (r *Router) groundSignerOnChain(ctx context.Context, providerAddr, signer s
 			// mismatch for the rest of the window even after the chain recovers — the
 			// cached entry still disagrees, and nothing is allowed to go look again.
 			// That files our problem under the metric documented as an accusation.
-			r.signerRevalidate.reschedule(providerAddr, reverifyFailureBackoff)
+			r.signerRevalidate.reschedule(key, reverifyFailureBackoff)
 			res, ferr := r.onchainLookupFailed(providerAddr, err)
 			res.revalidated = true
 			return res, ferr
