@@ -14,48 +14,35 @@ import (
 // this is generous.
 const DefaultGrace = 30 * time.Minute
 
-// Cached wraps a SignerRegistry with a per-provider TTL cache, a grace window,
-// and single-flighted refreshes. A provider's acknowledged teeSignerAddress
-// changes rarely (only on re-registration), so caching it keeps the chain RPC off
-// the request path while a bounded TTL still lets a rotation take effect.
+// Cached wraps a SignerRegistry with a per-provider TTL cache, a grace window, a
+// failure cooldown, and single-flighted refreshes. A provider's acknowledged
+// teeSignerAddress changes only on re-registration, so caching keeps the chain RPC
+// off the request path while a bounded TTL still lets a rotation take effect.
 //
-// Grace window. When an entry's TTL lapses and the refresh FAILS, the expired
-// entry stays usable for grace, marked Signer.Stale. Without it, chain RPC
-// availability is a hard dependency of the data plane: the route resolver grounds
-// every candidate it materializes, so an RPC outage fails every candidate of
-// every request — a total outage caused by our own infrastructure rather than by
-// anything wrong with a provider. Serving a value that was verified minutes ago
-// is a far better trade, because the value is near-static: to exploit the window
-// an attacker would need a provider to re-register a new signer AND our RPC to be
-// down across exactly that period.
+// The three behaviors past plain caching all answer the same problem: the route
+// resolver grounds EVERY candidate on the request path, so anything the chain does
+// badly, the data plane does badly.
 //
-// Staleness is asymmetric, and callers MUST honor the asymmetry: a stale reading
-// is good enough to CONFIRM that a quote-bound signer matches, and never good
-// enough to REJECT one. A broker upgrade rotates the signer, so during a benign
-// upgrade a stale entry disagrees with a freshly quoted signer — indistinguishable
-// from an attack if you rule on it. A caller about to reject calls RefreshSigner
-// to get fresh evidence first.
+//   - Grace window — when the TTL lapses and the refresh fails, the expired entry
+//     stays usable for grace, marked Stale. Otherwise an RPC outage fails every
+//     candidate of every request: a total outage caused by our own dependency.
+//   - Failure cooldown — a failure suppresses live attempts for FailureCooldown.
+//     The grace window alone stops requests FAILING but not paying: the inner
+//     registry retries with backoff before giving up, so every request would spend
+//     that budget before falling back. Any success clears the mark.
+//   - Single-flight — concurrent misses for one provider collapse into one RPC, so
+//     a TTL expiry under load cannot stampede an endpoint already struggling.
 //
-// Single-flight. Concurrent misses for one provider collapse into a single RPC,
-// so a TTL expiry under load cannot stampede an endpoint that may already be
-// struggling — the same protection the quote path gets from its own singleflight
-// group.
-//
-// Failure cooldown. A failed lookup is remembered for FailureCooldown, and while
-// it is remembered the live call is skipped entirely: a stale entry is served at
-// once, or the recorded error returned at once. Without this the grace window
-// still prevents failure but not COST — the inner registry retries with backoff
-// before giving up, so every request would pay the full retry budget (seconds)
-// per grounded candidate, serially, for the whole outage. The point of the window
-// is that an unreachable chain stops mattering, and a request that hangs for ten
-// seconds and then succeeds has not stopped mattering. Recovery still happens
-// promptly: one probe per cooldown, plus the warmer's own sweep, and any success
-// clears the mark.
+// Callers MUST honor one asymmetry: a CACHED reading (Stale, or merely within its
+// TTL — see Signer.Cached) is good enough to CONFIRM that a quote-bound signer
+// matches, and never good enough to REJECT one. A broker upgrade rotates the
+// signer, so a cached entry disagreeing with a freshly quoted one is the expected
+// shape of a benign rollout, indistinguishable from an attack if you rule on it.
+// A caller about to reject calls RefreshSigner first.
 //
 // Only successful lookups become cached VALUES; a failure is never stored as
-// though it were a reading, it only starts the cooldown above. A non-positive ttl
-// disables caching entirely (every call reads through). A non-positive grace
-// disables the grace window, restoring strict fail-on-error behavior.
+// though it were a reading. A non-positive ttl disables caching entirely; a
+// non-positive grace disables the grace window, restoring strict fail-on-error.
 func Cached(inner SignerRegistry, ttl, grace time.Duration) SignerRegistry {
 	if ttl <= 0 {
 		return inner
@@ -127,7 +114,7 @@ func (c *cachedRegistry) AcknowledgedSigner(ctx context.Context, providerAddr st
 	if err == nil {
 		return got, nil
 	}
-	c.recordFailure(key, now, err)
+	c.noteFailure(ctx, key, now, err)
 	if stale, ok := c.staleWithinGrace(key, now); ok {
 		return stale, nil
 	}
@@ -144,9 +131,22 @@ func (c *cachedRegistry) AcknowledgedSigner(ctx context.Context, providerAddr st
 func (c *cachedRegistry) RefreshSigner(ctx context.Context, providerAddr string) (Signer, error) {
 	got, err := c.refresh(ctx, providerAddr)
 	if err != nil {
-		c.recordFailure(strings.ToLower(providerAddr), c.now(), err)
+		c.noteFailure(ctx, strings.ToLower(providerAddr), c.now(), err)
 	}
 	return got, err
+}
+
+// noteFailure records a failed lookup UNLESS the caller is the one that gave up.
+// refresh returns the caller's own ctx.Err() when its context ends mid-lookup, and
+// that says nothing about the chain: a client that disconnects would otherwise
+// stamp a cooldown on the provider, making unrelated requests skip the live lookup
+// and answer "context canceled" for someone else's cancellation. The same guard,
+// for the same reason, as the quote cache's eviction in warmer.refreshQuote.
+func (c *cachedRegistry) noteFailure(ctx context.Context, key string, now time.Time, err error) {
+	if ctx.Err() != nil {
+		return
+	}
+	c.recordFailure(key, now, err)
 }
 
 // recentFailure reports a failure still inside the cooldown, so a caller can

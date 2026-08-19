@@ -94,10 +94,11 @@ type Signer struct {
 	// Acknowledged mirrors the contract's teeSignerAcknowledged. A caller MUST
 	// trust Address only when this is true.
 	Acknowledged bool
-	// Stale reports that the value came from a cache entry past its TTL, kept
-	// usable by the grace window because the refresh RPC failed. A stale reading is
-	// good enough to CONFIRM that a quote-bound signer matches, and never good
-	// enough to REJECT one — see the asymmetry documented on Cached.
+	// Stale reports that the value came from a cache entry past its TTL, kept usable
+	// by the grace window because the refresh RPC failed. It implies Cached, so the
+	// rule below covers it; what Stale adds is that the entry is old enough to be
+	// worth reporting separately (a sustained rate means the chain has been
+	// unreachable for longer than the TTL).
 	Stale bool
 	// Cached reports that the value came from a cache entry at all, whether or not
 	// it was past its TTL. Stale implies Cached; the reverse does not hold.
@@ -116,13 +117,14 @@ type Signer struct {
 // advertises as the routing pin). Callers MUST trust the returned signer only
 // when Signer.Acknowledged is true.
 type SignerRegistry interface {
-	// AcknowledgedSigner returns the provider's acknowledged TEE signer, which may
-	// come from a cache and may be Stale (see Signer.Stale).
+	// AcknowledgedSigner returns the provider's acknowledged TEE signer. It may come
+	// from a cache, and may be Stale — check Signer.Cached before acting on a
+	// disagreement.
 	AcknowledgedSigner(ctx context.Context, providerAddr string) (Signer, error)
 	// RefreshSigner returns a reading taken live from the chain, bypassing any
-	// cache — including the grace window, so it never returns a Stale value. A
-	// caller about to REJECT a provider on the strength of a lookup calls this
-	// first, so a benign signer rotation cannot be indicted by a stale cache entry.
+	// cache — including the grace window, so it never returns a Cached or Stale
+	// value. A caller about to REJECT a provider on the strength of a lookup calls
+	// this first, so a benign signer rotation cannot be indicted by a cached entry.
 	RefreshSigner(ctx context.Context, providerAddr string) (Signer, error)
 }
 

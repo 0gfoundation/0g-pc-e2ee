@@ -151,9 +151,9 @@ const onchainCacheTTL = 5 * time.Minute
 // the chain RPC is failing (chain.Cached's grace window). It is generous on
 // purpose: the value it protects is near-static, while the outage it prevents is
 // total — the resolver grounds every candidate on the request path, so without a
-// grace window an unreachable RPC fails every request. A stale reading can only
-// ever CONFIRM a signer, never condemn one, so lengthening it does not widen what
-// a stale entry is allowed to decide.
+// grace window an unreachable RPC fails every request. A cached reading can only
+// ever CONFIRM a signer, never condemn one, so lengthening this does not widen
+// what a cached entry is allowed to decide.
 const onchainCacheGrace = 30 * time.Minute
 
 // NewLogger builds the process logger both proxy binaries share: human-readable

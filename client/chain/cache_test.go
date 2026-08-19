@@ -426,3 +426,58 @@ func TestCached_RefreshIgnoresTheCooldown(t *testing.T) {
 		t.Error("RefreshSigner must attempt the chain despite the cooldown")
 	}
 }
+
+// A caller that gives up mid-lookup must not stamp a cooldown on the provider.
+// refresh returns the CALLER's ctx.Err() when its context ends, which says nothing
+// about the chain — but recorded as a failure it would make unrelated requests skip
+// the live lookup and answer "context canceled" for someone else's disconnect.
+//
+// TestCached_CancelledCallerDoesNotDoomOthers covers the concurrent follower, which
+// shares the in-flight result; this covers the caller that arrives AFTER, which
+// would have been served from the failure map instead of joining anything.
+func TestCached_CancelledCallerDoesNotPoisonTheCooldown(t *testing.T) {
+	block := make(chan struct{})
+	inner := &fakeRegistry{signer: "0xabc", ack: true, block: block}
+	now := time.Unix(1000, 0)
+	c := newTestCache(inner, time.Minute, DefaultGrace, &now)
+
+	// A: starts a live lookup, then disconnects while it is in flight.
+	ctxA, cancelA := context.WithCancel(context.Background())
+	doneA := make(chan error, 1)
+	go func() {
+		_, err := c.AcknowledgedSigner(ctxA, "0xP")
+		doneA <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancelA()
+	if err := <-doneA; err == nil {
+		t.Fatal("A should see its own cancellation")
+	}
+
+	// B: an unrelated request arriving afterwards, on a cold cache. It must reach
+	// the chain rather than inherit A's cancellation from the cooldown.
+	close(block)
+	got, err := c.AcknowledgedSigner(context.Background(), "0xP")
+	if err != nil {
+		t.Fatalf("B got %v (want the lookup's result); is it A's cancellation? %v",
+			err, errors.Is(err, context.Canceled))
+	}
+	if got.Address != "0xabc" || !got.Acknowledged {
+		t.Errorf("B got %+v, want the looked-up signer", got)
+	}
+}
+
+// The guard must not swallow a GENUINE failure that happens to be observed by a
+// caller whose context is still live — that is the case the cooldown exists for.
+func TestCached_LiveCallerStillRecordsFailures(t *testing.T) {
+	inner := &fakeRegistry{err: errors.New("rpc down")}
+	now := time.Unix(1000, 0)
+	c := newTestCache(inner, time.Minute, DefaultGrace, &now)
+
+	if _, err := c.AcknowledgedSigner(context.Background(), "0xP"); err == nil {
+		t.Fatal("want error")
+	}
+	if _, ok := c.recentFailure("0xp", now); !ok {
+		t.Error("a real failure on a live context must start the cooldown")
+	}
+}

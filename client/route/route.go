@@ -488,26 +488,17 @@ func (r *Router) verifiedKeysCached(ctx context.Context, endpoint string) (_ cry
 	return res.encPub, res.signer, false, nil
 }
 
-// reverifiedKeys forces a live re-verification of endpoint's quote, bypassing the
-// cache, and returns the keys the fresh quote binds. It exists for one situation:
-// a cached quote is about to cost a provider its candidacy, and the cached copy
-// may itself be the thing that is wrong. A broker upgrade rotates enc_pub and
-// signer together, so for up to the quote TTL our cached pair names the OLD
-// enclave while the chain already names the new one — a benign rollout that
-// looks exactly like a signer mismatch. Re-reading the quote before ruling turns
-// that window from a rejection into a refresh.
+// reverifiedKeys forces a live re-verification of endpoint's quote, for the case
+// where a CACHED quote is about to cost a provider its candidacy and the cached
+// copy may itself be the thing that is wrong (the rotation story in
+// groundSignerOnChain, seen from the quote side).
 //
-// It is deliberately NOT on the happy path: a quote verification is expensive and
-// rate-limit-sensitive, so it runs only when the alternative is rejecting the
-// provider outright — and even then at most once per quote TTL per provider.
-//
-// That rate limit is load-bearing, not belt-and-braces. The caller only reaches
-// here when the quote came from the cache, which reads like a bound on its own,
-// but a re-verification REFILLS that cache entry — so the next request is a cache
-// hit again, and a provider that keeps mismatching (a stuck registration, or one
-// arranging it) would force a live quote fetch plus DCAP verify on every single
-// request. Throttling on the quote URL bounds the cost to what a normal refresh
-// already costs, while still catching a rotation within one TTL.
+// Quote verification is expensive and rate-limit-sensitive, so this runs only when
+// the alternative is rejecting the provider outright, and at most once per quote
+// TTL per provider. That limit is load-bearing rather than belt-and-braces: "the
+// quote came from the cache" reads like a bound on its own, but re-verifying
+// REFILLS that entry, so the next request is a cache hit again and a provider that
+// keeps mismatching would force a live fetch plus DCAP verify on every request.
 func (r *Router) reverifiedKeys(ctx context.Context, endpoint string) (crypto.PublicKey, string, error) {
 	quoteURL, err := deriveQuoteURL(endpoint)
 	if err != nil {

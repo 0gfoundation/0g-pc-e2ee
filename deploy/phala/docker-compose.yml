@@ -271,10 +271,13 @@ services:
       # honest lever is turning enforce off.
       #
       # A blip does not reach that decision: eth_call retries with backoff, the
-      # result is cached 5m, the warmer refreshes ahead of expiry, and a 30m grace
-      # window keeps serving the last known-good reading. Only a sustained outage
-      # does — watch onchain_grounding_total{outcome="lookup_failed"} and
-      # warmer_signer_refreshes_total{result="failed"} to see it coming.
+      # result is cached 5m, the warmer refreshes ahead of expiry, a 30m grace window
+      # keeps serving the last known-good reading, and a 30s cooldown after a failure
+      # stops an ongoing outage costing every request the retry budget. Only a
+      # sustained outage gets through — watch onchain_grounding_total{outcome=
+      # "lookup_failed"} and warmer_signer_refreshes_total{result="failed"} for that,
+      # and {result="mismatch"} for the different problem of a provider the chain
+      # declines to vouch for.
       # Verify each response's §8 TEE signature (trust-chain hop 11) fail-closed
       # against the quote-bound signer. A response that does not verify is rejected.
       - "ZG_GATEWAY_VERIFY_RESPONSES=true"
