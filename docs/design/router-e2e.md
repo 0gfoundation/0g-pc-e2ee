@@ -144,9 +144,14 @@ Backward compatible; sealed mode is opt-in ("privacy mode").
 
 ## Limitations
 
-- **Metadata still leaks:** model, coarse token count, capability flags, timing,
-  sizes are visible to the router / TLS terminator. ECH + padding only if the
-  router is not the decryptor.
+- **Metadata still leaks:** model, capability flags, timing and sizes are visible
+  to the router / TLS terminator — and token usage **exactly**, not as a coarse
+  estimate: SPEC §7 leaves `usage` cleartext precisely so the L7 router can bill
+  on it. Sizes are exact too (ChaCha20-Poly1305, 16-byte tag, no padding), so a
+  ciphertext's length gives the plaintext's. ECH + padding would blunt the size
+  channel, and only if the router is not the decryptor — but neither touches
+  `usage`, which is cleartext by design. Hiding that needs the data-plane bypass
+  (variant ii), not padding.
 - **Trust boundary unchanged for the model:** this hides the prompt from the
   router; it does not prove the upstream model behaved. Centralized = verifiable
   *routing/relay*, not verifiable *computation*.
