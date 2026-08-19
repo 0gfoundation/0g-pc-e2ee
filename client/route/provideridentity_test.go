@@ -271,6 +271,60 @@ func TestProviderIdentity_RecordedEvenWhenTheVerdictRejects(t *testing.T) {
 	}
 }
 
+// pidRotatedComposeHashHex is the compose hash of the POST-upgrade enclave —
+// different from pidComposeHashHex, because a broker upgrade rotates the signer and
+// the deployment together.
+const pidRotatedComposeHashHex = "1c2d3e4f50617283940a1b2c3d4e5f60718293a4b5c6d7e8f90123456789abcd"
+
+// The rotation recovery must carry the FRESH quote's facts into the record, not just
+// its keys. This is the assertion that pins it: narrow `verified = fresh` back to
+// taking encPub and signer alone and the record reports the pre-rotation
+// compose_hash — describing an enclave the request was NOT sealed to, which is the
+// one thing this whole design exists to rule out.
+func TestProviderIdentity_RotationRecoveryRecordsTheFreshQuote(t *testing.T) {
+	// The LIVE quote is the upgraded enclave: new signer, new compose hash.
+	srv := pidServer(t, pidQuote(t, qvMeasurement(0xaa), pidMRConfigID(t, 1, pidRotatedComposeHashHex)), nil)
+	v := attest.New(pidAllowAll(),
+		attest.WithQuoteParser(qvParser(qvMeasurement(0xaa), mutableReportData(t, rotatedSignerHex))))
+	// The chain names the rotated signer too — the upgrade is complete everywhere except
+	// in our cache. enforce=true, so a mismatch that survived the recovery would skip
+	// the candidate and fail this test loudly rather than quietly recording a warning.
+	r := New(srv.URL,
+		WithQuoteVerification(v, discardLogger()),
+		WithOnChainVerification(&stubRegistry{signer: rotatedSignerStr, ack: true}, true, discardLogger()))
+
+	// Seed the cache as a live gateway's would be for up to the quote TTL after a
+	// rollout: the PRE-upgrade signer, and the pre-upgrade compose hash with it.
+	quoteURL, err := deriveQuoteURL(srv.URL)
+	if err != nil {
+		t.Fatalf("deriveQuoteURL: %v", err)
+	}
+	r.quoteCache.put(quoteURL, quoteResult{
+		encPub: mustHex(t, qvEncPubHex),
+		signer: qvSignerStr,
+		facts:  quoteFacts{measurement: VerdictPass, composeHash: pidComposeHashHex},
+	})
+
+	pidResolve(t, r)
+
+	id, ok := r.ProviderIdentity(testProviderAddr)
+	if !ok {
+		t.Fatal("expected a record")
+	}
+	if id.ComposeHash == pidComposeHashHex {
+		t.Errorf("ComposeHash = %q — the pre-rotation quote's; the request was sealed to the enclave at %q",
+			id.ComposeHash, pidRotatedComposeHashHex)
+	}
+	if id.ComposeHash != pidRotatedComposeHashHex {
+		t.Errorf("ComposeHash = %q, want the re-verified quote's %q", id.ComposeHash, pidRotatedComposeHashHex)
+	}
+	// And the verdict that stood is the one after the recovery: the rotation resolved
+	// cleanly, so this is a pass rather than the mismatch the cached quote produced.
+	if id.OnChainSigner != VerdictPass {
+		t.Errorf("OnChainSigner = %q, want %q once the rotation is recognized", id.OnChainSigner, VerdictPass)
+	}
+}
+
 // The verdict a panel reads and the outcome the metrics count are the same
 // conclusion, so the mapping between them is worth pinning: the two negatives
 // collapse (both are "no"), a match on a stale reading is still a match, and a
