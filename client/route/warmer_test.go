@@ -132,13 +132,13 @@ func TestWarmer_EvictsOnRefreshFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, _, ok := r.quoteCache.get(quoteURL); !ok {
+	if _, ok := r.quoteCache.get(quoteURL); !ok {
 		t.Fatal("expected a warm cache entry")
 	}
 
 	atomic.StoreInt32(&status, http.StatusServiceUnavailable) // quote now fails
 	r.WarmOnce(context.Background(), res)                     // refresh fails → evict
-	if _, _, ok := r.quoteCache.get(quoteURL); ok {
+	if _, ok := r.quoteCache.get(quoteURL); ok {
 		t.Error("stale entry should be evicted after a failed refresh")
 	}
 }

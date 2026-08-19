@@ -38,6 +38,15 @@
 // a browser panel and deliberately not evidence: it is parsed, not signed, and every
 // value in it is what pcverify independently rederives.
 //
+// The provider half of that panel is /v1/providers/{address}/identity (see
+// provideridentity.go): what this gateway VERIFIED about a provider before sealing to
+// it — the DCAP verdict on that provider's quote, the on-chain signer comparison, the
+// boot-chain verdict, its compose hash. Unlike the self-description it DOES report
+// verdicts, because unlike the self-description those are verifications this process
+// genuinely performed, on a third party. They are still relayed rather than the
+// reader's own, it answers only for providers already used, and it never fetches
+// anything.
+//
 // The sealed inference path carries a front-door credential gate
 // (openaiproxy.RequireInferenceCredential in newHandler): a cheap presence/shape check
 // that sheds missing-credential and mgmt-key traffic before the seal/route work,
@@ -72,6 +81,7 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/client/evidence"
 	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
+	"github.com/0gfoundation/0g-pc-e2ee/client/route"
 )
 
 func main() {
@@ -159,6 +169,28 @@ func main() {
 		"serve this CVM's self-description at "+identityPath+" (app_id, compose_hash, OS image, "+
 			"container list, matching release). Public, unauthenticated, and NOT evidence — every "+
 			"value is independently rederivable with pcverify (env ZG_GATEWAY_IDENTITY_ENDPOINT)")
+	// The provider-side counterpart (GET /v1/providers/{address}/identity, issue #80):
+	// what this gateway VERIFIED about the provider it sealed a request to — the DCAP
+	// verdict on that provider's quote, the on-chain signer comparison, the boot-chain
+	// verdict, its compose hash. The gateway already did all of it before sealing (see
+	// client/route); until now the results died with the request, leaving a
+	// verification panel with nothing to show for the broker hop.
+	//
+	// ON by default, like the self-description, and for the same reason: every value is
+	// obtainable by fetching that provider's own public /v1/quote, so there is nothing
+	// here to authorize. It differs in one important way — see provideridentity.go —
+	// in that it DOES report verdicts, because unlike the self-description they are
+	// verifications this process genuinely performed on a third party.
+	//
+	// The route is mounted only when there is a source that can ever answer: router
+	// mode with -attest on (see proxycli.Built.ProviderIdentities). Without quote
+	// verification nothing is verified, and a route that could only ever 404 is worse
+	// than an absent one.
+	providerIdentityOn := flag.Bool("provider-identity-endpoint", proxycli.EnvBool("ZG_GATEWAY_PROVIDER_IDENTITY_ENDPOINT", true),
+		"serve what this gateway verified about each provider it sealed to at "+providerIdentityPath+
+			" (DCAP verdict, on-chain signer check, boot-chain verdict, compose_hash). Public and "+
+			"unauthenticated; answers only for providers already used (no address triggers a quote "+
+			"fetch), and requires -attest (env ZG_GATEWAY_PROVIDER_IDENTITY_ENDPOINT)")
 	// Where the endpoint's container list comes from: the manifest cmd/cvmid wrote to
 	// the shared identity volume. Preferred over the platform lookup below because it
 	// needs no network, no third-party host and no DNS — and, like -identity-file, it
@@ -318,6 +350,14 @@ func main() {
 		}, logger)
 	}
 
+	// The provider-side records the endpoint above publishes. Nil — so the route stays
+	// unmounted — whenever this build can never produce one: direct-broker mode (no
+	// on-chain provider address to key a record by) or -attest off (nothing verified).
+	var providerIdentities route.ProviderIdentitySource
+	if *providerIdentityOn {
+		providerIdentities = built.ProviderIdentities()
+	}
+
 	// Start the background quote-cache warmer (a no-op unless -warm is set) so
 	// requests hit a warm cache instead of paying the DCAP verify inline; stop it
 	// on shutdown before the process exits.
@@ -346,7 +386,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              *f.Listen,
-		Handler:           newHandler(built.Client, routerTarget, origins, instanceID, *evidenceDir, *maxInFlight, identity, logger),
+		Handler:           newHandler(built.Client, routerTarget, origins, instanceID, *evidenceDir, *maxInFlight, identity, providerIdentities, logger),
 		ReadHeaderTimeout: 10 * time.Second,     // mitigate slow-header (Slowloris) clients
 		IdleTimeout:       proxycli.IdleTimeout, // bound idle keep-alives; unset means unbounded
 	}
@@ -381,9 +421,15 @@ func main() {
 	// the two when it is off: the endpoint answers 200 with nulls when its SOURCES
 	// are missing and 404s (via the router catch-all) when the route itself is off,
 	// which are very different diagnoses for the same-looking symptom.
+	//
+	// provider_identity_endpoint reports whether the route is MOUNTED, not merely
+	// whether it was asked for: it also needs -attest (nothing to report without it),
+	// and "asked for but silently absent" is precisely the diagnosis an operator would
+	// otherwise have to reconstruct from two other flags.
 	logger.Info("gateway listening", "listen", *f.Listen, "router_url", *f.RouterURL,
 		"cors_allowed_origins", origins, "max_inflight", *maxInFlight,
 		"evidence_dir", *evidenceDir, "identity_endpoint", *identityOn,
+		"provider_identity_endpoint", providerIdentities != nil,
 		"go_memlimit_bytes", currentMemoryLimit(), "gomaxprocs", runtime.GOMAXPROCS(0))
 	err = proxycli.Serve(srv, logger)
 	stopWarmer()
@@ -543,7 +589,12 @@ func runHealthCheck(listen string) int {
 // /v1/gateway/identity. Nil leaves the route unmounted — the same fall-through as
 // an unset evidenceDir — which is what -identity-endpoint=false and every test
 // that is not about the route get.
-func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, instanceID, evidenceDir string, maxInFlight int, identity *identityCache, logger *slog.Logger) http.Handler {
+//
+// providerIdentities, when non-nil, mounts the provider-side counterpart at
+// /v1/providers/{address}/identity: what this gateway verified about the providers
+// it sealed to. Nil leaves it unmounted, which is what a build that verifies no
+// quotes gets — see main's wiring and proxycli.Built.ProviderIdentities.
+func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, instanceID, evidenceDir string, maxInFlight int, identity *identityCache, providerIdentities route.ProviderIdentitySource, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	// Mount the sealed inference path behind the gateway's front-door credential
 	// gate. The gate is a cheap presence/shape check (reject missing credentials
@@ -585,6 +636,19 @@ func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, 
 	// from the bundle, so widening the origin policy for it would buy nothing.
 	if identity != nil {
 		mux.Handle("GET "+identityPath, identityHandler(identity))
+	}
+	// The provider side of the same panel, with the same three placements and the same
+	// reasoning: outside the credential gate (it publishes only what the provider's own
+	// public /v1/quote already does), outside the in-flight cap (a map lookup must not
+	// price against sealed inference), inside the CORS allowlist.
+	//
+	// It shadows /v1/providers/{address}/identity from the router catch-all below,
+	// which is the intent: the answer must come from the party that did the verifying,
+	// not from the router — whose account of a provider's identity is, by design, not
+	// something this system trusts. The catalog itself (/v1/providers) is a less
+	// specific pattern and keeps falling through to the router untouched.
+	if providerIdentities != nil {
+		mux.Handle("GET "+providerIdentityPath, providerIdentityHandler(providerIdentities))
 	}
 	// The gateway exposes no /quote route: it emits no attestation quote of its
 	// own. Endpoint/code identity comes from dstack-ingress's in-CVM cert-binding

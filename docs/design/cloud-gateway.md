@@ -255,6 +255,56 @@ Two properties follow, and both are enforced in code (`client/cmd/gateway/identi
 This does not reopen the "no `/quote` route" decision: publishing a parsed
 *description* of an attestation is a different act from signing one.
 
+### 6.4 What the gateway says about a *provider* is a relay — and it does carry verdicts
+
+`GET /v1/providers/{address}/identity` answers the other half of the same panel: the
+provider hop. For a provider this gateway has sealed to, it returns that provider's
+serving `endpoint`, the `compose_hash` out of its verified quote, and — unlike §6.3 —
+**verdicts**: `quote_dcap`, `onchain_signer`, `measurement`.
+
+The asymmetry with §6.3 is the point, so state it precisely. There, the gateway is
+describing **itself**, and nothing verified anything, so a verdict of any shape would
+be self-vouching. Here the gateway is reporting checks it genuinely **performed on a
+third party** — a DCAP verification of that provider's quote against Intel's roots, a
+comparison of the quote-bound signer against the on-chain `teeSignerAddress` — before
+it agreed to seal a user's prompt to that enclave (`client/route`). Those are real
+verifications. Withholding them would not make the endpoint humbler; it would hide the
+only verification in the picture.
+
+What they are not is the *reader's* verification. They are **relayed**, and their
+weight rests entirely on trust chain A: the reader can verify this gateway itself
+(§6.2, `pcverify -gateway`). So a UI must render them as "the gateway verified this
+for you", never as "verified" — a compromised gateway would serve whatever it liked
+here, exactly as in §6.3. Every response carries that caveat inline, in `verify`.
+
+Three rules the implementation holds to (`client/cmd/gateway/provideridentity.go`,
+`client/route/provideridentity.go`):
+
+- **It fetches nothing.** The record is a byproduct of a request that already
+  happened; an address this gateway has not sealed to is a `404`, not a lookup. That
+  is what keeps the route from becoming a quote proxy — or a scanner — for arbitrary
+  addresses. Records are bounded in count and expire, because a verdict attests a
+  point in time.
+- **It returns no raw quote and no boot-chain registers.** Anyone who wants to redo
+  the work should fetch the quote **direct from the provider** (`verify` names the
+  URL), not through the party whose claims are under examination — the same reasoning
+  that keeps the §8 signature off the router. Three hex registers are not actionable
+  without a baseline anyway; the reader who needs observed values is the operator
+  filling hop 3's allowlist, and that is `pcverify`'s job.
+- **Every verdict is an explicit enum, never a null to be interpreted.** `pass` /
+  `no_match` / `no_baseline` / `unavailable` / `not_checked` separate a finding about
+  the provider from a gap in our own configuration. It matters immediately:
+  `measurement` is `no_baseline` in every deployment today, because hop 3's audited
+  allowlist is empty (`docs/design/trust-chain.md`), and a panel that rendered that as
+  a failure would accuse every provider of running unaudited code when the truth is
+  that we have audited none. `os_image` may still be `null`, but it is no longer
+  ambiguous — the verdict says which case produced it.
+
+It lives on the gateway rather than the router for the same reason the rest of this
+document exists: the router is untrusted by design, so its account of a provider's
+identity could only ever be marked "does not participate in trust". The gateway is the
+party that did the verifying.
+
 ## 7. Deployment: use dstack, not hand-rolled confidential TLS
 
 The hard parts of §5.3/§6 — terminating TLS in a TEE, proving the cert is

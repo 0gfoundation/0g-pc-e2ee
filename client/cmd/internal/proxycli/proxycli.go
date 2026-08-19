@@ -253,6 +253,26 @@ type Built struct {
 	router       *route.Router
 	resolver     route.EndpointResolver
 	warmInterval time.Duration
+	// verifiesQuotes records whether provider quotes are DCAP-verified (-attest), so
+	// ProviderIdentities can say whether there will ever be a verdict to report.
+	verifiesQuotes bool
+}
+
+// ProviderIdentities returns the read side of the per-provider verification records
+// the router accumulates — what this process verified about each provider it sealed
+// to (see route.ProviderIdentity) — for a caller that publishes them (the gateway's
+// provider-identity endpoint).
+//
+// It returns nil when this build can never produce a record, so the caller can leave
+// the surface unmounted rather than serve a route that only ever 404s. Two such
+// builds: direct-broker mode, which pins no on-chain provider address to key a
+// record by, and any build without -attest, where nothing is verified and the only
+// honest report is no report at all.
+func (b *Built) ProviderIdentities() route.ProviderIdentitySource {
+	if b.router == nil || !b.verifiesQuotes {
+		return nil
+	}
+	return b.router
 }
 
 // Build validates the parsed flags and constructs the wired client core: a
@@ -403,7 +423,7 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 
 	router := route.New(*f.RouterURL, routeOpts...)
 	client := core.NewWithResolver(router, coreOpts...)
-	b := &Built{Client: client, router: router}
+	b := &Built{Client: client, router: router, verifiesQuotes: *f.attestOn}
 	if *f.warmOn {
 		b.resolver = resolver
 		b.warmInterval = *f.warmInterval

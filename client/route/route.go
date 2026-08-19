@@ -33,6 +33,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -126,12 +127,18 @@ type Router struct {
 	// makes a negative result fail-closed (skip the candidate) instead of a warn.
 	registry       chain.SignerRegistry
 	onchainEnforce bool
-	// quoteCache memoizes DCAP-verified results (enc_pub/signer) per endpoint, and
-	// quoteSF collapses concurrent misses for the same endpoint into a single
-	// verification so a cold/expired key can't stampede the expensive quote+
-	// collateral path. Used only on the quote-verification path (verifier != nil).
+	// quoteCache memoizes DCAP-verified results (enc_pub/signer + the facts the same
+	// verification established) per endpoint, and quoteSF collapses concurrent misses
+	// for the same endpoint into a single verification so a cold/expired key can't
+	// stampede the expensive quote+collateral path. Used only on the
+	// quote-verification path (verifier != nil).
 	quoteCache *quoteCache
 	quoteSF    singleflight.Group
+	// identities keeps, per provider address, the outcome of the checks this process
+	// ran before sealing to that provider — read by the gateway's provider-identity
+	// endpoint (see provideridentity.go). Written only from the path that materializes
+	// a candidate; nothing reads it on the request path.
+	identities *identityStore
 }
 
 // Option customizes a Router.
@@ -269,6 +276,7 @@ func New(routerURL string, opts ...Option) *Router {
 		http:            &http.Client{Transport: tr},
 		cache:           newPubkeyCache(defaultPubkeyTTL),
 		quoteCache:      newQuoteCache(defaultQuoteTTL),
+		identities:      newIdentityStore(providerIdentityTTL, maxProviderIdentities),
 	}
 	for _, o := range opts {
 		o(r)
@@ -328,10 +336,15 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 	var (
 		encPub crypto.PublicKey
 		signer string
-		err    error
+		// verified carries the facts the quote verification established (measurement
+		// verdict, compose hash). It stays zero on the legacy pubkey path, where nothing
+		// was verified — which is why that path records no provider identity below.
+		verified quoteResult
+		err      error
 	)
 	if c.router.verifier != nil {
-		encPub, signer, err = c.router.verifiedKeys(ctx, prov.Endpoint)
+		verified, err = c.router.verifiedProvider(ctx, prov.Endpoint)
+		encPub, signer = verified.encPub, verified.signer
 	} else {
 		var pubkeyURL string
 		pubkeyURL, err = derivePubkeyURL(prov.Endpoint)
@@ -350,10 +363,18 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 	// look-alike enclave running the same audited image (both pass the quote
 	// check). Keyed on prov.Address (the provider's on-chain account), whose
 	// Address→teeSigner mapping the untrusted router cannot forge.
+	onchain := VerdictNotChecked
 	if c.router.registry != nil {
-		if err := c.router.groundSignerOnChain(ctx, prov.Address, signer); err != nil {
+		if onchain, err = c.router.groundSignerOnChain(ctx, prov.Address, signer); err != nil {
 			return core.Provider{}, err
 		}
+	}
+	// Keep what those checks established, so a verification panel can show this hop
+	// instead of a blank (see provideridentity.go). Only on the verified path: with
+	// quote verification off there is no verdict to report, and reporting the router's
+	// word for it would be worse than reporting nothing.
+	if c.router.verifier != nil {
+		c.router.recordProviderIdentity(providerIdentityOf(prov, verified, onchain))
 	}
 	// Two distinct pins, which may differ (so they are NOT cross-checked):
 	//   - SignerAddr (broker's signer_address) → sealed into _e2ee.signer_addr,
@@ -378,13 +399,25 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 	}, nil
 }
 
-// verifiedKeys returns the DCAP-verified enc_pub + signer for a candidate
-// endpoint, from the cache when fresh, otherwise by verifying its quote. It
-// collapses concurrent misses for the same endpoint into ONE verification
-// (quote fetch + go-tdx-guest + Intel PCS collateral is expensive and
-// rate-limit-sensitive) via singleflight; the rest share the result. Errors are
-// not cached, so a transient failure is retried on the next request.
+// verifiedKeys is verifiedProvider's keys-only form, for the callers that seal but
+// report nothing: the direct-broker resolver (which pins no on-chain address, so it
+// has no provider identity to record) and tests.
 func (r *Router) verifiedKeys(ctx context.Context, endpoint string) (crypto.PublicKey, string, error) {
+	res, err := r.verifiedProvider(ctx, endpoint)
+	if err != nil {
+		return nil, "", err
+	}
+	return res.encPub, res.signer, nil
+}
+
+// verifiedProvider returns the DCAP-verified enc_pub + signer for a candidate
+// endpoint, plus the facts that verification established, from the cache when fresh
+// and otherwise by verifying its quote. It collapses concurrent misses for the same
+// endpoint into ONE verification (quote fetch + go-tdx-guest + Intel PCS collateral
+// is expensive and rate-limit-sensitive) via singleflight; the rest share the
+// result. Errors are not cached, so a transient failure is retried on the next
+// request.
+func (r *Router) verifiedProvider(ctx context.Context, endpoint string) (quoteResult, error) {
 	// Key the cache + singleflight by the DERIVED quote URL, not the raw endpoint,
 	// so different endpoint spellings for the same provider (bare origin, /v1, full
 	// chat URL, trailing slash) — and, importantly, the warmer's chain-sourced URL
@@ -392,18 +425,14 @@ func (r *Router) verifiedKeys(ctx context.Context, endpoint string) (crypto.Publ
 	// host. Deriving up front also fails a malformed endpoint before any lookup.
 	quoteURL, err := deriveQuoteURL(endpoint)
 	if err != nil {
-		return nil, "", upstream(0, fmt.Errorf("provider endpoint: %w", err))
+		return quoteResult{}, upstream(0, fmt.Errorf("provider endpoint: %w", err))
 	}
-	if encPub, signer, ok := r.quoteCache.get(quoteURL); ok {
+	if res, ok := r.quoteCache.get(quoteURL); ok {
 		metrics.QuoteCacheLookup(true)
-		return encPub, signer, nil
+		return res, nil
 	}
 	metrics.QuoteCacheLookup(false)
-	res, err := r.verifyAndCache(ctx, quoteURL)
-	if err != nil {
-		return nil, "", err
-	}
-	return res.encPub, res.signer, nil
+	return r.verifyAndCache(ctx, quoteURL)
 }
 
 // verifyAndCache runs (or joins, via singleflight) the verification for quoteURL
@@ -421,12 +450,12 @@ func (r *Router) verifyAndCache(ctx context.Context, quoteURL string) (quoteResu
 	ch := r.quoteSF.DoChan(quoteURL, func() (any, error) {
 		vctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), quoteVerifyTimeout)
 		defer cancel()
-		encPub, signer, err := r.verifyQuoteAt(vctx, quoteURL)
+		res, err := r.verifyQuoteAt(vctx, quoteURL)
 		if err != nil {
 			return nil, err
 		}
-		r.quoteCache.put(quoteURL, encPub, signer)
-		return quoteResult{encPub: encPub, signer: signer}, nil
+		r.quoteCache.put(quoteURL, res)
+		return res, nil
 	})
 	select {
 	case <-ctx.Done():
@@ -439,13 +468,14 @@ func (r *Router) verifyAndCache(ctx context.Context, quoteURL string) (quoteResu
 	}
 }
 
-// verifyQuoteAt is the uncached work behind verifiedKeys: fetch the attestation
+// verifyQuoteAt is the uncached work behind verifiedProvider: fetch the attestation
 // quote from quoteURL and DCAP-verify it, returning the enc_pub + signer bound
-// into the verified report_data. Because the keys come out of a genuine, signed
+// into the verified report_data, plus the facts the same verification established
+// (see quoteFacts). Because the keys come out of a genuine, signed
 // quote, it does not matter that the untrusted router chose the endpoint: a
 // substituted endpoint serving an attacker key would fail verification. On a
 // warn-mode measurement miss it logs but still returns the (genuine) keys.
-func (r *Router) verifyQuoteAt(ctx context.Context, quoteURL string) (encPub crypto.PublicKey, signer string, err error) {
+func (r *Router) verifyQuoteAt(ctx context.Context, quoteURL string) (res quoteResult, err error) {
 	// Meter the actually-performed verification (this runs only on a cache miss)
 	// and its latency, so the histogram measures the expensive path — quote fetch
 	// + go-tdx-guest signature/TCB checks + any collateral fetch — that the warmer
@@ -455,11 +485,11 @@ func (r *Router) verifyQuoteAt(ctx context.Context, quoteURL string) (encPub cry
 
 	raw, err := r.fetchQuote(ctx, quoteURL)
 	if err != nil {
-		return nil, "", err
+		return quoteResult{}, err
 	}
 	verified, err := r.verifier.Verify(raw)
 	if err != nil {
-		return nil, "", upstream(0, fmt.Errorf("provider quote: %w", err))
+		return quoteResult{}, upstream(0, fmt.Errorf("provider quote: %w", err))
 	}
 	if !verified.MeasurementTrusted {
 		metrics.MeasurementUntrusted()
@@ -476,7 +506,70 @@ func (r *Router) verifyQuoteAt(ctx context.Context, quoteURL string) (encPub cry
 			"rtmr2", fmt.Sprintf("%x", bc.RTMR2[:]),
 			"signer_addr", verified.SignerAddr)
 	}
-	return verified.EncPub, verified.SignerAddr, nil
+	return quoteResult{
+		encPub: verified.EncPub,
+		signer: verified.SignerAddr,
+		facts: quoteFacts{
+			measurement: r.measurementVerdict(verified),
+			composeHash: composeHashOf(raw, verified, r.logger),
+		},
+	}, nil
+}
+
+// measurementVerdict turns the boot-chain outcome into the three-state verdict a
+// reader can act on. MeasurementTrusted alone cannot: it is false both for an
+// enclave running an image we have not audited and for a deployment that has
+// audited none, and those must never be shown as the same thing (see
+// attest.Verifier.MeasurementBaselineConfigured).
+//
+// Today every deployment lands on VerdictNoBaseline — hop 3's allowlist is empty
+// (docs/design/trust-chain.md) — and saying exactly that is the point: the panel
+// marks the hop "observed only" rather than implying either a pass or a finding.
+func (r *Router) measurementVerdict(verified attest.Verified) Verdict {
+	switch {
+	case verified.MeasurementTrusted:
+		return VerdictPass
+	case r.verifier.MeasurementBaselineConfigured():
+		return VerdictNoMatch
+	default:
+		return VerdictNoBaseline
+	}
+}
+
+// composeHashOf reads the dstack compose hash — which application configuration the
+// provider enclave booted — out of the quote's mr_config_id, or returns "" when the
+// register's layout does not expose one (V2/V3 commit to it inside a digest).
+//
+// The register comes from a STRUCTURAL re-parse of the same bytes the verifier just
+// authenticated, which is what makes the value trustworthy: mr_config_id sits inside
+// the signed TD report, so the signature check that produced `verified` covers it.
+// The measurement equality guard is what holds that argument together — it confirms
+// the offsets this parse reads describe the same TD the verifier saw. If a future
+// quote layout moved them, the mismatch reports nothing rather than a field lifted
+// from bytes no one checked.
+//
+// This exists here, rather than on attest.Verified, because the quoteParser seam
+// does not surface mr_config_id (see attest.Verify's step-2 note). Reading it from
+// the verified bytes is the same thing the gateway does for its own quote, and it
+// avoids widening a protocol-level interface that every participant depends on.
+func composeHashOf(raw []byte, verified attest.Verified, logger *slog.Logger) string {
+	body, err := attest.ParseTDXQuoteBody(raw)
+	if err != nil {
+		logger.Debug("provider quote: cannot structurally re-parse a verified quote, reporting no compose_hash", "err", err)
+		return ""
+	}
+	if body.Measurement != verified.Measurement {
+		logger.Warn("provider quote: structural re-parse disagrees with the verified measurement, reporting no compose_hash")
+		return ""
+	}
+	hash, err := attest.ComposeHashFromMRConfigID(body.MRConfigID)
+	if err != nil {
+		// A V2/V3 (or absent) mr_config_id does not carry the hash in the clear. Nothing
+		// is wrong with the quote; there is simply nothing to read.
+		logger.Debug("provider quote: mr_config_id does not expose compose_hash", "err", err)
+		return ""
+	}
+	return hex.EncodeToString(hash[:])
 }
 
 // groundSignerOnChain enforces SPEC §4.4 step 3 / trust-chain hop 5: the signer
@@ -485,20 +578,27 @@ func (r *Router) verifyQuoteAt(ctx context.Context, quoteURL string) (encPub cry
 // fail-closed on every negative — lookup error, unacknowledged signer, or
 // mismatch — so the candidate is skipped and core falls back. Warn mode is
 // observe-only (log and proceed), mirroring attest warn mode for staged rollout.
-func (r *Router) groundSignerOnChain(ctx context.Context, providerAddr, signer string) error {
+//
+// It also returns the verdict it reached, so warn mode is observe-only for the
+// SEALING decision without being invisible: the outcome reaches the
+// provider-identity record instead of surviving only as a log line. A lookup that
+// could not complete is VerdictUnavailable rather than VerdictNoMatch — an RPC
+// failure is our problem, not a finding about the provider, and reporting it as one
+// would accuse every provider whenever the chain is unreachable.
+func (r *Router) groundSignerOnChain(ctx context.Context, providerAddr, signer string) (Verdict, error) {
 	onchain, acknowledged, err := r.registry.AcknowledgedSigner(ctx, providerAddr)
 	if err != nil {
-		return r.onchainFail(fmt.Sprintf("on-chain signer lookup for provider %s failed", providerAddr), err)
+		return VerdictUnavailable, r.onchainFail(fmt.Sprintf("on-chain signer lookup for provider %s failed", providerAddr), err)
 	}
 	if !acknowledged {
-		return r.onchainFail(fmt.Sprintf("provider %s has no acknowledged on-chain TEE signer", providerAddr), nil)
+		return VerdictNoMatch, r.onchainFail(fmt.Sprintf("provider %s has no acknowledged on-chain TEE signer", providerAddr), nil)
 	}
 	if !strings.EqualFold(strings.TrimSpace(onchain), strings.TrimSpace(signer)) {
-		return r.onchainFail(fmt.Sprintf(
+		return VerdictNoMatch, r.onchainFail(fmt.Sprintf(
 			"quote signer %s does not match on-chain teeSignerAddress %s for provider %s",
 			signer, onchain, providerAddr), nil)
 	}
-	return nil
+	return VerdictPass, nil
 }
 
 // onchainFail turns a failed on-chain signer check into either a fail-closed
@@ -724,6 +824,20 @@ func deriveV1Base(endpoint string) (string, error) {
 		base += "/v1"
 	}
 	return u.Scheme + "://" + u.Host + base, nil
+}
+
+// deriveOrigin reduces a provider endpoint to its origin (scheme://host[:port]),
+// dropping whatever path spelling the router used. It is the form a panel shows and
+// a human recognises; the paths under it are this package's business.
+func deriveOrigin(endpoint string) (string, error) {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("%q is not a valid URL: %w", endpoint, err)
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return "", fmt.Errorf("%q is not an absolute URL", endpoint)
+	}
+	return u.Scheme + "://" + u.Host, nil
 }
 
 // derivePubkeyURL turns a provider endpoint into the broker's e2ee pubkey URL.

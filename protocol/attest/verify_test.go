@@ -121,6 +121,46 @@ func TestVerify_EnforceWithEmptyAllowlistNamesTheConfigGap(t *testing.T) {
 	}
 }
 
+// A caller that REPORTS the measurement outcome, rather than only acting on it, has
+// to tell "this image is not one we audited" from "we have audited none" — and under
+// ModeWarn, MeasurementTrusted=false is both. This is the accessor that separates
+// them, and the pairing below is the whole point: same false, different reason.
+func TestMeasurementBaselineConfigured(t *testing.T) {
+	served := mkMeasurement(0xaa)
+	rd := makeReportData(sampleEncPub(), sampleSigner(), ReportDataVersion, [reservedLen]byte{})
+	other := BootChainPolicy{Allowed: []BootChain{BootChainOf(mkMeasurement(0xbb))}}
+
+	for _, tc := range []struct {
+		name           string
+		policy         BootChainPolicy
+		wantConfigured bool
+	}{
+		{"no allowlist at all", BootChainPolicy{}, false},
+		{"an allowlist this quote is not in", other, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := New(tc.policy, WithQuoteParser(fakeParser(served, rd, nil)), WithMeasurementMode(ModeWarn))
+			got, err := v.Verify([]byte("raw-quote"))
+			if err != nil {
+				t.Fatalf("ModeWarn should proceed: %v", err)
+			}
+			if got.MeasurementTrusted {
+				t.Fatal("MeasurementTrusted = true, want false in both cases")
+			}
+			if v.MeasurementBaselineConfigured() != tc.wantConfigured {
+				t.Errorf("MeasurementBaselineConfigured() = %v, want %v",
+					v.MeasurementBaselineConfigured(), tc.wantConfigured)
+			}
+		})
+	}
+	// And it is true for a policy the quote does match, so it reports the ALLOWLIST's
+	// state and never doubles as a verdict on the quote.
+	v := New(BootChainPolicy{Allowed: []BootChain{BootChainOf(served)}}, WithQuoteParser(fakeParser(served, rd, nil)))
+	if !v.MeasurementBaselineConfigured() {
+		t.Error("MeasurementBaselineConfigured() = false for a populated allowlist")
+	}
+}
+
 func TestVerify_ParserErrorPropagates(t *testing.T) {
 	sentinel := errors.New("bad TDX signature")
 	v := New(BootChainPolicy{Allowed: []BootChain{BootChainOf(mkMeasurement(0xaa))}}, WithQuoteParser(fakeParser(Measurement{}, nil, sentinel)))
