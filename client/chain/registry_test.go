@@ -143,12 +143,15 @@ func TestOnChainRegistry_AcknowledgedSigner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewOnChainRegistry: %v", err)
 	}
-	gotSigner, ack, err := reg.AcknowledgedSigner(context.Background(), provider)
+	got, err := reg.AcknowledgedSigner(context.Background(), provider)
 	if err != nil {
 		t.Fatalf("AcknowledgedSigner: %v", err)
 	}
-	if !strings.EqualFold(gotSigner, signer) || !ack {
-		t.Errorf("got (%s, %v), want (%s, true)", gotSigner, ack, signer)
+	if !strings.EqualFold(got.Address, signer) || !got.Acknowledged {
+		t.Errorf("got %+v, want (%s, true)", got, signer)
+	}
+	if got.Stale {
+		t.Error("a direct on-chain read must never be marked Stale")
 	}
 	if !strings.EqualFold(gotTo, DefaultInferenceServingAddress) {
 		t.Errorf("call.to = %s, want %s", gotTo, DefaultInferenceServingAddress)
@@ -161,13 +164,89 @@ func TestOnChainRegistry_AcknowledgedSigner(t *testing.T) {
 }
 
 func TestOnChainRegistry_RPCError(t *testing.T) {
+	var calls int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
 		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"execution reverted"}}`))
 	}))
 	defer srv.Close()
 	reg, _ := NewOnChainRegistry(Config{RPCURL: srv.URL})
-	if _, _, err := reg.AcknowledgedSigner(context.Background(), "0xaabbccddeeff00112233445566778899aabbccdd"); err == nil {
+	if _, err := reg.AcknowledgedSigner(context.Background(), "0xaabbccddeeff00112233445566778899aabbccdd"); err == nil {
 		t.Error("want error on JSON-RPC error response")
+	}
+	// A JSON-RPC application error is deterministic: retrying it only multiplies
+	// the latency the caller's request pays.
+	if calls != 1 {
+		t.Errorf("RPC called %d times, want 1 (application errors are not retried)", calls)
+	}
+}
+
+// A transient server-side failure is exactly what the retry exists for: the
+// lookup should absorb it rather than fail a candidate over a blip.
+func TestOnChainRegistry_RetriesTransientFailure(t *testing.T) {
+	const signer = "0x99887766554433221100ffeeddccbbaa99887766"
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls < 3 {
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"0x` +
+			hex.EncodeToString(buildServiceReturn(signer, true)) + `"}`))
+	}))
+	defer srv.Close()
+
+	reg, _ := NewOnChainRegistry(Config{RPCURL: srv.URL})
+	got, err := reg.AcknowledgedSigner(context.Background(), "0xaabbccddeeff00112233445566778899aabbccdd")
+	if err != nil {
+		t.Fatalf("want the retry to absorb two 502s, got: %v", err)
+	}
+	if !strings.EqualFold(got.Address, signer) || !got.Acknowledged {
+		t.Errorf("got %+v, want (%s, true)", got, signer)
+	}
+	if calls != 3 {
+		t.Errorf("RPC called %d times, want 3 (two failures then a success)", calls)
+	}
+}
+
+// A 4xx says the request itself is wrong, so repeating it is pure latency.
+func TestOnChainRegistry_DoesNotRetryClientError(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	reg, _ := NewOnChainRegistry(Config{RPCURL: srv.URL})
+	if _, err := reg.AcknowledgedSigner(context.Background(), "0xaabbccddeeff00112233445566778899aabbccdd"); err == nil {
+		t.Error("want error on HTTP 400")
+	}
+	if calls != 1 {
+		t.Errorf("RPC called %d times, want 1 (4xx is not retried)", calls)
+	}
+}
+
+// The caller's deadline bounds the whole lookup, not one attempt: a cancelled
+// request must stop retrying immediately.
+func TestOnChainRegistry_RetryHonorsContext(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	reg, _ := NewOnChainRegistry(Config{RPCURL: srv.URL})
+	cancel()
+	if _, err := reg.AcknowledgedSigner(ctx, "0xaabbccddeeff00112233445566778899aabbccdd"); err == nil {
+		t.Error("want error on a cancelled context")
+	}
+	if calls > 1 {
+		t.Errorf("RPC called %d times after cancellation, want at most 1", calls)
 	}
 }
 
@@ -179,7 +258,7 @@ func TestOnChainRegistry_BadInputs(t *testing.T) {
 		t.Error("want error on bad contract address")
 	}
 	reg, _ := NewOnChainRegistry(Config{RPCURL: "http://127.0.0.1:0"})
-	if _, _, err := reg.AcknowledgedSigner(context.Background(), "not-an-address"); err == nil {
+	if _, err := reg.AcknowledgedSigner(context.Background(), "not-an-address"); err == nil {
 		t.Error("want error on bad provider address")
 	}
 }

@@ -853,6 +853,28 @@ and warmer liveness).
   is a switch and the other is not:
   - the **on-chain signer** check (trust-chain hop 5) is wired and observed;
     `ZG_GATEWAY_ONCHAIN_ENFORCE` is simply off, so turning it on is a config change.
+    Read `onchain_grounding_total` from `/metrics` before flipping it: warn mode is
+    the baseline that says whether enforce is safe here, since every outcome other
+    than `ok`/`ok_stale` becomes a skipped candidate. The negatives are counted apart
+    because they need different responses — `mismatch`/`not_acknowledged` are verdicts
+    about the provider and are what enforce is for, while `lookup_failed` is our own
+    chain RPC. Both fail-closed under enforce, with no opt-out for the second, so
+    enforce means the chain was actually read rather than merely consulted; if a
+    chain-RPC outage ever has to be ridden out, the lever is turning enforce off. A
+    blip will not get that far — `eth_call` retries, the reading is cached 5m, the
+    warmer refreshes ahead of expiry, a 30m grace window serves the last known-good
+    value, and a 30s cooldown after a failed lookup keeps an ongoing outage from
+    costing every request the retry budget — so watch `lookup_failed` and
+    `warmer_signer_refreshes_total{result="failed"}` for the sustained case. A provider
+    is never rejected on a stale or cached reading without a live re-read first, so a
+    broker upgrade rotating its signer does not read as an attack (see
+    `trust-chain.md`, "What hop 5 concludes, and what it does not"). Read a `mismatch`
+    together with the log line beside it rather than on its own: the counter cannot say
+    whether the recovery re-verification ran, and only a mismatch that survived one is
+    an accusation. The three are logged apart — "could not re-verify … the mismatch
+    stands on the cached quote" (throttled or the quote fetch failed), "the cached quote
+    had rotated" (benign, and it resolves), and "the quote signer had not rotated and
+    the mismatch stands" (live quote, live chain read, still disagreeing).
   - the **boot-chain** check (hop 3) has an empty allowlist, so
     `ZG_GATEWAY_ATTEST_ENFORCE` would reject every provider. It now compares the boot
     chain (MRTD + RTMR1 + RTMR2) rather than all five registers — the same split the
@@ -867,3 +889,21 @@ and warmer liveness).
   a separate CVM. To roll one out without downtime and with instant rollback, run
   the old and new builds as two sides and flip a single DNS pointer between them
   — see [`blue-green.md`](./blue-green.md) and [`switch.sh`](./switch.sh).
+- **When a PROVIDER upgrades its broker**, expect a brief window where that
+  provider is skipped, and order the rollout to keep it brief. A broker upgrade
+  rotates the provider's `enc_pub` and `signer_addr` together and changes its
+  measurement, while the on-chain registry has room for exactly one
+  `teeSignerAddress` — so it cannot mark old and new both valid, and the chain and
+  the quote necessarily disagree for a moment in whichever order the provider does
+  it (`trust-chain.md`, "What is *not* in the trust chain"). The gateway narrows
+  that window by re-reading live rather than ruling on a cached value, and cannot
+  close it. So:
+  1. **Update the measurement allowlist before the rollout.** New code means new
+     MRTD/RTMR values, and with `ZG_GATEWAY_ATTEST_ENFORCE` on an unlisted boot
+     chain rejects the upgraded broker outright. (The allowlist is empty and
+     enforce is off today, so this is a future dependency, not a live one.)
+  2. **Keep the on-chain acknowledgement close to the roll** — the gap between the
+     two is the window.
+  3. **Expect the provider to be skipped during it.** With several providers
+     registered, candidate fallback covers it; **a single-provider deployment has
+     no fallback**, so there the window is user-visible and wants scheduling.
