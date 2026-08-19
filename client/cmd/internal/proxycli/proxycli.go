@@ -147,6 +147,15 @@ func serve(srv *http.Server, logger *slog.Logger, sigCh <-chan os.Signal) error 
 // minutes trades a stale-signer window for far fewer chain RPCs per request.
 const onchainCacheTTL = 5 * time.Minute
 
+// onchainCacheGrace is how long past onchainCacheTTL an entry stays usable when
+// the chain RPC is failing (chain.Cached's grace window). It is generous on
+// purpose: the value it protects is near-static, while the outage it prevents is
+// total — the resolver grounds every candidate on the request path, so without a
+// grace window an unreachable RPC fails every request. A cached reading can only
+// ever CONFIRM a signer, never condemn one, so lengthening this does not widen
+// what a cached entry is allowed to decide.
+const onchainCacheGrace = 30 * time.Minute
+
 // NewLogger builds the process logger both proxy binaries share: human-readable
 // text records to stdout, at Info and above. Centralizing it here keeps the
 // sidecar and gateway on one format, level, and sink so their logs don't drift.
@@ -384,8 +393,11 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 			os.Exit(1)
 		}
 		resolver = reg
-		routeOpts = append(routeOpts, route.WithOnChainVerification(chain.Cached(reg, onchainCacheTTL), *f.onchainEnforce, logger))
-		logger.Info("on-chain signer grounding enabled", "label", label, "enforce", *f.onchainEnforce, "contract", *f.servingContract)
+		routeOpts = append(routeOpts,
+			route.WithOnChainVerification(chain.Cached(reg, onchainCacheTTL, onchainCacheGrace), *f.onchainEnforce, logger))
+		logger.Info("on-chain signer grounding enabled", "label", label,
+			"enforce", *f.onchainEnforce,
+			"contract", *f.servingContract, "cache_ttl", onchainCacheTTL, "cache_grace", onchainCacheGrace)
 	}
 	coreOpts := []core.Option{
 		core.WithSealFields(sealFields),
@@ -429,6 +441,69 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 		b.warmInterval = *f.warmInterval
 	}
 	return b
+}
+
+// warmStateMaxAge bounds how long Readiness will trust the last sweep, counted
+// from whichever is later: when a sweep last FINISHED, or when one last STARTED.
+// At three intervals (12m by default) a missed tick does not flap the answer,
+// while a warmer that has genuinely stopped turns not-ready well before an
+// operator would notice by hand — and a sweep that is simply taking a long time
+// keeps the answer alive while it runs.
+const warmStateMaxAge = 3
+
+// Readiness reports whether this process could currently serve a sealed request,
+// as distinct from whether its HTTP server is up. It returns nil when there is
+// nothing to assert — no warmer configured, so no sweep data exists — and callers
+// treat a nil func as "always ready".
+//
+// The signal is the last warmer sweep: at least one provider prepared end to end
+// (endpoint resolved, quote verified, on-chain signer read) and the sweep recent
+// enough to believe. That covers, in one predicate, every reason a freshly started
+// side would fail every request — router catalog unreachable, provider quote
+// endpoints down, chain RPC unreadable — without probing anything itself, so the
+// check costs a mutex and stays safe to call on every poll.
+//
+// It exists for the blue/green standby probe: with on-chain grounding enforced, a
+// side that cannot read the chain serves nothing, and the deploy must not point
+// traffic at it while the live side is still serving from a warm cache. It is
+// deliberately NOT what the container healthcheck asks — see the /healthz vs
+// /readyz split in cmd/gateway.
+func (b *Built) Readiness() func() error {
+	if b.warmInterval <= 0 || b.resolver == nil || b.router == nil {
+		return nil
+	}
+	router, interval := b.router, b.warmInterval
+	return func() error { return readinessFromWarmState(router.WarmState(), interval) }
+}
+
+// readinessFromWarmState is the decision Readiness makes, split from the plumbing
+// so it can be exercised across every sweep state without a live warmer. The
+// reasons are phrased for a human reading a failed probe: switch.sh prints the
+// body, and "0 of 7 prepared" calls for a different look than "no sweep yet".
+func readinessFromWarmState(s route.WarmState, interval time.Duration) error {
+	if s.At.IsZero() {
+		return errors.New("no warmer sweep has completed yet")
+	}
+	// Age from the later of "finished" and "started", so a sweep that is merely
+	// SLOW does not read as a warmer that has STALLED. Sweep duration scales with
+	// the provider count — a DCAP verify plus a chain read each, serially, both
+	// slower precisely when the upstreams are unwell — so a fixed multiple of the
+	// interval is not a safe proxy for "something is wrong". Judging on the finish
+	// time alone would report a process not-ready for being busy re-confirming what
+	// it is still serving happily from cache. A sweep that hangs outright still ages
+	// out, because Started stops advancing too.
+	last := s.At
+	if s.Started.After(last) {
+		last = s.Started
+	}
+	if age := time.Since(last); age > warmStateMaxAge*interval {
+		return fmt.Errorf("no warmer sweep has finished or started for %s (interval %s)",
+			age.Truncate(time.Second), interval)
+	}
+	if s.Ready == 0 {
+		return fmt.Errorf("no provider is usable: 0 of %d prepared by the last sweep", s.Total)
+	}
+	return nil
 }
 
 // StartWarmer launches the background quote-cache warmer in a goroutine and

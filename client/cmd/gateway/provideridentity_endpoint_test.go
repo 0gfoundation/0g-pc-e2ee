@@ -62,7 +62,8 @@ func pidGateway(t *testing.T, src route.ProviderIdentitySource) (*httptest.Serve
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	t.Cleanup(router.Close)
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, router.URL), testOrigins(), "", "", noInFlightCap, nil, src, discardLogger()))
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, router.URL), testOrigins(), "", "",
+		noInFlightCap, nil, src, nil, discardLogger()))
 	t.Cleanup(gw.Close)
 	return gw, fellThrough
 }

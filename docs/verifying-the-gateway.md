@@ -372,10 +372,15 @@ incomplete run. Render it as "observed only" — not as a pass, and not as a fai
 `onchain_signer` is `not_checked` unless the deployment runs with `ZG_GATEWAY_ONCHAIN`.
 
 Two things the endpoint will not do. It answers **only for providers this gateway has
-already sealed to**, and only for a few minutes afterwards — any other address is a
-`404`, and no address makes it fetch a quote, so it is not a quote proxy or a scanner.
-And it returns no raw quote and no measurement registers: what you would do with those
-is verify the quote, which you should do at the source.
+checked while serving a request**, and only for a few minutes afterwards — any other
+address is a `404`, and no address makes it fetch a quote, so it is not a quote proxy or
+a scanner. And it returns no raw quote and no measurement registers: what you would do
+with those is verify the quote, which you should do at the source.
+
+A provider the gateway *rejected* is reported too, with the verdict that rejected it —
+better than leaving an earlier `pass` standing while every request is refusing that
+provider. The one exception is a quote that failed DCAP outright: that leaves no record,
+so the address simply `404`s.
 
 It needs `ZG_GATEWAY_ATTEST` (without quote verification there are no verdicts to
 report, and the route is not mounted at all) and can be switched off with

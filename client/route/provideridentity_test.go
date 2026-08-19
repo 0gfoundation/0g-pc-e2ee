@@ -103,7 +103,7 @@ func pidRouter(t *testing.T, srvURL string, policy attest.BootChainPolicy, mode 
 		attest.WithMeasurementMode(mode))
 	opts := []Option{WithQuoteVerification(v, discardLogger())}
 	if reg != nil {
-		opts = append(opts, WithOnChainVerification(*reg, false, discardLogger()))
+		opts = append(opts, WithOnChainVerification(reg, false, discardLogger()))
 	}
 	return New(srvURL, opts...)
 }
@@ -233,6 +233,61 @@ func TestProviderIdentity_OnChainVerdicts(t *testing.T) {
 				t.Errorf("OnChainSigner = %q, want %q", id.OnChainSigner, tc.want)
 			}
 		})
+	}
+}
+
+// A candidate the on-chain check REJECTS under enforce is still recorded, with the
+// verdict that rejected it. The alternative is the one way this endpoint could state
+// something the gateway no longer believes: an earlier "pass" standing for the rest
+// of its TTL while every request is refusing that provider.
+func TestProviderIdentity_RecordedEvenWhenTheVerdictRejects(t *testing.T) {
+	srv := pidServer(t, pidQuote(t, qvMeasurement(0xaa), pidMRConfigID(t, 1, pidComposeHashHex)), nil)
+	v := attest.New(pidAllowAll(),
+		attest.WithQuoteParser(qvParser(qvMeasurement(0xaa), qvReportData(t))))
+	// enforce=true on the grounding check: the chain names someone else, so the
+	// candidate is skipped and core falls back.
+	r := New(srv.URL,
+		WithQuoteVerification(v, discardLogger()),
+		WithOnChainVerification(&stubRegistry{signer: ocOther, ack: true}, true, discardLogger()))
+
+	cands, err := r.Resolve(context.Background(), wire.Request{})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if _, err := cands.Provider(context.Background(), 0); err == nil {
+		t.Fatal("enforce mode should have skipped the candidate")
+	}
+
+	id, ok := r.ProviderIdentity(testProviderAddr)
+	if !ok {
+		t.Fatal("a rejected candidate left no record; the panel would keep showing the previous verdict")
+	}
+	if id.OnChainSigner != VerdictNoMatch {
+		t.Errorf("OnChainSigner = %q, want %q", id.OnChainSigner, VerdictNoMatch)
+	}
+	// The quote itself was genuine — that is why there is a record at all.
+	if id.QuoteDCAP != VerdictPass {
+		t.Errorf("QuoteDCAP = %q, want %q", id.QuoteDCAP, VerdictPass)
+	}
+}
+
+// The verdict a panel reads and the outcome the metrics count are the same
+// conclusion, so the mapping between them is worth pinning: the two negatives
+// collapse (both are "no"), a match on a stale reading is still a match, and a
+// lookup that failed must NOT arrive as an accusation against the provider.
+func TestOnChainVerdictOf(t *testing.T) {
+	for outcome, want := range map[groundingOutcome]Verdict{
+		groundingOK:              VerdictPass,
+		groundingOKStale:         VerdictPass,
+		groundingMismatch:        VerdictNoMatch,
+		groundingNotAcknowledged: VerdictNoMatch,
+		groundingLookupFailed:    VerdictUnavailable,
+		// An outcome this mapping has not been taught: unknown, never a pass.
+		groundingOutcome("added_later"): VerdictUnavailable,
+	} {
+		if got := onchainVerdictOf(outcome); got != want {
+			t.Errorf("onchainVerdictOf(%s) = %q, want %q", outcome, got, want)
+		}
 	}
 }
 

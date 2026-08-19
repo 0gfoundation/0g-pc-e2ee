@@ -37,8 +37,8 @@ const providerIdentityPath = "/v1/providers/{address}/identity"
 //
 //   - It never fetches anything. The record is a byproduct of a request that already
 //     happened (client/route's identity store), so an address this gateway has not
-//     sealed to is a 404 rather than a lookup. That is what keeps the route from
-//     becoming a quote proxy — or a scanner — for arbitrary addresses.
+//     verified while serving one is a 404 rather than a lookup. That is what keeps the
+//     route from becoming a quote proxy — or a scanner — for arbitrary addresses.
 //   - It does not return the raw quote. A reader who wants to redo the work should
 //     fetch it from the provider DIRECT (the note names the URL), not through the
 //     party whose claims are under examination — the same reason the §8 signature is
@@ -73,9 +73,10 @@ type providerIdentityDoc struct {
 	// and echoing the caller's own bytes back would make this field a mirror rather
 	// than a statement.
 	Address string `json:"address"`
-	// Endpoint is the provider's serving origin — where its quote, enc key and §8
+	// Endpoint is the provider's serving origin — the host its quote, enc key and §8
 	// signatures come from. It is here so a reader can leave this gateway and go to
-	// the source.
+	// the source; the exact URL to fetch is in `verify`, because an origin cannot carry
+	// a base path (see route.ProviderIdentity.Endpoint).
 	Endpoint string `json:"endpoint"`
 	// Verdicts are the outcomes of the checks this gateway made before sealing.
 	Verdicts providerVerdicts `json:"verdicts"`
@@ -97,8 +98,8 @@ type providerIdentityDoc struct {
 type providerVerdicts struct {
 	// QuoteDCAP: the quote is a genuine, Intel-rooted TDX quote with an acceptable TCB
 	// whose report_data binds the enc key and signer. Always "pass" in a served
-	// response — a quote that fails this is never sealed to, so no record exists to
-	// serve (see route.ProviderIdentity.QuoteDCAP).
+	// response — a quote that fails this leaves no record behind, so the request 404s
+	// rather than reporting a failure (see route.ProviderIdentity.QuoteDCAP).
 	QuoteDCAP route.Verdict `json:"quote_dcap"`
 	// OnChainSigner: the quote-bound signer equals the provider's acknowledged
 	// teeSignerAddress on chain (SPEC §4.4 step 3 / trust-chain hop 5) — what
@@ -124,7 +125,7 @@ func providerIdentityHandler(src route.ProviderIdentitySource) http.Handler {
 		id, ok := src.ProviderIdentity(r.PathValue("address"))
 		if !ok {
 			openaiproxy.WriteError(w, http.StatusNotFound, "gateway",
-				"this gateway has verified no provider at that address (it reports only providers it has sealed to, and only for a few minutes)")
+				"this gateway has verified no provider at that address (it reports only providers it has checked while serving a request, and only for a few minutes afterwards)")
 			return
 		}
 		body, err := json.MarshalIndent(providerIdentityDoc{

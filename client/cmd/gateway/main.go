@@ -385,8 +385,9 @@ func main() {
 	}
 
 	srv := &http.Server{
-		Addr:              *f.Listen,
-		Handler:           newHandler(built.Client, routerTarget, origins, instanceID, *evidenceDir, *maxInFlight, identity, providerIdentities, logger),
+		Addr: *f.Listen,
+		Handler: newHandler(built.Client, routerTarget, origins, instanceID, *evidenceDir, *maxInFlight,
+			identity, providerIdentities, built.Readiness(), logger),
 		ReadHeaderTimeout: 10 * time.Second,     // mitigate slow-header (Slowloris) clients
 		IdleTimeout:       proxycli.IdleTimeout, // bound idle keep-alives; unset means unbounded
 	}
@@ -566,10 +567,10 @@ func runHealthCheck(listen string) int {
 	return 0
 }
 
-// newHandler mounts the shared OpenAI proxy, the gateway-only operational route
-// (health), and a catch-all that reverse-proxies every other path to the router
-// (routerTarget), all wrapped in the CORS and access-log middleware so browser
-// callers on an allowed origin can reach it and every request emits one
+// newHandler mounts the shared OpenAI proxy, the gateway-only operational routes
+// (health and readiness), and a catch-all that reverse-proxies every other path to
+// the router (routerTarget), all wrapped in the CORS and access-log middleware so
+// browser callers on an allowed origin can reach it and every request emits one
 // redaction-safe structured line. It is split out from main so tests can drive it
 // with httptest.
 //
@@ -594,7 +595,13 @@ func runHealthCheck(listen string) int {
 // /v1/providers/{address}/identity: what this gateway verified about the providers
 // it sealed to. Nil leaves it unmounted, which is what a build that verifies no
 // quotes gets — see main's wiring and proxycli.Built.ProviderIdentities.
-func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, instanceID, evidenceDir string, maxInFlight int, identity *identityCache, providerIdentities route.ProviderIdentitySource, logger *slog.Logger) http.Handler {
+//
+// ready backs GET /readyz: nil means there is nothing to assert (no warmer
+// configured) and the route always answers ready. See proxycli.Built.Readiness and
+// the /healthz vs /readyz split at the routes below.
+func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, instanceID, evidenceDir string,
+	maxInFlight int, identity *identityCache, providerIdentities route.ProviderIdentitySource,
+	ready func() error, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	// Mount the sealed inference path behind the gateway's front-door credential
 	// gate. The gate is a cheap presence/shape check (reject missing credentials
@@ -615,9 +622,36 @@ func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, 
 	mux.Handle("POST /v1/chat/completions",
 		openaiproxy.RequireInferenceCredential(
 			openaiproxy.LimitInFlight(maxInFlight, openaiproxy.Handler(c))))
+	// /healthz answers "is this process serving?" and nothing more. It is the
+	// container healthcheck, and compose gates dstack-ingress's STARTUP on it
+	// (depends_on: service_healthy), so widening it to cover provider reachability
+	// would be actively harmful: on a boot during an upstream outage the ingress
+	// would never start, leaving the CVM dark and its certificate unissued rather
+	// than up and reporting honest errors.
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte("ok\n"))
+	})
+	// /readyz answers the other question — "could this side actually serve a sealed
+	// request?" — and is what the blue/green cutover probes on the standby before
+	// pointing traffic at it (switch.sh gate 2). Failing here is the useful
+	// direction: the deploy stops and the live side keeps serving from its warm
+	// cache, which is exactly what you want when the standby cannot verify anybody
+	// (chain RPC unreadable under -onchain-enforce, provider quotes unreachable,
+	// router catalog down). Unauthenticated and mounted explicitly for the same two
+	// reasons as /healthz: an external probe must reach it, and an unmounted path
+	// would fall through to the router passthrough below and answer with the
+	// ROUTER's status instead of ours.
+	mux.HandleFunc("GET /readyz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		if ready != nil {
+			if err := ready(); err != nil {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = fmt.Fprintf(w, "not ready: %v\n", err)
+				return
+			}
+		}
+		_, _ = w.Write([]byte("ready\n"))
 	})
 	// This CVM's self-description, for a browser panel that wants to show what it is
 	// connected to (issue #78). Three deliberate placements:

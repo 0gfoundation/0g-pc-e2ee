@@ -1,9 +1,10 @@
 package route
 
 import (
-	"strings"
 	"sync"
 	"time"
+
+	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
 )
 
 // This file holds what a request path already established about a provider but
@@ -19,10 +20,17 @@ import (
 // Two properties are load-bearing, and both come from where the record is WRITTEN
 // (routeCandidates.Provider, after the checks) rather than from anything here:
 //
-//   - A record exists only for a provider this gateway actually verified and was
-//     prepared to seal to. Nothing in this file can fetch a quote, resolve an
+//   - A record exists only for a provider this gateway actually verified while
+//     serving a request. Nothing in this file can fetch a quote, resolve an
 //     endpoint, or reach the chain, so the surface it feeds cannot be turned into a
 //     quote proxy or a scanner for arbitrary addresses.
+//   - It is written on the way past the checks, not on the way to a successful seal.
+//     A candidate the on-chain check REJECTS (enforce mode) is recorded with the
+//     verdict that rejected it, because the alternative is worse: an earlier pass
+//     would stand for the rest of its TTL while the gateway is actively refusing that
+//     provider, which is the one way this endpoint could state something the gateway
+//     no longer believes. A quote that fails DCAP is the exception and leaves no
+//     record at all — see ProviderIdentity.QuoteDCAP.
 //   - Every verdict is the one the gateway REACHED, not a restatement of what it
 //     would like to be true. VerdictPass on the DCAP check means a genuine,
 //     Intel-rooted quote; VerdictNoBaseline on the measurement means the audited
@@ -79,6 +87,40 @@ const (
 	VerdictNotChecked Verdict = "not_checked"
 )
 
+// onchainVerdictOf translates a grounding outcome into the wire vocabulary.
+//
+// It is a translation and not a second opinion: groundSignerOnChain owns what the
+// chain said, and this only decides how much of that distinction a browser panel
+// needs. Two collapses, both deliberate:
+//
+//   - mismatch and not_acknowledged both become VerdictNoMatch. They are counted
+//     apart because an operator responds to them differently; to a reader asking "is
+//     this the provider the chain vouches for?", both answers are no.
+//   - ok_stale becomes VerdictPass, because that is what it means: staleness
+//     disqualifies a NEGATIVE, never a positive (see groundSignerOnChain), and a
+//     sustained ok_stale rate is a fact about our chain RPC's reachability rather
+//     than about this provider — which is why it stays in the metrics, where the
+//     operator looking for it will be.
+//
+// lookup_failed is the one that must NOT collapse: it becomes VerdictUnavailable, so
+// a chain RPC having a bad minute never reaches a user as an accusation against the
+// provider they were just served by.
+func onchainVerdictOf(outcome groundingOutcome) Verdict {
+	switch outcome {
+	case groundingOK, groundingOKStale:
+		return VerdictPass
+	case groundingMismatch, groundingNotAcknowledged:
+		return VerdictNoMatch
+	case groundingLookupFailed:
+		return VerdictUnavailable
+	default:
+		// An outcome added later and not mapped here: report it as unknown rather than
+		// as either a pass or a finding. Both of those would be a claim this function
+		// has no basis for.
+		return VerdictUnavailable
+	}
+}
+
 // ProviderIdentity is the record of what this gateway verified about one provider,
 // as of the last request that used it.
 //
@@ -94,14 +136,19 @@ type ProviderIdentity struct {
 	// route preview (EIP-55 or lowercase). It is the same value the gateway returns
 	// in the X-Provider response header, which is how a panel knows what to ask for.
 	Address string
-	// Endpoint is the provider's serving origin (scheme://host[:port]) — where its
-	// quote, its enc key and its §8 signatures are served. Reported so a caller can
-	// go straight to the source.
+	// Endpoint is the provider's serving origin (scheme://host[:port]) — the host a
+	// panel names as "who answered", reported so a reader can leave this gateway and go
+	// to the source.
+	//
+	// It is a DISPLAY value: do not build paths off it. The router may advertise an
+	// endpoint under a base path, which an origin necessarily drops, so
+	// Endpoint+"/v1/quote" is not reliably the quote URL. QuoteURL is.
 	Endpoint string
-	// QuoteURL is the exact URL this gateway fetched and verified the quote from,
-	// Endpoint's /v1/quote with the SPEC §4.2 report_data layout requested. Carried
-	// separately from Endpoint because "verify it yourself" is only useful if it names
-	// the same artifact we checked.
+	// QuoteURL is the exact URL this gateway fetched and verified the quote from —
+	// the provider's /v1/quote with the SPEC §4.2 report_data layout requested, derived
+	// from whatever endpoint spelling the preview supplied. Carried separately from
+	// Endpoint because "verify it yourself" is only useful if it names the same
+	// artifact we checked.
 	QuoteURL string
 	// QuoteDCAP is the DCAP verification outcome: genuine Intel-rooted TDX quote,
 	// acceptable TCB, and a report_data that binds the enc key and signer.
@@ -180,8 +227,11 @@ const providerIdentityTTL = 5 * time.Minute
 // of providers — so a legitimate deployment never reaches it.
 const maxProviderIdentities = 1024
 
-// identityStore holds the records, keyed by lowercased provider address. Safe for
-// concurrent use (mutex-guarded map, like quoteCache).
+// identityStore holds the records, keyed by provider address through
+// chain.ProviderKey — the one canonicalization every per-provider keyed structure in
+// this codebase goes through, so "the same provider, differently capitalized" cannot
+// become a second entry the panel never finds. Safe for concurrent use (mutex-guarded
+// map, like quoteCache).
 type identityStore struct {
 	ttl time.Duration
 	max int
@@ -195,22 +245,20 @@ type identityEntry struct {
 }
 
 func newIdentityStore(ttl time.Duration, max int) *identityStore {
+	if max <= 0 {
+		// A non-positive cap would make the eviction below a no-op that still admits
+		// every write — unbounded growth wearing a cap's clothes. Fall back to the real
+		// one rather than let a caller's zero value mean "no limit".
+		max = maxProviderIdentities
+	}
 	return &identityStore{ttl: ttl, max: max, m: make(map[string]identityEntry)}
-}
-
-// identityKey normalizes an address for lookup. Case-insensitive because the same
-// account travels as EIP-55 from one source and lowercase from another, and a panel
-// asking about the address it was handed must not miss the record because of
-// checksum casing.
-func identityKey(address string) string {
-	return strings.ToLower(strings.TrimSpace(address))
 }
 
 // put records (or replaces) one provider's identity. An empty address is dropped:
 // direct-broker mode pins no on-chain address, and a record no one can look up
 // would only consume the cap.
 func (s *identityStore) put(id ProviderIdentity) {
-	key := identityKey(id.Address)
+	key := chain.ProviderKey(id.Address)
 	// A nil store is a Router assembled field-by-field (tests do this for the
 	// on-chain and warmer paths); recording nowhere is the right behavior, not a
 	// panic on a display feature.
@@ -249,7 +297,7 @@ func (s *identityStore) makeRoomLocked(now time.Time) {
 }
 
 func (s *identityStore) get(address string) (ProviderIdentity, bool) {
-	key := identityKey(address)
+	key := chain.ProviderKey(address)
 	if s == nil || key == "" {
 		return ProviderIdentity{}, false
 	}
@@ -291,6 +339,14 @@ func providerIdentityOf(prov previewProvider, res quoteResult, onchain Verdict) 
 		Measurement:   res.facts.measurement,
 		ComposeHash:   res.facts.composeHash,
 	}
+	// A verdict must never reach the wire empty. Every path that builds a quoteResult
+	// records what the boot-chain check concluded, so an unset value would mean a
+	// future one did not — and the honest report of a verdict nobody computed is
+	// "unknown", not the pass or the finding a reader would otherwise infer from a
+	// blank.
+	if id.Measurement == "" {
+		id.Measurement = VerdictUnavailable
+	}
 	// Report the provider's ORIGIN rather than the endpoint spelling the router
 	// happened to send (a bare origin, a /v1 base, or a full chat URL are all the same
 	// provider): a panel showing "this is who answered" wants the host, and a reader
@@ -307,9 +363,9 @@ func providerIdentityOf(prov previewProvider, res quoteResult, onchain Verdict) 
 }
 
 // recordProviderIdentity stores what the checks in routeCandidates.Provider just
-// established. It is called on the path that MATERIALIZED a candidate — the quote
-// verified, the keys bound, the on-chain check made — so a record means "this
-// gateway was prepared to seal to this provider", never "the router mentioned it".
+// established. It is called once the quote has been verified, the keys bound and the
+// on-chain check made — so a record means "this gateway ran its checks against this
+// provider for a real request", never "the router mentioned it".
 func (r *Router) recordProviderIdentity(id ProviderIdentity) {
 	r.identities.put(id)
 }

@@ -63,14 +63,17 @@ below.
 ./switch.sh acme b           # 1. aim the issuance switch at side b FIRST
 phala cvm create ...         # 2. deploy side b — new image digest (=> new app_id),
                              #    DELEGATION_ZONE=b.integratenetwork.work, DNS_SETUP_MODE=print
-./switch.sh switch b         # 3. probe b directly, flip traffic, confirm b is really
-                             #    serving (cert changed) + /healthz; auto-rollback otherwise
+./switch.sh switch b         # 3. probe b's /readyz directly, flip traffic, confirm b is
+                             #    really serving (cert changed) + /healthz; auto-rollback otherwise
 phala cvm delete <side a>    # 4. once b is confirmed live, retire a to free resources
 ```
 
-With `PLATFORM_BASE` set in `switch.env`, step 3 health-checks side b **before**
-the flip, so a broken b is rejected rather than briefly taking traffic — see
-[Health-checking the standby](#health-checking-the-standby-side).
+With `PLATFORM_BASE` set in `switch.env`, step 3 checks side b's **readiness**
+before the flip — can it actually serve, not just is it listening — so a b that
+cannot verify any provider is rejected instead of briefly taking traffic. Allow it
+time: a cold side must finish its first warmer sweep, which is why the probe window
+is minutes (see
+[Health-checking the standby](#health-checking-the-standby-side)).
 
 > **About the certificate (step 1).** Side b serves the same `router-api-tee.0g.ai`
 > and needs its own cert for it. **Side b's own dstack-ingress issues that cert on
@@ -291,9 +294,12 @@ switch to the production compose only once it works.
 1. refuses if b is already live;
 2. **gate 1** — reads side b's published `app_id` from the delegation zone;
    aborts if b has not published one (its CVM is not up);
-3. **gate 2** — health-checks side b **directly** before sending it any traffic
-   (via `PLATFORM_BASE`, or an explicit `--probe-url`), retrying up to
-   `PROBE_RETRIES` times; refuses to switch if b stays unhealthy. See
+3. **gate 2** — probes side b's **readiness** (`/readyz`) **directly** before
+   sending it any traffic (via `PLATFORM_BASE`, or an explicit `--probe-url`),
+   retrying up to `PROBE_RETRIES` times `PROBE_INTERVAL` apart; refuses to switch
+   if b never becomes ready. This asks whether b can actually *serve* — not merely
+   whether its process is up — so a side that cannot verify any provider never
+   receives traffic while the live side is still serving from a warm cache. See
    [Health-checking the standby](#health-checking-the-standby-side);
 4. repoints the traffic + issuance switches at b;
 5. **confirms the cutover actually took effect, cache-proof.** It polls
@@ -329,11 +335,56 @@ destroyed side is no longer a rollback target.
 
 ## Health-checking the standby side
 
+### `/healthz` and `/readyz` answer different questions
+
+The gateway serves both, and the difference decides which one a gate should use:
+
+| Route | Asserts | Used by | Failing means |
+| --- | --- | --- | --- |
+| `/healthz` | the process is serving HTTP | container healthcheck (`gateway -health`), which compose uses to gate **dstack-ingress startup**; the post-switch public check | ingress never starts — a dark CVM with no certificate |
+| `/readyz` | at least one provider is fully usable — endpoint resolved, quote DCAP-verified, on-chain signer read — as of a recent warmer sweep | **gate 2**, the pre-switch standby probe | the cutover stops and the live side keeps serving |
+
+`/healthz` is deliberately *not* widened to cover provider reachability. Because
+compose gates the ingress's startup on it, a side booting during an upstream
+outage would never bring its ingress up — no traffic, and no ACME certificate
+either — instead of coming up and reporting honest errors. Failing the *cutover*
+on the same condition is safe, because the live side is unaffected.
+
+> **`/readyz` only has teeth when the warmer is on.** It reports the last sweep's
+> result, so with `ZG_GATEWAY_WARM` off there is no sweep to report and the route
+> always answers ready — the gate silently becomes liveness-only. The shipped
+> compose has the warmer on.
+
+The readiness window is sized to a **cold first sweep**, not to a DNS TTL:
+`PROBE_RETRIES` × `PROBE_INTERVAL` (30 × 10s ≈ 5 min by default). A freshly
+started side DCAP-verifies each provider's quote one at a time, fetches Intel
+collateral cold, and reads each provider's on-chain signer, so it is legitimately
+not-ready for a while.
+
+> **That default assumes today's fleet size.** The sweep is serial, so its duration
+> grows with the number of registered providers — and each provider costs more when
+> Intel PCS or the chain RPC is slow, which is exactly when a deploy is most likely
+> to be under way. If the fleet grows or `warmer_last_success_timestamp_seconds`
+> shows sweeps taking minutes, raise `PROBE_RETRIES` to match; the failure mode of
+> too small a window is a refused cutover to a side that was going to be fine. Keep this separate from `VERIFY_*`, which sizes the
+*post-switch* check against the route cache — the two measure unrelated things.
+To fall back to the weaker liveness-only gate, point `--probe-url` at `/healthz`.
+
+> **Rolling back to a side that predates `/readyz`.** That side does not serve the
+> route at all — the path falls through its catch-all to the router, which answers
+> about itself. `switch.sh` detects the 404 and degrades to `/healthz` with a loud
+> warning rather than failing the gate, because the target of a rollback is an older
+> image by definition and the emergency path is the worst place to be strict. A
+> `503` is different: the route exists and is answering not-ready, which is a real
+> verdict, so it keeps retrying and ultimately refuses.
+
+### Reaching the standby at all
+
 `https://<DOMAIN>/healthz` always hits the **live** side, so verifying the
 *standby* before cutover needs a way to reach it directly. The dstack platform
 gives you one, and it works alongside the custom domain:
 
-> **`https://<app_id>-443s.<PLATFORM_BASE>/healthz`** reaches a specific side
+> **`https://<app_id>-443s.<PLATFORM_BASE>/readyz`** reaches a specific side
 > directly. The `-443s` form is TLS **passthrough** to that CVM's ingress on 443,
 > and the gateway routes it by the **app_id in the hostname** — independent of the
 > custom domain's `_dstack-app-address` — so it hits the standby even though no
@@ -341,9 +392,10 @@ gives you one, and it works alongside the custom domain:
 
 Set `PLATFORM_BASE` (e.g. `in1.phala.network`) in `switch.env` and `switch.sh`
 builds this URL from the target side's published `app_id` and probes it
-automatically before every switch, refusing to cut over unless the standby is
-healthy (retrying `PROBE_RETRIES` times). `./switch.sh status` prints each side's
-probe URL. An explicit `--probe-url` overrides it.
+automatically before every switch, refusing to cut over unless the standby reports
+ready (retrying `PROBE_RETRIES` times, `PROBE_INTERVAL` apart). `./switch.sh status`
+prints each side's probe URL. An explicit `--probe-url` overrides it — including to
+downgrade the gate to `/healthz`.
 
 Notes on why other forms don't work here: `<app_id>-8443…` fails because the
 gateway port (8443) is deliberately **not** published (a published 8443 would

@@ -132,6 +132,24 @@ var (
 		Help: "Genuine quotes whose measurement was not in the allowlist (attest warn mode).",
 	})
 
+	// On-chain signer grounding (route.groundSignerOnChain, trust-chain hop 5).
+	// The outcome label separates the two classes an operator must not conflate:
+	// mismatch/not_acknowledged are verdicts about the PROVIDER (the reason enforce
+	// mode exists), while lookup_failed is a verdict about OUR OWN chain RPC. In
+	// warn mode this counter is the baseline that says whether enforce can be
+	// turned on at all; after that, a nonzero mismatch rate is the alert-worthy
+	// signal, since it means a quote-bound signer disagreed with the chain.
+	onchainGrounding = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "onchain_grounding_total",
+		Help: "On-chain signer grounding attempts by outcome " +
+			"(ok|ok_stale|mismatch|not_acknowledged|lookup_failed).",
+	}, []string{"outcome"})
+	onchainRevalidations = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "onchain_revalidations_total",
+		Help: "Live re-reads forced because a negative verdict rested on stale or cached " +
+			"evidence, by what the fresh evidence then said (ok|negative|lookup_failed).",
+	}, []string{"result"})
+
 	// Warmer (route/warmer.go) — the background sweep keeping the quote cache hot.
 	warmerSweeps = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "warmer_sweeps_total",
@@ -141,6 +159,21 @@ var (
 		Namespace: namespace, Subsystem: subsystem, Name: "warmer_provider_refreshes_total",
 		Help: "Per-provider warmer refreshes by result (ok|endpoint_failed|verify_failed).",
 	}, []string{"result"})
+	warmerSignerRefresh = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "warmer_signer_refreshes_total",
+		Help: "Per-provider on-chain signer refreshes by the warmer, by result " +
+			"(ok|failed|mismatch|unchecked). failed is our chain RPC; mismatch is the chain " +
+			"declining to vouch for the quote-bound signer, which under enforce makes that " +
+			"provider unusable and can hold back a blue/green cutover; unchecked is a reading " +
+			"that acknowledged someone but had no quote-bound signer to compare against, " +
+			"because the quote refresh failed first (see verify_failed).",
+	}, []string{"result"})
+	warmerReadyProviders = prometheus.NewGauge(prometheus.GaugeOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "warmer_ready_providers",
+		Help: "Providers the last warmer sweep prepared end to end (endpoint + quote + " +
+			"on-chain signer). Zero while the process is up means no request could be " +
+			"served — alert on it; it is also what the blue/green standby probe gates on.",
+	})
 	warmerLastSuccess = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "warmer_last_success_timestamp_seconds",
 		Help: "Unix time of the last completed warmer sweep; alert if it stops advancing.",
@@ -169,7 +202,9 @@ func init() {
 		httpRequests, httpDuration, httpInFlight, inFlightLimit, requestsShed,
 		completions, openFailures, verificationFailures,
 		quoteVerify, quoteVerifyDuration, quoteCache, measurementUntrusted,
-		warmerSweeps, warmerProviderRefresh, warmerLastSuccess,
+		onchainGrounding, onchainRevalidations,
+		warmerSweeps, warmerProviderRefresh, warmerSignerRefresh,
+		warmerReadyProviders, warmerLastSuccess,
 		collateralCache, collateralFetch, collateralFetchDuration,
 	)
 }
@@ -190,7 +225,7 @@ func Handler() http.Handler {
 // paths the gateway reverse-proxies to the router — collapses to "other".
 func RouteLabel(path string) string {
 	switch path {
-	case "/v1/chat/completions", "/healthz":
+	case "/v1/chat/completions", "/healthz", "/readyz":
 		return path
 	}
 	// The public evidence bundle, collapsed to ONE label rather than one per file:
@@ -255,6 +290,28 @@ func QuoteCacheLookup(hit bool) { quoteCache.WithLabelValues(hitMiss(hit)).Inc()
 // MeasurementUntrusted counts a genuine quote whose measurement was not in the
 // allowlist (only reachable in attest warn mode; enforce fails the verify).
 func MeasurementUntrusted() { measurementUntrusted.Inc() }
+
+// OnChainGrounding records the outcome of one on-chain signer-grounding attempt.
+// outcome is a fixed low-cardinality label: ok, ok_stale, mismatch,
+// not_acknowledged, or lookup_failed.
+func OnChainGrounding(outcome string) { onchainGrounding.WithLabelValues(outcome).Inc() }
+
+// OnChainRevalidation records a live re-read forced because a negative verdict
+// would otherwise have rested on stale or cached evidence. result is what the
+// fresh evidence said: ok (the negative was an artifact of staleness — typically
+// a benign signer rotation), negative (the verdict survived), or lookup_failed
+// (no fresh evidence could be obtained).
+func OnChainRevalidation(result string) { onchainRevalidations.WithLabelValues(result).Inc() }
+
+// WarmerSignerRefresh records one provider's on-chain signer refresh by the
+// warmer: ok, failed (our chain RPC could not be read), or mismatch (it was read
+// and did not vouch for the quote-bound signer). The last is the one that marks a
+// provider unprepared under enforce, so it is not a variant of failed.
+func WarmerSignerRefresh(result string) { warmerSignerRefresh.WithLabelValues(result).Inc() }
+
+// WarmerReadyProviders records how many providers the last sweep prepared end to
+// end (endpoint resolved, quote verified, on-chain signer read).
+func WarmerReadyProviders(n int) { warmerReadyProviders.Set(float64(n)) }
 
 // WarmerSweep records the outcome of one warmer sweep.
 func WarmerSweep(result string) { warmerSweeps.WithLabelValues(result).Inc() }
