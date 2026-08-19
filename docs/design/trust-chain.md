@@ -158,8 +158,14 @@ mount.
 Honest gaps — half the value of this diagram is marking them (see
 [`router-e2e.md` Limitations](./router-e2e.md#limitations)):
 
-- **Metadata leaks to the router**: `model`, coarse token counts, timing, packet
-  sizes remain visible.
+- **Metadata leaks to the router**: `model`, timing and packet sizes remain
+  visible — and token usage **exactly**, not approximately: [`SPEC.md` §7](../../protocol/SPEC.md#7-sealed-response-envelope-v1)
+  leaves `usage` cleartext so the router can bill on it. Sizes are exact for the
+  same kind of reason: ChaCha20-Poly1305 adds a 16-byte tag and no padding, so a
+  ciphertext's length is its plaintext's length plus a constant. On a stream,
+  per-frame timing is visible too. What the router cannot do is *alter* any of
+  it — `usage` is in the AAD and covered by the §8 signature, so it reads and
+  bills but cannot forge (hop 10).
 - **Verifiable relay, not verifiable computation**: the chain proves the enclave
   produced this exact response to this exact request; it does **not** prove the
   upstream model (`M`) behaved. The segment past hop 12 into `M` is outside the
