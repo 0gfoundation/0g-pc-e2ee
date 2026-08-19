@@ -80,7 +80,29 @@ func TestReadinessFromWarmState(t *testing.T) {
 		name:      "stalled warmer",
 		state:     route.WarmState{At: now.Add(-(warmStateMaxAge + 1) * interval), Ready: 3, Total: 3},
 		wantErr:   true,
-		wantInMsg: "warmer sweep was",
+		wantInMsg: "no warmer sweep has finished or started",
+	}, {
+		// A sweep that is merely SLOW is not a warmer that has stalled. Sweep duration
+		// scales with the provider count and gets worse exactly when the upstreams are
+		// unwell, so judging on the finish time alone would report a process not-ready
+		// for being busy re-confirming what it is still serving happily from cache.
+		name: "slow sweep still running",
+		state: route.WarmState{
+			At:      now.Add(-(warmStateMaxAge + 5) * interval),
+			Started: now.Add(-2 * interval),
+			Ready:   3, Total: 3,
+		},
+	}, {
+		// A sweep that hangs outright still ages out, because Started stops advancing
+		// too — the guard above must not become a way to look ready forever.
+		name: "sweep hung since long ago",
+		state: route.WarmState{
+			At:      now.Add(-(warmStateMaxAge + 5) * interval),
+			Started: now.Add(-(warmStateMaxAge + 1) * interval),
+			Ready:   3, Total: 3,
+		},
+		wantErr:   true,
+		wantInMsg: "no warmer sweep has finished or started",
 	}}
 
 	for _, tc := range cases {

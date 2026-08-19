@@ -114,6 +114,11 @@ func (c *cachedRegistry) AcknowledgedSigner(ctx context.Context, providerAddr st
 	if err == nil {
 		return got, nil
 	}
+	// Re-read the clock: the lookup above can take seconds (the inner registry
+	// retries with backoff), and stamping the failure with the time we STARTED would
+	// backdate the cooldown by that much — a 30s window worth 20s — and widen the
+	// grace comparison by the same amount.
+	now = c.now()
 	c.noteFailure(ctx, key, now, err)
 	if stale, ok := c.staleWithinGrace(key, now); ok {
 		return stale, nil
@@ -179,9 +184,15 @@ func (c *cachedRegistry) clearFailure(key string) {
 	delete(c.failures, key)
 }
 
-// refresh performs a single-flighted live lookup and caches a success. Callers
-// that arrive during an in-flight lookup share its result, which is live evidence
-// for all of them: the call was issued after the staleness that prompted it.
+// refresh performs a single-flighted live lookup and caches a success.
+//
+// What "live" means here is worth stating exactly, because a caller may REJECT a
+// provider on it. The leader's read is issued after the disagreement that prompted
+// it. A caller that joins a call already in flight instead gets a read issued
+// slightly BEFORE it observed that disagreement — still a real chain read, never a
+// cache entry, but up to one RPC old. Rejecting on it is sound as long as the
+// window stays that small: it is bounded by one lookup, and the caller-side rate
+// limit (route.signerRevalidate) means the next disagreement gets its own read.
 func (c *cachedRegistry) refresh(ctx context.Context, providerAddr string) (Signer, error) {
 	key := strings.ToLower(providerAddr)
 	ch := c.sf.DoChan(key, func() (any, error) {

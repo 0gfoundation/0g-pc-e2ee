@@ -118,6 +118,14 @@ type WarmState struct {
 	// just-started process, which a caller should treat as not-ready rather than as
 	// ready-by-default.
 	At time.Time
+	// Started is when the most recent sweep BEGAN, which may be after At if one is
+	// running now. A staleness check must consider both: a sweep that is merely slow
+	// is not a warmer that has stalled, and sweep duration grows with the provider
+	// count — each one costs a DCAP verify plus a chain read, serially, and both get
+	// slower exactly when the upstreams are unwell. Judging on At alone would call a
+	// process not-ready for taking too long to re-confirm what it is still happily
+	// serving from cache.
+	Started time.Time
 	// Ready counts providers the sweep prepared END TO END: endpoint resolved, quote
 	// verified and cached, and (when on-chain grounding is configured) the signer
 	// read from the chain. A provider counted here is one a request could actually
@@ -136,9 +144,20 @@ func (r *Router) WarmState() WarmState {
 	return r.warmState
 }
 
-func (r *Router) setWarmState(s WarmState) {
+// beginSweep stamps the start of a sweep, leaving the previous sweep's result in
+// place — that result stays the honest answer until this one produces a new one.
+func (r *Router) beginSweep(at time.Time) {
 	r.warmMu.Lock()
-	r.warmState = s
+	r.warmState.Started = at
+	r.warmMu.Unlock()
+}
+
+// finishSweep records what a completed sweep found, preserving Started.
+func (r *Router) finishSweep(ready, total int) {
+	r.warmMu.Lock()
+	r.warmState.At = time.Now()
+	r.warmState.Ready = ready
+	r.warmState.Total = total
 	r.warmMu.Unlock()
 }
 
@@ -156,6 +175,7 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 	if r.verifier == nil || endpoints == nil {
 		return
 	}
+	r.beginSweep(time.Now())
 	addrs, err := r.listProviderAddrs(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -174,7 +194,7 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 		// let the alert built on it stay green while /readyz reports not-ready, which
 		// is the one combination guaranteed to waste an operator's time.
 		metrics.WarmerReadyProviders(0)
-		r.setWarmState(WarmState{At: time.Now()})
+		r.finishSweep(0, 0)
 		return
 	}
 	ready := 0
@@ -248,7 +268,7 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 	metrics.WarmerSweep("ok")
 	metrics.WarmerSweepSucceeded()
 	metrics.WarmerReadyProviders(ready)
-	r.setWarmState(WarmState{At: time.Now(), Ready: ready, Total: len(addrs)})
+	r.finishSweep(ready, len(addrs))
 }
 
 // RunWarmer warms once immediately, then re-warms every interval until ctx is

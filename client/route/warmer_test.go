@@ -232,8 +232,13 @@ func TestWarmer_CancelledSweepLeavesWarmStateAlone(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	r.WarmOnce(ctx, res)
-	if got := r.WarmState(); got != before {
-		t.Errorf("WarmState = %+v after a cancelled sweep, want it untouched (%+v)", got, before)
+
+	// The READINESS fields must survive: a shutdown must not publish "nothing is
+	// ready" on its way out. Started does advance — a sweep really did begin — and
+	// that only ever makes the process look more current, never less.
+	got := r.WarmState()
+	if got.At != before.At || got.Ready != before.Ready || got.Total != before.Total {
+		t.Errorf("WarmState = %+v after a cancelled sweep, want its result untouched (%+v)", got, before)
 	}
 }
 

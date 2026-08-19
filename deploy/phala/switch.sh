@@ -272,7 +272,10 @@ side_app_addr() { # a|b
 }
 
 http_status() { # url -> the HTTP status code, or 000 if unreachable
-  curl -sSk -o /dev/null -w '%{http_code}' --max-time 10 "$1" 2>/dev/null || echo 000
+  # `-w` prints 000 itself when the request never got a response, so the exit code
+  # is swallowed rather than handled: `|| echo 000` would APPEND a second one and
+  # the caller would compare against "000\n000".
+  curl -sSk -o /dev/null -w '%{http_code}' --max-time 10 "$1" 2>/dev/null || true
 }
 
 http_ok() { # url -> 0 if HTTP 2xx. -k: we check reachability/health, not cert
@@ -438,28 +441,32 @@ cmd_switch() {
   local probe="$PROBE_URL"
   [ -z "$probe" ] && probe="$(platform_probe_url "$target")"
   if [ -n "$probe" ]; then
-    # A side that PREDATES readiness gating does not serve PROBE_PATH at all: the
-    # path falls through its catch-all to the router, which answers about itself.
-    # That must not read as "not ready" — most of the time the target is an older
-    # image precisely because this is a ROLLBACK, the emergency path, and burning
-    # the full probe window before refusing it is the worst possible moment to be
-    # strict. A 404 means the route is absent (old image) and we degrade to
-    # HEALTH_PATH loudly; a 503 means the route is present and answering
-    # not-ready, which is a real verdict and is retried.
-    if [ -z "$PROBE_URL" ] && [ "$(http_status "$probe")" = "404" ]; then
-      local health_probe; health_probe="$(platform_probe_url "$target" "$HEALTH_PATH")"
-      warn "side ${target} does not serve ${PROBE_PATH} (404) — it predates readiness gating"
-      warn "falling back to ${HEALTH_PATH}: this only checks the process is up, NOT that it can"
-      warn "serve. It cannot tell you whether that side can reach providers or the chain."
-      probe="$health_probe"
-    fi
     info "probing target side ${target} directly: $probe"
     info "  (up to ${PROBE_RETRIES} attempts ${PROBE_INTERVAL}s apart — a cold side must finish its first warmer sweep)"
-    local pi probe_ok=0
+    local pi probe_ok=0 status
     for ((pi=1; pi<=PROBE_RETRIES; pi++)); do
-      if http_ok "$probe"; then probe_ok=1; break; fi
+      status="$(http_status "$probe")"
+      case "$status" in
+        2*) probe_ok=1; break ;;
+        404)
+          # A side that PREDATES readiness gating does not serve PROBE_PATH at all: the
+          # path falls through its catch-all to the router, which answers about itself.
+          # That must not read as "not ready" — the target of a ROLLBACK is an older
+          # image by definition, and the emergency path is the worst place to be strict.
+          # Checked on EVERY attempt, not once up front: a standby that has not finished
+          # booting answers 000, and a single early probe would miss the 404 entirely and
+          # then burn the whole window on an image that was never going to serve it.
+          # A 503 is different — the route exists and says not-ready, a real verdict.
+          if [ -n "$PROBE_URL" ]; then break; fi   # operator chose this URL; respect it
+          warn "side ${target} does not serve ${PROBE_PATH} (404) — it predates readiness gating"
+          warn "falling back to ${HEALTH_PATH}: this only checks the process is up, NOT that it can"
+          warn "serve. It cannot tell you whether that side can reach providers or the chain."
+          probe="$(platform_probe_url "$target" "$HEALTH_PATH")"
+          continue   # retry immediately against the fallback, without burning an interval
+          ;;
+      esac
       if [ "$pi" -lt "$PROBE_RETRIES" ]; then
-        log "  probe attempt ${pi}/${PROBE_RETRIES} failed, retrying in ${PROBE_INTERVAL}s"
+        log "  probe attempt ${pi}/${PROBE_RETRIES} got ${status}, retrying in ${PROBE_INTERVAL}s"
         sleep "$PROBE_INTERVAL"
       fi
     done

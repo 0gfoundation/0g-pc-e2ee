@@ -359,7 +359,14 @@ The readiness window is sized to a **cold first sweep**, not to a DNS TTL:
 `PROBE_RETRIES` × `PROBE_INTERVAL` (30 × 10s ≈ 5 min by default). A freshly
 started side DCAP-verifies each provider's quote one at a time, fetches Intel
 collateral cold, and reads each provider's on-chain signer, so it is legitimately
-not-ready for a while. Keep this separate from `VERIFY_*`, which sizes the
+not-ready for a while.
+
+> **That default assumes today's fleet size.** The sweep is serial, so its duration
+> grows with the number of registered providers — and each provider costs more when
+> Intel PCS or the chain RPC is slow, which is exactly when a deploy is most likely
+> to be under way. If the fleet grows or `warmer_last_success_timestamp_seconds`
+> shows sweeps taking minutes, raise `PROBE_RETRIES` to match; the failure mode of
+> too small a window is a refused cutover to a side that was going to be fine. Keep this separate from `VERIFY_*`, which sizes the
 *post-switch* check against the route cache — the two measure unrelated things.
 To fall back to the weaker liveness-only gate, point `--probe-url` at `/healthz`.
 

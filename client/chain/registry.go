@@ -79,9 +79,11 @@ const (
 	// rpcRetryBackoff is the pause before the second attempt; it doubles for each
 	// attempt after that.
 	rpcRetryBackoff = 200 * time.Millisecond
-	// rpcTotalTimeout is the belt-and-braces ceiling on the HTTP client, covering
-	// the whole retry sequence in case a per-attempt deadline is somehow not
-	// honored. It is not the operative bound — rpcAttemptTimeout is.
+	// rpcTotalTimeout is the http.Client timeout — a belt-and-braces ceiling on ONE
+	// request, not on the retry sequence (http.Client.Timeout applies per request, so
+	// each attempt gets its own). It exists only in case a per-attempt context
+	// deadline is somehow not honored; rpcAttemptTimeout is the operative bound, and
+	// the caller's context bounds the sequence.
 	rpcTotalTimeout = 15 * time.Second
 )
 

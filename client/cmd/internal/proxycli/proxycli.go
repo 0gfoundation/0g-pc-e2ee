@@ -423,11 +423,12 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 	return b
 }
 
-// warmStateMaxAge bounds how old the last warmer sweep may be before Readiness
-// stops trusting it. At three intervals (12m by default) a single missed or slow
-// sweep does not flap the answer, while a warmer that has actually stalled — or a
-// process whose sweeps keep failing to enumerate anything — turns not-ready well
-// before an operator would notice by hand.
+// warmStateMaxAge bounds how long Readiness will trust the last sweep, counted
+// from whichever is later: when a sweep last FINISHED, or when one last STARTED.
+// At three intervals (12m by default) a missed tick does not flap the answer,
+// while a warmer that has genuinely stopped turns not-ready well before an
+// operator would notice by hand — and a sweep that is simply taking a long time
+// keeps the answer alive while it runs.
 const warmStateMaxAge = 3
 
 // Readiness reports whether this process could currently serve a sealed request,
@@ -463,8 +464,21 @@ func readinessFromWarmState(s route.WarmState, interval time.Duration) error {
 	if s.At.IsZero() {
 		return errors.New("no warmer sweep has completed yet")
 	}
-	if age := time.Since(s.At); age > warmStateMaxAge*interval {
-		return fmt.Errorf("last warmer sweep was %s ago (interval %s)", age.Truncate(time.Second), interval)
+	// Age from the later of "finished" and "started", so a sweep that is merely
+	// SLOW does not read as a warmer that has STALLED. Sweep duration scales with
+	// the provider count — a DCAP verify plus a chain read each, serially, both
+	// slower precisely when the upstreams are unwell — so a fixed multiple of the
+	// interval is not a safe proxy for "something is wrong". Judging on the finish
+	// time alone would report a process not-ready for being busy re-confirming what
+	// it is still serving happily from cache. A sweep that hangs outright still ages
+	// out, because Started stops advancing too.
+	last := s.At
+	if s.Started.After(last) {
+		last = s.Started
+	}
+	if age := time.Since(last); age > warmStateMaxAge*interval {
+		return fmt.Errorf("no warmer sweep has finished or started for %s (interval %s)",
+			age.Truncate(time.Second), interval)
 	}
 	if s.Ready == 0 {
 		return fmt.Errorf("no provider is usable: 0 of %d prepared by the last sweep", s.Total)
