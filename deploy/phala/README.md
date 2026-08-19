@@ -868,7 +868,7 @@ and warmer liveness).
     `warmer_signer_refreshes_total{result="failed"}` for the sustained case. A provider
     is never rejected on a stale or cached reading without a live re-read first, so a
     broker upgrade rotating its signer does not read as an attack (see
-    `trust-chain.md`, "Operating the on-chain root").
+    `trust-chain.md`, "What hop 5 concludes, and what it does not").
   - the **boot-chain** check (hop 3) has an empty allowlist, so
     `ZG_GATEWAY_ATTEST_ENFORCE` would reject every provider. It now compares the boot
     chain (MRTD + RTMR1 + RTMR2) rather than all five registers — the same split the
@@ -883,3 +883,21 @@ and warmer liveness).
   a separate CVM. To roll one out without downtime and with instant rollback, run
   the old and new builds as two sides and flip a single DNS pointer between them
   — see [`blue-green.md`](./blue-green.md) and [`switch.sh`](./switch.sh).
+- **When a PROVIDER upgrades its broker**, expect a brief window where that
+  provider is skipped, and order the rollout to keep it brief. A broker upgrade
+  rotates the provider's `enc_pub` and `signer_addr` together and changes its
+  measurement, while the on-chain registry has room for exactly one
+  `teeSignerAddress` — so it cannot mark old and new both valid, and the chain and
+  the quote necessarily disagree for a moment in whichever order the provider does
+  it (`trust-chain.md`, "What is *not* in the trust chain"). The gateway narrows
+  that window by re-reading live rather than ruling on a cached value, and cannot
+  close it. So:
+  1. **Update the measurement allowlist before the rollout.** New code means new
+     MRTD/RTMR values, and with `ZG_GATEWAY_ATTEST_ENFORCE` on an unlisted boot
+     chain rejects the upgraded broker outright. (The allowlist is empty and
+     enforce is off today, so this is a future dependency, not a live one.)
+  2. **Keep the on-chain acknowledgement close to the roll** — the gap between the
+     two is the window.
+  3. **Expect the provider to be skipped during it.** With several providers
+     registered, candidate fallback covers it; **a single-provider deployment has
+     no fallback**, so there the window is user-visible and wants scheduling.
