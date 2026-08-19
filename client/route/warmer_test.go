@@ -417,3 +417,58 @@ func (c *cancellingRegistry) RefreshSigner(ctx context.Context, addr string) (ch
 	}
 	return chain.Signer{Address: qvSignerStr, Acknowledged: true}, nil
 }
+
+// A chain reading that acknowledges nobody must count as a mismatch even when the
+// quote refresh failed first and left no quote-bound signer to compare against.
+// Folding !Acknowledged into the comparison alone made it reachable only with a
+// quote in hand, so this provider — unusable under enforce for TWO independent
+// reasons — was counted "ok" on the signer axis, hiding the chain-side reason
+// behind the quote-side one.
+func TestWarmer_UnacknowledgedCountsAsMismatchWhenQuoteRefreshFailed(t *testing.T) {
+	var hits, status int32
+	srv := warmerServer(t, &hits, []string{"0xa"}, &status)
+	atomic.StoreInt32(&status, http.StatusInternalServerError) // quote refresh fails
+	reg := &countingRegistry{signer: qvSignerStr, ack: false}  // chain vouches for nobody
+	r := New(srv.URL,
+		WithQuoteVerification(qvVerifier(t), discardLogger()),
+		WithOnChainVerification(reg, false, discardLogger()))
+
+	before := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="mismatch"}`)
+	okBefore := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="ok"}`)
+	r.WarmOnce(context.Background(), fakeResolver{url: srv.URL})
+
+	if got := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="mismatch"}`); got != before+1 {
+		t.Errorf("mismatch counter moved by %v, want 1 (the chain acknowledged nobody)", got-before)
+	}
+	if got := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="ok"}`); got != okBefore {
+		t.Errorf("ok counter moved by %v, want 0: nothing agreed here", got-okBefore)
+	}
+}
+
+// The narrower case the new bucket exists for: the chain DID acknowledge someone, so
+// it is not a mismatch, but the quote refresh failed so no comparison happened. That
+// is neither "ok" (nothing was confirmed) nor "mismatch" (nothing disagreed).
+func TestWarmer_NoQuoteSignerCountsAsUnchecked(t *testing.T) {
+	var hits, status int32
+	srv := warmerServer(t, &hits, []string{"0xa"}, &status)
+	atomic.StoreInt32(&status, http.StatusInternalServerError) // quote refresh fails
+	reg := &countingRegistry{signer: qvSignerStr, ack: true}   // chain acknowledges someone
+	r := New(srv.URL,
+		WithQuoteVerification(qvVerifier(t), discardLogger()),
+		WithOnChainVerification(reg, false, discardLogger()))
+
+	before := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="unchecked"}`)
+	okBefore := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="ok"}`)
+	mmBefore := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="mismatch"}`)
+	r.WarmOnce(context.Background(), fakeResolver{url: srv.URL})
+
+	if got := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="unchecked"}`); got != before+1 {
+		t.Errorf("unchecked counter moved by %v, want 1", got-before)
+	}
+	if got := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="ok"}`); got != okBefore {
+		t.Errorf("ok counter moved by %v, want 0: no comparison was made", got-okBefore)
+	}
+	if got := metricValue(t, `zg_gateway_warmer_signer_refreshes_total{result="mismatch"}`); got != mmBefore {
+		t.Errorf("mismatch counter moved by %v, want 0: nothing disagreed", got-mmBefore)
+	}
+}

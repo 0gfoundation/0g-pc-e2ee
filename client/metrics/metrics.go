@@ -162,9 +162,11 @@ var (
 	warmerSignerRefresh = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "warmer_signer_refreshes_total",
 		Help: "Per-provider on-chain signer refreshes by the warmer, by result " +
-			"(ok|failed|mismatch). failed is our chain RPC; mismatch is the chain declining " +
-			"to vouch for the quote-bound signer, which under enforce makes that provider " +
-			"unusable and can hold back a blue/green cutover.",
+			"(ok|failed|mismatch|unchecked). failed is our chain RPC; mismatch is the chain " +
+			"declining to vouch for the quote-bound signer, which under enforce makes that " +
+			"provider unusable and can hold back a blue/green cutover; unchecked is a reading " +
+			"that acknowledged someone but had no quote-bound signer to compare against, " +
+			"because the quote refresh failed first (see verify_failed).",
 	}, []string{"result"})
 	warmerReadyProviders = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "warmer_ready_providers",

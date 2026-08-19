@@ -245,16 +245,30 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 				// fact serving every request — reporting OUR chain RPC's problem as the
 				// standby's.
 				prepared = prepared && !r.onchainEnforce
-			case quoteSigner != "" && !signerAgrees(got, quoteSigner):
+			case !got.Acknowledged || (quoteSigner != "" && !signerAgrees(got, quoteSigner)):
 				// The lookup worked and disagreed. Ask the same question a request asks,
 				// rather than treating "the RPC answered" as success: an unacknowledged or
 				// mismatched signer is a provider enforce would skip, so counting it ready
 				// would send traffic to a side where every request fails.
+				//
+				// !Acknowledged is tested on its own, ahead of the comparison, because it
+				// needs no quote to interpret: a chain that vouches for NOBODY fails hop 5
+				// whatever the quote says. Folding it into signerAgrees alone made it
+				// reachable only with a quote signer in hand, so an unacknowledged provider
+				// whose quote refresh had also failed was counted "ok" — hiding the second,
+				// independent reason that provider can never become ready behind the first.
 				metrics.WarmerSignerRefresh("mismatch")
 				r.logger.Warn("warmer: on-chain signer does not vouch for the quote-bound signer",
 					"provider", addr, "quote_signer", quoteSigner,
 					"onchain_signer", got.Address, "acknowledged", got.Acknowledged)
 				prepared = prepared && !r.onchainEnforce
+			case quoteSigner == "":
+				// The chain acknowledges someone, but refreshQuote failed above so there is
+				// no quote-bound signer to compare it against. Its own bucket rather than
+				// "ok": nothing was actually checked, and "ok" is the series an operator
+				// reads as "agreement confirmed". prepared is already false from
+				// verify_failed, which is the metric that says why.
+				metrics.WarmerSignerRefresh("unchecked")
 			default:
 				metrics.WarmerSignerRefresh("ok")
 			}
