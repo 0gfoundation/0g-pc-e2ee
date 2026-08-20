@@ -158,7 +158,18 @@ Backward compatible; sealed mode is opt-in ("privacy mode").
   attesting that the code does not cache. A server timestamp/nonce in the signed
   text is the belt-and-suspenders fix. Tracked separately from this doc.
 - **Extra round trip:** the control-plane call adds latency; amortized by caching
-  candidate pubkeys/quotes by measurement.
+  candidate pubkeys/quotes by measurement. The route-preview half is **not**
+  cached and deliberately so — the ranking has to reflect the live fleet — which
+  makes it the only outbound dependency on the request path with nothing in front
+  of it, and so the one whose blips are felt directly. It is retried instead
+  (`route.previewAttempts`), inside a budget sized so the retries add no worst
+  case a single attempt did not already carry (`route.previewRetryBudget`); a
+  definitive answer (4xx, 429, an empty candidate list) is never retried.
+- **Candidate walk is bounded, not free:** the candidate list comes from the
+  untrusted router and is walked serially, so `core.resolveBudget` caps the total
+  time one call may spend *materializing* candidates. The first candidate always
+  gets the whole budget, so a cold cache still works; a long chain of unreachable
+  providers is cut short rather than kept a caller waiting through all of it.
 
 ---
 

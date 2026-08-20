@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/proof"
@@ -244,5 +245,112 @@ func TestSealedFieldsForFiltersByPresence(t *testing.T) {
 	want := []string{"messages", "metadata"} // configured order, present only
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("sealedFieldsFor = %v, want %v", got, want)
+	}
+}
+
+// slowCandidates is a candidate chain whose materialization blocks until its
+// context ends, recording how many candidates were reached. It stands in for a
+// chain of unreachable providers — the case resolveBudget exists to bound.
+type slowCandidates struct {
+	n       int
+	reached int
+}
+
+func (s *slowCandidates) Len() int { return s.n }
+
+func (s *slowCandidates) Provider(ctx context.Context, i int) (Provider, error) {
+	s.reached++
+	<-ctx.Done()
+	return Provider{}, ctx.Err()
+}
+
+// The first candidate always gets the whole budget, so the walk can never refuse
+// to try anybody — a cold start with one slow provider must still reach it.
+func TestCandidateWalkAlwaysTriesTheFirstCandidate(t *testing.T) {
+	var w candidateWalk
+	cands := &slowCandidates{n: 3}
+	// Pre-charge to just under the budget so the (blocking) materialization returns
+	// promptly instead of holding the test for the full 90s.
+	w.spent = resolveBudget - 50*time.Millisecond
+
+	if _, err := w.provider(context.Background(), cands, 0); err == nil {
+		t.Fatal("a materialization that ran out of budget should error")
+	}
+	if cands.reached != 1 {
+		t.Fatalf("candidates reached = %d, want 1", cands.reached)
+	}
+	if !w.exhausted() {
+		t.Fatal("the budget should be exhausted after a materialization that consumed it")
+	}
+}
+
+// Once the budget is gone the walk reports it WITHOUT touching the resolver: every
+// remaining candidate would fail the same way, and the caller is better served by
+// the failure already in hand.
+func TestCandidateWalkStopsWithoutCallingTheResolver(t *testing.T) {
+	w := candidateWalk{spent: resolveBudget}
+	cands := &slowCandidates{n: 5}
+
+	_, err := w.provider(context.Background(), cands, 2)
+	if err == nil {
+		t.Fatal("want an error once the budget is spent, got nil")
+	}
+	if cands.reached != 0 {
+		t.Fatalf("the resolver was called %d time(s) with no budget left; want 0", cands.reached)
+	}
+	var e *Error
+	if !errors.As(err, &e) || e.Stage != StageUpstream {
+		t.Fatalf("want a StageUpstream *Error, got %v (%T)", err, err)
+	}
+	if !strings.Contains(err.Error(), "budget") {
+		t.Errorf("error should name the budget, got %q", err.Error())
+	}
+}
+
+// The budget is shared across the chain, so a walk down several slow candidates
+// costs the budget ONCE in total rather than once per candidate.
+func TestCandidateWalkBudgetIsSharedAcrossCandidates(t *testing.T) {
+	var w candidateWalk
+	cands := &slowCandidates{n: 4}
+	w.spent = resolveBudget - 50*time.Millisecond
+
+	start := time.Now()
+	for i := 0; i < cands.n; i++ {
+		if _, err := w.provider(context.Background(), cands, i); err != nil && w.exhausted() {
+			break
+		}
+	}
+	elapsed := time.Since(start)
+
+	if cands.reached != 1 {
+		t.Fatalf("candidates reached = %d, want 1 (the first exhausts the shared budget)", cands.reached)
+	}
+	// Generous bound: the point is that the remaining candidates cost nothing, not
+	// the precise timing of the one that ran.
+	if elapsed > 5*time.Second {
+		t.Fatalf("the walk took %s; the budget is not being shared across candidates", elapsed)
+	}
+}
+
+// Time spent on an ATTEMPT is not charged to the budget — only materialization is
+// — so a long, legitimate inference on the head candidate cannot starve a later
+// fallback of the budget it needs to materialize.
+func TestCandidateWalkChargesOnlyMaterialization(t *testing.T) {
+	var w candidateWalk
+	cands := staticCandidates{Provider{URL: "https://example.test"}, Provider{URL: "https://example.test"}}
+
+	if _, err := w.provider(context.Background(), cands, 0); err != nil {
+		t.Fatalf("materialize candidate 0: %v", err)
+	}
+	// Stand in for a long attempt against the materialized provider.
+	time.Sleep(20 * time.Millisecond)
+	if _, err := w.provider(context.Background(), cands, 1); err != nil {
+		t.Fatalf("materialize candidate 1 after a long attempt: %v", err)
+	}
+	if w.exhausted() {
+		t.Fatal("two instant materializations should not exhaust the budget")
+	}
+	if w.spent > time.Second {
+		t.Errorf("spent = %s; the attempt's own duration was charged to the budget", w.spent)
 	}
 }

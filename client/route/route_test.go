@@ -127,6 +127,9 @@ type mockRouter struct {
 	lastChatHeaders http.Header
 	lastChatModel   string            // cleartext "model" the data-plane request carried
 	status          int               // override preview response status; 0 = 200
+	previewHits     int32             // preview attempts served (retry assertions)
+	previewFailN    int32             // fail the first N preview attempts with previewFailStatus
+	previewFailCode int               // status for previewFailN attempts (0 = 503)
 	noProviders     bool              // preview returns no providers
 	previewAddress  string            // head provider's address in preview (default testProviderAddr)
 	extra           []previewProvider // extra candidates appended after the head
@@ -142,12 +145,24 @@ func newMockRouter(t *testing.T, broker *mockBroker) *mockRouter {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /v1/routing/preview", func(w http.ResponseWriter, r *http.Request) {
+		hit := atomic.AddInt32(&m.previewHits, 1)
 		body, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(body, &m.lastPreview)
 		m.lastAuth = r.Header.Get("Authorization")
 		m.lastHeaders = r.Header.Clone()
 		if m.status != 0 {
 			http.Error(w, "boom", m.status)
+			return
+		}
+		// Fail the first previewFailN attempts, so a test can assert the client
+		// retried its way past a transient router failure (and that each attempt
+		// carried the full request again).
+		if hit <= m.previewFailN {
+			code := m.previewFailCode
+			if code == 0 {
+				code = http.StatusServiceUnavailable
+			}
+			http.Error(w, "transient router failure", code)
 			return
 		}
 		providers := []previewProvider{{
@@ -687,6 +702,132 @@ func TestResolveNoProvidersIs503(t *testing.T) {
 
 	_, err := New(router.srv.URL).Resolve(context.Background(), chatReq())
 	assertStageStatus(t, err, core.StageUpstream, http.StatusServiceUnavailable)
+}
+
+// Preview is the one request-path dependency with no cache in front of it, so a
+// transient router failure must not cost the caller its completion: the client
+// retries and resolves off a later attempt.
+func TestPreviewRetriesTransientFailure(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	router.previewFailN = previewAttempts - 1 // every attempt but the last
+
+	provider, err := resolveHead(context.Background(), New(router.srv.URL), chatReq())
+	if err != nil {
+		t.Fatalf("Resolve after %d transient preview failures: %v", router.previewFailN, err)
+	}
+	if provider.Address != testProviderAddr {
+		t.Errorf("provider address = %q, want %q", provider.Address, testProviderAddr)
+	}
+	if got := atomic.LoadInt32(&router.previewHits); got != previewAttempts {
+		t.Errorf("preview attempts = %d, want %d", got, previewAttempts)
+	}
+	// Each attempt must carry the whole request again, not an already-drained body:
+	// the retry re-wraps the marshaled payload rather than reusing one reader.
+	if _, ok := router.lastPreview["service_type"]; !ok {
+		t.Error("the succeeding attempt carried no service_type; the request body did not survive the retry")
+	}
+	if _, leaked := router.lastPreview["messages"]; leaked {
+		t.Error("a retried preview leaked the prompt to the router")
+	}
+}
+
+// A router that keeps failing is surfaced with its real status once the attempts
+// run out — not masked by a retry-budget message, which would tell the caller
+// nothing about what the router did.
+func TestPreviewGivesUpAfterAttempts(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	router.previewFailN = previewAttempts + 5 // never recovers
+
+	_, err := New(router.srv.URL).Resolve(context.Background(), chatReq())
+	assertStageStatus(t, err, core.StageUpstream, http.StatusServiceUnavailable)
+	if got := atomic.LoadInt32(&router.previewHits); got != previewAttempts {
+		t.Errorf("preview attempts = %d, want %d", got, previewAttempts)
+	}
+}
+
+// A definitive failure is not retried: a 4xx recurs identically, and a 429 is the
+// router's own limiter — another attempt would spend more of the caller's
+// allowance to be told the same thing. Both must reach the caller on the first
+// attempt, with their status intact.
+func TestPreviewDoesNotRetryDefinitiveFailures(t *testing.T) {
+	for _, status := range []int{
+		http.StatusUnauthorized,
+		http.StatusNotFound,
+		http.StatusTooManyRequests,
+	} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			broker := newMockBroker(t)
+			router := newMockRouter(t, broker)
+			router.previewFailN = previewAttempts + 5
+			router.previewFailCode = status
+
+			_, err := New(router.srv.URL).Resolve(context.Background(), chatReq())
+			assertStageStatus(t, err, core.StageUpstream, status)
+			if got := atomic.LoadInt32(&router.previewHits); got != 1 {
+				t.Errorf("preview attempts = %d, want 1 (a %d must not be retried)", got, status)
+			}
+		})
+	}
+}
+
+// An empty candidate list is the router ANSWERING — negatively, but answering —
+// so it is not retried either: the 503 is about the fleet, not about reaching the
+// router.
+func TestPreviewDoesNotRetryEmptyCandidateList(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	router.noProviders = true
+
+	_, err := New(router.srv.URL).Resolve(context.Background(), chatReq())
+	assertStageStatus(t, err, core.StageUpstream, http.StatusServiceUnavailable)
+	if got := atomic.LoadInt32(&router.previewHits); got != 1 {
+		t.Errorf("preview attempts = %d, want 1", got)
+	}
+}
+
+// A caller that has already given up must not be made to sit through the retry
+// schedule: the cancelled context ends the sequence instead of the attempts doing.
+func TestPreviewStopsRetryingOnCancelledContext(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	router.previewFailN = previewAttempts + 5
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel as soon as the first attempt has been served, so the cancellation lands
+	// while the client is in (or about to enter) its first backoff.
+	go func() {
+		for atomic.LoadInt32(&router.previewHits) == 0 {
+			time.Sleep(time.Millisecond)
+		}
+		cancel()
+	}()
+
+	_, err := New(router.srv.URL).Resolve(ctx, chatReq())
+	if err == nil {
+		t.Fatal("Resolve with a cancelled context: want error, got nil")
+	}
+	if got := atomic.LoadInt32(&router.previewHits); got >= previewAttempts {
+		t.Errorf("preview attempts = %d, want fewer than %d (cancellation should cut the sequence short)", got, previewAttempts)
+	}
+}
+
+func TestRetryablePreviewStatus(t *testing.T) {
+	for status, want := range map[int]bool{
+		http.StatusBadRequest:          false,
+		http.StatusUnauthorized:        false,
+		http.StatusNotFound:            false,
+		http.StatusTooManyRequests:     false, // unlike the data plane — see previewOnce
+		http.StatusInternalServerError: true,
+		http.StatusBadGateway:          true,
+		http.StatusServiceUnavailable:  true,
+		http.StatusGatewayTimeout:      true,
+	} {
+		if got := retryablePreviewStatus(status); got != want {
+			t.Errorf("retryablePreviewStatus(%d) = %v, want %v", status, got, want)
+		}
+	}
 }
 
 // A candidate without a USABLE address can't be pinned, so the router could

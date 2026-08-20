@@ -2,6 +2,8 @@ package core
 
 import (
 	"context"
+	"fmt"
+	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
@@ -44,6 +46,54 @@ type Candidates interface {
 	// error like Resolve.
 	Provider(ctx context.Context, i int) (Provider, error)
 }
+
+// resolveBudget bounds the TOTAL time one Complete/CompleteStream call may spend
+// MATERIALIZING candidates, summed across the whole chain.
+//
+// Materializing ONE candidate is already bounded by the resolver — route caps a
+// DCAP quote verification at a minute and a chain read at a few seconds — but the
+// NUMBER of candidates is not: the list comes from the untrusted router, and the
+// client walks it serially, re-sealing to each in turn. So a chain of unreachable
+// providers multiplies that per-candidate bound by however many the router chose
+// to send, and the caller waits through all of them before seeing an error. This
+// is the ceiling on that product; nothing else imposes one.
+//
+// Sized to admit one full COLD materialization — a cache-miss quote verification
+// plus the chain read that grounds it — so a request arriving before the warmer
+// has swept still succeeds, and only a genuinely long walk is cut short. The first
+// candidate always gets the whole budget (spent starts at zero), so this can never
+// refuse to try anybody: at worst it stops the walk after someone has been tried.
+const resolveBudget = 90 * time.Second
+
+// candidateWalk meters one walk down a Candidates chain, charging each
+// materialization against resolveBudget. It is not safe for concurrent use: one
+// walk belongs to one Complete/CompleteStream call.
+type candidateWalk struct{ spent time.Duration }
+
+// provider materializes candidate i under whatever is left of the budget, charging
+// what it takes. Time spent on the ATTEMPT against a materialized provider is
+// deliberately not charged — only materialization is — so a long, legitimate
+// inference on the head candidate cannot exhaust the budget a later fallback needs.
+//
+// A caller that gets an error checks exhausted() to tell "this candidate failed"
+// from "there is nothing left to try one with".
+func (w *candidateWalk) provider(ctx context.Context, cands Candidates, i int) (Provider, error) {
+	remaining := resolveBudget - w.spent
+	if remaining <= 0 {
+		return Provider{}, &Error{Stage: StageUpstream, Err: fmt.Errorf(
+			"provider selection budget (%s) spent before candidate %d could be prepared", resolveBudget, i)}
+	}
+	ctx, cancel := context.WithTimeout(ctx, remaining)
+	defer cancel()
+	start := time.Now()
+	p, err := cands.Provider(ctx, i)
+	w.spent += time.Since(start)
+	return p, err
+}
+
+// exhausted reports that the budget is gone, so continuing down the chain would
+// only reproduce the same failure once per remaining candidate.
+func (w *candidateWalk) exhausted() bool { return w.spent >= resolveBudget }
 
 // staticResolver always returns the same single provider, ignoring the request —
 // the low-level case for a caller that already holds a provider identity. It

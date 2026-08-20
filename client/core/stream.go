@@ -59,10 +59,17 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 	// committed to that provider and cannot be restarted on another (streaming
 	// fallback is pre-first-token only — docs/design/router-e2e.md "Limitations").
 	var lastErr error
+	// One shared materialization budget for the whole walk, as in Complete — a
+	// stream that has not started yet has a caller waiting on it just the same (see
+	// resolveBudget).
+	var walk candidateWalk
 	for i := 0; i < cands.Len(); i++ {
-		provider, err := cands.Provider(ctx, i)
+		provider, err := walk.provider(ctx, cands, i)
 		if err != nil {
 			lastErr = resolveErr(err)
+			if walk.exhausted() {
+				break
+			}
 			continue
 		}
 		sealed, err := c.seal(provider, req, ephPub)

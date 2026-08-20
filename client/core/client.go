@@ -338,12 +338,21 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 	// provider failure, re-seal to the next and retry (SPEC §4.4). lastErr holds
 	// the most recent failure so a fully exhausted chain surfaces a real cause.
 	var lastErr error
+	// The walk charges every materialization against one shared budget, so a long
+	// chain of unreachable candidates cannot keep the caller waiting indefinitely
+	// (see resolveBudget).
+	var walk candidateWalk
 	for i := 0; i < cands.Len(); i++ {
-		provider, err := cands.Provider(ctx, i)
+		provider, err := walk.provider(ctx, cands, i)
 		if err != nil {
 			// This candidate could not be materialized (e.g. its pubkey fetch
-			// failed); skip it and try the next.
+			// failed); skip it and try the next — unless the budget is gone, in which
+			// case every remaining candidate would fail the same way and the caller is
+			// better served by the failure we already have.
 			lastErr = resolveErr(err)
+			if walk.exhausted() {
+				break
+			}
 			continue
 		}
 
