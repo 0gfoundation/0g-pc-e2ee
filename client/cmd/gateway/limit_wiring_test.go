@@ -28,6 +28,14 @@ import (
 // why blocking it is enough — no sealing or provider key material is involved.
 func blockedGateway(t *testing.T, maxInFlight int, identity *identityCache) (gw *httptest.Server, entered <-chan struct{}) {
 	t.Helper()
+	return blockedGatewayWith(t, maxInFlight, identity, nil)
+}
+
+// blockedGatewayWith is blockedGateway with the provider-identity route mounted
+// too, for the test that the panel's provider hop is also served while the cap is
+// full.
+func blockedGatewayWith(t *testing.T, maxInFlight int, identity *identityCache, providerIdentities route.ProviderIdentitySource) (gw *httptest.Server, entered <-chan struct{}) {
+	t.Helper()
 	release := make(chan struct{})
 	reached := make(chan struct{}, 8)
 
@@ -39,7 +47,8 @@ func blockedGateway(t *testing.T, maxInFlight int, identity *identityCache) (gw 
 	router := httptest.NewServer(routerMux)
 
 	client := core.NewWithResolver(route.New(router.URL))
-	gw = httptest.NewServer(newHandler(client, mustURL(t, router.URL), testOrigins(), "", "", maxInFlight, identity, discardLogger()))
+	gw = httptest.NewServer(newHandler(client, mustURL(t, router.URL), testOrigins(), "", "",
+		maxInFlight, identity, providerIdentities, nil, discardLogger()))
 
 	// Cleanup runs LIFO, and Close blocks on in-flight requests — so the parked
 	// handler must be released before either server is closed, which means

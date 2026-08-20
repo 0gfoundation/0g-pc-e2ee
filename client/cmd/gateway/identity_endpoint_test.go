@@ -469,7 +469,7 @@ func identityGateway(t *testing.T, cache *identityCache) *httptest.Server {
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	t.Cleanup(router.Close)
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, router.URL), testOrigins(), "", "", noInFlightCap, cache, discardLogger()))
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, router.URL), testOrigins(), "", "", noInFlightCap, cache, nil, nil, discardLogger()))
 	t.Cleanup(gw.Close)
 	return gw
 }
@@ -654,7 +654,7 @@ func TestIdentityRoute_NotMountedWhenDisabled(t *testing.T) {
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	t.Cleanup(router.Close)
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, router.URL), testOrigins(), "", "", noInFlightCap, nil, discardLogger()))
+	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, router.URL), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
 	t.Cleanup(gw.Close)
 
 	resp, err := http.Get(gw.URL + identityPath)

@@ -153,13 +153,56 @@ on-chain root lets you trust *that* enclave — defeating the "real TEE, real co
 wrong operator" impersonation that an untrusted router is best positioned to
 mount.
 
+### What hop 5 concludes, and what it does not
+
+Hop 5 compares two independently-cached readings — the quote-bound signer and the
+chain's acknowledged `teeSignerAddress` — so a negative can be about either the
+provider or the *readings*. Two rules follow, both enforced in `client/route`:
+
+- **A failed lookup is not a verdict, and not a pass.** Under `-onchain-enforce` an
+  unreadable chain fails the candidate, so enforce means the chain was actually
+  read; but it is counted as its own class, never as a `mismatch`, so a problem with
+  our own RPC never reads as an accusation against a provider. There is deliberately
+  no switch to proceed ungrounded: a check an adversary can turn off by degrading
+  one RPC endpoint is not one anything may call proven.
+- **Cached evidence may confirm, never condemn.** A cached reading that agrees with
+  the quote is accepted; one that disagrees is re-read live before any rejection,
+  on either side of the comparison. The reason is the rotation window in
+  [What is *not* in the trust chain](#what-is-not-in-the-trust-chain), not
+  fastidiousness.
+
+The consequence for the layers above: under enforce, grounding cannot silently
+lapse, so a panel labelling the provider address *proven* can say so from the mode
+alone rather than carrying a per-request grounding flag.
+
+Operating it — the metrics to watch before enabling enforce, and the caches and
+backoffs that keep the strict default affordable — is in
+[`deploy/phala/README.md`](../../deploy/phala/README.md) and
+[`deploy/grafana/README.md`](../../deploy/grafana/README.md).
+
 ## What is *not* in the trust chain
 
 Honest gaps — half the value of this diagram is marking them (see
 [`router-e2e.md` Limitations](./router-e2e.md#limitations)):
 
-- **Metadata leaks to the router**: `model`, coarse token counts, timing, packet
-  sizes remain visible.
+- **A signer rotation cannot be expressed atomically.** The registry holds exactly
+  one `teeSignerAddress` and one `teeSignerAcknowledged` flag per provider, so it
+  cannot say "old and new are both valid for the next few minutes". A broker upgrade
+  rotates `enc_pub` and `signer_addr` together (both out of one `report_data`, so
+  they never split), which means that during any rollout the chain and the quote
+  name different signers for a while — in whichever order the operator does it. The
+  resolver narrows the window by re-reading live rather than ruling on a cached
+  reading, but it cannot close it: what remains is a deployment-ordering concern,
+  and the runbook is in [`deploy/phala/README.md`](../../deploy/phala/README.md).
+
+- **Metadata leaks to the router**: `model`, timing and packet sizes remain
+  visible — and token usage **exactly**, not approximately: [`SPEC.md` §7](../../protocol/SPEC.md#7-sealed-response-envelope-v1)
+  leaves `usage` cleartext so the router can bill on it. Sizes are exact for the
+  same kind of reason: ChaCha20-Poly1305 adds a 16-byte tag and no padding, so a
+  ciphertext's length is its plaintext's length plus a constant. On a stream,
+  per-frame timing is visible too. What the router cannot do is *alter* any of
+  it — `usage` is in the AAD and covered by the §8 signature, so it reads and
+  bills but cannot forge (hop 10).
 - **Verifiable relay, not verifiable computation**: the chain proves the enclave
   produced this exact response to this exact request; it does **not** prove the
   upstream model (`M`) behaved. The segment past hop 12 into `M` is outside the
@@ -186,7 +229,7 @@ particular is implemented against an allowlist that is still empty.
 | Hop 2 — TDX quote signature-chain verification | **Implemented.** A real go-tdx-guest DCAP verifier (quote chain → Intel root + QE identity + TCB status) fills the `WithQuoteParser` seam, wired into the sidecar, gateway, and route resolver. The seam stays in `protocol/attest` by design (keeps `protocol` lean/portable); the heavy verifier lives in the client. | `client/dcap/tdxverify.go`, `client/cmd/{sidecar,gateway}/main.go`, #29 / #31 |
 | Hop 3 — boot-chain allowlist | **Implemented, allowlist empty.** `Verifier.Verify` compares the quote's `BootChain` (MRTD + RTMR1 + RTMR2) against `BootChainPolicy` in enforce/warn modes (`-attest-enforce`). **The audited-image allowlist is still empty**, so warn mode proceeds on any image and enforce rejects every provider — reporting `ErrMeasurementPolicyNotConfigured`, which names the unfinished configuration rather than blaming the enclave. What remains is where the values are published, not the mechanism. | `attest/verify.go`, `attest/measurement.go`, `client/cmd/gateway/main.go`, #31 |
 | Hop 4 — `report_data` → `enc_pub`/`signer_addr` | **Implemented.** `ParseReportData` (SPEC §4.2 layout). | `attest/reportdata.go` |
-| Hop 5 — `signer_addr == on-chain teeSignerAddress` | **Implemented (warn/enforce).** The route resolver cross-checks the DCAP-quote-bound signer against the provider's *acknowledged* `teeSignerAddress` read from the on-chain InferenceServing registry (`getService`), keyed on the provider's on-chain account — a mapping the untrusted router cannot forge. This is what catches a *genuine* enclave running audited code but operated by an unregistered party ([Why the on-chain root exists](#why-the-on-chain-root-exists)). Enforce skips a missing/unacknowledged/mismatched candidate; warn observes only. Reads the chain over a client-trusted RPC (`-onchain`, `-chain-rpc-url`), not the router. | `client/chain/registry.go`, `client/route` `WithOnChainVerification`, #18 |
+| Hop 5 — `signer_addr == on-chain teeSignerAddress` | **Implemented (warn/enforce).** The route resolver cross-checks the DCAP-quote-bound signer against the provider's *acknowledged* `teeSignerAddress` read from the on-chain InferenceServing registry (`getService`), keyed on the provider's on-chain account — a mapping the untrusted router cannot forge. This is what catches a *genuine* enclave running audited code but operated by an unregistered party ([Why the on-chain root exists](#why-the-on-chain-root-exists)). Enforce skips a missing/unacknowledged/mismatched candidate; warn observes only. A failed *lookup* is fail-closed too, with no opt-out — so enforce means the chain was actually read — but is counted as its own class rather than as a provider accusation; and a negative is never returned on stale or cached evidence without a live re-read ([What hop 5 concludes, and what it does not](#what-hop-5-concludes-and-what-it-does-not)). Reads the chain over a client-trusted RPC (`-onchain`, `-chain-rpc-url`), not the router. | `client/chain/registry.go`, `client/route` `WithOnChainVerification`, #18 |
 | Hops 6–9 — HPKE seal/open, AAD binding | **Implemented.** | `crypto/`, `wire/` |
 | Hop 11 — signature verify against signer | **Implemented (opt-in, `-verify-responses`).** The client recomputes the §8 ciphertext binding over the on-wire `aad‖ciphertext` it received (non-stream, and streamed via an ordered per-frame aggregate), recovers the EIP-191 signer, and accepts only if it equals `provider.SignerAddr` — the quote-bound signer, itself grounded on-chain when `-onchain` is on (hop 5) — never the self-reported `signing_address`. The signature is fetched **directly from the provider's broker endpoint** (the router does not proxy `/v1/proxy/signature`). Fail-closed; off by default. The versioned signed-text/binding contract is shared with the broker in `protocol/proof` (no drift). | `protocol/proof`, `client/sig`, `client/core` (verify.go), `client/route` (sigfetch.go) |
 
