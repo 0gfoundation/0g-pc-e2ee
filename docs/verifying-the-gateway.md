@@ -318,6 +318,76 @@ the published releases already.
 
 ---
 
+## What the gateway says about the *provider* it sealed to
+
+The address a response was sealed to and pinned to comes back in the `X-Provider`
+response header. Ask about it:
+
+```sh
+curl -s https://<gateway-domain>/v1/providers/0x7B3f…9aC1/identity
+```
+
+```jsonc
+{
+  "address": "0x7B3f…9aC1",
+  "endpoint": "https://broker-07.0g.ai",
+  "verdicts": {
+    "quote_dcap": "pass",          // genuine, Intel-rooted TDX quote binding these keys
+    "onchain_signer": "pass",      // its signer is the acknowledged teeSignerAddress on chain
+    "measurement": "no_baseline"   // the audited boot-chain allowlist is empty (hop 3)
+  },
+  "os_image": null,
+  "compose_hash": "8779f38c…",
+  "verify": "recheck this provider yourself: GET https://broker-07.0g.ai/v1/quote?legacy=false direct from the provider and DCAP-verify it. …"
+}
+```
+
+**Unlike the self-description above, this one does carry verdicts — and that is
+correct.** These are checks the gateway actually ran on a *third party* before it
+sealed your prompt to that enclave: it fetched that provider's quote, DCAP-verified it
+against Intel's roots, and compared the signer bound into it against the provider's
+acknowledged `teeSignerAddress` on chain. Hiding those would hide the only
+verification in the picture.
+
+**But they are the gateway's verdicts, not yours.** They are worth exactly as much as
+your trust in the gateway itself — which is what `pcverify -gateway <domain>` is for.
+Read the fields as "the gateway verified this for me", and if you want the claim first
+hand, fetch the provider's quote from the provider (the `verify` string names the URL)
+and verify it yourself; the endpoint deliberately does not relay the quote bytes for
+you.
+
+Reading the verdicts:
+
+| Value | Means |
+|---|---|
+| `pass` | the check ran and was positive |
+| `no_match` | the check ran and was **negative** — a real finding about the provider |
+| `no_baseline` | there was nothing to compare against, so the check did not run |
+| `unavailable` | the check should have run but could not complete (e.g. the chain RPC was down) |
+| `not_checked` | this deployment does not perform that check at all |
+
+`measurement` is `no_baseline` on every deployment today: that is hop 3's empty
+allowlist (see `docs/design/trust-chain.md`), the same gap `pcverify` reports as an
+incomplete run. Render it as "observed only" — not as a pass, and not as a failure.
+`onchain_signer` is `not_checked` unless the deployment runs with `ZG_GATEWAY_ONCHAIN`.
+
+Two things the endpoint will not do. It answers **only for providers this gateway has
+checked while serving a request**, and only for a few minutes afterwards — any other
+address is a `404`, and no address makes it fetch a quote, so it is not a quote proxy or
+a scanner. And it returns no raw quote and no measurement registers: what you would do
+with those is verify the quote, which you should do at the source.
+
+A provider the gateway *rejected* is reported too, with the verdict that rejected it —
+better than leaving an earlier `pass` standing while every request is refusing that
+provider. The one exception is a quote that failed DCAP outright: that leaves no record,
+so the address simply `404`s.
+
+It needs `ZG_GATEWAY_ATTEST` (without quote verification there are no verdicts to
+report, and the route is not mounted at all) and can be switched off with
+`ZG_GATEWAY_PROVIDER_IDENTITY_ENDPOINT=false`.
+
+---
+
 ## Trust assumptions, stated plainly
 
 **Intel.** The attestation root. If Intel's signing infrastructure is compromised or

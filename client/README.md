@@ -66,6 +66,9 @@ sdk/
 > buffered and streaming). The sidecar serves it as-is; the gateway adds `GET /healthz`,
 > the public attestation bundle at `/evidences/`, its own self-description at
 > `GET /v1/gateway/identity` (display material, not evidence — see `identity.go`),
+> what it verified about each provider it sealed to at
+> `GET /v1/providers/{address}/identity` (relayed verdicts, not evidence — see
+> `provideridentity.go`),
 > a catch-all `/` that proxies to the router for non-inference routes, and — on a
 > separate internal listener the compose never publishes — `GET /metrics` plus an
 > optional pprof (see `-metrics-listen` / `-pprof`). `cmd/sidecar`,
@@ -188,6 +191,16 @@ endpoint is **not** a substitute for this tool and does not try to be: it verifi
 nothing, signs nothing, and exists only so there is something to show. `pcverify`
 rederives every one of those values independently — and does the endpoint binding, the
 one step no web page can perform. If the two disagree, `pcverify` is right.
+
+The provider side is a different kind of claim, and has its own route: `GET
+/v1/providers/{address}/identity` reports what the gateway **verified** about a
+provider it sealed to — the DCAP verdict on that provider's quote, the on-chain signer
+comparison, the boot-chain verdict (`no_baseline` today, hop 3), its `compose_hash`
+(`cmd/gateway/provideridentity.go`, `route/provideridentity.go`). Those checks really
+happened, on a third party, before the seal; what the endpoint cannot do is make them
+*yours*. It answers only for providers it has checked while serving a request, never
+fetches a quote, and returns no quote bytes — anyone re-verifying should fetch that
+provider's `/v1/quote` direct, which is what the response's `verify` string names.
 
 `-allow-untrusted-cert` (gateway mode) is for a hostname on the ACME staging CA. Every
 check runs either way — the evidence fetch does not verify PKI, since it rides the same

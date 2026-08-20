@@ -1,0 +1,169 @@
+package main
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
+	"github.com/0gfoundation/0g-pc-e2ee/client/route"
+)
+
+// providerIdentityPath is the public route this serves. The {address} wildcard is
+// the provider's on-chain account — the same value the gateway returns in the
+// X-Provider response header, so a panel asks about the provider it was actually
+// sealed to and pinned to rather than one the router named.
+const providerIdentityPath = "/v1/providers/{address}/identity"
+
+// THIS ENDPOINT REPORTS VERDICTS, AND THAT IS DELIBERATE — it is the one place the
+// gateway is allowed to, which is worth stating next to /v1/gateway/identity, where
+// the opposite rule holds.
+//
+// /v1/gateway/identity is the gateway describing ITSELF: nothing verified anything,
+// so it carries no verdict of any shape and never should. Here the gateway reports
+// checks it genuinely PERFORMED on a THIRD PARTY — a DCAP verification of the
+// provider's quote against Intel's roots, and a comparison of the quote-bound signer
+// against the on-chain registry — before it agreed to seal a user's prompt to that
+// enclave. Withholding those would not make the endpoint humbler; it would hide the
+// only verification in the picture.
+//
+// What the verdicts are NOT is the reader's own verification. They are RELAYED:
+// their weight rests entirely on the reader being able to check this gateway itself
+// (`pcverify -gateway <domain>`, trust chain A), which is why every response carries
+// the note below and why a UI must render these as "the gateway verified this for
+// you", never as "verified". A compromised gateway would serve whatever it liked
+// here, exactly as with the self-description.
+//
+// Three things it deliberately does not do:
+//
+//   - It never fetches anything. The record is a byproduct of a request that already
+//     happened (client/route's identity store), so an address this gateway has not
+//     verified while serving one is a 404 rather than a lookup. That is what keeps the
+//     route from becoming a quote proxy — or a scanner — for arbitrary addresses.
+//   - It does not return the raw quote. A reader who wants to redo the work should
+//     fetch it from the provider DIRECT (the note names the URL), not through the
+//     party whose claims are under examination — the same reason the §8 signature is
+//     not proxied through the router. It is smaller and the trust path is shorter.
+//   - It does not return the boot-chain registers. Three hex strings are not
+//     actionable for a reader with no baseline to compare them against; the reader
+//     who needs observed values is the operator filling the hop-3 allowlist, and
+//     that is pcverify's job.
+
+// providerVerifyNote rides in every response so a verdict cannot travel without the
+// caveat, mirroring /v1/gateway/identity's note. It names the two independent
+// recourses in order: recheck the provider at the source, and check the gateway that
+// is telling you about it.
+func providerVerifyNote(quoteURL string) string {
+	note := "verdicts reached by this gateway on your behalf, not by you; verify this gateway itself with: pcverify -gateway <domain>"
+	if quoteURL == "" {
+		return note
+	}
+	return "recheck this provider yourself: GET " + quoteURL + " direct from the provider and DCAP-verify it. " + note
+}
+
+// providerIdentityDoc is the response body.
+//
+// Absent values are null rather than "" — as on /v1/gateway/identity, "" and null
+// are different claims — but nothing here depends on reading a null correctly: the
+// verdicts say which case produced it. That is the whole point of the vocabulary in
+// route.Verdict, and the fix for the ambiguity the gateway's own os_image shipped
+// with.
+type providerIdentityDoc struct {
+	// Address is the provider's on-chain account as RECORDED (the spelling the route
+	// preview used), not as spelled in the request path: matching is case-insensitive,
+	// and echoing the caller's own bytes back would make this field a mirror rather
+	// than a statement.
+	Address string `json:"address"`
+	// Endpoint is the provider's serving origin — the host its quote, enc key and §8
+	// signatures come from. It is here so a reader can leave this gateway and go to
+	// the source; the exact URL to fetch is in `verify`, because an origin cannot carry
+	// a base path (see route.ProviderIdentity.Endpoint).
+	Endpoint string `json:"endpoint"`
+	// Verdicts are the outcomes of the checks this gateway made before sealing.
+	Verdicts providerVerdicts `json:"verdicts"`
+	// OSImage names the allowlisted OS image the provider's boot chain matched, or
+	// null. Null today for every provider, and verdicts.measurement says why (the
+	// audited allowlist is empty — trust-chain hop 3); see route.ProviderIdentity.
+	OSImage *string `json:"os_image"`
+	// ComposeHash is the dstack compose hash out of the verified quote's mr_config_id
+	// — WHICH application configuration that enclave booted. Null when the register's
+	// layout does not carry it in the clear (mr_config_id V2/V3).
+	ComposeHash *string `json:"compose_hash"`
+	// Verify is providerVerifyNote. See the file comment.
+	Verify string `json:"verify"`
+}
+
+// providerVerdicts is the per-check outcome block. Every value is one of the
+// route.Verdict strings, so a panel switches on a closed vocabulary instead of
+// interpreting nulls.
+type providerVerdicts struct {
+	// QuoteDCAP: the quote is a genuine, Intel-rooted TDX quote with an acceptable TCB
+	// whose report_data binds the enc key and signer. Always "pass" in a served
+	// response — a quote that fails this leaves no record behind, so the request 404s
+	// rather than reporting a failure (see route.ProviderIdentity.QuoteDCAP).
+	QuoteDCAP route.Verdict `json:"quote_dcap"`
+	// OnChainSigner: the quote-bound signer equals the provider's acknowledged
+	// teeSignerAddress on chain (SPEC §4.4 step 3 / trust-chain hop 5) — what
+	// separates the expected provider from a look-alike enclave running the same
+	// image. "not_checked" when the deployment did not enable on-chain grounding.
+	OnChainSigner route.Verdict `json:"onchain_signer"`
+	// Measurement: the boot chain against the audited allowlist. "no_baseline" in
+	// every deployment today, because that allowlist is the half of hop 3 still
+	// unfilled — a panel must render that as "observed only", never as a pass.
+	Measurement route.Verdict `json:"measurement"`
+}
+
+// providerIdentityHandler serves one provider's record from src.
+//
+// An address src does not know is a 404, and so is a malformed one: both mean "this
+// gateway has no verdict for that", which is the honest answer and the only one that
+// does not invite the caller to keep asking about addresses in the hope of a
+// different result. There is deliberately no way to ask for a LIST — which providers
+// a gateway has recently used is not something a panel needs, and publishing it
+// would turn an answer about the caller's own request into fleet telemetry.
+func providerIdentityHandler(src route.ProviderIdentitySource) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		id, ok := src.ProviderIdentity(r.PathValue("address"))
+		if !ok {
+			openaiproxy.WriteError(w, http.StatusNotFound, "gateway",
+				"this gateway has verified no provider at that address (it reports only providers it has checked while serving a request, and only for a few minutes afterwards)")
+			return
+		}
+		body, err := json.MarshalIndent(providerIdentityDoc{
+			Address:  id.Address,
+			Endpoint: id.Endpoint,
+			Verdicts: providerVerdicts{
+				QuoteDCAP:     id.QuoteDCAP,
+				OnChainSigner: id.OnChainSigner,
+				Measurement:   id.Measurement,
+			},
+			OSImage:     optional(id.OSImage),
+			ComposeHash: optional(id.ComposeHash),
+			Verify:      providerVerifyNote(id.QuoteURL),
+		}, "", "  ")
+		if err != nil {
+			// Nothing in the document can fail to marshal; a 500 here would be a bug in
+			// this file, not a condition a caller can act on.
+			openaiproxy.WriteError(w, http.StatusInternalServerError, "gateway", "cannot render provider identity")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		// This response varies by Origin (the CORS middleware reflects an allowed one)
+		// and, unlike /v1/gateway/identity, it is NOT cacheable: the record is replaced
+		// as the gateway re-verifies, and it expires. A shared cache holding a verdict
+		// past its record would be showing a verification that is no longer in force —
+		// the one thing this endpoint must not do. Vary is added anyway so a cache that
+		// ignores no-cache still keys on the origin (see identityHandler).
+		w.Header().Add("Vary", "Origin")
+		w.Header().Set("Cache-Control", "no-store")
+		_, _ = w.Write(body)
+	})
+}
+
+// optional turns an absent string into a JSON null. Empty means "we have no value",
+// and "" would be a claim that the value IS empty.
+func optional(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}

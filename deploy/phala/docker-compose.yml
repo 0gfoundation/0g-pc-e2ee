@@ -338,6 +338,22 @@ services:
       # retry), not per request. Uncomment to disable the lookup — for a CVM with no
       # egress to GitHub, which then reports matched_release: null.
       # - "ZG_GATEWAY_IDENTITY_RELEASES=0"
+      #
+      # The PROVIDER half of the same panel, at /v1/providers/{address}/identity
+      # (issue #80): what this gateway VERIFIED about the provider it sealed a request
+      # to — the DCAP verdict on that provider's quote, the on-chain signer comparison,
+      # the boot-chain verdict, its compose_hash. Unlike the self-description above
+      # this one DOES report verdicts, because unlike the self-description they are
+      # verifications this process genuinely performed on a third party (see
+      # client/cmd/gateway/provideridentity.go). They are still RELAYED: a panel must
+      # render them as "the gateway verified this for you", not as "verified".
+      #
+      # It needs ZG_GATEWAY_ATTEST — without quote verification there is no verdict to
+      # report and the route is not mounted at all. It answers only for providers
+      # already used (no address triggers a quote fetch, so it is not a quote proxy or
+      # a scanner) and returns no raw quote and no measurement registers. On by
+      # default; uncomment to remove the route entirely.
+      # - "ZG_GATEWAY_PROVIDER_IDENTITY_ENDPOINT=false"
     volumes:
       # Identity in, read-only, as a plain JSON file — deliberately not the
       # guest-agent socket, which also derives keys and issues quotes.

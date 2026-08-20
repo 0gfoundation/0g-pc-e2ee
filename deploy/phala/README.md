@@ -59,6 +59,11 @@ writes this replica's `instance_id`/`app_id` once at boot and exits, and
   manifest — so a browser panel can display what it is connected to. That endpoint
   is convenience, not proof: see
   [Gateway self-description](#gateway-self-description-v1gatewayidentity) below.
+- And it reports what it **verified about the provider** it sealed to at
+  `/v1/providers/{address}/identity` — the DCAP verdict on that provider's quote, the
+  on-chain signer comparison, its `compose_hash`. Those are real verifications, made
+  by this gateway on your behalf rather than by you: see
+  [Provider identity](#provider-identity-v1providersaddressidentity) below.
 
 ## Serving domain
 
@@ -557,6 +562,54 @@ curl -s "https://<DOMAIN>/v1/gateway/identity" | jq
 
 # the app_id it reports must be the one pcverify derives from the quote
 pcverify -gateway <DOMAIN>
+```
+
+## Provider identity (`/v1/providers/{address}/identity`)
+
+The provider half of the same panel: what this gateway **verified** about the provider
+it sealed a request to
+([#80](https://github.com/0gfoundation/0g-pc-e2ee/issues/80)). The address to ask about
+is the one the response carried in `X-Provider`.
+
+No new setting is required — the route is on by default and reads results the request
+path already produced. Three settings govern whether it can answer anything, and what
+it can say:
+
+| Setting | Effect |
+|---|---|
+| `ZG_GATEWAY_ATTEST` | **required.** Without quote verification nothing is verified, so there is no verdict to report and the route is not mounted at all. |
+| `ZG_GATEWAY_ONCHAIN` | when off, `verdicts.onchain_signer` is `not_checked` rather than a comparison result. When on but the chain could not be read, it is `unavailable` — a chain-RPC problem is never reported as a finding against the provider. |
+| `ZG_GATEWAY_PROVIDER_IDENTITY_ENDPOINT` | on by default; set `false` to remove the route entirely. Appears in the compose only as a commented-out line, per this file's convention. |
+
+**This endpoint does report verdicts, unlike the self-description above — and that is
+the intended difference.** There the gateway describes *itself*, so a verdict would be
+self-vouching; here it reports a DCAP verification and an on-chain signer comparison it
+genuinely performed on a *third party* before sealing a user's prompt to it. They are
+still **relayed** verdicts: they are worth what the reader's verification of this
+gateway is worth (`pcverify -gateway <DOMAIN>`), which is why every response carries
+that caveat inline and a panel must render them as "the gateway verified this for you".
+
+**It fetches nothing.** Only providers this gateway has checked while serving a request
+are reportable, records expire after a few minutes, and no address triggers a quote fetch — so the route cannot be
+turned into a quote proxy or a fleet scanner. It returns no raw quote and no
+measurement registers either: anyone wanting to re-verify should fetch the quote direct
+from the provider, and the `verify` field names that URL.
+
+Expect `verdicts.measurement: "no_baseline"` on every deployment today — that is hop
+3's empty audited allowlist (`docs/design/trust-chain.md`), the same gap `pcverify`
+reports as an incomplete run, and it must be rendered as "observed only" rather than as
+a failure. Smoke-test after deploying:
+
+```sh
+# the address the sealed request was pinned to
+ADDR=$(curl -sSD - -o /dev/null -X POST "https://<DOMAIN>/v1/chat/completions" \
+  -H "Authorization: Bearer $ZG_KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"…","messages":[{"role":"user","content":"hi"}]}' \
+  | awk 'tolower($1)=="x-provider:"{print $2}' | tr -d '\r')
+
+curl -s "https://<DOMAIN>/v1/providers/$ADDR/identity" | jq
+# an address never used must 404
+curl -sS -o /dev/null -w '%{http_code}\n' "https://<DOMAIN>/v1/providers/0x0000000000000000000000000000000000000000/identity"
 ```
 
 ## Pin the image digest
