@@ -206,8 +206,10 @@ services:
     # measured — a reader should see the configuration app_id commits to. See README
     # "Notes" for the reasoning behind each setting.
     environment:
-      # Must stay all-interfaces: a localhost bind (as the sidecar uses) would be
-      # unreachable across the compose network.
+      # Spelled out rather than inherited: the binary's own default is already
+      # all-interfaces (`:8443`), so this pins the same reachability into the
+      # measured text. Must STAY all-interfaces — a localhost bind would be
+      # unreachable from dstack-ingress across the compose network.
       - "ZG_GATEWAY_LISTEN=0.0.0.0:8443"
       # Prometheus /metrics on a separate internal listener, never published to the
       # host and not fronted by dstack-ingress, so it is reachable only over the
@@ -230,9 +232,14 @@ services:
       - "ZG_GATEWAY_ALLOWED_ORIGINS=${ZG_GATEWAY_ALLOWED_ORIGINS:-https://0g.ai,https://*.0g.ai,http://localhost:3000,http://localhost:5173}"
       # Request fields sealed end-to-end to the provider (must include "messages"),
       # and cleartext fields excluded from the AAD (an empty value binds everything).
-      # Both default to the binary's built-in sets; uncomment to override.
-      # - "ZG_GATEWAY_SEAL_FIELDS=messages"
-      # - "ZG_GATEWAY_UNBOUND_FIELDS="
+      # Left to the binary's built-in sets, which are "messages,tools" and "model"
+      # (protocol/wire/envelope.go) — NOT what the samples below show. Either value
+      # REPLACES the default set rather than adding to it, so an override has to
+      # restate the fields it still wants: dropping "tools" from the first stops
+      # sealing tool definitions, and dropping "model" from the second binds the
+      # model name into the AAD.
+      # - "ZG_GATEWAY_SEAL_FIELDS=messages,tools,tool_choice"
+      # - "ZG_GATEWAY_UNBOUND_FIELDS=model,route_options"
       # DCAP-verify each provider's TDX quote and seal only to the verified enc key,
       # instead of trusting the router-supplied pubkey endpoint. Enforced per request:
       # a provider that fails is rejected.

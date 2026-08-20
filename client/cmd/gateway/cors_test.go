@@ -3,6 +3,8 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"regexp"
 	"testing"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
@@ -104,5 +106,42 @@ func TestGatewayCatchAllStripsUpstreamCORS(t *testing.T) {
 	}
 	if v := resp.Header.Get("Access-Control-Expose-Headers"); v == "X-Router-Only" {
 		t.Error("the router's Expose-Headers survived; the gateway's own list must govern")
+	}
+}
+
+// composePath is the deployed compose manifest, relative to this package. It sits
+// outside the client module, which is fine for a test that only reads it.
+const composePath = "../../../deploy/phala/docker-compose.yml"
+
+// composeAllowedOrigins matches the fallback of the compose's
+// ZG_GATEWAY_ALLOWED_ORIGINS entry — the value that applies when the encrypted
+// environment supplies no override.
+var composeAllowedOrigins = regexp.MustCompile(
+	`ZG_GATEWAY_ALLOWED_ORIGINS=\$\{ZG_GATEWAY_ALLOWED_ORIGINS:-([^}]*)\}`)
+
+// TestComposeAllowedOriginsMatchesDefault enforces the "keep in sync" note in
+// deploy/phala/docker-compose.yml. The compose spells the allowlist out instead of
+// inheriting it, because that block is measured into compose_hash and app_id should
+// commit to which web origins may drive sealed inference through the enclave. That
+// is only sound while the two agree: a change to DefaultAllowedOriginsCSV alone
+// would leave the deployed enclave on the old list with nothing to say so, and the
+// note asking a human to remember is not a mechanism.
+//
+// Deliberately compared against the shipped constant, not corsTestOrigins — this is
+// the one test whose subject IS the default list.
+func TestComposeAllowedOriginsMatchesDefault(t *testing.T) {
+	compose, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", composePath, err)
+	}
+	m := composeAllowedOrigins.FindSubmatch(compose)
+	if m == nil {
+		t.Fatalf("no ZG_GATEWAY_ALLOWED_ORIGINS=${...:-<default>} entry in %s; if the entry was "+
+			"reshaped deliberately, update this test rather than dropping it", composePath)
+	}
+	if got := string(m[1]); got != openaiproxy.DefaultAllowedOriginsCSV {
+		t.Errorf("compose allowlist and the built-in default disagree:\n compose: %q\n default: %q\n"+
+			"update whichever is stale — the deployed enclave serves the compose value", got,
+			openaiproxy.DefaultAllowedOriginsCSV)
 	}
 }
