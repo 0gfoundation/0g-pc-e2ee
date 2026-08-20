@@ -203,7 +203,8 @@ const (
 	UpstreamStream   = "stream"
 
 	UpstreamOK = "ok"
-	// UpstreamTransport: the request never reached the provider.
+	// UpstreamTransport: no response at all — the request never reached the
+	// provider, or reached it and it never answered (the response-header timeout).
 	UpstreamTransport = "transport"
 	// UpstreamBody: a response began but its body dropped mid-read, or a stream
 	// ended before its final frame — a delivery failure, not a content one.
@@ -226,6 +227,14 @@ const (
 	// UpstreamInternal: a fault in THIS client detected mid-attempt. Its own bucket
 	// so our bug can never be read as a provider's.
 	UpstreamInternal = "internal"
+	// Status-derived outcomes, produced by upstreamStatusOutcome. They live here
+	// with the rest so this block is the whole vocabulary it claims to be — the
+	// same strings appear in the metric's Help, the dashboard and the runbook, and
+	// a literal buried in a switch is how those drift apart.
+	UpstreamHTTP429   = "http_429"
+	UpstreamHTTP4xx   = "http_4xx"
+	UpstreamHTTP5xx   = "http_5xx"
+	UpstreamHTTPOther = "http_other"
 
 	FallbackUpstream    = "upstream"
 	FallbackMaterialize = "materialize"
@@ -238,13 +247,13 @@ const (
 func upstreamStatusOutcome(status int) string {
 	switch {
 	case status == http.StatusTooManyRequests:
-		return "http_429"
+		return UpstreamHTTP429
 	case status >= 500 && status <= 599:
-		return "http_5xx"
+		return UpstreamHTTP5xx
 	case status >= 400 && status <= 499:
-		return "http_4xx"
+		return UpstreamHTTP4xx
 	default:
-		return "http_other"
+		return UpstreamHTTPOther
 	}
 }
 

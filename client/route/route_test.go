@@ -1202,3 +1202,58 @@ func TestUpstreamMetricsRecordStreamAndFirstFrame(t *testing.T) {
 		}
 	}
 }
+
+// onFrame can fail two ways and core cannot see inside it: the caller
+// disconnected, or the caller's handler broke on its own. They must not share a
+// bucket — "canceled" is excluded from every alert, so filing a gateway bug there
+// hides it, and filing a disconnect under "internal" cries wolf on every closed
+// tab. The split is decided by asking the parent context.
+func TestStreamOnFrameFailureAttribution(t *testing.T) {
+	internal := upstreamAttempt("stream", "internal")
+	canceled := upstreamAttempt("stream", "canceled")
+
+	streamReq := func() wire.Request {
+		req := chatReq()
+		req["stream"] = json.RawMessage(`true`)
+		return req
+	}
+
+	// The handler fails while the caller's context is still live: our fault.
+	t.Run("handler failure with a live caller is internal", func(t *testing.T) {
+		before := map[string]float64{internal: metricValue(t, internal), canceled: metricValue(t, canceled)}
+		router := newMockRouter(t, newMockBroker(t))
+		err := meteredClient(router.srv.URL).CompleteStream(context.Background(), streamReq(),
+			func(wire.Response) error { return errors.New("could not serialize the frame") })
+		if err == nil {
+			t.Fatal("want the handler's error back")
+		}
+		if got := metricValue(t, internal) - before[internal]; got != 1 {
+			t.Errorf("%s delta = %v, want 1", internal, got)
+		}
+		if got := metricValue(t, canceled) - before[canceled]; got != 0 {
+			t.Errorf("a live caller must not be counted canceled; %s delta = %v", canceled, got)
+		}
+	})
+
+	// The caller went away: not our fault, and not the provider's.
+	t.Run("handler failure with a gone caller is canceled", func(t *testing.T) {
+		before := map[string]float64{internal: metricValue(t, internal), canceled: metricValue(t, canceled)}
+		router := newMockRouter(t, newMockBroker(t))
+		ctx, cancel := context.WithCancel(context.Background())
+		err := meteredClient(router.srv.URL).CompleteStream(ctx, streamReq(),
+			func(wire.Response) error {
+				cancel() // the client hung up as this frame was being written
+				return errors.New("write: broken pipe")
+			})
+		cancel()
+		if err == nil {
+			t.Fatal("want the handler's error back")
+		}
+		if got := metricValue(t, canceled) - before[canceled]; got != 1 {
+			t.Errorf("%s delta = %v, want 1", canceled, got)
+		}
+		if got := metricValue(t, internal) - before[internal]; got != 0 {
+			t.Errorf("a disconnect must not be counted internal; %s delta = %v", internal, got)
+		}
+	})
+}

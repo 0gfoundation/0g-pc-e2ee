@@ -155,12 +155,14 @@ var (
 	upstreamAttempts = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "upstream_attempts_total",
 		Help: "Data-plane attempts against one provider, by kind (buffered|stream) and outcome: ok; " +
-			"http_429/http_4xx/http_5xx/http_other (a status came back); transport (never reached it); " +
-			"body (the response dropped mid-read, or a stream ended before its final frame); " +
-			"undecodable (a 2xx whose sealed body would not decode or open); not_stream (a 200 that " +
-			"was not an event stream); unverified (the §8 signature did not verify); timeout (our own " +
-			"provider deadline or stream idle watchdog); canceled (the CALLER went away — not a " +
-			"provider fault, and deliberately not in the failure buckets).",
+			"http_429/http_4xx/http_5xx/http_other (a status came back); transport (no response at " +
+			"all — never reached it, or it never answered); body (the response dropped mid-read, or " +
+			"a stream ended before its final frame); undecodable (a 2xx whose sealed body would not " +
+			"decode or open); not_stream (a 200 that was not an event stream); unverified (the §8 " +
+			"signature did not verify); timeout (our own provider deadline or stream idle watchdog — " +
+			"the provider went quiet); canceled (the CALLER went away); internal (a fault in the " +
+			"gateway itself). The last two are deliberately NOT failure buckets: a closed tab is not " +
+			"a provider's fault, and our own bug should not be filed as one either.",
 	}, []string{"kind", "outcome"})
 	upstreamDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "upstream_attempt_duration_seconds",

@@ -280,10 +280,19 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 			recordMeta(ctx, provider, resp.Header)
 		}
 		if err := onFrame(out); err != nil {
-			// The caller could not take the frame (a disconnect, most often). The
-			// provider did nothing wrong, so this belongs with the other caller-side
-			// exits, not in a failure bucket.
-			outcome = UpstreamCanceled
+			// The caller's frame handler rejected a frame. Either way the provider did
+			// nothing wrong, but WHICH caller-side failure it was matters, and core
+			// cannot see inside an opaque callback — so ask the parent, as everywhere
+			// else here. A done parent is a disconnect; a live one means the handler
+			// failed on its own (the gateway's re-serialization, or a write that failed
+			// just before the disconnect became visible), which is our fault, not the
+			// user's navigation. Filing the first case as internal would cry wolf;
+			// filing the second as canceled would hide a real bug of ours in a bucket
+			// every alert deliberately ignores.
+			outcome = UpstreamInternal
+			if canceledBy(parent) {
+				outcome = UpstreamCanceled
+			}
 			return false, err
 		}
 		if fe.Final {
