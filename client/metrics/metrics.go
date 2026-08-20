@@ -114,6 +114,31 @@ var (
 		Help: "§8 response-signature verification failures by reason (fetch|signature).",
 	}, []string{"reason"})
 
+	// Route preview (route.preview) — the ONE outbound dependency on the request
+	// path with no cache in front of it, deliberately, since the ranking must
+	// reflect the live fleet. So its health is request health directly, and its
+	// latency is request latency: everything else (quote, collateral, on-chain
+	// signer) is normally served from a warm cache and shows up in the counters
+	// above only on a miss.
+	previewAttempts = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "preview_attempts_total",
+		Help: "Route-preview HTTP attempts by result: ok, retryable (transport failure or 5xx — " +
+			"another attempt follows), definitive (4xx/429, undecodable body, empty candidate list — " +
+			"no retry), canceled (the caller gave up mid-attempt; says nothing about the router).",
+	}, []string{"result"})
+	previewCalls = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "preview_calls_total",
+		Help: "Route-preview CALLS (one per chat request, whatever its attempt count) by outcome: " +
+			"ok, ok_retried, failed, canceled. Watch ok_retried: it is where a degrading router shows " +
+			"up while the error rate is still flat, because the retries are absorbing it.",
+	}, []string{"outcome"})
+	previewDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "preview_duration_seconds",
+		Help: "End-to-end latency of one route-preview call, retries and their backoff included. " +
+			"This sits in front of every sealed request, so it is a floor on request latency.",
+		Buckets: verifyBuckets,
+	})
+
 	// Attestation / quote verification (route) — the trust-model core.
 	quoteVerify = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "quote_verifications_total",
@@ -201,6 +226,7 @@ func init() {
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		httpRequests, httpDuration, httpInFlight, inFlightLimit, requestsShed,
 		completions, openFailures, verificationFailures,
+		previewAttempts, previewCalls, previewDuration,
 		quoteVerify, quoteVerifyDuration, quoteCache, measurementUntrusted,
 		onchainGrounding, onchainRevalidations,
 		warmerSweeps, warmerProviderRefresh, warmerSignerRefresh,
@@ -275,6 +301,19 @@ func ResponseOpenFailure() { openFailures.Inc() }
 // failure, by reason ("fetch" or "signature").
 func ResponseVerificationFailure(reason string) {
 	verificationFailures.WithLabelValues(reason).Inc()
+}
+
+// PreviewAttempt counts one route-preview HTTP attempt. result is a fixed
+// low-cardinality label: ok, retryable, definitive, canceled (see the metric's
+// Help for what falls in each).
+func PreviewAttempt(result string) { previewAttempts.WithLabelValues(result).Inc() }
+
+// PreviewCall records one route-preview call — one per chat request, whatever its
+// attempt count — and its end-to-end latency including any retries. outcome is a
+// fixed low-cardinality label: ok, ok_retried, failed, canceled.
+func PreviewCall(outcome string, dur time.Duration) {
+	previewCalls.WithLabelValues(outcome).Inc()
+	previewDuration.Observe(dur.Seconds())
 }
 
 // QuoteVerification records one performed (cache-miss) DCAP verification and its

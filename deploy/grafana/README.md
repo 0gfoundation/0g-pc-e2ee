@@ -41,7 +41,7 @@ Grafana `dashboards` provider watches). The `uid` is `0g-pc-gateway`.
 
 ## Layout
 
-One dashboard, six collapsible rows — one service, so cross-metric correlation
+One dashboard, seven collapsible rows — one service, so cross-metric correlation
 (latency vs quote-cache misses, open failures vs a bad provider) stays on one
 screen:
 
@@ -50,10 +50,21 @@ screen:
    latency p50/p90/p99 by route.
 2. **Completions**: outcome by result, and errors broken down by
    `source`/`stage` (gateway fault vs router/provider).
-3. **Attestation & E2EE**: quote-cache hit ratio, verifications by result, verify
+3. **Route preview — the uncached control plane**: retried-preview ratio, failure
+   rate, calls by outcome, and preview latency p50/p99. This row exists because
+   preview is the only outbound dependency on the request path with no cache in
+   front of it — deliberately, since the ranking must reflect the live fleet — so
+   its latency is a floor on every sealed request's latency, and its health is
+   request health. Read **"Retried previews"** first: it is where a degrading
+   router shows up while the error rate is still flat, because the retries are
+   absorbing it. A ratio that climbs and stays up is the signal to go look at the
+   router, not at this gateway. `canceled` is broken out from `failed` on purpose —
+   it is a caller that gave up mid-flight, which says nothing about the router — so
+   the failure panel and the alert below both exclude it.
+4. **Attestation & E2EE**: quote-cache hit ratio, verifications by result, verify
    latency, response-signature verification failures by reason (fetch vs
    signature), untrusted-measurement rate, E2EE open failures.
-4. **On-chain grounding (hop 5)**: ready-provider count, chain-RPC lookup-failure
+5. **On-chain grounding (hop 5)**: ready-provider count, chain-RPC lookup-failure
    and signer-mismatch rates, all grounding outcomes, and revalidations. This row
    is what says whether `ZG_GATEWAY_ONCHAIN_ENFORCE` can be turned on: while
    `lookup_failed` and `mismatch` sit at zero in warn mode, enforce costs nothing,
@@ -62,9 +73,9 @@ screen:
    provider, `lookup_failed` is our own chain RPC — and note "Ready providers" uses
    `min` across the selected replicas, not a sum: one replica that can ground
    nothing is the number that matters, since it is the one failing every request.
-5. **Warmer & DCAP collateral**: warmer last-success age (with alert-colored
+6. **Warmer & DCAP collateral**: warmer last-success age (with alert-colored
    thresholds), sweep/provider outcomes, collateral cache + fetch latency.
-6. **Process runtime**: goroutines, resident memory, CPU. These are the panels
+7. **Process runtime**: goroutines, resident memory, CPU. These are the panels
    that are not summed, so they draw one line per replica; the legend is
    `{{instance_id}}` rather than Prometheus' own `instance`, which is the scrape
    address (`gateway:9464`) and therefore the same string in every replica.
@@ -82,6 +93,16 @@ highest-signal ones:
   the softer, operational proof-retrieval failure).
 - `time() - max(zg_gateway_warmer_last_success_timestamp_seconds) > 900` — the
   warmer has stalled (only meaningful when `-warm` is enabled).
+- `sum(rate(zg_gateway_preview_calls_total{outcome="ok_retried"}[5m])) /
+  clamp_min(sum(rate(zg_gateway_preview_calls_total[5m])), 1e-9) > 0.05` — more than
+  5% of chat requests needed a route-preview retry to succeed. Nothing is failing
+  yet, which is exactly why this is worth an alert: the retries are paying for a
+  degrading router out of every caller's latency budget, and the request error rate
+  will not show it until they stop being enough. Pair it with
+  `sum(rate(zg_gateway_preview_calls_total{outcome="failed"}[5m])) > 0`, which is
+  when they have. Note both deliberately ignore `outcome="canceled"` — a caller that
+  disconnected mid-preview says nothing about the router, and folding it in would
+  make a burst of client cancellations page the wrong team.
 - `rate(zg_gateway_onchain_grounding_total{outcome="mismatch"}[5m]) > 0` — a
   provider's quote-bound signer disagreed with the chain, and still disagreed after
   a live re-read. Not an operational blip: it means the enclave that answered is not

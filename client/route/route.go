@@ -907,7 +907,14 @@ func (r *Router) preview(ctx context.Context, req wire.Request) ([]previewProvid
 		return nil, upstream(0, fmt.Errorf("marshal preview request: %w", err))
 	}
 
+	// One call-level observation on EVERY exit path, recorded by a defer rather than
+	// at each return so the counter cannot drift from the control flow as this loop
+	// grows. "failed" is the honest default: it is what falling out of the loop
+	// means, and every better outcome overwrites it before returning.
 	start := time.Now()
+	outcome := "failed"
+	defer func() { metrics.PreviewCall(outcome, time.Since(start)) }()
+
 	backoff := previewRetryBackoff
 	var lastErr error
 	for attempt := 0; attempt < previewAttempts; attempt++ {
@@ -922,6 +929,7 @@ func (r *Router) preview(ctx context.Context, req wire.Request) ([]previewProvid
 			select {
 			case <-ctx.Done():
 				t.Stop()
+				outcome = "canceled"
 				return nil, upstream(0, fmt.Errorf("route preview: %w (last error: %v)", ctx.Err(), lastErr))
 			case <-t.C:
 			}
@@ -929,13 +937,32 @@ func (r *Router) preview(ctx context.Context, req wire.Request) ([]previewProvid
 		}
 		providers, retryable, err := r.previewOnce(ctx, body, req)
 		if err == nil {
+			metrics.PreviewAttempt("ok")
+			// A success that NEEDED a retry gets its own outcome. It is the series that
+			// shows the retries earning their keep — and the one that stops a degrading
+			// router from hiding behind a flat error rate, which is the whole failure
+			// mode of adding retries to an uncached dependency.
+			outcome = "ok"
+			if attempt > 0 {
+				outcome = "ok_retried"
+			}
 			return providers, nil
 		}
 		lastErr = err
-		// A caller that has given up gets its own error, not another attempt.
-		if !retryable || ctx.Err() != nil {
+		// A caller that has given up gets its own error, not another attempt — and it
+		// is counted apart from a router failure, because it says nothing about the
+		// router (the same distinction chain.noteFailure draws before stamping a
+		// cooldown).
+		if ctx.Err() != nil {
+			metrics.PreviewAttempt("canceled")
+			outcome = "canceled"
 			return nil, err
 		}
+		if !retryable {
+			metrics.PreviewAttempt("definitive")
+			return nil, err
+		}
+		metrics.PreviewAttempt("retryable")
 	}
 	return nil, lastErr
 }

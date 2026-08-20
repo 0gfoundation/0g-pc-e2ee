@@ -813,6 +813,102 @@ func TestPreviewStopsRetryingOnCancelledContext(t *testing.T) {
 	}
 }
 
+// The point of metering the retries: a router degrading badly enough to need them
+// must be visible even while every request still succeeds. ok_retried is that
+// series, and it has to stay distinct from a clean first-attempt ok.
+func TestPreviewMetricsSeparateAbsorbedFailuresFromCleanCalls(t *testing.T) {
+	const (
+		callsOK            = `zg_gateway_preview_calls_total{outcome="ok"}`
+		callsRetried       = `zg_gateway_preview_calls_total{outcome="ok_retried"}`
+		callsFailed        = `zg_gateway_preview_calls_total{outcome="failed"}`
+		attemptsOK         = `zg_gateway_preview_attempts_total{result="ok"}`
+		attemptsRetryable  = `zg_gateway_preview_attempts_total{result="retryable"}`
+		attemptsDefinitive = `zg_gateway_preview_attempts_total{result="definitive"}`
+	)
+	before := map[string]float64{}
+	for _, s := range []string{callsOK, callsRetried, callsFailed, attemptsOK, attemptsRetryable, attemptsDefinitive} {
+		before[s] = metricValue(t, s)
+	}
+	delta := func(s string) float64 { return metricValue(t, s) - before[s] }
+
+	// A router per phase: previewFailN counts attempts over the mock's whole life,
+	// so a router reused across phases would have spent its failures already.
+	newRouter := func() *mockRouter { return newMockRouter(t, newMockBroker(t)) }
+
+	// A clean call: one ok attempt, outcome ok.
+	if _, err := New(newRouter().srv.URL).Resolve(context.Background(), chatReq()); err != nil {
+		t.Fatalf("clean Resolve: %v", err)
+	}
+	if got := delta(callsOK); got != 1 {
+		t.Errorf("%s delta = %v, want 1", callsOK, got)
+	}
+	if got := delta(callsRetried); got != 0 {
+		t.Errorf("a first-attempt success must not count as retried; %s delta = %v", callsRetried, got)
+	}
+
+	// A blip the retries absorb: the caller still succeeds, but the router's
+	// degradation is on the record as ok_retried plus a retryable attempt.
+	blip := newRouter()
+	blip.previewFailN = 1
+	if _, err := New(blip.srv.URL).Resolve(context.Background(), chatReq()); err != nil {
+		t.Fatalf("Resolve across a transient failure: %v", err)
+	}
+	if got := delta(callsRetried); got != 1 {
+		t.Errorf("%s delta = %v, want 1 — an absorbed failure is invisible", callsRetried, got)
+	}
+	if got := delta(callsOK); got != 1 {
+		t.Errorf("a retried success must not also count as a clean ok; %s delta = %v, want 1", callsOK, got)
+	}
+	if got := delta(attemptsRetryable); got != 1 {
+		t.Errorf("%s delta = %v, want 1", attemptsRetryable, got)
+	}
+	if got := delta(attemptsOK); got != 2 {
+		t.Errorf("%s delta = %v, want 2 (one per successful attempt)", attemptsOK, got)
+	}
+
+	// A definitive failure: counted as definitive, never as retryable, and the call
+	// as failed rather than absorbed.
+	dead := newRouter()
+	dead.previewFailN = previewAttempts + 5
+	dead.previewFailCode = http.StatusUnauthorized
+	if _, err := New(dead.srv.URL).Resolve(context.Background(), chatReq()); err == nil {
+		t.Fatal("Resolve against a 401 router: want error, got nil")
+	}
+	if got := delta(attemptsDefinitive); got != 1 {
+		t.Errorf("%s delta = %v, want 1", attemptsDefinitive, got)
+	}
+	if got := delta(attemptsRetryable); got != 1 {
+		t.Errorf("a 401 must not be counted retryable; %s delta = %v, want 1 (unchanged)", attemptsRetryable, got)
+	}
+	if got := delta(callsFailed); got != 1 {
+		t.Errorf("%s delta = %v, want 1", callsFailed, got)
+	}
+}
+
+// Every preview call observes the duration histogram exactly once, whatever its
+// outcome — the defer that records it must not be skipped on an error path.
+func TestPreviewDurationObservedOnEveryCall(t *testing.T) {
+	const series = `zg_gateway_preview_duration_seconds_count`
+	before := metricValue(t, series)
+
+	ok := newMockRouter(t, newMockBroker(t))
+	if _, err := New(ok.srv.URL).Resolve(context.Background(), chatReq()); err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	// Its own router: previewFailN counts over the mock's whole life, so reusing the
+	// one above would have to account for the attempt it already served.
+	dead := newMockRouter(t, newMockBroker(t))
+	dead.previewFailN = previewAttempts + 5
+	dead.previewFailCode = http.StatusUnauthorized
+	if _, err := New(dead.srv.URL).Resolve(context.Background(), chatReq()); err == nil {
+		t.Fatal("want an error from a 401 router")
+	}
+
+	if got := metricValue(t, series) - before; got != 2 {
+		t.Errorf("%s delta = %v, want 2 (one observation per call, success and failure alike)", series, got)
+	}
+}
+
 func TestRetryablePreviewStatus(t *testing.T) {
 	for status, want := range map[int]bool{
 		http.StatusBadRequest:          false,
