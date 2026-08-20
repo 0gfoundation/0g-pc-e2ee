@@ -98,3 +98,82 @@ func sweepExpired[V any](m map[string]V, now time.Time, deadline func(V) time.Ti
 		}
 	}
 }
+
+// Preview retry-suppression policy. Retrying an uncached dependency is a load
+// multiplier exactly when the dependency is least able to take it: with the router
+// fully down, every request makes previewAttempts calls instead of one, and each
+// holds its gateway concurrency slot (openaiproxy.LimitInFlight) for the retry
+// ceiling — budget plus one attempt — rather than for a single attempt. A local
+// router outage would therefore turn into gateway-wide shedding, which is a worse
+// failure than the one the retries were added to paper over.
+//
+// So the retries switch themselves off once the router stops looking like it is
+// merely blipping. The FIRST attempt is never suppressed, so correctness does not
+// depend on this at all — a request still reaches the router and still gets its
+// real error; what is dropped is only the amplification.
+const (
+	// previewRetryTripAfter is how many consecutive calls must fail to get any
+	// answer before retries are suppressed. Concurrent requests all count, so a
+	// genuine outage trips this within one round of traffic, while an isolated blip
+	// (which by definition is followed by a success) never does.
+	previewRetryTripAfter = 5
+	// previewRetryCooldown is how long retries stay off. Short on purpose: the next
+	// single attempt after it is what discovers the recovery, so this is the longest
+	// a recovered router waits to get its retries back.
+	previewRetryCooldown = 10 * time.Second
+)
+
+// retryGate decides whether preview retries are currently worth making. It is the
+// smallest thing that removes the amplification above: a consecutive-failure count
+// and a cooldown, with any answer at all from the router clearing both.
+//
+// Deliberately NOT a general circuit breaker. It never blocks a request, never
+// changes what a caller is told, and holds no per-route state — there is one
+// router, so there is one counter. Safe for concurrent use.
+type retryGate struct {
+	mu sync.Mutex
+	// consecutive counts calls that got no answer since the last one that did.
+	consecutive int
+	// openUntil is when retries resume; zero means they are on.
+	openUntil time.Time
+	now       func() time.Time // nil uses time.Now; a test substitutes a clock
+}
+
+// allow reports whether a retry may be made right now.
+func (g *retryGate) allow() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return !g.clock().Before(g.openUntil)
+}
+
+// noAnswer records a call that never got an answer out of the router, tripping the
+// gate once enough of them have piled up back to back.
+func (g *retryGate) noAnswer() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.consecutive++
+	if g.consecutive >= previewRetryTripAfter {
+		g.openUntil = g.clock().Add(previewRetryCooldown)
+		// Reset the count with the window: it has done its job, and leaving it high
+		// would re-trip the gate on the first failure after the window lapses,
+		// before the traffic has had a chance to say anything new.
+		g.consecutive = 0
+	}
+}
+
+// answered records that the router replied — well or badly, but replied. That is
+// proof of reachability, so it clears both the count and any open window: a
+// recovered router should not keep serving requests with retries switched off.
+func (g *retryGate) answered() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.consecutive = 0
+	g.openUntil = time.Time{}
+}
+
+func (g *retryGate) clock() time.Time {
+	if g.now != nil {
+		return g.now()
+	}
+	return time.Now()
+}

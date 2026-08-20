@@ -133,17 +133,28 @@ var (
 			"dropped, or a 5xx — another attempt follows); rejected (the router ANSWERED definitively — " +
 			"a 4xx/429, or a well-formed reply with no candidates — usually about the caller or the " +
 			"fleet, not about the router); broken (it answered with a body that will not decode, which " +
-			"IS the router misbehaving); canceled (the caller gave up mid-attempt).",
+			"IS the router misbehaving); canceled (the caller gave up mid-attempt); internal (a " +
+			"request this gateway could not even build — our own configuration).",
 	}, []string{"result"})
 	previewCalls = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "preview_calls_total",
 		Help: "Route-preview CALLS (one per chat request, whatever its attempt count) by outcome: " +
-			"ok, ok_retried, rejected, failed, canceled. Watch ok_retried: it is where a degrading " +
+			"ok, ok_retried, rejected, failed, canceled, internal. Watch ok_retried: it is where a degrading " +
 			"router shows up while the error rate is still flat, because the retries are absorbing " +
 			"it. Alert on failed, NOT on rejected: rejected is the router answering a caller (a bad " +
 			"credential, an unknown model) or reporting an empty fleet, so folding it in lets one " +
 			"misconfigured tenant pin an alert meant for the router. canceled is the caller leaving.",
 	}, []string{"outcome"})
+	previewRetrySuppressed = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "preview_retries_suppressed_total",
+		Help: "Route-preview retries NOT made because the router had stopped answering " +
+			"altogether (see route.retryGate). Retrying an uncached dependency multiplies load " +
+			"on it exactly when it can least take it, and holds a gateway concurrency slot for " +
+			"the retry ceiling rather than one attempt, so a router outage would become " +
+			"gateway-wide shedding. The first attempt of every request is still made, so this " +
+			"rising means requests are still being served their real error, just without the " +
+			"amplification — read it next to preview_calls_total{outcome=\"failed\"}.",
+	})
 	previewDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "preview_duration_seconds",
 		Help: "End-to-end latency of one route-preview call, retries and their backoff included. " +
@@ -299,7 +310,7 @@ func init() {
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		httpRequests, httpDuration, httpInFlight, inFlightLimit, requestsShed,
 		completions, openFailures, verificationFailures,
-		previewAttempts, previewCalls, previewDuration,
+		previewAttempts, previewCalls, previewDuration, previewRetrySuppressed,
 		upstreamAttempts, upstreamDuration, streamTTFF, candidateFallbacks,
 		signatureFetchCalls, signatureFetchDuration,
 		quoteVerify, quoteVerifyDuration, quoteCache, measurementUntrusted,
@@ -379,13 +390,20 @@ func ResponseVerificationFailure(reason string) {
 }
 
 // PreviewAttempt counts one route-preview HTTP attempt. result is a fixed
-// low-cardinality label: ok, retryable, definitive, canceled (see the metric's
-// Help for what falls in each).
+// low-cardinality label, and route.previewResult is its single definition —
+// re-listing the values here is what let this comment drift to naming one that is
+// never emitted while omitting two that are. See the metric's Help for what falls
+// in each.
 func PreviewAttempt(result string) { previewAttempts.WithLabelValues(result).Inc() }
+
+// PreviewRetrySuppressed counts one retry the retry gate declined to make.
+func PreviewRetrySuppressed() { previewRetrySuppressed.Inc() }
 
 // PreviewCall records one route-preview call — one per chat request, whatever its
 // attempt count — and its end-to-end latency including any retries. outcome is a
-// fixed low-cardinality label: ok, ok_retried, failed, canceled.
+// fixed low-cardinality label derived from the attempt result that ended the call
+// (route.previewResult.callOutcome), plus ok_retried for a success that needed a
+// retry; that method is the single definition.
 func PreviewCall(outcome string, dur time.Duration) {
 	previewCalls.WithLabelValues(outcome).Inc()
 	previewDuration.Observe(dur.Seconds())

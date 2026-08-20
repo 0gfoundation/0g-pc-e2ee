@@ -79,9 +79,24 @@ type Candidates interface {
 const resolveBudget = 90 * time.Second
 
 // candidateWalk meters one walk down a Candidates chain, charging each
-// materialization against resolveBudget. It is not safe for concurrent use: one
-// walk belongs to one Complete/CompleteStream call.
-type candidateWalk struct{ spent time.Duration }
+// materialization against its budget. It is not safe for concurrent use: one walk
+// belongs to one Complete/CompleteStream call.
+//
+// budget is carried per walk rather than read from the constant so a test can scale
+// it down — exercising the exhaustion path takes a full budget of wall clock
+// otherwise. Zero means resolveBudget.
+type candidateWalk struct {
+	spent  time.Duration
+	budget time.Duration
+}
+
+// limit is the walk's budget, defaulted.
+func (w *candidateWalk) limit() time.Duration {
+	if w.budget > 0 {
+		return w.budget
+	}
+	return resolveBudget
+}
 
 // provider materializes candidate i under whatever is left of the budget, charging
 // what it takes. Time spent on the ATTEMPT against a materialized provider is
@@ -91,10 +106,10 @@ type candidateWalk struct{ spent time.Duration }
 // A caller that gets an error checks exhausted() to tell "this candidate failed"
 // from "there is nothing left to try one with".
 func (w *candidateWalk) provider(ctx context.Context, cands Candidates, i int) (Provider, error) {
-	remaining := resolveBudget - w.spent
+	remaining := w.limit() - w.spent
 	if remaining <= 0 {
 		return Provider{}, &Error{Stage: StageUpstream, Err: fmt.Errorf(
-			"provider selection budget (%s) spent before candidate %d could be prepared", resolveBudget, i)}
+			"provider selection budget (%s) spent before candidate %d could be prepared", w.limit(), i)}
 	}
 	ctx, cancel := context.WithTimeout(ctx, remaining)
 	defer cancel()
@@ -106,7 +121,7 @@ func (w *candidateWalk) provider(ctx context.Context, cands Candidates, i int) (
 
 // exhausted reports that the budget is gone, so continuing down the chain would
 // only reproduce the same failure once per remaining candidate.
-func (w *candidateWalk) exhausted() bool { return w.spent >= resolveBudget }
+func (w *candidateWalk) exhausted() bool { return w.spent >= w.limit() }
 
 // staticResolver always returns the same single provider, ignoring the request —
 // the low-level case for a caller that already holds a provider identity. It

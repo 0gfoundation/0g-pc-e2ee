@@ -155,6 +155,10 @@ type Client struct {
 	// WithResponseVerification. See verify.go.
 	sigFetcher SignatureFetcher
 	recover    proof.RecoverFunc
+	// resolveBudgetTO bounds total candidate materialization for one call
+	// (resolveBudget by default). A field so a test can scale it down; see
+	// candidateWalk.
+	resolveBudgetTO time.Duration
 }
 
 // MetricsHook receives redaction-safe counters for core events, letting a caller
@@ -433,6 +437,8 @@ func NewWithResolver(r Resolver, opts ...Option) *Client {
 		sealFields:    wire.DefaultSealedFields(),
 		unboundFields: wire.DefaultUnboundFields(),
 		http:          &http.Client{Transport: tr},
+
+		resolveBudgetTO: resolveBudget,
 	}
 	for _, o := range opts {
 		o(c)
@@ -479,18 +485,27 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 	// The walk charges every materialization against one shared budget, so a long
 	// chain of unreachable candidates cannot keep the caller waiting indefinitely
 	// (see resolveBudget).
-	var walk candidateWalk
+	walk := candidateWalk{budget: c.resolveBudgetTO}
 	for i := 0; i < cands.Len(); i++ {
 		provider, err := walk.provider(ctx, cands, i)
 		if err != nil {
-			// This candidate could not be materialized (e.g. its pubkey fetch
-			// failed); skip it and try the next — unless the budget is gone, in which
-			// case every remaining candidate would fail the same way and the caller is
-			// better served by the failure we already have.
-			lastErr = resolveErr(err)
 			if walk.exhausted() {
+				// Out of materialization budget: every remaining candidate would fail the
+				// same way, so stop. KEEP whatever failure we already have rather than
+				// overwriting it with this one — an earlier candidate's real upstream
+				// reply (a 503 with its Retry-After, say, which the proxy surfaces
+				// verbatim) tells the caller far more than "we ran out of time preparing
+				// the next one", and only that is worth reporting when there is nothing
+				// else. This assignment used to happen before the check, which threw the
+				// better error away.
+				if lastErr == nil {
+					lastErr = resolveErr(err)
+				}
 				break
 			}
+			// This candidate could not be materialized (e.g. its pubkey fetch failed);
+			// skip it and try the next.
+			lastErr = resolveErr(err)
 			c.metricFallback(FallbackMaterialize, i, cands.Len())
 			continue
 		}

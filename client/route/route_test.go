@@ -1445,3 +1445,139 @@ func TestPreviewCeilingIsBudgetPlusOneAttempt(t *testing.T) {
 	}
 	t.Logf("elapsed %s over %d attempts (ceiling %s)", elapsed.Truncate(time.Millisecond), atomic.LoadInt32(&hits), budgetTO+attemptTO)
 }
+
+// The retry gate exists so a router outage cannot be amplified back at the router
+// (previewAttempts× the traffic) or at us (each request holding its concurrency
+// slot for the retry ceiling instead of one attempt). The first attempt is never
+// suppressed, so every request still gets its real error.
+func TestPreviewRetriesSuppressedWhileRouterIsDown(t *testing.T) {
+	const suppressed = `zg_gateway_preview_retries_suppressed_total`
+	before := metricValue(t, suppressed)
+
+	router := newMockRouter(t, newMockBroker(t))
+	router.previewFailN = 1 << 20 // never recovers
+	r := New(router.srv.URL)
+
+	// Trip the gate: each call burns its full attempt allowance.
+	for i := 0; i < previewRetryTripAfter; i++ {
+		if _, err := r.Resolve(context.Background(), chatReq()); err == nil {
+			t.Fatal("want an error from a dead router")
+		}
+	}
+	tripped := atomic.LoadInt32(&router.previewHits)
+	if want := int32(previewRetryTripAfter * previewAttempts); tripped != want {
+		t.Fatalf("attempts before tripping = %d, want %d", tripped, want)
+	}
+
+	// From here each call costs ONE attempt, not previewAttempts.
+	if _, err := r.Resolve(context.Background(), chatReq()); err == nil {
+		t.Fatal("want an error from a dead router")
+	}
+	if got := atomic.LoadInt32(&router.previewHits) - tripped; got != 1 {
+		t.Errorf("attempts after tripping = %d, want 1 (retries should be suppressed)", got)
+	}
+	if got := metricValue(t, suppressed) - before; got == 0 {
+		t.Error("no suppression was counted; the gate is invisible to an operator")
+	}
+}
+
+// A router that comes back must get its retries back — the gate is a cooldown, not
+// a latch, and any answer at all is proof of reachability.
+func TestPreviewRetryGateReopensOnAnAnswer(t *testing.T) {
+	router := newMockRouter(t, newMockBroker(t))
+	router.previewFailN = 1 << 20
+	r := New(router.srv.URL)
+	for i := 0; i < previewRetryTripAfter; i++ {
+		_, _ = r.Resolve(context.Background(), chatReq())
+	}
+
+	// The router recovers; the one attempt the gate still allows finds it.
+	router.previewFailN = 0
+	if _, err := r.Resolve(context.Background(), chatReq()); err != nil {
+		t.Fatalf("Resolve after recovery: %v", err)
+	}
+
+	// Retries are back: a fresh transient blip is absorbed again.
+	base := atomic.LoadInt32(&router.previewHits)
+	router.previewFailN = base + 1 // fail exactly the next attempt
+	if _, err := r.Resolve(context.Background(), chatReq()); err != nil {
+		t.Fatalf("Resolve across a blip after recovery: %v", err)
+	}
+	if got := atomic.LoadInt32(&router.previewHits) - base; got != 2 {
+		t.Errorf("attempts = %d, want 2 (the gate should have reopened)", got)
+	}
+}
+
+// lateCancelCtx reports Err() as canceled once flipped, while its Done channel is
+// never closed — so an HTTP request already in flight is NOT torn down. That models
+// exactly the race the ordering fix is about ("the caller went away in the gap
+// after a successful attempt returned") without having to win it: a real
+// cancellation would abort the request and never reach the branch under test.
+type lateCancelCtx struct {
+	context.Context
+	done     chan struct{}
+	canceled *atomic.Bool
+}
+
+func (c lateCancelCtx) Done() <-chan struct{} { return c.done }
+
+func (c lateCancelCtx) Err() error {
+	if c.canceled.Load() {
+		return context.Canceled
+	}
+	return nil
+}
+
+// A cancellation that lands between a successful attempt returning and the loop
+// inspecting it must not turn that attempt into "canceled": the call is counted ok,
+// and two series that disagree about the same attempt are worse than either alone.
+func TestPreviewSuccessNotReattributedToLateCancellation(t *testing.T) {
+	const (
+		attemptsOK       = `zg_gateway_preview_attempts_total{result="ok"}`
+		attemptsCanceled = `zg_gateway_preview_attempts_total{result="canceled"}`
+		callsOK          = `zg_gateway_preview_calls_total{outcome="ok"}`
+		callsCanceled    = `zg_gateway_preview_calls_total{outcome="canceled"}`
+	)
+	series := []string{attemptsOK, attemptsCanceled, callsOK, callsCanceled}
+	before := map[string]float64{}
+	for _, s := range series {
+		before[s] = metricValue(t, s)
+	}
+
+	var canceled atomic.Bool
+	router := newMockRouter(t, newMockBroker(t))
+	ctx := lateCancelCtx{
+		Context:  context.Background(),
+		done:     make(chan struct{}),
+		canceled: &canceled,
+	}
+
+	// The preview succeeds, and the caller is gone by the time the loop looks.
+	r := New(router.srv.URL)
+	providers, err := r.preview(ctx, chatReq())
+	canceled.Store(true)
+	if err != nil {
+		t.Fatalf("preview: %v", err)
+	}
+	if len(providers) == 0 {
+		t.Fatal("preview returned no candidates")
+	}
+	// Re-run with the flag already set: this is the ordering under test.
+	if _, err := r.preview(ctx, chatReq()); err != nil {
+		t.Fatalf("preview with an already-done caller: %v", err)
+	}
+
+	if got := metricValue(t, attemptsOK) - before[attemptsOK]; got != 2 {
+		t.Errorf("%s delta = %v, want 2", attemptsOK, got)
+	}
+	if got := metricValue(t, attemptsCanceled) - before[attemptsCanceled]; got != 0 {
+		t.Errorf("a successful attempt was re-attributed to a late cancellation; %s delta = %v, want 0",
+			attemptsCanceled, got)
+	}
+	if got := metricValue(t, callsOK) - before[callsOK]; got != 2 {
+		t.Errorf("%s delta = %v, want 2", callsOK, got)
+	}
+	if got := metricValue(t, callsCanceled) - before[callsCanceled]; got != 0 {
+		t.Errorf("%s delta = %v, want 0 — the attempt and call series must agree", callsCanceled, got)
+	}
+}

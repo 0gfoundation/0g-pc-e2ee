@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
@@ -287,11 +288,8 @@ func (s *slowCandidates) Provider(ctx context.Context, i int) (Provider, error) 
 // The first candidate always gets the whole budget, so the walk can never refuse
 // to try anybody — a cold start with one slow provider must still reach it.
 func TestCandidateWalkAlwaysTriesTheFirstCandidate(t *testing.T) {
-	var w candidateWalk
+	w := candidateWalk{budget: 50 * time.Millisecond}
 	cands := &slowCandidates{n: 3}
-	// Pre-charge to just under the budget so the (blocking) materialization returns
-	// promptly instead of holding the test for the full 90s.
-	w.spent = resolveBudget - 50*time.Millisecond
 
 	if _, err := w.provider(context.Background(), cands, 0); err == nil {
 		t.Fatal("a materialization that ran out of budget should error")
@@ -308,7 +306,7 @@ func TestCandidateWalkAlwaysTriesTheFirstCandidate(t *testing.T) {
 // remaining candidate would fail the same way, and the caller is better served by
 // the failure already in hand.
 func TestCandidateWalkStopsWithoutCallingTheResolver(t *testing.T) {
-	w := candidateWalk{spent: resolveBudget}
+	w := candidateWalk{budget: time.Second, spent: time.Second}
 	cands := &slowCandidates{n: 5}
 
 	_, err := w.provider(context.Background(), cands, 2)
@@ -330,9 +328,8 @@ func TestCandidateWalkStopsWithoutCallingTheResolver(t *testing.T) {
 // The budget is shared across the chain, so a walk down several slow candidates
 // costs the budget ONCE in total rather than once per candidate.
 func TestCandidateWalkBudgetIsSharedAcrossCandidates(t *testing.T) {
-	var w candidateWalk
+	w := candidateWalk{budget: 50 * time.Millisecond}
 	cands := &slowCandidates{n: 4}
-	w.spent = resolveBudget - 50*time.Millisecond
 
 	start := time.Now()
 	for i := 0; i < cands.n; i++ {
@@ -425,3 +422,72 @@ func TestMetricCallsAreNoOpWithoutAHook(t *testing.T) {
 	c.metricFallback(FallbackUpstream, 0, 2)
 	c.metricStreamFirstFrame(time.Second)
 }
+
+// mixedCandidates materializes candidate 0 fine and blocks forever on every later
+// one — the shape that exhausts the materialization budget after an attempt has
+// already produced a real upstream failure.
+type mixedCandidates struct {
+	n int
+	p Provider
+}
+
+func (m mixedCandidates) Len() int { return m.n }
+
+func (m mixedCandidates) Provider(ctx context.Context, i int) (Provider, error) {
+	if i == 0 {
+		return m.p, nil
+	}
+	<-ctx.Done()
+	return Provider{}, ctx.Err()
+}
+
+// When the budget runs out mid-walk, the caller must still be told what the
+// PROVIDER said. The materialization deadline is our own bookkeeping; a 503 with a
+// Retry-After (which the proxy surfaces verbatim) is what the caller can act on, so
+// it must not be overwritten on the way out.
+func TestBudgetExhaustionKeepsTheUpstreamError(t *testing.T) {
+	// A provider whose data-plane call returns 503, so the first candidate produces a
+	// real staged upstream error before the walk stalls on the second.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "7")
+		http.Error(w, "provider busy", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	_, encPub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cands := mixedCandidates{n: 3, p: Provider{
+		URL: srv.URL, EncPubKey: encPub, Address: "0xC0FFEE0000000000000000000000000000000001",
+		SignerAddr: "0xd45b4301940B297F76d6e622c1CeA2AE660617d4",
+	}}
+	c := NewWithResolver(fixedResolver{cands})
+	c.resolveBudgetTO = 300 * time.Millisecond // scaled; the shipped value is a minute-plus
+
+	_, err = c.Complete(context.Background(), wire.Request{
+		"model":    json.RawMessage(`"gpt-4o"`),
+		"messages": json.RawMessage(`[{"role":"user","content":"hi"}]`),
+	})
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	var e *Error
+	if !errors.As(err, &e) {
+		t.Fatalf("want *Error, got %T: %v", err, err)
+	}
+	// The status is the whole point: a materialization timeout carries none, so a 0
+	// here means the provider's reply was thrown away.
+	if e.Status != http.StatusServiceUnavailable {
+		t.Errorf("Status = %d, want %d — the upstream reply was overwritten by our own bookkeeping error",
+			e.Status, http.StatusServiceUnavailable)
+	}
+	if e.Header.Get("Retry-After") != "7" {
+		t.Errorf("Retry-After = %q, want \"7\"", e.Header.Get("Retry-After"))
+	}
+}
+
+// fixedResolver returns a prepared Candidates, so a test can control materialization.
+type fixedResolver struct{ c Candidates }
+
+func (f fixedResolver) Resolve(context.Context, wire.Request) (Candidates, error) { return f.c, nil }

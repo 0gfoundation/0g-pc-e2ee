@@ -204,6 +204,10 @@ type Router struct {
 	// tests stay parallel-safe.
 	previewAttemptTO time.Duration
 	previewBudgetTO  time.Duration
+	// previewRetries switches preview retries off while the router looks down, so a
+	// router outage does not become a load multiplier against it and a slot-holding
+	// multiplier against us. See retryGate.
+	previewRetries retryGate
 	// warmState is the outcome of the most recent completed warmer sweep — how many
 	// providers it prepared end to end — read by a caller that needs to know whether
 	// this process can serve anything at all (see WarmState).
@@ -1025,6 +1029,10 @@ const (
 	// previewCanceled: the caller went away mid-attempt. Says nothing about the
 	// router, so it is kept out of every failure bucket.
 	previewCanceled previewResult = "canceled"
+	// previewInternal: a fault in THIS process — a request we could not even build.
+	// Its own bucket for the same reason the data plane has one: our bug must not
+	// point a runbook at the router.
+	previewInternal previewResult = "internal"
 )
 
 // callOutcome maps the attempt result that ENDED a preview onto the call-level
@@ -1036,6 +1044,8 @@ func (r previewResult) callOutcome() string {
 		return "rejected"
 	case previewCanceled:
 		return "canceled"
+	case previewInternal:
+		return "internal"
 	default:
 		return "failed"
 	}
@@ -1109,6 +1119,12 @@ func (r *Router) preview(ctx context.Context, req wire.Request) ([]previewProvid
 			if time.Since(start)+backoff >= r.previewBudgetTO {
 				break
 			}
+			// Retries are off while the router is failing everything: the first attempt
+			// above already happened, so the caller loses nothing but the amplification.
+			if !r.previewRetries.allow() {
+				metrics.PreviewRetrySuppressed()
+				break
+			}
 			t := time.NewTimer(backoff)
 			select {
 			case <-ctx.Done():
@@ -1120,15 +1136,9 @@ func (r *Router) preview(ctx context.Context, req wire.Request) ([]previewProvid
 			backoff *= 2
 		}
 		providers, res, err := r.previewOnce(ctx, body, req)
-		// A caller that has given up is attributed to itself, not to the router — the
-		// same distinction chain.noteFailure draws before stamping a cooldown. Checked
-		// first because a cancellation surfaces as whatever failure the in-flight call
-		// happened to hit.
-		if ctx.Err() != nil {
-			res = previewCanceled
-		}
-		metrics.PreviewAttempt(string(res))
 		if err == nil {
+			metrics.PreviewAttempt(string(res))
+			r.previewRetries.answered()
 			// A success that NEEDED a retry gets its own outcome. It is the series that
 			// shows the retries earning their keep — and the one that stops a degrading
 			// router from hiding behind a flat error rate, which is the whole failure
@@ -1139,15 +1149,32 @@ func (r *Router) preview(ctx context.Context, req wire.Request) ([]previewProvid
 			}
 			return providers, nil
 		}
+		// Only a FAILED attempt can be re-attributed to the caller. Testing ctx before
+		// the success branch (as this did) counted an attempt that had just returned a
+		// usable list as "canceled" whenever the caller went away in the gap, leaving
+		// the attempt and call series contradicting each other.
+		//
+		// A caller that has given up is attributed to itself, not to the router — the
+		// same distinction chain.noteFailure draws before stamping a cooldown.
+		if ctx.Err() != nil {
+			res = previewCanceled
+		}
+		metrics.PreviewAttempt(string(res))
 		lastErr = err
 		if res != previewRetryable {
+			// rejected and broken are both the router REPLYING, which is what the gate
+			// cares about; canceled and internal say nothing about it either way.
+			if res == previewRejected || res == previewBroken {
+				r.previewRetries.answered()
+			}
 			outcome = res.callOutcome()
 			return nil, err
 		}
 	}
-	// Out of attempts (or out of budget) with only retryable failures behind us: we
-	// never got a usable answer, which is the one shape that is squarely the
-	// router's.
+	// Out of attempts (or out of budget, or out of retry allowance) with only
+	// retryable failures behind us: we never got a usable answer, which is the one
+	// shape that is squarely the router's — and the one the gate counts.
+	r.previewRetries.noAnswer()
 	return nil, lastErr
 }
 
@@ -1180,7 +1207,11 @@ func (r *Router) previewOnce(ctx context.Context, body []byte, req wire.Request)
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, r.previewURL, bytes.NewReader(body))
 	if err != nil {
-		return nil, previewBroken, upstream(0, err)
+		// Reachable only for a previewURL this process built wrong — our own
+		// configuration, not the router misbehaving. (The gateway parses -router-url at
+		// startup and exits, so this is near-unreachable; label it honestly anyway,
+		// because "broken" sends a runbook at the router.)
+		return nil, previewInternal, upstream(0, err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	// Forward routing directives first, then the credential, so the credential

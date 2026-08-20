@@ -74,6 +74,15 @@ screen:
      attempt, and the end-to-end worst case is about twice the header timeout. Both
      bounds are real: without the per-attempt one, the shared client caps only the
      wait for headers and a dribbled body would leave a preview unbounded.
+   - **`retries suppressed` rising means the router is fully down, not flaky.**
+     Retrying an uncached dependency multiplies load on it exactly when it can
+     least take it, and each retrying request holds its gateway concurrency slot
+     for the ceiling above rather than for one attempt — so a router outage would
+     turn into gateway-wide shedding. After a few consecutive answerless calls the
+     retries switch themselves off (`route.retryGate`) until an answer comes back.
+     The first attempt of every request is still made, so callers still get their
+     real error; what stops is the amplification. Read it next to `failed`: both
+     up together is an outage, `ok_retried` up with this flat is a degradation.
 4. **Data plane — the sealed request to the provider**: upstream failure ratio and
    candidate-fallback rate; attempts by outcome; buffered completion latency;
    stream time-to-first-frame and open duration; the §8 signature fetch and its
@@ -162,7 +171,9 @@ highest-signal ones:
   mid-preview says nothing about the router — and in the ratio's denominator it would
   dilute the very signal being watched) and neither counts `rejected`, which is the
   router answering a caller's own 401/404/429 or reporting an empty fleet. A tenant
-  with a misconfigured key must not be able to page the router team.
+  with a misconfigured key must not be able to page the router team. `internal` is
+  excluded for the same reason from the other side: a request this gateway could
+  not even build is our bug, not the router's.
 - `rate(zg_gateway_onchain_grounding_total{outcome="mismatch"}[5m]) > 0` — a
   provider's quote-bound signer disagreed with the chain, and still disagreed after
   a live re-read. Not an operational blip: it means the enclave that answered is not

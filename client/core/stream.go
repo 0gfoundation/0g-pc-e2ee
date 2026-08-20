@@ -62,14 +62,19 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 	// One shared materialization budget for the whole walk, as in Complete — a
 	// stream that has not started yet has a caller waiting on it just the same (see
 	// resolveBudget).
-	var walk candidateWalk
+	walk := candidateWalk{budget: c.resolveBudgetTO}
 	for i := 0; i < cands.Len(); i++ {
 		provider, err := walk.provider(ctx, cands, i)
 		if err != nil {
-			lastErr = resolveErr(err)
 			if walk.exhausted() {
+				// Keep the better error, as in Complete: a previous candidate's upstream
+				// status outlives "we ran out of budget preparing the next one".
+				if lastErr == nil {
+					lastErr = resolveErr(err)
+				}
 				break
 			}
+			lastErr = resolveErr(err)
 			c.metricFallback(FallbackMaterialize, i, cands.Len())
 			continue
 		}
