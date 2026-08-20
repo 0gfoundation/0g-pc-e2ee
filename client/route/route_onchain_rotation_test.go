@@ -92,7 +92,7 @@ func TestProvider_MismatchAgainstCachedQuote_ReverifiesAndPasses(t *testing.T) {
 	if err != nil {
 		t.Fatalf("deriveQuoteURL: %v", err)
 	}
-	r.quoteCache.put(quoteURL, mustHex(t, qvEncPubHex), qvSignerStr)
+	r.quoteCache.put(quoteURL, quoteResult{encPub: mustHex(t, qvEncPubHex), signer: qvSignerStr})
 
 	cands, err := r.Resolve(context.Background(), wire.Request{})
 	if err != nil {
@@ -132,7 +132,7 @@ func TestProvider_MismatchSurvivesReverification(t *testing.T) {
 	if err != nil {
 		t.Fatalf("deriveQuoteURL: %v", err)
 	}
-	r.quoteCache.put(quoteURL, mustHex(t, qvEncPubHex), qvSignerStr)
+	r.quoteCache.put(quoteURL, quoteResult{encPub: mustHex(t, qvEncPubHex), signer: qvSignerStr})
 
 	cands, err := r.Resolve(context.Background(), wire.Request{})
 	if err != nil {
@@ -199,7 +199,7 @@ func TestProvider_ReverificationIsRateLimited(t *testing.T) {
 
 	for i := 0; i < 5; i++ {
 		// Seed a cached quote each round, as a live gateway's cache would hold one.
-		r.quoteCache.put(quoteURL, mustHex(t, qvEncPubHex), qvSignerStr)
+		r.quoteCache.put(quoteURL, quoteResult{encPub: mustHex(t, qvEncPubHex), signer: qvSignerStr})
 		cands, err := r.Resolve(context.Background(), wire.Request{})
 		if err != nil {
 			t.Fatalf("round %d: Resolve: %v", i, err)
@@ -236,7 +236,7 @@ func TestProvider_RotationRecoveryRunsInWarnMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("deriveQuoteURL: %v", err)
 	}
-	r.quoteCache.put(quoteURL, mustHex(t, qvEncPubHex), qvSignerStr) // pre-rotation
+	r.quoteCache.put(quoteURL, quoteResult{encPub: mustHex(t, qvEncPubHex), signer: qvSignerStr}) // pre-rotation
 
 	cands, err := r.Resolve(context.Background(), wire.Request{})
 	if err != nil {

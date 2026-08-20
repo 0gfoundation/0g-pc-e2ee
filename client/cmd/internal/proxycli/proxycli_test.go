@@ -195,6 +195,39 @@ func TestBuildDirectMode(t *testing.T) {
 	}
 	// No warmer in direct mode: StartWarmer must be a no-op that returns cleanly.
 	built.StartWarmer(testLogger())()
+	// And no provider-identity source: direct mode pins no on-chain provider address,
+	// so there is nothing a record could be keyed by and nothing for the gateway to
+	// mount a route over.
+	if built.ProviderIdentities() != nil {
+		t.Error("direct mode should expose no provider-identity source")
+	}
+}
+
+// The provider-identity source exists exactly when a verdict could ever be
+// produced: router mode with -attest. Without -attest nothing is verified, and a
+// gateway that mounted the route anyway would serve a surface that can only 404 —
+// which reads, to a panel, as "this provider is unknown" rather than "this
+// deployment does not verify providers".
+func TestBuildProviderIdentitiesRequiresAttest(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{"router mode without -attest", nil, false},
+		{"router mode with -attest", []string{"-attest"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := flag.NewFlagSet("t", flag.ContinueOnError)
+			f := RegisterFlags(fs, "ZG_TEST", ":0")
+			if err := fs.Parse(tc.args); err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			if got := f.Build("test", testLogger()).ProviderIdentities() != nil; got != tc.want {
+				t.Errorf("ProviderIdentities() non-nil = %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
 
 // IdleTimeout's whole justification is a net/http behaviour that is easy to

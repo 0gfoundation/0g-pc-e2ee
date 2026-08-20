@@ -105,6 +105,20 @@ func New(policy BootChainPolicy, opts ...Option) *Verifier {
 	return v
 }
 
+// MeasurementBaselineConfigured reports whether this Verifier holds any expected
+// boot chain at all — i.e. whether the measurement check has a baseline to compare
+// against.
+//
+// It exists because Verified.MeasurementTrusted is false for two very different
+// reasons under ModeWarn: the enclave runs an image that is not in the allowlist (a
+// finding about the enclave), and the allowlist is empty (a finding about our own
+// configuration). Verify separates them only under ModeEnforce, via
+// ErrMeasurementPolicyNotConfigured. A caller that REPORTS the measurement outcome
+// rather than merely acting on it — the gateway's provider-identity endpoint — has
+// to distinguish the two, because collapsing them tells a user "this provider runs
+// unaudited code" when the truth is "we have audited none".
+func (v *Verifier) MeasurementBaselineConfigured() bool { return v.policy.Configured() }
+
 // Verified is the trusted result of Verify: the keys bound into a genuine quote
 // whose measurement the client accepts.
 type Verified struct {
