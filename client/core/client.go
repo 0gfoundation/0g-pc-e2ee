@@ -172,7 +172,112 @@ type MetricsHook interface {
 	// against the grounded signer (an integrity/authenticity failure of the
 	// provider — the alarming case).
 	ResponseVerificationFailure(reason string)
+	// UpstreamAttempt is called once per completed data-plane attempt against one
+	// provider, with how long the upstream call took. kind is UpstreamBuffered or
+	// UpstreamStream; outcome is one of the Upstream* constants.
+	//
+	// It exists because a caller cannot recover this from its own server-side
+	// timings: those measure provider selection plus this, and when the number
+	// moves they cannot say which half moved. Only the client core knows where one
+	// attempt began and ended, and which of several candidates it was.
+	UpstreamAttempt(kind, outcome string, dur time.Duration)
+	// StreamFirstFrame is called once per stream, when the first frame is
+	// delivered to the caller. A stream's total duration is set by how much the
+	// model has to say; the wait for its first token is the part a caller
+	// experiences as latency, and the two are unrelated.
+	StreamFirstFrame(dur time.Duration)
+	// CandidateFallback is called each time the client gives up on a candidate and
+	// moves to the next, with reason FallbackUpstream (an attempt failed
+	// transiently and is re-sealed to the next candidate) or FallbackMaterialize
+	// (the candidate could not be prepared at all). Sustained fallback is the only
+	// signal that the ranking the untrusted router hands us puts bad providers
+	// first — invisible in the request outcome, which the fallback repaired.
+	CandidateFallback(reason string)
 }
+
+// Attempt kinds and outcomes reported through MetricsHook.UpstreamAttempt, named
+// so the vocabulary cannot drift between the buffered and streaming paths (which
+// classify the same failures at different call sites).
+const (
+	UpstreamBuffered = "buffered"
+	UpstreamStream   = "stream"
+
+	UpstreamOK = "ok"
+	// UpstreamTransport: the request never reached the provider.
+	UpstreamTransport = "transport"
+	// UpstreamBody: a response began but its body dropped mid-read, or a stream
+	// ended before its final frame — a delivery failure, not a content one.
+	UpstreamBody = "body"
+	// UpstreamUndecodable: a 2xx whose sealed body would not decode or open.
+	UpstreamUndecodable = "undecodable"
+	// UpstreamNotStream: a 200 that was not an event stream (the provider ignored
+	// stream:true), which would otherwise read as an empty completion.
+	UpstreamNotStream = "not_stream"
+	// UpstreamUnverified: the response opened but failed §8 signature verification.
+	UpstreamUnverified = "unverified"
+	// UpstreamTimeout: OUR deadline fired — the per-attempt provider timeout, or a
+	// stream's idle watchdog between frames. The provider went quiet; the caller
+	// did not go away.
+	UpstreamTimeout = "timeout"
+	// UpstreamCanceled: the CALLER went away mid-attempt. Kept out of every failure
+	// bucket on purpose: a user closing a tab is not a provider fault, and folding
+	// it in would put our own users' navigation in the router's error rate.
+	UpstreamCanceled = "canceled"
+	// UpstreamInternal: a fault in THIS client detected mid-attempt. Its own bucket
+	// so our bug can never be read as a provider's.
+	UpstreamInternal = "internal"
+
+	FallbackUpstream    = "upstream"
+	FallbackMaterialize = "materialize"
+)
+
+// upstreamStatusOutcome classifies a non-2xx provider status into its attempt
+// outcome. 429 is split out from the rest of the 4xx range because it is the one
+// that says "this provider is saturated" rather than "this request was wrong" —
+// the same reason the fallback logic treats it as transient.
+func upstreamStatusOutcome(status int) string {
+	switch {
+	case status == http.StatusTooManyRequests:
+		return "http_429"
+	case status >= 500 && status <= 599:
+		return "http_5xx"
+	case status >= 400 && status <= 499:
+		return "http_4xx"
+	default:
+		return "http_other"
+	}
+}
+
+// metricUpstreamAttempt reports one data-plane attempt to the hook, if one is
+// configured. No-op otherwise, like every other metric call in core.
+func (c *Client) metricUpstreamAttempt(kind, outcome string, dur time.Duration) {
+	if c.metrics != nil {
+		c.metrics.UpstreamAttempt(kind, outcome, dur)
+	}
+}
+
+// metricFallback reports one move from candidate i (of n) to the next — but only
+// when there IS a next one. A failure on the LAST candidate ends the walk, and
+// counting it as a fallback would inflate the series on a single-candidate
+// deployment, the common shape, where nothing was ever fallen back to.
+func (c *Client) metricFallback(reason string, i, n int) {
+	if c.metrics != nil && i+1 < n {
+		c.metrics.CandidateFallback(reason)
+	}
+}
+
+// metricStreamFirstFrame reports a stream's time to first delivered frame.
+func (c *Client) metricStreamFirstFrame(dur time.Duration) {
+	if c.metrics != nil {
+		c.metrics.StreamFirstFrame(dur)
+	}
+}
+
+// canceledBy reports whether parent is done, i.e. whether a failure inside a
+// derived (deadline-bearing) context is the CALLER giving up rather than our own
+// deadline firing. Both look identical from inside the attempt, and they belong in
+// different metric buckets: see UpstreamCanceled vs UpstreamTimeout.
+func canceledBy(parent context.Context) bool { return parent.Err() != nil }
 
 // Option customizes a Client.
 type Option func(*Client)
@@ -353,6 +458,7 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 			if walk.exhausted() {
 				break
 			}
+			c.metricFallback(FallbackMaterialize, i, cands.Len())
 			continue
 		}
 
@@ -362,6 +468,7 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 		}
 		lastErr = err
 		if retry {
+			c.metricFallback(FallbackUpstream, i, cands.Len())
 			continue
 		}
 		return nil, err
@@ -385,21 +492,36 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 //   - true (fall back): a transient status (429 / 5xx), a response whose body
 //     dropped mid-read, or a 2xx whose sealed body will not decode/open — all
 //     provider-side failures with nothing yet returned to the caller.
-func (c *Client) completeOnce(ctx context.Context, provider Provider, req wire.Request, ephPub []byte, ephPriv crypto.PrivateKey) (wire.Response, bool, error) {
-	ctx, cancel := context.WithTimeout(ctx, providerTimeout)
+func (c *Client) completeOnce(parent context.Context, provider Provider, req wire.Request, ephPub []byte, ephPriv crypto.PrivateKey) (wire.Response, bool, error) {
+	ctx, cancel := context.WithTimeout(parent, providerTimeout)
 	defer cancel()
 
 	sealed, err := c.seal(provider, req, ephPub)
 	if err != nil {
 		// A seal failure depends on the request, not the provider (e.g. no messages
 		// to seal), so it would fail identically for every candidate — terminal.
+		// Deliberately unmetered as an upstream attempt: nothing went upstream.
 		return nil, false, stageErr(StageRequest, fmt.Errorf("seal request: %w", err))
 	}
+
+	// Meter the upstream call from here — after the seal, which is local work — to
+	// whichever return follows. The outcome is set at each failure site and reported
+	// once by this defer, so a new return cannot silently escape the counter.
+	start := time.Now()
+	outcome := UpstreamOK
+	defer func() { c.metricUpstreamAttempt(UpstreamBuffered, outcome, time.Since(start)) }()
 
 	resp, err := c.doRequest(ctx, provider, sealed)
 	if err != nil {
 		// Never reached the provider (transport failure); the same router fronts
-		// every candidate, so it recurs — terminal.
+		// every candidate, so it recurs — terminal. A caller that went away mid-flight
+		// looks identical here, so attribute it by asking the parent.
+		outcome = UpstreamTransport
+		if canceledBy(parent) {
+			outcome = UpstreamCanceled
+		} else if ctx.Err() != nil {
+			outcome = UpstreamTimeout
+		}
 		return nil, false, &Error{Stage: StageUpstream, Err: fmt.Errorf("post to provider: %w", err)}
 	}
 	defer resp.Body.Close()
@@ -414,6 +536,7 @@ func (c *Client) completeOnce(ctx context.Context, provider Provider, req wire.R
 		// intentionally unbounded — a completion can legitimately be large.) Fall
 		// back only on a transient status (429 / 5xx).
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBytes))
+		outcome = upstreamStatusOutcome(resp.StatusCode)
 		e := &Error{Stage: StageUpstream, Status: resp.StatusCode, Err: fmt.Errorf("provider returned %d", resp.StatusCode), Body: string(body), Header: resp.Header.Clone()}
 		return nil, retryableStatus(resp.StatusCode), e
 	}
@@ -422,6 +545,12 @@ func (c *Client) completeOnce(ctx context.Context, provider Provider, req wire.R
 	if err != nil {
 		// A response began but the body dropped mid-read: a provider-side failure
 		// with nothing delivered to the caller — fall back to the next candidate.
+		outcome = UpstreamBody
+		if canceledBy(parent) {
+			outcome = UpstreamCanceled
+		} else if ctx.Err() != nil {
+			outcome = UpstreamTimeout
+		}
 		return nil, true, stageErr(StageUpstream, fmt.Errorf("read provider response: %w", err))
 	}
 
@@ -430,11 +559,13 @@ func (c *Client) completeOnce(ctx context.Context, provider Provider, req wire.R
 		// A 2xx whose body will not decode/open is a provider fault with nothing
 		// yet returned to the caller — fall back (as the streaming path does before
 		// its first frame).
+		outcome = UpstreamUndecodable
 		return nil, true, stageErr(StageUpstream, fmt.Errorf("decode sealed response: %w", err))
 	}
 	out, err := wire.OpenResponse(ephPriv, sealedResp)
 	if err != nil {
 		c.logOpenFailure(0, sealedResp, err)
+		outcome = UpstreamUndecodable
 		return nil, true, stageErr(StageUpstream, fmt.Errorf("open response: %w", err))
 	}
 	// Response-signature verification (hop 11), fail-closed. A response that
@@ -443,6 +574,7 @@ func (c *Client) completeOnce(ctx context.Context, provider Provider, req wire.R
 	// mask a bad provider). Nothing is returned to the caller on failure.
 	if c.verifyEnabled() {
 		if err := c.verifyNonStream(ctx, provider, resp.Header, sealed, sealedResp); err != nil {
+			outcome = UpstreamUnverified
 			return nil, false, stageErr(StageUpstream, err)
 		}
 	}

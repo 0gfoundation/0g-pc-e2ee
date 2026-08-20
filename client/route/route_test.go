@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
@@ -1058,5 +1059,146 @@ func assertStageStatus(t *testing.T, err error, stage string, status int) {
 	}
 	if e.Status != status {
 		t.Errorf("status = %d, want %d", e.Status, status)
+	}
+}
+
+// meteredClient is a route-resolving core client with the real Prometheus adapter
+// wired in, so the data-plane assertions below read the same series the dashboard
+// does rather than a test double's idea of them.
+func meteredClient(routerURL string) *core.Client {
+	return core.NewWithResolver(New(routerURL), core.WithMetrics(metrics.CoreMetrics{}))
+}
+
+func upstreamAttempt(kind, outcome string) string {
+	return fmt.Sprintf(`zg_gateway_upstream_attempts_total{kind="%s",outcome="%s"}`, kind, outcome)
+}
+
+// A clean buffered completion books exactly one buffered/ok attempt, observes the
+// attempt-duration histogram once, and reports no fallback.
+func TestUpstreamMetricsOnCleanCompletion(t *testing.T) {
+	ok := upstreamAttempt("buffered", "ok")
+	dur := `zg_gateway_upstream_attempt_duration_seconds_count{kind="buffered"}`
+	fb := `zg_gateway_candidate_fallbacks_total{reason="upstream"}`
+	before := map[string]float64{ok: metricValue(t, ok), dur: metricValue(t, dur), fb: metricValue(t, fb)}
+
+	router := newMockRouter(t, newMockBroker(t))
+	if _, err := meteredClient(router.srv.URL).Complete(context.Background(), chatReq()); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	for series, want := range map[string]float64{ok: 1, dur: 1, fb: 0} {
+		if got := metricValue(t, series) - before[series]; got != want {
+			t.Errorf("%s delta = %v, want %v", series, got, want)
+		}
+	}
+}
+
+// The fallback counter is the only signal that the router's ranking put a bad
+// provider first — the request itself succeeded, so nothing else records it. The
+// failing head must also land in the bucket for the status it actually returned.
+func TestUpstreamMetricsRecordFallbackAndStatus(t *testing.T) {
+	fb := `zg_gateway_candidate_fallbacks_total{reason="upstream"}`
+	s5xx := upstreamAttempt("buffered", "http_5xx")
+	ok := upstreamAttempt("buffered", "ok")
+	before := map[string]float64{fb: metricValue(t, fb), s5xx: metricValue(t, s5xx), ok: metricValue(t, ok)}
+
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	secondAddr := "0xC0FFEE0000000000000000000000000000000002"
+	router.extra = []previewProvider{{
+		Address: secondAddr, CanonicalID: "canon-2", Endpoint: broker.srv.URL, ModelID: "gpt-4o@v2",
+	}}
+	router.failPin = testProviderAddr // the head 503s; the second serves
+
+	if _, err := meteredClient(router.srv.URL).Complete(context.Background(), chatReq()); err != nil {
+		t.Fatalf("Complete should have fallen back and succeeded: %v", err)
+	}
+
+	for series, want := range map[string]float64{fb: 1, s5xx: 1, ok: 1} {
+		if got := metricValue(t, series) - before[series]; got != want {
+			t.Errorf("%s delta = %v, want %v", series, got, want)
+		}
+	}
+}
+
+// 429 gets its own bucket rather than joining the 4xx crowd: it says the provider
+// is saturated, not that the request was wrong, and it is the 4xx the client falls
+// back on.
+func TestUpstreamMetricsSeparateRateLimitFromOther4xx(t *testing.T) {
+	s429, s4xx := upstreamAttempt("buffered", "http_429"), upstreamAttempt("buffered", "http_4xx")
+	before := map[string]float64{s429: metricValue(t, s429), s4xx: metricValue(t, s4xx)}
+
+	for _, tc := range []struct {
+		status int
+		series string
+	}{
+		{http.StatusTooManyRequests, s429},
+		{http.StatusBadRequest, s4xx},
+	} {
+		router := newMockRouter(t, newMockBroker(t))
+		router.failPin = testProviderAddr
+		router.failStatus = tc.status
+		if _, err := meteredClient(router.srv.URL).Complete(context.Background(), chatReq()); err == nil {
+			t.Fatalf("Complete against a %d provider: want error", tc.status)
+		}
+	}
+
+	for series, want := range map[string]float64{s429: 1, s4xx: 1} {
+		if got := metricValue(t, series) - before[series]; got != want {
+			t.Errorf("%s delta = %v, want %v", series, got, want)
+		}
+	}
+}
+
+// A 2xx whose sealed body will not open is its own diagnosis — the provider
+// answered, the crypto did not line up — and must not be filed as a transport or
+// status failure.
+func TestUpstreamMetricsRecordUnopenableBody(t *testing.T) {
+	series := upstreamAttempt("buffered", "undecodable")
+	before := metricValue(t, series)
+
+	router := newMockRouter(t, newMockBroker(t))
+	router.badBodyPin = testProviderAddr
+	if _, err := meteredClient(router.srv.URL).Complete(context.Background(), chatReq()); err == nil {
+		t.Fatal("Complete against an unopenable body: want error")
+	}
+
+	if got := metricValue(t, series) - before; got != 1 {
+		t.Errorf("%s delta = %v, want 1", series, got)
+	}
+}
+
+// A stream books a stream-kind attempt and, separately, its time to first frame —
+// the latency a streaming caller feels, which the attempt duration cannot show
+// because it measures how long the stream stayed open.
+func TestUpstreamMetricsRecordStreamAndFirstFrame(t *testing.T) {
+	ok := upstreamAttempt("stream", "ok")
+	ttff := `zg_gateway_upstream_stream_ttff_seconds_count`
+	dur := `zg_gateway_upstream_attempt_duration_seconds_count{kind="stream"}`
+	// The buffered histogram is watched too: mixing a stream's open duration into it
+	// is exactly what makes a completion-latency panel unreadable, so the split has
+	// to be asserted, not assumed.
+	buffered := `zg_gateway_upstream_attempt_duration_seconds_count{kind="buffered"}`
+	before := map[string]float64{
+		ok: metricValue(t, ok), ttff: metricValue(t, ttff),
+		dur: metricValue(t, dur), buffered: metricValue(t, buffered),
+	}
+
+	router := newMockRouter(t, newMockBroker(t))
+	req := chatReq()
+	req["stream"] = json.RawMessage(`true`)
+	frames := 0
+	if err := meteredClient(router.srv.URL).CompleteStream(context.Background(), req,
+		func(wire.Response) error { frames++; return nil }); err != nil {
+		t.Fatalf("CompleteStream: %v", err)
+	}
+	if frames < 2 {
+		t.Fatalf("got %d frames, want at least 2 (so first-frame is distinct from last)", frames)
+	}
+
+	for series, want := range map[string]float64{ok: 1, ttff: 1, dur: 1, buffered: 0} {
+		if got := metricValue(t, series) - before[series]; got != want {
+			t.Errorf("%s delta = %v, want %v — a stream must book one attempt, ONE first-frame, and nothing buffered", series, got, want)
+		}
 	}
 }

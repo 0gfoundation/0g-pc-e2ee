@@ -2,6 +2,7 @@ package route
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/proof"
 )
 
 func TestDeriveSignatureURL(t *testing.T) {
@@ -112,5 +114,69 @@ func TestFetchSignature_NoRetryOn4xx(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&n); got != 1 {
 		t.Fatalf("a 400 must not be retried, got %d attempts", got)
+	}
+}
+
+// The §8 fetch is serial with every verified response, so it needs its own
+// latency and outcome series. ok_retried in particular is expected traffic — the
+// broker writes the signature at end-of-response, so a just-finished response can
+// momentarily 404 — and must be distinguishable from a clean fetch, otherwise a
+// broker that has started 404ing on EVERY response looks identical to a healthy one.
+func TestSignatureFetchMetrics(t *testing.T) {
+	const (
+		callsOK      = `zg_gateway_signature_fetch_calls_total{outcome="ok"}`
+		callsRetried = `zg_gateway_signature_fetch_calls_total{outcome="ok_retried"}`
+		callsFailed  = `zg_gateway_signature_fetch_calls_total{outcome="failed"}`
+		durCount     = `zg_gateway_signature_fetch_duration_seconds_count`
+	)
+	before := map[string]float64{}
+	for _, s := range []string{callsOK, callsRetried, callsFailed, durCount} {
+		before[s] = metricValue(t, s)
+	}
+	delta := func(s string) float64 { return metricValue(t, s) - before[s] }
+
+	// Any decodable body will do — this test is about the metric, not the signature;
+	// verification is covered by the §8 tests.
+	sig := proof.ChatSignature{Text: "t", Signature: "0xsig", SigningAlgo: "ecdsa-secp256k1"}
+	fetcher := NewSignatureFetcher(nil)
+	provider := func(u string) core.Provider { return core.Provider{Endpoint: u} }
+	key := "11111111-1111-1111-1111-111111111111"
+
+	// Clean fetch.
+	clean := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(sig)
+	}))
+	defer clean.Close()
+	if _, err := fetcher.FetchSignature(context.Background(), provider(clean.URL), key); err != nil {
+		t.Fatalf("clean fetch: %v", err)
+	}
+
+	// The 404-then-ready race the retry exists for.
+	var hits int32
+	racy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&hits, 1) == 1 {
+			http.Error(w, "not cached yet", http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(sig)
+	}))
+	defer racy.Close()
+	if _, err := fetcher.FetchSignature(context.Background(), provider(racy.URL), key); err != nil {
+		t.Fatalf("fetch across the 404 race: %v", err)
+	}
+
+	// A broker that never produces it.
+	gone := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "nope", http.StatusNotFound)
+	}))
+	defer gone.Close()
+	if _, err := fetcher.FetchSignature(context.Background(), provider(gone.URL), key); err == nil {
+		t.Fatal("fetch against a permanently-404 broker: want error")
+	}
+
+	for series, want := range map[string]float64{callsOK: 1, callsRetried: 1, callsFailed: 1, durCount: 3} {
+		if got := delta(series); got != want {
+			t.Errorf("%s delta = %v, want %v", series, got, want)
+		}
 	}
 }

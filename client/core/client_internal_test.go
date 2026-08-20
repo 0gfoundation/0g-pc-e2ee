@@ -180,10 +180,14 @@ func TestLogOpenFailureNilLoggerIsNoop(t *testing.T) {
 }
 
 // countingHook is a MetricsHook that records how many open failures it saw, plus
-// verification failures by reason.
+// verification failures by reason, data-plane attempts by "kind/outcome",
+// candidate fallbacks by reason, and stream first-frame observations.
 type countingHook struct {
-	n      int
-	verify map[string]int
+	n         int
+	verify    map[string]int
+	attempts  map[string]int
+	fallbacks map[string]int
+	ttff      int
 }
 
 func (h *countingHook) ResponseOpenFailure() { h.n++ }
@@ -192,6 +196,22 @@ func (h *countingHook) ResponseVerificationFailure(reason string) {
 		h.verify = map[string]int{}
 	}
 	h.verify[reason]++
+}
+
+func (h *countingHook) UpstreamAttempt(kind, outcome string, _ time.Duration) {
+	if h.attempts == nil {
+		h.attempts = map[string]int{}
+	}
+	h.attempts[kind+"/"+outcome]++
+}
+
+func (h *countingHook) StreamFirstFrame(time.Duration) { h.ttff++ }
+
+func (h *countingHook) CandidateFallback(reason string) {
+	if h.fallbacks == nil {
+		h.fallbacks = map[string]int{}
+	}
+	h.fallbacks[reason]++
 }
 
 // The metrics hook must fire on every open failure and, critically, independently
@@ -353,4 +373,55 @@ func TestCandidateWalkChargesOnlyMaterialization(t *testing.T) {
 	if w.spent > time.Second {
 		t.Errorf("spent = %s; the attempt's own duration was charged to the budget", w.spent)
 	}
+}
+
+func TestUpstreamStatusOutcome(t *testing.T) {
+	for status, want := range map[int]string{
+		http.StatusTooManyRequests:     "http_429",
+		http.StatusBadRequest:          "http_4xx",
+		http.StatusUnauthorized:        "http_4xx",
+		http.StatusNotFound:            "http_4xx",
+		http.StatusInternalServerError: "http_5xx",
+		http.StatusBadGateway:          "http_5xx",
+		http.StatusServiceUnavailable:  "http_5xx",
+		http.StatusMovedPermanently:    "http_other",
+	} {
+		if got := upstreamStatusOutcome(status); got != want {
+			t.Errorf("upstreamStatusOutcome(%d) = %q, want %q", status, got, want)
+		}
+	}
+	// 429 must never be folded into the 4xx bucket: it says "this provider is
+	// saturated", not "this request was wrong", and it is the one the fallback logic
+	// treats as transient.
+	if upstreamStatusOutcome(http.StatusTooManyRequests) == upstreamStatusOutcome(http.StatusBadRequest) {
+		t.Error("429 and 400 must not share a bucket")
+	}
+}
+
+// A failure on the LAST candidate is not a fallback — there was nothing to fall
+// back to. Without this the series would count every transient failure on a
+// single-candidate deployment, which is the common shape.
+func TestMetricFallbackOnlyWhenANextCandidateExists(t *testing.T) {
+	h := &countingHook{}
+	c := New(Provider{}, WithMetrics(h))
+
+	c.metricFallback(FallbackUpstream, 0, 2) // candidate 0 of 2 — a real fallback
+	c.metricFallback(FallbackUpstream, 1, 2) // the last one — not a fallback
+	c.metricFallback(FallbackMaterialize, 0, 1)
+
+	if got := h.fallbacks[FallbackUpstream]; got != 1 {
+		t.Errorf("upstream fallbacks = %d, want 1", got)
+	}
+	if got := h.fallbacks[FallbackMaterialize]; got != 0 {
+		t.Errorf("materialize fallbacks = %d, want 0 (a single-candidate chain cannot fall back)", got)
+	}
+}
+
+// A nil hook is the default, and every metric call must stay a no-op under it —
+// core's metering is optional and must never panic a caller that left it off.
+func TestMetricCallsAreNoOpWithoutAHook(t *testing.T) {
+	c := New(Provider{})
+	c.metricUpstreamAttempt(UpstreamBuffered, UpstreamOK, time.Second)
+	c.metricFallback(FallbackUpstream, 0, 2)
+	c.metricStreamFirstFrame(time.Second)
 }

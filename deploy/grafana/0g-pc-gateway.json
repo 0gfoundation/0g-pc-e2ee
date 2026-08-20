@@ -1226,13 +1226,666 @@
       }
     },
     {
+      "id": 300,
+      "type": "row",
+      "title": "Data plane \u2014 the sealed request to the provider",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 37,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 301,
+      "type": "stat",
+      "title": "Upstream failure ratio",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 38,
+        "w": 5,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(zg_gateway_upstream_attempts_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\",outcome!~\"ok|canceled\"}[$__rate_interval])) / clamp_min(sum(rate(zg_gateway_upstream_attempts_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\",outcome!=\"canceled\"}[$__rate_interval])), 1e-9)",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.01
+              },
+              {
+                "color": "red",
+                "value": 0.05
+              }
+            ]
+          },
+          "decimals": 3
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "textMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 302,
+      "type": "stat",
+      "title": "Candidate fallbacks (rate)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 5,
+        "y": 38,
+        "w": 5,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(zg_gateway_candidate_fallbacks_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval]))",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 0.01
+              },
+              {
+                "color": "red",
+                "value": 0.1
+              }
+            ]
+          },
+          "decimals": 4
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "textMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      }
+    },
+    {
+      "id": 303,
+      "type": "timeseries",
+      "title": "Upstream attempts by outcome",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 10,
+        "y": 38,
+        "w": 7,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (rate(zg_gateway_upstream_attempts_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval]))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 304,
+      "type": "timeseries",
+      "title": "Completion latency (buffered)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 17,
+        "y": 38,
+        "w": 7,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(zg_gateway_upstream_attempt_duration_seconds_bucket{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\",kind=\"buffered\"}[$__rate_interval])))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "p99"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(zg_gateway_upstream_attempt_duration_seconds_bucket{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\",kind=\"buffered\"}[$__rate_interval])))",
+          "range": true,
+          "refId": "B",
+          "legendFormat": "p50"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 305,
+      "type": "timeseries",
+      "title": "Stream time-to-first-frame",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 44,
+        "w": 8,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(zg_gateway_upstream_stream_ttff_seconds_bucket{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval])))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "p99"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(zg_gateway_upstream_stream_ttff_seconds_bucket{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval])))",
+          "range": true,
+          "refId": "B",
+          "legendFormat": "p50"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 306,
+      "type": "timeseries",
+      "title": "Stream open duration",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 44,
+        "w": 8,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(zg_gateway_upstream_attempt_duration_seconds_bucket{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\",kind=\"stream\"}[$__rate_interval])))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "p99"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(zg_gateway_upstream_attempt_duration_seconds_bucket{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\",kind=\"stream\"}[$__rate_interval])))",
+          "range": true,
+          "refId": "B",
+          "legendFormat": "p50"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 307,
+      "type": "timeseries",
+      "title": "\u00a78 signature fetch",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 44,
+        "w": 8,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (outcome) (rate(zg_gateway_signature_fetch_calls_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval]))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{outcome}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 308,
+      "type": "timeseries",
+      "title": "\u00a78 signature fetch latency",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 50,
+        "w": 8,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(zg_gateway_signature_fetch_duration_seconds_bucket{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval])))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "p99"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(zg_gateway_signature_fetch_duration_seconds_bucket{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval])))",
+          "range": true,
+          "refId": "B",
+          "legendFormat": "p50"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      }
+    },
+    {
       "id": 15,
       "type": "row",
       "title": "Attestation & E2EE",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 37,
+        "y": 56,
         "w": 24,
         "h": 1
       },
@@ -1248,7 +1901,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 38,
+        "y": 57,
         "w": 6,
         "h": 6
       },
@@ -1315,7 +1968,7 @@
       },
       "gridPos": {
         "x": 6,
-        "y": 38,
+        "y": 57,
         "w": 9,
         "h": 6
       },
@@ -1392,7 +2045,7 @@
       },
       "gridPos": {
         "x": 15,
-        "y": 38,
+        "y": 57,
         "w": 9,
         "h": 6
       },
@@ -1469,7 +2122,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 44,
+        "y": 63,
         "w": 8,
         "h": 8
       },
@@ -1557,7 +2210,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 44,
+        "y": 63,
         "w": 8,
         "h": 8
       },
@@ -1638,7 +2291,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 44,
+        "y": 63,
         "w": 4,
         "h": 8
       },
@@ -1701,7 +2354,7 @@
       },
       "gridPos": {
         "x": 20,
-        "y": 44,
+        "y": 63,
         "w": 4,
         "h": 8
       },
@@ -1761,7 +2414,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 52,
+        "y": 71,
         "w": 24,
         "h": 1
       },
@@ -1777,7 +2430,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 53,
+        "y": 72,
         "w": 4,
         "h": 6
       },
@@ -1840,7 +2493,7 @@
       },
       "gridPos": {
         "x": 4,
-        "y": 53,
+        "y": 72,
         "w": 4,
         "h": 6
       },
@@ -1903,7 +2556,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 53,
+        "y": 72,
         "w": 4,
         "h": 6
       },
@@ -1966,7 +2619,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 53,
+        "y": 72,
         "w": 6,
         "h": 6
       },
@@ -2043,7 +2696,7 @@
       },
       "gridPos": {
         "x": 18,
-        "y": 53,
+        "y": 72,
         "w": 6,
         "h": 6
       },
@@ -2128,7 +2781,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 59,
+        "y": 78,
         "w": 24,
         "h": 1
       },
@@ -2144,7 +2797,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 60,
+        "y": 79,
         "w": 6,
         "h": 6
       },
@@ -2211,7 +2864,7 @@
       },
       "gridPos": {
         "x": 6,
-        "y": 60,
+        "y": 79,
         "w": 9,
         "h": 6
       },
@@ -2299,7 +2952,7 @@
       },
       "gridPos": {
         "x": 15,
-        "y": 60,
+        "y": 79,
         "w": 9,
         "h": 6
       },
@@ -2387,7 +3040,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 66,
+        "y": 85,
         "w": 12,
         "h": 8
       },
@@ -2472,7 +3125,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 74,
+        "y": 93,
         "w": 24,
         "h": 1
       },
@@ -2488,7 +3141,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 75,
+        "y": 94,
         "w": 8,
         "h": 6
       },
@@ -2565,7 +3218,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 75,
+        "y": 94,
         "w": 8,
         "h": 6
       },
@@ -2642,7 +3295,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 75,
+        "y": 94,
         "w": 8,
         "h": 6
       },
@@ -2817,6 +3470,6 @@
   "timezone": "browser",
   "title": "0G-PC Gateway",
   "uid": "0g-pc-gateway",
-  "version": 3,
+  "version": 4,
   "weekStart": ""
 }

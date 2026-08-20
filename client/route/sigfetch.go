@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/proof"
 )
 
@@ -76,20 +77,39 @@ func (f *SignatureFetcher) FetchSignature(ctx context.Context, provider core.Pro
 		return proof.ChatSignature{}, err
 	}
 
+	// One observation per fetch on every exit path, recorded by a defer so no return
+	// escapes it. This fetch is serial with the response — every verified completion
+	// waits for it — so its latency is added to each of them, and "ok_retried" is
+	// how the expected 404 race (the broker caches the signature at end-of-response)
+	// shows up before it becomes a per-response backoff.
+	start := time.Now()
+	outcome := "failed"
+	defer func() { metrics.SignatureFetch(outcome, time.Since(start)) }()
+
 	var lastErr error
 	for attempt := 0; attempt < sigFetchAttempts; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
+				outcome = "canceled"
 				return proof.ChatSignature{}, ctx.Err()
 			case <-time.After(sigFetchBackoff << (attempt - 1)):
 			}
 		}
 		sig, retryable, err := f.fetchOnce(ctx, u)
 		if err == nil {
+			outcome = "ok"
+			if attempt > 0 {
+				outcome = "ok_retried"
+			}
 			return sig, nil
 		}
 		lastErr = err
+		if ctx.Err() != nil {
+			// The caller went away mid-fetch; that says nothing about the broker.
+			outcome = "canceled"
+			return proof.ChatSignature{}, err
+		}
 		if !retryable {
 			return proof.ChatSignature{}, err
 		}

@@ -41,7 +41,7 @@ Grafana `dashboards` provider watches). The `uid` is `0g-pc-gateway`.
 
 ## Layout
 
-One dashboard, seven collapsible rows — one service, so cross-metric correlation
+One dashboard, eight collapsible rows — one service, so cross-metric correlation
 (latency vs quote-cache misses, open failures vs a bad provider) stays on one
 screen:
 
@@ -61,10 +61,32 @@ screen:
    router, not at this gateway. `canceled` is broken out from `failed` on purpose —
    it is a caller that gave up mid-flight, which says nothing about the router — so
    the failure panel and the alert below both exclude it.
-4. **Attestation & E2EE**: quote-cache hit ratio, verifications by result, verify
+4. **Data plane — the sealed request to the provider**: upstream failure ratio and
+   candidate-fallback rate; attempts by outcome; buffered completion latency;
+   stream time-to-first-frame and open duration; the §8 signature fetch and its
+   latency. Rows 1–2 measure what this gateway *served*, which is preview +
+   materialization + this; only this row isolates the hop that dominates it.
+   Three things to know when reading it:
+   - **`canceled` is not a failure** and is excluded from the failure ratio on both
+     sides of the fraction. It means the caller went away mid-attempt — a closed
+     tab, not a bad provider. `timeout` is the neighbouring case that *is* the
+     provider: our own deadline fired because it went quiet.
+   - **Candidate fallbacks are the only signal that the router's ranking is putting
+     bad providers first.** The requests they cover *succeed*, so nothing else
+     records them — not the error rate, not the completion outcome. A rate that
+     climbs while everything looks green is a routing problem, not a gateway one.
+     Failures on the *last* candidate are deliberately not counted: nothing was
+     fallen back to, and counting them would light this panel up on any
+     single-provider deployment.
+   - **Stream TTFF and stream open duration answer different questions.** Open
+     duration is set by how much the model has to say, so it is not a latency SLI;
+     TTFF is what a streaming caller experiences. They are separate panels, and
+     buffered latency is a third series again — mixing a 10-minute stream into the
+     completion histogram is what makes such a panel unreadable.
+5. **Attestation & E2EE**: quote-cache hit ratio, verifications by result, verify
    latency, response-signature verification failures by reason (fetch vs
    signature), untrusted-measurement rate, E2EE open failures.
-5. **On-chain grounding (hop 5)**: ready-provider count, chain-RPC lookup-failure
+6. **On-chain grounding (hop 5)**: ready-provider count, chain-RPC lookup-failure
    and signer-mismatch rates, all grounding outcomes, and revalidations. This row
    is what says whether `ZG_GATEWAY_ONCHAIN_ENFORCE` can be turned on: while
    `lookup_failed` and `mismatch` sit at zero in warn mode, enforce costs nothing,
@@ -73,9 +95,9 @@ screen:
    provider, `lookup_failed` is our own chain RPC — and note "Ready providers" uses
    `min` across the selected replicas, not a sum: one replica that can ground
    nothing is the number that matters, since it is the one failing every request.
-6. **Warmer & DCAP collateral**: warmer last-success age (with alert-colored
+7. **Warmer & DCAP collateral**: warmer last-success age (with alert-colored
    thresholds), sweep/provider outcomes, collateral cache + fetch latency.
-7. **Process runtime**: goroutines, resident memory, CPU. These are the panels
+8. **Process runtime**: goroutines, resident memory, CPU. These are the panels
    that are not summed, so they draw one line per replica; the legend is
    `{{instance_id}}` rather than Prometheus' own `instance`, which is the scrape
    address (`gateway:9464`) and therefore the same string in every replica.
@@ -93,6 +115,18 @@ highest-signal ones:
   the softer, operational proof-retrieval failure).
 - `time() - max(zg_gateway_warmer_last_success_timestamp_seconds) > 900` — the
   warmer has stalled (only meaningful when `-warm` is enabled).
+- `sum(rate(zg_gateway_candidate_fallbacks_total[5m])) > 0.1` — the client keeps
+  having to move off the provider the router ranked first. Every request this covers
+  *succeeded*, so no other series shows it: the fallback repaired the outcome and
+  charged the caller a second attempt for it. Sustained, it means the ranking is
+  wrong, which is a router-side fix, not a gateway one. Split by `reason` before
+  escalating — `upstream` is providers failing under load, `materialize` is
+  candidates we cannot even prepare (quote, key or on-chain grounding).
+- `sum(rate(zg_gateway_upstream_attempts_total{outcome=~"undecodable|unverified"}[5m])) > 0`
+  — a provider answered 2xx with a body that would not open, or one whose §8
+  signature did not verify. Both are integrity signals, not capacity ones, and they
+  pair with the two E2EE alerts above; keep them out of any ratio built on
+  `http_*`/`transport`, which are ordinary operational failures.
 - `sum(rate(zg_gateway_preview_calls_total{outcome="ok_retried"}[5m])) /
   clamp_min(sum(rate(zg_gateway_preview_calls_total[5m])), 1e-9) > 0.05` — more than
   5% of chat requests needed a route-preview retry to succeed. Nothing is failing
