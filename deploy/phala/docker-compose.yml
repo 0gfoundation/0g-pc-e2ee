@@ -48,11 +48,11 @@ services:
       - "/run/identity/identity.json"
       # This CVM's app-compose.json, verbatim, for the gateway's self-description
       # endpoint (GET /v1/gateway/identity, issue #78) — it is what names the
-      # containers running in here. It comes from the same guest-agent call as the
-      # identity above, so publishing it costs nothing extra and keeps the gateway
-      # off that socket. The gateway checks these bytes against the compose_hash in
-      # the attestation quote before reading anything out of them; an absent or
-      # stale file costs the container list and nothing else.
+      # containers running in here. Same guest-agent call as the identity above, so
+      # publishing it costs nothing extra and keeps the gateway off that socket. The
+      # gateway checks these bytes against the quote's compose_hash before reading
+      # anything out of them; absent or stale costs the container list and nothing
+      # else.
       - "-out-app-compose"
       - "/run/identity/app-compose.json"
       # One file_sd document per scrape job — they must NOT share one, or each job
@@ -104,12 +104,11 @@ services:
       - TARGET_ENDPOINT=gateway:8443 # forward decrypted traffic to the gateway
       # Default `wait` blocks on boot until the served CNAMEs resolve to
       # `<name>.<DOMAIN>.<DELEGATION_ZONE>` — a strict one-hop match, correct for a
-      # single instance. Blue/green (blue-green.md) runs each side under its own
-      # sub-zone while the served CNAMEs stay pinned at the base zone, so the one-hop
-      # pre-check never matches and a side would block: set DNS_SETUP_MODE=print
-      # there, which skips only this container's pre-check (issuance and routing use
-      # normal resolution, which follows the full chain). Keep DNS_SETUP_MODE listed
-      # in allowed_envs permanently and toggle by VALUE — allowed_envs is itself
+      # single instance. Blue/green (blue-green.md) pins the served CNAMEs at the
+      # base zone while each side lives under its own sub-zone, so that one-hop
+      # pre-check never matches and a side would block: use DNS_SETUP_MODE=print
+      # there, which skips only this pre-check (issuance and routing follow the full
+      # chain). Listed here permanently and toggled by VALUE — allowed_envs is itself
       # measured, so editing the list changes app_id.
       - DNS_SETUP_MODE=${DNS_SETUP_MODE:-wait}
       # Least privilege: the container manages every record it needs inside the
@@ -118,38 +117,22 @@ services:
       # — see README "Serving domain" — and never touches DNS again, not even when
       # app_id changes.
       #
-      # ACME_EMAIL is deliberately NOT declared: a var absent from this block is
-      # never passed to the container, and this one is optional and PUBLISHED — the
-      # ACME account document is part of the evidence bundle, so any address here is
-      # world-readable at https://<DOMAIN>/evidences/acme-account.json.
-      # - ACME_EMAIL=${ACME_EMAIL:-}
+      # ACME_EMAIL is deliberately NOT declared — it is optional, and anything set
+      # here ends up world-readable in /evidences/acme-account.json.
       #
-      # Staging CA, defaulting to false = real, publicly-trusted certs. Set
-      # ACME_STAGING=true in the encrypted env to bring up a NEW hostname first:
-      # staging's rate limits are far higher than the 5-duplicate-certs-per-week
-      # budget, and its certs are untrusted (smoke tests only). Toggle by value, not
-      # by editing allowed_envs; a staging and a production run share app_id, and the
-      # served cert's issuer is what distinguishes them.
+      # Staging CA; false = real, publicly-trusted certs. Set true in the encrypted
+      # env to bring a NEW hostname up first — staging's rate limits are far higher
+      # than the 5-duplicate-certs-per-week budget, and its certs are untrusted
+      # (smoke tests only). Toggled by value like DNS_SETUP_MODE above; a staging and
+      # a production run share app_id, and the served cert's issuer is what tells
+      # them apart.
       - ACME_STAGING=${ACME_STAGING:-false}
-      # Stop serving /evidences/ from THIS container; the gateway serves the same
-      # bytes at the same path instead (ZG_GATEWAY_EVIDENCE_DIR below). The bundle is
-      # still WRITTEN here — this flag gates only the built-in mini_httpd and the
-      # HAProxy path ACL in front of it, while the collect/finalize steps that produce
-      # quote.json, sha256sum.txt, cert-<DOMAIN>.pem and acme-account.json are
-      # unconditional.
-      #
-      # Why: this image adds no CORS header to those responses and exposes no knob to
-      # add one (it is a pinned upstream digest), so no web page could read the bundle
-      # whose entire purpose is public verification — issue #73. Moving the route to
-      # the gateway puts the response headers in this repo. It also removes a
-      # connection-level routing quirk: the ACL matched on the FIRST 16 bytes of a
-      # connection, so on a reused keep-alive connection a bundle fetch and an API
-      # call could not both be served.
-      #
-      # Trust is unaffected — the bundle is self-authenticating (TDX-signed quote,
-      # report_data over sha256sum.txt, and the served certificate compared against
-      # the caller's own TLS session), so which container hands over the bytes is not
-      # part of what is proven. See client/cmd/gateway/evidences.go.
+      # Hand the /evidences/ route to the gateway (ZG_GATEWAY_EVIDENCE_DIR below),
+      # which serves the same bytes with a CORS header this pinned image cannot add
+      # — issue #73. Gates only this container's mini_httpd and the HAProxy ACL in
+      # front of it; the bundle is still WRITTEN here, unconditionally. Trust is
+      # unaffected: the bundle is self-authenticating, so who serves it is not part
+      # of what is proven. README "Public evidence bundle" has the rest.
       - EVIDENCE_SERVER=false
     volumes:
       - /var/run/dstack.sock:/var/run/dstack.sock # in-enclave attestation + cert binding
@@ -173,10 +156,9 @@ services:
     restart: unless-stopped
     # Wait for the identity file, so the gateway's first log line already carries
     # instance_id — it reads the file ONCE at startup, so a race here costs the
-    # dimension for the life of the process. cvm-identity exits 0 even when the guest
-    # agent does not answer (writing no identity file), precisely so a telemetry
-    # problem cannot hold the gateway down; it exits non-zero only if the volume is
-    # not writable, which is a broken deploy.
+    # dimension for the life of the process. cvm-identity still exits 0 when the
+    # guest agent does not answer, precisely so a telemetry problem cannot hold the
+    # gateway down; only an unwritable volume (a broken deploy) fails it.
     depends_on:
       cvm-identity:
         condition: service_completed_successfully
@@ -206,8 +188,9 @@ services:
     # measured — a reader should see the configuration app_id commits to. See README
     # "Notes" for the reasoning behind each setting.
     environment:
-      # Must stay all-interfaces: a localhost bind (as the sidecar uses) would be
-      # unreachable across the compose network.
+      # Same reachability as the binary's own default (`:8443`), pinned here per the
+      # note above. Must STAY all-interfaces — a localhost bind would be unreachable
+      # from dstack-ingress across the compose network.
       - "ZG_GATEWAY_LISTEN=0.0.0.0:8443"
       # Prometheus /metrics on a separate internal listener, never published to the
       # host and not fronted by dstack-ingress, so it is reachable only over the
@@ -230,9 +213,14 @@ services:
       - "ZG_GATEWAY_ALLOWED_ORIGINS=${ZG_GATEWAY_ALLOWED_ORIGINS:-https://0g.ai,https://*.0g.ai,http://localhost:3000,http://localhost:5173}"
       # Request fields sealed end-to-end to the provider (must include "messages"),
       # and cleartext fields excluded from the AAD (an empty value binds everything).
-      # Both default to the binary's built-in sets; uncomment to override.
-      # - "ZG_GATEWAY_SEAL_FIELDS=messages"
-      # - "ZG_GATEWAY_UNBOUND_FIELDS="
+      # Left to the binary's built-in sets. The two commented lines below ARE those
+      # defaults (protocol/wire/envelope.go), spelled out as the starting point to
+      # edit — NOT example overrides. Either value REPLACES the set rather than
+      # adding to it, so an override must restate every field it still wants:
+      # dropping "tools" from the first stops sealing tool definitions, and dropping
+      # "model" from the second binds the model name into the AAD.
+      # - "ZG_GATEWAY_SEAL_FIELDS=messages,tools"
+      # - "ZG_GATEWAY_UNBOUND_FIELDS=model"
       # DCAP-verify each provider's TDX quote and seal only to the verified enc key,
       # instead of trusting the router-supplied pubkey endpoint. Enforced per request:
       # a provider that fails is rejected.
@@ -248,10 +236,9 @@ services:
       # - "ZG_GATEWAY_CHAIN_RPC_URL=https://evmrpc.0g.ai"
       # - "ZG_GATEWAY_SERVING_CONTRACT=0x47340d900bdFec2BD393c626E12ea0656F938d84"
       # Skip a provider whose on-chain signer is missing/unacknowledged/mismatched
-      # instead of only warning. Left OFF: verify-and-warn.
-      # It also covers a signer that could not be READ at all, and there is no knob
-      # to relax that. Read onchain_grounding_total before enabling; see README
-      # "Notes" for what to look for and why there is no third option.
+      # instead of only warning. Left OFF: verify-and-warn. It also fails closed on a
+      # signer that could not be READ at all, with no knob to relax that — so read
+      # onchain_grounding_total first; README "Notes" says what to look for.
       # - "ZG_GATEWAY_ONCHAIN_ENFORCE=true"
       # Verify each response's §8 TEE signature (trust-chain hop 11) fail-closed
       # against the quote-bound signer. A response that does not verify is rejected.
@@ -269,10 +256,9 @@ services:
       # - "ZG_GATEWAY_COLLATERAL_TTL=1h"
       # Background warmer: pre-verify every provider's quote ahead of expiry so
       # requests hit a warm cache instead of paying the DCAP verify inline. Requires
-      # ZG_GATEWAY_ATTEST *and* ZG_GATEWAY_ONCHAIN — both on above, so this starts
-      # cleanly; enabling it with ONCHAIN off would exit(1) into a restart loop with
-      # the ingress up and healthy in front of it. Interval left at its 4m default,
-      # under the ~5m quote-cache TTL.
+      # ZG_GATEWAY_ATTEST *and* ZG_GATEWAY_ONCHAIN — both on above; enabling it with
+      # ONCHAIN off exits(1) into a restart loop behind a healthy ingress. Interval
+      # left at its 4m default, under the ~5m quote-cache TTL.
       - "ZG_GATEWAY_WARM=true"
       # - "ZG_GATEWAY_WARM_INTERVAL=4m" # optional; 4m is already the default
       #
@@ -282,11 +268,10 @@ services:
       #
       #   24 GiB / 2 (bodies' share) / ~30 MiB (peak per request) = ~409 in flight
       #
-      # Not a replacement for that cap: the cap refuses admission and so bounds LIVE
-      # memory, while GOMEMLIMIT is soft — it collects harder and cannot refuse an
-      # allocation. ASSUMES a 32 GiB CVM, which nothing here can check, so re-derive
-      # on resize. Where 24 comes from and how a wrong value stays quiet: README
-      # "CVM shape — and the one setting that depends on it".
+      # ASSUMES a 32 GiB CVM, which nothing here can check, so it must be re-derived
+      # by hand on resize. Where 24 comes from, why this is not a substitute for the
+      # cap, and how a wrong value stays quiet: README "CVM shape — and the one
+      # setting that depends on it".
       - "GOMEMLIMIT=24GiB"
       # Read this CVM's identity from the file cvm-identity wrote, NOT the
       # guest-agent socket. The empty ZG_GATEWAY_DSTACK_SOCKET is load-bearing: unset
@@ -294,35 +279,29 @@ services:
       # giving the prompt-handling container a privileged runtime surface back.
       - "ZG_GATEWAY_IDENTITY_FILE=/run/identity/identity.json"
       - "ZG_GATEWAY_DSTACK_SOCKET="
-      # Serve the public evidence bundle at /evidences/ out of the volume
-      # dstack-ingress writes (EVIDENCE_SERVER=false above hands the route over), with
-      # Access-Control-Allow-Origin: * so browser verifiers can read it — issue #73.
-      # The wildcard is independent of ZG_GATEWAY_ALLOWED_ORIGINS above and must stay
-      # that way: that list governs who may drive SEALED INFERENCE through the
-      # enclave, while this is static public data any `curl` already fetches. Empty
-      # unmounts the route entirely. See client/cmd/gateway/evidences.go.
+      # The /evidences/ route EVIDENCE_SERVER=false handed over, served out of the
+      # ingress's volume with Access-Control-Allow-Origin: *. That wildcard is
+      # independent of ZG_GATEWAY_ALLOWED_ORIGINS above and must stay that way: that
+      # list governs who may drive SEALED INFERENCE through the enclave, while this
+      # is static public data any `curl` already fetches. Empty unmounts the route.
       - "ZG_GATEWAY_EVIDENCE_DIR=/evidences"
-      # This CVM's self-description at /v1/gateway/identity — app_id, compose_hash,
-      # OS image, the container list, and which published release this deployment
-      # is (issue #78). It exists so a browser panel can SHOW what it is connected
-      # to; it is NOT evidence, and nothing in it is signed by this gateway. Every
-      # value is independently rederivable with `pcverify -gateway <DOMAIN>`, which
-      # additionally does the step a browser cannot do at all — comparing the served
-      # TLS certificate against the one the quote binds. See
-      # client/cmd/gateway/identity.go before extending what it reports.
-      #
-      # It publishes nothing that is not already public: the quote is under
-      # /evidences/ and the compose text is a GitHub release asset. On by default;
-      # uncomment to remove the route entirely.
+      # This CVM's self-description at /v1/gateway/identity (issue #78), for a
+      # browser panel to SHOW what it is connected to. A DESCRIPTION, not evidence —
+      # nothing in it is signed, and every value is rederivable with `pcverify
+      # -gateway <DOMAIN>`, which also does the step a browser cannot do at all:
+      # comparing the served TLS certificate against the one the quote binds. On by
+      # default — it publishes nothing that /evidences/ and the release assets do
+      # not already make public — so uncomment only to remove the route entirely. Read
+      # the header of client/cmd/gateway/identity.go before extending what it
+      # reports.
       # - "ZG_GATEWAY_IDENTITY_ENDPOINT=false"
       #
-      # Where its container list comes from: the manifest cvm-identity published on
-      # the shared volume above. Read once, hash-checked against the quote. Set here
-      # rather than defaulted in the binary because this path is a CONTRACT BETWEEN
-      # CONTAINERS — it appears three times in this file (the -out-app-compose
-      # argument, the `identity` volume, this line) and splitting it between YAML and
-      # Go is how a renamed volume turns into a silently empty container list. Same
-      # shape as ZG_GATEWAY_IDENTITY_FILE below, deliberately.
+      # Where that container list comes from: the manifest cvm-identity wrote to the
+      # shared volume. Set here rather than defaulted in the binary because this path
+      # is a CONTRACT BETWEEN CONTAINERS — it appears three times in this file (the
+      # -out-app-compose argument, the `identity` volume, this line) and splitting it
+      # between YAML and Go is how a renamed volume turns into a silently empty
+      # container list.
       - "ZG_GATEWAY_APP_COMPOSE_FILE=/run/identity/app-compose.json"
       # Fallback for the one case the file cannot cover: a replica whose init
       # container predates -out-app-compose, which is exactly what a rolling
@@ -332,27 +311,18 @@ services:
       - "ZG_GATEWAY_PLATFORM_BASE_DOMAIN=${GATEWAY_DOMAIN:-}"
       # How many published releases the deployed compose text is compared against,
       # byte-for-byte, for matched_release — the same lookup pcverify makes, so the
-      # release this panel NAMES and the release pcverify CONFIRMS cannot disagree.
-      # Defaults to 5, which is also pcverify's default. Unauthenticated GitHub
-      # allows 60 requests/hour per IP; this runs once per boot (plus a bounded
-      # retry), not per request. Uncomment to disable the lookup — for a CVM with no
-      # egress to GitHub, which then reports matched_release: null.
+      # release this panel NAMES and the one pcverify CONFIRMS cannot disagree. Left
+      # at 5, pcverify's default too; runs once per boot, not per request. Uncomment
+      # to disable the lookup — for a CVM with no egress to GitHub, which then
+      # reports matched_release: null.
       # - "ZG_GATEWAY_IDENTITY_RELEASES=0"
       #
       # The PROVIDER half of the same panel, at /v1/providers/{address}/identity
-      # (issue #80): what this gateway VERIFIED about the provider it sealed a request
-      # to — the DCAP verdict on that provider's quote, the on-chain signer comparison,
-      # the boot-chain verdict, its compose_hash. Unlike the self-description above
-      # this one DOES report verdicts, because unlike the self-description they are
-      # verifications this process genuinely performed on a third party (see
-      # client/cmd/gateway/provideridentity.go). They are still RELAYED: a panel must
-      # render them as "the gateway verified this for you", not as "verified".
-      #
-      # It needs ZG_GATEWAY_ATTEST — without quote verification there is no verdict to
-      # report and the route is not mounted at all. It answers only for providers
-      # already used (no address triggers a quote fetch, so it is not a quote proxy or
-      # a scanner) and returns no raw quote and no measurement registers. On by
-      # default; uncomment to remove the route entirely.
+      # (issue #80): what this gateway verified about each provider it sealed to.
+      # Unlike the self-description it DOES report verdicts — but RELAYED ones, which
+      # a panel must render as "the gateway verified this for you". Requires
+      # ZG_GATEWAY_ATTEST (on above), or the route is not mounted. On by default;
+      # uncomment to remove it. See client/cmd/gateway/provideridentity.go.
       # - "ZG_GATEWAY_PROVIDER_IDENTITY_ENDPOINT=false"
     volumes:
       # Identity in, read-only, as a plain JSON file — deliberately not the

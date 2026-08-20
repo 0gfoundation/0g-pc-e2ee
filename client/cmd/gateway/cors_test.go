@@ -3,9 +3,13 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
 // The browser allowlist these tests drive newHandler with, kept independent of the
@@ -104,5 +108,86 @@ func TestGatewayCatchAllStripsUpstreamCORS(t *testing.T) {
 	}
 	if v := resp.Header.Get("Access-Control-Expose-Headers"); v == "X-Router-Only" {
 		t.Error("the router's Expose-Headers survived; the gateway's own list must govern")
+	}
+}
+
+// composePath is the deployed compose manifest, relative to this package. It sits
+// outside the client module, which is fine for a test that only reads it.
+const composePath = "../../../deploy/phala/docker-compose.yml"
+
+// composeAllowedOrigins matches the fallback of the compose's
+// ZG_GATEWAY_ALLOWED_ORIGINS entry — the value that applies when the encrypted
+// environment supplies no override.
+var composeAllowedOrigins = regexp.MustCompile(
+	`ZG_GATEWAY_ALLOWED_ORIGINS=\$\{ZG_GATEWAY_ALLOWED_ORIGINS:-([^}]*)\}`)
+
+// TestComposeAllowedOriginsMatchesDefault enforces the "keep in sync" note in
+// deploy/phala/docker-compose.yml. The compose spells the allowlist out instead of
+// inheriting it, because that block is measured into compose_hash and app_id should
+// commit to which web origins may drive sealed inference through the enclave. That
+// is only sound while the two agree: a change to DefaultAllowedOriginsCSV alone
+// would leave the deployed enclave on the old list with nothing to say so, and the
+// note asking a human to remember is not a mechanism.
+//
+// Deliberately compared against the shipped constant, not corsTestOrigins — this is
+// the one test whose subject IS the default list.
+func TestComposeAllowedOriginsMatchesDefault(t *testing.T) {
+	compose, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", composePath, err)
+	}
+	m := composeAllowedOrigins.FindSubmatch(compose)
+	if m == nil {
+		t.Fatalf("no ZG_GATEWAY_ALLOWED_ORIGINS=${...:-<default>} entry in %s; if the entry was "+
+			"reshaped deliberately, update this test rather than dropping it", composePath)
+	}
+	if got := string(m[1]); got != openaiproxy.DefaultAllowedOriginsCSV {
+		t.Errorf("compose allowlist and the built-in default disagree:\n compose: %q\n default: %q\n"+
+			"update whichever is stale — the deployed enclave serves the compose value", got,
+			openaiproxy.DefaultAllowedOriginsCSV)
+	}
+}
+
+// composeCommentedDefault matches a commented-out `# - "NAME=value"` entry in the
+// compose's environment block — the form used to document a setting the deployment
+// leaves at its built-in default.
+func composeCommentedDefault(t *testing.T, compose []byte, name string) string {
+	t.Helper()
+	re := regexp.MustCompile(`(?m)^\s*#\s*-\s*"` + regexp.QuoteMeta(name) + `=([^"]*)"`)
+	m := re.FindSubmatch(compose)
+	if m == nil {
+		t.Fatalf("no commented-out %s entry in %s", name, composePath)
+	}
+	return string(m[1])
+}
+
+// TestComposeCommentedDefaultsMatchTheBinary is TestComposeAllowedOriginsMatchesDefault's
+// counterpart for the two field sets the deployment does NOT set. They are written
+// out as commented lines so a reader of the measured manifest can see what the
+// enclave seals without opening the Go source — which makes them a copy of
+// wire.DefaultSealedFields/DefaultUnboundFields, and a copy needs a test.
+//
+// Not a hypothetical: DefaultUnboundFields carries TODO(model-binding), which
+// reverts it to the empty set once the router stops rewriting "model". The day that
+// lands, an untested comment here would start telling operators the enclave leaves
+// the model name unbound when it no longer does.
+func TestComposeCommentedDefaultsMatchTheBinary(t *testing.T) {
+	compose, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", composePath, err)
+	}
+	for _, tc := range []struct {
+		env  string
+		want []string
+	}{
+		{"ZG_GATEWAY_SEAL_FIELDS", wire.DefaultSealedFields()},
+		{"ZG_GATEWAY_UNBOUND_FIELDS", wire.DefaultUnboundFields()},
+	} {
+		got := composeCommentedDefault(t, compose, tc.env)
+		if want := strings.Join(tc.want, ","); got != want {
+			t.Errorf("%s comment claims %q, but the binary defaults to %q; update the "+
+				"compose comment (it is read by operators as what the enclave seals)",
+				tc.env, got, want)
+		}
 	}
 }

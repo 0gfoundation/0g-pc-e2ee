@@ -88,7 +88,8 @@ Only variables the compose file actually references reach the container. Setting
 anything else in the CVM environment does nothing; changing what the compose
 references means editing the file, which changes `app_id`. Two optional
 dstack-ingress variables are therefore handled differently from the four above.
-`ACME_EMAIL` is **commented out** in the compose — it is optional, and it is published in
+`ACME_EMAIL` is **not declared at all** in the compose — a variable absent from the
+env block is never passed to the container. It is optional, and it is published in
 the evidence bundle, so any address there would be world-readable at
 `https://<DOMAIN>/evidences/acme-account.json`. `ACME_STAGING` **is** referenced
 (`${ACME_STAGING:-false}`), precisely so it can be switched by value without editing the
@@ -144,6 +145,13 @@ phala cvm create --compose deploy/phala/docker-compose.yml
 |---|---|---|
 | `GOMEMLIMIT` | `24GiB` | **Yes — hardcoded.** 32 GiB less ~2 for guest OS/kernel, ~1 for `dstack-ingress` + the metrics agent, ~5 of slack so the *host* never reaches an OOM kill (which takes the whole CVM, not just one container). |
 | in-flight cap | derived, **~409** | Indirectly: it is `GOMEMLIMIT / 2 / ~30 MiB`, so it follows the line above. Printed as `max_inflight` on the gateway's startup line and published as `zg_gateway_inflight_limit`. |
+
+The two bound different things and neither replaces the other. The in-flight cap
+refuses admission, so it bounds **live** memory: past the ceiling a request is
+shed with 503 + `Retry-After` and never allocates. `GOMEMLIMIT` is **soft** — it
+makes the collector work harder as the heap approaches the limit, but it cannot
+refuse an allocation, so on its own it answers a memory spike with CPU rather
+than with backpressure.
 
 `ZG_GATEWAY_MAX_INFLIGHT` is deliberately left unset so the cap has a single
 source. Set it only to replace that arithmetic with a **measured** value — an L3
