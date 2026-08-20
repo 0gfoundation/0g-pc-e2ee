@@ -129,15 +129,20 @@ var (
 	// above only on a miss.
 	previewAttempts = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "preview_attempts_total",
-		Help: "Route-preview HTTP attempts by result: ok, retryable (transport failure or 5xx — " +
-			"another attempt follows), definitive (4xx/429, undecodable body, empty candidate list — " +
-			"no retry), canceled (the caller gave up mid-attempt; says nothing about the router).",
+		Help: "Route-preview HTTP attempts by result: ok; retryable (transport failure, a body that " +
+			"dropped, or a 5xx — another attempt follows); rejected (the router ANSWERED definitively — " +
+			"a 4xx/429, or a well-formed reply with no candidates — usually about the caller or the " +
+			"fleet, not about the router); broken (it answered with a body that will not decode, which " +
+			"IS the router misbehaving); canceled (the caller gave up mid-attempt).",
 	}, []string{"result"})
 	previewCalls = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "preview_calls_total",
 		Help: "Route-preview CALLS (one per chat request, whatever its attempt count) by outcome: " +
-			"ok, ok_retried, failed, canceled. Watch ok_retried: it is where a degrading router shows " +
-			"up while the error rate is still flat, because the retries are absorbing it.",
+			"ok, ok_retried, rejected, failed, canceled. Watch ok_retried: it is where a degrading " +
+			"router shows up while the error rate is still flat, because the retries are absorbing " +
+			"it. Alert on failed, NOT on rejected: rejected is the router answering a caller (a bad " +
+			"credential, an unknown model) or reporting an empty fleet, so folding it in lets one " +
+			"misconfigured tenant pin an alert meant for the router. canceled is the caller leaving.",
 	}, []string{"outcome"})
 	previewDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "preview_duration_seconds",
@@ -159,7 +164,11 @@ var (
 			"all — never reached it, or it never answered); body (the response dropped mid-read, or " +
 			"a stream ended before its final frame); undecodable (a 2xx whose sealed body would not " +
 			"decode or open); not_stream (a 200 that was not an event stream); unverified (the §8 " +
-			"signature did not verify); timeout (our own provider deadline or stream idle watchdog — " +
+			"signature was retrieved and did not verify — an integrity claim about the provider); " +
+			"unverifiable (the signature could not be retrieved at all, so nothing was proven either " +
+			"way — operational, and deliberately apart from unverified so a broker's bad minute " +
+			"cannot page anyone as a provider integrity failure); timeout (our own provider deadline " +
+			"or stream idle watchdog — " +
 			"the provider went quiet); canceled (the CALLER went away); internal (a fault in the " +
 			"gateway itself). The last two are deliberately NOT failure buckets: a closed tab is not " +
 			"a provider's fault, and our own bug should not be filed as one either.",

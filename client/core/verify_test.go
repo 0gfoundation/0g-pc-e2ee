@@ -126,8 +126,8 @@ func TestVerifyNonStream_OK(t *testing.T) {
 	ff := &fakeFetcher{sig: signer.sign(text)}
 	c := New(Provider{SignerAddr: signer.addr}, WithResponseVerification(ff, sig.Recover))
 
-	if err := c.verifyNonStream(context.Background(), Provider{SignerAddr: signer.addr}, headerWith("ck-1"), req, resp); err != nil {
-		t.Fatalf("verifyNonStream OK failed: %v", err)
+	if vo, err := c.verifyNonStream(context.Background(), Provider{SignerAddr: signer.addr}, headerWith("ck-1"), req, resp); err != nil {
+		t.Fatalf("verifyNonStream OK failed: %v (outcome %q)", err, vo)
 	}
 	if ff.gotKey != "ck-1" {
 		t.Fatalf("fetcher got chatKey %q, want ck-1", ff.gotKey)
@@ -143,9 +143,14 @@ func TestVerifyNonStream_WrongSigner(t *testing.T) {
 
 	// provider.SignerAddr is someone else → recovered signer must not match.
 	prov := Provider{SignerAddr: "0x0000000000000000000000000000000000000009"}
-	err := c.verifyNonStream(context.Background(), prov, headerWith("ck-1"), req, resp)
+	vo, err := c.verifyNonStream(context.Background(), prov, headerWith("ck-1"), req, resp)
 	if err == nil || !strings.Contains(err.Error(), "!= on-chain acknowledged") {
 		t.Fatalf("want signer mismatch, got %v", err)
+	}
+	// A proof WAS retrieved and did not verify: the integrity bucket the runbook
+	// pages on, never the operational one.
+	if vo != UpstreamUnverified {
+		t.Errorf("outcome = %q, want %q", vo, UpstreamUnverified)
 	}
 }
 
@@ -162,9 +167,12 @@ func TestVerifyNonStream_TamperedResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = c.verifyNonStream(context.Background(), Provider{SignerAddr: signer.addr}, headerWith("ck-1"), req, otherSealed)
+	vo, err := c.verifyNonStream(context.Background(), Provider{SignerAddr: signer.addr}, headerWith("ck-1"), req, otherSealed)
 	if err == nil || !strings.Contains(err.Error(), "content-binding mismatch") {
 		t.Fatalf("want content-binding mismatch, got %v", err)
+	}
+	if vo != UpstreamUnverified {
+		t.Errorf("outcome = %q, want %q", vo, UpstreamUnverified)
 	}
 }
 
@@ -174,9 +182,14 @@ func TestVerifyNonStream_MissingHeader(t *testing.T) {
 	text, _ := proof.SignedTextE2EE(req, resp)
 	c := New(Provider{}, WithResponseVerification(&fakeFetcher{sig: signer.sign(text)}, sig.Recover))
 
-	err := c.verifyNonStream(context.Background(), Provider{SignerAddr: signer.addr}, headerWith(""), req, resp)
+	vo, err := c.verifyNonStream(context.Background(), Provider{SignerAddr: signer.addr}, headerWith(""), req, resp)
 	if err == nil || !strings.Contains(err.Error(), headerResKey) {
 		t.Fatalf("want missing-header error, got %v", err)
+	}
+	// No proof could be retrieved, so nothing is proven either way — this must NOT
+	// land in the bucket that accuses a provider.
+	if vo != UpstreamUnverifiable {
+		t.Errorf("outcome = %q, want %q", vo, UpstreamUnverifiable)
 	}
 }
 
@@ -228,8 +241,8 @@ func TestVerifyStream_OK(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := c.verifyStream(context.Background(), Provider{SignerAddr: signer.addr}, headerWith("ck-s"), binder); err != nil {
-		t.Fatalf("verifyStream OK failed: %v", err)
+	if vo, err := c.verifyStream(context.Background(), Provider{SignerAddr: signer.addr}, headerWith("ck-s"), binder); err != nil {
+		t.Fatalf("verifyStream OK failed: %v (outcome %q)", err, vo)
 	}
 }
 

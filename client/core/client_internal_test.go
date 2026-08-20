@@ -244,7 +244,7 @@ func TestVerifyNonStreamMetersFetchFailure(t *testing.T) {
 		WithMetrics(h),
 		WithResponseVerification(stubFetcher{}, func(text string, sig []byte) (string, error) { return "", nil }),
 	)
-	err := c.verifyNonStream(context.Background(), Provider{}, http.Header{}, wire.Request{}, wire.Response{})
+	_, err := c.verifyNonStream(context.Background(), Provider{}, http.Header{}, wire.Request{}, wire.Response{})
 	if err == nil {
 		t.Fatal("verifyNonStream with no ZG-Res-Key header should fail closed")
 	}

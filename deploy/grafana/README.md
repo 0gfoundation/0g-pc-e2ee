@@ -58,19 +58,40 @@ screen:
    request health. Read **"Retried previews"** first: it is where a degrading
    router shows up while the error rate is still flat, because the retries are
    absorbing it. A ratio that climbs and stays up is the signal to go look at the
-   router, not at this gateway. `canceled` is broken out from `failed` on purpose —
-   it is a caller that gave up mid-flight, which says nothing about the router — so
-   the failure panel and the alert below both exclude it.
+   router, not at this gateway. Two outcomes are broken out of `failed` on purpose,
+   and neither belongs in a router alert: `canceled` is a caller that gave up
+   mid-flight, and `rejected` is the router *answering* — a 4xx/429 for a caller's
+   own bad credential or unknown model, or a well-formed reply with no candidates
+   for the model asked for. Fold either in and one misconfigured tenant can hold
+   the panel red forever. `failed` is what is left: we could not get a usable answer
+   out of the router. The retried-ratio denominator excludes `canceled` too, since
+   a burst of disconnects would otherwise dilute the ratio and hide exactly the
+   degradation it exists to show.
+   - **The retry ceiling is budget + one attempt, not one attempt.** The budget
+     (`route.previewRetryBudget`) only gates whether another attempt may *start*;
+     an attempt already in flight is bounded by `previewAttemptTimeout` instead. So
+     a router that fails slowly — say a proxy that 502s after 20s — gets one more
+     attempt, and the end-to-end worst case is about twice the header timeout. Both
+     bounds are real: without the per-attempt one, the shared client caps only the
+     wait for headers and a dribbled body would leave a preview unbounded.
 4. **Data plane — the sealed request to the provider**: upstream failure ratio and
    candidate-fallback rate; attempts by outcome; buffered completion latency;
    stream time-to-first-frame and open duration; the §8 signature fetch and its
    latency. Rows 1–2 measure what this gateway *served*, which is preview +
    materialization + this; only this row isolates the hop that dominates it.
-   Three things to know when reading it:
-   - **`canceled` is not a failure** and is excluded from the failure ratio on both
-     sides of the fraction. It means the caller went away mid-attempt — a closed
-     tab, not a bad provider. `timeout` is the neighbouring case that *is* the
-     provider: our own deadline fired because it went quiet.
+   Four things to know when reading it:
+   - **`canceled` and `internal` are not failures** and are excluded from the
+     failure ratio on both sides of the fraction. `canceled` means the caller went
+     away mid-attempt — a closed tab, not a bad provider; `internal` is a fault in
+     this gateway, which deserves its own attention and not a provider's blame.
+     `timeout` is the neighbouring case that *is* the provider: our own deadline
+     fired because it went quiet.
+   - **`unverified` and `unverifiable` are very different findings.** `unverified`
+     means a §8 signature *was* retrieved and did not verify against the grounded
+     signer — an integrity claim about a provider, and what the alert below pages
+     on. `unverifiable` means it could not be retrieved at all, so nothing was
+     proven either way; that is the broker having a bad minute, or us, and it is
+     deliberately outside the integrity alert.
    - **Candidate fallbacks are the only signal that the router's ranking is putting
      bad providers first.** The requests they cover *succeed*, so nothing else
      records them — not the error rate, not the completion outcome. A rate that
@@ -124,19 +145,24 @@ highest-signal ones:
   candidates we cannot even prepare (quote, key or on-chain grounding).
 - `sum(rate(zg_gateway_upstream_attempts_total{outcome=~"undecodable|unverified"}[5m])) > 0`
   — a provider answered 2xx with a body that would not open, or one whose §8
-  signature did not verify. Both are integrity signals, not capacity ones, and they
-  pair with the two E2EE alerts above; keep them out of any ratio built on
-  `http_*`/`transport`, which are ordinary operational failures.
+  signature was retrieved and did not verify. Both are integrity signals, not
+  capacity ones, and they pair with the two E2EE alerts above; keep them out of any
+  ratio built on `http_*`/`transport`, which are ordinary operational failures. Note
+  what is deliberately absent: `unverifiable` (the signature could not be fetched at
+  all) proves nothing about the provider, so it belongs to whoever owns the broker,
+  not to a provider-integrity page. Same for `internal`, which is ours.
 - `sum(rate(zg_gateway_preview_calls_total{outcome="ok_retried"}[5m])) /
-  clamp_min(sum(rate(zg_gateway_preview_calls_total[5m])), 1e-9) > 0.05` — more than
-  5% of chat requests needed a route-preview retry to succeed. Nothing is failing
-  yet, which is exactly why this is worth an alert: the retries are paying for a
-  degrading router out of every caller's latency budget, and the request error rate
+  clamp_min(sum(rate(zg_gateway_preview_calls_total{outcome!="canceled"}[5m])), 1e-9) > 0.05`
+  — more than 5% of chat requests needed a route-preview retry to succeed. Nothing is
+  failing yet, which is exactly why this is worth an alert: the retries are paying for
+  a degrading router out of every caller's latency budget, and the request error rate
   will not show it until they stop being enough. Pair it with
   `sum(rate(zg_gateway_preview_calls_total{outcome="failed"}[5m])) > 0`, which is
-  when they have. Note both deliberately ignore `outcome="canceled"` — a caller that
-  disconnected mid-preview says nothing about the router, and folding it in would
-  make a burst of client cancellations page the wrong team.
+  when they have. Both deliberately exclude `canceled` (a caller that disconnected
+  mid-preview says nothing about the router — and in the ratio's denominator it would
+  dilute the very signal being watched) and neither counts `rejected`, which is the
+  router answering a caller's own 401/404/429 or reporting an empty fleet. A tenant
+  with a misconfigured key must not be able to page the router team.
 - `rate(zg_gateway_onchain_grounding_total{outcome="mismatch"}[5m]) > 0` — a
   provider's quote-bound signer disagreed with the chain, and still disagreed after
   a live re-read. Not an operational blip: it means the enclave that answered is not

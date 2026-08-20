@@ -58,11 +58,24 @@ type Candidates interface {
 // to send, and the caller waits through all of them before seeing an error. This
 // is the ceiling on that product; nothing else imposes one.
 //
-// Sized to admit one full COLD materialization — a cache-miss quote verification
-// plus the chain read that grounds it — so a request arriving before the warmer
-// has swept still succeeds, and only a genuinely long walk is cut short. The first
-// candidate always gets the whole budget (spent starts at zero), so this can never
-// refuse to try anybody: at worst it stops the walk after someone has been tried.
+// Sized to admit a TYPICAL cold materialization — a cache-miss quote verification
+// (route bounds one at 60s) plus the chain read that grounds it (three eth_call
+// attempts at 3s, ~10s with backoff) — so a request arriving before the warmer has
+// swept still succeeds.
+//
+// It does NOT cover that path's own worst case, and the arithmetic is worth being
+// explicit about rather than rounding away: a cold candidate that also triggers the
+// signer-revalidation re-read and then the quote re-verification recovery can reach
+// roughly 60 + 10 + 10 + 60 ≈ 140s on its own. Such a candidate will be cut here.
+// That is the deliberate trade — a ceiling only binds if it is lower than the worst
+// case it is bounding — and it is survivable because the expensive half is
+// singleflighted under a context detached from any one caller: the verification it
+// interrupts keeps running and lands in the cache, so the next request finds it
+// warm instead of repeating the wait.
+//
+// The first candidate always gets the whole budget (spent starts at zero), so this
+// can never refuse to try anybody: at worst it stops the walk after someone has
+// been tried.
 const resolveBudget = 90 * time.Second
 
 // candidateWalk meters one walk down a Candidates chain, charging each

@@ -819,15 +819,17 @@ func TestPreviewStopsRetryingOnCancelledContext(t *testing.T) {
 // series, and it has to stay distinct from a clean first-attempt ok.
 func TestPreviewMetricsSeparateAbsorbedFailuresFromCleanCalls(t *testing.T) {
 	const (
-		callsOK            = `zg_gateway_preview_calls_total{outcome="ok"}`
-		callsRetried       = `zg_gateway_preview_calls_total{outcome="ok_retried"}`
-		callsFailed        = `zg_gateway_preview_calls_total{outcome="failed"}`
-		attemptsOK         = `zg_gateway_preview_attempts_total{result="ok"}`
-		attemptsRetryable  = `zg_gateway_preview_attempts_total{result="retryable"}`
-		attemptsDefinitive = `zg_gateway_preview_attempts_total{result="definitive"}`
+		callsOK           = `zg_gateway_preview_calls_total{outcome="ok"}`
+		callsRetried      = `zg_gateway_preview_calls_total{outcome="ok_retried"}`
+		callsRejected     = `zg_gateway_preview_calls_total{outcome="rejected"}`
+		callsFailed       = `zg_gateway_preview_calls_total{outcome="failed"}`
+		attemptsOK        = `zg_gateway_preview_attempts_total{result="ok"}`
+		attemptsRetryable = `zg_gateway_preview_attempts_total{result="retryable"}`
+		attemptsRejected  = `zg_gateway_preview_attempts_total{result="rejected"}`
 	)
+	series := []string{callsOK, callsRetried, callsRejected, callsFailed, attemptsOK, attemptsRetryable, attemptsRejected}
 	before := map[string]float64{}
-	for _, s := range []string{callsOK, callsRetried, callsFailed, attemptsOK, attemptsRetryable, attemptsDefinitive} {
+	for _, s := range series {
 		before[s] = metricValue(t, s)
 	}
 	delta := func(s string) float64 { return metricValue(t, s) - before[s] }
@@ -867,22 +869,59 @@ func TestPreviewMetricsSeparateAbsorbedFailuresFromCleanCalls(t *testing.T) {
 		t.Errorf("%s delta = %v, want 2 (one per successful attempt)", attemptsOK, got)
 	}
 
-	// A definitive failure: counted as definitive, never as retryable, and the call
-	// as failed rather than absorbed.
+	// A 401: the router ANSWERED. It must be counted rejected, never retryable, and
+	// — the point of the split — the CALL must not land in "failed", which is the
+	// series an alert reads as "the router is unwell". One tenant with a bad key
+	// would otherwise pin it.
 	dead := newRouter()
 	dead.previewFailN = previewAttempts + 5
 	dead.previewFailCode = http.StatusUnauthorized
 	if _, err := New(dead.srv.URL).Resolve(context.Background(), chatReq()); err == nil {
 		t.Fatal("Resolve against a 401 router: want error, got nil")
 	}
-	if got := delta(attemptsDefinitive); got != 1 {
-		t.Errorf("%s delta = %v, want 1", attemptsDefinitive, got)
+	if got := delta(attemptsRejected); got != 1 {
+		t.Errorf("%s delta = %v, want 1", attemptsRejected, got)
 	}
 	if got := delta(attemptsRetryable); got != 1 {
 		t.Errorf("a 401 must not be counted retryable; %s delta = %v, want 1 (unchanged)", attemptsRetryable, got)
 	}
+	if got := delta(callsRejected); got != 1 {
+		t.Errorf("%s delta = %v, want 1", callsRejected, got)
+	}
+	if got := delta(callsFailed); got != 0 {
+		t.Errorf("a caller's own 401 must not be counted a router failure; %s delta = %v, want 0", callsFailed, got)
+	}
+
+	// A router that only ever 5xxes IS the router being unwell: that one is failed.
+	broken := newRouter()
+	broken.previewFailN = previewAttempts + 5
+	if _, err := New(broken.srv.URL).Resolve(context.Background(), chatReq()); err == nil {
+		t.Fatal("Resolve against a 503 router: want error, got nil")
+	}
 	if got := delta(callsFailed); got != 1 {
 		t.Errorf("%s delta = %v, want 1", callsFailed, got)
+	}
+}
+
+// An empty candidate list is the router answering about the FLEET, not failing —
+// so it is rejected, and must not read as the router being unwell either.
+func TestPreviewEmptyCandidateListIsRejectedNotFailed(t *testing.T) {
+	const (
+		callsRejected = `zg_gateway_preview_calls_total{outcome="rejected"}`
+		callsFailed   = `zg_gateway_preview_calls_total{outcome="failed"}`
+	)
+	before := map[string]float64{callsRejected: metricValue(t, callsRejected), callsFailed: metricValue(t, callsFailed)}
+
+	router := newMockRouter(t, newMockBroker(t))
+	router.noProviders = true
+	if _, err := New(router.srv.URL).Resolve(context.Background(), chatReq()); err == nil {
+		t.Fatal("want a 503 error")
+	}
+	if got := metricValue(t, callsRejected) - before[callsRejected]; got != 1 {
+		t.Errorf("%s delta = %v, want 1", callsRejected, got)
+	}
+	if got := metricValue(t, callsFailed) - before[callsFailed]; got != 0 {
+		t.Errorf("%s delta = %v, want 0", callsFailed, got)
 	}
 }
 
@@ -910,19 +949,37 @@ func TestPreviewDurationObservedOnEveryCall(t *testing.T) {
 	}
 }
 
-func TestRetryablePreviewStatus(t *testing.T) {
-	for status, want := range map[int]bool{
-		http.StatusBadRequest:          false,
-		http.StatusUnauthorized:        false,
-		http.StatusNotFound:            false,
-		http.StatusTooManyRequests:     false, // unlike the data plane — see previewOnce
-		http.StatusInternalServerError: true,
-		http.StatusBadGateway:          true,
-		http.StatusServiceUnavailable:  true,
-		http.StatusGatewayTimeout:      true,
+func TestPreviewStatusResult(t *testing.T) {
+	for status, want := range map[int]previewResult{
+		// The router answered. Retrying cannot change any of these, and they are
+		// usually about the caller, not the router — see previewRejected.
+		http.StatusBadRequest:      previewRejected,
+		http.StatusUnauthorized:    previewRejected,
+		http.StatusNotFound:        previewRejected,
+		http.StatusTooManyRequests: previewRejected, // unlike the data plane — see previewOnce
+		// The router faulted, and may not next time.
+		http.StatusInternalServerError: previewRetryable,
+		http.StatusBadGateway:          previewRetryable,
+		http.StatusServiceUnavailable:  previewRetryable,
+		http.StatusGatewayTimeout:      previewRetryable,
 	} {
-		if got := retryablePreviewStatus(status); got != want {
-			t.Errorf("retryablePreviewStatus(%d) = %v, want %v", status, got, want)
+		if got := previewStatusResult(status); got != want {
+			t.Errorf("previewStatusResult(%d) = %q, want %q", status, got, want)
+		}
+	}
+}
+
+// The call-level outcome must keep a definitive negative out of "failed": a tenant
+// with a misconfigured key would otherwise pin an alert meant for the router.
+func TestPreviewResultCallOutcome(t *testing.T) {
+	for res, want := range map[previewResult]string{
+		previewRejected:  "rejected",
+		previewCanceled:  "canceled",
+		previewBroken:    "failed",
+		previewRetryable: "failed",
+	} {
+		if got := res.callOutcome(); got != want {
+			t.Errorf("%q.callOutcome() = %q, want %q", res, got, want)
 		}
 	}
 }
@@ -1256,4 +1313,135 @@ func TestStreamOnFrameFailureAttribution(t *testing.T) {
 			t.Errorf("a disconnect must not be counted internal; %s delta = %v", internal, got)
 		}
 	})
+}
+
+// The per-attempt deadline is what makes the retry ceiling a fact. Without it the
+// shared client bounds only the wait for HEADERS, so a router that dribbles (or
+// never finishes) a body leaves an attempt — and therefore the whole preview —
+// unbounded, and the retry budget, which only gates ENTRY to an attempt, cannot
+// cap anything.
+//
+// This is the regression test for the claim that used to be wrong: a probe failing
+// each attempt slowly measured ~2× the "budget", because the budget check had
+// already passed when the next attempt began.
+func TestPreviewAttemptIsBounded(t *testing.T) {
+	// Headers go out immediately so ResponseHeaderTimeout cannot be what saves us;
+	// the body then never arrives. Only a bound on the whole attempt ends this.
+	release := make(chan struct{})
+	defer close(release)
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+
+	router := New(srv.URL)
+	const attempt = 150 * time.Millisecond
+	router.previewAttemptTO = attempt
+
+	start := time.Now()
+	if _, err := router.Resolve(context.Background(), chatReq()); err == nil {
+		t.Fatal("want an error from a router that never finishes a body")
+	}
+	elapsed := time.Since(start)
+
+	// A hung body reads as a retryable failure, so the budget admits more attempts;
+	// what must hold is that each one is bounded, so the total stays near a small
+	// multiple of the attempt bound rather than running forever.
+	if max := time.Duration(previewAttempts) * attempt * 4; elapsed > max {
+		t.Errorf("preview took %s against a %s attempt bound (max %s): the attempt is not bounded",
+			elapsed, attempt, max)
+	}
+	if got := atomic.LoadInt32(&hits); got == 0 {
+		t.Fatal("the router was never called")
+	}
+	t.Logf("bounded: %s over %d attempt(s) at %s each", elapsed.Truncate(time.Millisecond), atomic.LoadInt32(&hits), attempt)
+}
+
+// The caller's own deadline still wins when it is shorter — the per-attempt bound
+// is a ceiling, not a floor that could outlive the request it serves.
+func TestPreviewAttemptHonoursAShorterCallerDeadline(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+
+	router := New(srv.URL)
+	router.previewAttemptTO = 10 * time.Second // deliberately far longer than the caller's
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := router.Resolve(ctx, chatReq()); err == nil {
+		t.Fatal("want an error once the caller's deadline passes")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("preview took %s; the caller's 150ms deadline should have ended it", elapsed)
+	}
+}
+
+// The exact scenario that disproved the original claim: each attempt fails slowly
+// but well short of its own bound, so the budget check passes and a second attempt
+// starts. The end-to-end cost is then budget + one attempt — NOT one attempt, which
+// is what the code used to claim. This pins the real ceiling.
+func TestPreviewCeilingIsBudgetPlusOneAttempt(t *testing.T) {
+	// Scaled to the shape that was actually measured against the shipped constants
+	// (20s failures under a 30s budget cost 40s): a failure that spends most of the
+	// budget but is well inside the attempt bound. previewRetryBackoff is a real
+	// constant and is NOT scaled, so the budget has to leave room for it.
+	const (
+		attemptTO = time.Second
+		budgetTO  = time.Second
+		failAfter = 600 * time.Millisecond
+	)
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		select {
+		case <-time.After(failAfter):
+			http.Error(w, "slow failure", http.StatusServiceUnavailable)
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+
+	router := New(srv.URL)
+	router.previewAttemptTO, router.previewBudgetTO = attemptTO, budgetTO
+
+	start := time.Now()
+	if _, err := router.Resolve(context.Background(), chatReq()); err == nil {
+		t.Fatal("want an error from a router that always 503s")
+	}
+	elapsed := time.Since(start)
+
+	// Two attempts is the expected shape: the first spends most of the budget, the
+	// second is admitted, and the third is not.
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Errorf("attempts = %d, want 2 (one, then one the budget still admitted)", got)
+	}
+	// The ceiling the comment now states. Generous slack for scheduling; the point
+	// is that it is a CEILING at all — before the attempt was bounded, a slow body
+	// on this path had none.
+	if ceiling := budgetTO + attemptTO; elapsed > ceiling+500*time.Millisecond {
+		t.Errorf("preview took %s, past the stated ceiling of budget+attempt = %s", elapsed, ceiling)
+	}
+	// And it really is MORE than one attempt: the old comment claimed otherwise.
+	if elapsed <= attemptTO {
+		t.Errorf("preview took only %s; this scenario is supposed to cost more than one attempt (%s)", elapsed, attemptTO)
+	}
+	t.Logf("elapsed %s over %d attempts (ceiling %s)", elapsed.Truncate(time.Millisecond), atomic.LoadInt32(&hits), budgetTO+attemptTO)
 }

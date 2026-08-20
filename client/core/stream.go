@@ -195,8 +195,8 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 				return !committed, stageErr(StageUpstream, fmt.Errorf("stream ended before the final frame (truncated)"))
 			}
 			if binder != nil {
-				if verr := c.verifyStream(ctx, provider, resp.Header, binder); verr != nil {
-					outcome = UpstreamUnverified
+				if vo, verr := c.verifyStream(ctx, provider, resp.Header, binder); verr != nil {
+					outcome = verifyOutcome(parent, vo)
 					return false, stageErr(StageUpstream, verr)
 				}
 			}
@@ -224,8 +224,8 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 				return !committed, stageErr(StageUpstream, fmt.Errorf("stream reached [DONE] before the final frame (truncated)"))
 			}
 			if binder != nil {
-				if verr := c.verifyStream(ctx, provider, resp.Header, binder); verr != nil {
-					outcome = UpstreamUnverified
+				if vo, verr := c.verifyStream(ctx, provider, resp.Header, binder); verr != nil {
+					outcome = verifyOutcome(parent, vo)
 					return false, stageErr(StageUpstream, verr)
 				}
 			}

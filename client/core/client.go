@@ -214,8 +214,14 @@ const (
 	// UpstreamNotStream: a 200 that was not an event stream (the provider ignored
 	// stream:true), which would otherwise read as an empty completion.
 	UpstreamNotStream = "not_stream"
-	// UpstreamUnverified: the response opened but failed §8 signature verification.
+	// UpstreamUnverified: a §8 signature was retrieved and did NOT verify against
+	// the grounded signer. An integrity claim about the provider — the alarming one.
 	UpstreamUnverified = "unverified"
+	// UpstreamUnverifiable: the §8 signature could not be retrieved at all, so
+	// nothing was proven either way. Operational (the broker's problem, or ours),
+	// and deliberately apart from unverified: a runbook that pages on provider
+	// integrity must not be firable by one broker's bad minute.
+	UpstreamUnverifiable = "unverifiable"
 	// UpstreamTimeout: OUR deadline fired — the per-attempt provider timeout, or a
 	// stream's idle watchdog between frames. The provider went quiet; the caller
 	// did not go away.
@@ -287,6 +293,24 @@ func (c *Client) metricStreamFirstFrame(dur time.Duration) {
 // deadline firing. Both look identical from inside the attempt, and they belong in
 // different metric buckets: see UpstreamCanceled vs UpstreamTimeout.
 func canceledBy(parent context.Context) bool { return parent.Err() != nil }
+
+// verifyOutcome resolves what to attribute a §8 verification failure to, given
+// what the verifier concluded and whether the caller is still there.
+//
+// A caller that walked away while we were FETCHING the proof explains that
+// failure, so it is re-attributed. A signature that did not verify is never
+// re-attributed: that finding is about the provider and stands whether or not the
+// caller stayed to hear it, and letting a well-timed disconnect erase it would put
+// the one integrity signal here at the mercy of client behaviour.
+func verifyOutcome(parent context.Context, concluded string) string {
+	if concluded == UpstreamUnverified {
+		return concluded
+	}
+	if canceledBy(parent) {
+		return UpstreamCanceled
+	}
+	return concluded
+}
 
 // Option customizes a Client.
 type Option func(*Client)
@@ -582,8 +606,8 @@ func (c *Client) completeOnce(parent context.Context, provider Provider, req wir
 	// this provider — terminal, not a fall-back to another candidate (which would
 	// mask a bad provider). Nothing is returned to the caller on failure.
 	if c.verifyEnabled() {
-		if err := c.verifyNonStream(ctx, provider, resp.Header, sealed, sealedResp); err != nil {
-			outcome = UpstreamUnverified
+		if vo, err := c.verifyNonStream(ctx, provider, resp.Header, sealed, sealedResp); err != nil {
+			outcome = verifyOutcome(parent, vo)
 			return nil, false, stageErr(StageUpstream, err)
 		}
 	}
