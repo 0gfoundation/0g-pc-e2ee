@@ -290,8 +290,8 @@ services:
       # nothing in it is signed, and every value is rederivable with `pcverify
       # -gateway <DOMAIN>`, which also does the step a browser cannot do at all:
       # comparing the served TLS certificate against the one the quote binds. On by
-      # default — it publishes nothing /evidences/ and the release assets do not
-      # already make public — so uncomment only to remove the route entirely. Read
+      # default — it publishes nothing that /evidences/ and the release assets do
+      # not already make public — so uncomment only to remove the route entirely. Read
       # the header of client/cmd/gateway/identity.go before extending what it
       # reports.
       # - "ZG_GATEWAY_IDENTITY_ENDPOINT=false"
