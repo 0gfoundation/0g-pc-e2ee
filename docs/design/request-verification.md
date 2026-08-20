@@ -285,14 +285,35 @@ right instrument — they have to be mechanical. That is also when hop 3 genuine
 needs to stop being warn-only. Until then the panel reports the provider's
 measurement as **observed (◐)**, which is the honest state.
 
-### Separately: report_data has not migrated
+### The rollout window, and what the panel does during it
 
-The observed `report_data` is the signer address as **ASCII hex**, zero-padded —
-the pre-SPEC layout that §4.2 flags as a breaking change. It does not carry
-`enc_pub`, so the spec'd binding between the quote and the HPKE recipient key is
-not in place on this broker yet. Sealing against it requires that migration first;
-it is a prerequisite for hop 3 mattering in production, and is tracked with the
-protocol work rather than here.
+The SPEC §4.2 `report_data` layout (`enc_pub ‖ signer_addr ‖ version`) is
+implemented but not fully deployed. The staging broker sampled above still
+publishes the old form — the signer address as ASCII hex, zero-padded, with no
+`enc_pub` — so sealing against *that* instance is not possible until it rolls.
+
+Two consequences that outlive the rollout itself, both worth building for rather
+than discovering:
+
+**Both layouts coexist while it rolls.** That is what the `version` field is for
+and the client must branch on it, not assume the new one. A provider on the old
+layout is a provider that cannot be sealed to — a routing fact, not an error.
+
+**A provider upgrade transiently breaks the on-chain signer check.** The registry
+holds exactly one `teeSignerAddress` per provider and cannot express "old and new
+are both valid for the next few minutes", while a broker upgrade rotates `enc_pub`
+and `signer_addr` **together** — they come out of one `report_data`, so they never
+split. So during any provider rollout the chain and the quote name different
+signers for a while, in whichever order the operator sequences it. The resolver
+narrows the window by re-reading live instead of ruling on a cached value, but it
+cannot close it (`trust-chain.md`, "What is *not* in the trust chain").
+
+For the panel this shows up as `verdicts.onchain_signer` failing on a provider that
+is merely mid-deploy. **Do not render that as a compromised broker.** It is
+indistinguishable at the endpoint from a real mismatch, so the honest treatment is
+the ◐ state, not ✗ — and the deployment runbook, not the UI, is where the window
+gets shortened. Frontend should expect this before it appears, or the first
+occurrence gets reported as a bug.
 
 ## 7. Where each panel field comes from
 
@@ -305,7 +326,7 @@ protocol work rather than here.
 | Provider address | `X-Provider`, gateway-originated (#76) | available, CORS-exposed |
 | app_id, compose hash, OS image, containers, release | `GET /v1/gateway/identity` (#79) | available |
 | Evidence bundle | `GET /evidences/` from the gateway, `ACAO: *` (#75) | available |
-| Provider endpoint, quote verdicts, measurement | — | **missing**; needs a provider identity endpoint |
+| Provider endpoint, quote verdicts, measurement | `GET /v1/providers/{address}/identity` (#82) | available |
 
 Two notes on the shape of that data:
 
@@ -346,16 +367,25 @@ reads as a deploy rather than as a substitution.
 
 ## 9. Order of work
 
-1. Panel renders what already exists (§7 rows marked available), with the §3 ladder
-   and the §2 rule about which chain each check belongs to.
-2. Correct the two "coarse token count" lines (§4).
-3. `report_data` migration to the SPEC §4.2 layout. Listed here rather than left to
-   the protocol work because it gates the rest: the observed broker publishes only
-   the ASCII signer address, so there is no quote-bound `enc_pub` to seal against
-   and hop 3 cannot matter in production until it lands.
-4. Provider identity endpoint — unblocks the broker hop of the panel.
-5. Hop 3, enforced half (§6): digest pinning, provider OS-image entries kept
+Done: `/evidences/` served with CORS (#75), the provider address reported from our
+own pin rather than the router's claim (#76), `GET /v1/gateway/identity` (#79),
+`GET /v1/providers/{address}/identity` (#82), and the §4 correction (#83). Every
+row in §7 now has a source.
+
+That makes the panel the bottleneck rather than the backend: **four endpoints are
+live with nothing consuming them.**
+
+1. **Build the panel.** §7 for the fields, §3 for the ladder, §2 for labelling which
+   chain each check belongs to. Three rules that are easy to lose in
+   implementation: `os_image` null renders as *not established*, never as *failed*;
+   the router hop carries no verdict mark at all; "verify the gateway" sits first,
+   because every "we checked this for you" hangs off it. Also expect
+   `onchain_signer` to fail on a provider mid-deploy — see §6's rollout window.
+2. `report_data` rollout completed across providers. Implemented; until a given
+   provider carries the §4.2 layout it cannot be sealed to, and both layouts have to
+   be handled meanwhile.
+3. Hop 3, enforced half (§6): digest pinning, provider OS-image entries kept
    separate from the gateway's, non-dstack quotes rejected.
-6. Hop 3, checklist half (§6): written down as a provider launch review, not code.
-7. Chain B, if and when we choose to sell it: nonce + transcript + commit–reveal,
+4. Hop 3, checklist half (§6): written down as a provider launch review, not code.
+5. Chain B, if and when we choose to sell it: nonce + transcript + commit–reveal,
    together.
