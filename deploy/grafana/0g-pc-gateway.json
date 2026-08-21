@@ -1413,7 +1413,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum(rate(zg_gateway_upstream_attempts_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\",outcome!~\"ok|canceled|internal\"}[$__rate_interval])) / clamp_min(sum(rate(zg_gateway_upstream_attempts_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\",outcome!~\"canceled|internal\"}[$__rate_interval])), 1e-9)",
+          "expr": "sum(rate(zg_gateway_upstream_attempts_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\",outcome!~\"ok|canceled|internal|http_4xx\"}[$__rate_interval])) / clamp_min(sum(rate(zg_gateway_upstream_attempts_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\",outcome!~\"canceled|internal|http_4xx\"}[$__rate_interval])), 1e-9)",
           "range": true,
           "refId": "A"
         }
@@ -3625,6 +3625,6 @@
   "timezone": "browser",
   "title": "0G-PC Gateway",
   "uid": "0g-pc-gateway",
-  "version": 8,
+  "version": 9,
   "weekStart": ""
 }

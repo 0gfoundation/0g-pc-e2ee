@@ -104,15 +104,27 @@ screen:
      rule is which way an omission fails. A *failure* ratio built as a denylist
      fails LOUD: a new outcome nobody classified lands in the numerator, the number
      goes up, and somebody looks. Built as an allowlist it would fail SILENT — a new
-     failure mode simply would not count — and it would need all eleven current
-     failure outcomes enumerated correctly. The retried-preview ratio is the mirror
+     failure mode simply would not count — and it would need every current failure
+     outcome enumerated correctly. The retried-preview ratio is the mirror
      image: there a denylist fails silent (a new outcome dilutes the fraction), so it
      is an allowlist. Allowlist when omission causes silence, denylist when omission
      causes noise.
-   - **`canceled` and `internal` are not failures** and are excluded from the
-     failure ratio on both sides of the fraction. `canceled` means the caller went
-     away mid-attempt — a closed tab, not a bad provider; `internal` is a fault in
-     this gateway, which deserves its own attention and not a provider's blame.
+   - **`canceled`, `internal` and `http_4xx` are not provider failures** and are
+     excluded from the failure ratio on both sides of the fraction. `canceled` means
+     the caller went away mid-attempt — a closed tab, not a bad provider; `internal`
+     is a fault in this gateway, which deserves its own attention and not a
+     provider's blame; `http_4xx` is what `completeOnce` calls a client fault (auth,
+     bad request, unknown model), and leaving it in was the §4 rule "a caller's own
+     fault is never a router alert" applied to preview via `rejected` and then not to
+     the data plane — a tenant spraying malformed requests moved a provider-health
+     number. Excluded from BOTH sides, not just the numerator: kept in the
+     denominator it would instead *dilute* a real provider failure rate, which is the
+     same failure the preview ratio's allowlist exists to prevent. What is left is
+     the honest base for this number — attempts where the provider had a chance to
+     succeed. A 4xx spike is still visible in "attempts by outcome" next door; it
+     just does not accuse anybody. The residual judgement call: a provider's own
+     404 or 401 can be infrastructure rather than the caller, and those go
+     uncounted here.
      `timeout` is the neighbouring case that *is* the provider: our own deadline
      fired because it went quiet.
    - **`unverified` and `unverifiable` are very different findings.** `unverified`

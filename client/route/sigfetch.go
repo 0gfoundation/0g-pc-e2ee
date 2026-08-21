@@ -112,7 +112,15 @@ func (f *SignatureFetcher) FetchSignature(ctx context.Context, provider core.Pro
 			return sig, nil
 		}
 		lastErr = err
-		if ctx.Err() != nil {
+		// Only a RETRYABLE failure may be re-attributed. fetchOnce's other three
+		// conclusions are the broker ANSWERING definitively — a non-404 4xx, or a body
+		// that will not decode — and relabelling those because the context happened to
+		// be done files a corrupt signature from a provider under "canceled", the one
+		// bucket every alert deliberately ignores. That is the same blind spot the
+		// relocated defers were installed to close, and the same guard preview
+		// (res == previewRetryable) and verifyOutcome (concluded != unverifiable)
+		// already carry. This site was written without it.
+		if retryable && ctx.Err() != nil {
 			// Something other than the broker ended this; that says nothing about it.
 			outcome = endedBy(ctx)
 			return proof.ChatSignature{}, err

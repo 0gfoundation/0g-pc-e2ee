@@ -270,3 +270,79 @@ func TestSignatureFetchSeparatesOurDeadlineFromTheCaller(t *testing.T) {
 		t.Errorf("%s delta = %v, want 1 (unchanged) — a cancel is not our timeout", callsTimeout, got)
 	}
 }
+
+// A broker that answered DEFINITIVELY — a non-404 4xx, or a body that will not
+// decode — must keep that finding even if the context happens to be done. Filing a
+// corrupt signature under "canceled" hides it in the bucket every alert ignores,
+// which is the third instance of this bug class in the PR and the one that shipped
+// without the guard its two siblings carry.
+func TestSignatureFetchKeepsDefinitiveFailuresUnderALateCancellation(t *testing.T) {
+	const (
+		callsFailed   = `zg_gateway_signature_fetch_calls_total{outcome="failed"}`
+		callsCanceled = `zg_gateway_signature_fetch_calls_total{outcome="canceled"}`
+		callsTimeout  = `zg_gateway_signature_fetch_calls_total{outcome="timeout"}`
+	)
+	for _, tc := range []struct {
+		name    string
+		handler http.HandlerFunc
+	}{
+		{"definitive 4xx", func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+		}},
+		{"undecodable signature body", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"text": not-json`))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := map[string]float64{
+				callsFailed:   metricValue(t, callsFailed),
+				callsCanceled: metricValue(t, callsCanceled),
+				callsTimeout:  metricValue(t, callsTimeout),
+			}
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+
+			// Done before the loop classifies the failure, without tearing the request
+			// down — the same shape the preview late-cancellation test uses.
+			var canceled atomic.Bool
+			canceled.Store(true)
+			ctx := lateCancelCtx{Context: context.Background(), done: make(chan struct{}), canceled: &canceled}
+
+			if _, err := NewSignatureFetcher(srv.Client()).FetchSignature(
+				ctx, core.Provider{Endpoint: srv.URL}, "11111111-1111-1111-1111-111111111111"); err == nil {
+				t.Fatal("want an error")
+			}
+			if got := metricValue(t, callsFailed) - before[callsFailed]; got != 1 {
+				t.Errorf("%s delta = %v, want 1 — the broker's own answer was relabelled", callsFailed, got)
+			}
+			for _, s := range []string{callsCanceled, callsTimeout} {
+				if got := metricValue(t, s) - before[s]; got != 0 {
+					t.Errorf("%s delta = %v, want 0", s, got)
+				}
+			}
+		})
+	}
+}
+
+// A Router built directly rather than by New must still preview. The pacing pair had
+// no zero-value default, unlike candidateWalk.limit(), so an unset attempt timeout
+// meant an already-expired context and every request failing — silently and totally,
+// and the tests already construct &Router{}.
+func TestZeroValuePacingFallsBackToTheConstants(t *testing.T) {
+	r := &Router{}
+	if got := r.attemptTimeout(); got != previewAttemptTimeout {
+		t.Errorf("attemptTimeout() = %s, want %s", got, previewAttemptTimeout)
+	}
+	if got := r.retryBudget(); got != previewRetryBudget {
+		t.Errorf("retryBudget() = %s, want %s", got, previewRetryBudget)
+	}
+	// And an explicit value still wins.
+	r.previewAttemptTO, r.previewBudgetTO = time.Second, 2*time.Second
+	if got := r.attemptTimeout(); got != time.Second {
+		t.Errorf("attemptTimeout() = %s, want 1s", got)
+	}
+	if got := r.retryBudget(); got != 2*time.Second {
+		t.Errorf("retryBudget() = %s, want 2s", got)
+	}
+}

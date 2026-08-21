@@ -210,6 +210,11 @@ type Router struct {
 	// down and exercise the real end-to-end ceiling (budget + one attempt) in
 	// milliseconds instead of a minute — per Router, not mutable globals, so such
 	// tests stay parallel-safe.
+	//
+	// Read through attemptTimeout()/retryBudget(), which default a zero the way
+	// candidateWalk.limit() does. Without that, a Router not built by New — and the
+	// tests already construct &Router{} directly — gave every preview an
+	// already-expired context and failed every request, silently and totally.
 	previewAttemptTO time.Duration
 	previewBudgetTO  time.Duration
 	// previewRetries switches preview retries off while the router looks down, so a
@@ -1009,6 +1014,24 @@ func (r *Router) fetchQuote(ctx context.Context, quoteURL string) ([]byte, error
 	return raw, nil
 }
 
+// attemptTimeout and retryBudget read the pacing pair with the constants as
+// defaults, so a zero value means "unset" rather than "instantly expired" / "no
+// retries". Mirrors candidateWalk.limit(); the asymmetry between them was one
+// direct-construction away from being live.
+func (r *Router) attemptTimeout() time.Duration {
+	if r.previewAttemptTO > 0 {
+		return r.previewAttemptTO
+	}
+	return previewAttemptTimeout
+}
+
+func (r *Router) retryBudget() time.Duration {
+	if r.previewBudgetTO > 0 {
+		return r.previewBudgetTO
+	}
+	return previewRetryBudget
+}
+
 // previewResult classifies one preview attempt, so the retry decision and the
 // metric label come from ONE judgement rather than a bool and a string that can
 // drift apart.
@@ -1129,7 +1152,7 @@ func (r *Router) preview(ctx context.Context, req wire.Request) ([]previewProvid
 			// Stop when the next backoff would carry this preview past its budget, and
 			// surface the failure we already have rather than a budget message: the
 			// caller wants to know what the router did, not how we paced our retries.
-			if time.Since(start)+backoff >= r.previewBudgetTO {
+			if time.Since(start)+backoff >= r.retryBudget() {
 				break
 			}
 			// Retries are off while the router is failing everything: the first attempt
@@ -1225,7 +1248,7 @@ func (r *Router) preview(ctx context.Context, req wire.Request) ([]previewProvid
 // the shared client caps only the wait for headers, so without this a slow body
 // would leave the attempt (and the retry ceiling built on it) unbounded.
 func (r *Router) previewOnce(ctx context.Context, body []byte, req wire.Request) ([]previewProvider, previewResult, error) {
-	ctx, cancel := context.WithTimeout(ctx, r.previewAttemptTO)
+	ctx, cancel := context.WithTimeout(ctx, r.attemptTimeout())
 	defer cancel()
 
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, r.previewURL, bytes.NewReader(body))
