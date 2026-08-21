@@ -1679,3 +1679,40 @@ func TestPreviewBrokenSurvivesALateCancellation(t *testing.T) {
 		t.Errorf("%s delta = %v, want 0", callsCanceled, got)
 	}
 }
+
+// The gate must not be reopened by a definitive rejection. During a router-layer
+// outage a load balancer commonly mixes 404s and 403s in with the 502s; resetting on
+// those put the 502 requests back to full amplification and back to holding a
+// LimitInFlight slot for the whole ceiling — the gateway-level cascade this gate
+// exists to prevent. Only a preview that SUCCEEDED is evidence retries are worth
+// making again.
+func TestRetryGateNotReopenedByARejection(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	router.previewFailN = 1 << 20 // 503s forever
+	r := New(router.srv.URL)
+	for i := 0; i < previewRetryTripAfter; i++ {
+		_, _ = r.Resolve(context.Background(), chatReq())
+	}
+	if r.previewRetries.allow() {
+		t.Fatal("the gate should be shut after consecutive answerless calls")
+	}
+
+	// The LB now answers some requests definitively (a 401). This must not reopen it.
+	router.previewFailCode = http.StatusUnauthorized
+	if _, err := r.Resolve(context.Background(), chatReq()); err == nil {
+		t.Fatal("want an error from a 401 router")
+	}
+	if r.previewRetries.allow() {
+		t.Error("a definitive rejection reopened the gate; the 502 traffic goes back to 3x amplification")
+	}
+
+	// A success does reopen it — that is the one signal that retries are useful.
+	router.previewFailN = 0
+	if _, err := r.Resolve(context.Background(), chatReq()); err != nil {
+		t.Fatalf("Resolve after recovery: %v", err)
+	}
+	if !r.previewRetries.allow() {
+		t.Error("a successful preview must reopen the gate")
+	}
+}

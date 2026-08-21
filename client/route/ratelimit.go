@@ -161,9 +161,13 @@ func (g *retryGate) noAnswer() {
 	}
 }
 
-// answered records that the router replied — well or badly, but replied. That is
-// proof of reachability, so it clears both the count and any open window: a
-// recovered router should not keep serving requests with retries switched off.
+// answered records a preview that SUCCEEDED — the only evidence that retrying is
+// worth doing again, so it clears both the count and any open window.
+//
+// Deliberately not called for a definitive rejection. "The router replied" is proof
+// of reachability but says nothing about whether retries help, and those outcomes do
+// not retry at all; resetting on them let a load balancer mixing 404s into an outage
+// reopen the gate for free, over and over.
 func (g *retryGate) answered() {
 	g.mu.Lock()
 	defer g.mu.Unlock()

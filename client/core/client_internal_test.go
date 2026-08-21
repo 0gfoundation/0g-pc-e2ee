@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -637,3 +638,119 @@ func TestWalkStopsOnceFailedAttemptsSpendTheBudget(t *testing.T) {
 	t.Logf("stopped after %d/%d candidates in %s (ceiling %s)",
 		cands.reached, cands.n, elapsed.Truncate(time.Millisecond), c.resolveBudgetTO+attemptCost)
 }
+
+// A candidate we could not PREPARE never displaces what a provider actually said.
+// The rule was written on the budget-exhausted branch only, so its sibling — a
+// materialization that failed for any other reason — still replaced a 503 and its
+// Retry-After with a Status-0 error, and the caller got a generic 502.
+func TestPreferErr(t *testing.T) {
+	upstream := &Error{Stage: StageUpstream, Status: 503, Err: errors.New("provider busy")}
+	materialize := &Error{Stage: StageUpstream, Err: errors.New("pubkey fetch failed")}
+
+	if got := preferErr(upstream, materialize); got != error(upstream) {
+		t.Errorf("a materialization failure displaced the provider's reply: got %v", got)
+	}
+	if got := preferErr(nil, materialize); got != error(materialize) {
+		t.Errorf("with nothing better, the materialization failure must be reported: got %v", got)
+	}
+}
+
+// failThenUnpreparable answers candidate 0 (whose attempt will 503) and refuses to
+// prepare every later one, quickly and for a reason that is not the budget.
+type failThenUnpreparable struct {
+	n int
+	p Provider
+}
+
+func (c failThenUnpreparable) Len() int { return c.n }
+
+func (c failThenUnpreparable) Provider(_ context.Context, i int) (Provider, error) {
+	if i == 0 {
+		return c.p, nil
+	}
+	return Provider{}, &Error{Stage: StageUpstream, Err: errors.New("pubkey fetch failed")}
+}
+
+// End to end: the caller must still receive the 503 and its Retry-After, not the
+// bookkeeping error from the candidate we could not prepare afterwards.
+func TestUnpreparableCandidateDoesNotDisplaceTheProvidersReply(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "7")
+		http.Error(w, "provider busy", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	_, encPub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := NewWithResolver(fixedResolver{failThenUnpreparable{n: 3, p: Provider{
+		URL: srv.URL, EncPubKey: encPub,
+		Address:    "0xC0FFEE0000000000000000000000000000000001",
+		SignerAddr: "0xd45b4301940B297F76d6e622c1CeA2AE660617d4",
+	}}})
+
+	_, err = c.Complete(context.Background(), wire.Request{
+		"model":    json.RawMessage(`"gpt-4o"`),
+		"messages": json.RawMessage(`[{"role":"user","content":"hi"}]`),
+	})
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	var e *Error
+	if !errors.As(err, &e) {
+		t.Fatalf("want *Error, got %T", err)
+	}
+	if e.Status != http.StatusServiceUnavailable {
+		t.Errorf("Status = %d, want 503 — the provider's reply was displaced", e.Status)
+	}
+	if e.Header.Get("Retry-After") != "7" {
+		t.Errorf("Retry-After = %q, want \"7\"", e.Header.Get("Retry-After"))
+	}
+}
+
+// One fault must not split across two buckets by kind. A provider that accepts the
+// connection and never answers is a timeout however it is noticed: the buffered
+// path's context deadline, or the transport's ResponseHeaderTimeout, which is all
+// the streaming path has since its context carries no deadline of its own.
+func TestUpstreamFailureOutcomeAgreesAcrossMechanisms(t *testing.T) {
+	live := context.Background()
+	expired, cancelExpired := context.WithCancel(context.Background())
+	cancelExpired()
+	goneParent, cancelParent := context.WithCancel(context.Background())
+	cancelParent()
+
+	netTimeout := &net.OpError{Op: "read", Err: timeoutErr{}}
+
+	for _, tc := range []struct {
+		name            string
+		parent, attempt context.Context
+		err             error
+		base, want      string
+	}{
+		// The buffered shape: our per-attempt context deadline noticed.
+		{"context deadline", live, expired, context.DeadlineExceeded, UpstreamTransport, UpstreamTimeout},
+		// The streaming shape: no context deadline exists, so only the transport can
+		// notice. Same fault, and it must land in the same bucket.
+		{"transport timeout, no context deadline", live, live, netTimeout, UpstreamTransport, UpstreamTimeout},
+		// A genuine unreachable provider stays transport.
+		{"connection refused", live, live, errors.New("connect: connection refused"), UpstreamTransport, UpstreamTransport},
+		// The caller outranks both.
+		{"caller gone", goneParent, expired, netTimeout, UpstreamTransport, UpstreamCanceled},
+		// The same judgement serves the body-read site, with its own base.
+		{"body dropped", live, live, errors.New("unexpected EOF"), UpstreamBody, UpstreamBody},
+		{"body read timed out", live, live, netTimeout, UpstreamBody, UpstreamTimeout},
+	} {
+		if got := upstreamFailureOutcome(tc.parent, tc.attempt, tc.err, tc.base); got != tc.want {
+			t.Errorf("%s: got %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}
+
+// timeoutErr is a net.Error that reports a timeout, the shape ResponseHeaderTimeout
+// surfaces as.
+type timeoutErr struct{}
+
+func (timeoutErr) Error() string   { return "i/o timeout" }
+func (timeoutErr) Timeout() bool   { return true }
+func (timeoutErr) Temporary() bool { return true }

@@ -66,15 +66,12 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 	for i := 0; i < cands.Len(); i++ {
 		provider, err := walk.provider(ctx, cands, i)
 		if err != nil {
+			// As in Complete: a candidate we could not prepare never displaces what an
+			// earlier provider actually said, budget or no budget (preferErr).
+			lastErr = preferErr(lastErr, resolveErr(err))
 			if walk.exhausted() {
-				// Keep the better error, as in Complete: a previous candidate's upstream
-				// status outlives "we ran out of budget preparing the next one".
-				if lastErr == nil {
-					lastErr = resolveErr(err)
-				}
 				break
 			}
-			lastErr = resolveErr(err)
 			c.metricFallback(FallbackMaterialize, i, cands.Len())
 			continue
 		}
@@ -138,11 +135,11 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 	resp, err := c.doRequest(ctx, provider, sealed)
 	if err != nil {
 		// Transport failure reaching the router (which fronts every candidate) — it
-		// would recur, so do not fall back.
-		outcome = UpstreamTransport
-		if canceledBy(parent) {
-			outcome = UpstreamCanceled
-		}
+		// would recur, so do not fall back. Classified by the shared judgement, so a
+		// provider that accepts the connection and never answers lands in the same
+		// bucket here as on the buffered path: this context carries no deadline of its
+		// own, so only the transport's own timeout can say so.
+		outcome = upstreamFailureOutcome(parent, ctx, err, UpstreamTransport)
 		return false, &Error{Stage: StageUpstream, Err: fmt.Errorf("post to provider: %w", err)}
 	}
 	defer resp.Body.Close()
@@ -227,7 +224,9 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 				outcome = UpstreamTimeout
 				return !committed, stageErr(StageUpstream, fmt.Errorf("stream aborted: %w", ctx.Err()))
 			}
-			outcome = UpstreamBody
+			// ctx is not done, so this is the read itself failing; a transport-level
+			// deadline still reads as our bound, not as a truncated body.
+			outcome = upstreamFailureOutcome(parent, ctx, err, UpstreamBody)
 			return !committed, stageErr(StageUpstream, fmt.Errorf("read stream: %w", err))
 		}
 		if bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]")) {

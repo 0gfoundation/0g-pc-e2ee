@@ -1208,11 +1208,15 @@ func (r *Router) preview(ctx context.Context, req wire.Request) ([]previewProvid
 		metrics.PreviewAttempt(string(res))
 		lastErr = err
 		if res != previewRetryable {
-			// rejected and broken are both the router REPLYING, which is what the gate
-			// cares about; canceled and internal say nothing about it either way.
-			if res == previewRejected || res == previewBroken {
-				r.previewRetries.answered()
-			}
+			// Deliberately does NOT touch the retry gate. An earlier version reset it
+			// here on the reasoning that rejected and broken prove the router is
+			// replying — but the gate is about whether RETRYING is worth doing, and
+			// neither of those outcomes retries at all. Resetting on them reopened the
+			// gate for free whenever a load balancer mixed 404s and 403s in with the
+			// 502s during a router-layer outage, which is the one scenario the gate
+			// exists for: the 502 requests went back to 3x amplification and to holding
+			// a LimitInFlight slot for the full ceiling. Only a preview that actually
+			// succeeded is evidence that retries are worth making again.
 			outcome = res.callOutcome()
 			return nil, err
 		}

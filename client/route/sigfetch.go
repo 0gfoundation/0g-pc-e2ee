@@ -178,8 +178,16 @@ func deriveSignatureURL(endpoint, chatKey string) (string, error) {
 // which put our own deadline in the bucket every alert ignores.
 //
 // context.Canceled means somebody called cancel — in practice the caller going
-// away. context.DeadlineExceeded means a deadline fired, and the only deadlines on
-// this path are ours (providerTimeout) plus the fetcher's own client timeout.
+// away. context.DeadlineExceeded means a deadline on the CONTEXT fired, which on
+// this path means core's providerTimeout.
+//
+// Note what this does NOT cover: the fetcher's own http.Client.Timeout never touches
+// the context — it surfaces as a transport error from Do, which fetchOnce marks
+// retryable, so it is retried and ends in "failed". An earlier version of this
+// comment claimed otherwise. Reading it as a timeout would mean classifying the
+// error rather than the context, and unlike core's transport path there is nothing
+// to gain: every such failure here is already retried three times, so it is a
+// genuine failure to obtain the proof by the time it is recorded.
 //
 // Two residual ambiguities, stated because they are real: a CALLER that set its own
 // deadline reads as timeout, and a stream whose idle watchdog fires (a cancel, not

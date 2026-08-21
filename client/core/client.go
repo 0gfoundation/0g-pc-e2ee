@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"slices"
 	"time"
@@ -86,6 +87,22 @@ func (e *Error) Source() string {
 }
 
 func stageErr(stage string, err error) error { return &Error{Stage: stage, Err: err} }
+
+// preferErr keeps the more useful of two walk failures. A materialization failure
+// carries no upstream status — it is our own bookkeeping about a candidate we could
+// not prepare — while an attempt failure carries the provider's verbatim reply, a
+// 503 with the Retry-After the proxy surfaces. So a materialization failure only
+// ever fills a gap; it never displaces what a provider actually said.
+//
+// This rule was originally written inline on the budget-exhausted branch only, which
+// left its sibling — a materialization that failed for any other reason — still
+// throwing that 503 away. Hoisting it here is what makes it apply to both.
+func preferErr(have, materialize error) error {
+	if have != nil {
+		return have
+	}
+	return materialize
+}
 
 // resolveErr maps a Resolver failure onto an *Error. A resolver that already
 // staged its error (route mode wraps its router/broker failures as *Error) is
@@ -290,6 +307,39 @@ func (c *Client) metricStreamFirstFrame(dur time.Duration) {
 	if c.metrics != nil {
 		c.metrics.StreamFirstFrame(dur)
 	}
+}
+
+// upstreamFailureOutcome resolves what to blame for a failure whose default reading
+// is base (UpstreamTransport for a request that produced no response,
+// UpstreamBody for one whose body dropped).
+//
+// A TIMEOUT is our bound expiring rather than the provider being unreachable, and it
+// must land in the same bucket whichever mechanism noticed — the buffered path's
+// per-attempt context deadline, or the shared client's ResponseHeaderTimeout, which
+// is all the streaming path has since its context carries no deadline of its own.
+// Deciding by mechanism split ONE fault (a provider that accepts the connection and
+// never answers) across two buckets by kind: timeout on the buffered path, transport
+// on the streaming one. That is precisely the drift the shared outcome constants
+// exist to prevent.
+func upstreamFailureOutcome(parent, attempt context.Context, err error, base string) string {
+	if canceledBy(parent) {
+		return UpstreamCanceled
+	}
+	if attempt.Err() != nil || isTimeout(err) {
+		return UpstreamTimeout
+	}
+	return base
+}
+
+// isTimeout reports whether err is a deadline expiring, from either layer: a context
+// deadline, or a net.Error the transport timed out on (which is how
+// ResponseHeaderTimeout surfaces).
+func isTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 // canceledBy reports whether parent is done, i.e. whether a failure inside a
@@ -500,23 +550,14 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 	for i := 0; i < cands.Len(); i++ {
 		provider, err := walk.provider(ctx, cands, i)
 		if err != nil {
+			// Whatever the reason — out of budget, or a pubkey fetch that failed — a
+			// candidate we could not prepare never displaces what an earlier provider
+			// actually said (preferErr).
+			lastErr = preferErr(lastErr, resolveErr(err))
 			if walk.exhausted() {
-				// Out of materialization budget: every remaining candidate would fail the
-				// same way, so stop. KEEP whatever failure we already have rather than
-				// overwriting it with this one — an earlier candidate's real upstream
-				// reply (a 503 with its Retry-After, say, which the proxy surfaces
-				// verbatim) tells the caller far more than "we ran out of time preparing
-				// the next one", and only that is worth reporting when there is nothing
-				// else. This assignment used to happen before the check, which threw the
-				// better error away.
-				if lastErr == nil {
-					lastErr = resolveErr(err)
-				}
+				// Every remaining candidate would fail the same way; stop.
 				break
 			}
-			// This candidate could not be materialized (e.g. its pubkey fetch failed);
-			// skip it and try the next.
-			lastErr = resolveErr(err)
 			c.metricFallback(FallbackMaterialize, i, cands.Len())
 			continue
 		}
@@ -582,12 +623,7 @@ func (c *Client) completeOnce(parent context.Context, provider Provider, req wir
 		// Never reached the provider (transport failure); the same router fronts
 		// every candidate, so it recurs — terminal. A caller that went away mid-flight
 		// looks identical here, so attribute it by asking the parent.
-		outcome = UpstreamTransport
-		if canceledBy(parent) {
-			outcome = UpstreamCanceled
-		} else if ctx.Err() != nil {
-			outcome = UpstreamTimeout
-		}
+		outcome = upstreamFailureOutcome(parent, ctx, err, UpstreamTransport)
 		return nil, false, &Error{Stage: StageUpstream, Err: fmt.Errorf("post to provider: %w", err)}
 	}
 	defer resp.Body.Close()
@@ -611,12 +647,7 @@ func (c *Client) completeOnce(parent context.Context, provider Provider, req wir
 	if err != nil {
 		// A response began but the body dropped mid-read: a provider-side failure
 		// with nothing delivered to the caller — fall back to the next candidate.
-		outcome = UpstreamBody
-		if canceledBy(parent) {
-			outcome = UpstreamCanceled
-		} else if ctx.Err() != nil {
-			outcome = UpstreamTimeout
-		}
+		outcome = upstreamFailureOutcome(parent, ctx, err, UpstreamBody)
 		return nil, true, stageErr(StageUpstream, fmt.Errorf("read provider response: %w", err))
 	}
 
