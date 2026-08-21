@@ -232,10 +232,13 @@ type MetricsHook interface {
 	// model has to say; the wait for its first token is the part a caller
 	// experiences as latency, and the two are unrelated.
 	StreamFirstFrame(dur time.Duration)
-	// WalkBudgetExhausted is called when a call stops walking the candidate chain
-	// because resolveBudget ran out. It is the only signal that a request was cut at
-	// that ceiling rather than by anything upstream, and therefore the only way to
-	// tell whether the ceiling is set anywhere near right.
+	// WalkBudgetExhausted is called when resolveBudget running out actually
+	// truncated a call's work: it cut a candidate's materialization short, or it
+	// denied a fallback the walk would otherwise have made. It is the only signal
+	// that a request was cut at that ceiling rather than by anything upstream, and
+	// therefore the only way to tell whether the ceiling is set anywhere near right
+	// — so it must not also fire where the walk was ending anyway (see
+	// metricWalkBudgetBlockedFallback).
 	WalkBudgetExhausted()
 	// CandidateFallback is called each time the client gives up on a candidate and
 	// moves to the next, with reason FallbackUpstream (an attempt failed
@@ -332,10 +335,27 @@ func (c *Client) metricFallback(reason string, i, n int) {
 	}
 }
 
-// metricWalkBudgetExhausted reports one walk cut short by resolveBudget.
+// metricWalkBudgetExhausted reports one walk cut short by resolveBudget. Used
+// where the budget genuinely truncated work: materializing a candidate runs under
+// a deadline derived from what is left, so even on the last candidate the ceiling
+// really did cut it.
 func (c *Client) metricWalkBudgetExhausted() {
 	if c.metrics != nil {
 		c.metrics.WalkBudgetExhausted()
+	}
+}
+
+// metricWalkBudgetBlockedFallback reports the budget stopping a fallback after a
+// failed attempt — where, unlike materialization, a running attempt is never cut
+// short by the budget, so its only effect is to decide whether to move on. Guarded
+// like metricFallback, and for the same reason: on the last candidate there is
+// nothing to move on to, the ceiling truncated nothing, and counting it would book
+// every request whose upstream is slower than resolveBudget (90s, against a 630s
+// provider timeout) as our ceiling firing — on a single-candidate deployment, the
+// common shape, that series would read "slow failure", not "limit reached".
+func (c *Client) metricWalkBudgetBlockedFallback(i, n int) {
+	if i+1 < n {
+		c.metricWalkBudgetExhausted()
 	}
 }
 
@@ -628,7 +648,7 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 				break
 			}
 			if walk.exhausted() {
-				c.metricWalkBudgetExhausted()
+				c.metricWalkBudgetBlockedFallback(i, cands.Len())
 				break
 			}
 			c.metricFallback(FallbackUpstream, i, cands.Len())

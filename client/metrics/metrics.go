@@ -200,9 +200,16 @@ var (
 		Help: "Duration of one data-plane attempt, split by kind because the two distributions are " +
 			"different questions: buffered is the completion's whole latency, stream is how long the " +
 			"stream stayed open (see upstream_stream_ttff_seconds for the latency a streaming caller " +
-			"actually feels).",
+			"actually feels). Split by result (ok|failed|canceled) as well, because a histogram over " +
+			"ALL attempts is not a latency series: a 4xx rejected in 20ms and a caller that left " +
+			"after 200ms both drag the completion p99 down, and that p99 is what the budget-cut " +
+			"runbook says to read the ceiling against. Chart result=\"ok\" for latency. canceled is " +
+			"kept out of failed for the same reason it is kept out of every failure bucket next " +
+			"door, and because its duration is set by when the caller left rather than by anything " +
+			"upstream. Coarsened to three values on purpose: the counter next door carries the full " +
+			"outcome vocabulary, which here would multiply every bucket series by it.",
 		Buckets: upstreamBuckets,
-	}, []string{"kind"})
+	}, []string{"kind", "result"})
 	streamTTFF = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "upstream_stream_ttff_seconds",
 		Help: "Time to first delivered frame of a stream — the latency a streaming caller feels, " +
@@ -216,8 +223,12 @@ var (
 	})
 	walkBudgetExhausted = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "walk_budget_exhausted_total",
-		Help: "Requests cut short because core.resolveBudget ran out while walking the candidate " +
-			"chain — the only signal that a request was ended by OUR ceiling rather than by " +
+		Help: "Requests where core.resolveBudget running out actually truncated the candidate walk " +
+			"— it cut a materialization short, or denied a fallback the walk would otherwise have " +
+			"made. Not counted when a failed attempt on the LAST candidate happens to exhaust it: a " +
+			"running attempt is never cut by the budget, so there it only decides whether to move " +
+			"on, and there was nothing to move on to. This is " +
+			"the only signal that a request was ended by OUR ceiling rather than by " +
 			"anything upstream, and therefore the only way to tell whether that ceiling is set " +
 			"anywhere near right. Read it next to the buffered completion-latency p99: this rising " +
 			"with the p99 pinned near the budget means requests are spending their whole allowance " +
@@ -235,13 +246,15 @@ var (
 	// provider's broker — the router does not proxy it — once per response.
 	signatureFetchCalls = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "signature_fetch_calls_total",
-		Help: "§8 signature fetches (one per verified response) by outcome: ok, ok_retried, failed, " +
-			"timeout (OUR deadline for the attempt fired mid-fetch), canceled (the caller left). " +
+		Help: "§8 signature fetches (one per verified response) by outcome: ok, ok_retried, failed " +
+			"(the broker was asked and did not deliver), timeout (OUR deadline for the attempt " +
+			"fired mid-fetch), canceled (the caller left), internal (we never asked it — no " +
+			"endpoint to fetch from, or an endpoint/chatKey that would not form a URL). " +
 			"ok_retried is expected traffic, not an incident: the broker writes the signature at " +
 			"end-of-response, so a just-finished response can momentarily 404 — but a ratio that " +
-			"climbs means every response is paying the backoff. timeout and canceled are split " +
-			"because only one of them is ours; see route.endedBy for the two cases that split " +
-			"imperfectly.",
+			"climbs means every response is paying the backoff. timeout, canceled and internal are " +
+			"split out of failed because none of them is the broker's; see route.endedBy for the " +
+			"two cases that split imperfectly.",
 	}, []string{"outcome"})
 	signatureFetchDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "signature_fetch_duration_seconds",
@@ -444,7 +457,29 @@ func PreviewCall(outcome string, dur time.Duration) {
 // fixed low-cardinality label (see the metric's Help).
 func UpstreamAttempt(kind, outcome string, dur time.Duration) {
 	upstreamAttempts.WithLabelValues(kind, outcome).Inc()
-	upstreamDuration.WithLabelValues(kind).Observe(dur.Seconds())
+	upstreamDuration.WithLabelValues(kind, attemptResult(outcome)).Observe(dur.Seconds())
+}
+
+// attemptResult coarsens an attempt outcome to the duration histogram's result
+// label. Three values rather than the counter's full vocabulary, which here would
+// multiply every bucket series by it — and three rather than two, because
+// "canceled" is not a failure (the same rule the counter's Help states) and its
+// duration is set by when the caller left, so folding it into either neighbour
+// distorts that neighbour.
+//
+// The two literals are core's outcome vocabulary (core.UpstreamOK,
+// core.UpstreamCanceled). This package deliberately does not import core, so they
+// are pinned to it by TestAttemptResultMatchesCoreVocabulary rather than by the
+// compiler: renaming an outcome without it would silently relabel every attempt.
+func attemptResult(outcome string) string {
+	switch outcome {
+	case "ok":
+		return "ok"
+	case "canceled":
+		return "canceled"
+	default:
+		return "failed"
+	}
 }
 
 // StreamFirstFrame records the time to a stream's first delivered frame.

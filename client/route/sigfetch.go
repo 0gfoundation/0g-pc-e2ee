@@ -85,11 +85,21 @@ func (f *SignatureFetcher) FetchSignature(ctx context.Context, provider core.Pro
 	outcome := "failed"
 	defer func() { metrics.SignatureFetch(outcome, time.Since(start)) }()
 
+	// Metered, but NOT as "failed": neither check has asked the broker anything yet,
+	// and "failed" is the bucket an operator reads as "the broker is not serving
+	// signatures". A missing endpoint is a materialization gap on our side; a chatKey
+	// or endpoint that will not form a URL is bad input reaching us. Both fail
+	// verification closed either way, which is what response_verification_failures
+	// and the upstream "unverifiable" outcome are for. Same §4 rule the other two
+	// planes already follow — our fault is never a provider alert — applied here,
+	// where it was not.
 	if provider.Endpoint == "" {
+		outcome = "internal"
 		return proof.ChatSignature{}, fmt.Errorf("no provider endpoint to fetch the response signature from")
 	}
 	u, err := deriveSignatureURL(provider.Endpoint, chatKey)
 	if err != nil {
+		outcome = "internal"
 		return proof.ChatSignature{}, err
 	}
 
@@ -126,11 +136,22 @@ func (f *SignatureFetcher) FetchSignature(ctx context.Context, provider core.Pro
 			return proof.ChatSignature{}, err
 		}
 		if !retryable {
+			// One of fetchOnce's definitive failures is not the broker's: failing to
+			// build the GET at all. Unreachable in practice (the URL was already
+			// derived and validated), classified anyway so "failed" means one thing
+			// on every exit path rather than on the reachable ones only.
+			if errors.Is(err, errRequestBuild) {
+				outcome = "internal"
+			}
 			return proof.ChatSignature{}, err
 		}
 	}
 	return proof.ChatSignature{}, fmt.Errorf("after %d attempts: %w", sigFetchAttempts, lastErr)
 }
+
+// errRequestBuild marks the one fetchOnce failure that is ours and not the
+// broker's, so FetchSignature can keep it out of the provider-facing bucket.
+var errRequestBuild = errors.New("build signature request")
 
 // fetchOnce performs a single GET. retryable is true only for a transient failure
 // worth another attempt — a transport error, a 404 (the broker caches the
@@ -139,7 +160,7 @@ func (f *SignatureFetcher) FetchSignature(ctx context.Context, provider core.Pro
 func (f *SignatureFetcher) fetchOnce(ctx context.Context, url string) (proof.ChatSignature, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return proof.ChatSignature{}, false, err
+		return proof.ChatSignature{}, false, fmt.Errorf("%w: %w", errRequestBuild, err)
 	}
 	resp, err := f.http.Do(req)
 	if err != nil {

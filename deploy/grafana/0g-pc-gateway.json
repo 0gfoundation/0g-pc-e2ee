@@ -672,7 +672,7 @@
     {
       "id": 11,
       "type": "timeseries",
-      "title": "In-flight requests",
+      "title": "In-flight requests, limit & shed rate",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -694,6 +694,28 @@
           "range": true,
           "refId": "A",
           "legendFormat": "in-flight"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(zg_gateway_inflight_limit{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"})",
+          "range": true,
+          "refId": "B",
+          "legendFormat": "limit"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(zg_gateway_requests_shed_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval]))",
+          "range": true,
+          "refId": "C",
+          "legendFormat": "shed/s"
         }
       ],
       "fieldConfig": {
@@ -1636,7 +1658,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(zg_gateway_upstream_attempt_duration_seconds_bucket{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\",kind=\"buffered\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(zg_gateway_upstream_attempt_duration_seconds_bucket{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\",kind=\"buffered\",result=\"ok\"}[$__rate_interval])))",
           "range": true,
           "refId": "A",
           "legendFormat": "p99"
@@ -1647,7 +1669,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(zg_gateway_upstream_attempt_duration_seconds_bucket{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\",kind=\"buffered\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(zg_gateway_upstream_attempt_duration_seconds_bucket{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\",kind=\"buffered\",result=\"ok\"}[$__rate_interval])))",
           "range": true,
           "refId": "B",
           "legendFormat": "p50"
@@ -1812,7 +1834,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(zg_gateway_upstream_attempt_duration_seconds_bucket{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\",kind=\"stream\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(zg_gateway_upstream_attempt_duration_seconds_bucket{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\",kind=\"stream\",result=\"ok\"}[$__rate_interval])))",
           "range": true,
           "refId": "A",
           "legendFormat": "p99"
@@ -1823,7 +1845,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by (le) (rate(zg_gateway_upstream_attempt_duration_seconds_bucket{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\",kind=\"stream\"}[$__rate_interval])))",
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(zg_gateway_upstream_attempt_duration_seconds_bucket{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\",kind=\"stream\",result=\"ok\"}[$__rate_interval])))",
           "range": true,
           "refId": "B",
           "legendFormat": "p50"

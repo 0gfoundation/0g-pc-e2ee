@@ -47,7 +47,15 @@ screen:
 
 1. **Overview — traffic & health**: request rate, 5xx/4xx ratio, in-flight,
    completion success ratio, E2EE open-failure rate; rate by route/status; HTTP
-   latency p50/p90/p99 by route.
+   latency p50/p90/p99 by route; in-flight against its configured limit, with the
+   shed rate on the same axes. That last panel is where saturation and its
+   consequence are visible together: a shed is a 503, so it is already in the
+   "5xx ratio" and "rate by status" panels above, where it reads as a fault the
+   gateway committed rather than as the limiter doing its job — subtract this
+   series to get faults alone. It is also the panel that confirms or refutes the
+   premise behind `route.retryGate` (row 3): that a router outage becomes
+   gateway-wide shedding, because each retrying request holds its concurrency
+   slot for the whole retry ceiling.
 2. **Completions**: outcome by result, and errors broken down by
    `source`/`stage` (gateway fault vs router/provider).
 3. **Route preview — the uncached control plane**: retried-preview ratio, failure
@@ -86,7 +94,8 @@ screen:
      Retrying an uncached dependency multiplies load on it exactly when it can
      least take it, and each retrying request holds its gateway concurrency slot
      for the ceiling above rather than for one attempt — so a router outage would
-     turn into gateway-wide shedding. After a few consecutive answerless calls the
+     turn into gateway-wide shedding, which the in-flight/limit/shed panel in row 1
+     is what confirms. After a few consecutive answerless calls the
      retries switch themselves off (`route.retryGate`) until an answer comes back.
      The first attempt of every request is still made, so callers still get their
      real error; what stops is the amplification. Read it next to `failed`: both
@@ -99,7 +108,7 @@ screen:
    stream time-to-first-frame and open duration; the §8 signature fetch and its
    latency. Rows 1–2 measure what this gateway *served*, which is preview +
    materialization + this; only this row isolates the hop that dominates it.
-   Seven things to know when reading it:
+   Eight things to know when reading it:
    - **Why this ratio uses a denylist when the preview one uses an allowlist.** The
      rule is which way an omission fails. A *failure* ratio built as a denylist
      fails LOUD: a new outcome nobody classified lands in the numerator, the number
@@ -134,16 +143,29 @@ screen:
      proven either way; that is the broker having a bad minute, or us, and it is
      deliberately outside the integrity alert. The §8 fetch panel draws the same
      line for itself: `timeout` is OUR attempt deadline expiring mid-fetch,
-     `canceled` is the caller leaving. Both used to be `canceled`, which put our
-     own deadline in a bucket every alert ignores.
+     `canceled` is the caller leaving, and `internal` is a fetch that never
+     happened (no endpoint to fetch from, or an endpoint/chatKey that would not
+     form a URL). Only `failed` means the broker was asked and did not deliver,
+     which is the one an operator can act on. All three used to be `failed` or
+     `canceled`, which put our own deadline and our own gaps in the broker's
+     number.
    - **`budget cut` is our ceiling firing, not anything upstream.** It counts
-     requests ended because `core.resolveBudget` ran out while walking the chain,
-     and it is the only way to tell whether that ceiling is set anywhere near right
-     — read it against the buffered-latency p99. It is deliberately NOT on the
-     failure ratio: the request failed, but the thing that failed it was us.
-     A caller disconnecting mid-walk is not counted here and is not a fallback
-     either; it ends the walk silently, because filing a closed tab as bad routing
-     is what the fallback series exists not to do.
+     requests where `core.resolveBudget` running out actually truncated the walk —
+     it cut a candidate's materialization short, or it denied a fallback the walk
+     would otherwise have made — and it is the only way to tell whether that
+     ceiling is set anywhere near right, so read it against the buffered-latency
+     p99. It is deliberately NOT on the failure ratio: the request failed, but the
+     thing that failed it was us. Two cases are deliberately absent, both because
+     the number is worthless if it also counts requests the ceiling did not change.
+     A caller disconnecting mid-walk ends the walk silently — and is not a fallback
+     either, since filing a closed tab as bad routing is what the fallback series
+     exists not to do. And a failed attempt on the *last* candidate: a running
+     attempt is never cut by the budget, so there the budget only decides whether
+     to move on, and there was nothing to move on to. Counting it would book every
+     request whose upstream is slower than the budget (90s, against a 630s provider
+     timeout) as a ceiling cut — manufacturing exactly the correlation with the
+     latency p99 this bullet asks you to read, and on a single-provider deployment
+     turning the panel into a slow-failure counter.
    - **A failing chain is bounded, in both factors.** `core.resolveBudget` charges
      materialization AND failed attempts, so the walk stops instead of paying
      `providerTimeout` once per candidate; `route.maxPreviewCandidates` bounds how
@@ -165,6 +187,18 @@ screen:
      TTFF is what a streaming caller experiences. They are separate panels, and
      buffered latency is a third series again — mixing a 10-minute stream into the
      completion histogram is what makes such a panel unreadable.
+   - **Both duration panels filter `result="ok"`.** `kind` alone was not enough:
+     a 4xx rejected in 20ms and a caller who left after 200ms are attempts, but
+     they are not completion latency, and while they were in the histogram they
+     pulled down the same p99 the budget-cut bullet above tells you to read the
+     resolve ceiling against. `upstream_attempt_duration_seconds` is therefore
+     labelled `kind` × `result` (`ok|failed|canceled`) — coarser than the counter
+     next door, which keeps the full outcome, because every outcome here would
+     multiply the bucket series by it. `canceled` is its own value rather than part
+     of `failed` for the same reason it is its own bucket on the counter, plus one
+     specific to a histogram: its duration says when the caller left, not how long
+     anything took. To ask "how long do doomed attempts take to give up", chart
+     `result="failed"`; the panels here deliberately do not.
 5. **Attestation & E2EE**: quote-cache hit ratio, verifications by result, verify
    latency, response-signature verification failures by reason (fetch vs
    signature), untrusted-measurement rate, E2EE open failures.

@@ -1134,7 +1134,7 @@ func upstreamAttempt(kind, outcome string) string {
 // attempt-duration histogram once, and reports no fallback.
 func TestUpstreamMetricsOnCleanCompletion(t *testing.T) {
 	ok := upstreamAttempt("buffered", "ok")
-	dur := `zg_gateway_upstream_attempt_duration_seconds_count{kind="buffered"}`
+	dur := `zg_gateway_upstream_attempt_duration_seconds_count{kind="buffered",result="ok"}`
 	fb := `zg_gateway_candidate_fallbacks_total{reason="upstream"}`
 	before := map[string]float64{ok: metricValue(t, ok), dur: metricValue(t, dur), fb: metricValue(t, fb)}
 
@@ -1207,6 +1207,31 @@ func TestUpstreamMetricsSeparateRateLimitFromOther4xx(t *testing.T) {
 	}
 }
 
+// The attempt-duration histogram is a latency series, and a rejected request is
+// not latency. A 4xx comes back in milliseconds; while the histogram was labelled
+// by kind alone, every one of them sat in the buffered distribution and pulled
+// down the p99 that the budget-cut runbook tells operators to read the resolve
+// ceiling against. The counter next door keeps the full outcome; this only has to
+// keep the two apart.
+func TestUpstreamDurationKeepsRejectionsOutOfTheLatencySeries(t *testing.T) {
+	okDur := `zg_gateway_upstream_attempt_duration_seconds_count{kind="buffered",result="ok"}`
+	failDur := `zg_gateway_upstream_attempt_duration_seconds_count{kind="buffered",result="failed"}`
+	before := map[string]float64{okDur: metricValue(t, okDur), failDur: metricValue(t, failDur)}
+
+	router := newMockRouter(t, newMockBroker(t))
+	router.failPin = testProviderAddr
+	router.failStatus = http.StatusBadRequest
+	if _, err := meteredClient(router.srv.URL).Complete(context.Background(), chatReq()); err == nil {
+		t.Fatal("Complete against a 400 provider: want error")
+	}
+
+	for series, want := range map[string]float64{okDur: 0, failDur: 1} {
+		if got := metricValue(t, series) - before[series]; got != want {
+			t.Errorf("%s delta = %v, want %v", series, got, want)
+		}
+	}
+}
+
 // A 2xx whose sealed body will not open is its own diagnosis — the provider
 // answered, the crypto did not line up — and must not be filed as a transport or
 // status failure.
@@ -1231,11 +1256,11 @@ func TestUpstreamMetricsRecordUnopenableBody(t *testing.T) {
 func TestUpstreamMetricsRecordStreamAndFirstFrame(t *testing.T) {
 	ok := upstreamAttempt("stream", "ok")
 	ttff := `zg_gateway_upstream_stream_ttff_seconds_count`
-	dur := `zg_gateway_upstream_attempt_duration_seconds_count{kind="stream"}`
+	dur := `zg_gateway_upstream_attempt_duration_seconds_count{kind="stream",result="ok"}`
 	// The buffered histogram is watched too: mixing a stream's open duration into it
 	// is exactly what makes a completion-latency panel unreadable, so the split has
 	// to be asserted, not assumed.
-	buffered := `zg_gateway_upstream_attempt_duration_seconds_count{kind="buffered"}`
+	buffered := `zg_gateway_upstream_attempt_duration_seconds_count{kind="buffered",result="ok"}`
 	before := map[string]float64{
 		ok: metricValue(t, ok), ttff: metricValue(t, ttff),
 		dur: metricValue(t, dur), buffered: metricValue(t, buffered),

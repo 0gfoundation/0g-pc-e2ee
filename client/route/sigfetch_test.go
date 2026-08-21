@@ -186,12 +186,22 @@ func TestSignatureFetchMetrics(t *testing.T) {
 // a URL — are fail-closed verification failures. They used to return before the
 // metrics defer was installed, leaving the §8 panel at zero while responses went
 // unverified: the exact blind spot this counter exists to close.
+//
+// Metered, but as "internal", not "failed": nothing was asked of the broker on
+// either path, and "failed" is the bucket an operator reads as "the broker is not
+// serving signatures". Preview and the data plane both keep our own faults out of
+// the upstream bucket; this plane did not.
 func TestSignatureFetchMetersPreflightFailures(t *testing.T) {
 	const (
-		callsFailed = `zg_gateway_signature_fetch_calls_total{outcome="failed"}`
-		durCount    = `zg_gateway_signature_fetch_duration_seconds_count`
+		callsFailed   = `zg_gateway_signature_fetch_calls_total{outcome="failed"}`
+		callsInternal = `zg_gateway_signature_fetch_calls_total{outcome="internal"}`
+		durCount      = `zg_gateway_signature_fetch_duration_seconds_count`
 	)
-	before := map[string]float64{callsFailed: metricValue(t, callsFailed), durCount: metricValue(t, durCount)}
+	before := map[string]float64{
+		callsFailed:   metricValue(t, callsFailed),
+		callsInternal: metricValue(t, callsInternal),
+		durCount:      metricValue(t, durCount),
+	}
 
 	f := NewSignatureFetcher(nil)
 	for _, tc := range []struct {
@@ -208,8 +218,11 @@ func TestSignatureFetchMetersPreflightFailures(t *testing.T) {
 		}
 	}
 
-	if got := metricValue(t, callsFailed) - before[callsFailed]; got != 3 {
-		t.Errorf("%s delta = %v, want 3 — a pre-flight failure is still a failed fetch", callsFailed, got)
+	if got := metricValue(t, callsInternal) - before[callsInternal]; got != 3 {
+		t.Errorf("%s delta = %v, want 3 — a fetch we never made is ours, not the broker's", callsInternal, got)
+	}
+	if got := metricValue(t, callsFailed) - before[callsFailed]; got != 0 {
+		t.Errorf("%s delta = %v, want 0 — the broker was never asked anything", callsFailed, got)
 	}
 	if got := metricValue(t, durCount) - before[durCount]; got != 3 {
 		t.Errorf("%s delta = %v, want 3 — every exit path must observe once", durCount, got)

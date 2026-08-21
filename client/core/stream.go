@@ -103,7 +103,7 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 				break
 			}
 			if walk.exhausted() {
-				c.metricWalkBudgetExhausted()
+				c.metricWalkBudgetBlockedFallback(i, cands.Len())
 				break
 			}
 			c.metricFallback(FallbackUpstream, i, cands.Len())

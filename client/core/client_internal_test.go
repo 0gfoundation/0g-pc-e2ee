@@ -828,6 +828,104 @@ func TestCallerDisconnectIsNotAFallback(t *testing.T) {
 	}
 }
 
+// A slow retryable failure on the LAST candidate is not a ceiling cut. At an
+// attempt site the budget's only effect is to stop the walk from moving on — a
+// running attempt is never cut short by it — so when there is nothing to move on
+// to, the ceiling truncated nothing and the loop was ending regardless. Counting
+// it books every request whose upstream is slower than resolveBudget (90s, against
+// a 630s provider timeout) as OUR limit firing, in the one series the runbook says
+// means exactly that, and tells operators to read against latency p99: the false
+// correlation it would itself manufacture. Same reasoning as metricFallback's
+// i+1 < n guard, added for the same single-candidate shape.
+func TestSlowFailureOnTheLastCandidateIsNotABudgetCut(t *testing.T) {
+	const attemptCost = 80 * time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(attemptCost):
+		case <-r.Context().Done():
+			return
+		}
+		http.Error(w, "provider busy", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	_, encPub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &countingHook{}
+	cands := &slowFailCandidates{n: 1, p: Provider{
+		URL: srv.URL, EncPubKey: encPub,
+		Address:    "0xC0FFEE0000000000000000000000000000000001",
+		SignerAddr: "0xd45b4301940B297F76d6e622c1CeA2AE660617d4",
+	}}
+	c := NewWithResolver(fixedResolver{cands}, WithMetrics(h))
+	c.resolveBudgetTO = 20 * time.Millisecond // spent by the one attempt, and only then
+
+	if _, err := c.Complete(context.Background(), wire.Request{
+		"model":    json.RawMessage(`"gpt-4o"`),
+		"messages": json.RawMessage(`[{"role":"user","content":"hi"}]`),
+	}); err == nil {
+		t.Fatal("want the provider's 503")
+	}
+
+	// Guard the vacuous version: without the attempt actually running and failing
+	// retryably, the budget branch under test is never reached.
+	if got := h.attempts[UpstreamBuffered+"/"+UpstreamHTTP5xx]; got != 1 {
+		t.Fatalf("buffered/http_5xx attempts = %d, want 1 — the 503 attempt never ran", got)
+	}
+	if len(h.fallbacks) != 0 {
+		t.Errorf("fallbacks = %v, want none — there was no next candidate", h.fallbacks)
+	}
+	if h.budgetCut != 0 {
+		t.Errorf("budget cuts = %d, want 0 — a slow failure on the last candidate is not the ceiling firing", h.budgetCut)
+	}
+}
+
+// The streaming walk makes the same call at the same place, so it needs the same
+// guard: the two loops are mirrors and a rule applied to one of them is the
+// recurring shape of this whole change.
+func TestStreamSlowFailureOnTheLastCandidateIsNotABudgetCut(t *testing.T) {
+	const attemptCost = 80 * time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(attemptCost):
+		case <-r.Context().Done():
+			return
+		}
+		http.Error(w, "provider busy", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	_, encPub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &countingHook{}
+	cands := &slowFailCandidates{n: 1, p: Provider{
+		URL: srv.URL, EncPubKey: encPub,
+		Address:    "0xC0FFEE0000000000000000000000000000000001",
+		SignerAddr: "0xd45b4301940B297F76d6e622c1CeA2AE660617d4",
+	}}
+	c := NewWithResolver(fixedResolver{cands}, WithMetrics(h))
+	c.resolveBudgetTO = 20 * time.Millisecond
+
+	err = c.CompleteStream(context.Background(), wire.Request{
+		"model":    json.RawMessage(`"gpt-4o"`),
+		"messages": json.RawMessage(`[{"role":"user","content":"hi"}]`),
+	}, func(wire.Response) error { return nil })
+	if err == nil {
+		t.Fatal("want the provider's 503")
+	}
+
+	if got := h.attempts[UpstreamStream+"/"+UpstreamHTTP5xx]; got != 1 {
+		t.Fatalf("stream/http_5xx attempts = %d, want 1 — the 503 attempt never ran", got)
+	}
+	if h.budgetCut != 0 {
+		t.Errorf("budget cuts = %d, want 0 — a slow failure on the last candidate is not the ceiling firing", h.budgetCut)
+	}
+}
+
 // quickFailThenBlock fails candidate 0 fast with the least informative error there
 // is, then blocks — the combination that used to return "no usable address" for a
 // request held the whole budget.
