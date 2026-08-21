@@ -1093,21 +1093,26 @@ func (r *Router) preview(ctx context.Context, req wire.Request) ([]previewProvid
 	serviceTypeJSON, _ := json.Marshal(r.serviceType)
 	payload["service_type"] = serviceTypeJSON
 
+	// One call-level observation on EVERY exit path, recorded by a defer rather than
+	// at each return so the counter cannot drift from the control flow as this loop
+	// grows. "failed" is the honest default: it is what falling out of the loop
+	// means, and every better outcome overwrites it before returning.
+	//
+	// Installed before the marshal below, which used to return ahead of it — the one
+	// exit that recorded nothing at all, and the one that most obviously belongs in
+	// the internal bucket.
+	start := time.Now()
+	outcome := "failed"
+	defer func() { metrics.PreviewCall(outcome, time.Since(start)) }()
+
 	// Marshal once, outside the retry loop: the body is identical on every attempt
 	// (each attempt wraps these bytes in its own reader), and a marshal failure is a
 	// fault in the request we were handed, not something an attempt could clear.
 	body, err := json.Marshal(payload)
 	if err != nil {
+		outcome = previewInternal.callOutcome()
 		return nil, upstream(0, fmt.Errorf("marshal preview request: %w", err))
 	}
-
-	// One call-level observation on EVERY exit path, recorded by a defer rather than
-	// at each return so the counter cannot drift from the control flow as this loop
-	// grows. "failed" is the honest default: it is what falling out of the loop
-	// means, and every better outcome overwrites it before returning.
-	start := time.Now()
-	outcome := "failed"
-	defer func() { metrics.PreviewCall(outcome, time.Since(start)) }()
 
 	backoff := previewRetryBackoff
 	var lastErr error
@@ -1122,7 +1127,10 @@ func (r *Router) preview(ctx context.Context, req wire.Request) ([]previewProvid
 			// Retries are off while the router is failing everything: the first attempt
 			// above already happened, so the caller loses nothing but the amplification.
 			if !r.previewRetries.allow() {
-				metrics.PreviewRetrySuppressed()
+				// Count the retries NOT made, not the calls that lost them: the whole
+				// point of the number is how much amplification was shed, and one Inc()
+				// per call under-reported that by up to previewAttempts-1.
+				metrics.PreviewRetrySuppressed(previewAttempts - attempt)
 				break
 			}
 			t := time.NewTimer(backoff)

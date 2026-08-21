@@ -57,11 +57,19 @@ var registry = prometheus.NewRegistry()
 // wider and longer-tailed than the default HTTP buckets.
 var verifyBuckets = []float64{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60}
 
+// previewBuckets sizes the route-preview latency histogram: verifyBuckets with one
+// bucket ABOVE that call's own ceiling — retry budget plus one attempt, ~2x
+// controlPlaneHeaderTimeout — so a preview that runs all the way to the ceiling is
+// measurable instead of collapsing into +Inf right at the boundary.
+var previewBuckets = []float64{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120}
+
 // upstreamBuckets sizes the data-plane attempt histogram, which needs a far wider
 // range than verifyBuckets: a completion can legitimately run for minutes and a
 // stream is bounded only by the provider timeout (10m30s), so the top bucket sits
 // past it — without one, every long-but-healthy stream would pile into +Inf and
-// the p99 would be unreadable exactly when it matters.
+// the p99 would be unreadable exactly when it matters. The stream first-frame
+// histogram shares it for the same reason: that wait is bounded by the same idle
+// watchdog, not by anything smaller.
 var upstreamBuckets = []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600, 900}
 
 var (
@@ -147,7 +155,7 @@ var (
 	}, []string{"outcome"})
 	previewRetrySuppressed = prometheus.NewCounter(prometheus.CounterOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "preview_retries_suppressed_total",
-		Help: "Route-preview retries NOT made because the router had stopped answering " +
+		Help: "Route-preview retry ATTEMPTS not made because the router had stopped answering " +
 			"altogether (see route.retryGate). Retrying an uncached dependency multiplies load " +
 			"on it exactly when it can least take it, and holds a gateway concurrency slot for " +
 			"the retry ceiling rather than one attempt, so a router outage would become " +
@@ -159,7 +167,10 @@ var (
 		Namespace: namespace, Subsystem: subsystem, Name: "preview_duration_seconds",
 		Help: "End-to-end latency of one route-preview call, retries and their backoff included. " +
 			"This sits in front of every sealed request, so it is a floor on request latency.",
-		Buckets: verifyBuckets,
+		// previewBuckets, not verifyBuckets, whose top finite bucket is 60s — exactly
+		// this call's own ceiling (retry budget + one attempt), so the worst case
+		// would land in +Inf.
+		Buckets: previewBuckets,
 	})
 
 	// Data plane (core) — the sealed POST to the router and what came back. This is
@@ -197,7 +208,11 @@ var (
 		Help: "Time to first delivered frame of a stream — the latency a streaming caller feels, " +
 			"which the attempt duration cannot show (a stream that runs for minutes may have " +
 			"produced its first token instantly).",
-		Buckets: verifyBuckets,
+		// upstreamBuckets, not verifyBuckets: the wait for a first frame is bounded
+		// only by the stream idle watchdog (providerTimeout, 10m30s), so a 60s top
+		// bucket would put every degraded stream in +Inf — unreadable exactly when
+		// this panel matters.
+		Buckets: upstreamBuckets,
 	})
 	candidateFallbacks = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "candidate_fallbacks_total",
@@ -396,8 +411,11 @@ func ResponseVerificationFailure(reason string) {
 // in each.
 func PreviewAttempt(result string) { previewAttempts.WithLabelValues(result).Inc() }
 
-// PreviewRetrySuppressed counts one retry the retry gate declined to make.
-func PreviewRetrySuppressed() { previewRetrySuppressed.Inc() }
+// PreviewRetrySuppressed counts n retry attempts the retry gate declined to make.
+// n is the attempts remaining when the gate closed, so this measures amplification
+// shed rather than calls affected — the budget might independently have declined
+// some of them, which makes it the ceiling removed rather than an exact saving.
+func PreviewRetrySuppressed(n int) { previewRetrySuppressed.Add(float64(n)) }
 
 // PreviewCall records one route-preview call — one per chat request, whatever its
 // attempt count — and its end-to-end latency including any retries. outcome is a

@@ -180,3 +180,37 @@ func TestSignatureFetchMetrics(t *testing.T) {
 		}
 	}
 }
+
+// Both pre-flight checks — no endpoint, and an endpoint/chatKey that will not form
+// a URL — are fail-closed verification failures. They used to return before the
+// metrics defer was installed, leaving the §8 panel at zero while responses went
+// unverified: the exact blind spot this counter exists to close.
+func TestSignatureFetchMetersPreflightFailures(t *testing.T) {
+	const (
+		callsFailed = `zg_gateway_signature_fetch_calls_total{outcome="failed"}`
+		durCount    = `zg_gateway_signature_fetch_duration_seconds_count`
+	)
+	before := map[string]float64{callsFailed: metricValue(t, callsFailed), durCount: metricValue(t, durCount)}
+
+	f := NewSignatureFetcher(nil)
+	for _, tc := range []struct {
+		name     string
+		provider core.Provider
+		chatKey  string
+	}{
+		{"no endpoint", core.Provider{}, "11111111-1111-1111-1111-111111111111"},
+		{"unusable endpoint", core.Provider{Endpoint: "not-a-url"}, "11111111-1111-1111-1111-111111111111"},
+		{"unusable chatKey", core.Provider{Endpoint: "https://broker.test"}, "../../escape"},
+	} {
+		if _, err := f.FetchSignature(context.Background(), tc.provider, tc.chatKey); err == nil {
+			t.Errorf("%s: want an error", tc.name)
+		}
+	}
+
+	if got := metricValue(t, callsFailed) - before[callsFailed]; got != 3 {
+		t.Errorf("%s delta = %v, want 3 — a pre-flight failure is still a failed fetch", callsFailed, got)
+	}
+	if got := metricValue(t, durCount) - before[durCount]; got != 3 {
+		t.Errorf("%s delta = %v, want 3 — every exit path must observe once", durCount, got)
+	}
+}

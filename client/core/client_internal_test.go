@@ -491,3 +491,39 @@ func TestBudgetExhaustionKeepsTheUpstreamError(t *testing.T) {
 type fixedResolver struct{ c Candidates }
 
 func (f fixedResolver) Resolve(context.Context, wire.Request) (Candidates, error) { return f.c, nil }
+
+// Our own provider deadline expiring during the §8 fetch is OUR timeout, not the
+// broker failing to produce a proof — and the runbook reads "unverifiable" as the
+// broker's account. The transport and body sites already drew this three-way split;
+// the verification site did not, so it filed our timeout as somebody else's.
+func TestVerifyOutcomeSeparatesOurTimeoutFromAnUnfetchableProof(t *testing.T) {
+	parent := context.Background()
+
+	expired, cancelExpired := context.WithCancel(parent)
+	cancelExpired() // stands in for our attempt deadline having fired
+
+	goneParent, cancelParent := context.WithCancel(context.Background())
+	cancelParent()
+
+	live := context.Background()
+
+	for _, tc := range []struct {
+		name            string
+		parent, attempt context.Context
+		concluded, want string
+	}{
+		{"our deadline fired", parent, expired, UpstreamUnverifiable, UpstreamTimeout},
+		{"broker could not produce it", parent, live, UpstreamUnverifiable, UpstreamUnverifiable},
+		{"caller went away", goneParent, expired, UpstreamUnverifiable, UpstreamCanceled},
+		// An integrity finding is never re-attributed, whatever the contexts say:
+		// letting a well-timed disconnect or our own deadline erase it would put the
+		// one integrity signal here at the mercy of timing.
+		{"signature did not verify, caller gone", goneParent, expired, UpstreamUnverified, UpstreamUnverified},
+		{"signature did not verify, deadline fired", parent, expired, UpstreamUnverified, UpstreamUnverified},
+		{"our own binder broke", parent, live, UpstreamInternal, UpstreamInternal},
+	} {
+		if got := verifyOutcome(tc.parent, tc.attempt, tc.concluded); got != tc.want {
+			t.Errorf("%s: verifyOutcome(%q) = %q, want %q", tc.name, tc.concluded, got, tc.want)
+		}
+	}
+}

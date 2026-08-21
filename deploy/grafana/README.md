@@ -64,9 +64,11 @@ screen:
    own bad credential or unknown model, or a well-formed reply with no candidates
    for the model asked for. Fold either in and one misconfigured tenant can hold
    the panel red forever. `failed` is what is left: we could not get a usable answer
-   out of the router. The retried-ratio denominator excludes `canceled` too, since
-   a burst of disconnects would otherwise dilute the ratio and hide exactly the
-   degradation it exists to show.
+   out of the router. The retried-ratio denominator is an allowlist of exactly those
+   three retry-relevant outcomes (`ok`, `ok_retried`, `failed`) rather than "all but
+   canceled": anything else in the denominator dilutes the ratio and hides the
+   degradation it exists to show, and a denylist stops being right the moment an
+   outcome is added.
    - **The retry ceiling is budget + one attempt, not one attempt.** The budget
      (`route.previewRetryBudget`) only gates whether another attempt may *start*;
      an attempt already in flight is bounded by `previewAttemptTimeout` instead. So
@@ -161,19 +163,21 @@ highest-signal ones:
   all) proves nothing about the provider, so it belongs to whoever owns the broker,
   not to a provider-integrity page. Same for `internal`, which is ours.
 - `sum(rate(zg_gateway_preview_calls_total{outcome="ok_retried"}[5m])) /
-  clamp_min(sum(rate(zg_gateway_preview_calls_total{outcome!="canceled"}[5m])), 1e-9) > 0.05`
+  clamp_min(sum(rate(zg_gateway_preview_calls_total{outcome=~"ok|ok_retried|failed"}[5m])), 1e-9) > 0.05`
   — more than 5% of chat requests needed a route-preview retry to succeed. Nothing is
   failing yet, which is exactly why this is worth an alert: the retries are paying for
   a degrading router out of every caller's latency budget, and the request error rate
   will not show it until they stop being enough. Pair it with
   `sum(rate(zg_gateway_preview_calls_total{outcome="failed"}[5m])) > 0`, which is
-  when they have. Both deliberately exclude `canceled` (a caller that disconnected
-  mid-preview says nothing about the router — and in the ratio's denominator it would
-  dilute the very signal being watched) and neither counts `rejected`, which is the
-  router answering a caller's own 401/404/429 or reporting an empty fleet. A tenant
-  with a misconfigured key must not be able to page the router team. `internal` is
-  excluded for the same reason from the other side: a request this gateway could
-  not even build is our bug, not the router's.
+  when they have. The denominator is an allowlist — `ok|ok_retried|failed`, the three
+  outcomes where retry logic was actually in play — rather than "everything except
+  canceled". That is deliberate: a denylist has to be revisited every time an outcome
+  is added, and when `rejected` and `internal` arrived it was not, so a tenant
+  spraying 401s could dilute a real 20% retry rate down to 0.2% and keep the alert
+  quiet. `canceled` is a caller that disconnected, `rejected` is the router answering
+  that caller's own 401/404/429 or reporting an empty fleet, and `internal` is a
+  request this gateway could not even build; none of the three says anything about
+  whether the router is degrading, so none belongs on either side of the fraction.
 - `rate(zg_gateway_onchain_grounding_total{outcome="mismatch"}[5m]) > 0` — a
   provider's quote-bound signer disagreed with the chain, and still disagreed after
   a live re-read. Not an operational blip: it means the enclave that answered is not

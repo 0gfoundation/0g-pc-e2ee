@@ -299,19 +299,27 @@ func (c *Client) metricStreamFirstFrame(dur time.Duration) {
 func canceledBy(parent context.Context) bool { return parent.Err() != nil }
 
 // verifyOutcome resolves what to attribute a §8 verification failure to, given
-// what the verifier concluded and whether the caller is still there.
+// what the verifier concluded, whether the caller is still there, and whether OUR
+// deadline for this attempt has fired.
 //
-// A caller that walked away while we were FETCHING the proof explains that
-// failure, so it is re-attributed. A signature that did not verify is never
-// re-attributed: that finding is about the provider and stands whether or not the
-// caller stayed to hear it, and letting a well-timed disconnect erase it would put
-// the one integrity signal here at the mercy of client behaviour.
-func verifyOutcome(parent context.Context, concluded string) string {
+// A signature that did not verify is never re-attributed: that finding is about the
+// provider and stands whether or not the caller stayed to hear it, and letting a
+// well-timed disconnect erase it would put the one integrity signal here at the
+// mercy of client behaviour.
+//
+// The other conclusions are about a proof we could not FETCH, and there the same
+// three-way split the transport and body sites make applies — it was missing here,
+// so our own provider deadline expiring mid-fetch was filed as "unverifiable",
+// which the runbook reads as the broker's account rather than our timeout.
+func verifyOutcome(parent, attempt context.Context, concluded string) string {
 	if concluded == UpstreamUnverified {
 		return concluded
 	}
 	if canceledBy(parent) {
 		return UpstreamCanceled
+	}
+	if attempt.Err() != nil {
+		return UpstreamTimeout
 	}
 	return concluded
 }
@@ -622,7 +630,7 @@ func (c *Client) completeOnce(parent context.Context, provider Provider, req wir
 	// mask a bad provider). Nothing is returned to the caller on failure.
 	if c.verifyEnabled() {
 		if vo, err := c.verifyNonStream(ctx, provider, resp.Header, sealed, sealedResp); err != nil {
-			outcome = verifyOutcome(parent, vo)
+			outcome = verifyOutcome(parent, ctx, vo)
 			return nil, false, stageErr(StageUpstream, err)
 		}
 	}

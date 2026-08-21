@@ -1581,3 +1581,26 @@ func TestPreviewSuccessNotReattributedToLateCancellation(t *testing.T) {
 		t.Errorf("%s delta = %v, want 0 — the attempt and call series must agree", callsCanceled, got)
 	}
 }
+
+// The suppression counter measures amplification shed, so it must count the retry
+// ATTEMPTS not made — one increment per affected call under-reported it by up to
+// previewAttempts-1, while the metric's name, its Help and the runbook all read it
+// as attempts.
+func TestPreviewSuppressionCountsAttemptsNotCalls(t *testing.T) {
+	const suppressed = `zg_gateway_preview_retries_suppressed_total`
+
+	router := newMockRouter(t, newMockBroker(t))
+	router.previewFailN = 1 << 20
+	r := New(router.srv.URL)
+	for i := 0; i < previewRetryTripAfter; i++ {
+		_, _ = r.Resolve(context.Background(), chatReq())
+	}
+
+	// One more call, now with the gate shut: it makes attempt 0 and is turned away
+	// at attempt 1, so previewAttempts-1 retries were shed.
+	before := metricValue(t, suppressed)
+	_, _ = r.Resolve(context.Background(), chatReq())
+	if got, want := metricValue(t, suppressed)-before, float64(previewAttempts-1); got != want {
+		t.Errorf("%s delta = %v, want %v (the attempts not made, not one per call)", suppressed, got, want)
+	}
+}

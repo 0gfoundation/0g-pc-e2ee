@@ -201,7 +201,7 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 			}
 			if binder != nil {
 				if vo, verr := c.verifyStream(ctx, provider, resp.Header, binder); verr != nil {
-					outcome = verifyOutcome(parent, vo)
+					outcome = verifyOutcome(parent, ctx, vo)
 					return false, stageErr(StageUpstream, verr)
 				}
 			}
@@ -230,7 +230,7 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 			}
 			if binder != nil {
 				if vo, verr := c.verifyStream(ctx, provider, resp.Header, binder); verr != nil {
-					outcome = verifyOutcome(parent, vo)
+					outcome = verifyOutcome(parent, ctx, vo)
 					return false, stageErr(StageUpstream, verr)
 				}
 			}
