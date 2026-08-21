@@ -36,6 +36,13 @@ The consequence for the UI is concrete: the sentence "the gateway sees your
 plaintext" belongs **on the gateway hop itself**, where the claim is made — not in
 a disclaimer block at the bottom, which is where text goes to be skipped.
 
+And say it in the right number of places. Plaintext exists at **three** points, not
+two: the gateway holds it before sealing, the broker holds it after unsealing, and
+the broker's MySQL persists request and response bodies as blobs for the async-job
+path — so it is also at rest on disk inside that CVM. All three are inside an
+attested enclave, which is the claim; "only here and there" is not, and panel copy
+that says so is wrong on a checkable fact.
+
 ## 2. Two trust chains — pick one, and say which
 
 There are two coherent stances a user can take, and they are mutually exclusive
@@ -284,6 +291,70 @@ internal controls and become admission criteria, and a checklist is no longer th
 right instrument — they have to be mechanical. That is also when hop 3 genuinely
 needs to stop being warn-only. Until then the panel reports the provider's
 measurement as **observed (◐)**, which is the honest state.
+
+### Run against the real broker
+
+The sections above were written from a staging deployment running Phala's starter
+template. A production broker's `/v1/quote` has since been checked against them.
+Most of the checklist is satisfied by construction — and the one enforced rule
+catches four real cases. Recorded here rather than filed, so the rule has a test
+case and the gaps have somewhere to live.
+
+**Confirmed working.** The OS is a release image (`dstack-nvidia-0.5.9`), not a dev
+one. `mr_config_id` is V1, so `ComposeHashFromMRConfigID` reads the compose hash
+straight out of the signed report — no event-log replay, as designed.
+`allowed_envs` does **not** carry `DSTACK_AUTHORIZED_KEYS`: the env-injection route
+to a shell is closed.
+
+**Model weights are attested, which we had assumed they were not.** The engine is
+launched with `--revision <commit>` pinning the HuggingFace revision, and that flag
+is in the compose text, so `compose_hash` covers it. A revision is content-addressed,
+so this is genuine weight identity — "which weights ran" is answerable. (It is still
+not *verifiable computation*: knowing which weights ran says nothing about whether
+the model behaved. `trust-chain.md`'s "verifiable relay, not verifiable computation"
+is unaffected.)
+
+**The controller is a real hardening, worth not undoing.** One container holds
+`dstack.sock` and `docker.sock`; the broker and event service reach attestation
+through it over a private socket, and it deliberately does **not** serve `GetKey` —
+so a broker image cannot derive a key it could keep signing with across an upgrade.
+Handing either socket back to the broker silently voids the chain, for the reason
+its own comments give: a container holding `dstack.sock` can append RTMR3 records,
+including one about the image it is itself running.
+
+**Finding — four images are tag-only, and two of them are privileged.** Eight of
+twelve services pin a digest. The four that do not are the observability stack, and
+the reasoning behind that split ("pin what is inside the trust boundary") does not
+survive contact with two of them: the node exporter runs `privileged: true` with
+`/:/rootfs:ro`, and the DCGM exporter carries `cap_add: SYS_ADMIN`. A privileged
+container with the host root mounted is inside any boundary worth naming. This is
+not hypothetical drift, either — the pre-launch script runs `docker compose pull` on
+every boot, so a republished tag is picked up silently while `compose_hash` holds
+still. The compose file states that mechanism itself, in the comment explaining why
+`alpine` is pinned; it just was not carried to these four.
+
+**Finding — a second route to a shell survives, but is observable.** The pre-launch
+script also reads `ssh_authorized_keys` from `/dstack/user_config`, which is neither
+gated by `allowed_envs` nor covered by `compose_hash`. What makes it acceptable for
+now is that the same script prints the SHA-256 fingerprint of every installed key at
+boot, and `public_logs` is true — so key injection is detectable by reading a public
+log. Hence the checklist item below.
+
+**Finding — the configuration channel is half closed.** `BROKER_CONFIG` still
+arrives as an unmeasured base64 env written to `config.yaml` with no hash check. But
+the field that matters most was pulled out of it: `TARGET_URL` is a literal in the
+compose, explicitly so that a verifier can read where the broker forwards after
+unsealing. That is the right instinct applied to one field; the interpolation-hash
+rule above generalizes it. The stronger version of this gap is the controller's
+`PUT /v1/config/core`, which replaces the whole config file behind an admin
+signature with no published baseline (0g-router#728) — changes are recorded in RTMR3
+but not constrained by anything.
+
+**Checklist additions from this run:**
+
+- The boot log's SSH-key fingerprint list is empty.
+- Every image is digest-pinned, *including* observability sidecars — privilege, not
+  proximity to plaintext, is what puts a container inside the boundary.
 
 ### The rollout window, and what the panel does during it
 
