@@ -83,14 +83,21 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 			// Request-level failure — identical for every candidate; fail fast.
 			return stageErr(StageRequest, fmt.Errorf("seal request: %w", err))
 		}
+		attemptStart := time.Now()
 		retry, err := c.streamOnce(ctx, provider, sealed, ephPriv, onFrame)
 		if err == nil {
 			return nil
 		}
+		// Charged like Complete's: a stream that stalled before its first frame spent
+		// the caller's time and produced nothing (see resolveBudget).
+		walk.charge(time.Since(attemptStart))
 		lastErr = err
 		if retry {
 			// Nothing was delivered yet and the failure is provider-transient — try
-			// the next candidate.
+			// the next candidate, unless that time is all the walk had.
+			if walk.exhausted() {
+				break
+			}
 			c.metricFallback(FallbackUpstream, i, cands.Len())
 			continue
 		}

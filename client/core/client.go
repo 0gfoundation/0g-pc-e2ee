@@ -521,12 +521,19 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 			continue
 		}
 
+		attemptStart := time.Now()
 		out, retry, err := c.completeOnce(ctx, provider, req, ephPub, ephPriv)
 		if err == nil {
 			return out, nil
 		}
+		// A failed attempt is wasted caller time and is charged to the walk. lastErr is
+		// already this attempt's error, so stopping here surfaces the richer one.
+		walk.charge(time.Since(attemptStart))
 		lastErr = err
 		if retry {
+			if walk.exhausted() {
+				break
+			}
 			c.metricFallback(FallbackUpstream, i, cands.Len())
 			continue
 		}

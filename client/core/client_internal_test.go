@@ -349,26 +349,27 @@ func TestCandidateWalkBudgetIsSharedAcrossCandidates(t *testing.T) {
 	}
 }
 
-// Time spent on an ATTEMPT is not charged to the budget — only materialization is
-// — so a long, legitimate inference on the head candidate cannot starve a later
-// fallback of the budget it needs to materialize.
-func TestCandidateWalkChargesOnlyMaterialization(t *testing.T) {
-	var w candidateWalk
+// A FAILED attempt is charged to the walk. This test used to assert the opposite —
+// that attempts are never charged — which was the reasoning that left the walk
+// unbounded: with materialization cached and free, exhausted() never tripped and the
+// loop ran to the router's candidate count, N x providerTimeout of the caller's time.
+// See resolveBudget for why "a long inference must not starve a later fallback" was
+// the wrong way round.
+func TestCandidateWalkChargesFailedAttempts(t *testing.T) {
+	w := candidateWalk{budget: 50 * time.Millisecond}
 	cands := staticCandidates{Provider{URL: "https://example.test"}, Provider{URL: "https://example.test"}}
 
+	// Materialization is instant here (a static candidate), so without charging the
+	// attempt nothing would ever be spent.
 	if _, err := w.provider(context.Background(), cands, 0); err != nil {
 		t.Fatalf("materialize candidate 0: %v", err)
 	}
-	// Stand in for a long attempt against the materialized provider.
-	time.Sleep(20 * time.Millisecond)
-	if _, err := w.provider(context.Background(), cands, 1); err != nil {
-		t.Fatalf("materialize candidate 1 after a long attempt: %v", err)
-	}
 	if w.exhausted() {
-		t.Fatal("two instant materializations should not exhaust the budget")
+		t.Fatal("an instant materialization should not exhaust the budget")
 	}
-	if w.spent > time.Second {
-		t.Errorf("spent = %s; the attempt's own duration was charged to the budget", w.spent)
+	w.charge(60 * time.Millisecond) // stands in for an attempt that failed slowly
+	if !w.exhausted() {
+		t.Fatalf("spent %s against a %s budget: a failed attempt must count", w.spent, w.limit())
 	}
 }
 
@@ -553,4 +554,86 @@ func TestCandidateWalkSpendIsFullyChargedAtTheBoundary(t *testing.T) {
 				i, w.spent, w.limit())
 		}
 	}
+}
+
+// slowFailCandidates materializes instantly (so only attempt time can be charged)
+// and every attempt against it fails after a fixed delay — the shape of a provider
+// that returns 200 headers and then withholds the body until the deadline.
+type slowFailCandidates struct {
+	n       int
+	p       Provider
+	reached int
+}
+
+func (c *slowFailCandidates) Len() int { return c.n }
+
+func (c *slowFailCandidates) Provider(_ context.Context, i int) (Provider, error) {
+	c.reached++
+	return c.p, nil
+}
+
+// End to end, and the reproduction that showed the walk was unbounded: N candidates
+// whose attempts each burn wall clock. Before failed attempts were charged, all N
+// ran. Now the budget stops the walk, and the ceiling is budget + one attempt rather
+// than N x it — with N itself capped by route.maxPreviewCandidates.
+func TestWalkStopsOnceFailedAttemptsSpendTheBudget(t *testing.T) {
+	const attemptCost = 120 * time.Millisecond
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 200 headers, then withhold the body until the client's deadline — the
+		// io.ReadAll stall that returns retry=true.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		select {
+		case <-time.After(attemptCost):
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+
+	_, encPub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A real enc key: without one the seal fails before any attempt is made and this
+	// test would pass while exercising nothing (it did, at first — "1/8 in 0s").
+	cands := &slowFailCandidates{n: 8, p: Provider{
+		URL: srv.URL, EncPubKey: encPub,
+		Address:    "0xC0FFEE0000000000000000000000000000000001",
+		SignerAddr: "0xd45b4301940B297F76d6e622c1CeA2AE660617d4",
+	}}
+	c := NewWithResolver(fixedResolver{cands})
+	c.resolveBudgetTO = 200 * time.Millisecond
+
+	start := time.Now()
+	if _, err := c.Complete(context.Background(), wire.Request{
+		"model":    json.RawMessage(`"gpt-4o"`),
+		"messages": json.RawMessage(`[{"role":"user","content":"hi"}]`),
+	}); err == nil {
+		t.Fatal("want an error from a chain that never answers")
+	}
+	elapsed := time.Since(start)
+
+	if cands.reached >= cands.n {
+		t.Errorf("walked all %d candidates; the budget did not bound the walk", cands.n)
+	}
+	if cands.reached == 0 {
+		t.Fatal("no candidate was tried at all")
+	}
+	// Guard against the vacuous version of this test: if the seal or the request
+	// failed before reaching the server, no attempt time was spent and the budget
+	// was never the thing that stopped the walk.
+	if elapsed < attemptCost {
+		t.Fatalf("walk took only %s, less than one attempt (%s) — the attempts never ran",
+			elapsed, attemptCost)
+	}
+	// The stated ceiling: the budget, plus the one attempt that was already running
+	// when it ran out. Generous slack for scheduling; the point is that it is not
+	// n x attemptCost.
+	if ceiling := c.resolveBudgetTO + attemptCost; elapsed > ceiling+400*time.Millisecond {
+		t.Errorf("walk took %s over %d candidates, past the budget+one-attempt ceiling of %s",
+			elapsed, cands.reached, ceiling)
+	}
+	t.Logf("stopped after %d/%d candidates in %s (ceiling %s)",
+		cands.reached, cands.n, elapsed.Truncate(time.Millisecond), c.resolveBudgetTO+attemptCost)
 }

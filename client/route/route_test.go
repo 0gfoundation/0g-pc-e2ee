@@ -1604,3 +1604,78 @@ func TestPreviewSuppressionCountsAttemptsNotCalls(t *testing.T) {
 		t.Errorf("%s delta = %v, want %v (the attempts not made, not one per call)", suppressed, got, want)
 	}
 }
+
+// The router picks the candidate list and nothing else bounds its length, while
+// core walks it serially — so N is one of the two factors in what a failing chain
+// costs a caller. Trimming is safe because the list arrives ranked best-first.
+func TestPreviewCapsTheCandidateList(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	// One head plus far more extras than the cap allows.
+	for i := 0; i < maxPreviewCandidates*3; i++ {
+		router.extra = append(router.extra, previewProvider{
+			Address:     fmt.Sprintf("0xC0FFEE%035X", i+2),
+			CanonicalID: "canon-x",
+			Endpoint:    broker.srv.URL,
+			ModelID:     "gpt-4o@v1",
+		})
+	}
+
+	cands, err := New(router.srv.URL).Resolve(context.Background(), chatReq())
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got := cands.Len(); got != maxPreviewCandidates {
+		t.Errorf("candidate chain length = %d, want %d — the walk's length must be ours, not the router's",
+			got, maxPreviewCandidates)
+	}
+}
+
+// A cancellation may only re-attribute a RETRYABLE attempt. previewBroken is the
+// router answering with a body that will not decode — the constant defines it as the
+// router misbehaving — and previewInternal is our own fault; relabelling either
+// "canceled" hides it in the bucket every alert deliberately ignores. Same bug the
+// verifyOutcome allowlist fixed, in the other file.
+func TestPreviewBrokenSurvivesALateCancellation(t *testing.T) {
+	const (
+		attemptsBroken   = `zg_gateway_preview_attempts_total{result="broken"}`
+		attemptsCanceled = `zg_gateway_preview_attempts_total{result="canceled"}`
+		callsFailed      = `zg_gateway_preview_calls_total{outcome="failed"}`
+		callsCanceled    = `zg_gateway_preview_calls_total{outcome="canceled"}`
+	)
+	series := []string{attemptsBroken, attemptsCanceled, callsFailed, callsCanceled}
+	before := map[string]float64{}
+	for _, s := range series {
+		before[s] = metricValue(t, s)
+	}
+
+	// A 200 whose body will not decode: previewBroken.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"providers": not-json`))
+	}))
+	defer srv.Close()
+
+	// The caller is already gone by the time the loop classifies the failure — the
+	// same shape as the late-cancellation test above, so the race need not be won.
+	var canceled atomic.Bool
+	canceled.Store(true)
+	ctx := lateCancelCtx{Context: context.Background(), done: make(chan struct{}), canceled: &canceled}
+
+	if _, err := New(srv.URL).preview(ctx, chatReq()); err == nil {
+		t.Fatal("want an error from an undecodable preview body")
+	}
+
+	if got := metricValue(t, attemptsBroken) - before[attemptsBroken]; got != 1 {
+		t.Errorf("%s delta = %v, want 1", attemptsBroken, got)
+	}
+	if got := metricValue(t, attemptsCanceled) - before[attemptsCanceled]; got != 0 {
+		t.Errorf("the router misbehaving was relabelled canceled; %s delta = %v, want 0", attemptsCanceled, got)
+	}
+	if got := metricValue(t, callsFailed) - before[callsFailed]; got != 1 {
+		t.Errorf("%s delta = %v, want 1", callsFailed, got)
+	}
+	if got := metricValue(t, callsCanceled) - before[callsCanceled]; got != 0 {
+		t.Errorf("%s delta = %v, want 0", callsCanceled, got)
+	}
+}

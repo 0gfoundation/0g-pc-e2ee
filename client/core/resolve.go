@@ -48,30 +48,45 @@ type Candidates interface {
 }
 
 // resolveBudget bounds the TOTAL time one Complete/CompleteStream call may spend
-// MATERIALIZING candidates, summed across the whole chain.
+// on WASTED work while walking the candidate chain: materializing candidates, plus
+// attempts that failed. Time inside the attempt that ultimately succeeds is not
+// charged, because that call returns rather than walking any further.
 //
-// Materializing ONE candidate is already bounded by the resolver — route caps a
-// DCAP quote verification at a minute and a chain read at a few seconds — but the
-// NUMBER of candidates is not: the list comes from the untrusted router, and the
-// client walks it serially, re-sealing to each in turn. So a chain of unreachable
-// providers multiplies that per-candidate bound by however many the router chose
-// to send, and the caller waits through all of them before seeing an error. This
-// is the ceiling on that product; nothing else imposes one.
+// An earlier version charged materialization ONLY, on the reasoning that a long
+// legitimate inference on the head candidate must not starve a later fallback of
+// the budget it needs. That reasoning was wrong, and it left the walk with no bound
+// at all — the thing this budget is named for. If the head's long inference
+// SUCCEEDS there is no fallback to starve, because Complete returns; if it FAILS,
+// those minutes were the caller's, spent on nothing, and are exactly what wants
+// counting. Uncharged, a chain of candidates that each burn the full providerTimeout
+// (a provider that sends 200 headers and then withholds the body, or stalls before
+// the first frame) cost N × 10m30s, N chosen by the untrusted router, all of it
+// holding one openaiproxy.LimitInFlight slot. That is the same amplification the
+// preview retries are suppressed to avoid, on the more expensive plane.
+//
+// The budget gates ENTRY to the next candidate and is never imposed on an attempt
+// already running — cutting one would cut a completion that is streaming tokens to
+// its caller. So the ceiling, stated the same way preview's is, is this budget plus
+// one attempt: bounded, and one attempt's overrun rather than N. maxPreviewCandidates
+// bounds N independently, so neither factor is left to the router.
 //
 // Sized to admit a TYPICAL cold materialization — a cache-miss quote verification
 // (route bounds one at 60s) plus the chain read that grounds it (three eth_call
 // attempts at 3s, ~10s with backoff) — so a request arriving before the warmer has
-// swept still succeeds.
+// swept still succeeds. It does NOT cover that path's own worst case, and the
+// arithmetic is worth being explicit about rather than rounding away: a cold
+// candidate that also triggers the signer-revalidation re-read and then the quote
+// re-verification recovery can reach roughly 60 + 10 + 10 + 60 ≈ 140s on its own,
+// and will be cut here. That is the deliberate trade — a ceiling only binds if it is
+// lower than the worst case it bounds — and it is survivable because the expensive
+// half is singleflighted under a context detached from any one caller: the
+// verification it interrupts keeps running and lands in the cache, so the next
+// request finds it warm instead of repeating the wait.
 //
-// It does NOT cover that path's own worst case, and the arithmetic is worth being
-// explicit about rather than rounding away: a cold candidate that also triggers the
-// signer-revalidation re-read and then the quote re-verification recovery can reach
-// roughly 60 + 10 + 10 + 60 ≈ 140s on its own. Such a candidate will be cut here.
-// That is the deliberate trade — a ceiling only binds if it is lower than the worst
-// case it is bounding — and it is survivable because the expensive half is
-// singleflighted under a context detached from any one caller: the verification it
-// interrupts keeps running and lands in the cache, so the next request finds it
-// warm instead of repeating the wait.
+// One consequence worth seeing plainly: an attempt that runs to providerTimeout
+// blows this budget by itself, so the walk stops after it. That is intended. A
+// caller already held for ten minutes by one provider is not served by being held
+// another ten by the next.
 //
 // The first candidate always gets the whole budget (spent starts at zero), so this
 // can never refuse to try anybody: at worst it stops the walk after someone has
@@ -99,9 +114,9 @@ func (w *candidateWalk) limit() time.Duration {
 }
 
 // provider materializes candidate i under whatever is left of the budget, charging
-// what it takes. Time spent on the ATTEMPT against a materialized provider is
-// deliberately not charged — only materialization is — so a long, legitimate
-// inference on the head candidate cannot exhaust the budget a later fallback needs.
+// what it takes. A failed ATTEMPT against a materialized provider is charged too,
+// by the caller via charge() — see resolveBudget for why leaving it out left the
+// walk unbounded.
 //
 // A caller that gets an error checks exhausted() to tell "this candidate failed"
 // from "there is nothing left to try one with".
@@ -126,6 +141,11 @@ func (w *candidateWalk) provider(ctx context.Context, cands Candidates, i int) (
 	w.spent += time.Since(start)
 	return p, err
 }
+
+// charge books time the walk spent on work that came to nothing — a failed attempt
+// against a materialized provider. Materialization charges itself; this is the other
+// half, and without it the budget bounded only the cheaper of the two.
+func (w *candidateWalk) charge(d time.Duration) { w.spent += d }
 
 // exhausted reports that the budget is gone, so continuing down the chain would
 // only reproduce the same failure once per remaining candidate.

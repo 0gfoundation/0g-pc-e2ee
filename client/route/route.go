@@ -142,6 +142,14 @@ const (
 	quoteVerifyTimeout = 60 * time.Second
 	// x25519PubLen is the byte length of the HPKE (X25519) recipient key.
 	x25519PubLen = 32
+	// maxPreviewCandidates caps how many candidates one preview reply may contribute
+	// to the fallback chain. The router chooses the list and nothing else bounds its
+	// length — maxControlBodyBytes leaves room for thousands — and core walks it
+	// SERIALLY, so N is one of the two factors in what a failing chain costs a
+	// caller (core.resolveBudget bounds the other). Truncating is cheap and safe
+	// here: the list arrives ranked best-first, so what is dropped is the tail the
+	// client would reach only after everything better had already failed.
+	maxPreviewCandidates = 8
 	// maxControlBodyBytes caps a control-plane response body read (preview /
 	// pubkey), guarding against an unbounded response.
 	maxControlBodyBytes = 1 << 20 // 1 MiB
@@ -1157,14 +1165,21 @@ func (r *Router) preview(ctx context.Context, req wire.Request) ([]previewProvid
 			}
 			return providers, nil
 		}
-		// Only a FAILED attempt can be re-attributed to the caller. Testing ctx before
-		// the success branch (as this did) counted an attempt that had just returned a
-		// usable list as "canceled" whenever the caller went away in the gap, leaving
-		// the attempt and call series contradicting each other.
+		// Only a RETRYABLE failure may be re-attributed to the caller, and the test is
+		// an allowlist for the same reason verifyOutcome's is: written as "anything
+		// when ctx is done" it also relabelled previewBroken — the router answering
+		// with a body that will not decode, which the constant defines as the router
+		// misbehaving — and previewInternal, our own fault. Both would have landed in
+		// canceled, the one bucket every alert deliberately ignores. Reachable, too:
+		// the caller need only go away after the body was read.
+		//
+		// Testing ctx before the success branch above would be the same mistake in the
+		// other direction, counting an attempt that had just returned a usable list as
+		// canceled and leaving the attempt and call series contradicting each other.
 		//
 		// A caller that has given up is attributed to itself, not to the router — the
 		// same distinction chain.noteFailure draws before stamping a cooldown.
-		if ctx.Err() != nil {
+		if res == previewRetryable && ctx.Err() != nil {
 			res = previewCanceled
 		}
 		metrics.PreviewAttempt(string(res))
@@ -1261,7 +1276,11 @@ func (r *Router) previewOnce(ctx context.Context, body []byte, req wire.Request)
 	// The router returns candidates ranked best-first; core pins the head and
 	// falls back down the rest (SPEC §4.4). Per-candidate validation is deferred
 	// to routeCandidates.Provider so a single malformed candidate is skipped, not
-	// fatal to the whole list.
+	// fatal to the whole list. Trimmed to maxPreviewCandidates so the length of the
+	// walk is ours rather than the router's.
+	if len(pr.Providers) > maxPreviewCandidates {
+		pr.Providers = pr.Providers[:maxPreviewCandidates]
+	}
 	return pr.Providers, previewOK, nil
 }
 
