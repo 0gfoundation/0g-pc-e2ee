@@ -307,12 +307,15 @@ func canceledBy(parent context.Context) bool { return parent.Err() != nil }
 // well-timed disconnect erase it would put the one integrity signal here at the
 // mercy of client behaviour.
 //
-// The other conclusions are about a proof we could not FETCH, and there the same
-// three-way split the transport and body sites make applies — it was missing here,
-// so our own provider deadline expiring mid-fetch was filed as "unverifiable",
-// which the runbook reads as the broker's account rather than our timeout.
+// UpstreamUnverifiable — a proof we could not FETCH — is the only re-attributable
+// conclusion, and the test is written as an allowlist for the same reason the
+// dashboard's ratios are: a denylist has to be revisited every time verify.go can
+// conclude something new, and it was already wrong once. UpstreamInternal used to
+// fall through it, so a binder of ours that would not produce its text got filed as
+// "canceled" whenever the caller had left — a bug of ours in the one bucket every
+// alert deliberately ignores, which is exactly what the onFrame site refuses to do.
 func verifyOutcome(parent, attempt context.Context, concluded string) string {
-	if concluded == UpstreamUnverified {
+	if concluded != UpstreamUnverifiable {
 		return concluded
 	}
 	if canceledBy(parent) {

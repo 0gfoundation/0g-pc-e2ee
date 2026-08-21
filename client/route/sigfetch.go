@@ -3,6 +3,7 @@ package route
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -97,7 +98,7 @@ func (f *SignatureFetcher) FetchSignature(ctx context.Context, provider core.Pro
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
-				outcome = "canceled"
+				outcome = endedBy(ctx)
 				return proof.ChatSignature{}, ctx.Err()
 			case <-time.After(sigFetchBackoff << (attempt - 1)):
 			}
@@ -112,8 +113,8 @@ func (f *SignatureFetcher) FetchSignature(ctx context.Context, provider core.Pro
 		}
 		lastErr = err
 		if ctx.Err() != nil {
-			// The caller went away mid-fetch; that says nothing about the broker.
-			outcome = "canceled"
+			// Something other than the broker ended this; that says nothing about it.
+			outcome = endedBy(ctx)
 			return proof.ChatSignature{}, err
 		}
 		if !retryable {
@@ -160,4 +161,26 @@ func deriveSignatureURL(endpoint, chatKey string) (string, error) {
 		return "", err
 	}
 	return base + "/proxy/signature/" + chatKey, nil
+}
+
+// endedBy names who ended a fetch whose context is done, which is NOT always the
+// caller: core hands this fetcher a context derived from the attempt, so the
+// buffered path's providerTimeout expiring mid-fetch arrives here indistinguishable
+// from a disconnect unless the error kind is read. It was all counted "canceled",
+// which put our own deadline in the bucket every alert ignores.
+//
+// context.Canceled means somebody called cancel — in practice the caller going
+// away. context.DeadlineExceeded means a deadline fired, and the only deadlines on
+// this path are ours (providerTimeout) plus the fetcher's own client timeout.
+//
+// Two residual ambiguities, stated because they are real: a CALLER that set its own
+// deadline reads as timeout, and a stream whose idle watchdog fires (a cancel, not
+// a deadline) reads as canceled. Both are narrower than lumping everything into one
+// bucket, and neither can be resolved without threading the parent context through
+// core.SignatureFetcher — which is not worth an interface change for this.
+func endedBy(ctx context.Context) string {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return "timeout"
+	}
+	return "canceled"
 }

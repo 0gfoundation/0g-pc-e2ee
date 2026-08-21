@@ -227,9 +227,12 @@ var (
 	signatureFetchCalls = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "signature_fetch_calls_total",
 		Help: "§8 signature fetches (one per verified response) by outcome: ok, ok_retried, failed, " +
-			"canceled. ok_retried is expected traffic, not an incident: the broker writes the " +
-			"signature at end-of-response, so a just-finished response can momentarily 404 — but a " +
-			"ratio that climbs means every response is paying the backoff.",
+			"timeout (OUR deadline for the attempt fired mid-fetch), canceled (the caller left). " +
+			"ok_retried is expected traffic, not an incident: the broker writes the signature at " +
+			"end-of-response, so a just-finished response can momentarily 404 — but a ratio that " +
+			"climbs means every response is paying the backoff. timeout and canceled are split " +
+			"because only one of them is ours; see route.endedBy for the two cases that split " +
+			"imperfectly.",
 	}, []string{"outcome"})
 	signatureFetchDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "signature_fetch_duration_seconds",

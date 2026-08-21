@@ -111,9 +111,17 @@ func (w *candidateWalk) provider(ctx context.Context, cands Candidates, i int) (
 		return Provider{}, &Error{Stage: StageUpstream, Err: fmt.Errorf(
 			"provider selection budget (%s) spent before candidate %d could be prepared", w.limit(), i)}
 	}
-	ctx, cancel := context.WithTimeout(ctx, remaining)
-	defer cancel()
+	// Read the clock BEFORE deriving the deadline, and derive it FROM that reading.
+	// Taken the other way round, any scheduling delay between the two lands outside
+	// the measurement: the deadline still ends the materialization, but spent comes
+	// back short of remaining and exhausted() — the only judge at this boundary —
+	// reads false. A 5ms preemption injected between the two lines is enough
+	// (spent=45ms against a 50ms limit), and under parallel load it showed up as a
+	// ~1% flake. Anchoring both to one reading makes spent >= remaining hold
+	// unconditionally once the deadline fires.
 	start := time.Now()
+	ctx, cancel := context.WithDeadline(ctx, start.Add(remaining))
+	defer cancel()
 	p, err := cands.Provider(ctx, i)
 	w.spent += time.Since(start)
 	return p, err

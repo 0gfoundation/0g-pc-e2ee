@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/proof"
@@ -212,5 +213,60 @@ func TestSignatureFetchMetersPreflightFailures(t *testing.T) {
 	}
 	if got := metricValue(t, durCount) - before[durCount]; got != 3 {
 		t.Errorf("%s delta = %v, want 3 — every exit path must observe once", durCount, got)
+	}
+}
+
+// The context this fetcher receives is derived from the ATTEMPT, not from the
+// caller, so a done context is not evidence of a disconnect: our own
+// providerTimeout expiring mid-fetch arrives here looking the same. Counting both
+// as "canceled" put our deadline in the bucket every alert ignores.
+func TestSignatureFetchSeparatesOurDeadlineFromTheCaller(t *testing.T) {
+	const (
+		callsTimeout  = `zg_gateway_signature_fetch_calls_total{outcome="timeout"}`
+		callsCanceled = `zg_gateway_signature_fetch_calls_total{outcome="canceled"}`
+	)
+	before := map[string]float64{
+		callsTimeout:  metricValue(t, callsTimeout),
+		callsCanceled: metricValue(t, callsCanceled),
+	}
+
+	// A broker that never answers, so only the context ends the fetch.
+	release := make(chan struct{})
+	defer close(release)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	f := NewSignatureFetcher(srv.Client())
+	prov := core.Provider{Endpoint: srv.URL}
+	key := "11111111-1111-1111-1111-111111111111"
+
+	// A DEADLINE — what core's providerTimeout looks like from in here.
+	dl, cancelDL := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancelDL()
+	if _, err := f.FetchSignature(dl, prov, key); err == nil {
+		t.Fatal("want an error once the deadline fires")
+	}
+	if got := metricValue(t, callsTimeout) - before[callsTimeout]; got != 1 {
+		t.Errorf("%s delta = %v, want 1 — our own deadline must not read as a disconnect", callsTimeout, got)
+	}
+	if got := metricValue(t, callsCanceled) - before[callsCanceled]; got != 0 {
+		t.Errorf("%s delta = %v, want 0", callsCanceled, got)
+	}
+
+	// A CANCEL — what a caller going away looks like.
+	cc, cancelCC := context.WithCancel(context.Background())
+	go func() { time.Sleep(50 * time.Millisecond); cancelCC() }()
+	if _, err := f.FetchSignature(cc, prov, key); err == nil {
+		t.Fatal("want an error once the caller cancels")
+	}
+	if got := metricValue(t, callsCanceled) - before[callsCanceled]; got != 1 {
+		t.Errorf("%s delta = %v, want 1", callsCanceled, got)
+	}
+	if got := metricValue(t, callsTimeout) - before[callsTimeout]; got != 1 {
+		t.Errorf("%s delta = %v, want 1 (unchanged) — a cancel is not our timeout", callsTimeout, got)
 	}
 }

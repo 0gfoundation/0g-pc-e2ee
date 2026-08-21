@@ -520,10 +520,37 @@ func TestVerifyOutcomeSeparatesOurTimeoutFromAnUnfetchableProof(t *testing.T) {
 		// one integrity signal here at the mercy of timing.
 		{"signature did not verify, caller gone", goneParent, expired, UpstreamUnverified, UpstreamUnverified},
 		{"signature did not verify, deadline fired", parent, expired, UpstreamUnverified, UpstreamUnverified},
+		// Nor is a fault of OURS. All three cells, because only the quiet one used to
+		// be covered: a binder that will not produce its text is a local failure with
+		// nothing to do with either context, and re-labelling it canceled or timeout
+		// files our bug in a bucket every alert ignores — the same thing the onFrame
+		// site refuses to do.
 		{"our own binder broke", parent, live, UpstreamInternal, UpstreamInternal},
+		{"our own binder broke, caller gone", goneParent, live, UpstreamInternal, UpstreamInternal},
+		{"our own binder broke, deadline fired", parent, expired, UpstreamInternal, UpstreamInternal},
 	} {
 		if got := verifyOutcome(tc.parent, tc.attempt, tc.concluded); got != tc.want {
 			t.Errorf("%s: verifyOutcome(%q) = %q, want %q", tc.name, tc.concluded, got, tc.want)
+		}
+	}
+}
+
+// exhausted() is the only judge at the budget boundary, so spent must never come
+// back short of the budget the deadline just consumed. It did when the clock was
+// read AFTER deriving the deadline: any scheduling delay between the two fell
+// outside the measurement. This runs the boundary repeatedly, since the gap it
+// guards against is a few milliseconds wide.
+func TestCandidateWalkSpendIsFullyChargedAtTheBoundary(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		w := candidateWalk{budget: 2 * time.Millisecond}
+		cands := &slowCandidates{n: 2}
+		if _, err := w.provider(context.Background(), cands, 0); err == nil {
+			t.Fatal("a blocking materialization under a spent budget should error")
+		}
+		if !w.exhausted() {
+			t.Fatalf("iteration %d: spent %s against a %s budget — the deadline ended the "+
+				"materialization but exhausted() disagrees, so the walk would try another candidate",
+				i, w.spent, w.limit())
 		}
 	}
 }

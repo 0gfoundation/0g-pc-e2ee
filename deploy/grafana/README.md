@@ -51,8 +51,9 @@ screen:
 2. **Completions**: outcome by result, and errors broken down by
    `source`/`stage` (gateway fault vs router/provider).
 3. **Route preview — the uncached control plane**: retried-preview ratio, failure
-   rate, calls by outcome, and preview latency p50/p99. This row exists because
-   preview is the only outbound dependency on the request path with no cache in
+   rate, calls by outcome, preview latency p50/p99, attempts by result, and
+   suppressed retries. This row exists because preview is the only outbound
+   dependency on the request path with no cache in
    front of it — deliberately, since the ranking must reflect the live fleet — so
    its latency is a floor on every sealed request's latency, and its health is
    request health. Read **"Retried previews"** first: it is where a degrading
@@ -69,6 +70,11 @@ screen:
    canceled": anything else in the denominator dilutes the ratio and hides the
    degradation it exists to show, and a denylist stops being right the moment an
    outcome is added.
+   - **Calls and attempts answer different questions.** "Calls by outcome" is one
+     series per chat request; "attempts by result" is one per HTTP attempt, and it
+     is the triage view the calls series cannot give — whether the router is *flaky*
+     (`retryable` climbing, the retries absorbing it) or *refusing us* (`rejected`
+     climbing, nothing to absorb).
    - **The retry ceiling is budget + one attempt, not one attempt.** The budget
      (`route.previewRetryBudget`) only gates whether another attempt may *start*;
      an attempt already in flight is bounded by `previewAttemptTimeout` instead. So
@@ -85,12 +91,24 @@ screen:
      The first attempt of every request is still made, so callers still get their
      real error; what stops is the amplification. Read it next to `failed`: both
      up together is an outage, `ok_retried` up with this flat is a degradation.
+     The panel counts the retry ATTEMPTS not made, not the calls affected, so it
+     reads as load shed — an upper bound, since the budget might independently have
+     declined some of them.
 4. **Data plane — the sealed request to the provider**: upstream failure ratio and
    candidate-fallback rate; attempts by outcome; buffered completion latency;
    stream time-to-first-frame and open duration; the §8 signature fetch and its
    latency. Rows 1–2 measure what this gateway *served*, which is preview +
    materialization + this; only this row isolates the hop that dominates it.
-   Four things to know when reading it:
+   Five things to know when reading it:
+   - **Why this ratio uses a denylist when the preview one uses an allowlist.** The
+     rule is which way an omission fails. A *failure* ratio built as a denylist
+     fails LOUD: a new outcome nobody classified lands in the numerator, the number
+     goes up, and somebody looks. Built as an allowlist it would fail SILENT — a new
+     failure mode simply would not count — and it would need all eleven current
+     failure outcomes enumerated correctly. The retried-preview ratio is the mirror
+     image: there a denylist fails silent (a new outcome dilutes the fraction), so it
+     is an allowlist. Allowlist when omission causes silence, denylist when omission
+     causes noise.
    - **`canceled` and `internal` are not failures** and are excluded from the
      failure ratio on both sides of the fraction. `canceled` means the caller went
      away mid-attempt — a closed tab, not a bad provider; `internal` is a fault in
@@ -102,7 +120,10 @@ screen:
      signer — an integrity claim about a provider, and what the alert below pages
      on. `unverifiable` means it could not be retrieved at all, so nothing was
      proven either way; that is the broker having a bad minute, or us, and it is
-     deliberately outside the integrity alert.
+     deliberately outside the integrity alert. The §8 fetch panel draws the same
+     line for itself: `timeout` is OUR attempt deadline expiring mid-fetch,
+     `canceled` is the caller leaving. Both used to be `canceled`, which put our
+     own deadline in a bucket every alert ignores.
    - **Candidate fallbacks are the only signal that the router's ranking is putting
      bad providers first.** The requests they cover *succeed*, so nothing else
      records them — not the error rate, not the completion outcome. A rate that
