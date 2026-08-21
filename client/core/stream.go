@@ -58,20 +58,26 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 	// onFrame: once a token has been delivered to the caller the stream is
 	// committed to that provider and cannot be restarted on another (streaming
 	// fallback is pre-first-token only — docs/design/router-e2e.md "Limitations").
-	var lastErr error
-	// One shared materialization budget for the whole walk, as in Complete — a
-	// stream that has not started yet has a caller waiting on it just the same (see
-	// resolveBudget).
+	// One shared budget for the whole walk, as in Complete — a stream that has not
+	// started yet has a caller waiting on it just the same (see resolveBudget), and
+	// the same failure tiering (walkErr).
+	var fail walkErr
 	walk := candidateWalk{budget: c.resolveBudgetTO}
 	for i := 0; i < cands.Len(); i++ {
 		provider, err := walk.provider(ctx, cands, i)
 		if err != nil {
-			// As in Complete: a candidate we could not prepare never displaces what an
-			// earlier provider actually said, budget or no budget (preferErr).
-			lastErr = preferErr(lastErr, resolveErr(err))
-			if walk.exhausted() {
+			// A caller that went away ends the walk, as in Complete: not a fallback, and
+			// not the router's ranking.
+			if canceledBy(ctx) {
+				fail.record(tierMaterialize, resolveErr(err))
 				break
 			}
+			if walk.exhausted() {
+				c.metricWalkBudgetExhausted()
+				fail.record(tierBudget, budgetErr(walk.limit(), err))
+				break
+			}
+			fail.record(tierMaterialize, resolveErr(err))
 			c.metricFallback(FallbackMaterialize, i, cands.Len())
 			continue
 		}
@@ -88,11 +94,16 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 		// Charged like Complete's: a stream that stalled before its first frame spent
 		// the caller's time and produced nothing (see resolveBudget).
 		walk.charge(time.Since(attemptStart))
-		lastErr = err
+		fail.record(tierAttempt, err)
 		if retry {
 			// Nothing was delivered yet and the failure is provider-transient — try
-			// the next candidate, unless that time is all the walk had.
+			// the next candidate, unless the caller has gone or that time was all the
+			// walk had.
+			if canceledBy(ctx) {
+				break
+			}
 			if walk.exhausted() {
+				c.metricWalkBudgetExhausted()
 				break
 			}
 			c.metricFallback(FallbackUpstream, i, cands.Len())
@@ -103,10 +114,10 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 		return err
 	}
 
-	if lastErr == nil {
-		lastErr = stageErr(StageUpstream, fmt.Errorf("no provider candidates to try"))
+	if fail.err == nil {
+		return stageErr(StageUpstream, fmt.Errorf("no provider candidates to try"))
 	}
-	return lastErr
+	return fail.err
 }
 
 // streamOnce posts one sealed envelope to a single provider and pumps its SSE

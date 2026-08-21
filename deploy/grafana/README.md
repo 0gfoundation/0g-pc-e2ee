@@ -99,7 +99,7 @@ screen:
    stream time-to-first-frame and open duration; the §8 signature fetch and its
    latency. Rows 1–2 measure what this gateway *served*, which is preview +
    materialization + this; only this row isolates the hop that dominates it.
-   Six things to know when reading it:
+   Seven things to know when reading it:
    - **Why this ratio uses a denylist when the preview one uses an allowlist.** The
      rule is which way an omission fails. A *failure* ratio built as a denylist
      fails LOUD: a new outcome nobody classified lands in the numerator, the number
@@ -136,6 +136,14 @@ screen:
      line for itself: `timeout` is OUR attempt deadline expiring mid-fetch,
      `canceled` is the caller leaving. Both used to be `canceled`, which put our
      own deadline in a bucket every alert ignores.
+   - **`budget cut` is our ceiling firing, not anything upstream.** It counts
+     requests ended because `core.resolveBudget` ran out while walking the chain,
+     and it is the only way to tell whether that ceiling is set anywhere near right
+     — read it against the buffered-latency p99. It is deliberately NOT on the
+     failure ratio: the request failed, but the thing that failed it was us.
+     A caller disconnecting mid-walk is not counted here and is not a fallback
+     either; it ends the walk silently, because filing a closed tab as bad routing
+     is what the fallback series exists not to do.
    - **A failing chain is bounded, in both factors.** `core.resolveBudget` charges
      materialization AND failed attempts, so the walk stops instead of paying
      `providerTimeout` once per candidate; `route.maxPreviewCandidates` bounds how

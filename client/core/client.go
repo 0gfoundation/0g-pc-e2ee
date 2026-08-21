@@ -88,20 +88,45 @@ func (e *Error) Source() string {
 
 func stageErr(stage string, err error) error { return &Error{Stage: stage, Err: err} }
 
-// preferErr keeps the more useful of two walk failures. A materialization failure
-// carries no upstream status — it is our own bookkeeping about a candidate we could
-// not prepare — while an attempt failure carries the provider's verbatim reply, a
-// 503 with the Retry-After the proxy surfaces. So a materialization failure only
-// ever fills a gap; it never displaces what a provider actually said.
-//
-// This rule was originally written inline on the budget-exhausted branch only, which
-// left its sibling — a materialization that failed for any other reason — still
-// throwing that 503 away. Hoisting it here is what makes it apply to both.
-func preferErr(have, materialize error) error {
-	if have != nil {
-		return have
+// Tiers of walk failure, ordered by how much they tell the caller. A flat
+// "anything already held wins" rule — which is what this started as — cannot tell a
+// provider's verbatim reply apart from an earlier bookkeeping error, so a request cut
+// at the budget ceiling could return "candidate 0 is malformed" and never mention
+// that it had been held for the full ninety seconds.
+const (
+	// tierMaterialize: we could not prepare a candidate. Our own bookkeeping, no
+	// upstream status, the least actionable of the three.
+	tierMaterialize = iota
+	// tierBudget: the walk ran out of budget. Says why the request was cut, which no
+	// materialize error does — a bare deadline does not name the ceiling that set it.
+	tierBudget
+	// tierAttempt: a provider answered. Carries its status and headers (a 503 with
+	// its Retry-After, surfaced verbatim by the proxy), so nothing outranks it.
+	tierAttempt
+)
+
+// walkErr keeps the most useful failure seen while walking the candidate chain.
+type walkErr struct {
+	err  error
+	tier int
+}
+
+// record keeps err when its tier is at least as informative as what is held. Equal
+// tiers let the LATER one win: two candidates that could not be prepared are equally
+// ranked, and the second tells you more than the first (an early "no usable address"
+// otherwise masks whatever the rest of the chain did).
+func (w *walkErr) record(tier int, err error) {
+	if w.err == nil || tier >= w.tier {
+		w.err, w.tier = err, tier
 	}
-	return materialize
+}
+
+// budgetErr names the ceiling that cut a walk short, wrapping whatever the last
+// candidate was doing when it ran out. Recorded at tierBudget so it displaces the
+// materialize errors that cannot explain the cut, and never a provider's own reply.
+func budgetErr(limit time.Duration, cause error) error {
+	return &Error{Stage: StageUpstream, Err: fmt.Errorf(
+		"provider selection budget (%s) exhausted: %w", limit, cause)}
 }
 
 // resolveErr maps a Resolver failure onto an *Error. A resolver that already
@@ -207,6 +232,11 @@ type MetricsHook interface {
 	// model has to say; the wait for its first token is the part a caller
 	// experiences as latency, and the two are unrelated.
 	StreamFirstFrame(dur time.Duration)
+	// WalkBudgetExhausted is called when a call stops walking the candidate chain
+	// because resolveBudget ran out. It is the only signal that a request was cut at
+	// that ceiling rather than by anything upstream, and therefore the only way to
+	// tell whether the ceiling is set anywhere near right.
+	WalkBudgetExhausted()
 	// CandidateFallback is called each time the client gives up on a candidate and
 	// moves to the next, with reason FallbackUpstream (an attempt failed
 	// transiently and is re-sealed to the next candidate) or FallbackMaterialize
@@ -299,6 +329,13 @@ func (c *Client) metricUpstreamAttempt(kind, outcome string, dur time.Duration) 
 func (c *Client) metricFallback(reason string, i, n int) {
 	if c.metrics != nil && i+1 < n {
 		c.metrics.CandidateFallback(reason)
+	}
+}
+
+// metricWalkBudgetExhausted reports one walk cut short by resolveBudget.
+func (c *Client) metricWalkBudgetExhausted() {
+	if c.metrics != nil {
+		c.metrics.WalkBudgetExhausted()
 	}
 }
 
@@ -542,22 +579,33 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 	// Fall back down the candidate chain: attempt a candidate and, on a retryable
 	// provider failure, re-seal to the next and retry (SPEC §4.4). lastErr holds
 	// the most recent failure so a fully exhausted chain surfaces a real cause.
-	var lastErr error
-	// The walk charges every materialization against one shared budget, so a long
-	// chain of unreachable candidates cannot keep the caller waiting indefinitely
-	// (see resolveBudget).
+	// The walk charges every materialization and every failed attempt against one
+	// shared budget, so a long chain cannot keep the caller waiting indefinitely (see
+	// resolveBudget). fail keeps the most useful failure seen (see walkErr).
+	var fail walkErr
 	walk := candidateWalk{budget: c.resolveBudgetTO}
 	for i := 0; i < cands.Len(); i++ {
 		provider, err := walk.provider(ctx, cands, i)
 		if err != nil {
-			// Whatever the reason — out of budget, or a pubkey fetch that failed — a
-			// candidate we could not prepare never displaces what an earlier provider
-			// actually said (preferErr).
-			lastErr = preferErr(lastErr, resolveErr(err))
-			if walk.exhausted() {
-				// Every remaining candidate would fail the same way; stop.
+			// A caller that went away ends the walk. It is not a fallback and says
+			// nothing about the router's ranking — and without this the loop ground on
+			// through every remaining candidate, each failing instantly on the dead
+			// context, each counted: one disconnect booked seven materialize fallbacks
+			// on an eight-candidate chain, into the series documented as the only signal
+			// that the router is ranking badly, with an alert on it.
+			if canceledBy(ctx) {
+				fail.record(tierMaterialize, resolveErr(err))
 				break
 			}
+			if walk.exhausted() {
+				// Name the ceiling. Recorded above the materialize tier because a bare
+				// "no usable address" from candidate 0 would otherwise be all the caller
+				// got for a request we held for the whole budget.
+				c.metricWalkBudgetExhausted()
+				fail.record(tierBudget, budgetErr(walk.limit(), err))
+				break
+			}
+			fail.record(tierMaterialize, resolveErr(err))
 			c.metricFallback(FallbackMaterialize, i, cands.Len())
 			continue
 		}
@@ -567,12 +615,18 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 		if err == nil {
 			return out, nil
 		}
-		// A failed attempt is wasted caller time and is charged to the walk. lastErr is
-		// already this attempt's error, so stopping here surfaces the richer one.
+		// A failed attempt is wasted caller time and is charged to the walk.
 		walk.charge(time.Since(attemptStart))
-		lastErr = err
+		fail.record(tierAttempt, err)
 		if retry {
+			// Same two reasons to stop, and for the same reasons: a disconnect mid-body
+			// also surfaces as a retryable failure, and counting it would file the
+			// caller's own departure as a bad provider.
+			if canceledBy(ctx) {
+				break
+			}
 			if walk.exhausted() {
+				c.metricWalkBudgetExhausted()
 				break
 			}
 			c.metricFallback(FallbackUpstream, i, cands.Len())
@@ -581,12 +635,12 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 		return nil, err
 	}
 
-	// The chain was exhausted without a success. lastErr is set whenever Len() > 0
+	// The chain was exhausted without a success. fail is set whenever Len() > 0
 	// (a candidate was tried); guard the impossible empty-chain case anyway.
-	if lastErr == nil {
-		lastErr = stageErr(StageUpstream, fmt.Errorf("no provider candidates to try"))
+	if fail.err == nil {
+		return nil, stageErr(StageUpstream, fmt.Errorf("no provider candidates to try"))
 	}
-	return nil, lastErr
+	return nil, fail.err
 }
 
 // completeOnce runs one non-streaming attempt against a single provider under

@@ -214,6 +214,15 @@ var (
 		// this panel matters.
 		Buckets: upstreamBuckets,
 	})
+	walkBudgetExhausted = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "walk_budget_exhausted_total",
+		Help: "Requests cut short because core.resolveBudget ran out while walking the candidate " +
+			"chain — the only signal that a request was ended by OUR ceiling rather than by " +
+			"anything upstream, and therefore the only way to tell whether that ceiling is set " +
+			"anywhere near right. Read it next to the buffered completion-latency p99: this rising " +
+			"with the p99 pinned near the budget means requests are spending their whole allowance " +
+			"walking a bad chain.",
+	})
 	candidateFallbacks = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "candidate_fallbacks_total",
 		Help: "Times the client moved on to the next provider candidate, by reason: upstream (an " +
@@ -329,7 +338,7 @@ func init() {
 		httpRequests, httpDuration, httpInFlight, inFlightLimit, requestsShed,
 		completions, openFailures, verificationFailures,
 		previewAttempts, previewCalls, previewDuration, previewRetrySuppressed,
-		upstreamAttempts, upstreamDuration, streamTTFF, candidateFallbacks,
+		upstreamAttempts, upstreamDuration, streamTTFF, candidateFallbacks, walkBudgetExhausted,
 		signatureFetchCalls, signatureFetchDuration,
 		quoteVerify, quoteVerifyDuration, quoteCache, measurementUntrusted,
 		onchainGrounding, onchainRevalidations,
@@ -441,6 +450,9 @@ func UpstreamAttempt(kind, outcome string, dur time.Duration) {
 // StreamFirstFrame records the time to a stream's first delivered frame.
 func StreamFirstFrame(dur time.Duration) { streamTTFF.Observe(dur.Seconds()) }
 
+// WalkBudgetExhausted counts one request cut short by the candidate-walk budget.
+func WalkBudgetExhausted() { walkBudgetExhausted.Inc() }
+
 // CandidateFallback counts one move to the next provider candidate. reason is
 // "upstream" (an attempt failed and was re-sealed) or "materialize" (the candidate
 // could not be prepared at all).
@@ -529,6 +541,9 @@ func (CoreMetrics) UpstreamAttempt(kind, outcome string, dur time.Duration) {
 
 // StreamFirstFrame implements core.MetricsHook.
 func (CoreMetrics) StreamFirstFrame(dur time.Duration) { StreamFirstFrame(dur) }
+
+// WalkBudgetExhausted implements core.MetricsHook.
+func (CoreMetrics) WalkBudgetExhausted() { WalkBudgetExhausted() }
 
 // CandidateFallback implements core.MetricsHook.
 func (CoreMetrics) CandidateFallback(reason string) { CandidateFallback(reason) }

@@ -190,6 +190,7 @@ type countingHook struct {
 	attempts  map[string]int
 	fallbacks map[string]int
 	ttff      int
+	budgetCut int
 }
 
 func (h *countingHook) ResponseOpenFailure() { h.n++ }
@@ -208,6 +209,8 @@ func (h *countingHook) UpstreamAttempt(kind, outcome string, _ time.Duration) {
 }
 
 func (h *countingHook) StreamFirstFrame(time.Duration) { h.ttff++ }
+
+func (h *countingHook) WalkBudgetExhausted() { h.budgetCut++ }
 
 func (h *countingHook) CandidateFallback(reason string) {
 	if h.fallbacks == nil {
@@ -639,20 +642,44 @@ func TestWalkStopsOnceFailedAttemptsSpendTheBudget(t *testing.T) {
 		cands.reached, cands.n, elapsed.Truncate(time.Millisecond), c.resolveBudgetTO+attemptCost)
 }
 
-// A candidate we could not PREPARE never displaces what a provider actually said.
-// The rule was written on the budget-exhausted branch only, so its sibling — a
-// materialization that failed for any other reason — still replaced a 503 and its
-// Retry-After with a Status-0 error, and the caller got a generic 502.
-func TestPreferErr(t *testing.T) {
-	upstream := &Error{Stage: StageUpstream, Status: 503, Err: errors.New("provider busy")}
-	materialize := &Error{Stage: StageUpstream, Err: errors.New("pubkey fetch failed")}
+// The failure the caller is told about must be the most useful one seen. Three tiers,
+// because they answer different questions — and a flat "whatever we already hold
+// wins", which is what this started as, let a budget cut hide behind an early
+// bookkeeping error and made a 90s ceiling undiagnosable.
+func TestWalkErrTiers(t *testing.T) {
+	mat1 := &Error{Stage: StageUpstream, Err: errors.New("no usable address")}
+	mat2 := &Error{Stage: StageUpstream, Err: errors.New("pubkey fetch failed")}
+	budget := budgetErr(90*time.Second, errors.New("context deadline exceeded"))
+	attempt := &Error{Stage: StageUpstream, Status: 503, Err: errors.New("provider busy")}
 
-	if got := preferErr(upstream, materialize); got != error(upstream) {
-		t.Errorf("a materialization failure displaced the provider's reply: got %v", got)
-	}
-	if got := preferErr(nil, materialize); got != error(materialize) {
-		t.Errorf("with nothing better, the materialization failure must be reported: got %v", got)
-	}
+	t.Run("a provider's reply outranks everything", func(t *testing.T) {
+		var w walkErr
+		w.record(tierAttempt, attempt)
+		w.record(tierMaterialize, mat1)
+		w.record(tierBudget, budget)
+		if w.err != error(attempt) {
+			t.Errorf("got %v, want the provider's reply", w.err)
+		}
+	})
+	t.Run("the budget outranks bookkeeping", func(t *testing.T) {
+		var w walkErr
+		w.record(tierMaterialize, mat1)
+		w.record(tierBudget, budget)
+		if w.err != budget {
+			t.Errorf("got %v, want the budget error — a 90s cut must say so", w.err)
+		}
+		if !strings.Contains(w.err.Error(), "budget") {
+			t.Errorf("the budget error does not name the budget: %v", w.err)
+		}
+	})
+	t.Run("within a tier the later one wins", func(t *testing.T) {
+		var w walkErr
+		w.record(tierMaterialize, mat1)
+		w.record(tierMaterialize, mat2)
+		if w.err != error(mat2) {
+			t.Errorf("got %v, want the later failure — the earliest is the least informative", w.err)
+		}
+	})
 }
 
 // failThenUnpreparable answers candidate 0 (whose attempt will 503) and refuses to
@@ -754,3 +781,87 @@ type timeoutErr struct{}
 func (timeoutErr) Error() string   { return "i/o timeout" }
 func (timeoutErr) Timeout() bool   { return true }
 func (timeoutErr) Temporary() bool { return true }
+
+// blockingCandidates never finishes materializing, so the caller's disconnect is
+// what ends each one. reached counts how far the walk got.
+type blockingCandidates struct {
+	n       int
+	reached int
+}
+
+func (c *blockingCandidates) Len() int { return c.n }
+
+func (c *blockingCandidates) Provider(ctx context.Context, i int) (Provider, error) {
+	c.reached++
+	<-ctx.Done()
+	return Provider{}, ctx.Err()
+}
+
+// A caller that goes away is not a fallback and says nothing about the router's
+// ranking. Without a break the loop ground on through every remaining candidate,
+// each failing instantly on the dead context, each counted — one disconnect booked
+// seven materialize fallbacks on an eight-candidate chain, into the series
+// documented as the only signal that the router ranks badly, with an alert on it.
+func TestCallerDisconnectIsNotAFallback(t *testing.T) {
+	h := &countingHook{}
+	cands := &blockingCandidates{n: 8}
+	c := NewWithResolver(fixedResolver{cands}, WithMetrics(h))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(30 * time.Millisecond); cancel() }()
+
+	if _, err := c.Complete(ctx, wire.Request{
+		"model":    json.RawMessage(`"gpt-4o"`),
+		"messages": json.RawMessage(`[{"role":"user","content":"hi"}]`),
+	}); err == nil {
+		t.Fatal("want an error once the caller goes away")
+	}
+
+	if got := h.fallbacks[FallbackMaterialize]; got != 0 {
+		t.Errorf("materialize fallbacks = %d, want 0 — a disconnect was filed as bad routing", got)
+	}
+	if cands.reached != 1 {
+		t.Errorf("candidates reached = %d, want 1 — the walk spun through the dead chain", cands.reached)
+	}
+	if h.budgetCut != 0 {
+		t.Errorf("budget cuts = %d, want 0 — the caller left, the ceiling did not fire", h.budgetCut)
+	}
+}
+
+// quickFailThenBlock fails candidate 0 fast with the least informative error there
+// is, then blocks — the combination that used to return "no usable address" for a
+// request held the whole budget.
+type quickFailThenBlock struct{ n int }
+
+func (c quickFailThenBlock) Len() int { return c.n }
+
+func (c quickFailThenBlock) Provider(ctx context.Context, i int) (Provider, error) {
+	if i == 0 {
+		return Provider{}, &Error{Stage: StageUpstream, Err: errors.New("no usable address")}
+	}
+	<-ctx.Done()
+	return Provider{}, ctx.Err()
+}
+
+// A request cut at the ceiling must SAY so, and be counted. Before, an early
+// bookkeeping error outranked the budget error and the cut was invisible in both the
+// message and the metrics — a hard 90s limit with nothing to diagnose it by.
+func TestBudgetCutIsVisibleInBothErrorAndMetric(t *testing.T) {
+	h := &countingHook{}
+	c := NewWithResolver(fixedResolver{quickFailThenBlock{n: 4}}, WithMetrics(h))
+	c.resolveBudgetTO = 100 * time.Millisecond
+
+	_, err := c.Complete(context.Background(), wire.Request{
+		"model":    json.RawMessage(`"gpt-4o"`),
+		"messages": json.RawMessage(`[{"role":"user","content":"hi"}]`),
+	})
+	if err == nil {
+		t.Fatal("want an error")
+	}
+	if !strings.Contains(err.Error(), "budget") {
+		t.Errorf("error does not mention the budget that cut the request: %v", err)
+	}
+	if h.budgetCut != 1 {
+		t.Errorf("budget cuts = %d, want 1", h.budgetCut)
+	}
+}

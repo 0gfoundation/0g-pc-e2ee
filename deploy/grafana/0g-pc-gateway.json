@@ -1462,7 +1462,7 @@
     {
       "id": 302,
       "type": "stat",
-      "title": "Candidate fallbacks by reason (rate)",
+      "title": "Candidate fallbacks by reason + budget cuts (rate)",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1484,6 +1484,17 @@
           "range": true,
           "refId": "A",
           "legendFormat": "{{reason}}"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(zg_gateway_walk_budget_exhausted_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval]))",
+          "range": true,
+          "refId": "B",
+          "legendFormat": "budget cut"
         }
       ],
       "fieldConfig": {
@@ -3625,6 +3636,6 @@
   "timezone": "browser",
   "title": "0G-PC Gateway",
   "uid": "0g-pc-gateway",
-  "version": 9,
+  "version": 10,
   "weekStart": ""
 }
