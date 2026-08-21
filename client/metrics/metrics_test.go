@@ -8,7 +8,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
+
+	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 )
 
 // RouteLabel must map only the known served routes to themselves and collapse
@@ -150,4 +154,65 @@ func TestHandlerServesExposition(t *testing.T) {
 			t.Errorf("exposition missing %q", want)
 		}
 	}
+}
+
+// attemptResult carries two of core's outcome strings as literals, because this
+// package deliberately does not import core (core defines the hook interface so it
+// need not depend on Prometheus). Nothing but this test stops the two from
+// drifting: rename core.UpstreamOK and every attempt would silently be labelled
+// result="failed", turning the completion-latency panel into a panel of failures.
+func TestAttemptResultMatchesCoreVocabulary(t *testing.T) {
+	for outcome, want := range map[string]string{
+		core.UpstreamOK:          "ok",
+		core.UpstreamCanceled:    "canceled",
+		core.UpstreamHTTP4xx:     "failed",
+		core.UpstreamHTTP5xx:     "failed",
+		core.UpstreamTransport:   "failed",
+		core.UpstreamTimeout:     "failed",
+		core.UpstreamUnverified:  "failed",
+		core.UpstreamInternal:    "failed",
+		core.UpstreamUndecodable: "failed",
+	} {
+		if got := attemptResult(outcome); got != want {
+			t.Errorf("attemptResult(%q) = %q, want %q", outcome, got, want)
+		}
+	}
+}
+
+// The duration histogram must observe under the coarsened result label while the
+// counter keeps the full outcome — the split that stops a 4xx rejected in
+// milliseconds from sitting in the completion-latency distribution.
+func TestUpstreamAttemptSplitsCounterOutcomeFromHistogramResult(t *testing.T) {
+	c4xx := upstreamAttempts.WithLabelValues(core.UpstreamBuffered, core.UpstreamHTTP4xx)
+	hOK := upstreamDuration.WithLabelValues(core.UpstreamBuffered, "ok")
+	hFailed := upstreamDuration.WithLabelValues(core.UpstreamBuffered, "failed")
+	cBefore := testutil.ToFloat64(c4xx)
+	okBefore, failedBefore := histCount(t, hOK), histCount(t, hFailed)
+
+	UpstreamAttempt(core.UpstreamBuffered, core.UpstreamHTTP4xx, 20*time.Millisecond)
+
+	if got := testutil.ToFloat64(c4xx) - cBefore; got != 1 {
+		t.Errorf("counter{outcome=http_4xx} delta = %v, want 1 — the full outcome is the counter's job", got)
+	}
+	if got := histCount(t, hFailed) - failedBefore; got != 1 {
+		t.Errorf("histogram{result=failed} delta = %v, want 1", got)
+	}
+	if got := histCount(t, hOK) - okBefore; got != 0 {
+		t.Errorf("histogram{result=ok} delta = %v, want 0 — a rejection is not completion latency", got)
+	}
+}
+
+// histCount reads a histogram child's sample count; testutil.ToFloat64 refuses
+// histograms.
+func histCount(t *testing.T, o prometheus.Observer) float64 {
+	t.Helper()
+	m, ok := o.(prometheus.Metric)
+	if !ok {
+		t.Fatalf("%T is not a prometheus.Metric", o)
+	}
+	var pb dto.Metric
+	if err := m.Write(&pb); err != nil {
+		t.Fatalf("write metric: %v", err)
+	}
+	return float64(pb.GetHistogram().GetSampleCount())
 }

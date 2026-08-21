@@ -58,11 +58,27 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 	// onFrame: once a token has been delivered to the caller the stream is
 	// committed to that provider and cannot be restarted on another (streaming
 	// fallback is pre-first-token only — docs/design/router-e2e.md "Limitations").
-	var lastErr error
+	// One shared budget for the whole walk, as in Complete — a stream that has not
+	// started yet has a caller waiting on it just the same (see resolveBudget), and
+	// the same failure tiering (walkErr).
+	var fail walkErr
+	walk := candidateWalk{budget: c.resolveBudgetTO}
 	for i := 0; i < cands.Len(); i++ {
-		provider, err := cands.Provider(ctx, i)
+		provider, err := walk.provider(ctx, cands, i)
 		if err != nil {
-			lastErr = resolveErr(err)
+			// A caller that went away ends the walk, as in Complete: not a fallback, and
+			// not the router's ranking.
+			if canceledBy(ctx) {
+				fail.record(tierMaterialize, resolveErr(err))
+				break
+			}
+			if walk.exhausted() {
+				c.metricWalkBudgetExhausted()
+				fail.record(tierBudget, budgetErr(walk.limit(), err))
+				break
+			}
+			fail.record(tierMaterialize, resolveErr(err))
+			c.metricFallback(FallbackMaterialize, i, cands.Len())
 			continue
 		}
 		sealed, err := c.seal(provider, req, ephPub)
@@ -70,14 +86,27 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 			// Request-level failure — identical for every candidate; fail fast.
 			return stageErr(StageRequest, fmt.Errorf("seal request: %w", err))
 		}
+		attemptStart := time.Now()
 		retry, err := c.streamOnce(ctx, provider, sealed, ephPriv, onFrame)
 		if err == nil {
 			return nil
 		}
-		lastErr = err
+		// Charged like Complete's: a stream that stalled before its first frame spent
+		// the caller's time and produced nothing (see resolveBudget).
+		walk.charge(time.Since(attemptStart))
+		fail.record(tierAttempt, err)
 		if retry {
 			// Nothing was delivered yet and the failure is provider-transient — try
-			// the next candidate.
+			// the next candidate, unless the caller has gone or that time was all the
+			// walk had.
+			if canceledBy(ctx) {
+				break
+			}
+			if walk.exhausted() {
+				c.metricWalkBudgetBlockedFallback(i, cands.Len())
+				break
+			}
+			c.metricFallback(FallbackUpstream, i, cands.Len())
 			continue
 		}
 		// Terminal: a frame already reached the caller, the caller aborted, or the
@@ -85,10 +114,10 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 		return err
 	}
 
-	if lastErr == nil {
-		lastErr = stageErr(StageUpstream, fmt.Errorf("no provider candidates to try"))
+	if fail.err == nil {
+		return stageErr(StageUpstream, fmt.Errorf("no provider candidates to try"))
 	}
-	return lastErr
+	return fail.err
 }
 
 // streamOnce posts one sealed envelope to a single provider and pumps its SSE
@@ -106,10 +135,22 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
+	// Meter this attempt: one outcome, set at each failure site and reported by the
+	// defer, so no return escapes the counter. The duration is how long the stream
+	// stayed OPEN — a different question from how long the caller waited for its
+	// first token, which is recorded separately when that frame is delivered.
+	start := time.Now()
+	outcome := UpstreamOK
+	defer func() { c.metricUpstreamAttempt(UpstreamStream, outcome, time.Since(start)) }()
+
 	resp, err := c.doRequest(ctx, provider, sealed)
 	if err != nil {
 		// Transport failure reaching the router (which fronts every candidate) — it
-		// would recur, so do not fall back.
+		// would recur, so do not fall back. Classified by the shared judgement, so a
+		// provider that accepts the connection and never answers lands in the same
+		// bucket here as on the buffered path: this context carries no deadline of its
+		// own, so only the transport's own timeout can say so.
+		outcome = upstreamFailureOutcome(parent, ctx, err, UpstreamTransport)
 		return false, &Error{Stage: StageUpstream, Err: fmt.Errorf("post to provider: %w", err)}
 	}
 	defer resp.Body.Close()
@@ -119,6 +160,7 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 		// a multi-tenant gateway never echoes it back (see Error.Body). Fall back
 		// only on a transient provider status (429 / 5xx).
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxSSELine))
+		outcome = upstreamStatusOutcome(resp.StatusCode)
 		return retryableStatus(resp.StatusCode), &Error{Stage: StageUpstream, Status: resp.StatusCode, Err: fmt.Errorf("provider returned %d", resp.StatusCode), Body: string(body), Header: resp.Header.Clone()}
 	}
 	// A 200 that is not an event stream (a provider that ignored stream:true) would
@@ -126,6 +168,7 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 	// was delivered, so fall back to the next candidate.
 	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxSSELine))
+		outcome = UpstreamNotStream
 		return true, &Error{Stage: StageUpstream, Err: fmt.Errorf("provider did not stream (content-type %q)", ct), Body: string(body), Header: resp.Header.Clone()}
 	}
 
@@ -145,6 +188,9 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 	if c.verifyEnabled() {
 		var berr error
 		if binder, berr = proof.NewStreamBinder(sealed); berr != nil {
+			// Our own fault, not the provider's — an envelope we built that will not
+			// bind. Given its own bucket so it can never be read as a provider failure.
+			outcome = UpstreamInternal
 			return false, stageErr(StageInternal, fmt.Errorf("start response binding: %w", berr))
 		}
 	}
@@ -165,10 +211,12 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 			// A stream that ends without its final frame was truncated (provider
 			// crash / dropped connection) — not a complete answer.
 			if !sawFinal {
+				outcome = UpstreamBody
 				return !committed, stageErr(StageUpstream, fmt.Errorf("stream ended before the final frame (truncated)"))
 			}
 			if binder != nil {
-				if verr := c.verifyStream(ctx, provider, resp.Header, binder); verr != nil {
+				if vo, verr := c.verifyStream(ctx, provider, resp.Header, binder); verr != nil {
+					outcome = verifyOutcome(parent, ctx, vo)
 					return false, stageErr(StageUpstream, verr)
 				}
 			}
@@ -178,20 +226,28 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 			if ctx.Err() != nil {
 				// A parent-context cancel (client disconnect / deadline) is terminal;
 				// a child-only cancel is this provider's idle stall — fall back if
-				// nothing was delivered yet.
+				// nothing was delivered yet. The same split decides the metric bucket:
+				// the caller going away is not the provider going quiet.
 				if parent.Err() != nil {
+					outcome = UpstreamCanceled
 					return false, stageErr(StageUpstream, fmt.Errorf("stream aborted: %w", ctx.Err()))
 				}
+				outcome = UpstreamTimeout
 				return !committed, stageErr(StageUpstream, fmt.Errorf("stream aborted: %w", ctx.Err()))
 			}
+			// ctx is not done, so this is the read itself failing; a transport-level
+			// deadline still reads as our bound, not as a truncated body.
+			outcome = upstreamFailureOutcome(parent, ctx, err, UpstreamBody)
 			return !committed, stageErr(StageUpstream, fmt.Errorf("read stream: %w", err))
 		}
 		if bytes.Equal(bytes.TrimSpace(data), []byte("[DONE]")) {
 			if !sawFinal {
+				outcome = UpstreamBody
 				return !committed, stageErr(StageUpstream, fmt.Errorf("stream reached [DONE] before the final frame (truncated)"))
 			}
 			if binder != nil {
-				if verr := c.verifyStream(ctx, provider, resp.Header, binder); verr != nil {
+				if vo, verr := c.verifyStream(ctx, provider, resp.Header, binder); verr != nil {
+					outcome = verifyOutcome(parent, ctx, vo)
 					return false, stageErr(StageUpstream, verr)
 				}
 			}
@@ -200,10 +256,12 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 
 		var frame wire.Response
 		if err := json.Unmarshal(data, &frame); err != nil {
+			outcome = UpstreamUndecodable
 			return !committed, stageErr(StageUpstream, fmt.Errorf("decode stream frame %d: %w", frameIdx, err))
 		}
 		fe, err := frame.E2EE()
 		if err != nil {
+			outcome = UpstreamUndecodable
 			return !committed, stageErr(StageUpstream, fmt.Errorf("read metadata of stream frame %d: %w", frameIdx, err))
 		}
 		if opener == nil {
@@ -211,18 +269,21 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 			opener, err = wire.NewResponseOpener(ephPriv, frame)
 			if err != nil {
 				c.logOpenFailure(frameIdx, frame, err)
+				outcome = UpstreamUndecodable
 				return !committed, stageErr(StageUpstream, fmt.Errorf("stream setup on frame %d: %w", frameIdx, err))
 			}
 		}
 		out, err := opener.OpenFrame(frame)
 		if err != nil {
 			c.logOpenFailure(frameIdx, frame, err)
+			outcome = UpstreamUndecodable
 			return !committed, stageErr(StageUpstream, fmt.Errorf("open stream frame %d: %w", frameIdx, err))
 		}
 		// Bind the sealed frame (not the opened plaintext) for §8 verification, in
 		// delivery order. frame is unchanged by OpenFrame (which builds a new map).
 		if binder != nil {
 			if err := binder.AddFrame(frame); err != nil {
+				outcome = UpstreamUndecodable
 				return !committed, stageErr(StageUpstream, fmt.Errorf("bind stream frame %d: %w", frameIdx, err))
 			}
 		}
@@ -230,6 +291,10 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 		// provider and can no longer be retried on another.
 		if !committed {
 			committed = true
+			// The wait for the first token — what a streaming caller experiences as
+			// latency, and unrelated to how long the stream then runs, which is set by
+			// how much the model has to say.
+			c.metricStreamFirstFrame(time.Since(start))
 			// Once committed, no fallback can change which provider answered, so this
 			// is the metadata for the response the caller receives; surface it for a
 			// caller that asked (WithResponseMeta). Recorded before the first onFrame
@@ -237,6 +302,19 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 			recordMeta(ctx, provider, resp.Header)
 		}
 		if err := onFrame(out); err != nil {
+			// The caller's frame handler rejected a frame. Either way the provider did
+			// nothing wrong, but WHICH caller-side failure it was matters, and core
+			// cannot see inside an opaque callback — so ask the parent, as everywhere
+			// else here. A done parent is a disconnect; a live one means the handler
+			// failed on its own (the gateway's re-serialization, or a write that failed
+			// just before the disconnect became visible), which is our fault, not the
+			// user's navigation. Filing the first case as internal would cry wolf;
+			// filing the second as canceled would hide a real bug of ours in a bucket
+			// every alert deliberately ignores.
+			outcome = UpstreamInternal
+			if canceledBy(parent) {
+				outcome = UpstreamCanceled
+			}
 			return false, err
 		}
 		if fe.Final {

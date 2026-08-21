@@ -57,6 +57,21 @@ var registry = prometheus.NewRegistry()
 // wider and longer-tailed than the default HTTP buckets.
 var verifyBuckets = []float64{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60}
 
+// previewBuckets sizes the route-preview latency histogram: verifyBuckets with one
+// bucket ABOVE that call's own ceiling — retry budget plus one attempt, ~2x
+// controlPlaneHeaderTimeout — so a preview that runs all the way to the ceiling is
+// measurable instead of collapsing into +Inf right at the boundary.
+var previewBuckets = []float64{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120}
+
+// upstreamBuckets sizes the data-plane attempt histogram, which needs a far wider
+// range than verifyBuckets: a completion can legitimately run for minutes and a
+// stream is bounded only by the provider timeout (10m30s), so the top bucket sits
+// past it — without one, every long-but-healthy stream would pile into +Inf and
+// the p99 would be unreadable exactly when it matters. The stream first-frame
+// histogram shares it for the same reason: that wait is bounded by the same idle
+// watchdog, not by anything smaller.
+var upstreamBuckets = []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600, 900}
+
 var (
 	// HTTP layer (openaiproxy.LogRequests) — the RED signals for every request.
 	httpRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -113,6 +128,140 @@ var (
 		Namespace: namespace, Subsystem: subsystem, Name: "response_verification_failures_total",
 		Help: "§8 response-signature verification failures by reason (fetch|signature).",
 	}, []string{"reason"})
+
+	// Route preview (route.preview) — the ONE outbound dependency on the request
+	// path with no cache in front of it, deliberately, since the ranking must
+	// reflect the live fleet. So its health is request health directly, and its
+	// latency is request latency: everything else (quote, collateral, on-chain
+	// signer) is normally served from a warm cache and shows up in the counters
+	// above only on a miss.
+	previewAttempts = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "preview_attempts_total",
+		Help: "Route-preview HTTP attempts by result: ok; retryable (transport failure, a body that " +
+			"dropped, or a 5xx — another attempt follows); rejected (the router ANSWERED definitively — " +
+			"a 4xx/429, or a well-formed reply with no candidates — usually about the caller or the " +
+			"fleet, not about the router); broken (it answered with a body that will not decode, which " +
+			"IS the router misbehaving); canceled (the caller gave up mid-attempt); internal (a " +
+			"request this gateway could not even build — our own configuration).",
+	}, []string{"result"})
+	previewCalls = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "preview_calls_total",
+		Help: "Route-preview CALLS (one per chat request, whatever its attempt count) by outcome: " +
+			"ok, ok_retried, rejected, failed, canceled, internal. Watch ok_retried: it is where a degrading " +
+			"router shows up while the error rate is still flat, because the retries are absorbing " +
+			"it. Alert on failed, NOT on rejected: rejected is the router answering a caller (a bad " +
+			"credential, an unknown model) or reporting an empty fleet, so folding it in lets one " +
+			"misconfigured tenant pin an alert meant for the router. canceled is the caller leaving.",
+	}, []string{"outcome"})
+	previewRetrySuppressed = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "preview_retries_suppressed_total",
+		Help: "Route-preview retry ATTEMPTS not made because the router had stopped answering " +
+			"altogether (see route.retryGate). Retrying an uncached dependency multiplies load " +
+			"on it exactly when it can least take it, and holds a gateway concurrency slot for " +
+			"the retry ceiling rather than one attempt, so a router outage would become " +
+			"gateway-wide shedding. The first attempt of every request is still made, so this " +
+			"rising means requests are still being served their real error, just without the " +
+			"amplification — read it next to preview_calls_total{outcome=\"failed\"}.",
+	})
+	previewDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "preview_duration_seconds",
+		Help: "End-to-end latency of one route-preview call, retries and their backoff included. " +
+			"This sits in front of every sealed request, so it is a floor on request latency.",
+		// previewBuckets, not verifyBuckets, whose top finite bucket is 60s — exactly
+		// this call's own ceiling (retry budget + one attempt), so the worst case
+		// would land in +Inf.
+		Buckets: previewBuckets,
+	})
+
+	// Data plane (core) — the sealed POST to the router and what came back. This is
+	// the expensive hop and the one that carries the long timeouts, the candidate
+	// fallback and the streams, so it is metered on its own rather than left to be
+	// inferred from the inbound http_* series: those measure the gateway's whole
+	// handling, which is preview + materialization + this, and cannot say which
+	// part moved.
+	upstreamAttempts = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "upstream_attempts_total",
+		Help: "Data-plane attempts against one provider, by kind (buffered|stream) and outcome: ok; " +
+			"http_429/http_4xx/http_5xx/http_other (a status came back); transport (no response at " +
+			"all — never reached it, or it never answered); body (the response dropped mid-read, or " +
+			"a stream ended before its final frame); undecodable (a 2xx whose sealed body would not " +
+			"decode or open); not_stream (a 200 that was not an event stream); unverified (the §8 " +
+			"signature was retrieved and did not verify — an integrity claim about the provider); " +
+			"unverifiable (the signature could not be retrieved at all, so nothing was proven either " +
+			"way — operational, and deliberately apart from unverified so a broker's bad minute " +
+			"cannot page anyone as a provider integrity failure); timeout (our own provider deadline " +
+			"or stream idle watchdog — " +
+			"the provider went quiet); canceled (the CALLER went away); internal (a fault in the " +
+			"gateway itself). The last two are deliberately NOT failure buckets: a closed tab is not " +
+			"a provider's fault, and our own bug should not be filed as one either.",
+	}, []string{"kind", "outcome"})
+	upstreamDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "upstream_attempt_duration_seconds",
+		Help: "Duration of one data-plane attempt, split by kind because the two distributions are " +
+			"different questions: buffered is the completion's whole latency, stream is how long the " +
+			"stream stayed open (see upstream_stream_ttff_seconds for the latency a streaming caller " +
+			"actually feels). Split by result (ok|failed|canceled) as well, because a histogram over " +
+			"ALL attempts is not a latency series: a 4xx rejected in 20ms and a caller that left " +
+			"after 200ms both drag the completion p99 down, and that p99 is what the budget-cut " +
+			"runbook says to read the ceiling against. Chart result=\"ok\" for latency. canceled is " +
+			"kept out of failed for the same reason it is kept out of every failure bucket next " +
+			"door, and because its duration is set by when the caller left rather than by anything " +
+			"upstream. Coarsened to three values on purpose: the counter next door carries the full " +
+			"outcome vocabulary, which here would multiply every bucket series by it.",
+		Buckets: upstreamBuckets,
+	}, []string{"kind", "result"})
+	streamTTFF = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "upstream_stream_ttff_seconds",
+		Help: "Time to first delivered frame of a stream — the latency a streaming caller feels, " +
+			"which the attempt duration cannot show (a stream that runs for minutes may have " +
+			"produced its first token instantly).",
+		// upstreamBuckets, not verifyBuckets: the wait for a first frame is bounded
+		// only by the stream idle watchdog (providerTimeout, 10m30s), so a 60s top
+		// bucket would put every degraded stream in +Inf — unreadable exactly when
+		// this panel matters.
+		Buckets: upstreamBuckets,
+	})
+	walkBudgetExhausted = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "walk_budget_exhausted_total",
+		Help: "Requests where core.resolveBudget running out actually truncated the candidate walk " +
+			"— it cut a materialization short, or denied a fallback the walk would otherwise have " +
+			"made. Not counted when a failed attempt on the LAST candidate happens to exhaust it: a " +
+			"running attempt is never cut by the budget, so there it only decides whether to move " +
+			"on, and there was nothing to move on to. This is " +
+			"the only signal that a request was ended by OUR ceiling rather than by " +
+			"anything upstream, and therefore the only way to tell whether that ceiling is set " +
+			"anywhere near right. Read it next to the buffered completion-latency p99: this rising " +
+			"with the p99 pinned near the budget means requests are spending their whole allowance " +
+			"walking a bad chain.",
+	})
+	candidateFallbacks = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "candidate_fallbacks_total",
+		Help: "Times the client moved on to the next provider candidate, by reason: upstream (an " +
+			"attempt failed transiently and was re-sealed to the next) or materialize (the candidate " +
+			"could not be prepared at all — its quote, key or on-chain grounding failed). Sustained " +
+			"either way means the ranking the router hands us is putting bad providers first.",
+	}, []string{"reason"})
+
+	// §8 response-signature fetch (route.SignatureFetcher), which goes DIRECT to the
+	// provider's broker — the router does not proxy it — once per response.
+	signatureFetchCalls = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "signature_fetch_calls_total",
+		Help: "§8 signature fetches (one per verified response) by outcome: ok, ok_retried, failed " +
+			"(the broker was asked and did not deliver), timeout (OUR deadline for the attempt " +
+			"fired mid-fetch), canceled (the caller left), internal (we never asked it — no " +
+			"endpoint to fetch from, or an endpoint/chatKey that would not form a URL). " +
+			"ok_retried is expected traffic, not an incident: the broker writes the signature at " +
+			"end-of-response, so a just-finished response can momentarily 404 — but a ratio that " +
+			"climbs means every response is paying the backoff. timeout, canceled and internal are " +
+			"split out of failed because none of them is the broker's; see route.endedBy for the " +
+			"two cases that split imperfectly.",
+	}, []string{"outcome"})
+	signatureFetchDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "signature_fetch_duration_seconds",
+		Help: "End-to-end latency of one §8 signature fetch, retries and backoff included. It is " +
+			"serial with the response, so it is added to every verified completion.",
+		Buckets: verifyBuckets,
+	})
 
 	// Attestation / quote verification (route) — the trust-model core.
 	quoteVerify = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -201,6 +350,9 @@ func init() {
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		httpRequests, httpDuration, httpInFlight, inFlightLimit, requestsShed,
 		completions, openFailures, verificationFailures,
+		previewAttempts, previewCalls, previewDuration, previewRetrySuppressed,
+		upstreamAttempts, upstreamDuration, streamTTFF, candidateFallbacks, walkBudgetExhausted,
+		signatureFetchCalls, signatureFetchDuration,
 		quoteVerify, quoteVerifyDuration, quoteCache, measurementUntrusted,
 		onchainGrounding, onchainRevalidations,
 		warmerSweeps, warmerProviderRefresh, warmerSignerRefresh,
@@ -277,6 +429,80 @@ func ResponseVerificationFailure(reason string) {
 	verificationFailures.WithLabelValues(reason).Inc()
 }
 
+// PreviewAttempt counts one route-preview HTTP attempt. result is a fixed
+// low-cardinality label, and route.previewResult is its single definition —
+// re-listing the values here is what let this comment drift to naming one that is
+// never emitted while omitting two that are. See the metric's Help for what falls
+// in each.
+func PreviewAttempt(result string) { previewAttempts.WithLabelValues(result).Inc() }
+
+// PreviewRetrySuppressed counts n retry attempts the retry gate declined to make.
+// n is the attempts remaining when the gate closed, so this measures amplification
+// shed rather than calls affected — the budget might independently have declined
+// some of them, which makes it the ceiling removed rather than an exact saving.
+func PreviewRetrySuppressed(n int) { previewRetrySuppressed.Add(float64(n)) }
+
+// PreviewCall records one route-preview call — one per chat request, whatever its
+// attempt count — and its end-to-end latency including any retries. outcome is a
+// fixed low-cardinality label derived from the attempt result that ended the call
+// (route.previewResult.callOutcome), plus ok_retried for a success that needed a
+// retry; that method is the single definition.
+func PreviewCall(outcome string, dur time.Duration) {
+	previewCalls.WithLabelValues(outcome).Inc()
+	previewDuration.Observe(dur.Seconds())
+}
+
+// UpstreamAttempt records one completed data-plane attempt against a provider and
+// how long the upstream call took. kind is "buffered" or "stream"; outcome is a
+// fixed low-cardinality label (see the metric's Help).
+func UpstreamAttempt(kind, outcome string, dur time.Duration) {
+	upstreamAttempts.WithLabelValues(kind, outcome).Inc()
+	upstreamDuration.WithLabelValues(kind, attemptResult(outcome)).Observe(dur.Seconds())
+}
+
+// attemptResult coarsens an attempt outcome to the duration histogram's result
+// label. Three values rather than the counter's full vocabulary, which here would
+// multiply every bucket series by it — and three rather than two, because
+// "canceled" is not a failure (the same rule the counter's Help states) and its
+// duration is set by when the caller left, so folding it into either neighbour
+// distorts that neighbour.
+//
+// The two literals are core's outcome vocabulary (core.UpstreamOK,
+// core.UpstreamCanceled). This package deliberately does not import core, so they
+// are pinned to it by TestAttemptResultMatchesCoreVocabulary rather than by the
+// compiler: renaming an outcome without it would silently relabel every attempt.
+func attemptResult(outcome string) string {
+	switch outcome {
+	case "ok":
+		return "ok"
+	case "canceled":
+		return "canceled"
+	default:
+		return "failed"
+	}
+}
+
+// StreamFirstFrame records the time to a stream's first delivered frame.
+func StreamFirstFrame(dur time.Duration) { streamTTFF.Observe(dur.Seconds()) }
+
+// WalkBudgetExhausted counts one request cut short by the candidate-walk budget.
+func WalkBudgetExhausted() { walkBudgetExhausted.Inc() }
+
+// CandidateFallback counts one move to the next provider candidate. reason is
+// "upstream" (an attempt failed and was re-sealed) or "materialize" (the candidate
+// could not be prepared at all).
+func CandidateFallback(reason string) { candidateFallbacks.WithLabelValues(reason).Inc() }
+
+// SignatureFetch records one §8 signature fetch — one per verified response — and
+// its end-to-end latency including retries. outcome is a fixed low-cardinality
+// label: ok, ok_retried, failed, timeout, canceled — see the metric's Help, which is
+// the one place the set is described (this comment had already drifted from it once
+// by omitting timeout).
+func SignatureFetch(outcome string, dur time.Duration) {
+	signatureFetchCalls.WithLabelValues(outcome).Inc()
+	signatureFetchDuration.Observe(dur.Seconds())
+}
+
 // QuoteVerification records one performed (cache-miss) DCAP verification and its
 // latency; ok distinguishes a successful verify from a failed one.
 func QuoteVerification(ok bool, dur time.Duration) {
@@ -342,6 +568,20 @@ func (CoreMetrics) ResponseOpenFailure() { ResponseOpenFailure() }
 
 // ResponseVerificationFailure implements core.MetricsHook.
 func (CoreMetrics) ResponseVerificationFailure(reason string) { ResponseVerificationFailure(reason) }
+
+// UpstreamAttempt implements core.MetricsHook.
+func (CoreMetrics) UpstreamAttempt(kind, outcome string, dur time.Duration) {
+	UpstreamAttempt(kind, outcome, dur)
+}
+
+// StreamFirstFrame implements core.MetricsHook.
+func (CoreMetrics) StreamFirstFrame(dur time.Duration) { StreamFirstFrame(dur) }
+
+// WalkBudgetExhausted implements core.MetricsHook.
+func (CoreMetrics) WalkBudgetExhausted() { WalkBudgetExhausted() }
+
+// CandidateFallback implements core.MetricsHook.
+func (CoreMetrics) CandidateFallback(reason string) { CandidateFallback(reason) }
 
 func result(ok bool) string {
 	if ok {

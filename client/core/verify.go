@@ -44,39 +44,55 @@ func (c *Client) verifyEnabled() bool {
 	return c.sigFetcher != nil && c.recover != nil
 }
 
+// Both verify functions return the attempt outcome to attribute a failure to,
+// alongside the error — this is the ONE place that can tell the three cases apart,
+// and they call for very different responses:
+//
+//   - UpstreamUnverified is the alarming one: a proof was retrieved and did not
+//     verify against the grounded signer. That is an integrity claim about a
+//     provider, and it is what the runbook pages on.
+//   - UpstreamUnverifiable is operational: the proof could not be retrieved at all
+//     (the broker is down, or the handle is missing). Nothing is proven either way.
+//     Folding it into the line above would let one broker's bad minute page
+//     somebody as a provider integrity failure.
+//   - UpstreamInternal is ours: the binder we built will not produce its text.
+//
+// Both are fail-closed regardless — nothing is returned to the caller — so this
+// distinction is purely about attribution, never about leniency.
+
 // verifyNonStream verifies a buffered (non-stream) E2EE response, fail-closed. It
 // anchors on provider.SignerAddr — the on-chain TEE signer the resolver already
 // grounded (hop 5) — never the signature's self-reported address.
-func (c *Client) verifyNonStream(ctx context.Context, provider Provider, header http.Header, reqEnv wire.Request, respFrame wire.Response) error {
+func (c *Client) verifyNonStream(ctx context.Context, provider Provider, header http.Header, reqEnv wire.Request, respFrame wire.Response) (string, error) {
 	sig, err := c.fetchSig(ctx, provider, header)
 	if err != nil {
 		c.metricVerifyFail("fetch")
-		return err
+		return UpstreamUnverifiable, err
 	}
 	if err := sig.VerifyE2EE(reqEnv, respFrame, provider.SignerAddr, c.recover); err != nil {
 		c.metricVerifyFail("signature")
-		return fmt.Errorf("response signature: %w", err)
+		return UpstreamUnverified, fmt.Errorf("response signature: %w", err)
 	}
-	return nil
+	return "", nil
 }
 
 // verifyStream verifies a streamed E2EE response after the final frame, using the
 // binder the receive loop folded each sealed frame into (no full-response buffer).
-func (c *Client) verifyStream(ctx context.Context, provider Provider, header http.Header, binder *proof.StreamBinder) error {
+func (c *Client) verifyStream(ctx context.Context, provider Provider, header http.Header, binder *proof.StreamBinder) (string, error) {
 	want, err := binder.Text()
 	if err != nil {
-		return err
+		return UpstreamInternal, err
 	}
 	sig, err := c.fetchSig(ctx, provider, header)
 	if err != nil {
 		c.metricVerifyFail("fetch")
-		return err
+		return UpstreamUnverifiable, err
 	}
 	if err := sig.VerifyBoundText(want, proof.SchemeE2EECiphertextStream, provider.SignerAddr, c.recover); err != nil {
 		c.metricVerifyFail("signature")
-		return fmt.Errorf("response signature: %w", err)
+		return UpstreamUnverified, fmt.Errorf("response signature: %w", err)
 	}
-	return nil
+	return "", nil
 }
 
 // metricVerifyFail reports one response-verification failure to the metrics hook

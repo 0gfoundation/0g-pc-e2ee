@@ -2,6 +2,8 @@ package core
 
 import (
 	"context"
+	"fmt"
+	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
@@ -44,6 +46,110 @@ type Candidates interface {
 	// error like Resolve.
 	Provider(ctx context.Context, i int) (Provider, error)
 }
+
+// resolveBudget bounds the TOTAL time one Complete/CompleteStream call may spend
+// on WASTED work while walking the candidate chain: materializing candidates, plus
+// attempts that failed. Time inside the attempt that ultimately succeeds is not
+// charged, because that call returns rather than walking any further.
+//
+// An earlier version charged materialization ONLY, on the reasoning that a long
+// legitimate inference on the head candidate must not starve a later fallback of
+// the budget it needs. That reasoning was wrong, and it left the walk with no bound
+// at all — the thing this budget is named for. If the head's long inference
+// SUCCEEDS there is no fallback to starve, because Complete returns; if it FAILS,
+// those minutes were the caller's, spent on nothing, and are exactly what wants
+// counting. Uncharged, a chain of candidates that each burn the full providerTimeout
+// (a provider that sends 200 headers and then withholds the body, or stalls before
+// the first frame) cost N × 10m30s, N chosen by the untrusted router, all of it
+// holding one openaiproxy.LimitInFlight slot. That is the same amplification the
+// preview retries are suppressed to avoid, on the more expensive plane.
+//
+// The budget gates ENTRY to the next candidate and is never imposed on an attempt
+// already running — cutting one would cut a completion that is streaming tokens to
+// its caller. So the ceiling, stated the same way preview's is, is this budget plus
+// one attempt: bounded, and one attempt's overrun rather than N. maxPreviewCandidates
+// bounds N independently, so neither factor is left to the router.
+//
+// Sized to admit a TYPICAL cold materialization — a cache-miss quote verification
+// (route bounds one at 60s) plus the chain read that grounds it (three eth_call
+// attempts at 3s, ~10s with backoff) — so a request arriving before the warmer has
+// swept still succeeds. It does NOT cover that path's own worst case, and the
+// arithmetic is worth being explicit about rather than rounding away: a cold
+// candidate that also triggers the signer-revalidation re-read and then the quote
+// re-verification recovery can reach roughly 60 + 10 + 10 + 60 ≈ 140s on its own,
+// and will be cut here. That is the deliberate trade — a ceiling only binds if it is
+// lower than the worst case it bounds — and it is survivable because the expensive
+// half is singleflighted under a context detached from any one caller: the
+// verification it interrupts keeps running and lands in the cache, so the next
+// request finds it warm instead of repeating the wait.
+//
+// One consequence worth seeing plainly: an attempt that runs to providerTimeout
+// blows this budget by itself, so the walk stops after it. That is intended. A
+// caller already held for ten minutes by one provider is not served by being held
+// another ten by the next.
+//
+// The first candidate always gets the whole budget (spent starts at zero), so this
+// can never refuse to try anybody: at worst it stops the walk after someone has
+// been tried.
+const resolveBudget = 90 * time.Second
+
+// candidateWalk meters one walk down a Candidates chain, charging each
+// materialization against its budget. It is not safe for concurrent use: one walk
+// belongs to one Complete/CompleteStream call.
+//
+// budget is carried per walk rather than read from the constant so a test can scale
+// it down — exercising the exhaustion path takes a full budget of wall clock
+// otherwise. Zero means resolveBudget.
+type candidateWalk struct {
+	spent  time.Duration
+	budget time.Duration
+}
+
+// limit is the walk's budget, defaulted.
+func (w *candidateWalk) limit() time.Duration {
+	if w.budget > 0 {
+		return w.budget
+	}
+	return resolveBudget
+}
+
+// provider materializes candidate i under whatever is left of the budget, charging
+// what it takes. A failed ATTEMPT against a materialized provider is charged too,
+// by the caller via charge() — see resolveBudget for why leaving it out left the
+// walk unbounded.
+//
+// A caller that gets an error checks exhausted() to tell "this candidate failed"
+// from "there is nothing left to try one with".
+func (w *candidateWalk) provider(ctx context.Context, cands Candidates, i int) (Provider, error) {
+	remaining := w.limit() - w.spent
+	if remaining <= 0 {
+		return Provider{}, &Error{Stage: StageUpstream, Err: fmt.Errorf(
+			"provider selection budget (%s) spent before candidate %d could be prepared", w.limit(), i)}
+	}
+	// Read the clock BEFORE deriving the deadline, and derive it FROM that reading.
+	// Taken the other way round, any scheduling delay between the two lands outside
+	// the measurement: the deadline still ends the materialization, but spent comes
+	// back short of remaining and exhausted() — the only judge at this boundary —
+	// reads false. A 5ms preemption injected between the two lines is enough
+	// (spent=45ms against a 50ms limit), and under parallel load it showed up as a
+	// ~1% flake. Anchoring both to one reading makes spent >= remaining hold
+	// unconditionally once the deadline fires.
+	start := time.Now()
+	ctx, cancel := context.WithDeadline(ctx, start.Add(remaining))
+	defer cancel()
+	p, err := cands.Provider(ctx, i)
+	w.spent += time.Since(start)
+	return p, err
+}
+
+// charge books time the walk spent on work that came to nothing — a failed attempt
+// against a materialized provider. Materialization charges itself; this is the other
+// half, and without it the budget bounded only the cheaper of the two.
+func (w *candidateWalk) charge(d time.Duration) { w.spent += d }
+
+// exhausted reports that the budget is gone, so continuing down the chain would
+// only reproduce the same failure once per remaining candidate.
+func (w *candidateWalk) exhausted() bool { return w.spent >= w.limit() }
 
 // staticResolver always returns the same single provider, ignoring the request —
 // the low-level case for a caller that already holds a provider identity. It

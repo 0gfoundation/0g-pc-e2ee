@@ -94,12 +94,62 @@ const (
 	// control-plane call (preview, pubkey, quote) — short, unlike the data plane's,
 	// because none of these streams.
 	controlPlaneHeaderTimeout = 30 * time.Second
+	// Route-preview attempt policy. Preview is the one outbound dependency on the
+	// request path with nothing in front of it: every other hop is served from a
+	// cache the warmer keeps hot (quote, collateral, on-chain signer), while the
+	// ranking has to reflect the live fleet and so is fetched per request. That
+	// makes a single blip on this call a failed chat completion, which is what these
+	// retries are for. Replaying it is safe: it ranks providers and starts no
+	// inference, so an attempt that failed in transit costs at most a duplicate
+	// read.
+	//
+	// previewAttempts is the total number of attempts, previewRetryBackoff the pause
+	// before the second (doubling for each after it).
+	previewAttempts     = 3
+	previewRetryBackoff = 200 * time.Millisecond
+	// previewAttemptTimeout bounds ONE attempt, end to end.
+	//
+	// Without it an attempt has no bound at all: r.http sets only
+	// ResponseHeaderTimeout, which covers the wait for response HEADERS and not the
+	// body read, so a router that dribbles a reply keeps a caller waiting for as
+	// long as it likes. Preview is a small control-plane call that never streams and
+	// whose body is already capped at maxControlBodyBytes, so bounding the whole
+	// attempt costs nothing real — and it is what makes the ceiling below a fact
+	// rather than an assumption.
+	previewAttemptTimeout = controlPlaneHeaderTimeout
+	// previewRetryBudget gates whether ANOTHER attempt may start. It is checked
+	// before each backoff and never imposed on an attempt already in flight, so it
+	// can never cut short a preview that is about to succeed.
+	//
+	// Because it only gates entry, the end-to-end ceiling is this budget PLUS one
+	// full attempt — about 2× controlPlaneHeaderTimeout, NOT 1×. An earlier version
+	// of this comment claimed that retrying inside the budget added no worst case a
+	// caller did not already have. That was wrong: a probe failing each attempt
+	// after 20s measured 40s against a 30s "budget", because the budget check had
+	// already passed when the second attempt began. State the real bound.
+	//
+	// What the budget does buy is self-selection for the cases retrying helps: a
+	// fast failure (refused connection, reset, a proxy's 502) leaves nearly the
+	// whole budget and gets its retries, while a router that hangs until its
+	// attempt timeout consumes the budget in one attempt and gets none — which is
+	// right, because there retrying only makes the user wait longer for the same
+	// error. The middle case (a proxy that 502s after 20s) does get one more
+	// attempt, and previewAttemptTimeout is what bounds what that costs.
+	previewRetryBudget = controlPlaneHeaderTimeout
 	// quoteVerifyTimeout bounds a single (de-duplicated) quote verification, which
 	// runs under a context detached from any one caller (so no caller's
 	// cancellation kills the shared work); this caps a hung upstream instead.
 	quoteVerifyTimeout = 60 * time.Second
 	// x25519PubLen is the byte length of the HPKE (X25519) recipient key.
 	x25519PubLen = 32
+	// maxPreviewCandidates caps how many candidates one preview reply may contribute
+	// to the fallback chain. The router chooses the list and nothing else bounds its
+	// length — maxControlBodyBytes leaves room for thousands — and core walks it
+	// SERIALLY, so N is one of the two factors in what a failing chain costs a
+	// caller (core.resolveBudget bounds the other). Truncating is cheap and safe
+	// here: the list arrives ranked best-first, so what is dropped is the tail the
+	// client would reach only after everything better had already failed.
+	maxPreviewCandidates = 8
 	// maxControlBodyBytes caps a control-plane response body read (preview /
 	// pubkey), guarding against an unbounded response.
 	maxControlBodyBytes = 1 << 20 // 1 MiB
@@ -155,6 +205,22 @@ type Router struct {
 	// per-request cost.
 	quoteReverify    rateLimiter
 	signerRevalidate rateLimiter
+	// The preview pacing pair, defaulted from previewAttemptTimeout and
+	// previewRetryBudget. Fields rather than bare constants so a test can scale both
+	// down and exercise the real end-to-end ceiling (budget + one attempt) in
+	// milliseconds instead of a minute — per Router, not mutable globals, so such
+	// tests stay parallel-safe.
+	//
+	// Read through attemptTimeout()/retryBudget(), which default a zero the way
+	// candidateWalk.limit() does. Without that, a Router not built by New — and the
+	// tests already construct &Router{} directly — gave every preview an
+	// already-expired context and failed every request, silently and totally.
+	previewAttemptTO time.Duration
+	previewBudgetTO  time.Duration
+	// previewRetries switches preview retries off while the router looks down, so a
+	// router outage does not become a load multiplier against it and a slot-holding
+	// multiplier against us. See retryGate.
+	previewRetries retryGate
 	// warmState is the outcome of the most recent completed warmer sweep — how many
 	// providers it prepared end to end — read by a caller that needs to know whether
 	// this process can serve anything at all (see WarmState).
@@ -301,15 +367,17 @@ func New(routerURL string, opts ...Option) *Router {
 	tr := core.NewPooledTransport()
 	tr.ResponseHeaderTimeout = controlPlaneHeaderTimeout
 	r := &Router{
-		previewURL:      base + previewPath,
-		completionsURL:  base + completionsPath,
-		providersURL:    base + providersPath,
-		serviceType:     DefaultServiceType,
-		sensitiveFields: sliceToSet(wire.DefaultSealedFields()),
-		http:            &http.Client{Transport: tr},
-		cache:           newPubkeyCache(defaultPubkeyTTL),
-		quoteCache:      newQuoteCache(defaultQuoteTTL),
-		identities:      newIdentityStore(providerIdentityTTL, maxProviderIdentities),
+		previewURL:       base + previewPath,
+		completionsURL:   base + completionsPath,
+		providersURL:     base + providersPath,
+		serviceType:      DefaultServiceType,
+		sensitiveFields:  sliceToSet(wire.DefaultSealedFields()),
+		http:             &http.Client{Transport: tr},
+		previewAttemptTO: previewAttemptTimeout,
+		previewBudgetTO:  previewRetryBudget,
+		cache:            newPubkeyCache(defaultPubkeyTTL),
+		quoteCache:       newQuoteCache(defaultQuoteTTL),
+		identities:       newIdentityStore(providerIdentityTTL, maxProviderIdentities),
 	}
 	for _, o := range opts {
 		o(r)
@@ -946,6 +1014,74 @@ func (r *Router) fetchQuote(ctx context.Context, quoteURL string) ([]byte, error
 	return raw, nil
 }
 
+// attemptTimeout and retryBudget read the pacing pair with the constants as
+// defaults, so a zero value means "unset" rather than "instantly expired" / "no
+// retries". Mirrors candidateWalk.limit(); the asymmetry between them was one
+// direct-construction away from being live.
+func (r *Router) attemptTimeout() time.Duration {
+	if r.previewAttemptTO > 0 {
+		return r.previewAttemptTO
+	}
+	return previewAttemptTimeout
+}
+
+func (r *Router) retryBudget() time.Duration {
+	if r.previewBudgetTO > 0 {
+		return r.previewBudgetTO
+	}
+	return previewRetryBudget
+}
+
+// previewResult classifies one preview attempt, so the retry decision and the
+// metric label come from ONE judgement rather than a bool and a string that can
+// drift apart.
+//
+// The split that matters is rejected vs broken. Both are terminal, but only one is
+// about the router being unwell: a 401 from a tenant with a misconfigured key, or
+// an empty candidate list because the fleet has nobody for that model, is the
+// router ANSWERING — correctly, from its point of view. Folding those into the
+// same bucket as "we could not get a usable answer" makes any alert on preview
+// health pinnable by a single misconfigured caller.
+type previewResult string
+
+const (
+	// previewOK: a usable candidate list.
+	previewOK previewResult = "ok"
+	// previewRetryable: no answer yet — a transport failure, a body that dropped
+	// mid-read, or a 5xx. Another attempt may get one.
+	previewRetryable previewResult = "retryable"
+	// previewRejected: the router answered definitively and negatively — a 4xx or
+	// 429, or a well-formed reply with no candidates. Retrying cannot change it,
+	// and it is usually about the caller or the fleet, not about the router.
+	previewRejected previewResult = "rejected"
+	// previewBroken: the router answered with something unusable (a body that will
+	// not decode). Terminal like rejected, but this one IS the router misbehaving.
+	previewBroken previewResult = "broken"
+	// previewCanceled: the caller went away mid-attempt. Says nothing about the
+	// router, so it is kept out of every failure bucket.
+	previewCanceled previewResult = "canceled"
+	// previewInternal: a fault in THIS process — a request we could not even build.
+	// Its own bucket for the same reason the data plane has one: our bug must not
+	// point a runbook at the router.
+	previewInternal previewResult = "internal"
+)
+
+// callOutcome maps the attempt result that ENDED a preview onto the call-level
+// outcome. Only "no usable answer" becomes failed; a definitive negative travels
+// through as rejected so the two can be alerted on differently.
+func (r previewResult) callOutcome() string {
+	switch r {
+	case previewRejected:
+		return "rejected"
+	case previewCanceled:
+		return "canceled"
+	case previewInternal:
+		return "internal"
+	default:
+		return "failed"
+	}
+}
+
 // previewProvider is one candidate in the route-preview reply.
 type previewProvider struct {
 	Address     string `json:"address"`
@@ -971,6 +1107,10 @@ type previewResponse struct {
 // request. "model" is optional and passes through when present (it is not a
 // sealed field): present → candidates are that model's providers; omitted →
 // candidates are any provider of the service type.
+//
+// A transient failure is retried (see previewAttempts and previewRetryBudget for
+// the policy and its sizing); a definitive one is returned on the first attempt,
+// so a caller's 401 or 404 is never delayed by a retry that cannot change it.
 func (r *Router) preview(ctx context.Context, req wire.Request) ([]previewProvider, error) {
 	payload := make(map[string]json.RawMessage, len(req)+1)
 	for k, v := range req {
@@ -984,13 +1124,144 @@ func (r *Router) preview(ctx context.Context, req wire.Request) ([]previewProvid
 	serviceTypeJSON, _ := json.Marshal(r.serviceType)
 	payload["service_type"] = serviceTypeJSON
 
+	// One call-level observation on EVERY exit path, recorded by a defer rather than
+	// at each return so the counter cannot drift from the control flow as this loop
+	// grows. "failed" is the honest default: it is what falling out of the loop
+	// means, and every better outcome overwrites it before returning.
+	//
+	// Installed before the marshal below, which used to return ahead of it — the one
+	// exit that recorded nothing at all, and the one that most obviously belongs in
+	// the internal bucket.
+	start := time.Now()
+	outcome := "failed"
+	defer func() { metrics.PreviewCall(outcome, time.Since(start)) }()
+
+	// Marshal once, outside the retry loop: the body is identical on every attempt
+	// (each attempt wraps these bytes in its own reader), and a marshal failure is a
+	// fault in the request we were handed, not something an attempt could clear.
 	body, err := json.Marshal(payload)
 	if err != nil {
+		outcome = previewInternal.callOutcome()
 		return nil, upstream(0, fmt.Errorf("marshal preview request: %w", err))
 	}
+
+	backoff := previewRetryBackoff
+	var lastErr error
+	for attempt := 0; attempt < previewAttempts; attempt++ {
+		if attempt > 0 {
+			// Stop when the next backoff would carry this preview past its budget, and
+			// surface the failure we already have rather than a budget message: the
+			// caller wants to know what the router did, not how we paced our retries.
+			if time.Since(start)+backoff >= r.retryBudget() {
+				break
+			}
+			// Retries are off while the router is failing everything: the first attempt
+			// above already happened, so the caller loses nothing but the amplification.
+			if !r.previewRetries.allow() {
+				// Count the retries NOT made, not the calls that lost them: the whole
+				// point of the number is how much amplification was shed, and one Inc()
+				// per call under-reported that by up to previewAttempts-1.
+				metrics.PreviewRetrySuppressed(previewAttempts - attempt)
+				break
+			}
+			t := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				outcome = "canceled"
+				return nil, upstream(0, fmt.Errorf("route preview: %w (last error: %v)", ctx.Err(), lastErr))
+			case <-t.C:
+			}
+			backoff *= 2
+		}
+		providers, res, err := r.previewOnce(ctx, body, req)
+		if err == nil {
+			metrics.PreviewAttempt(string(res))
+			r.previewRetries.answered()
+			// A success that NEEDED a retry gets its own outcome. It is the series that
+			// shows the retries earning their keep — and the one that stops a degrading
+			// router from hiding behind a flat error rate, which is the whole failure
+			// mode of adding retries to an uncached dependency.
+			outcome = "ok"
+			if attempt > 0 {
+				outcome = "ok_retried"
+			}
+			return providers, nil
+		}
+		// Only a RETRYABLE failure may be re-attributed to the caller, and the test is
+		// an allowlist for the same reason verifyOutcome's is: written as "anything
+		// when ctx is done" it also relabelled previewBroken — the router answering
+		// with a body that will not decode, which the constant defines as the router
+		// misbehaving — and previewInternal, our own fault. Both would have landed in
+		// canceled, the one bucket every alert deliberately ignores. Reachable, too:
+		// the caller need only go away after the body was read.
+		//
+		// Testing ctx before the success branch above would be the same mistake in the
+		// other direction, counting an attempt that had just returned a usable list as
+		// canceled and leaving the attempt and call series contradicting each other.
+		//
+		// A caller that has given up is attributed to itself, not to the router — the
+		// same distinction chain.noteFailure draws before stamping a cooldown.
+		if res == previewRetryable && ctx.Err() != nil {
+			res = previewCanceled
+		}
+		metrics.PreviewAttempt(string(res))
+		lastErr = err
+		if res != previewRetryable {
+			// Deliberately does NOT touch the retry gate. An earlier version reset it
+			// here on the reasoning that rejected and broken prove the router is
+			// replying — but the gate is about whether RETRYING is worth doing, and
+			// neither of those outcomes retries at all. Resetting on them reopened the
+			// gate for free whenever a load balancer mixed 404s and 403s in with the
+			// 502s during a router-layer outage, which is the one scenario the gate
+			// exists for: the 502 requests went back to 3x amplification and to holding
+			// a LimitInFlight slot for the full ceiling. Only a preview that actually
+			// succeeded is evidence that retries are worth making again.
+			outcome = res.callOutcome()
+			return nil, err
+		}
+	}
+	// Out of attempts (or out of budget, or out of retry allowance) with only
+	// retryable failures behind us: we never got a usable answer, which is the one
+	// shape that is squarely the router's — and the one the gate counts.
+	r.previewRetries.noAnswer()
+	return nil, lastErr
+}
+
+// previewOnce performs a single route-preview POST with the already-marshaled
+// body, returning the ranked candidate list. req is used only to describe what was
+// previewed in the "no provider available" error.
+//
+// The returned previewResult drives both the retry decision and the metric label.
+// previewRetryable is worth another attempt: a transport failure (the request may
+// never have arrived), a body that dropped mid-read (nothing was decoded yet), or
+// a 5xx (the router faulted, and may not next time). Everything else is terminal:
+//   - 429 is the router's own per-account rate limiter. Note this deliberately
+//     differs from the data plane's retryableStatus, where a 429 means "try a
+//     different provider" — here there is only the one router, so another attempt
+//     spends more of the caller's allowance to be told the same thing, and the
+//     caller is better served by seeing the status and its Retry-After.
+//   - any other 4xx is a client fault (auth, bad request, unknown model) that
+//     recurs identically. Both are previewRejected: the router answered.
+//   - an empty candidate list is also the router answering — negatively, about
+//     the fleet — so it is previewRejected too, not a failure to reach it.
+//   - a body that will not decode is previewBroken: an answer, but an unusable
+//     one, and unlike the others it is the router itself misbehaving.
+//
+// The attempt runs under its own previewAttemptTimeout, which is what bounds it:
+// the shared client caps only the wait for headers, so without this a slow body
+// would leave the attempt (and the retry ceiling built on it) unbounded.
+func (r *Router) previewOnce(ctx context.Context, body []byte, req wire.Request) ([]previewProvider, previewResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, r.attemptTimeout())
+	defer cancel()
+
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, r.previewURL, bytes.NewReader(body))
 	if err != nil {
-		return nil, upstream(0, err)
+		// Reachable only for a previewURL this process built wrong — our own
+		// configuration, not the router misbehaving. (The gateway parses -router-url at
+		// startup and exits, so this is near-unreachable; label it honestly anyway,
+		// because "broken" sends a runbook at the router.)
+		return nil, previewInternal, upstream(0, err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	// Forward routing directives first, then the credential, so the credential
@@ -1006,33 +1277,48 @@ func (r *Router) preview(ctx context.Context, req wire.Request) ([]previewProvid
 
 	resp, err := r.http.Do(httpReq)
 	if err != nil {
-		return nil, upstream(0, fmt.Errorf("route preview request: %w", err))
+		return nil, previewRetryable, upstream(0, fmt.Errorf("route preview request: %w", err))
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxControlBodyBytes))
 	if err != nil {
-		return nil, upstream(0, fmt.Errorf("read route preview response: %w", err))
+		return nil, previewRetryable, upstream(0, fmt.Errorf("read route preview response: %w", err))
 	}
 	if resp.StatusCode != http.StatusOK {
 		// Surface the router's status verbatim (401/404/503 are meaningful) and carry
 		// its body as Error.Body; the proxy decides whether to pass the router's
 		// client-facing error through (sidecar / structured passthrough) or withhold
 		// it (see openaiproxy.errorEnvelope).
-		return nil, upstreamBody(resp.StatusCode, raw, fmt.Errorf("route preview returned %d", resp.StatusCode))
+		return nil, previewStatusResult(resp.StatusCode),
+			upstreamBody(resp.StatusCode, raw, fmt.Errorf("route preview returned %d", resp.StatusCode))
 	}
 
 	var pr previewResponse
 	if err := json.Unmarshal(raw, &pr); err != nil {
-		return nil, upstream(0, fmt.Errorf("decode route preview response: %w", err))
+		return nil, previewBroken, upstream(0, fmt.Errorf("decode route preview response: %w", err))
 	}
 	if len(pr.Providers) == 0 {
-		return nil, upstream(http.StatusServiceUnavailable, fmt.Errorf("no provider available for %s", modelDesc(req)))
+		return nil, previewRejected, upstream(http.StatusServiceUnavailable, fmt.Errorf("no provider available for %s", modelDesc(req)))
 	}
 	// The router returns candidates ranked best-first; core pins the head and
 	// falls back down the rest (SPEC §4.4). Per-candidate validation is deferred
 	// to routeCandidates.Provider so a single malformed candidate is skipped, not
-	// fatal to the whole list.
-	return pr.Providers, nil
+	// fatal to the whole list. Trimmed to maxPreviewCandidates so the length of the
+	// walk is ours rather than the router's.
+	if len(pr.Providers) > maxPreviewCandidates {
+		pr.Providers = pr.Providers[:maxPreviewCandidates]
+	}
+	return pr.Providers, previewOK, nil
+}
+
+// previewStatusResult classifies a non-200 route-preview status. Only a 5xx is
+// worth another attempt; everything else is the router answering (see previewOnce
+// for why 429 is not retried here even though the data plane retries it).
+func previewStatusResult(status int) previewResult {
+	if status >= 500 && status <= 599 {
+		return previewRetryable
+	}
+	return previewRejected
 }
 
 // pubkeyResponse is the broker's /v1/e2ee/pubkey reply.
