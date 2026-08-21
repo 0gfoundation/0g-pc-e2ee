@@ -577,11 +577,13 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 	}
 
 	// Fall back down the candidate chain: attempt a candidate and, on a retryable
-	// provider failure, re-seal to the next and retry (SPEC §4.4). lastErr holds
-	// the most recent failure so a fully exhausted chain surfaces a real cause.
+	// provider failure, re-seal to the next and retry (SPEC §4.4).
+	//
 	// The walk charges every materialization and every failed attempt against one
 	// shared budget, so a long chain cannot keep the caller waiting indefinitely (see
-	// resolveBudget). fail keeps the most useful failure seen (see walkErr).
+	// resolveBudget). fail keeps the most USEFUL failure seen rather than the most
+	// recent — a provider's own reply outranks a budget cut, which outranks our
+	// bookkeeping about a candidate we could not prepare (see walkErr).
 	var fail walkErr
 	walk := candidateWalk{budget: c.resolveBudgetTO}
 	for i := 0; i < cands.Len(); i++ {
