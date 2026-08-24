@@ -338,9 +338,31 @@ curl -s https://<gateway-domain>/v1/providers/0x7B3f…9aC1/identity
   },
   "os_image": null,
   "compose_hash": "8779f38c…",
+  "containers": [                  // what compose_hash commits to, in file order
+    {"name": "broker", "image": "ghcr.io/0gfoundation/0g-serving-broker",
+                                     "digest": "sha256:ec5df834…"},
+    {"name": "prometheus", "image": "prom/prometheus", "digest": ""}
+  ],
   "verify": "recheck this provider yourself: GET https://broker-07.0g.ai/v1/quote?legacy=false direct from the provider and DCAP-verify it. …"
 }
 ```
+
+`containers` appears only when the app-compose in the provider's reply hashes to the
+`compose_hash` in its verified quote — the same gate as above, and a mismatch reports
+`null` rather than a probably-right list. Two differences from the gateway's own list
+are deliberate:
+
+- **No `source`.** That label answers "can I trace this image to a release of this
+  repository", which works for the gateway because its manifest is published. No
+  per-provider manifest is, so there would be no release to trace to — and the label
+  would end up stamping "third-party" on 0G's own broker image for shipping from a
+  different repository. Absent beats misleading.
+- **An empty `digest` is the finding**, exactly as it is above: that image is pinned
+  by tag, so `compose_hash` commits to a *name* whose contents can be republished
+  underneath it while the hash holds still.
+
+And as with the verdicts: the list being present is not approval. Nothing compared
+these images against an expected set — that is hop 3's empty allowlist again.
 
 **Unlike the self-description above, this one does carry verdicts — and that is
 correct.** These are checks the gateway actually ran on a *third party* before it

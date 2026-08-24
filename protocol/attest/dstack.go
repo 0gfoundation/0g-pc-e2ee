@@ -64,29 +64,61 @@ var ErrNoAppCompose = errors.New("attest: quote response carries no app_compose"
 // it wrote it, so re-encoding equal JSON would change the digest and turn a genuine
 // app-compose into a mismatch.
 //
-// The nesting is dstack's, not ours: the reply's `tcb_info` is a JSON *string*
-// holding a JSON object, whose `app_compose` is in turn a JSON string holding
-// app-compose.json. Both levels are decoded here so the caller handles one shape.
+// The nesting is dstack's, not ours: the reply's `tcb_info` holds a JSON object
+// whose `app_compose` is in turn a JSON string holding app-compose.json. tcb_info
+// itself arrives EITHER as that object or as a JSON string wrapping it, depending on
+// which shape the broker's SDK received from the guest agent; unwrapJSONString
+// accepts both. Every level is decoded here so the caller handles one shape.
 func AppComposeFromQuoteResponse(body []byte) ([]byte, error) {
 	var outer struct {
-		TCBInfo string `json:"tcb_info"`
+		TCBInfo json.RawMessage `json:"tcb_info"`
 	}
 	if err := json.Unmarshal(body, &outer); err != nil {
 		return nil, fmt.Errorf("attest: decode quote response: %w", err)
 	}
-	if outer.TCBInfo == "" {
+	tcbInfo, err := unwrapJSONString(outer.TCBInfo)
+	if err != nil {
+		return nil, fmt.Errorf("attest: decode tcb_info: %w", err)
+	}
+	if len(tcbInfo) == 0 {
 		return nil, ErrNoAppCompose
 	}
 	var tcb struct {
 		AppCompose string `json:"app_compose"`
 	}
-	if err := json.Unmarshal([]byte(outer.TCBInfo), &tcb); err != nil {
+	if err := json.Unmarshal(tcbInfo, &tcb); err != nil {
 		return nil, fmt.Errorf("attest: decode tcb_info: %w", err)
 	}
 	if tcb.AppCompose == "" {
 		return nil, ErrNoAppCompose
 	}
 	return []byte(tcb.AppCompose), nil
+}
+
+// unwrapJSONString returns the document raw holds: raw itself when it is already an
+// object, or the string's contents when the document was delivered quoted.
+//
+// Both shapes are real. dstack's guest agent has shipped tcb_info as a nested object
+// AND as a JSON string holding the same document, and a broker's /v1/quote is a
+// re-serialization of whichever one its SDK received — so committing to either shape
+// silently loses the other. client/dstack.unwrapJSONString normalizes the same two
+// for the same reason; this is a deliberate duplicate rather than a shared helper,
+// because protocol must not depend on client.
+//
+// It normalizes only the WRAPPER. app_compose inside stays a JSON string in every
+// form of the reply, and that is load-bearing rather than awkward: those exact bytes
+// are the preimage of the compose hash, so anything that re-marshals them breaks the
+// digest.
+func unwrapJSONString(raw json.RawMessage) ([]byte, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '"' {
+		return trimmed, nil
+	}
+	var s string
+	if err := json.Unmarshal(trimmed, &s); err != nil {
+		return nil, err
+	}
+	return []byte(s), nil
 }
 
 // MRConfigVersion is the layout version in the first byte of a dstack

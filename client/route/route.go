@@ -32,6 +32,7 @@ package route
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -704,12 +705,23 @@ func (r *Router) containersOf(appCompose []byte, composeHash [attest.ComposeHash
 	}
 	ac, err := evidence.VerifyAppCompose(appCompose, composeHash)
 	if err != nil {
-		// Worth a WARN, not a debug: the reply carried an app-compose that does not
-		// hash to what its own quote commits to. Benign explanations exist (a reply
-		// assembled from a different instance), but so does a substitution attempt, and
-		// this is the one place either would show.
-		r.logger.Warn("provider app-compose does not match the compose_hash its quote binds; reporting no containers",
-			"quote_url", quoteURL, "err", err)
+		// VerifyAppCompose fails for three different reasons and only one of them is a
+		// security signal, so they must not share a line. A digest mismatch means the
+		// reply carried an app-compose that is not the one its own quote commits to —
+		// benign explanations exist (a reply assembled from another instance), but so
+		// does a substitution attempt, and this is the one place either would show.
+		//
+		// The other two — authenticated bytes that are not JSON, or that carry no
+		// docker_compose_file — are past the gate. Logging those as a mismatch would be
+		// false, and would hand an operator a standing security alert every cache miss
+		// for a provider whose runner simply is not docker-compose.
+		if sha256.Sum256(appCompose) != composeHash {
+			r.logger.Warn("provider app-compose does not match the compose_hash its quote binds; reporting no containers",
+				"quote_url", quoteURL, "err", err)
+		} else {
+			r.logger.Debug("provider app-compose is authenticated but carries no readable compose text; reporting no containers",
+				"quote_url", quoteURL, "err", err)
+		}
 		return nil
 	}
 	services, err := compose.ParseServices([]byte(ac.DockerComposeFile))

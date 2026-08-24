@@ -115,3 +115,51 @@ func TestDecodeQuoteResponseIgnoresAppCompose(t *testing.T) {
 		t.Errorf("quote bytes = %x, want the decoded 0400", raw)
 	}
 }
+
+// The guest agent has shipped tcb_info BOTH ways — a nested object and a JSON
+// string holding the same document — and a broker's /v1/quote re-serializes
+// whichever shape its SDK received. Committing to one silently loses the other:
+// before unwrapJSONString the object form failed at the OUTER unmarshal, so the
+// caller saw "cannot unmarshal object into a string" and reported no containers,
+// permanently and (at default log level) silently.
+func TestAppComposeFromQuoteResponseAcceptsObjectTCBInfo(t *testing.T) {
+	const appCompose = `{"docker_compose_file":"services:\n  broker:\n    image: x@sha256:aa\n"}`
+
+	// tcb_info as a nested OBJECT.
+	objForm, err := json.Marshal(map[string]any{
+		"quote":    "00",
+		"tcb_info": map[string]string{"app_compose": appCompose},
+	})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	// tcb_info as a JSON STRING holding the same document.
+	inner, err := json.Marshal(map[string]string{"app_compose": appCompose})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	strForm, err := json.Marshal(map[string]string{"quote": "00", "tcb_info": string(inner)})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name string
+		body []byte
+	}{
+		{"object form", objForm},
+		{"string form", strForm},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := AppComposeFromQuoteResponse(tc.body)
+			if err != nil {
+				t.Fatalf("AppComposeFromQuoteResponse: %v", err)
+			}
+			// Byte-for-byte: these bytes are the preimage of the compose hash, so a shape
+			// difference in the WRAPPER must not change what comes out of it.
+			if string(got) != appCompose {
+				t.Errorf("app_compose = %q, want %q", got, appCompose)
+			}
+		})
+	}
+}

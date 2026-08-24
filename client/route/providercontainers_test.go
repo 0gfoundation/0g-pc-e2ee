@@ -1,8 +1,11 @@
 package route
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
+	"log/slog"
+	"strings"
 	"testing"
 )
 
@@ -167,5 +170,61 @@ func TestContainersOfHandlesRealComposeShapes(t *testing.T) {
 		if s.Image == "not-a-service" {
 			t.Errorf("text inside a literal command block was read as an image: %+v", s)
 		}
+	}
+}
+
+// The gate has three failure exits and only one is a security signal. A digest
+// mismatch is a possible substitution and must WARN; authenticated bytes that
+// simply carry no compose text are past the gate, and logging those as a mismatch
+// would be false — and would hand an operator a standing security alert on every
+// cache miss for a provider whose runner is not docker-compose.
+func TestContainersOfWarnsOnlyOnDigestMismatch(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		mutate   func(raw []byte, hash [32]byte) ([]byte, [32]byte)
+		wantWarn bool
+	}{
+		{
+			name: "digest mismatch",
+			mutate: func(raw []byte, _ [32]byte) ([]byte, [32]byte) {
+				_, other := appComposeWith(t, "services:\n  x:\n")
+				return raw, other
+			},
+			wantWarn: true,
+		},
+		{
+			name: "authenticated, no docker_compose_file",
+			mutate: func(_ []byte, _ [32]byte) ([]byte, [32]byte) {
+				raw := []byte(`{"allowed_envs":["A"]}`)
+				return raw, sha256.Sum256(raw)
+			},
+			wantWarn: false,
+		},
+		{
+			name: "authenticated, not JSON",
+			mutate: func(_ []byte, _ [32]byte) ([]byte, [32]byte) {
+				raw := []byte("not json at all")
+				return raw, sha256.Sum256(raw)
+			},
+			wantWarn: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			r := &Router{logger: slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))}
+			raw, hash := appComposeWith(t, testComposeText)
+			raw, hash = tc.mutate(raw, hash)
+
+			if got := r.containersOf(raw, hash, "https://broker.example/v1/quote"); got != nil {
+				t.Fatalf("containers = %+v, want nil", got)
+			}
+			gotWarn := strings.Contains(buf.String(), "level=WARN")
+			if gotWarn != tc.wantWarn {
+				t.Errorf("WARN emitted = %v, want %v; log was:\n%s", gotWarn, tc.wantWarn, buf.String())
+			}
+			if !tc.wantWarn && strings.Contains(buf.String(), "does not match the compose_hash") {
+				t.Errorf("logged a mismatch for bytes that passed the hash gate:\n%s", buf.String())
+			}
+		})
 	}
 }
