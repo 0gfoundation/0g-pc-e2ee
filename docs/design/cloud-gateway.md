@@ -259,8 +259,26 @@ This does not reopen the "no `/quote` route" decision: publishing a parsed
 
 `GET /v1/providers/{address}/identity` answers the other half of the same panel: the
 provider hop. For a provider this gateway has sealed to, it returns that provider's
-serving `endpoint`, the `compose_hash` out of its verified quote, and — unlike §6.3 —
-**verdicts**: `quote_dcap`, `onchain_signer`, `measurement`.
+serving `endpoint`, the `compose_hash` out of its verified quote, the `containers`
+that hash commits to, and — unlike §6.3 — **verdicts**: `quote_dcap`,
+`onchain_signer`, `measurement`.
+
+`containers` reaches the wire only through a hash gate, and the gate is the whole of
+its standing. The compose text rides in the quote reply's `tcb_info`, which Intel
+does not sign, so it is worth nothing until SHA-256 over it equals the `compose_hash`
+the *verified* quote commits to in `mr_config_id`. Past that gate it is the manifest
+the enclave actually booted; short of it, it is discarded — a mismatch reports no
+containers rather than a probably-right list, and logs, because the same shape covers
+both a stale reply and a substitution attempt.
+
+What it is **not** is a check. Nothing compared those images against an expected set —
+that is hop 3's unfilled allowlist — so a panel may render the list but must not read
+its existence as approval. The one finding it carries unaided is an **empty digest**:
+an image pinned by tag leaves `compose_hash` committing to a *name* whose contents can
+be republished under it, so the absence is rendered rather than hidden. Unlike §6.3's
+container list there is no `source` label, because no per-provider manifest is
+published — there is no release to trace an image to, and the label would end up
+stamping "third-party" on 0G's own broker image for shipping from another repository.
 
 The asymmetry with §6.3 is the point, so state it precisely. There, the gateway is
 describing **itself**, and nothing verified anything, so a verdict of any shape would

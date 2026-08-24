@@ -106,3 +106,66 @@ func TestContainersOfDegradesQuietly(t *testing.T) {
 		}
 	})
 }
+
+// realShapeCompose mirrors the production broker's file where it is awkward to
+// parse: comments that contain colons and image-looking text, a literal-block
+// command carrying shell with its own `image:` string, ${VAR:?msg} interpolation,
+// a service whose digest and tag are both present, and trailing top-level keys
+// after `services`. A regex would trip on several of these; the node walk should
+// not.
+const realShapeCompose = `services:
+  broker-ingress:
+    # Pinned by digest, not by tag, because this container mounts dstack.sock.
+    # Re-resolve when upgrading:
+    #   docker buildx imagetools inspect dstacktee/dstack-ingress:2.2
+    image: dstacktee/dstack-ingress:2.2@sha256:d05a7b34
+    environment:
+      - DOMAIN=${DOMAIN:?set DOMAIN — there is no default}
+  prometheus-init:
+    image: alpine:3.18@sha256:de0eb0b3
+    command: |
+      sh -c 'if [ -n "$$PROMETHEUS_CONFIG" ]; then
+        echo "image: not-a-service" > /tmp/prometheus.yml
+      fi'
+  prometheus:
+    image: prom/prometheus:v2.45.2
+  node-exporter:
+    image: prom/node-exporter:v1.7.0
+    privileged: true
+
+volumes:
+  broker-config:
+
+networks:
+  default:
+    name: 0g-serving-network
+`
+
+func TestContainersOfHandlesRealComposeShapes(t *testing.T) {
+	r := &Router{logger: discardLogger()}
+	raw, hash := appComposeWith(t, realShapeCompose)
+
+	got := r.containersOf(raw, hash, "https://broker.example/v1/quote")
+	if len(got) != 4 {
+		t.Fatalf("got %d services, want 4 (volumes/networks must not become services): %+v", len(got), got)
+	}
+	want := []struct{ name, image, tag, digest string }{
+		{"broker-ingress", "dstacktee/dstack-ingress", "2.2", "sha256:d05a7b34"},
+		{"prometheus-init", "alpine", "3.18", "sha256:de0eb0b3"},
+		{"prometheus", "prom/prometheus", "v2.45.2", ""},
+		{"node-exporter", "prom/node-exporter", "v1.7.0", ""},
+	}
+	for i, w := range want {
+		if got[i].Name != w.name || got[i].Image != w.image || got[i].Tag != w.tag || got[i].Digest != w.digest {
+			t.Errorf("service %d = %+v, want name=%q image=%q tag=%q digest=%q",
+				i, got[i], w.name, w.image, w.tag, w.digest)
+		}
+	}
+	// The shell inside the literal block says `image: not-a-service`. It is a scalar
+	// value, not a mapping key, so nothing should have picked it up.
+	for _, s := range got {
+		if s.Image == "not-a-service" {
+			t.Errorf("text inside a literal command block was read as an image: %+v", s)
+		}
+	}
+}
