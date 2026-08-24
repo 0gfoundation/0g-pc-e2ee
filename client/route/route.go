@@ -1196,10 +1196,6 @@ func (r *Router) preview(ctx context.Context, req wire.Request) ([]previewProvid
 		// canceled, the one bucket every alert deliberately ignores. Reachable, too:
 		// the caller need only go away after the body was read.
 		//
-		// Testing ctx before the success branch above would be the same mistake in the
-		// other direction, counting an attempt that had just returned a usable list as
-		// canceled and leaving the attempt and call series contradicting each other.
-		//
 		// A caller that has given up is attributed to itself, not to the router — the
 		// same distinction chain.noteFailure draws before stamping a cooldown.
 		if res == previewRetryable && ctx.Err() != nil {
@@ -1208,15 +1204,8 @@ func (r *Router) preview(ctx context.Context, req wire.Request) ([]previewProvid
 		metrics.PreviewAttempt(string(res))
 		lastErr = err
 		if res != previewRetryable {
-			// Deliberately does NOT touch the retry gate. An earlier version reset it
-			// here on the reasoning that rejected and broken prove the router is
-			// replying — but the gate is about whether RETRYING is worth doing, and
-			// neither of those outcomes retries at all. Resetting on them reopened the
-			// gate for free whenever a load balancer mixed 404s and 403s in with the
-			// 502s during a router-layer outage, which is the one scenario the gate
-			// exists for: the 502 requests went back to 3x amplification and to holding
-			// a LimitInFlight slot for the full ceiling. Only a preview that actually
-			// succeeded is evidence that retries are worth making again.
+			// Does not touch the retry gate: only a preview that SUCCEEDED reopens it
+			// (retryGate.answered explains why a definitive reply does not).
 			outcome = res.callOutcome()
 			return nil, err
 		}

@@ -415,7 +415,7 @@ func canceledBy(parent context.Context) bool { return parent.Err() != nil }
 // conclude something new, and it was already wrong once. UpstreamInternal used to
 // fall through it, so a binder of ours that would not produce its text got filed as
 // "canceled" whenever the caller had left — a bug of ours in the one bucket every
-// alert deliberately ignores, which is exactly what the onFrame site refuses to do.
+// alert deliberately ignores.
 func verifyOutcome(parent, attempt context.Context, concluded string) string {
 	if concluded != UpstreamUnverifiable {
 		return concluded
