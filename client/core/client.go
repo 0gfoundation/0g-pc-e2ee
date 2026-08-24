@@ -236,9 +236,8 @@ type MetricsHook interface {
 	// truncated a call's work: it cut a candidate's materialization short, or it
 	// denied a fallback the walk would otherwise have made. It is the only signal
 	// that a request was cut at that ceiling rather than by anything upstream, and
-	// therefore the only way to tell whether the ceiling is set anywhere near right
-	// — so it must not also fire where the walk was ending anyway (see
-	// metricWalkBudgetBlockedFallback).
+	// therefore the only way to tell whether the ceiling is set anywhere near
+	// right — which is why it must not also fire where the walk was ending anyway.
 	WalkBudgetExhausted()
 	// CandidateFallback is called each time the client gives up on a candidate and
 	// moves to the next, with reason FallbackUpstream (an attempt failed
@@ -335,24 +334,20 @@ func (c *Client) metricFallback(reason string, i, n int) {
 	}
 }
 
-// metricWalkBudgetExhausted reports one walk cut short by resolveBudget. Used
-// where the budget genuinely truncated work: materializing a candidate runs under
-// a deadline derived from what is left, so even on the last candidate the ceiling
-// really did cut it.
+// metricWalkBudgetExhausted reports one walk the budget truncated. For the
+// materialization sites: that work runs under a deadline derived from what is left,
+// so even on the last candidate the ceiling really did cut it.
 func (c *Client) metricWalkBudgetExhausted() {
 	if c.metrics != nil {
 		c.metrics.WalkBudgetExhausted()
 	}
 }
 
-// metricWalkBudgetBlockedFallback reports the budget stopping a fallback after a
-// failed attempt — where, unlike materialization, a running attempt is never cut
-// short by the budget, so its only effect is to decide whether to move on. Guarded
-// like metricFallback, and for the same reason: on the last candidate there is
-// nothing to move on to, the ceiling truncated nothing, and counting it would book
-// every request whose upstream is slower than resolveBudget (90s, against a 630s
-// provider timeout) as our ceiling firing — on a single-candidate deployment, the
-// common shape, that series would read "slow failure", not "limit reached".
+// metricWalkBudgetBlockedFallback is the same report from an attempt site, where
+// the budget cuts nothing — a running attempt is never interrupted by it — and only
+// decides whether to move on. Hence the metricFallback guard: with no next
+// candidate there was nothing to move on to, so counting it would book every
+// upstream slower than resolveBudget as our ceiling firing.
 func (c *Client) metricWalkBudgetBlockedFallback(i, n int) {
 	if i+1 < n {
 		c.metricWalkBudgetExhausted()

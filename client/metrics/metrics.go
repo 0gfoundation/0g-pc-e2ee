@@ -495,9 +495,8 @@ func CandidateFallback(reason string) { candidateFallbacks.WithLabelValues(reaso
 
 // SignatureFetch records one §8 signature fetch — one per verified response — and
 // its end-to-end latency including retries. outcome is a fixed low-cardinality
-// label: ok, ok_retried, failed, timeout, canceled — see the metric's Help, which is
-// the one place the set is described (this comment had already drifted from it once
-// by omitting timeout).
+// label; the metric's Help is the one place the set is described, because this
+// comment restated it and drifted from it twice.
 func SignatureFetch(outcome string, dur time.Duration) {
 	signatureFetchCalls.WithLabelValues(outcome).Inc()
 	signatureFetchDuration.Observe(dur.Seconds())

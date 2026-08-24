@@ -71,28 +71,22 @@ var _ core.SignatureFetcher = (*SignatureFetcher)(nil)
 // skipping.
 func (f *SignatureFetcher) FetchSignature(ctx context.Context, provider core.Provider, chatKey string) (proof.ChatSignature, error) {
 	// One observation per fetch on every exit path, recorded by a defer so no return
-	// escapes it. This fetch is serial with the response — every verified completion
-	// waits for it — so its latency is added to each of them, and "ok_retried" is
-	// how the expected 404 race (the broker caches the signature at end-of-response)
-	// shows up before it becomes a per-response backoff.
-	//
-	// Installed BEFORE the two checks below, which used to return ahead of it. Both
-	// are real fail-closed verification failures — a candidate with no endpoint, or
-	// an endpoint/chatKey (both from untrusted hops) that will not form a URL — and
-	// skipping them left exactly the blind spot this counter exists to close: the
-	// response goes unverified while the §8 panel reads zero.
+	// escapes it — including the two pre-flight checks below, which used to return
+	// ahead of it and left the response unverified while the §8 panel read zero.
+	// This fetch is serial with the response, so its latency is added to every
+	// verified completion, and "ok_retried" is how the expected 404 race (the broker
+	// caches the signature at end-of-response) shows up before it becomes a
+	// per-response backoff.
 	start := time.Now()
 	outcome := "failed"
 	defer func() { metrics.SignatureFetch(outcome, time.Since(start)) }()
 
-	// Metered, but NOT as "failed": neither check has asked the broker anything yet,
-	// and "failed" is the bucket an operator reads as "the broker is not serving
-	// signatures". A missing endpoint is a materialization gap on our side; a chatKey
-	// or endpoint that will not form a URL is bad input reaching us. Both fail
-	// verification closed either way, which is what response_verification_failures
-	// and the upstream "unverifiable" outcome are for. Same §4 rule the other two
-	// planes already follow — our fault is never a provider alert — applied here,
-	// where it was not.
+	// Metered as "internal", not "failed": neither check has asked the broker
+	// anything, and "failed" is the bucket an operator reads as "the broker is not
+	// serving signatures". A missing endpoint is a materialization gap of ours; an
+	// endpoint or chatKey that will not form a URL is bad input reaching us. Both
+	// still fail verification closed, which is what response_verification_failures
+	// and the upstream "unverifiable" outcome record.
 	if provider.Endpoint == "" {
 		outcome = "internal"
 		return proof.ChatSignature{}, fmt.Errorf("no provider endpoint to fetch the response signature from")
@@ -122,24 +116,21 @@ func (f *SignatureFetcher) FetchSignature(ctx context.Context, provider core.Pro
 			return sig, nil
 		}
 		lastErr = err
-		// Only a RETRYABLE failure may be re-attributed. fetchOnce's other three
-		// conclusions are the broker ANSWERING definitively — a non-404 4xx, or a body
-		// that will not decode — and relabelling those because the context happened to
-		// be done files a corrupt signature from a provider under "canceled", the one
-		// bucket every alert deliberately ignores. That is the same blind spot the
-		// relocated defers were installed to close, and the same guard preview
-		// (res == previewRetryable) and verifyOutcome (concluded != unverifiable)
-		// already carry. This site was written without it.
+		// Only a RETRYABLE failure may be re-attributed. fetchOnce's other conclusions
+		// are the broker ANSWERING definitively — a non-404 4xx, or a body that will
+		// not decode — and relabelling those because the context happened to be done
+		// files a corrupt signature from a provider under "canceled", the one bucket
+		// every alert deliberately ignores. Preview and verifyOutcome carry the same
+		// allowlist guard for the same reason.
 		if retryable && ctx.Err() != nil {
 			// Something other than the broker ended this; that says nothing about it.
 			outcome = endedBy(ctx)
 			return proof.ChatSignature{}, err
 		}
 		if !retryable {
-			// One of fetchOnce's definitive failures is not the broker's: failing to
-			// build the GET at all. Unreachable in practice (the URL was already
-			// derived and validated), classified anyway so "failed" means one thing
-			// on every exit path rather than on the reachable ones only.
+			// One definitive failure is not the broker's: failing to build the GET.
+			// Unreachable (the URL was derived and validated above), classified
+			// anyway so "failed" means one thing on every exit path.
 			if errors.Is(err, errRequestBuild) {
 				outcome = "internal"
 			}

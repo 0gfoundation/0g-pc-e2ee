@@ -828,15 +828,12 @@ func TestCallerDisconnectIsNotAFallback(t *testing.T) {
 	}
 }
 
-// A slow retryable failure on the LAST candidate is not a ceiling cut. At an
-// attempt site the budget's only effect is to stop the walk from moving on — a
-// running attempt is never cut short by it — so when there is nothing to move on
-// to, the ceiling truncated nothing and the loop was ending regardless. Counting
-// it books every request whose upstream is slower than resolveBudget (90s, against
-// a 630s provider timeout) as OUR limit firing, in the one series the runbook says
-// means exactly that, and tells operators to read against latency p99: the false
-// correlation it would itself manufacture. Same reasoning as metricFallback's
-// i+1 < n guard, added for the same single-candidate shape.
+// A slow retryable failure on the LAST candidate is not a ceiling cut: a running
+// attempt is never interrupted by the budget, so there it only decides whether to
+// move on, and there was nothing to move on to. Counting it booked every request
+// whose upstream is slower than resolveBudget (90s, against a 630s providerTimeout)
+// as OUR ceiling firing — in the one series the runbook says means exactly that and
+// tells operators to correlate with the latency p99.
 func TestSlowFailureOnTheLastCandidateIsNotABudgetCut(t *testing.T) {
 	const attemptCost = 80 * time.Millisecond
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
