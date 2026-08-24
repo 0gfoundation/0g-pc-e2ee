@@ -42,6 +42,53 @@ func DecodeQuoteResponse(body []byte) ([]byte, error) {
 	return raw, nil
 }
 
+// ErrNoAppCompose reports a /v1/quote reply that carries no app-compose text.
+// Distinct from a malformed one because the two mean different things to a caller
+// building a display: a provider whose reply omits it (public_tcbinfo off, or an
+// older broker) has nothing to show, while a reply that will not parse is a bug
+// worth logging.
+var ErrNoAppCompose = errors.New("attest: quote response carries no app_compose")
+
+// AppComposeFromQuoteResponse pulls the app-compose text out of a provider's
+// /v1/quote reply.
+//
+// **What it returns is UNAUTHENTICATED and must not be used until it is hashed.**
+// It rides in `tcb_info`, which Intel does not sign — the caveat QuoteResponse
+// states by omitting these fields entirely. The bytes become trustworthy exactly
+// when sha256 over them equals the compose_hash a VERIFIED quote commits to in
+// mr_config_id, which is what evidence.VerifyAppCompose does and the only sanctioned
+// next step. That check is also why fetching this over an untrusted path is safe:
+// a substituted app-compose fails it, and the platform cannot choose the hash.
+//
+// The bytes are returned verbatim, never re-marshalled. dstack hashes the file as
+// it wrote it, so re-encoding equal JSON would change the digest and turn a genuine
+// app-compose into a mismatch.
+//
+// The nesting is dstack's, not ours: the reply's `tcb_info` is a JSON *string*
+// holding a JSON object, whose `app_compose` is in turn a JSON string holding
+// app-compose.json. Both levels are decoded here so the caller handles one shape.
+func AppComposeFromQuoteResponse(body []byte) ([]byte, error) {
+	var outer struct {
+		TCBInfo string `json:"tcb_info"`
+	}
+	if err := json.Unmarshal(body, &outer); err != nil {
+		return nil, fmt.Errorf("attest: decode quote response: %w", err)
+	}
+	if outer.TCBInfo == "" {
+		return nil, ErrNoAppCompose
+	}
+	var tcb struct {
+		AppCompose string `json:"app_compose"`
+	}
+	if err := json.Unmarshal([]byte(outer.TCBInfo), &tcb); err != nil {
+		return nil, fmt.Errorf("attest: decode tcb_info: %w", err)
+	}
+	if tcb.AppCompose == "" {
+		return nil, ErrNoAppCompose
+	}
+	return []byte(tcb.AppCompose), nil
+}
+
 // MRConfigVersion is the layout version in the first byte of a dstack
 // mr_config_id. dstack packs the app's identity into that register; the version
 // selects how, and the layouts are NOT interchangeable (see

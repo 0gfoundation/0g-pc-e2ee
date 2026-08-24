@@ -4,6 +4,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/compose"
+
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 )
 
@@ -57,6 +59,12 @@ type quoteFacts struct {
 	// composeHash is the hex dstack compose hash from the verified quote's
 	// mr_config_id, or "" when that register's layout does not expose one.
 	composeHash string
+	// containers is the service list of the app-compose that composeHash commits to,
+	// in file order, or nil when the reply carried none or it failed the hash gate
+	// (Router.containersOf). Derived here for the same reason the other facts are:
+	// the derivation needs the quote reply, which only the miss path holds, so a
+	// cache hit that recomputed it would have to fetch again.
+	containers []compose.Service
 }
 
 func newQuoteCache(ttl time.Duration) *quoteCache {

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/compose"
 	"github.com/0gfoundation/0g-pc-e2ee/client/route"
 )
 
@@ -256,5 +257,63 @@ func TestProviderIdentityRoute_LeavesTheCatalogAlone(t *testing.T) {
 		}
 	default:
 		t.Error("the provider catalog was answered locally; it belongs to the router")
+	}
+}
+
+// pidRecordWithContainers is pidFullRecord plus the service list its compose_hash
+// commits to — one 0G image pinned by digest, one third-party image pinned, and one
+// pinned only by a tag.
+func pidRecordWithContainers() route.ProviderIdentity {
+	rec := pidFullRecord()
+	rec.Containers = []compose.Service{
+		{Name: "broker", Ref: "ghcr.io/0gfoundation/0g-serving-broker@sha256:ec5df834",
+			Image: "ghcr.io/0gfoundation/0g-serving-broker", Digest: "sha256:ec5df834"},
+		{Name: "sglang", Ref: "lmsysorg/sglang:v0.5.17@sha256:220bb1a1",
+			Image: "lmsysorg/sglang", Tag: "v0.5.17", Digest: "sha256:220bb1a1"},
+		{Name: "prometheus", Ref: "prom/prometheus:v2.45.2",
+			Image: "prom/prometheus", Tag: "v2.45.2"},
+	}
+	return rec
+}
+
+func TestProviderIdentityRoute_ReportsContainers(t *testing.T) {
+	gw, _ := pidGateway(t, &stubIdentities{record: pidRecordWithContainers(), have: true})
+
+	_, body := pidGet(t, gw.URL+pidPath)
+	var doc providerIdentityDoc
+	if err := json.Unmarshal([]byte(body), &doc); err != nil {
+		t.Fatalf("decode: %v\n%s", err, body)
+	}
+	if len(doc.Containers) != 3 {
+		t.Fatalf("containers = %+v, want 3", doc.Containers)
+	}
+	// File order is part of the answer — see compose.ParseServices.
+	if doc.Containers[0].Name != "broker" || doc.Containers[2].Name != "prometheus" {
+		t.Errorf("containers out of file order: %+v", doc.Containers)
+	}
+	if doc.Containers[0].Digest != "sha256:ec5df834" {
+		t.Errorf("broker digest = %q", doc.Containers[0].Digest)
+	}
+	// An unpinned image is the one finding this list carries unaided, so the empty
+	// digest must reach the wire rather than be hidden.
+	if doc.Containers[2].Digest != "" {
+		t.Errorf("prometheus digest = %q, want empty for a tag-only reference", doc.Containers[2].Digest)
+	}
+	// No `source` field: no per-provider manifest is published, so there is no release
+	// to trace an image to, and a "third-party" stamp on 0G's own broker image (a
+	// different repository) would be worse than saying nothing.
+	if strings.Contains(body, `"source"`) {
+		t.Errorf("provider containers must not carry a source label; body:\n%s", body)
+	}
+}
+
+// Null, never []. An empty array would state that the enclave runs no containers,
+// which is never true — the honest report of "nothing to show" is the absence.
+func TestProviderIdentityRoute_ContainersNullWhenUnavailable(t *testing.T) {
+	gw, _ := pidGateway(t, &stubIdentities{record: pidFullRecord(), have: true})
+
+	_, body := pidGet(t, gw.URL+pidPath)
+	if !strings.Contains(body, `"containers": null`) {
+		t.Errorf("want containers to marshal as null when there are none; body:\n%s", body)
 	}
 }

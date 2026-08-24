@@ -46,7 +46,9 @@ import (
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
+	"github.com/0gfoundation/0g-pc-e2ee/client/compose"
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/client/evidence"
 	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
@@ -646,7 +648,7 @@ func (r *Router) verifyQuoteAt(ctx context.Context, quoteURL string) (res quoteR
 	start := time.Now()
 	defer func() { metrics.QuoteVerification(err == nil, time.Since(start)) }()
 
-	raw, err := r.fetchQuote(ctx, quoteURL)
+	raw, appCompose, err := r.fetchQuote(ctx, quoteURL)
 	if err != nil {
 		return quoteResult{}, err
 	}
@@ -669,14 +671,54 @@ func (r *Router) verifyQuoteAt(ctx context.Context, quoteURL string) (res quoteR
 			"rtmr2", fmt.Sprintf("%x", bc.RTMR2[:]),
 			"signer_addr", verified.SignerAddr)
 	}
+	composeHash, haveHash := composeHashOf(raw, verified, r.logger)
+	facts := quoteFacts{measurement: r.measurementVerdict(verified)}
+	if haveHash {
+		facts.composeHash = hex.EncodeToString(composeHash[:])
+		facts.containers = r.containersOf(appCompose, composeHash, quoteURL)
+	}
 	return quoteResult{
 		encPub: verified.EncPub,
 		signer: verified.SignerAddr,
-		facts: quoteFacts{
-			measurement: r.measurementVerdict(verified),
-			composeHash: composeHashOf(raw, verified, r.logger),
-		},
+		facts:  facts,
 	}, nil
+}
+
+// containersOf turns the reply's unauthenticated app-compose into the container
+// list behind it — but only after the hash gate.
+//
+// The whole security argument is one line of it: evidence.VerifyAppCompose accepts
+// the bytes only when sha256 over them equals composeHash, which came out of the
+// quote the verifier just authenticated. Before that the text is whatever the
+// provider (or anyone on the path) chose to send; after it, it is the manifest the
+// enclave actually booted. There is no partial credit — a mismatch returns nothing
+// rather than a "probably right" list.
+//
+// Everything past the gate is re-reading pinned bytes, so nothing here can make a
+// deployment more or less trustworthy — only its display right or wrong. Which is
+// why every failure yields nil and a debug line instead of failing the request: a
+// provider is not less usable because we could not draw its container list.
+func (r *Router) containersOf(appCompose []byte, composeHash [attest.ComposeHashLen]byte, quoteURL string) []compose.Service {
+	if len(appCompose) == 0 {
+		return nil
+	}
+	ac, err := evidence.VerifyAppCompose(appCompose, composeHash)
+	if err != nil {
+		// Worth a WARN, not a debug: the reply carried an app-compose that does not
+		// hash to what its own quote commits to. Benign explanations exist (a reply
+		// assembled from a different instance), but so does a substitution attempt, and
+		// this is the one place either would show.
+		r.logger.Warn("provider app-compose does not match the compose_hash its quote binds; reporting no containers",
+			"quote_url", quoteURL, "err", err)
+		return nil
+	}
+	services, err := compose.ParseServices([]byte(ac.DockerComposeFile))
+	if err != nil {
+		r.logger.Debug("provider compose text does not parse, reporting no containers",
+			"quote_url", quoteURL, "err", err)
+		return nil
+	}
+	return services
 }
 
 // measurementVerdict turns the boot-chain outcome into the three-state verdict a
@@ -722,24 +764,29 @@ func (r *Router) measurementVerdict(verified attest.Verified) Verdict {
 // does not surface mr_config_id (see attest.Verify's step-2 note). Reading it from
 // the verified bytes is the same thing the gateway does for its own quote, and it
 // avoids widening a protocol-level interface that every participant depends on.
-func composeHashOf(raw []byte, verified attest.Verified, logger *slog.Logger) string {
+// It returns the hash itself rather than its hex spelling because two callers need
+// different things from it: the identity record reports hex, and the container
+// lookup compares raw bytes against sha256 of the app-compose. Hexing and re-parsing
+// between the two would be a lossy round trip in the one place that must not have
+// one.
+func composeHashOf(raw []byte, verified attest.Verified, logger *slog.Logger) (hash [attest.ComposeHashLen]byte, ok bool) {
 	body, err := attest.ParseTDXQuoteBody(raw)
 	if err != nil {
 		logger.Debug("provider quote: cannot structurally re-parse a verified quote, reporting no compose_hash", "err", err)
-		return ""
+		return hash, false
 	}
 	if body.Measurement != verified.Measurement {
 		logger.Warn("provider quote: structural re-parse disagrees with the verified measurement, reporting no compose_hash")
-		return ""
+		return hash, false
 	}
-	hash, err := attest.ComposeHashFromMRConfigID(body.MRConfigID)
+	hash, err = attest.ComposeHashFromMRConfigID(body.MRConfigID)
 	if err != nil {
 		// A V2/V3 (or absent) mr_config_id does not carry the hash in the clear. Nothing
 		// is wrong with the quote; there is simply nothing to read.
 		logger.Debug("provider quote: mr_config_id does not expose compose_hash", "err", err)
-		return ""
+		return hash, false
 	}
-	return hex.EncodeToString(hash[:])
+	return hash, true
 }
 
 // groundingOutcome classifies one grounding attempt. The split that matters is
@@ -920,30 +967,49 @@ func (r *Router) onchainLookupFailed(providerAddr string, cause error) (groundin
 	return g, nil
 }
 
-// fetchQuote GETs and decodes a provider's /v1/quote reply into raw TDX quote
-// bytes (unverified — the caller verifies).
-func (r *Router) fetchQuote(ctx context.Context, quoteURL string) ([]byte, error) {
+// fetchQuote GETs and decodes a provider's /v1/quote reply.
+//
+// It returns two things with very different standing. `raw` is the TDX quote the
+// caller is about to verify. `appCompose` is the app-compose text the same reply
+// carries in its unsigned `tcb_info` — worth nothing until it is hashed against
+// the verified quote's compose_hash (attest.AppComposeFromQuoteResponse says why),
+// which containersOf does and nothing else may skip.
+//
+// A reply carrying no app-compose is not an error: `appCompose` comes back nil and
+// the container list is simply absent. Only the quote is load-bearing here.
+func (r *Router) fetchQuote(ctx context.Context, quoteURL string) (raw, appCompose []byte, err error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, quoteURL, nil)
 	if err != nil {
-		return nil, upstream(0, err)
+		return nil, nil, upstream(0, err)
 	}
 	resp, err := r.http.Do(httpReq)
 	if err != nil {
-		return nil, upstream(0, fmt.Errorf("fetch provider quote: %w", err))
+		return nil, nil, upstream(0, fmt.Errorf("fetch provider quote: %w", err))
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxControlBodyBytes))
 	if err != nil {
-		return nil, upstream(0, fmt.Errorf("read provider quote: %w", err))
+		return nil, nil, upstream(0, fmt.Errorf("read provider quote: %w", err))
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, upstreamBody(resp.StatusCode, body, fmt.Errorf("provider quote returned %d", resp.StatusCode))
+		return nil, nil, upstreamBody(resp.StatusCode, body, fmt.Errorf("provider quote returned %d", resp.StatusCode))
 	}
-	raw, err := attest.DecodeQuoteResponse(body)
+	raw, err = attest.DecodeQuoteResponse(body)
 	if err != nil {
-		return nil, upstream(0, err)
+		return nil, nil, upstream(0, err)
 	}
-	return raw, nil
+	appCompose, acErr := attest.AppComposeFromQuoteResponse(body)
+	if acErr != nil {
+		// Never fatal: this half feeds a display, and the quote — the half that decides
+		// whether we seal at all — parsed fine. Absent is the ordinary case for a
+		// provider with public_tcbinfo off, so only a malformed reply is worth a line.
+		if !errors.Is(acErr, attest.ErrNoAppCompose) {
+			r.logger.Debug("provider quote reply: cannot read app_compose, reporting no containers",
+				"quote_url", quoteURL, "err", acErr)
+		}
+		appCompose = nil
+	}
+	return raw, appCompose, nil
 }
 
 // previewProvider is one candidate in the route-preview reply.

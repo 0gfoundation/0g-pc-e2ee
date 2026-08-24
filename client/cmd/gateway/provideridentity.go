@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/compose"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 	"github.com/0gfoundation/0g-pc-e2ee/client/route"
 )
@@ -88,8 +89,53 @@ type providerIdentityDoc struct {
 	// — WHICH application configuration that enclave booted. Null when the register's
 	// layout does not carry it in the clear (mr_config_id V2/V3).
 	ComposeHash *string `json:"compose_hash"`
+	// Containers is what ComposeHash commits to, unpacked: the services the provider
+	// CVM runs, in the order its compose file lists them. Null — never [] — when
+	// there is none to report: the quote reply carried no app-compose, it did not
+	// hash to ComposeHash, or the text did not parse. An empty array would say "this
+	// enclave runs no containers", which is never true.
+	//
+	// Reaching the wire means the bytes hashed to ComposeHash, so this is as
+	// authenticated as the hash. It is NOT a check: nothing compared these images
+	// against an expected set, so a panel may render them but must not present the
+	// list's existence as approval.
+	Containers []providerContainerRef `json:"containers"`
 	// Verify is providerVerifyNote. See the file comment.
 	Verify string `json:"verify"`
+}
+
+// providerContainerRef is one container of a provider's deployment.
+//
+// It deliberately carries no `source` field, unlike the gateway's own
+// containerRef. There, source answers "can I trace this image to a GitHub release
+// of this repository", and the answer is useful because the gateway's manifest is
+// published. No per-provider manifest is published (docs/design/request-verification.md
+// §6), so for a provider there is no release to trace to and the label would be
+// either meaningless or — worse — a "third-party" stamp on 0G's own broker image
+// merely because it ships from a different repository.
+type providerContainerRef struct {
+	// Name is the compose service name.
+	Name string `json:"name"`
+	// Image is the repository, without tag or digest.
+	Image string `json:"image"`
+	// Digest is the "sha256:…" the compose text pins, or "" when the reference
+	// carries none — which is the one finding a reader can draw from this list
+	// unaided, so it is rendered rather than hidden: an unpinned image leaves
+	// compose_hash committing to a NAME whose contents can be republished under it.
+	Digest string `json:"digest"`
+}
+
+// providerContainersOf renders the record's service list for the wire, preserving
+// file order and mapping "none" to nil so it marshals as null.
+func providerContainersOf(services []compose.Service) []providerContainerRef {
+	if len(services) == 0 {
+		return nil
+	}
+	out := make([]providerContainerRef, 0, len(services))
+	for _, s := range services {
+		out = append(out, providerContainerRef{Name: s.Name, Image: s.Image, Digest: s.Digest})
+	}
+	return out
 }
 
 // providerVerdicts is the per-check outcome block. Every value is one of the
@@ -138,6 +184,7 @@ func providerIdentityHandler(src route.ProviderIdentitySource) http.Handler {
 			},
 			OSImage:     optional(id.OSImage),
 			ComposeHash: optional(id.ComposeHash),
+			Containers:  providerContainersOf(id.Containers),
 			Verify:      providerVerifyNote(id.QuoteURL),
 		}, "", "  ")
 		if err != nil {
