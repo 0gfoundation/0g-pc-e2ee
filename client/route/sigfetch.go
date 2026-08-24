@@ -3,6 +3,7 @@ package route
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/proof"
 )
 
@@ -68,11 +70,30 @@ var _ core.SignatureFetcher = (*SignatureFetcher)(nil)
 // last retry) is returned, so verification fails closed rather than silently
 // skipping.
 func (f *SignatureFetcher) FetchSignature(ctx context.Context, provider core.Provider, chatKey string) (proof.ChatSignature, error) {
+	// One observation per fetch on every exit path, recorded by a defer so no return
+	// escapes it — including the two pre-flight checks below, which used to return
+	// ahead of it and left the response unverified while the §8 panel read zero.
+	// This fetch is serial with the response, so its latency is added to every
+	// verified completion, and "ok_retried" is how the expected 404 race (the broker
+	// caches the signature at end-of-response) shows up before it becomes a
+	// per-response backoff.
+	start := time.Now()
+	outcome := "failed"
+	defer func() { metrics.SignatureFetch(outcome, time.Since(start)) }()
+
+	// Metered as "internal", not "failed": neither check has asked the broker
+	// anything, and "failed" is the bucket an operator reads as "the broker is not
+	// serving signatures". A missing endpoint is a materialization gap of ours; an
+	// endpoint or chatKey that will not form a URL is bad input reaching us. Both
+	// still fail verification closed, which is what response_verification_failures
+	// and the upstream "unverifiable" outcome record.
 	if provider.Endpoint == "" {
+		outcome = "internal"
 		return proof.ChatSignature{}, fmt.Errorf("no provider endpoint to fetch the response signature from")
 	}
 	u, err := deriveSignatureURL(provider.Endpoint, chatKey)
 	if err != nil {
+		outcome = "internal"
 		return proof.ChatSignature{}, err
 	}
 
@@ -81,21 +102,47 @@ func (f *SignatureFetcher) FetchSignature(ctx context.Context, provider core.Pro
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
+				outcome = endedBy(ctx)
 				return proof.ChatSignature{}, ctx.Err()
 			case <-time.After(sigFetchBackoff << (attempt - 1)):
 			}
 		}
 		sig, retryable, err := f.fetchOnce(ctx, u)
 		if err == nil {
+			outcome = "ok"
+			if attempt > 0 {
+				outcome = "ok_retried"
+			}
 			return sig, nil
 		}
 		lastErr = err
+		// Only a RETRYABLE failure may be re-attributed. fetchOnce's other conclusions
+		// are the broker ANSWERING definitively — a non-404 4xx, or a body that will
+		// not decode — and relabelling those because the context happened to be done
+		// files a corrupt signature from a provider under "canceled", the one bucket
+		// every alert deliberately ignores. Preview and verifyOutcome carry the same
+		// allowlist guard for the same reason.
+		if retryable && ctx.Err() != nil {
+			// Something other than the broker ended this; that says nothing about it.
+			outcome = endedBy(ctx)
+			return proof.ChatSignature{}, err
+		}
 		if !retryable {
+			// One definitive failure is not the broker's: failing to build the GET.
+			// Unreachable (the URL was derived and validated above), classified
+			// anyway so "failed" means one thing on every exit path.
+			if errors.Is(err, errRequestBuild) {
+				outcome = "internal"
+			}
 			return proof.ChatSignature{}, err
 		}
 	}
 	return proof.ChatSignature{}, fmt.Errorf("after %d attempts: %w", sigFetchAttempts, lastErr)
 }
+
+// errRequestBuild marks the one fetchOnce failure that is ours and not the
+// broker's, so FetchSignature can keep it out of the provider-facing bucket.
+var errRequestBuild = errors.New("build signature request")
 
 // fetchOnce performs a single GET. retryable is true only for a transient failure
 // worth another attempt — a transport error, a 404 (the broker caches the
@@ -104,7 +151,7 @@ func (f *SignatureFetcher) FetchSignature(ctx context.Context, provider core.Pro
 func (f *SignatureFetcher) fetchOnce(ctx context.Context, url string) (proof.ChatSignature, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return proof.ChatSignature{}, false, err
+		return proof.ChatSignature{}, false, fmt.Errorf("%w: %w", errRequestBuild, err)
 	}
 	resp, err := f.http.Do(req)
 	if err != nil {
@@ -134,4 +181,34 @@ func deriveSignatureURL(endpoint, chatKey string) (string, error) {
 		return "", err
 	}
 	return base + "/proxy/signature/" + chatKey, nil
+}
+
+// endedBy names who ended a fetch whose context is done, which is NOT always the
+// caller: core hands this fetcher a context derived from the attempt, so the
+// buffered path's providerTimeout expiring mid-fetch arrives here indistinguishable
+// from a disconnect unless the error kind is read. It was all counted "canceled",
+// which put our own deadline in the bucket every alert ignores.
+//
+// context.Canceled means somebody called cancel — in practice the caller going
+// away. context.DeadlineExceeded means a deadline on the CONTEXT fired, which on
+// this path means core's providerTimeout.
+//
+// Note what this does NOT cover: the fetcher's own http.Client.Timeout never touches
+// the context — it surfaces as a transport error from Do, which fetchOnce marks
+// retryable, so it is retried and ends in "failed". An earlier version of this
+// comment claimed otherwise. Reading it as a timeout would mean classifying the
+// error rather than the context, and unlike core's transport path there is nothing
+// to gain: every such failure here is already retried three times, so it is a
+// genuine failure to obtain the proof by the time it is recorded.
+//
+// Two residual ambiguities, stated because they are real: a CALLER that set its own
+// deadline reads as timeout, and a stream whose idle watchdog fires (a cancel, not
+// a deadline) reads as canceled. Both are narrower than lumping everything into one
+// bucket, and neither can be resolved without threading the parent context through
+// core.SignatureFetcher — which is not worth an interface change for this.
+func endedBy(ctx context.Context) string {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return "timeout"
+	}
+	return "canceled"
 }

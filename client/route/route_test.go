@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
@@ -127,6 +128,9 @@ type mockRouter struct {
 	lastChatHeaders http.Header
 	lastChatModel   string            // cleartext "model" the data-plane request carried
 	status          int               // override preview response status; 0 = 200
+	previewHits     int32             // preview attempts served (retry assertions)
+	previewFailN    int32             // fail the first N preview attempts with previewFailStatus
+	previewFailCode int               // status for previewFailN attempts (0 = 503)
 	noProviders     bool              // preview returns no providers
 	previewAddress  string            // head provider's address in preview (default testProviderAddr)
 	extra           []previewProvider // extra candidates appended after the head
@@ -142,12 +146,24 @@ func newMockRouter(t *testing.T, broker *mockBroker) *mockRouter {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /v1/routing/preview", func(w http.ResponseWriter, r *http.Request) {
+		hit := atomic.AddInt32(&m.previewHits, 1)
 		body, _ := io.ReadAll(r.Body)
 		_ = json.Unmarshal(body, &m.lastPreview)
 		m.lastAuth = r.Header.Get("Authorization")
 		m.lastHeaders = r.Header.Clone()
 		if m.status != 0 {
 			http.Error(w, "boom", m.status)
+			return
+		}
+		// Fail the first previewFailN attempts, so a test can assert the client
+		// retried its way past a transient router failure (and that each attempt
+		// carried the full request again).
+		if hit <= m.previewFailN {
+			code := m.previewFailCode
+			if code == 0 {
+				code = http.StatusServiceUnavailable
+			}
+			http.Error(w, "transient router failure", code)
 			return
 		}
 		providers := []previewProvider{{
@@ -689,6 +705,285 @@ func TestResolveNoProvidersIs503(t *testing.T) {
 	assertStageStatus(t, err, core.StageUpstream, http.StatusServiceUnavailable)
 }
 
+// Preview is the one request-path dependency with no cache in front of it, so a
+// transient router failure must not cost the caller its completion: the client
+// retries and resolves off a later attempt.
+func TestPreviewRetriesTransientFailure(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	router.previewFailN = previewAttempts - 1 // every attempt but the last
+
+	provider, err := resolveHead(context.Background(), New(router.srv.URL), chatReq())
+	if err != nil {
+		t.Fatalf("Resolve after %d transient preview failures: %v", router.previewFailN, err)
+	}
+	if provider.Address != testProviderAddr {
+		t.Errorf("provider address = %q, want %q", provider.Address, testProviderAddr)
+	}
+	if got := atomic.LoadInt32(&router.previewHits); got != previewAttempts {
+		t.Errorf("preview attempts = %d, want %d", got, previewAttempts)
+	}
+	// Each attempt must carry the whole request again, not an already-drained body:
+	// the retry re-wraps the marshaled payload rather than reusing one reader.
+	if _, ok := router.lastPreview["service_type"]; !ok {
+		t.Error("the succeeding attempt carried no service_type; the request body did not survive the retry")
+	}
+	if _, leaked := router.lastPreview["messages"]; leaked {
+		t.Error("a retried preview leaked the prompt to the router")
+	}
+}
+
+// A router that keeps failing is surfaced with its real status once the attempts
+// run out — not masked by a retry-budget message, which would tell the caller
+// nothing about what the router did.
+func TestPreviewGivesUpAfterAttempts(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	router.previewFailN = previewAttempts + 5 // never recovers
+
+	_, err := New(router.srv.URL).Resolve(context.Background(), chatReq())
+	assertStageStatus(t, err, core.StageUpstream, http.StatusServiceUnavailable)
+	if got := atomic.LoadInt32(&router.previewHits); got != previewAttempts {
+		t.Errorf("preview attempts = %d, want %d", got, previewAttempts)
+	}
+}
+
+// A definitive failure is not retried: a 4xx recurs identically, and a 429 is the
+// router's own limiter — another attempt would spend more of the caller's
+// allowance to be told the same thing. Both must reach the caller on the first
+// attempt, with their status intact.
+func TestPreviewDoesNotRetryDefinitiveFailures(t *testing.T) {
+	for _, status := range []int{
+		http.StatusUnauthorized,
+		http.StatusNotFound,
+		http.StatusTooManyRequests,
+	} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			broker := newMockBroker(t)
+			router := newMockRouter(t, broker)
+			router.previewFailN = previewAttempts + 5
+			router.previewFailCode = status
+
+			_, err := New(router.srv.URL).Resolve(context.Background(), chatReq())
+			assertStageStatus(t, err, core.StageUpstream, status)
+			if got := atomic.LoadInt32(&router.previewHits); got != 1 {
+				t.Errorf("preview attempts = %d, want 1 (a %d must not be retried)", got, status)
+			}
+		})
+	}
+}
+
+// An empty candidate list is the router ANSWERING — negatively, but answering —
+// so it is not retried either: the 503 is about the fleet, not about reaching the
+// router.
+func TestPreviewDoesNotRetryEmptyCandidateList(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	router.noProviders = true
+
+	_, err := New(router.srv.URL).Resolve(context.Background(), chatReq())
+	assertStageStatus(t, err, core.StageUpstream, http.StatusServiceUnavailable)
+	if got := atomic.LoadInt32(&router.previewHits); got != 1 {
+		t.Errorf("preview attempts = %d, want 1", got)
+	}
+}
+
+// A caller that has already given up must not be made to sit through the retry
+// schedule: the cancelled context ends the sequence instead of the attempts doing.
+func TestPreviewStopsRetryingOnCancelledContext(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	router.previewFailN = previewAttempts + 5
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// Cancel as soon as the first attempt has been served, so the cancellation lands
+	// while the client is in (or about to enter) its first backoff.
+	go func() {
+		for atomic.LoadInt32(&router.previewHits) == 0 {
+			time.Sleep(time.Millisecond)
+		}
+		cancel()
+	}()
+
+	_, err := New(router.srv.URL).Resolve(ctx, chatReq())
+	if err == nil {
+		t.Fatal("Resolve with a cancelled context: want error, got nil")
+	}
+	if got := atomic.LoadInt32(&router.previewHits); got >= previewAttempts {
+		t.Errorf("preview attempts = %d, want fewer than %d (cancellation should cut the sequence short)", got, previewAttempts)
+	}
+}
+
+// The point of metering the retries: a router degrading badly enough to need them
+// must be visible even while every request still succeeds. ok_retried is that
+// series, and it has to stay distinct from a clean first-attempt ok.
+func TestPreviewMetricsSeparateAbsorbedFailuresFromCleanCalls(t *testing.T) {
+	const (
+		callsOK           = `zg_gateway_preview_calls_total{outcome="ok"}`
+		callsRetried      = `zg_gateway_preview_calls_total{outcome="ok_retried"}`
+		callsRejected     = `zg_gateway_preview_calls_total{outcome="rejected"}`
+		callsFailed       = `zg_gateway_preview_calls_total{outcome="failed"}`
+		attemptsOK        = `zg_gateway_preview_attempts_total{result="ok"}`
+		attemptsRetryable = `zg_gateway_preview_attempts_total{result="retryable"}`
+		attemptsRejected  = `zg_gateway_preview_attempts_total{result="rejected"}`
+	)
+	series := []string{callsOK, callsRetried, callsRejected, callsFailed, attemptsOK, attemptsRetryable, attemptsRejected}
+	before := map[string]float64{}
+	for _, s := range series {
+		before[s] = metricValue(t, s)
+	}
+	delta := func(s string) float64 { return metricValue(t, s) - before[s] }
+
+	// A router per phase: previewFailN counts attempts over the mock's whole life,
+	// so a router reused across phases would have spent its failures already.
+	newRouter := func() *mockRouter { return newMockRouter(t, newMockBroker(t)) }
+
+	// A clean call: one ok attempt, outcome ok.
+	if _, err := New(newRouter().srv.URL).Resolve(context.Background(), chatReq()); err != nil {
+		t.Fatalf("clean Resolve: %v", err)
+	}
+	if got := delta(callsOK); got != 1 {
+		t.Errorf("%s delta = %v, want 1", callsOK, got)
+	}
+	if got := delta(callsRetried); got != 0 {
+		t.Errorf("a first-attempt success must not count as retried; %s delta = %v", callsRetried, got)
+	}
+
+	// A blip the retries absorb: the caller still succeeds, but the router's
+	// degradation is on the record as ok_retried plus a retryable attempt.
+	blip := newRouter()
+	blip.previewFailN = 1
+	if _, err := New(blip.srv.URL).Resolve(context.Background(), chatReq()); err != nil {
+		t.Fatalf("Resolve across a transient failure: %v", err)
+	}
+	if got := delta(callsRetried); got != 1 {
+		t.Errorf("%s delta = %v, want 1 — an absorbed failure is invisible", callsRetried, got)
+	}
+	if got := delta(callsOK); got != 1 {
+		t.Errorf("a retried success must not also count as a clean ok; %s delta = %v, want 1", callsOK, got)
+	}
+	if got := delta(attemptsRetryable); got != 1 {
+		t.Errorf("%s delta = %v, want 1", attemptsRetryable, got)
+	}
+	if got := delta(attemptsOK); got != 2 {
+		t.Errorf("%s delta = %v, want 2 (one per successful attempt)", attemptsOK, got)
+	}
+
+	// A 401: the router ANSWERED. It must be counted rejected, never retryable, and
+	// — the point of the split — the CALL must not land in "failed", which is the
+	// series an alert reads as "the router is unwell". One tenant with a bad key
+	// would otherwise pin it.
+	dead := newRouter()
+	dead.previewFailN = previewAttempts + 5
+	dead.previewFailCode = http.StatusUnauthorized
+	if _, err := New(dead.srv.URL).Resolve(context.Background(), chatReq()); err == nil {
+		t.Fatal("Resolve against a 401 router: want error, got nil")
+	}
+	if got := delta(attemptsRejected); got != 1 {
+		t.Errorf("%s delta = %v, want 1", attemptsRejected, got)
+	}
+	if got := delta(attemptsRetryable); got != 1 {
+		t.Errorf("a 401 must not be counted retryable; %s delta = %v, want 1 (unchanged)", attemptsRetryable, got)
+	}
+	if got := delta(callsRejected); got != 1 {
+		t.Errorf("%s delta = %v, want 1", callsRejected, got)
+	}
+	if got := delta(callsFailed); got != 0 {
+		t.Errorf("a caller's own 401 must not be counted a router failure; %s delta = %v, want 0", callsFailed, got)
+	}
+
+	// A router that only ever 5xxes IS the router being unwell: that one is failed.
+	broken := newRouter()
+	broken.previewFailN = previewAttempts + 5
+	if _, err := New(broken.srv.URL).Resolve(context.Background(), chatReq()); err == nil {
+		t.Fatal("Resolve against a 503 router: want error, got nil")
+	}
+	if got := delta(callsFailed); got != 1 {
+		t.Errorf("%s delta = %v, want 1", callsFailed, got)
+	}
+}
+
+// An empty candidate list is the router answering about the FLEET, not failing —
+// so it is rejected, and must not read as the router being unwell either.
+func TestPreviewEmptyCandidateListIsRejectedNotFailed(t *testing.T) {
+	const (
+		callsRejected = `zg_gateway_preview_calls_total{outcome="rejected"}`
+		callsFailed   = `zg_gateway_preview_calls_total{outcome="failed"}`
+	)
+	before := map[string]float64{callsRejected: metricValue(t, callsRejected), callsFailed: metricValue(t, callsFailed)}
+
+	router := newMockRouter(t, newMockBroker(t))
+	router.noProviders = true
+	if _, err := New(router.srv.URL).Resolve(context.Background(), chatReq()); err == nil {
+		t.Fatal("want a 503 error")
+	}
+	if got := metricValue(t, callsRejected) - before[callsRejected]; got != 1 {
+		t.Errorf("%s delta = %v, want 1", callsRejected, got)
+	}
+	if got := metricValue(t, callsFailed) - before[callsFailed]; got != 0 {
+		t.Errorf("%s delta = %v, want 0", callsFailed, got)
+	}
+}
+
+// Every preview call observes the duration histogram exactly once, whatever its
+// outcome — the defer that records it must not be skipped on an error path.
+func TestPreviewDurationObservedOnEveryCall(t *testing.T) {
+	const series = `zg_gateway_preview_duration_seconds_count`
+	before := metricValue(t, series)
+
+	ok := newMockRouter(t, newMockBroker(t))
+	if _, err := New(ok.srv.URL).Resolve(context.Background(), chatReq()); err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	// Its own router: previewFailN counts over the mock's whole life, so reusing the
+	// one above would have to account for the attempt it already served.
+	dead := newMockRouter(t, newMockBroker(t))
+	dead.previewFailN = previewAttempts + 5
+	dead.previewFailCode = http.StatusUnauthorized
+	if _, err := New(dead.srv.URL).Resolve(context.Background(), chatReq()); err == nil {
+		t.Fatal("want an error from a 401 router")
+	}
+
+	if got := metricValue(t, series) - before; got != 2 {
+		t.Errorf("%s delta = %v, want 2 (one observation per call, success and failure alike)", series, got)
+	}
+}
+
+func TestPreviewStatusResult(t *testing.T) {
+	for status, want := range map[int]previewResult{
+		// The router answered. Retrying cannot change any of these, and they are
+		// usually about the caller, not the router — see previewRejected.
+		http.StatusBadRequest:      previewRejected,
+		http.StatusUnauthorized:    previewRejected,
+		http.StatusNotFound:        previewRejected,
+		http.StatusTooManyRequests: previewRejected, // unlike the data plane — see previewOnce
+		// The router faulted, and may not next time.
+		http.StatusInternalServerError: previewRetryable,
+		http.StatusBadGateway:          previewRetryable,
+		http.StatusServiceUnavailable:  previewRetryable,
+		http.StatusGatewayTimeout:      previewRetryable,
+	} {
+		if got := previewStatusResult(status); got != want {
+			t.Errorf("previewStatusResult(%d) = %q, want %q", status, got, want)
+		}
+	}
+}
+
+// The call-level outcome must keep a definitive negative out of "failed": a tenant
+// with a misconfigured key would otherwise pin an alert meant for the router.
+func TestPreviewResultCallOutcome(t *testing.T) {
+	for res, want := range map[previewResult]string{
+		previewRejected:  "rejected",
+		previewCanceled:  "canceled",
+		previewBroken:    "failed",
+		previewRetryable: "failed",
+	} {
+		if got := res.callOutcome(); got != want {
+			t.Errorf("%q.callOutcome() = %q, want %q", res, got, want)
+		}
+	}
+}
+
 // A candidate without a USABLE address can't be pinned, so the router could
 // re-route the sealed request to a provider that can't decrypt it — materializing
 // it fails so core skips it.
@@ -821,5 +1116,628 @@ func assertStageStatus(t *testing.T, err error, stage string, status int) {
 	}
 	if e.Status != status {
 		t.Errorf("status = %d, want %d", e.Status, status)
+	}
+}
+
+// meteredClient is a route-resolving core client with the real Prometheus adapter
+// wired in, so the data-plane assertions below read the same series the dashboard
+// does rather than a test double's idea of them.
+func meteredClient(routerURL string) *core.Client {
+	return core.NewWithResolver(New(routerURL), core.WithMetrics(metrics.CoreMetrics{}))
+}
+
+func upstreamAttempt(kind, outcome string) string {
+	return fmt.Sprintf(`zg_gateway_upstream_attempts_total{kind="%s",outcome="%s"}`, kind, outcome)
+}
+
+// A clean buffered completion books exactly one buffered/ok attempt, observes the
+// attempt-duration histogram once, and reports no fallback.
+func TestUpstreamMetricsOnCleanCompletion(t *testing.T) {
+	ok := upstreamAttempt("buffered", "ok")
+	dur := `zg_gateway_upstream_attempt_duration_seconds_count{kind="buffered",result="ok"}`
+	fb := `zg_gateway_candidate_fallbacks_total{reason="upstream"}`
+	before := map[string]float64{ok: metricValue(t, ok), dur: metricValue(t, dur), fb: metricValue(t, fb)}
+
+	router := newMockRouter(t, newMockBroker(t))
+	if _, err := meteredClient(router.srv.URL).Complete(context.Background(), chatReq()); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	for series, want := range map[string]float64{ok: 1, dur: 1, fb: 0} {
+		if got := metricValue(t, series) - before[series]; got != want {
+			t.Errorf("%s delta = %v, want %v", series, got, want)
+		}
+	}
+}
+
+// The fallback counter is the only signal that the router's ranking put a bad
+// provider first — the request itself succeeded, so nothing else records it. The
+// failing head must also land in the bucket for the status it actually returned.
+func TestUpstreamMetricsRecordFallbackAndStatus(t *testing.T) {
+	fb := `zg_gateway_candidate_fallbacks_total{reason="upstream"}`
+	s5xx := upstreamAttempt("buffered", "http_5xx")
+	ok := upstreamAttempt("buffered", "ok")
+	before := map[string]float64{fb: metricValue(t, fb), s5xx: metricValue(t, s5xx), ok: metricValue(t, ok)}
+
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	secondAddr := "0xC0FFEE0000000000000000000000000000000002"
+	router.extra = []previewProvider{{
+		Address: secondAddr, CanonicalID: "canon-2", Endpoint: broker.srv.URL, ModelID: "gpt-4o@v2",
+	}}
+	router.failPin = testProviderAddr // the head 503s; the second serves
+
+	if _, err := meteredClient(router.srv.URL).Complete(context.Background(), chatReq()); err != nil {
+		t.Fatalf("Complete should have fallen back and succeeded: %v", err)
+	}
+
+	for series, want := range map[string]float64{fb: 1, s5xx: 1, ok: 1} {
+		if got := metricValue(t, series) - before[series]; got != want {
+			t.Errorf("%s delta = %v, want %v", series, got, want)
+		}
+	}
+}
+
+// 429 gets its own bucket rather than joining the 4xx crowd: it says the provider
+// is saturated, not that the request was wrong, and it is the 4xx the client falls
+// back on.
+func TestUpstreamMetricsSeparateRateLimitFromOther4xx(t *testing.T) {
+	s429, s4xx := upstreamAttempt("buffered", "http_429"), upstreamAttempt("buffered", "http_4xx")
+	before := map[string]float64{s429: metricValue(t, s429), s4xx: metricValue(t, s4xx)}
+
+	for _, tc := range []struct {
+		status int
+		series string
+	}{
+		{http.StatusTooManyRequests, s429},
+		{http.StatusBadRequest, s4xx},
+	} {
+		router := newMockRouter(t, newMockBroker(t))
+		router.failPin = testProviderAddr
+		router.failStatus = tc.status
+		if _, err := meteredClient(router.srv.URL).Complete(context.Background(), chatReq()); err == nil {
+			t.Fatalf("Complete against a %d provider: want error", tc.status)
+		}
+	}
+
+	for series, want := range map[string]float64{s429: 1, s4xx: 1} {
+		if got := metricValue(t, series) - before[series]; got != want {
+			t.Errorf("%s delta = %v, want %v", series, got, want)
+		}
+	}
+}
+
+// The attempt-duration histogram is a latency series, and a rejected request is
+// not latency. A 4xx comes back in milliseconds; while the histogram was labelled
+// by kind alone, every one of them sat in the buffered distribution and pulled
+// down the p99 that the budget-cut runbook tells operators to read the resolve
+// ceiling against. The counter next door keeps the full outcome; this only has to
+// keep the two apart.
+func TestUpstreamDurationKeepsRejectionsOutOfTheLatencySeries(t *testing.T) {
+	okDur := `zg_gateway_upstream_attempt_duration_seconds_count{kind="buffered",result="ok"}`
+	failDur := `zg_gateway_upstream_attempt_duration_seconds_count{kind="buffered",result="failed"}`
+	before := map[string]float64{okDur: metricValue(t, okDur), failDur: metricValue(t, failDur)}
+
+	router := newMockRouter(t, newMockBroker(t))
+	router.failPin = testProviderAddr
+	router.failStatus = http.StatusBadRequest
+	if _, err := meteredClient(router.srv.URL).Complete(context.Background(), chatReq()); err == nil {
+		t.Fatal("Complete against a 400 provider: want error")
+	}
+
+	for series, want := range map[string]float64{okDur: 0, failDur: 1} {
+		if got := metricValue(t, series) - before[series]; got != want {
+			t.Errorf("%s delta = %v, want %v", series, got, want)
+		}
+	}
+}
+
+// A 2xx whose sealed body will not open is its own diagnosis — the provider
+// answered, the crypto did not line up — and must not be filed as a transport or
+// status failure.
+func TestUpstreamMetricsRecordUnopenableBody(t *testing.T) {
+	series := upstreamAttempt("buffered", "undecodable")
+	before := metricValue(t, series)
+
+	router := newMockRouter(t, newMockBroker(t))
+	router.badBodyPin = testProviderAddr
+	if _, err := meteredClient(router.srv.URL).Complete(context.Background(), chatReq()); err == nil {
+		t.Fatal("Complete against an unopenable body: want error")
+	}
+
+	if got := metricValue(t, series) - before; got != 1 {
+		t.Errorf("%s delta = %v, want 1", series, got)
+	}
+}
+
+// A stream books a stream-kind attempt and, separately, its time to first frame —
+// the latency a streaming caller feels, which the attempt duration cannot show
+// because it measures how long the stream stayed open.
+func TestUpstreamMetricsRecordStreamAndFirstFrame(t *testing.T) {
+	ok := upstreamAttempt("stream", "ok")
+	ttff := `zg_gateway_upstream_stream_ttff_seconds_count`
+	dur := `zg_gateway_upstream_attempt_duration_seconds_count{kind="stream",result="ok"}`
+	// The buffered histogram is watched too: mixing a stream's open duration into it
+	// is exactly what makes a completion-latency panel unreadable, so the split has
+	// to be asserted, not assumed.
+	buffered := `zg_gateway_upstream_attempt_duration_seconds_count{kind="buffered",result="ok"}`
+	before := map[string]float64{
+		ok: metricValue(t, ok), ttff: metricValue(t, ttff),
+		dur: metricValue(t, dur), buffered: metricValue(t, buffered),
+	}
+
+	router := newMockRouter(t, newMockBroker(t))
+	req := chatReq()
+	req["stream"] = json.RawMessage(`true`)
+	frames := 0
+	if err := meteredClient(router.srv.URL).CompleteStream(context.Background(), req,
+		func(wire.Response) error { frames++; return nil }); err != nil {
+		t.Fatalf("CompleteStream: %v", err)
+	}
+	if frames < 2 {
+		t.Fatalf("got %d frames, want at least 2 (so first-frame is distinct from last)", frames)
+	}
+
+	for series, want := range map[string]float64{ok: 1, ttff: 1, dur: 1, buffered: 0} {
+		if got := metricValue(t, series) - before[series]; got != want {
+			t.Errorf("%s delta = %v, want %v — a stream must book one attempt, ONE first-frame, and nothing buffered", series, got, want)
+		}
+	}
+}
+
+// onFrame can fail two ways and core cannot see inside it: the caller
+// disconnected, or the caller's handler broke on its own. They must not share a
+// bucket — "canceled" is excluded from every alert, so filing a gateway bug there
+// hides it, and filing a disconnect under "internal" cries wolf on every closed
+// tab. The split is decided by asking the parent context.
+func TestStreamOnFrameFailureAttribution(t *testing.T) {
+	internal := upstreamAttempt("stream", "internal")
+	canceled := upstreamAttempt("stream", "canceled")
+
+	streamReq := func() wire.Request {
+		req := chatReq()
+		req["stream"] = json.RawMessage(`true`)
+		return req
+	}
+
+	// The handler fails while the caller's context is still live: our fault.
+	t.Run("handler failure with a live caller is internal", func(t *testing.T) {
+		before := map[string]float64{internal: metricValue(t, internal), canceled: metricValue(t, canceled)}
+		router := newMockRouter(t, newMockBroker(t))
+		err := meteredClient(router.srv.URL).CompleteStream(context.Background(), streamReq(),
+			func(wire.Response) error { return errors.New("could not serialize the frame") })
+		if err == nil {
+			t.Fatal("want the handler's error back")
+		}
+		if got := metricValue(t, internal) - before[internal]; got != 1 {
+			t.Errorf("%s delta = %v, want 1", internal, got)
+		}
+		if got := metricValue(t, canceled) - before[canceled]; got != 0 {
+			t.Errorf("a live caller must not be counted canceled; %s delta = %v", canceled, got)
+		}
+	})
+
+	// The caller went away: not our fault, and not the provider's.
+	t.Run("handler failure with a gone caller is canceled", func(t *testing.T) {
+		before := map[string]float64{internal: metricValue(t, internal), canceled: metricValue(t, canceled)}
+		router := newMockRouter(t, newMockBroker(t))
+		ctx, cancel := context.WithCancel(context.Background())
+		err := meteredClient(router.srv.URL).CompleteStream(ctx, streamReq(),
+			func(wire.Response) error {
+				cancel() // the client hung up as this frame was being written
+				return errors.New("write: broken pipe")
+			})
+		cancel()
+		if err == nil {
+			t.Fatal("want the handler's error back")
+		}
+		if got := metricValue(t, canceled) - before[canceled]; got != 1 {
+			t.Errorf("%s delta = %v, want 1", canceled, got)
+		}
+		if got := metricValue(t, internal) - before[internal]; got != 0 {
+			t.Errorf("a disconnect must not be counted internal; %s delta = %v", internal, got)
+		}
+	})
+}
+
+// The per-attempt deadline is what makes the retry ceiling a fact. Without it the
+// shared client bounds only the wait for HEADERS, so a router that dribbles (or
+// never finishes) a body leaves an attempt — and therefore the whole preview —
+// unbounded, and the retry budget, which only gates ENTRY to an attempt, cannot
+// cap anything.
+//
+// This is the regression test for the claim that used to be wrong: a probe failing
+// each attempt slowly measured ~2× the "budget", because the budget check had
+// already passed when the next attempt began.
+func TestPreviewAttemptIsBounded(t *testing.T) {
+	// Headers go out immediately so ResponseHeaderTimeout cannot be what saves us;
+	// the body then never arrives. Only a bound on the whole attempt ends this.
+	release := make(chan struct{})
+	defer close(release)
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+
+	router := New(srv.URL)
+	const attempt = 150 * time.Millisecond
+	router.previewAttemptTO = attempt
+
+	start := time.Now()
+	if _, err := router.Resolve(context.Background(), chatReq()); err == nil {
+		t.Fatal("want an error from a router that never finishes a body")
+	}
+	elapsed := time.Since(start)
+
+	// A hung body reads as a retryable failure, so the budget admits more attempts;
+	// what must hold is that each one is bounded, so the total stays near a small
+	// multiple of the attempt bound rather than running forever.
+	if max := time.Duration(previewAttempts) * attempt * 4; elapsed > max {
+		t.Errorf("preview took %s against a %s attempt bound (max %s): the attempt is not bounded",
+			elapsed, attempt, max)
+	}
+	if got := atomic.LoadInt32(&hits); got == 0 {
+		t.Fatal("the router was never called")
+	}
+	t.Logf("bounded: %s over %d attempt(s) at %s each", elapsed.Truncate(time.Millisecond), atomic.LoadInt32(&hits), attempt)
+}
+
+// The caller's own deadline still wins when it is shorter — the per-attempt bound
+// is a ceiling, not a floor that could outlive the request it serves.
+func TestPreviewAttemptHonoursAShorterCallerDeadline(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+
+	router := New(srv.URL)
+	router.previewAttemptTO = 10 * time.Second // deliberately far longer than the caller's
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	if _, err := router.Resolve(ctx, chatReq()); err == nil {
+		t.Fatal("want an error once the caller's deadline passes")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("preview took %s; the caller's 150ms deadline should have ended it", elapsed)
+	}
+}
+
+// The exact scenario that disproved the original claim: each attempt fails slowly
+// but well short of its own bound, so the budget check passes and a second attempt
+// starts. The end-to-end cost is then budget + one attempt — NOT one attempt, which
+// is what the code used to claim. This pins the real ceiling.
+func TestPreviewCeilingIsBudgetPlusOneAttempt(t *testing.T) {
+	// Scaled to the shape that was actually measured against the shipped constants
+	// (20s failures under a 30s budget cost 40s): a failure that spends most of the
+	// budget but is well inside the attempt bound. previewRetryBackoff is a real
+	// constant and is NOT scaled, so the budget has to leave room for it.
+	const (
+		attemptTO = time.Second
+		budgetTO  = time.Second
+		failAfter = 600 * time.Millisecond
+	)
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		select {
+		case <-time.After(failAfter):
+			http.Error(w, "slow failure", http.StatusServiceUnavailable)
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+
+	router := New(srv.URL)
+	router.previewAttemptTO, router.previewBudgetTO = attemptTO, budgetTO
+
+	start := time.Now()
+	if _, err := router.Resolve(context.Background(), chatReq()); err == nil {
+		t.Fatal("want an error from a router that always 503s")
+	}
+	elapsed := time.Since(start)
+
+	// Two attempts is the expected shape: the first spends most of the budget, the
+	// second is admitted, and the third is not.
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Errorf("attempts = %d, want 2 (one, then one the budget still admitted)", got)
+	}
+	// The ceiling the comment now states. Generous slack for scheduling; the point
+	// is that it is a CEILING at all — before the attempt was bounded, a slow body
+	// on this path had none.
+	if ceiling := budgetTO + attemptTO; elapsed > ceiling+500*time.Millisecond {
+		t.Errorf("preview took %s, past the stated ceiling of budget+attempt = %s", elapsed, ceiling)
+	}
+	// And it really is MORE than one attempt: the old comment claimed otherwise.
+	if elapsed <= attemptTO {
+		t.Errorf("preview took only %s; this scenario is supposed to cost more than one attempt (%s)", elapsed, attemptTO)
+	}
+	t.Logf("elapsed %s over %d attempts (ceiling %s)", elapsed.Truncate(time.Millisecond), atomic.LoadInt32(&hits), budgetTO+attemptTO)
+}
+
+// The retry gate exists so a router outage cannot be amplified back at the router
+// (previewAttempts× the traffic) or at us (each request holding its concurrency
+// slot for the retry ceiling instead of one attempt). The first attempt is never
+// suppressed, so every request still gets its real error.
+func TestPreviewRetriesSuppressedWhileRouterIsDown(t *testing.T) {
+	const suppressed = `zg_gateway_preview_retries_suppressed_total`
+	before := metricValue(t, suppressed)
+
+	router := newMockRouter(t, newMockBroker(t))
+	router.previewFailN = 1 << 20 // never recovers
+	r := New(router.srv.URL)
+
+	// Trip the gate: each call burns its full attempt allowance.
+	for i := 0; i < previewRetryTripAfter; i++ {
+		if _, err := r.Resolve(context.Background(), chatReq()); err == nil {
+			t.Fatal("want an error from a dead router")
+		}
+	}
+	tripped := atomic.LoadInt32(&router.previewHits)
+	if want := int32(previewRetryTripAfter * previewAttempts); tripped != want {
+		t.Fatalf("attempts before tripping = %d, want %d", tripped, want)
+	}
+
+	// From here each call costs ONE attempt, not previewAttempts.
+	if _, err := r.Resolve(context.Background(), chatReq()); err == nil {
+		t.Fatal("want an error from a dead router")
+	}
+	if got := atomic.LoadInt32(&router.previewHits) - tripped; got != 1 {
+		t.Errorf("attempts after tripping = %d, want 1 (retries should be suppressed)", got)
+	}
+	if got := metricValue(t, suppressed) - before; got == 0 {
+		t.Error("no suppression was counted; the gate is invisible to an operator")
+	}
+}
+
+// A router that comes back must get its retries back — the gate is a cooldown, not
+// a latch, and any answer at all is proof of reachability.
+func TestPreviewRetryGateReopensOnAnAnswer(t *testing.T) {
+	router := newMockRouter(t, newMockBroker(t))
+	router.previewFailN = 1 << 20
+	r := New(router.srv.URL)
+	for i := 0; i < previewRetryTripAfter; i++ {
+		_, _ = r.Resolve(context.Background(), chatReq())
+	}
+
+	// The router recovers; the one attempt the gate still allows finds it.
+	router.previewFailN = 0
+	if _, err := r.Resolve(context.Background(), chatReq()); err != nil {
+		t.Fatalf("Resolve after recovery: %v", err)
+	}
+
+	// Retries are back: a fresh transient blip is absorbed again.
+	base := atomic.LoadInt32(&router.previewHits)
+	router.previewFailN = base + 1 // fail exactly the next attempt
+	if _, err := r.Resolve(context.Background(), chatReq()); err != nil {
+		t.Fatalf("Resolve across a blip after recovery: %v", err)
+	}
+	if got := atomic.LoadInt32(&router.previewHits) - base; got != 2 {
+		t.Errorf("attempts = %d, want 2 (the gate should have reopened)", got)
+	}
+}
+
+// lateCancelCtx reports Err() as canceled once flipped, while its Done channel is
+// never closed — so an HTTP request already in flight is NOT torn down. That models
+// exactly the race the ordering fix is about ("the caller went away in the gap
+// after a successful attempt returned") without having to win it: a real
+// cancellation would abort the request and never reach the branch under test.
+type lateCancelCtx struct {
+	context.Context
+	done     chan struct{}
+	canceled *atomic.Bool
+}
+
+func (c lateCancelCtx) Done() <-chan struct{} { return c.done }
+
+func (c lateCancelCtx) Err() error {
+	if c.canceled.Load() {
+		return context.Canceled
+	}
+	return nil
+}
+
+// A cancellation that lands between a successful attempt returning and the loop
+// inspecting it must not turn that attempt into "canceled": the call is counted ok,
+// and two series that disagree about the same attempt are worse than either alone.
+func TestPreviewSuccessNotReattributedToLateCancellation(t *testing.T) {
+	const (
+		attemptsOK       = `zg_gateway_preview_attempts_total{result="ok"}`
+		attemptsCanceled = `zg_gateway_preview_attempts_total{result="canceled"}`
+		callsOK          = `zg_gateway_preview_calls_total{outcome="ok"}`
+		callsCanceled    = `zg_gateway_preview_calls_total{outcome="canceled"}`
+	)
+	series := []string{attemptsOK, attemptsCanceled, callsOK, callsCanceled}
+	before := map[string]float64{}
+	for _, s := range series {
+		before[s] = metricValue(t, s)
+	}
+
+	var canceled atomic.Bool
+	router := newMockRouter(t, newMockBroker(t))
+	ctx := lateCancelCtx{
+		Context:  context.Background(),
+		done:     make(chan struct{}),
+		canceled: &canceled,
+	}
+
+	// The preview succeeds, and the caller is gone by the time the loop looks.
+	r := New(router.srv.URL)
+	providers, err := r.preview(ctx, chatReq())
+	canceled.Store(true)
+	if err != nil {
+		t.Fatalf("preview: %v", err)
+	}
+	if len(providers) == 0 {
+		t.Fatal("preview returned no candidates")
+	}
+	// Re-run with the flag already set: this is the ordering under test.
+	if _, err := r.preview(ctx, chatReq()); err != nil {
+		t.Fatalf("preview with an already-done caller: %v", err)
+	}
+
+	if got := metricValue(t, attemptsOK) - before[attemptsOK]; got != 2 {
+		t.Errorf("%s delta = %v, want 2", attemptsOK, got)
+	}
+	if got := metricValue(t, attemptsCanceled) - before[attemptsCanceled]; got != 0 {
+		t.Errorf("a successful attempt was re-attributed to a late cancellation; %s delta = %v, want 0",
+			attemptsCanceled, got)
+	}
+	if got := metricValue(t, callsOK) - before[callsOK]; got != 2 {
+		t.Errorf("%s delta = %v, want 2", callsOK, got)
+	}
+	if got := metricValue(t, callsCanceled) - before[callsCanceled]; got != 0 {
+		t.Errorf("%s delta = %v, want 0 — the attempt and call series must agree", callsCanceled, got)
+	}
+}
+
+// The suppression counter measures amplification shed, so it must count the retry
+// ATTEMPTS not made — one increment per affected call under-reported it by up to
+// previewAttempts-1, while the metric's name, its Help and the runbook all read it
+// as attempts.
+func TestPreviewSuppressionCountsAttemptsNotCalls(t *testing.T) {
+	const suppressed = `zg_gateway_preview_retries_suppressed_total`
+
+	router := newMockRouter(t, newMockBroker(t))
+	router.previewFailN = 1 << 20
+	r := New(router.srv.URL)
+	for i := 0; i < previewRetryTripAfter; i++ {
+		_, _ = r.Resolve(context.Background(), chatReq())
+	}
+
+	// One more call, now with the gate shut: it makes attempt 0 and is turned away
+	// at attempt 1, so previewAttempts-1 retries were shed.
+	before := metricValue(t, suppressed)
+	_, _ = r.Resolve(context.Background(), chatReq())
+	if got, want := metricValue(t, suppressed)-before, float64(previewAttempts-1); got != want {
+		t.Errorf("%s delta = %v, want %v (the attempts not made, not one per call)", suppressed, got, want)
+	}
+}
+
+// The router picks the candidate list and nothing else bounds its length, while
+// core walks it serially — so N is one of the two factors in what a failing chain
+// costs a caller. Trimming is safe because the list arrives ranked best-first.
+func TestPreviewCapsTheCandidateList(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	// One head plus far more extras than the cap allows.
+	for i := 0; i < maxPreviewCandidates*3; i++ {
+		router.extra = append(router.extra, previewProvider{
+			Address:     fmt.Sprintf("0xC0FFEE%035X", i+2),
+			CanonicalID: "canon-x",
+			Endpoint:    broker.srv.URL,
+			ModelID:     "gpt-4o@v1",
+		})
+	}
+
+	cands, err := New(router.srv.URL).Resolve(context.Background(), chatReq())
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got := cands.Len(); got != maxPreviewCandidates {
+		t.Errorf("candidate chain length = %d, want %d — the walk's length must be ours, not the router's",
+			got, maxPreviewCandidates)
+	}
+}
+
+// A cancellation may only re-attribute a RETRYABLE attempt. previewBroken is the
+// router answering with a body that will not decode — the constant defines it as the
+// router misbehaving — and previewInternal is our own fault; relabelling either
+// "canceled" hides it in the bucket every alert deliberately ignores. Same bug the
+// verifyOutcome allowlist fixed, in the other file.
+func TestPreviewBrokenSurvivesALateCancellation(t *testing.T) {
+	const (
+		attemptsBroken   = `zg_gateway_preview_attempts_total{result="broken"}`
+		attemptsCanceled = `zg_gateway_preview_attempts_total{result="canceled"}`
+		callsFailed      = `zg_gateway_preview_calls_total{outcome="failed"}`
+		callsCanceled    = `zg_gateway_preview_calls_total{outcome="canceled"}`
+	)
+	series := []string{attemptsBroken, attemptsCanceled, callsFailed, callsCanceled}
+	before := map[string]float64{}
+	for _, s := range series {
+		before[s] = metricValue(t, s)
+	}
+
+	// A 200 whose body will not decode: previewBroken.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"providers": not-json`))
+	}))
+	defer srv.Close()
+
+	// The caller is already gone by the time the loop classifies the failure — the
+	// same shape as the late-cancellation test above, so the race need not be won.
+	var canceled atomic.Bool
+	canceled.Store(true)
+	ctx := lateCancelCtx{Context: context.Background(), done: make(chan struct{}), canceled: &canceled}
+
+	if _, err := New(srv.URL).preview(ctx, chatReq()); err == nil {
+		t.Fatal("want an error from an undecodable preview body")
+	}
+
+	if got := metricValue(t, attemptsBroken) - before[attemptsBroken]; got != 1 {
+		t.Errorf("%s delta = %v, want 1", attemptsBroken, got)
+	}
+	if got := metricValue(t, attemptsCanceled) - before[attemptsCanceled]; got != 0 {
+		t.Errorf("the router misbehaving was relabelled canceled; %s delta = %v, want 0", attemptsCanceled, got)
+	}
+	if got := metricValue(t, callsFailed) - before[callsFailed]; got != 1 {
+		t.Errorf("%s delta = %v, want 1", callsFailed, got)
+	}
+	if got := metricValue(t, callsCanceled) - before[callsCanceled]; got != 0 {
+		t.Errorf("%s delta = %v, want 0", callsCanceled, got)
+	}
+}
+
+// The gate must not be reopened by a definitive rejection. During a router-layer
+// outage a load balancer commonly mixes 404s and 403s in with the 502s; resetting on
+// those put the 502 requests back to full amplification and back to holding a
+// LimitInFlight slot for the whole ceiling — the gateway-level cascade this gate
+// exists to prevent. Only a preview that SUCCEEDED is evidence retries are worth
+// making again.
+func TestRetryGateNotReopenedByARejection(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	router.previewFailN = 1 << 20 // 503s forever
+	r := New(router.srv.URL)
+	for i := 0; i < previewRetryTripAfter; i++ {
+		_, _ = r.Resolve(context.Background(), chatReq())
+	}
+	if r.previewRetries.allow() {
+		t.Fatal("the gate should be shut after consecutive answerless calls")
+	}
+
+	// The LB now answers some requests definitively (a 401). This must not reopen it.
+	router.previewFailCode = http.StatusUnauthorized
+	if _, err := r.Resolve(context.Background(), chatReq()); err == nil {
+		t.Fatal("want an error from a 401 router")
+	}
+	if r.previewRetries.allow() {
+		t.Error("a definitive rejection reopened the gate; the 502 traffic goes back to 3x amplification")
+	}
+
+	// A success does reopen it — that is the one signal that retries are useful.
+	router.previewFailN = 0
+	if _, err := r.Resolve(context.Background(), chatReq()); err != nil {
+		t.Fatalf("Resolve after recovery: %v", err)
+	}
+	if !r.previewRetries.allow() {
+		t.Error("a successful preview must reopen the gate")
 	}
 }

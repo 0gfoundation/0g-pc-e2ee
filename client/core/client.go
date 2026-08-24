@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"slices"
 	"time"
@@ -87,6 +88,47 @@ func (e *Error) Source() string {
 
 func stageErr(stage string, err error) error { return &Error{Stage: stage, Err: err} }
 
+// Tiers of walk failure, ordered by how much they tell the caller. A flat
+// "anything already held wins" rule — which is what this started as — cannot tell a
+// provider's verbatim reply apart from an earlier bookkeeping error, so a request cut
+// at the budget ceiling could return "candidate 0 is malformed" and never mention
+// that it had been held for the full ninety seconds.
+const (
+	// tierMaterialize: we could not prepare a candidate. Our own bookkeeping, no
+	// upstream status, the least actionable of the three.
+	tierMaterialize = iota
+	// tierBudget: the walk ran out of budget. Says why the request was cut, which no
+	// materialize error does — a bare deadline does not name the ceiling that set it.
+	tierBudget
+	// tierAttempt: a provider answered. Carries its status and headers (a 503 with
+	// its Retry-After, surfaced verbatim by the proxy), so nothing outranks it.
+	tierAttempt
+)
+
+// walkErr keeps the most useful failure seen while walking the candidate chain.
+type walkErr struct {
+	err  error
+	tier int
+}
+
+// record keeps err when its tier is at least as informative as what is held. Equal
+// tiers let the LATER one win: two candidates that could not be prepared are equally
+// ranked, and the second tells you more than the first (an early "no usable address"
+// otherwise masks whatever the rest of the chain did).
+func (w *walkErr) record(tier int, err error) {
+	if w.err == nil || tier >= w.tier {
+		w.err, w.tier = err, tier
+	}
+}
+
+// budgetErr names the ceiling that cut a walk short, wrapping whatever the last
+// candidate was doing when it ran out. Recorded at tierBudget so it displaces the
+// materialize errors that cannot explain the cut, and never a provider's own reply.
+func budgetErr(limit time.Duration, cause error) error {
+	return &Error{Stage: StageUpstream, Err: fmt.Errorf(
+		"provider selection budget (%s) exhausted: %w", limit, cause)}
+}
+
 // resolveErr maps a Resolver failure onto an *Error. A resolver that already
 // staged its error (route mode wraps its router/broker failures as *Error) is
 // passed through verbatim; anything else is treated as an upstream failure,
@@ -155,6 +197,10 @@ type Client struct {
 	// WithResponseVerification. See verify.go.
 	sigFetcher SignatureFetcher
 	recover    proof.RecoverFunc
+	// resolveBudgetTO bounds total candidate materialization for one call
+	// (resolveBudget by default). A field so a test can scale it down; see
+	// candidateWalk.
+	resolveBudgetTO time.Duration
 }
 
 // MetricsHook receives redaction-safe counters for core events, letting a caller
@@ -172,6 +218,215 @@ type MetricsHook interface {
 	// against the grounded signer (an integrity/authenticity failure of the
 	// provider — the alarming case).
 	ResponseVerificationFailure(reason string)
+	// UpstreamAttempt is called once per completed data-plane attempt against one
+	// provider, with how long the upstream call took. kind is UpstreamBuffered or
+	// UpstreamStream; outcome is one of the Upstream* constants.
+	//
+	// It exists because a caller cannot recover this from its own server-side
+	// timings: those measure provider selection plus this, and when the number
+	// moves they cannot say which half moved. Only the client core knows where one
+	// attempt began and ended, and which of several candidates it was.
+	UpstreamAttempt(kind, outcome string, dur time.Duration)
+	// StreamFirstFrame is called once per stream, when the first frame is
+	// delivered to the caller. A stream's total duration is set by how much the
+	// model has to say; the wait for its first token is the part a caller
+	// experiences as latency, and the two are unrelated.
+	StreamFirstFrame(dur time.Duration)
+	// WalkBudgetExhausted is called when resolveBudget running out actually
+	// truncated a call's work: it cut a candidate's materialization short, or it
+	// denied a fallback the walk would otherwise have made. It is the only signal
+	// that a request was cut at that ceiling rather than by anything upstream, and
+	// therefore the only way to tell whether the ceiling is set anywhere near
+	// right — which is why it must not also fire where the walk was ending anyway.
+	WalkBudgetExhausted()
+	// CandidateFallback is called each time the client gives up on a candidate and
+	// moves to the next, with reason FallbackUpstream (an attempt failed
+	// transiently and is re-sealed to the next candidate) or FallbackMaterialize
+	// (the candidate could not be prepared at all). Sustained fallback is the only
+	// signal that the ranking the untrusted router hands us puts bad providers
+	// first — invisible in the request outcome, which the fallback repaired.
+	CandidateFallback(reason string)
+}
+
+// Attempt kinds and outcomes reported through MetricsHook.UpstreamAttempt, named
+// so the vocabulary cannot drift between the buffered and streaming paths (which
+// classify the same failures at different call sites).
+const (
+	UpstreamBuffered = "buffered"
+	UpstreamStream   = "stream"
+
+	UpstreamOK = "ok"
+	// UpstreamTransport: no response at all — the request never reached the
+	// provider, or reached it and it never answered (the response-header timeout).
+	UpstreamTransport = "transport"
+	// UpstreamBody: a response began but its body dropped mid-read, or a stream
+	// ended before its final frame — a delivery failure, not a content one.
+	UpstreamBody = "body"
+	// UpstreamUndecodable: a 2xx whose sealed body would not decode or open.
+	UpstreamUndecodable = "undecodable"
+	// UpstreamNotStream: a 200 that was not an event stream (the provider ignored
+	// stream:true), which would otherwise read as an empty completion.
+	UpstreamNotStream = "not_stream"
+	// UpstreamUnverified: a §8 signature was retrieved and did NOT verify against
+	// the grounded signer. An integrity claim about the provider — the alarming one.
+	UpstreamUnverified = "unverified"
+	// UpstreamUnverifiable: the §8 signature could not be retrieved at all, so
+	// nothing was proven either way. Operational (the broker's problem, or ours),
+	// and deliberately apart from unverified: a runbook that pages on provider
+	// integrity must not be firable by one broker's bad minute.
+	UpstreamUnverifiable = "unverifiable"
+	// UpstreamTimeout: OUR deadline fired — the per-attempt provider timeout, or a
+	// stream's idle watchdog between frames. The provider went quiet; the caller
+	// did not go away.
+	UpstreamTimeout = "timeout"
+	// UpstreamCanceled: the CALLER went away mid-attempt. Kept out of every failure
+	// bucket on purpose: a user closing a tab is not a provider fault, and folding
+	// it in would put our own users' navigation in the router's error rate.
+	UpstreamCanceled = "canceled"
+	// UpstreamInternal: a fault in THIS client detected mid-attempt. Its own bucket
+	// so our bug can never be read as a provider's.
+	UpstreamInternal = "internal"
+	// Status-derived outcomes, produced by upstreamStatusOutcome. They live here
+	// with the rest so this block is the whole vocabulary it claims to be — the
+	// same strings appear in the metric's Help, the dashboard and the runbook, and
+	// a literal buried in a switch is how those drift apart.
+	UpstreamHTTP429   = "http_429"
+	UpstreamHTTP4xx   = "http_4xx"
+	UpstreamHTTP5xx   = "http_5xx"
+	UpstreamHTTPOther = "http_other"
+
+	FallbackUpstream    = "upstream"
+	FallbackMaterialize = "materialize"
+)
+
+// upstreamStatusOutcome classifies a non-2xx provider status into its attempt
+// outcome. 429 is split out from the rest of the 4xx range because it is the one
+// that says "this provider is saturated" rather than "this request was wrong" —
+// the same reason the fallback logic treats it as transient.
+func upstreamStatusOutcome(status int) string {
+	switch {
+	case status == http.StatusTooManyRequests:
+		return UpstreamHTTP429
+	case status >= 500 && status <= 599:
+		return UpstreamHTTP5xx
+	case status >= 400 && status <= 499:
+		return UpstreamHTTP4xx
+	default:
+		return UpstreamHTTPOther
+	}
+}
+
+// metricUpstreamAttempt reports one data-plane attempt to the hook, if one is
+// configured. No-op otherwise, like every other metric call in core.
+func (c *Client) metricUpstreamAttempt(kind, outcome string, dur time.Duration) {
+	if c.metrics != nil {
+		c.metrics.UpstreamAttempt(kind, outcome, dur)
+	}
+}
+
+// metricFallback reports one move from candidate i (of n) to the next — but only
+// when there IS a next one. A failure on the LAST candidate ends the walk, and
+// counting it as a fallback would inflate the series on a single-candidate
+// deployment, the common shape, where nothing was ever fallen back to.
+func (c *Client) metricFallback(reason string, i, n int) {
+	if c.metrics != nil && i+1 < n {
+		c.metrics.CandidateFallback(reason)
+	}
+}
+
+// metricWalkBudgetExhausted reports one walk the budget truncated. For the
+// materialization sites: that work runs under a deadline derived from what is left,
+// so even on the last candidate the ceiling really did cut it.
+func (c *Client) metricWalkBudgetExhausted() {
+	if c.metrics != nil {
+		c.metrics.WalkBudgetExhausted()
+	}
+}
+
+// metricWalkBudgetBlockedFallback is the same report from an attempt site, where
+// the budget cuts nothing — a running attempt is never interrupted by it — and only
+// decides whether to move on. Hence the metricFallback guard: with no next
+// candidate there was nothing to move on to, so counting it would book every
+// upstream slower than resolveBudget as our ceiling firing.
+func (c *Client) metricWalkBudgetBlockedFallback(i, n int) {
+	if i+1 < n {
+		c.metricWalkBudgetExhausted()
+	}
+}
+
+// metricStreamFirstFrame reports a stream's time to first delivered frame.
+func (c *Client) metricStreamFirstFrame(dur time.Duration) {
+	if c.metrics != nil {
+		c.metrics.StreamFirstFrame(dur)
+	}
+}
+
+// upstreamFailureOutcome resolves what to blame for a failure whose default reading
+// is base (UpstreamTransport for a request that produced no response,
+// UpstreamBody for one whose body dropped).
+//
+// A TIMEOUT is our bound expiring rather than the provider being unreachable, and it
+// must land in the same bucket whichever mechanism noticed — the buffered path's
+// per-attempt context deadline, or the shared client's ResponseHeaderTimeout, which
+// is all the streaming path has since its context carries no deadline of its own.
+// Deciding by mechanism split ONE fault (a provider that accepts the connection and
+// never answers) across two buckets by kind: timeout on the buffered path, transport
+// on the streaming one. That is precisely the drift the shared outcome constants
+// exist to prevent.
+func upstreamFailureOutcome(parent, attempt context.Context, err error, base string) string {
+	if canceledBy(parent) {
+		return UpstreamCanceled
+	}
+	if attempt.Err() != nil || isTimeout(err) {
+		return UpstreamTimeout
+	}
+	return base
+}
+
+// isTimeout reports whether err is a deadline expiring, from either layer: a context
+// deadline, or a net.Error the transport timed out on (which is how
+// ResponseHeaderTimeout surfaces).
+func isTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// canceledBy reports whether parent is done, i.e. whether a failure inside a
+// derived (deadline-bearing) context is the CALLER giving up rather than our own
+// deadline firing. Both look identical from inside the attempt, and they belong in
+// different metric buckets: see UpstreamCanceled vs UpstreamTimeout.
+func canceledBy(parent context.Context) bool { return parent.Err() != nil }
+
+// verifyOutcome resolves what to attribute a §8 verification failure to, given
+// what the verifier concluded, whether the caller is still there, and whether OUR
+// deadline for this attempt has fired.
+//
+// A signature that did not verify is never re-attributed: that finding is about the
+// provider and stands whether or not the caller stayed to hear it, and letting a
+// well-timed disconnect erase it would put the one integrity signal here at the
+// mercy of client behaviour.
+//
+// UpstreamUnverifiable — a proof we could not FETCH — is the only re-attributable
+// conclusion, and the test is written as an allowlist for the same reason the
+// dashboard's ratios are: a denylist has to be revisited every time verify.go can
+// conclude something new, and it was already wrong once. UpstreamInternal used to
+// fall through it, so a binder of ours that would not produce its text got filed as
+// "canceled" whenever the caller had left — a bug of ours in the one bucket every
+// alert deliberately ignores.
+func verifyOutcome(parent, attempt context.Context, concluded string) string {
+	if concluded != UpstreamUnverifiable {
+		return concluded
+	}
+	if canceledBy(parent) {
+		return UpstreamCanceled
+	}
+	if attempt.Err() != nil {
+		return UpstreamTimeout
+	}
+	return concluded
 }
 
 // Option customizes a Client.
@@ -295,6 +550,8 @@ func NewWithResolver(r Resolver, opts ...Option) *Client {
 		sealFields:    wire.DefaultSealedFields(),
 		unboundFields: wire.DefaultUnboundFields(),
 		http:          &http.Client{Transport: tr},
+
+		resolveBudgetTO: resolveBudget,
 	}
 	for _, o := range opts {
 		o(c)
@@ -335,35 +592,72 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 	}
 
 	// Fall back down the candidate chain: attempt a candidate and, on a retryable
-	// provider failure, re-seal to the next and retry (SPEC §4.4). lastErr holds
-	// the most recent failure so a fully exhausted chain surfaces a real cause.
-	var lastErr error
+	// provider failure, re-seal to the next and retry (SPEC §4.4).
+	//
+	// The walk charges every materialization and every failed attempt against one
+	// shared budget, so a long chain cannot keep the caller waiting indefinitely (see
+	// resolveBudget). fail keeps the most USEFUL failure seen rather than the most
+	// recent — a provider's own reply outranks a budget cut, which outranks our
+	// bookkeeping about a candidate we could not prepare (see walkErr).
+	var fail walkErr
+	walk := candidateWalk{budget: c.resolveBudgetTO}
 	for i := 0; i < cands.Len(); i++ {
-		provider, err := cands.Provider(ctx, i)
+		provider, err := walk.provider(ctx, cands, i)
 		if err != nil {
-			// This candidate could not be materialized (e.g. its pubkey fetch
-			// failed); skip it and try the next.
-			lastErr = resolveErr(err)
+			// A caller that went away ends the walk. It is not a fallback and says
+			// nothing about the router's ranking — and without this the loop ground on
+			// through every remaining candidate, each failing instantly on the dead
+			// context, each counted: one disconnect booked seven materialize fallbacks
+			// on an eight-candidate chain, into the series documented as the only signal
+			// that the router is ranking badly, with an alert on it.
+			if canceledBy(ctx) {
+				fail.record(tierMaterialize, resolveErr(err))
+				break
+			}
+			if walk.exhausted() {
+				// Name the ceiling. Recorded above the materialize tier because a bare
+				// "no usable address" from candidate 0 would otherwise be all the caller
+				// got for a request we held for the whole budget.
+				c.metricWalkBudgetExhausted()
+				fail.record(tierBudget, budgetErr(walk.limit(), err))
+				break
+			}
+			fail.record(tierMaterialize, resolveErr(err))
+			c.metricFallback(FallbackMaterialize, i, cands.Len())
 			continue
 		}
 
+		attemptStart := time.Now()
 		out, retry, err := c.completeOnce(ctx, provider, req, ephPub, ephPriv)
 		if err == nil {
 			return out, nil
 		}
-		lastErr = err
+		// A failed attempt is wasted caller time and is charged to the walk.
+		walk.charge(time.Since(attemptStart))
+		fail.record(tierAttempt, err)
 		if retry {
+			// Same two reasons to stop, and for the same reasons: a disconnect mid-body
+			// also surfaces as a retryable failure, and counting it would file the
+			// caller's own departure as a bad provider.
+			if canceledBy(ctx) {
+				break
+			}
+			if walk.exhausted() {
+				c.metricWalkBudgetBlockedFallback(i, cands.Len())
+				break
+			}
+			c.metricFallback(FallbackUpstream, i, cands.Len())
 			continue
 		}
 		return nil, err
 	}
 
-	// The chain was exhausted without a success. lastErr is set whenever Len() > 0
+	// The chain was exhausted without a success. fail is set whenever Len() > 0
 	// (a candidate was tried); guard the impossible empty-chain case anyway.
-	if lastErr == nil {
-		lastErr = stageErr(StageUpstream, fmt.Errorf("no provider candidates to try"))
+	if fail.err == nil {
+		return nil, stageErr(StageUpstream, fmt.Errorf("no provider candidates to try"))
 	}
-	return nil, lastErr
+	return nil, fail.err
 }
 
 // completeOnce runs one non-streaming attempt against a single provider under
@@ -376,21 +670,31 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 //   - true (fall back): a transient status (429 / 5xx), a response whose body
 //     dropped mid-read, or a 2xx whose sealed body will not decode/open — all
 //     provider-side failures with nothing yet returned to the caller.
-func (c *Client) completeOnce(ctx context.Context, provider Provider, req wire.Request, ephPub []byte, ephPriv crypto.PrivateKey) (wire.Response, bool, error) {
-	ctx, cancel := context.WithTimeout(ctx, providerTimeout)
+func (c *Client) completeOnce(parent context.Context, provider Provider, req wire.Request, ephPub []byte, ephPriv crypto.PrivateKey) (wire.Response, bool, error) {
+	ctx, cancel := context.WithTimeout(parent, providerTimeout)
 	defer cancel()
 
 	sealed, err := c.seal(provider, req, ephPub)
 	if err != nil {
 		// A seal failure depends on the request, not the provider (e.g. no messages
 		// to seal), so it would fail identically for every candidate — terminal.
+		// Deliberately unmetered as an upstream attempt: nothing went upstream.
 		return nil, false, stageErr(StageRequest, fmt.Errorf("seal request: %w", err))
 	}
+
+	// Meter the upstream call from here — after the seal, which is local work — to
+	// whichever return follows. The outcome is set at each failure site and reported
+	// once by this defer, so a new return cannot silently escape the counter.
+	start := time.Now()
+	outcome := UpstreamOK
+	defer func() { c.metricUpstreamAttempt(UpstreamBuffered, outcome, time.Since(start)) }()
 
 	resp, err := c.doRequest(ctx, provider, sealed)
 	if err != nil {
 		// Never reached the provider (transport failure); the same router fronts
-		// every candidate, so it recurs — terminal.
+		// every candidate, so it recurs — terminal. A caller that went away mid-flight
+		// looks identical here, so attribute it by asking the parent.
+		outcome = upstreamFailureOutcome(parent, ctx, err, UpstreamTransport)
 		return nil, false, &Error{Stage: StageUpstream, Err: fmt.Errorf("post to provider: %w", err)}
 	}
 	defer resp.Body.Close()
@@ -405,6 +709,7 @@ func (c *Client) completeOnce(ctx context.Context, provider Provider, req wire.R
 		// intentionally unbounded — a completion can legitimately be large.) Fall
 		// back only on a transient status (429 / 5xx).
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, maxUpstreamErrorBytes))
+		outcome = upstreamStatusOutcome(resp.StatusCode)
 		e := &Error{Stage: StageUpstream, Status: resp.StatusCode, Err: fmt.Errorf("provider returned %d", resp.StatusCode), Body: string(body), Header: resp.Header.Clone()}
 		return nil, retryableStatus(resp.StatusCode), e
 	}
@@ -413,6 +718,7 @@ func (c *Client) completeOnce(ctx context.Context, provider Provider, req wire.R
 	if err != nil {
 		// A response began but the body dropped mid-read: a provider-side failure
 		// with nothing delivered to the caller — fall back to the next candidate.
+		outcome = upstreamFailureOutcome(parent, ctx, err, UpstreamBody)
 		return nil, true, stageErr(StageUpstream, fmt.Errorf("read provider response: %w", err))
 	}
 
@@ -421,11 +727,13 @@ func (c *Client) completeOnce(ctx context.Context, provider Provider, req wire.R
 		// A 2xx whose body will not decode/open is a provider fault with nothing
 		// yet returned to the caller — fall back (as the streaming path does before
 		// its first frame).
+		outcome = UpstreamUndecodable
 		return nil, true, stageErr(StageUpstream, fmt.Errorf("decode sealed response: %w", err))
 	}
 	out, err := wire.OpenResponse(ephPriv, sealedResp)
 	if err != nil {
 		c.logOpenFailure(0, sealedResp, err)
+		outcome = UpstreamUndecodable
 		return nil, true, stageErr(StageUpstream, fmt.Errorf("open response: %w", err))
 	}
 	// Response-signature verification (hop 11), fail-closed. A response that
@@ -433,7 +741,8 @@ func (c *Client) completeOnce(ctx context.Context, provider Provider, req wire.R
 	// this provider — terminal, not a fall-back to another candidate (which would
 	// mask a bad provider). Nothing is returned to the caller on failure.
 	if c.verifyEnabled() {
-		if err := c.verifyNonStream(ctx, provider, resp.Header, sealed, sealedResp); err != nil {
+		if vo, err := c.verifyNonStream(ctx, provider, resp.Header, sealed, sealedResp); err != nil {
+			outcome = verifyOutcome(parent, ctx, vo)
 			return nil, false, stageErr(StageUpstream, err)
 		}
 	}

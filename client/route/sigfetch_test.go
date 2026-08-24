@@ -2,13 +2,16 @@ package route
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/proof"
 )
 
 func TestDeriveSignatureURL(t *testing.T) {
@@ -112,5 +115,247 @@ func TestFetchSignature_NoRetryOn4xx(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&n); got != 1 {
 		t.Fatalf("a 400 must not be retried, got %d attempts", got)
+	}
+}
+
+// The §8 fetch is serial with every verified response, so it needs its own
+// latency and outcome series. ok_retried in particular is expected traffic — the
+// broker writes the signature at end-of-response, so a just-finished response can
+// momentarily 404 — and must be distinguishable from a clean fetch, otherwise a
+// broker that has started 404ing on EVERY response looks identical to a healthy one.
+func TestSignatureFetchMetrics(t *testing.T) {
+	const (
+		callsOK      = `zg_gateway_signature_fetch_calls_total{outcome="ok"}`
+		callsRetried = `zg_gateway_signature_fetch_calls_total{outcome="ok_retried"}`
+		callsFailed  = `zg_gateway_signature_fetch_calls_total{outcome="failed"}`
+		durCount     = `zg_gateway_signature_fetch_duration_seconds_count`
+	)
+	before := map[string]float64{}
+	for _, s := range []string{callsOK, callsRetried, callsFailed, durCount} {
+		before[s] = metricValue(t, s)
+	}
+	delta := func(s string) float64 { return metricValue(t, s) - before[s] }
+
+	// Any decodable body will do — this test is about the metric, not the signature;
+	// verification is covered by the §8 tests.
+	sig := proof.ChatSignature{Text: "t", Signature: "0xsig", SigningAlgo: "ecdsa-secp256k1"}
+	fetcher := NewSignatureFetcher(nil)
+	provider := func(u string) core.Provider { return core.Provider{Endpoint: u} }
+	key := "11111111-1111-1111-1111-111111111111"
+
+	// Clean fetch.
+	clean := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(sig)
+	}))
+	defer clean.Close()
+	if _, err := fetcher.FetchSignature(context.Background(), provider(clean.URL), key); err != nil {
+		t.Fatalf("clean fetch: %v", err)
+	}
+
+	// The 404-then-ready race the retry exists for.
+	var hits int32
+	racy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&hits, 1) == 1 {
+			http.Error(w, "not cached yet", http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(sig)
+	}))
+	defer racy.Close()
+	if _, err := fetcher.FetchSignature(context.Background(), provider(racy.URL), key); err != nil {
+		t.Fatalf("fetch across the 404 race: %v", err)
+	}
+
+	// A broker that never produces it.
+	gone := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "nope", http.StatusNotFound)
+	}))
+	defer gone.Close()
+	if _, err := fetcher.FetchSignature(context.Background(), provider(gone.URL), key); err == nil {
+		t.Fatal("fetch against a permanently-404 broker: want error")
+	}
+
+	for series, want := range map[string]float64{callsOK: 1, callsRetried: 1, callsFailed: 1, durCount: 3} {
+		if got := delta(series); got != want {
+			t.Errorf("%s delta = %v, want %v", series, got, want)
+		}
+	}
+}
+
+// Both pre-flight checks — no endpoint, and an endpoint/chatKey that will not form
+// a URL — are fail-closed verification failures. They used to return before the
+// metrics defer was installed, leaving the §8 panel at zero while responses went
+// unverified: the exact blind spot this counter exists to close.
+//
+// Metered, but as "internal", not "failed": nothing was asked of the broker on
+// either path, and "failed" is the bucket an operator reads as "the broker is not
+// serving signatures". Preview and the data plane both keep our own faults out of
+// the upstream bucket; this plane did not.
+func TestSignatureFetchMetersPreflightFailures(t *testing.T) {
+	const (
+		callsFailed   = `zg_gateway_signature_fetch_calls_total{outcome="failed"}`
+		callsInternal = `zg_gateway_signature_fetch_calls_total{outcome="internal"}`
+		durCount      = `zg_gateway_signature_fetch_duration_seconds_count`
+	)
+	before := map[string]float64{
+		callsFailed:   metricValue(t, callsFailed),
+		callsInternal: metricValue(t, callsInternal),
+		durCount:      metricValue(t, durCount),
+	}
+
+	f := NewSignatureFetcher(nil)
+	for _, tc := range []struct {
+		name     string
+		provider core.Provider
+		chatKey  string
+	}{
+		{"no endpoint", core.Provider{}, "11111111-1111-1111-1111-111111111111"},
+		{"unusable endpoint", core.Provider{Endpoint: "not-a-url"}, "11111111-1111-1111-1111-111111111111"},
+		{"unusable chatKey", core.Provider{Endpoint: "https://broker.test"}, "../../escape"},
+	} {
+		if _, err := f.FetchSignature(context.Background(), tc.provider, tc.chatKey); err == nil {
+			t.Errorf("%s: want an error", tc.name)
+		}
+	}
+
+	if got := metricValue(t, callsInternal) - before[callsInternal]; got != 3 {
+		t.Errorf("%s delta = %v, want 3 — a fetch we never made is ours, not the broker's", callsInternal, got)
+	}
+	if got := metricValue(t, callsFailed) - before[callsFailed]; got != 0 {
+		t.Errorf("%s delta = %v, want 0 — the broker was never asked anything", callsFailed, got)
+	}
+	if got := metricValue(t, durCount) - before[durCount]; got != 3 {
+		t.Errorf("%s delta = %v, want 3 — every exit path must observe once", durCount, got)
+	}
+}
+
+// The context this fetcher receives is derived from the ATTEMPT, not from the
+// caller, so a done context is not evidence of a disconnect: our own
+// providerTimeout expiring mid-fetch arrives here looking the same. Counting both
+// as "canceled" put our deadline in the bucket every alert ignores.
+func TestSignatureFetchSeparatesOurDeadlineFromTheCaller(t *testing.T) {
+	const (
+		callsTimeout  = `zg_gateway_signature_fetch_calls_total{outcome="timeout"}`
+		callsCanceled = `zg_gateway_signature_fetch_calls_total{outcome="canceled"}`
+	)
+	before := map[string]float64{
+		callsTimeout:  metricValue(t, callsTimeout),
+		callsCanceled: metricValue(t, callsCanceled),
+	}
+
+	// A broker that never answers, so only the context ends the fetch.
+	release := make(chan struct{})
+	defer close(release)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	f := NewSignatureFetcher(srv.Client())
+	prov := core.Provider{Endpoint: srv.URL}
+	key := "11111111-1111-1111-1111-111111111111"
+
+	// A DEADLINE — what core's providerTimeout looks like from in here.
+	dl, cancelDL := context.WithTimeout(context.Background(), 80*time.Millisecond)
+	defer cancelDL()
+	if _, err := f.FetchSignature(dl, prov, key); err == nil {
+		t.Fatal("want an error once the deadline fires")
+	}
+	if got := metricValue(t, callsTimeout) - before[callsTimeout]; got != 1 {
+		t.Errorf("%s delta = %v, want 1 — our own deadline must not read as a disconnect", callsTimeout, got)
+	}
+	if got := metricValue(t, callsCanceled) - before[callsCanceled]; got != 0 {
+		t.Errorf("%s delta = %v, want 0", callsCanceled, got)
+	}
+
+	// A CANCEL — what a caller going away looks like.
+	cc, cancelCC := context.WithCancel(context.Background())
+	go func() { time.Sleep(50 * time.Millisecond); cancelCC() }()
+	if _, err := f.FetchSignature(cc, prov, key); err == nil {
+		t.Fatal("want an error once the caller cancels")
+	}
+	if got := metricValue(t, callsCanceled) - before[callsCanceled]; got != 1 {
+		t.Errorf("%s delta = %v, want 1", callsCanceled, got)
+	}
+	if got := metricValue(t, callsTimeout) - before[callsTimeout]; got != 1 {
+		t.Errorf("%s delta = %v, want 1 (unchanged) — a cancel is not our timeout", callsTimeout, got)
+	}
+}
+
+// A broker that answered DEFINITIVELY — a non-404 4xx, or a body that will not
+// decode — must keep that finding even if the context happens to be done. Filing a
+// corrupt signature under "canceled" hides it in the bucket every alert ignores,
+// which is the third instance of this bug class in the PR and the one that shipped
+// without the guard its two siblings carry.
+func TestSignatureFetchKeepsDefinitiveFailuresUnderALateCancellation(t *testing.T) {
+	const (
+		callsFailed   = `zg_gateway_signature_fetch_calls_total{outcome="failed"}`
+		callsCanceled = `zg_gateway_signature_fetch_calls_total{outcome="canceled"}`
+		callsTimeout  = `zg_gateway_signature_fetch_calls_total{outcome="timeout"}`
+	)
+	for _, tc := range []struct {
+		name    string
+		handler http.HandlerFunc
+	}{
+		{"definitive 4xx", func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+		}},
+		{"undecodable signature body", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"text": not-json`))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := map[string]float64{
+				callsFailed:   metricValue(t, callsFailed),
+				callsCanceled: metricValue(t, callsCanceled),
+				callsTimeout:  metricValue(t, callsTimeout),
+			}
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+
+			// Done before the loop classifies the failure, without tearing the request
+			// down — the same shape the preview late-cancellation test uses.
+			var canceled atomic.Bool
+			canceled.Store(true)
+			ctx := lateCancelCtx{Context: context.Background(), done: make(chan struct{}), canceled: &canceled}
+
+			if _, err := NewSignatureFetcher(srv.Client()).FetchSignature(
+				ctx, core.Provider{Endpoint: srv.URL}, "11111111-1111-1111-1111-111111111111"); err == nil {
+				t.Fatal("want an error")
+			}
+			if got := metricValue(t, callsFailed) - before[callsFailed]; got != 1 {
+				t.Errorf("%s delta = %v, want 1 — the broker's own answer was relabelled", callsFailed, got)
+			}
+			for _, s := range []string{callsCanceled, callsTimeout} {
+				if got := metricValue(t, s) - before[s]; got != 0 {
+					t.Errorf("%s delta = %v, want 0", s, got)
+				}
+			}
+		})
+	}
+}
+
+// A Router built directly rather than by New must still preview. The pacing pair had
+// no zero-value default, unlike candidateWalk.limit(), so an unset attempt timeout
+// meant an already-expired context and every request failing — silently and totally,
+// and the tests already construct &Router{}.
+func TestZeroValuePacingFallsBackToTheConstants(t *testing.T) {
+	r := &Router{}
+	if got := r.attemptTimeout(); got != previewAttemptTimeout {
+		t.Errorf("attemptTimeout() = %s, want %s", got, previewAttemptTimeout)
+	}
+	if got := r.retryBudget(); got != previewRetryBudget {
+		t.Errorf("retryBudget() = %s, want %s", got, previewRetryBudget)
+	}
+	// And an explicit value still wins.
+	r.previewAttemptTO, r.previewBudgetTO = time.Second, 2*time.Second
+	if got := r.attemptTimeout(); got != time.Second {
+		t.Errorf("attemptTimeout() = %s, want 1s", got)
+	}
+	if got := r.retryBudget(); got != 2*time.Second {
+		t.Errorf("retryBudget() = %s, want 2s", got)
 	}
 }
