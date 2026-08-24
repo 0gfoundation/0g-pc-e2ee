@@ -2,6 +2,7 @@ package route
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -66,6 +67,15 @@ func pidMRConfigID(t *testing.T, version byte, composeHashHex string) []byte {
 // counted so a test can prove the identity lookup itself fetches nothing.
 func pidServer(t *testing.T, raw []byte, hits *int32) *httptest.Server {
 	t.Helper()
+	return pidServerWithAppCompose(t, raw, nil, hits)
+}
+
+// pidServerWithAppCompose is pidServer plus the app-compose the quote reply carries
+// in tcb_info — the half that has to survive fetchQuote → verifyQuoteAt → the record
+// for a container list to reach the wire. A nil appCompose serves the bare quote, so
+// the two shapes exercise a provider that publishes tcb_info and one that does not.
+func pidServerWithAppCompose(t *testing.T, raw, appCompose []byte, hits *int32) *httptest.Server {
+	t.Helper()
 	var srv *httptest.Server
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/routing/preview", func(w http.ResponseWriter, r *http.Request) {
@@ -81,7 +91,21 @@ func pidServer(t *testing.T, raw []byte, hits *int32) *httptest.Server {
 		if hits != nil {
 			atomic.AddInt32(hits, 1)
 		}
-		_, _ = fmt.Fprintf(w, `{"quote":%q}`, hex.EncodeToString(raw))
+		if appCompose == nil {
+			_, _ = fmt.Fprintf(w, `{"quote":%q}`, hex.EncodeToString(raw))
+			return
+		}
+		// tcb_info as a JSON string holding the document, the shape the real broker
+		// serves. app_compose inside it stays a JSON string in every shape — those exact
+		// bytes are the compose hash's preimage.
+		tcb, err := json.Marshal(map[string]string{"app_compose": string(appCompose)})
+		if err != nil {
+			t.Errorf("marshal tcb_info: %v", err)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"quote": hex.EncodeToString(raw), "tcb_info": string(tcb),
+		})
 	})
 	mux.HandleFunc("GET /v1/e2ee/pubkey", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(pubkeyResponse{
@@ -487,5 +511,85 @@ func TestIdentityStore_IgnoresAddresslessRecords(t *testing.T) {
 	s.put(pidRecord("   "))
 	if len(s.m) != 0 {
 		t.Errorf("stored %d addressless records, want 0", len(s.m))
+	}
+}
+
+// The wiring between the two halves this PR tests separately: fetchQuote pulling
+// app_compose out of the reply, verifyQuoteAt gating it on the verified quote's
+// compose_hash, and the result surviving into the record the endpoint reads.
+//
+// It earns its place because the failure mode is silent. Drop the assignment into
+// facts, hand containersOf `raw` instead of `appCompose`, cache the facts without
+// the list — every one of those yields `containers: null`, which is also what an
+// honest "this provider publishes no tcb_info" looks like. No log, no error, no
+// failing unit test at either end.
+func TestProviderIdentity_RecordsContainersFromTheQuoteReply(t *testing.T) {
+	appCompose := []byte(`{"docker_compose_file":"services:\n  broker:\n    image: ghcr.io/0gfoundation/0g-serving-broker@sha256:ec5df834\n  prometheus:\n    image: prom/prometheus:v2.45.2\n"}`)
+	// The mr_config_id must commit to THIS app-compose, or the gate rejects it — which
+	// is exactly the coupling being tested.
+	sum := sha256.Sum256(appCompose)
+	srv := pidServerWithAppCompose(t,
+		pidQuote(t, qvMeasurement(0xaa), pidMRConfigID(t, 1, hex.EncodeToString(sum[:]))),
+		appCompose, nil)
+	r := pidRouter(t, srv.URL, pidAllowAll(), attest.ModeEnforce, &stubRegistry{signer: qvSignerStr, ack: true})
+	pidResolve(t, r)
+
+	id, ok := r.ProviderIdentity(testProviderAddr)
+	if !ok {
+		t.Fatal("no record for the provider this request sealed to")
+	}
+	if id.ComposeHash != hex.EncodeToString(sum[:]) {
+		t.Fatalf("ComposeHash = %q, want the hash the quote binds %q", id.ComposeHash, hex.EncodeToString(sum[:]))
+	}
+	if len(id.Containers) != 2 {
+		t.Fatalf("Containers = %+v, want the 2 services the authenticated compose lists", id.Containers)
+	}
+	if id.Containers[0].Name != "broker" || id.Containers[0].Digest != "sha256:ec5df834" {
+		t.Errorf("Containers[0] = %+v, want the digest-pinned broker", id.Containers[0])
+	}
+	if id.Containers[1].Name != "prometheus" || id.Containers[1].Digest != "" {
+		t.Errorf("Containers[1] = %+v, want prometheus with an empty digest (tag-only)", id.Containers[1])
+	}
+}
+
+// The same path with a provider whose reply carries no tcb_info: everything else
+// still records, and containers is absent rather than the request failing.
+func TestProviderIdentity_NoAppComposeStillRecords(t *testing.T) {
+	srv := pidServer(t, pidQuote(t, qvMeasurement(0xaa), pidMRConfigID(t, 1, pidComposeHashHex)), nil)
+	r := pidRouter(t, srv.URL, pidAllowAll(), attest.ModeEnforce, &stubRegistry{signer: qvSignerStr, ack: true})
+	pidResolve(t, r)
+
+	id, ok := r.ProviderIdentity(testProviderAddr)
+	if !ok {
+		t.Fatal("no record for the provider this request sealed to")
+	}
+	if id.ComposeHash != pidComposeHashHex {
+		t.Errorf("ComposeHash = %q, want it recorded even with no app-compose", id.ComposeHash)
+	}
+	if id.Containers != nil {
+		t.Errorf("Containers = %+v, want nil when the reply carries no app-compose", id.Containers)
+	}
+}
+
+// A reply whose app-compose does NOT hash to the quote's compose_hash: the gate
+// drops the list, and — the part worth pinning — the rest of the record survives.
+// A substituted manifest must not cost the user the verdicts.
+func TestProviderIdentity_MismatchedAppComposeDropsOnlyContainers(t *testing.T) {
+	srv := pidServerWithAppCompose(t,
+		pidQuote(t, qvMeasurement(0xaa), pidMRConfigID(t, 1, pidComposeHashHex)),
+		[]byte(`{"docker_compose_file":"services:\n  evil:\n    image: attacker/x:latest\n"}`), nil)
+	r := pidRouter(t, srv.URL, pidAllowAll(), attest.ModeEnforce, &stubRegistry{signer: qvSignerStr, ack: true})
+	pidResolve(t, r)
+
+	id, ok := r.ProviderIdentity(testProviderAddr)
+	if !ok {
+		t.Fatal("no record for the provider this request sealed to")
+	}
+	if id.Containers != nil {
+		t.Fatalf("Containers = %+v, want nil for an app-compose that fails the hash gate", id.Containers)
+	}
+	if id.QuoteDCAP != VerdictPass || id.OnChainSigner != VerdictPass {
+		t.Errorf("verdicts = %q/%q, want both pass: a failed container lookup must not cost the record its verdicts",
+			id.QuoteDCAP, id.OnChainSigner)
 	}
 }

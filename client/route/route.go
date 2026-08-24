@@ -701,6 +701,8 @@ func (r *Router) verifyQuoteAt(ctx context.Context, quoteURL string) (res quoteR
 // provider is not less usable because we could not draw its container list.
 func (r *Router) containersOf(appCompose []byte, composeHash [attest.ComposeHashLen]byte, quoteURL string) []compose.Service {
 	if len(appCompose) == 0 {
+		// fetchQuote already logged why there is none; saying it twice per verification
+		// would only make the real lines harder to find.
 		return nil
 	}
 	ac, err := evidence.VerifyAppCompose(appCompose, composeHash)
@@ -1013,9 +1015,19 @@ func (r *Router) fetchQuote(ctx context.Context, quoteURL string) (raw, appCompo
 	appCompose, acErr := attest.AppComposeFromQuoteResponse(body)
 	if acErr != nil {
 		// Never fatal: this half feeds a display, and the quote — the half that decides
-		// whether we seal at all — parsed fine. Absent is the ordinary case for a
-		// provider with public_tcbinfo off, so only a malformed reply is worth a line.
-		if !errors.Is(acErr, attest.ErrNoAppCompose) {
+		// whether we seal at all — parsed fine.
+		//
+		// Both branches log, at Debug, and the absent one is the reason why. A provider
+		// serving `public_tcbinfo: false` legitimately omits it, and a container list
+		// that is permanently null looks identical to a bug on our side; without a line
+		// here an operator has no way to tell "that provider does not publish it" from
+		// "we stopped reading it". The 0G broker does publish it — its app-compose sets
+		// public_tcbinfo true and its /v1/quote carries app_compose today — so on this
+		// fleet the absent branch firing is itself the signal.
+		if errors.Is(acErr, attest.ErrNoAppCompose) {
+			r.logger.Debug("provider quote reply carries no app_compose (public_tcbinfo off?); reporting no containers",
+				"quote_url", quoteURL)
+		} else {
 			r.logger.Debug("provider quote reply: cannot read app_compose, reporting no containers",
 				"quote_url", quoteURL, "err", acErr)
 		}
