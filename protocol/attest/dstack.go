@@ -42,6 +42,90 @@ func DecodeQuoteResponse(body []byte) ([]byte, error) {
 	return raw, nil
 }
 
+// ErrNoAppCompose reports a /v1/quote reply that carries no app-compose text.
+// Distinct from a malformed one because the two mean different things to a caller
+// building a display: a provider whose reply omits it (public_tcbinfo off, or an
+// older broker) has nothing to show, while a reply that will not parse is a bug
+// worth logging.
+var ErrNoAppCompose = errors.New("attest: quote response carries no app_compose")
+
+// AppComposeFromQuoteResponse pulls the app-compose text out of a provider's
+// /v1/quote reply.
+//
+// **What it returns is UNAUTHENTICATED and must not be used until it is hashed.**
+// It rides in `tcb_info`, which Intel does not sign — the caveat QuoteResponse
+// states by omitting these fields entirely. The bytes become trustworthy exactly
+// when sha256 over them equals the compose_hash a VERIFIED quote commits to in
+// mr_config_id, which is what evidence.VerifyAppCompose does and the only sanctioned
+// next step. That check is also why fetching this over an untrusted path is safe:
+// a substituted app-compose fails it, and the platform cannot choose the hash.
+//
+// The bytes are returned verbatim, never re-marshalled. dstack hashes the file as
+// it wrote it, so re-encoding equal JSON would change the digest and turn a genuine
+// app-compose into a mismatch.
+//
+// The nesting is dstack's, not ours: the reply's `tcb_info` holds a JSON object
+// whose `app_compose` is in turn a JSON string holding app-compose.json. tcb_info
+// itself arrives EITHER as that object or as a JSON string wrapping it, depending on
+// which shape the broker's SDK received from the guest agent; unwrapJSONString
+// accepts both. Every level is decoded here so the caller handles one shape.
+func AppComposeFromQuoteResponse(body []byte) ([]byte, error) {
+	var outer struct {
+		TCBInfo json.RawMessage `json:"tcb_info"`
+	}
+	if err := json.Unmarshal(body, &outer); err != nil {
+		return nil, fmt.Errorf("attest: decode quote response: %w", err)
+	}
+	tcbInfo, err := UnwrapJSONString(outer.TCBInfo)
+	if err != nil {
+		return nil, fmt.Errorf("attest: decode tcb_info: %w", err)
+	}
+	if len(tcbInfo) == 0 {
+		return nil, ErrNoAppCompose
+	}
+	var tcb struct {
+		AppCompose string `json:"app_compose"`
+	}
+	if err := json.Unmarshal(tcbInfo, &tcb); err != nil {
+		return nil, fmt.Errorf("attest: decode tcb_info: %w", err)
+	}
+	if tcb.AppCompose == "" {
+		return nil, ErrNoAppCompose
+	}
+	return []byte(tcb.AppCompose), nil
+}
+
+// UnwrapJSONString returns the document raw holds: raw itself when it is already an
+// object, or the string's contents when the document was delivered quoted.
+//
+// It exists because dstack delivers `tcb_info` BOTH ways — as a nested object and as
+// a JSON string holding the same document — and every consumer in this codebase has
+// to accept either. Declaring the field a `string` compiles, passes tests written
+// against one shape, and then fails at the OUTER unmarshal on a deployment serving
+// the other; the caller sees "cannot unmarshal object into a string" for the whole
+// body and loses every field, not just this one.
+//
+// Exported so the three consumers share one answer: protocol/attest for a provider's
+// /v1/quote, client/dstack for the guest agent's Info, and client/evidence for the
+// platform's per-app Info. client → protocol is the allowed direction, which is why
+// this lives here rather than in client.
+//
+// It normalizes only the WRAPPER. The `app_compose` inside stays a JSON string in
+// every form of the reply, and that is load-bearing rather than awkward: those exact
+// bytes are the preimage of the compose hash, so anything that re-marshals them
+// breaks the digest.
+func UnwrapJSONString(raw json.RawMessage) ([]byte, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '"' {
+		return trimmed, nil
+	}
+	var s string
+	if err := json.Unmarshal(trimmed, &s); err != nil {
+		return nil, err
+	}
+	return []byte(s), nil
+}
+
 // MRConfigVersion is the layout version in the first byte of a dstack
 // mr_config_id. dstack packs the app's identity into that register; the version
 // selects how, and the layouts are NOT interchangeable (see

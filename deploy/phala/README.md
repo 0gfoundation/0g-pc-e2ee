@@ -603,6 +603,16 @@ turned into a quote proxy or a fleet scanner. It returns no raw quote and no
 measurement registers either: anyone wanting to re-verify should fetch the quote direct
 from the provider, and the `verify` field names that URL.
 
+**`containers` lists what `compose_hash` commits to** — the provider's services in
+file order, each with its image and the digest the compose pins. It is populated only
+when the app-compose in the provider's quote reply hashes to the `compose_hash` in its
+verified quote; a mismatch, a reply that carries no app-compose, or an unparseable
+manifest all report `null` (never `[]`, which would claim the enclave runs no
+containers). An entry with an **empty digest** is worth reading: that image is pinned
+by tag, so `compose_hash` commits to a name whose contents can be republished under
+it. There is no `source` label here, unlike the gateway's own list — no per-provider
+manifest is published, so there is no release to trace an image back to.
+
 Expect `verdicts.measurement: "no_baseline"` on every deployment today — that is hop
 3's empty audited allowlist (`docs/design/trust-chain.md`), the same gap `pcverify`
 reports as an incomplete run, and it must be rendered as "observed only" rather than as

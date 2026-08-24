@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
+	"github.com/0gfoundation/0g-pc-e2ee/client/compose"
 )
 
 // This file holds what a request path already established about a provider but
@@ -190,6 +191,19 @@ type ProviderIdentity struct {
 	// It is authenticated: mr_config_id sits inside the signed TD report, so the same
 	// signature check behind QuoteDCAP covers it.
 	ComposeHash string
+	// Containers is what ComposeHash commits to, unpacked: the services of the
+	// provider CVM's compose text, in file order. Nil when the quote reply carried no
+	// app-compose, when it failed the hash gate, or when the text did not parse — all
+	// three are "nothing to show", never a claim that the enclave runs no containers.
+	//
+	// Reaching this field means the bytes hashed to ComposeHash, so the list is as
+	// authenticated as the hash is. What it is NOT is a check: the images here were
+	// never compared against anything (that is hop 3's unfilled allowlist), so a
+	// reader may render them but must not read the list's existence as approval. The
+	// one entry that carries a finding on its own is an empty Digest — an image
+	// pinned only by tag, which leaves ComposeHash committing to a name whose
+	// contents can be republished underneath it.
+	Containers []compose.Service
 }
 
 // ProviderIdentitySource is the read side of the record store — the seam the
@@ -338,6 +352,7 @@ func providerIdentityOf(prov previewProvider, res quoteResult, onchain Verdict) 
 		OnChainSigner: onchain,
 		Measurement:   res.facts.measurement,
 		ComposeHash:   res.facts.composeHash,
+		Containers:    res.facts.containers,
 	}
 	// A verdict must never reach the wire empty. Every path that builds a quoteResult
 	// records what the boot-chain check concluded, so an unset value would mean a

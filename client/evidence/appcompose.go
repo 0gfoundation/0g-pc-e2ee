@@ -1,6 +1,7 @@
 package evidence
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -84,8 +85,12 @@ func VerifyAppCompose(raw []byte, composeHash [attest.ComposeHashLen]byte) (AppC
 // preserves app_compose byte-for-byte, and its bytes are what the compose hash is
 // over. Re-marshalling anywhere in this path would break the digest.
 type infoResponse struct {
-	AppID   string `json:"app_id"`
-	TCBInfo string `json:"tcb_info"`
+	AppID string `json:"app_id"`
+	// TCBInfo is raw JSON, not a string: the agent ships it as a nested object on
+	// some deployments and as a JSON string holding the same document on others, and
+	// declaring either shape loses the other at the OUTER unmarshal — taking the whole
+	// Info reply down with it, app_id included. attest.UnwrapJSONString normalizes both.
+	TCBInfo json.RawMessage `json:"tcb_info"`
 }
 
 type tcbInfo struct {
@@ -146,11 +151,15 @@ func FetchAppCompose(ctx context.Context, hc *http.Client, appID, baseDomain str
 	if err := json.Unmarshal(body, &info); err != nil {
 		return nil, fmt.Errorf("decode guest-agent Info: %w", err)
 	}
-	if strings.TrimSpace(info.TCBInfo) == "" {
+	tcbDoc, err := attest.UnwrapJSONString(info.TCBInfo)
+	if err != nil {
+		return nil, fmt.Errorf("decode tcb_info: %w", err)
+	}
+	if len(bytes.TrimSpace(tcbDoc)) == 0 {
 		return nil, fmt.Errorf("guest-agent Info from %s carries no tcb_info; the app's public_tcbinfo is off, so app-compose must be supplied out of band", host)
 	}
 	var tcb tcbInfo
-	if err := json.Unmarshal([]byte(info.TCBInfo), &tcb); err != nil {
+	if err := json.Unmarshal(tcbDoc, &tcb); err != nil {
 		return nil, fmt.Errorf("decode tcb_info: %w", err)
 	}
 	if tcb.AppCompose == "" {
