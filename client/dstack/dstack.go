@@ -42,6 +42,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
 )
 
 // DefaultSocket is where the dstack runtime exposes the guest agent inside a
@@ -133,20 +135,6 @@ type tcbInfoEnvelope struct {
 	AppCompose string `json:"app_compose"`
 }
 
-// unwrapJSONString returns the document raw holds: raw itself when it is already
-// an object, or the string's contents when the document was delivered quoted.
-func unwrapJSONString(raw json.RawMessage) ([]byte, error) {
-	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) == 0 || trimmed[0] != '"' {
-		return trimmed, nil
-	}
-	var s string
-	if err := json.Unmarshal(trimmed, &s); err != nil {
-		return nil, err
-	}
-	return []byte(s), nil
-}
-
 // FetchAppCompose returns the raw bytes of this CVM's `app-compose.json`, as the
 // guest agent delivers them. An empty socket path uses DefaultSocket.
 //
@@ -171,7 +159,7 @@ func FetchAppCompose(ctx context.Context, socket string) ([]byte, error) {
 	if err := json.Unmarshal(body, &env); err != nil {
 		return nil, fmt.Errorf("dstack guest agent at %s: decode Info: %w", socket, err)
 	}
-	tcbInfo, err := unwrapJSONString(env.TCBInfo)
+	tcbInfo, err := attest.UnwrapJSONString(env.TCBInfo)
 	if err != nil {
 		return nil, fmt.Errorf("dstack guest agent at %s: decode tcb_info: %w", socket, err)
 	}

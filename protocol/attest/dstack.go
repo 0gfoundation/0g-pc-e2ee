@@ -76,7 +76,7 @@ func AppComposeFromQuoteResponse(body []byte) ([]byte, error) {
 	if err := json.Unmarshal(body, &outer); err != nil {
 		return nil, fmt.Errorf("attest: decode quote response: %w", err)
 	}
-	tcbInfo, err := unwrapJSONString(outer.TCBInfo)
+	tcbInfo, err := UnwrapJSONString(outer.TCBInfo)
 	if err != nil {
 		return nil, fmt.Errorf("attest: decode tcb_info: %w", err)
 	}
@@ -95,21 +95,26 @@ func AppComposeFromQuoteResponse(body []byte) ([]byte, error) {
 	return []byte(tcb.AppCompose), nil
 }
 
-// unwrapJSONString returns the document raw holds: raw itself when it is already an
+// UnwrapJSONString returns the document raw holds: raw itself when it is already an
 // object, or the string's contents when the document was delivered quoted.
 //
-// Both shapes are real. dstack's guest agent has shipped tcb_info as a nested object
-// AND as a JSON string holding the same document, and a broker's /v1/quote is a
-// re-serialization of whichever one its SDK received — so committing to either shape
-// silently loses the other. client/dstack.unwrapJSONString normalizes the same two
-// for the same reason; this is a deliberate duplicate rather than a shared helper,
-// because protocol must not depend on client.
+// It exists because dstack delivers `tcb_info` BOTH ways — as a nested object and as
+// a JSON string holding the same document — and every consumer in this codebase has
+// to accept either. Declaring the field a `string` compiles, passes tests written
+// against one shape, and then fails at the OUTER unmarshal on a deployment serving
+// the other; the caller sees "cannot unmarshal object into a string" for the whole
+// body and loses every field, not just this one.
 //
-// It normalizes only the WRAPPER. app_compose inside stays a JSON string in every
-// form of the reply, and that is load-bearing rather than awkward: those exact bytes
-// are the preimage of the compose hash, so anything that re-marshals them breaks the
-// digest.
-func unwrapJSONString(raw json.RawMessage) ([]byte, error) {
+// Exported so the three consumers share one answer: protocol/attest for a provider's
+// /v1/quote, client/dstack for the guest agent's Info, and client/evidence for the
+// platform's per-app Info. client → protocol is the allowed direction, which is why
+// this lives here rather than in client.
+//
+// It normalizes only the WRAPPER. The `app_compose` inside stays a JSON string in
+// every form of the reply, and that is load-bearing rather than awkward: those exact
+// bytes are the preimage of the compose hash, so anything that re-marshals them
+// breaks the digest.
+func UnwrapJSONString(raw json.RawMessage) ([]byte, error) {
 	trimmed := bytes.TrimSpace(raw)
 	if len(trimmed) == 0 || trimmed[0] != '"' {
 		return trimmed, nil
