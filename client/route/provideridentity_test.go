@@ -87,6 +87,16 @@ func pidServerWithAppCompose(t *testing.T, raw, appCompose []byte, hits *int32) 
 			}},
 		})
 	})
+	// The catalog the WARMER enumerates from, listing the same one provider the
+	// preview offers. Both writers of the identity store can then be exercised against
+	// one fixture, which is the point: the two paths must produce the same record, and
+	// a test that gave them different servers could not tell.
+	mux.HandleFunc("GET /v1/providers", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"object": "list",
+			"data":   []map[string]string{{"address": testProviderAddr}},
+		})
+	})
 	mux.HandleFunc("GET /v1/quote", func(w http.ResponseWriter, r *http.Request) {
 		if hits != nil {
 			atomic.AddInt32(hits, 1)
@@ -568,6 +578,150 @@ func TestProviderIdentity_NoAppComposeStillRecords(t *testing.T) {
 	}
 	if id.Containers != nil {
 		t.Errorf("Containers = %+v, want nil when the reply carries no app-compose", id.Containers)
+	}
+}
+
+// The warmer is the second writer, and the reason it exists as one: a panel asking
+// "what would I be sealed to?" has to be answerable BEFORE the first request, which
+// the request path alone can never do. A sweep must therefore leave a record as
+// complete as a served request's — containers included, since those are derived from
+// the quote reply and a sweep is the only place in a sweep that holds it.
+func TestProviderIdentity_WarmerRecordsWithoutAnyRequest(t *testing.T) {
+	appCompose := []byte(`{"docker_compose_file":"services:\n  broker:\n    image: ghcr.io/0gfoundation/0g-serving-broker@sha256:ec5df834\n"}`)
+	sum := sha256.Sum256(appCompose)
+	srv := pidServerWithAppCompose(t,
+		pidQuote(t, qvMeasurement(0xaa), pidMRConfigID(t, 1, hex.EncodeToString(sum[:]))),
+		appCompose, nil)
+	r := pidRouter(t, srv.URL, pidAllowAll(), attest.ModeEnforce, &stubRegistry{signer: qvSignerStr, ack: true})
+
+	// No Resolve, no Provider, no seal — only a sweep.
+	r.WarmOnce(context.Background(), fakeResolver{url: srv.URL})
+
+	id, ok := r.ProviderIdentity(testProviderAddr)
+	if !ok {
+		t.Fatal("a completed sweep left no record; the endpoint would 404 until the first request")
+	}
+	if id.Address != testProviderAddr {
+		t.Errorf("Address = %q, want the catalog's spelling %q", id.Address, testProviderAddr)
+	}
+	if id.Endpoint != srv.URL {
+		t.Errorf("Endpoint = %q, want the origin resolved from chain %q", id.Endpoint, srv.URL)
+	}
+	if id.QuoteURL == "" || !strings.HasPrefix(id.QuoteURL, srv.URL) {
+		t.Errorf("QuoteURL = %q, want the URL the sweep actually verified", id.QuoteURL)
+	}
+	if id.QuoteDCAP != VerdictPass || id.OnChainSigner != VerdictPass || id.Measurement != VerdictPass {
+		t.Errorf("verdicts = %q/%q/%q, want all pass", id.QuoteDCAP, id.OnChainSigner, id.Measurement)
+	}
+	if id.ComposeHash != hex.EncodeToString(sum[:]) {
+		t.Errorf("ComposeHash = %q, want the hash the quote binds", id.ComposeHash)
+	}
+	// The whole point of the change: a panel can name the provider's containers with
+	// no request having happened.
+	if len(id.Containers) != 1 || id.Containers[0].Name != "broker" ||
+		id.Containers[0].Digest != "sha256:ec5df834" {
+		t.Errorf("Containers = %+v, want the one digest-pinned broker service", id.Containers)
+	}
+}
+
+// QuoteDCAP is VerdictPass in every record that exists, and the warmer must not be
+// the writer that breaks that: a provider whose quote does not verify leaves no
+// record, so the endpoint 404s for it rather than reporting a failure it cannot
+// describe. Without this the sweep would be the one path that records an unverified
+// provider — and it sweeps EVERY provider, including the broken ones a request would
+// simply have skipped.
+func TestProviderIdentity_WarmerRecordsNothingWhenTheQuoteFails(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/providers", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"object": "list",
+			"data":   []map[string]string{{"address": testProviderAddr}},
+		})
+	})
+	mux.HandleFunc("GET /v1/quote", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusServiceUnavailable)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	r := pidRouter(t, srv.URL, pidAllowAll(), attest.ModeEnforce, &stubRegistry{signer: qvSignerStr, ack: true})
+	r.WarmOnce(context.Background(), fakeResolver{url: srv.URL})
+
+	if id, ok := r.ProviderIdentity(testProviderAddr); ok {
+		t.Errorf("recorded %+v for a provider whose quote never verified; QuoteDCAP would be a claim no check made", id)
+	}
+}
+
+// A shutdown must not rewrite a verdict. The warmer's signer refresh reports OUR
+// cancellation as a failed lookup, so without the context guard a sweep interrupted
+// mid-provider would stamp "unavailable" over a `pass` it had just confirmed — the
+// gateway accusing itself of being unable to check a provider it checked fine a
+// moment earlier. Same reasoning as the sweep counters, applied to the record.
+func TestProviderIdentity_CancelledSweepLeavesTheRecordAlone(t *testing.T) {
+	srv := pidServer(t, pidQuote(t, qvMeasurement(0xaa), pidMRConfigID(t, 1, pidComposeHashHex)), nil)
+	reg := &stubRegistry{signer: qvSignerStr, ack: true}
+	r := pidRouter(t, srv.URL, pidAllowAll(), attest.ModeEnforce, reg)
+	res := fakeResolver{url: srv.URL}
+
+	r.WarmOnce(context.Background(), res)
+	before, ok := r.ProviderIdentity(testProviderAddr)
+	if !ok || before.OnChainSigner != VerdictPass {
+		t.Fatalf("setup: record = %+v (found %v), want one with OnChainSigner pass", before, ok)
+	}
+
+	// Armed only now, so the priming sweep above completes normally: from here the
+	// signer refresh cancels the sweep and then fails with ctx.Err(), which is what a
+	// registry does when the process is going down mid-provider.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cr := &cancellingRegistry{cancel: cancel, failWhenArmed: true}
+	cr.arm()
+	r.registry = cr
+	r.WarmOnce(ctx, res)
+
+	got, ok := r.ProviderIdentity(testProviderAddr)
+	if !ok {
+		t.Fatal("the record vanished on a cancelled sweep")
+	}
+	if got.OnChainSigner != VerdictPass {
+		t.Errorf("OnChainSigner = %q after a cancelled sweep, want the confirmed %q left standing",
+			got.OnChainSigner, VerdictPass)
+	}
+}
+
+// The sweep's on-chain verdict has to speak the same vocabulary the request path
+// reports, or one panel would show two different answers for the same chain state.
+// The distinction that matters most is the last case: our own RPC having a bad minute
+// is `unavailable`, never a finding against the provider.
+func TestProviderIdentity_WarmerOnChainVerdicts(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		reg  *stubRegistry
+		want Verdict
+	}{
+		{"acknowledged and agreeing", &stubRegistry{signer: qvSignerStr, ack: true}, VerdictPass},
+		{"acknowledges nobody", &stubRegistry{ack: false}, VerdictNoMatch},
+		{"acknowledges someone else", &stubRegistry{signer: "0xdead", ack: true}, VerdictNoMatch},
+		{"chain unreadable", &stubRegistry{refreshErr: errors.New("rpc down")}, VerdictUnavailable},
+		{"grounding not configured", nil, VerdictNotChecked},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := pidServer(t, pidQuote(t, qvMeasurement(0xaa), pidMRConfigID(t, 1, pidComposeHashHex)), nil)
+			r := pidRouter(t, srv.URL, pidAllowAll(), attest.ModeEnforce, tc.reg)
+			r.WarmOnce(context.Background(), fakeResolver{url: srv.URL})
+
+			id, ok := r.ProviderIdentity(testProviderAddr)
+			if !ok {
+				t.Fatal("no record; the quote verified, so the on-chain outcome must not suppress it")
+			}
+			if id.OnChainSigner != tc.want {
+				t.Errorf("OnChainSigner = %q, want %q", id.OnChainSigner, tc.want)
+			}
+			// Whatever the chain said, the quote's own verdict stands on its own evidence.
+			if id.QuoteDCAP != VerdictPass {
+				t.Errorf("QuoteDCAP = %q, want pass", id.QuoteDCAP)
+			}
+		})
 	}
 }
 

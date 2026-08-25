@@ -258,10 +258,27 @@ This does not reopen the "no `/quote` route" decision: publishing a parsed
 ### 6.4 What the gateway says about a *provider* is a relay — and it does carry verdicts
 
 `GET /v1/providers/{address}/identity` answers the other half of the same panel: the
-provider hop. For a provider this gateway has sealed to, it returns that provider's
-serving `endpoint`, the `compose_hash` out of its verified quote, the `containers`
-that hash commits to, and — unlike §6.3 — **verdicts**: `quote_dcap`,
+provider hop. For a provider this gateway has verified itself, it returns that
+provider's serving `endpoint`, the `compose_hash` out of its verified quote, the
+`containers` that hash commits to, and — unlike §6.3 — **verdicts**: `quote_dcap`,
 `onchain_signer`, `measurement`.
+
+"Verified itself" has two writers, and the second one is what makes the endpoint
+usable in a panel. A served request records the provider it sealed to; the background
+warmer (`-warm`, §4) records **every** provider in the router catalog, running the same
+DCAP verification and the same on-chain signer comparison on each sweep. Without the
+warmer the endpoint could only ever describe a request that had already happened, so
+"show me what I would be sealed to" was unanswerable and a provider stayed invisible
+until it was picked. With it, and with the sweep interval under the record TTL, the
+whole catalog is continuously describable.
+
+That widens what the *set* of records discloses, and the widening is deliberate:
+probing address by address now confirms catalog membership. It leaks nothing, because
+the catalog is `GET /v1/providers` — proxied to the router unauthenticated, and read
+without a credential by the warmer itself. The endpoint still exposes no **list**,
+which is a separate property worth keeping: the set of providers a gateway recently
+*served* is fleet telemetry, and covering every provider uniformly is exactly what
+stops a per-address probe from revealing it.
 
 `containers` reaches the wire only through a hash gate, and the gate is the whole of
 its standing. The compose text rides in the quote reply's `tcb_info`, which Intel
@@ -284,8 +301,9 @@ The asymmetry with §6.3 is the point, so state it precisely. There, the gateway
 describing **itself**, and nothing verified anything, so a verdict of any shape would
 be self-vouching. Here the gateway is reporting checks it genuinely **performed on a
 third party** — a DCAP verification of that provider's quote against Intel's roots, a
-comparison of the quote-bound signer against the on-chain `teeSignerAddress` — before
-it agreed to seal a user's prompt to that enclave (`client/route`). Those are real
+comparison of the quote-bound signer against the on-chain `teeSignerAddress` — the
+checks that decide whether it is willing to seal a user's prompt to that enclave at
+all (`client/route`). Those are real
 verifications. Withholding them would not make the endpoint humbler; it would hide the
 only verification in the picture.
 
@@ -298,11 +316,13 @@ here, exactly as in §6.3. Every response carries that caveat inline, in `verify
 Three rules the implementation holds to (`client/cmd/gateway/provideridentity.go`,
 `client/route/provideridentity.go`):
 
-- **It fetches nothing.** The record is a byproduct of a request that already
-  happened; an address this gateway has not sealed to is a `404`, not a lookup. That
-  is what keeps the route from becoming a quote proxy — or a scanner — for arbitrary
-  addresses. Records are bounded in count and expire, because a verdict attests a
-  point in time.
+- **It fetches nothing.** The record is a byproduct of a verification that already
+  happened — a served request, or a warmer sweep; an address this gateway has not
+  verified itself is a `404`, not a lookup. That is what keeps the route from becoming
+  a quote proxy — or a scanner — for arbitrary addresses, whichever writer filled the
+  store: the warmer enumerates from the catalog on its own schedule, never from a
+  caller's path parameter. Records are bounded in count and expire, because a verdict
+  attests a point in time.
 - **It returns no raw quote and no boot-chain registers.** Anyone who wants to redo
   the work should fetch the quote **direct from the provider** (`verify` names the
   URL), not through the party whose claims are under examination — the same reasoning

@@ -194,13 +194,15 @@ one step no web page can perform. If the two disagree, `pcverify` is right.
 
 The provider side is a different kind of claim, and has its own route: `GET
 /v1/providers/{address}/identity` reports what the gateway **verified** about a
-provider it sealed to — the DCAP verdict on that provider's quote, the on-chain signer
+provider — the DCAP verdict on that provider's quote, the on-chain signer
 comparison, the boot-chain verdict (`no_baseline` today, hop 3), its `compose_hash`
 (`cmd/gateway/provideridentity.go`, `route/provideridentity.go`). Those checks really
-happened, on a third party, before the seal; what the endpoint cannot do is make them
-*yours*. It answers only for providers it has checked while serving a request, never
-fetches a quote, and returns no quote bytes — anyone re-verifying should fetch that
-provider's `/v1/quote` direct, which is what the response's `verify` string names.
+happened, on a third party, before any seal; what the endpoint cannot do is make them
+*yours*. It answers only for providers it has checked itself — the ones it has sealed
+to, plus every provider the `-warm` sweep covers, which is what lets a panel describe
+the catalog before the first prompt — never fetches a quote for an address on demand,
+and returns no quote bytes: anyone re-verifying should fetch that provider's
+`/v1/quote` direct, which is what the response's `verify` string names.
 
 `-allow-untrusted-cert` (gateway mode) is for a hostname on the ACME staging CA. Every
 check runs either way — the evidence fetch does not verify PKI, since it rides the same

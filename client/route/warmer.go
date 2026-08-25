@@ -85,13 +85,16 @@ func (r *Router) listProviderAddrs(ctx context.Context) ([]string, error) {
 // actually refreshed. On failure it evicts any stale entry so a provider that has
 // gone bad (TCB downgrade, unreachable, revoked) is not served from cache until
 // its TTL lapses.
-// It returns the signer the fresh quote bound, so a caller can check it against
-// the chain the way a request would rather than assuming a successful refresh
-// means a usable provider.
-func (r *Router) refreshQuote(ctx context.Context, endpoint string) (signer string, err error) {
+//
+// It returns the whole verification result, not just the keys. The signer lets a
+// caller check it against the chain the way a request would, rather than assuming a
+// successful refresh means a usable provider; the facts are what the provider-identity
+// record is built from, and this is the only place in a sweep that holds them (they
+// are derived from the quote reply, which nothing downstream sees).
+func (r *Router) refreshQuote(ctx context.Context, endpoint string) (quoteResult, error) {
 	quoteURL, err := deriveQuoteURL(endpoint)
 	if err != nil {
-		return "", err
+		return quoteResult{}, err
 	}
 	res, err := r.verifyAndCache(ctx, quoteURL)
 	if err != nil {
@@ -101,9 +104,9 @@ func (r *Router) refreshQuote(ctx context.Context, endpoint string) (signer stri
 		if ctx.Err() == nil {
 			r.quoteCache.del(quoteURL)
 		}
-		return "", err
+		return quoteResult{}, err
 	}
-	return res.signer, nil
+	return res, nil
 }
 
 // WarmState describes what the most recently completed warmer sweep found. It is
@@ -212,7 +215,12 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 			continue
 		}
 		prepared := true
-		quoteSigner, err := r.refreshQuote(ctx, info.URL)
+		verified, err := r.refreshQuote(ctx, info.URL)
+		// Tracked apart from prepared, which the on-chain block below also lowers: only
+		// the QUOTE's outcome decides whether a provider-identity record may be written
+		// at all, and a provider that verified but failed its signer check is recorded
+		// (with the verdict that failed it) exactly as the request path records one.
+		quoteVerified := err == nil
 		if err != nil {
 			metrics.WarmerProviderRefresh("verify_failed")
 			r.logger.Warn("warmer: verify failed", "provider", addr, "endpoint", info.URL, "err", err)
@@ -220,6 +228,14 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 		} else {
 			metrics.WarmerProviderRefresh("ok")
 		}
+		quoteSigner := verified.signer
+		// The on-chain verdict for the record, in the same vocabulary the request path
+		// reports. Assigned per arm below rather than through onchainVerdictOf because a
+		// sweep produces no groundingOutcome to translate: it never calls
+		// groundSignerOnChain (no cached-reading-then-revalidate dance — see the comment
+		// on the refresh below), so there is nothing for that function to map. The
+		// conclusions are the ones it would reach from the same evidence.
+		onchain := VerdictNotChecked
 		// Refresh the on-chain signer-grounding cache too (when configured), so the
 		// first real request pays neither the DCAP verify nor the registry RPC. This
 		// uses RefreshSigner rather than an ordinary lookup on purpose: an ordinary
@@ -239,6 +255,10 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 			case err != nil:
 				metrics.WarmerSignerRefresh("failed")
 				r.logger.Warn("warmer: signer refresh failed", "provider", addr, "err", err)
+				// Unavailable, never a finding: OUR chain RPC having a bad minute must not
+				// reach a panel as an accusation against the provider (see onchainVerdictOf
+				// on why lookup_failed is the one outcome that must not collapse).
+				onchain = VerdictUnavailable
 				// Only enforce mode turns this into "a request could not use this provider".
 				// Under warn the request path proceeds ungrounded, so calling the provider
 				// unprepared here would make /readyz refuse a cutover to a side that is in
@@ -261,6 +281,12 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 				r.logger.Warn("warmer: on-chain signer does not vouch for the quote-bound signer",
 					"provider", addr, "quote_signer", quoteSigner,
 					"onchain_signer", got.Address, "acknowledged", got.Acknowledged)
+				// Both halves of this arm are VerdictNoMatch — the same collapse the request
+				// path makes: an operator responds differently to "the chain vouches for
+				// nobody" than to "it vouches for someone else", which is why the log line
+				// above carries both, but to a reader asking "is this the provider the chain
+				// vouches for?" the answer is no either way.
+				onchain = VerdictNoMatch
 				prepared = prepared && !r.onchainEnforce
 			case quoteSigner == "":
 				// The chain acknowledges someone, but refreshQuote failed above so there is
@@ -269,9 +295,38 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 				// reads as "agreement confirmed". prepared is already false from
 				// verify_failed, which is the metric that says why.
 				metrics.WarmerSignerRefresh("unchecked")
+				// Unavailable for the same reason this is its own metric bucket: the
+				// comparison did not happen. Unreachable for a RECORD — a quote that bound no
+				// signer did not verify, so none is written below — but assigned rather than
+				// left at not_checked, which would claim this deployment does not run the
+				// check when in fact it ran and could not conclude.
+				onchain = VerdictUnavailable
 			default:
 				metrics.WarmerSignerRefresh("ok")
+				onchain = VerdictPass
 			}
+		}
+		// Record what these checks established, so a panel can name this provider —
+		// its compose hash, its containers, the verdicts — before any request has been
+		// sealed to it (see provideridentity.go). Gated on the quote alone: QuoteDCAP is
+		// VerdictPass in every record that exists, so a provider whose quote did not
+		// verify leaves none and the endpoint 404s for it rather than reporting a
+		// failure. The on-chain verdict rides along whatever it turned out to be,
+		// mirroring the request path, which records a candidate enforce mode REJECTS
+		// rather than letting an older pass stand while the gateway refuses it.
+		//
+		// This can overwrite a record the request path just wrote, and that is safe in
+		// both directions: both writers verified the quote live, and a sweep's on-chain
+		// verdict comes from RefreshSigner — a read-through, never the grace window — so
+		// neither replaces a conclusion with a worse-evidenced one.
+		//
+		// Skipped on a cancelled context, for the same reason the sweep counters are: a
+		// cancellation is OURS, not the provider's. The signer refresh above returns
+		// ctx.Err() when we are shutting down, which lands in its `failed` arm and would
+		// stamp VerdictUnavailable over a perfectly good `pass` — publishing "we could
+		// not check this provider" about a shutdown that checked nothing.
+		if quoteVerified && ctx.Err() == nil {
+			r.recordProviderIdentity(providerIdentityOf(addr, info.URL, verified, onchain))
 		}
 		if prepared {
 			ready++

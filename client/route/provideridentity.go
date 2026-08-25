@@ -8,23 +8,34 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/client/compose"
 )
 
-// This file holds what a request path already established about a provider but
-// used to throw away: the outcome of the checks THIS process ran before it agreed
-// to seal to that provider.
+// This file holds what a verification already established about a provider but
+// used to throw away: the outcome of the checks THIS process ran before it was
+// willing to seal to that provider.
 //
 // The verification itself is not new — verifyQuoteAt has always DCAP-verified the
-// quote and compared the boot chain, and groundSignerOnChain has always compared
-// the quote-bound signer against the on-chain registry. What is new is that the
-// outcome survives the request, so a verification panel can show the user the
-// broker hop of the trust chain instead of a blank.
+// quote and compared the boot chain, and the on-chain signer has always been
+// compared against the registry. What is new is that the outcome survives the
+// verification, so a verification panel can show the user the broker hop of the
+// trust chain instead of a blank.
 //
-// Two properties are load-bearing, and both come from where the record is WRITTEN
-// (routeCandidates.Provider, after the checks) rather than from anything here:
+// Two writers, and the difference between them is only WHEN the checks ran:
 //
-//   - A record exists only for a provider this gateway actually verified while
-//     serving a request. Nothing in this file can fetch a quote, resolve an
+//   - routeCandidates.Provider, for the provider a real request was sealed to.
+//   - Router.WarmOnce, for every provider the background warmer sweeps. It runs the
+//     same DCAP verification and the same on-chain signer comparison, ahead of any
+//     request, so the panel can name a provider's containers before the user has
+//     made one. Without it the endpoint could only ever answer about a request that
+//     had already happened, which made "show me who I would be sealed to" impossible
+//     to answer and left every provider in the catalog invisible until it was picked.
+//
+// Three properties are load-bearing, and all three come from where the record is
+// WRITTEN (after the checks, in both writers) rather than from anything here:
+//
+//   - A record exists only for a provider this process verified ITSELF, and only
+//     once its quote passed DCAP. Nothing in this file can fetch a quote, resolve an
 //     endpoint, or reach the chain, so the surface it feeds cannot be turned into a
-//     quote proxy or a scanner for arbitrary addresses.
+//     quote proxy or a scanner for arbitrary addresses — an address neither writer
+//     has verified is absent however often it is asked for.
 //   - It is written on the way past the checks, not on the way to a successful seal.
 //     A candidate the on-chain check REJECTS (enforce mode) is recorded with the
 //     verdict that rejected it, because the alternative is worse: an earlier pass
@@ -37,6 +48,16 @@ import (
 //     Intel-rooted quote; VerdictNoBaseline on the measurement means the audited
 //     allowlist is empty and nothing was compared. A reader that cannot tell those
 //     apart is exactly what the explicit vocabulary below exists to prevent.
+//
+// What the warmer as a writer DOES change is how much the set of records discloses.
+// With the warmer on, the store holds the whole router catalog rather than only the
+// providers this gateway has recently been asked to use, so probing address by
+// address confirms catalog membership. That discloses nothing new: the catalog is
+// GET /v1/providers, which the gateway proxies to the router unauthenticated and
+// which the warmer itself reads without a credential. What it must not become is a
+// LIST — see providerIdentityHandler — because the set of providers a gateway
+// recently SERVED is fleet telemetry, and that is precisely the distinction the
+// warmer erases by covering every provider uniformly.
 //
 // The records are kept HERE rather than inside quoteCache, which holds the same
 // verifications, for two reasons that are properties of the data and not of taste.
@@ -123,7 +144,8 @@ func onchainVerdictOf(outcome groundingOutcome) Verdict {
 }
 
 // ProviderIdentity is the record of what this gateway verified about one provider,
-// as of the last request that used it.
+// as of the last verification it ran against that provider — the last request
+// sealed to it, or the last warmer sweep that swept it, whichever is later.
 //
 // It carries no quote bytes and no measurement registers, on purpose. A caller who
 // wants to redo the verification should fetch the quote from the provider DIRECT
@@ -133,13 +155,20 @@ func onchainVerdictOf(outcome groundingOutcome) Verdict {
 // them against; the reader who needs observed values is the operator filling the
 // hop-3 allowlist, and that is pcverify's job.
 type ProviderIdentity struct {
-	// Address is the provider's on-chain account, as the router spelled it in the
-	// route preview (EIP-55 or lowercase). It is the same value the gateway returns
-	// in the X-Provider response header, which is how a panel knows what to ask for.
+	// Address is the provider's on-chain account, as the router spelled it (EIP-55 or
+	// lowercase) in whichever list the writer read — the route preview for a served
+	// request, the provider catalog for a warmer sweep. It is the same value the
+	// gateway returns in the X-Provider response header, which is how a panel knows
+	// what to ask for. Lookups canonicalize, so the spelling is a display detail.
 	Address string
 	// Endpoint is the provider's serving origin (scheme://host[:port]) — the host a
-	// panel names as "who answered", reported so a reader can leave this gateway and go
-	// to the source.
+	// panel names as "who answered" (or, for a warmed record, who would), reported so
+	// a reader can leave this gateway and go to the source.
+	//
+	// The two writers source it differently and both are right: a request records the
+	// endpoint the route preview named and then verified, a sweep records the one it
+	// resolved from the on-chain registry. Either way it is the endpoint whose quote
+	// this record describes, which is the only property a reader needs from it.
 	//
 	// It is a DISPLAY value: do not build paths off it. The router may advertise an
 	// endpoint under a base path, which an origin necessarily drops, so
@@ -228,17 +257,28 @@ type ProviderIdentitySource interface {
 // panel's data source.
 //
 // Sized to match the quote cache's default so a reported verdict is never much
-// older than the verification a request would itself have relied on.
+// older than the verification a request would itself have relied on. That also
+// puts it above the warmer's default interval (proxycli.defaultWarmInterval, 4m),
+// which is what makes a warmed record CONTINUOUSLY available rather than
+// intermittently: each sweep replaces the entry before the previous one expires, so
+// a panel loading at an arbitrary moment finds an answer. A deployment that widens
+// -warm-interval past this TTL gets gaps between sweeps, and the endpoint honestly
+// 404s in them rather than reporting a verification that has lapsed.
 const providerIdentityTTL = 5 * time.Minute
 
 // maxProviderIdentities caps how many records are held.
 //
-// The address in a record comes from the route preview, and the router is
-// untrusted: a compromised one could name a new address per candidate (all pointing
-// at one genuinely-verifiable endpoint, since a record requires a passing quote
-// check) and grow this map for as long as it keeps answering. The cap turns that
-// into a fixed cost. It is far above any real fleet — the router's catalog is tens
-// of providers — so a legitimate deployment never reaches it.
+// The address in a record comes from the router, which is untrusted: a compromised
+// one could name a new address per candidate (all pointing at one
+// genuinely-verifiable endpoint, since a record requires a passing quote check) and
+// grow this map for as long as it keeps answering. The cap turns that into a fixed
+// cost. It is far above any real fleet — the router's catalog is tens of providers —
+// so a legitimate deployment never reaches it.
+//
+// The warmer, despite reading the same untrusted catalog, cannot be used this way at
+// all: it resolves every address's endpoint from the ON-CHAIN registry before
+// verifying anything, so an invented address fails that lookup and is skipped. Only
+// providers the chain knows about can ever reach the store through a sweep.
 const maxProviderIdentities = 1024
 
 // identityStore holds the records, keyed by provider address through
@@ -337,17 +377,23 @@ func (r *Router) ProviderIdentity(address string) (ProviderIdentity, bool) {
 	return r.identities.get(address)
 }
 
-// providerIdentityOf assembles the record from a materialized candidate: the
-// address and endpoint the preview named, the facts the quote verification
-// established, and the on-chain verdict.
+// providerIdentityOf assembles the record from a verified provider: its on-chain
+// address, the endpoint the quote was verified at, the facts that verification
+// established, and the on-chain signer verdict.
+//
+// It takes the address and endpoint as plain strings rather than the previewProvider
+// the request path holds, because the warmer reaches it with neither — it enumerates
+// an address from the catalog and resolves the endpoint from chain, and there is no
+// route preview anywhere in a sweep. Naming the two fields it actually reads keeps
+// the second writer from having to fabricate a preview candidate to satisfy a type.
 //
 // QuoteDCAP is VerdictPass unconditionally, and only here: this function is reached
-// only from the path where r.verifier.Verify returned without error, which is the
+// only from a path where r.verifier.Verify returned without error, which is the
 // definition of that verdict. A caller that reaches it any other way would be
 // asserting something no check made — see ProviderIdentity.QuoteDCAP.
-func providerIdentityOf(prov previewProvider, res quoteResult, onchain Verdict) ProviderIdentity {
+func providerIdentityOf(address, endpoint string, res quoteResult, onchain Verdict) ProviderIdentity {
 	id := ProviderIdentity{
-		Address:       prov.Address,
+		Address:       address,
 		QuoteDCAP:     VerdictPass,
 		OnChainSigner: onchain,
 		Measurement:   res.facts.measurement,
@@ -368,19 +414,19 @@ func providerIdentityOf(prov previewProvider, res quoteResult, onchain Verdict) 
 	// going to fetch the quote wants a URL they can reason about. Both derivations are
 	// best-effort — a malformed endpoint could not have been verified in the first
 	// place, so in practice they always succeed; an empty field beats a half-parsed URL.
-	if origin, err := deriveOrigin(prov.Endpoint); err == nil {
+	if origin, err := deriveOrigin(endpoint); err == nil {
 		id.Endpoint = origin
 	}
-	if quoteURL, err := deriveQuoteURL(prov.Endpoint); err == nil {
+	if quoteURL, err := deriveQuoteURL(endpoint); err == nil {
 		id.QuoteURL = quoteURL
 	}
 	return id
 }
 
-// recordProviderIdentity stores what the checks in routeCandidates.Provider just
-// established. It is called once the quote has been verified, the keys bound and the
+// recordProviderIdentity stores what a completed set of checks established. Both
+// writers call it only once the quote has been verified, the keys bound and the
 // on-chain check made — so a record means "this gateway ran its checks against this
-// provider for a real request", never "the router mentioned it".
+// provider", never "the router mentioned it".
 func (r *Router) recordProviderIdentity(id ProviderIdentity) {
 	r.identities.put(id)
 }
