@@ -41,10 +41,9 @@ is a single operator at both hops.
 |---|---|---|
 | your browser → the gateway | **ciphertext** (ordinary TLS) | the session ends *inside* the gateway TEE, not at a load balancer in front of it. The sealing to the provider happens in the gateway, not in your browser |
 | inside the gateway TEE | plaintext, in memory | unreadable from outside the enclave |
-| the gateway → the provider | **ciphertext** (HPKE, sealed to the provider enclave's key) | this is the only form 0G's router ever carries |
-| 0G's router | **ciphertext only** | it can route and bill; it cannot open the body |
+| the gateway → **0G's router** → the provider | **ciphertext** (HPKE, sealed to the provider enclave's key) | there is no direct gateway-to-provider link for a request: it travels through the router, which forwards the sealed body without holding the key that opens it |
 | inside the provider enclave | plaintext, in memory | the model runs here, in the same TEE |
-| the response, coming back | **ciphertext** + a signature from the enclave | the router can neither read it nor forge it |
+| the response, back along the same path | **ciphertext** + a signature from the enclave | the router can neither read it nor forge it |
 
 ```mermaid
 flowchart LR
@@ -65,7 +64,12 @@ flowchart LR
     R -->|"forwards the sealed body opaquely"| P
     P -.->|"sealed response + enclave signature"| R
     R -.->|"still sealed"| G
+    P ---->|"response signature, fetched DIRECT<br/>(the router does not proxy it)"| G
 ```
+
+One call does leave the router out: after a response comes back, the gateway fetches that
+response's signature straight from the provider, so the router cannot suppress or
+substitute the proof that the enclave produced it. That call carries no prompt content.
 
 Nothing on that path writes your prompt to a disk, a log, or a backup. Because the
 build that runs in the gateway is pinned by its attestation (below), that is something
