@@ -951,7 +951,13 @@ and warmer liveness).
     chain (MRTD + RTMR1 + RTMR2) rather than all five registers — the same split the
     gateway's own OS-image check makes — so an entry pins one audited image instead of
     one CVM, and the allowlist can be filled. What is still open is where the values are
-    published (see `trust-chain.md` hop 3).
+    published (see `trust-chain.md` hop 3). Every provider therefore logs this WARN on
+    each quote-cache miss, and the line carries all three registers so an entry can be
+    recorded from it: [`collect-bootchains.py`](./collect-bootchains.py) turns a log (or
+    a live sweep of `/v1/quote`) into the fleet's boot-chain census — how many distinct
+    chains are out there and who runs each — which is the inventory the switch needs
+    before it can be flipped. It reports what the fleet *claims*; an entry still has to
+    be recomputed with `dstack-mr`, per `client/evidence/osimages.json`'s header.
 
   Response signatures are always fail-closed.
 - If the gateway container is recreated with a new address, restart
