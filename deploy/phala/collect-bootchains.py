@@ -302,16 +302,47 @@ def dedupe(observations):
     return list(best.values())
 
 
-def builtin_gateway_images(path):
+# Where client/evidence/osimages.json sits relative to this script, tried before
+# the same path relative to the working directory. This script lives two levels
+# down from the repo root, so an operator running it from deploy/phala — the
+# obvious place, since that is where it is — must not silently lose the
+# cross-reference; and a copy of the script carried off somewhere else still finds
+# the file when invoked from a checkout.
+OSIMAGES_RELPATH = ("client", "evidence", "osimages.json")
+
+
+def default_osimages_paths():
+    here = os.path.dirname(os.path.abspath(__file__))
+    return [
+        os.path.normpath(os.path.join(here, "..", "..", *OSIMAGES_RELPATH)),
+        os.path.join(*OSIMAGES_RELPATH),
+    ]
+
+
+def builtin_gateway_images(paths):
     """Load client/evidence/osimages.json, so the census can say which boot chains
     are already the gateway's own audited image. It is the ONLY allowlist in the
     repo today, and it is the gateway's — the provider verifier is wired with an
-    empty policy — so a match here is a useful signal, not a pass."""
-    try:
-        with open(path, encoding="utf-8") as f:
-            doc = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return []
+    empty policy — so a match here is a useful signal, not a pass.
+
+    Returns (entries, problem). A missing file is reported rather than swallowed:
+    without it every group prints "NOT in any allowlist", which is TRUE of the
+    provider allowlist either way but hides that the comparison against the
+    gateway's image never ran — and that comparison is the most informative line
+    in the table."""
+    tried = []
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8") as f:
+                doc = json.load(f)
+            break
+        except OSError:
+            tried.append(path)
+        except json.JSONDecodeError as e:
+            return [], f"{path}: not valid JSON: {e}"
+    else:
+        return [], ("no gateway allowlist to cross-reference against (looked in "
+                    + ", ".join(tried) + ") — run from a checkout or pass --osimages")
     out = []
     for img in doc.get("images", []):
         try:
@@ -322,7 +353,7 @@ def builtin_gateway_images(path):
             ))
         except KeyError:
             continue
-    return out
+    return out, None
 
 
 def short(hex_str, keep=12):
@@ -464,8 +495,9 @@ def main(argv):
                     help='write the census as an endpoints file for a follow-up '
                          '--endpoints-file sweep ("-" for stdout)')
     ap.add_argument("--osimages", metavar="FILE",
-                    default="client/evidence/osimages.json",
-                    help="gateway allowlist to cross-reference (default %(default)s)")
+                    help="gateway allowlist to cross-reference (default: the repo's "
+                         "client/evidence/osimages.json, found relative to this "
+                         "script or to the working directory)")
     args = ap.parse_args(argv)
 
     endpoints = list(args.endpoint)
@@ -506,8 +538,11 @@ def main(argv):
     groups = collections.OrderedDict(
         sorted(groups.items(), key=lambda kv: -len(kv[1])))
 
-    gateway_images = builtin_gateway_images(args.osimages)
+    gateway_images, problem = builtin_gateway_images(
+        [args.osimages] if args.osimages else default_osimages_paths())
     render(groups, gateway_images, sys.stdout)
+    if problem:
+        print(f"note: {problem}", file=sys.stderr)
 
     if errors:
         print(f"{len(errors)} source(s) yielded nothing:", file=sys.stderr)
