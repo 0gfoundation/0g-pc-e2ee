@@ -114,6 +114,49 @@ func (r *Router) refreshQuote(ctx context.Context, endpoint string) (quoteResult
 	return res, quoteURL, nil
 }
 
+// cachedSignerVerdict answers, for the RECORD only, what a request's grounding would
+// conclude about providerAddr right now — used when the sweep's own forced re-read of
+// the chain failed.
+//
+// Without it a chain outage shorter than the cache's grace window made the two
+// writers disagree in a way neither of them was wrong about, and the sweep won. The
+// asymmetry is by design at both ends: a sweep calls RefreshSigner, which bypasses the
+// cache, the grace window AND the failure cooldown, because a sweep feeds readiness
+// and enforce mode must mean the chain was actually READ; a request calls
+// AcknowledgedSigner, which answers a grace-window reading as groundingOKStale, i.e.
+// VerdictPass, because staleness disqualifies a negative and never a positive. So for
+// the duration of the outage requests kept passing while every sweep overwrote the
+// record with unavailable — same endpoint, so putWarmed saw no conflict to defer on —
+// and with the sweep interval under the record TTL the sweep owned the steady state.
+// The record then described our own RPC's health rather than the provider's.
+//
+// The reading is free: RefreshSigner's failure has just stamped the cooldown, so this
+// lookup is answered from the stale entry or the remembered error without a live
+// attempt (chain/cache.go, AcknowledgedSigner).
+//
+// It can only ever UPGRADE unavailable to pass, never produce a finding, and that
+// bound is load-bearing rather than caution. A cached reading that DISAGREES is not a
+// verdict in the request path either: groundSignerOnChain revalidates it live before
+// ruling, and the live re-read is precisely what just failed — so a request meeting
+// this state also lands on lookup_failed. Reporting no_match here would accuse a
+// provider on evidence the rest of this package refuses to rule on.
+//
+// prepared is deliberately NOT revisited by the caller on the strength of this. That
+// answers a different question — "could a cutover to this side serve traffic?" — where
+// under enforce a chain we could not read live is a real reason to say no.
+func (r *Router) cachedSignerVerdict(ctx context.Context, providerAddr, quoteSigner string) Verdict {
+	// A cancelled sweep writes no record, so there is no verdict to compute — and the
+	// lookup would be a live attempt, since a cancellation is not stamped as a failure.
+	if ctx.Err() != nil || quoteSigner == "" {
+		return VerdictUnavailable
+	}
+	got, err := r.registry.AcknowledgedSigner(ctx, providerAddr)
+	if err != nil || !signerAgrees(got, quoteSigner) {
+		return VerdictUnavailable
+	}
+	return VerdictPass
+}
+
 // WarmState describes what the most recently completed warmer sweep found. It is
 // the process's answer to "could I serve a sealed request right now?", which is a
 // different question from "is my HTTP server up": a sweep that prepared nothing
@@ -260,10 +303,13 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 			case err != nil:
 				metrics.WarmerSignerRefresh("failed")
 				r.logger.Warn("warmer: signer refresh failed", "provider", addr, "err", err)
-				// Unavailable, never a finding: OUR chain RPC having a bad minute must not
-				// reach a panel as an accusation against the provider (see onchainVerdictOf
-				// on why lookup_failed is the one outcome that must not collapse).
-				onchain = VerdictUnavailable
+				// Never a finding: OUR chain RPC having a bad minute must not reach a panel as
+				// an accusation against the provider (see onchainVerdictOf on why
+				// lookup_failed is the one outcome that must not collapse). But "unavailable"
+				// is not automatic either — see cachedSignerVerdict, which asks what a request
+				// would conclude at this moment instead of reporting our forced read's failure
+				// as the last word.
+				onchain = r.cachedSignerVerdict(ctx, addr, quoteSigner)
 				// Only enforce mode turns this into "a request could not use this provider".
 				// Under warn the request path proceeds ungrounded, so calling the provider
 				// unprepared here would make /readyz refuse a cutover to a side that is in
@@ -307,7 +353,7 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 				// written at all, but it is not assumed: a verification that somehow bound no
 				// signer would still be recorded, and "unavailable" is the honest verdict for
 				// a comparison that had nothing to compare.
-				onchain = VerdictUnavailable
+				onchain = r.cachedSignerVerdict(ctx, addr, quoteSigner)
 			default:
 				metrics.WarmerSignerRefresh("ok")
 				onchain = VerdictPass

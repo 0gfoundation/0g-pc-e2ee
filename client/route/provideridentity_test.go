@@ -690,6 +690,80 @@ func TestProviderIdentity_CancelledSweepLeavesTheRecordAlone(t *testing.T) {
 	}
 }
 
+// A chain outage shorter than the cache's grace window must not make a sweep
+// downgrade what a request confirmed. The two paths read the chain differently on
+// purpose — a sweep forces RefreshSigner past the cache, grace window and cooldown
+// because it feeds readiness; a request takes a grace-window reading as
+// groundingOKStale, i.e. pass — so for the duration of the outage requests keep
+// passing while the sweep's forced read fails. Same endpoint, so putWarmed has no
+// conflict to defer on, and the sweep interval is under the record TTL: the sweep
+// would own the steady state and the record would describe our own RPC's health
+// rather than the provider's.
+func TestProviderIdentity_SweepDoesNotDowngradeAPassDuringAChainOutage(t *testing.T) {
+	srv := pidServer(t, pidQuote(t, qvMeasurement(0xaa), pidMRConfigID(t, 1, pidComposeHashHex)), nil)
+	// The shape of an outage inside the grace window: the live re-read fails, while the
+	// cached reading is stale-but-agreeing — which is what a request grounds on.
+	reg := &stubRegistry{signer: qvSignerStr, ack: true, stale: true, refreshErr: errors.New("rpc down")}
+	r := pidRouter(t, srv.URL, pidAllowAll(), attest.ModeEnforce, reg)
+
+	pidResolve(t, r)
+	if id, _ := r.ProviderIdentity(testProviderAddr); id.OnChainSigner != VerdictPass {
+		t.Fatalf("setup: OnChainSigner = %q, want the request's pass on a stale-but-agreeing reading", id.OnChainSigner)
+	}
+
+	r.WarmOnce(context.Background(), fakeResolver{url: srv.URL})
+
+	id, ok := r.ProviderIdentity(testProviderAddr)
+	if !ok {
+		t.Fatal("no record after the sweep")
+	}
+	if id.OnChainSigner != VerdictPass {
+		t.Errorf("OnChainSigner = %q after a sweep during a chain outage, want %q — a request grounding right now still passes, so the record must not report our own RPC's failure as the provider's state",
+			id.OnChainSigner, VerdictPass)
+	}
+}
+
+// The fallback can only ever upgrade unavailable to pass, never accuse. A cached
+// reading that DISAGREES is not a verdict in the request path either —
+// groundSignerOnChain revalidates it live before ruling, and the live re-read is
+// exactly what just failed — so a request meeting this state also lands on
+// lookup_failed. Reporting no_match here would accuse a provider on evidence the rest
+// of the package refuses to rule on.
+func TestProviderIdentity_SweepFallbackNeverAccusesOnACachedReading(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		reg  *stubRegistry
+		want Verdict
+	}{
+		{"stale reading agrees",
+			&stubRegistry{signer: qvSignerStr, ack: true, stale: true, refreshErr: errors.New("rpc down")},
+			VerdictPass},
+		{"stale reading names someone else",
+			&stubRegistry{signer: "0xdead", ack: true, stale: true, refreshErr: errors.New("rpc down")},
+			VerdictUnavailable},
+		{"stale reading acknowledges nobody",
+			&stubRegistry{ack: false, stale: true, refreshErr: errors.New("rpc down")},
+			VerdictUnavailable},
+		{"nothing cached to fall back on",
+			&stubRegistry{err: errors.New("rpc down"), refreshErr: errors.New("rpc down")},
+			VerdictUnavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := pidServer(t, pidQuote(t, qvMeasurement(0xaa), pidMRConfigID(t, 1, pidComposeHashHex)), nil)
+			r := pidRouter(t, srv.URL, pidAllowAll(), attest.ModeEnforce, tc.reg)
+			r.WarmOnce(context.Background(), fakeResolver{url: srv.URL})
+
+			id, ok := r.ProviderIdentity(testProviderAddr)
+			if !ok {
+				t.Fatal("no record; the quote verified, so the chain's state must not suppress it")
+			}
+			if id.OnChainSigner != tc.want {
+				t.Errorf("OnChainSigner = %q, want %q", id.OnChainSigner, tc.want)
+			}
+		})
+	}
+}
+
 // pidCatalogServer serves the provider catalog and a /v1/quote whose status is
 // switchable, so a test can take a provider's quote endpoint down between sweeps.
 func pidCatalogServer(t *testing.T, raw []byte, status *int32) *httptest.Server {
