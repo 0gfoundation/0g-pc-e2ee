@@ -18,15 +18,22 @@ import (
 // verification, so a verification panel can show the user the broker hop of the
 // trust chain instead of a blank.
 //
-// Two writers, and the difference between them is only WHEN the checks ran:
+// Two writers, running the same checks at different times and against endpoints they
+// source differently:
 //
-//   - routeCandidates.Provider, for the provider a real request was sealed to.
-//   - Router.WarmOnce, for every provider the background warmer sweeps. It runs the
-//     same DCAP verification and the same on-chain signer comparison, ahead of any
-//     request, so the panel can name a provider's containers before the user has
-//     made one. Without it the endpoint could only ever answer about a request that
-//     had already happened, which made "show me who I would be sealed to" impossible
-//     to answer and left every provider in the catalog invisible until it was picked.
+//   - routeCandidates.Provider, for the provider a real request was sealed to, at the
+//     endpoint the router's route preview named.
+//   - Router.WarmOnce, for every provider the background warmer sweeps, at the
+//     endpoint the ON-CHAIN registry names. It runs the same DCAP verification and the
+//     same on-chain signer comparison, ahead of any request, so the panel can name a
+//     provider's containers before the user has made one. Without it the endpoint
+//     could only ever answer about a request that had already happened, which made
+//     "show me who I would be sealed to" impossible to answer and left every provider
+//     in the catalog invisible until it was picked.
+//
+// The endpoints agree in any healthy deployment, and where they do the fresher
+// verification simply replaces the older one. Where they DISAGREE the served record
+// wins — see identityStore.putWarmed for why that ordering is not a preference.
 //
 // Three properties are load-bearing, and all three come from where the record is
 // WRITTEN (after the checks, in both writers) rather than from anything here:
@@ -143,9 +150,10 @@ func onchainVerdictOf(outcome groundingOutcome) Verdict {
 	}
 }
 
-// ProviderIdentity is the record of what this gateway verified about one provider,
-// as of the last verification it ran against that provider — the last request
-// sealed to it, or the last warmer sweep that swept it, whichever is later.
+// ProviderIdentity is the record of what this gateway verified about one provider:
+// the most recent verification it ran against that provider — the last request sealed
+// to it, or the last warmer sweep that swept it, the later of the two except where
+// they disagree about the provider's endpoint (see identityStore.putWarmed).
 //
 // It carries no quote bytes and no measurement registers, on purpose. A caller who
 // wants to redo the verification should fetch the quote from the provider DIRECT
@@ -296,6 +304,14 @@ type identityStore struct {
 type identityEntry struct {
 	id  ProviderIdentity
 	exp time.Time
+	// served marks a record the REQUEST path wrote — a verification of the endpoint a
+	// user's prompt was actually sealed to, as opposed to a sweep's verification of the
+	// endpoint the chain names. It exists only to order the two writers when they
+	// disagree (see putWarmed) and is deliberately not reported: which internal path
+	// last verified a provider is not a claim about that provider, and a wire field for
+	// it would invite a panel to rank one verification above the other when both are
+	// the same checks against the same roots.
+	served bool
 }
 
 func newIdentityStore(ttl time.Duration, max int) *identityStore {
@@ -308,10 +324,36 @@ func newIdentityStore(ttl time.Duration, max int) *identityStore {
 	return &identityStore{ttl: ttl, max: max, m: make(map[string]identityEntry)}
 }
 
-// put records (or replaces) one provider's identity. An empty address is dropped:
-// direct-broker mode pins no on-chain address, and a record no one can look up
-// would only consume the cap.
-func (s *identityStore) put(id ProviderIdentity) {
+// put records (or replaces) what a SERVED REQUEST verified. An empty address is
+// dropped: direct-broker mode pins no on-chain address, and a record no one can look
+// up would only consume the cap.
+//
+// It always wins. A record describing the endpoint a user's prompt actually went to
+// is the one a panel is asking about, so nothing defers to a sweep here.
+func (s *identityStore) put(id ProviderIdentity) { s.record(id, true) }
+
+// putWarmed records what a WARMER SWEEP verified, unless that would overwrite a
+// served record for a DIFFERENT endpoint.
+//
+// The exception is the whole reason the two writers are distinguished. They resolve a
+// provider's endpoint from different places — the request path from the router's
+// route preview, a sweep from the on-chain registry — so for one address they can
+// verify two different enclaves and reach two different verdicts. Where that happens,
+// last-write-wins would let a sweep's `pass` at the on-chain endpoint replace the
+// `no_match` a request reached at the router's, and under warn mode (the shipped
+// configuration) the request still proceeds: the panel would report agreement for the
+// very provider whose signer this gateway could not ground for the prompt it just
+// sealed. That is precisely the "states something the gateway no longer believes"
+// failure routeCandidates.Provider takes care to avoid by recording rejected
+// candidates in the first place, and it must not come back in through the warmer.
+//
+// Same endpoint — the case in every healthy deployment, where the router advertises
+// what the chain says — is not a conflict at all: both writers verified the same
+// artifact, so the fresher verification is simply better and replaces the older one,
+// which is what keeps a warmed record continuously refreshed.
+func (s *identityStore) putWarmed(id ProviderIdentity) { s.record(id, false) }
+
+func (s *identityStore) record(id ProviderIdentity, served bool) {
 	key := chain.ProviderKey(id.Address)
 	// A nil store is a Router assembled field-by-field (tests do this for the
 	// on-chain and warmer paths); recording nowhere is the right behavior, not a
@@ -322,10 +364,19 @@ func (s *identityStore) put(id ProviderIdentity) {
 	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, replacing := s.m[key]; !replacing && len(s.m) >= s.max {
+	cur, replacing := s.m[key]
+	// Expiry is tested too: an entry past its TTL is unreachable through get, so
+	// deferring to it would block the sweep on a record no reader can see — leaving the
+	// provider undescribed until the NEXT sweep, the gap this whole feature exists to
+	// close.
+	if !served && replacing && now.Before(cur.exp) &&
+		cur.served && cur.id.QuoteURL != id.QuoteURL {
+		return
+	}
+	if !replacing && len(s.m) >= s.max {
 		s.makeRoomLocked(now)
 	}
-	s.m[key] = identityEntry{id: id, exp: now.Add(s.ttl)}
+	s.m[key] = identityEntry{id: id, exp: now.Add(s.ttl), served: served}
 }
 
 // makeRoomLocked frees one slot: expired entries first, and failing that the entry
@@ -423,10 +474,16 @@ func providerIdentityOf(address, endpoint string, res quoteResult, onchain Verdi
 	return id
 }
 
-// recordProviderIdentity stores what a completed set of checks established. Both
-// writers call it only once the quote has been verified, the keys bound and the
-// on-chain check made — so a record means "this gateway ran its checks against this
-// provider", never "the router mentioned it".
+// recordProviderIdentity stores what the checks in routeCandidates.Provider just
+// established for a served request. It is called once the quote has been verified,
+// the keys bound and the on-chain check made — so a record means "this gateway ran
+// its checks against this provider", never "the router mentioned it".
 func (r *Router) recordProviderIdentity(id ProviderIdentity) {
 	r.identities.put(id)
+}
+
+// recordWarmedProviderIdentity is the same for a warmer sweep, which defers to a
+// served record when the two verified different endpoints — see putWarmed.
+func (r *Router) recordWarmedProviderIdentity(id ProviderIdentity) {
+	r.identities.putWarmed(id)
 }

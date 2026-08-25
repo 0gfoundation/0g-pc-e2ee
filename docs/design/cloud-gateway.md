@@ -272,6 +272,18 @@ warmer the endpoint could only ever describe a request that had already happened
 until it was picked. With it, and with the sweep interval under the record TTL, the
 whole catalog is continuously describable.
 
+The two source a provider's endpoint from different places — a request from the
+router's route preview, a sweep from the on-chain registry — so for one address they
+can, in principle, verify two different enclaves and reach two different verdicts.
+They agree in any healthy deployment, and where they agree the fresher verification
+replaces the older one. Where they disagree the **served** record wins, and that
+ordering is load-bearing rather than a preference: under warn mode the request went
+through, so reporting the on-chain endpoint's `pass` for a prompt that was sealed to
+the router's endpoint — and whose signer this gateway could not ground — would state
+something the gateway does not believe about the request that actually happened. That
+is the same failure the request path avoids by recording rejected candidates instead
+of leaving an older `pass` standing, and it must not return through the warmer.
+
 That widens what the *set* of records discloses, and the widening is deliberate:
 probing address by address now confirms catalog membership. It leaks nothing, because
 the catalog is `GET /v1/providers` — proxied to the router unauthenticated, and read

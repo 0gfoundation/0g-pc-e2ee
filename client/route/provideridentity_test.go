@@ -689,6 +689,43 @@ func TestProviderIdentity_CancelledSweepLeavesTheRecordAlone(t *testing.T) {
 	}
 }
 
+// The two writers resolve a provider's endpoint from different places — the request
+// path from the router's route preview, a sweep from the on-chain registry — so for
+// one address they can verify two different enclaves. A sweep must not overwrite the
+// served record then: under warn mode the request went through, and reporting the
+// on-chain endpoint's verdicts for a prompt sealed to the router's endpoint would
+// describe an enclave the user never talked to. Last-write-wins would decide this on
+// sweep timing, which is the same "states something the gateway no longer believes"
+// failure the request path records rejected candidates to avoid.
+func TestProviderIdentity_SweepDoesNotOverwriteAServedRecordForAnotherEndpoint(t *testing.T) {
+	quote := pidQuote(t, qvMeasurement(0xaa), pidMRConfigID(t, 1, pidComposeHashHex))
+	// Two endpoints for one provider address: the one the preview names (and the
+	// request verifies) and the one the chain names (and the sweep verifies).
+	served := pidServerWithAppCompose(t, quote, nil, nil)
+	onchain := pidServerWithAppCompose(t, quote, nil, nil)
+	r := pidRouter(t, served.URL, pidAllowAll(), attest.ModeEnforce, &stubRegistry{signer: qvSignerStr, ack: true})
+
+	pidResolve(t, r)
+	r.WarmOnce(context.Background(), fakeResolver{url: onchain.URL})
+
+	id, ok := r.ProviderIdentity(testProviderAddr)
+	if !ok {
+		t.Fatal("no record at all")
+	}
+	if id.Endpoint != served.URL {
+		t.Errorf("Endpoint = %q, want the endpoint the request was actually sealed to %q (a sweep of %q must not displace it)",
+			id.Endpoint, served.URL, onchain.URL)
+	}
+
+	// The deference is scoped to a CONFLICT. Sweeping the same endpoint the request
+	// used has to keep refreshing the record, or a provider that served once would stop
+	// being described the moment its served record expired.
+	r.WarmOnce(context.Background(), fakeResolver{url: served.URL})
+	if id, ok := r.ProviderIdentity(testProviderAddr); !ok || id.Endpoint != served.URL {
+		t.Errorf("record = %+v (found %v), want the sweep to refresh a served record for the same endpoint", id, ok)
+	}
+}
+
 // The sweep's on-chain verdict has to speak the same vocabulary the request path
 // reports, or one panel would show two different answers for the same chain state.
 // The distinction that matters most is the last case: our own RPC having a bad minute

@@ -296,10 +296,12 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 				// verify_failed, which is the metric that says why.
 				metrics.WarmerSignerRefresh("unchecked")
 				// Unavailable for the same reason this is its own metric bucket: the
-				// comparison did not happen. Unreachable for a RECORD — a quote that bound no
-				// signer did not verify, so none is written below — but assigned rather than
-				// left at not_checked, which would claim this deployment does not run the
-				// check when in fact it ran and could not conclude.
+				// comparison did not happen. Not left at not_checked, which would claim this
+				// deployment does not run the check when in fact it ran and could not
+				// conclude. Normally this arm means the quote refresh failed and no record is
+				// written at all, but it is not assumed: a verification that somehow bound no
+				// signer would still be recorded, and "unavailable" is the honest verdict for
+				// a comparison that had nothing to compare.
 				onchain = VerdictUnavailable
 			default:
 				metrics.WarmerSignerRefresh("ok")
@@ -315,10 +317,11 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 		// mirroring the request path, which records a candidate enforce mode REJECTS
 		// rather than letting an older pass stand while the gateway refuses it.
 		//
-		// This can overwrite a record the request path just wrote, and that is safe in
-		// both directions: both writers verified the quote live, and a sweep's on-chain
-		// verdict comes from RefreshSigner — a read-through, never the grace window — so
-		// neither replaces a conclusion with a worse-evidenced one.
+		// recordWarmed, not record: where a sweep and a served request verified DIFFERENT
+		// endpoints for one address — the router advertising something other than what the
+		// chain says — the served record wins, because it describes the enclave a user's
+		// prompt actually went to. Same endpoint and the fresher verification replaces the
+		// older one as usual. See identityStore.putWarmed.
 		//
 		// Skipped on a cancelled context, for the same reason the sweep counters are: a
 		// cancellation is OURS, not the provider's. The signer refresh above returns
@@ -326,7 +329,7 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 		// stamp VerdictUnavailable over a perfectly good `pass` — publishing "we could
 		// not check this provider" about a shutdown that checked nothing.
 		if quoteVerified && ctx.Err() == nil {
-			r.recordProviderIdentity(providerIdentityOf(addr, info.URL, verified, onchain))
+			r.recordWarmedProviderIdentity(providerIdentityOf(addr, info.URL, verified, onchain))
 		}
 		if prepared {
 			ready++
