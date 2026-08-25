@@ -23,11 +23,15 @@ enclave runs on, not by 0G's operators. The encryption keys are generated inside
 enclave and never leave it. This is a property of the hardware, not a setting we
 promise to keep.
 
-**There are two TEEs on this path: the access gateway, which 0G operates, and the
-provider enclave that runs the model.** Because one of them is ours, we publish its
-complete evidence — a hardware-signed attestation, the hash of the exact build that
-is running, and where that build came from — so you can verify it rather than take
-our word for it. That is what the rest of this document is about.
+**Two TEEs sit on this path — the access gateway, and the provider enclave that runs the
+model — and today 0G operates both.** The provider side is meant to be run by others in
+time; as of now it is us at both ends, and it would be cheap to imply otherwise. Which is
+exactly why nothing above is phrased as *two independent operators*: the guarantees rest
+on hardware that its own operator cannot read into, on a build whose hash Intel signs, and
+on your being able to check both — not on who we are. So we publish the complete evidence:
+the attestation, the hash of the exact build that is running, and where that build came
+from. That is what the rest of this document is about. Skip it, and what you are trusting
+is a single operator at both hops.
 
 ---
 
@@ -46,7 +50,7 @@ our word for it. That is what the rest of this document is about.
 flowchart LR
     APP["your browser"]
 
-    subgraph GW["gateway TEE — 0G-operated, attested"]
+    subgraph GW["gateway TEE — attested"]
         G["TLS terminates here"]
     end
 
