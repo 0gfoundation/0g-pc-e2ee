@@ -10,9 +10,8 @@ command below is a convenience, not the source of truth — the
 
 > **This document is the procedure.** If you came here asking *why* the product is
 > private rather than *how to check it*, start with
-> [`why-this-is-private.md`](./why-this-is-private.md) ([中文](./why-this-is-private.zh-CN.md))
-> — the same claims in three paragraphs, with what is and is not hidden, and no tooling
-> to install.
+> [`why-this-is-private.md`](./why-this-is-private.md) — the same claims in three
+> paragraphs, with what is and is not hidden, and no tooling to install.
 
 > **Scope.** This document covers the **gateway** — the 0G-operated enclave that takes
 > your request and seals it to a provider. The gateway verifies the *provider* on your

@@ -53,7 +53,7 @@ gateway publishes enough evidence to be checked rather than believed.
 
 | You are | Go to |
 |---|---|
-| **asking why the product is private** — where your prompt exists in plaintext, and who cannot read it | [`docs/why-this-is-private.md`](docs/why-this-is-private.md) ([中文](docs/why-this-is-private.zh-CN.md)) — the claims and the mechanisms in three paragraphs, plus what stays visible. No tooling |
+| **asking why the product is private** — where your prompt exists in plaintext, and who cannot read it | [`docs/why-this-is-private.md`](docs/why-this-is-private.md) — the claims and the mechanisms in three paragraphs, plus what stays visible. No tooling |
 | **using a 0G-hosted gateway** and want to know whether to trust it | [`docs/verifying-the-gateway.md`](docs/verifying-the-gateway.md) — one command, what a `PASS` does and does not prove, and the same procedure by hand with `curl` / `openssl` / `jq` |
 | **auditing the design** | [`docs/design/trust-chain.md`](docs/design/trust-chain.md) — every hop and where its trust bottoms out → [`protocol/SPEC.md`](protocol/SPEC.md) — the normative wire format → the **`docker-compose.release.yml` attached to a [Release](https://github.com/0gfoundation/0g-pc-e2ee/releases)**, which is the manifest actually hashed into the attestation. The [`deploy/phala/docker-compose.yml`](deploy/phala/docker-compose.yml) in git is the same file with the gateway image left on `:latest` for development — readable, but it will not match a deployment |
 
