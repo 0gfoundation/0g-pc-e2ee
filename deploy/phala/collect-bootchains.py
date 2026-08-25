@@ -271,10 +271,19 @@ def observe_endpoint(endpoint, timeout):
     vm = unwrap_json_string(reply.get("vm_config"))
     provenance = {
         k: vm[k]
-        for k in ("image", "os_image_hash", "qemu_single_pass_add_pages",
+        for k in ("os_image_hash", "qemu_single_pass_add_pages",
                   "num_gpus", "gpus", "vcpu", "memory")
         if k in vm
     }
+    # The image LABEL has moved between dstack versions, and some replies carry the
+    # hash without any name at all. Try the spellings seen in the wild before
+    # giving up: the label is provenance a human reads, so a missing one is worth a
+    # fallback, while os_image_hash above is the value that actually identifies the
+    # release and needs no aliasing.
+    for k in ("image", "image_name", "os_image", "os_image_name", "image_version"):
+        if isinstance(vm.get(k), str) and vm[k].strip():
+            provenance["image"] = vm[k].strip()
+            break
     app = compose_identity(regs["mr_config_id"])
     tcb = unwrap_json_string(reply.get("tcb_info"))
     if isinstance(tcb.get("app_compose"), str):
@@ -356,10 +365,6 @@ def builtin_gateway_images(paths):
     return out, None
 
 
-def short(hex_str, keep=12):
-    return hex_str[:keep] + "…"
-
-
 def render(groups, gateway_images, out):
     known = {bc: (name, h) for name, bc, h in gateway_images}
     gw_mrtd = {bc[0] for _, bc, _ in gateway_images}
@@ -387,9 +392,18 @@ def render(groups, gateway_images, out):
         images = sorted({o.vm.get("image", "") for o in obs} - {""})
         hashes = sorted({o.vm.get("os_image_hash", "") for o in obs} - {""})
         if images or hashes:
-            print(f"    claims image={','.join(images) or '?'} "
-                  f"os_image_hash={','.join(short(h, 16) for h in hashes) or '?'}"
+            # os_image_hash IS the release identity — it is what a published
+            # artifact's digest.txt is checked against before dstack-mr runs on it —
+            # so it prints in full even when the label is missing. A group whose
+            # members claim DIFFERENT hashes under one boot chain is worth seeing
+            # rather than eliding: the registers say one image, the claims say two.
+            print(f"    claims image={','.join(images) or '<unnamed>'}"
                   "   (unauthenticated vm_config)", file=out)
+            for h in hashes:
+                print(f"    os_image_hash {h}", file=out)
+            if len(hashes) > 1:
+                print("    ^^ one boot chain claiming several releases — the "
+                      "registers disagree with the labels", file=out)
         rtmr0s = sorted({o.regs["rtmr0"] for o in obs if "rtmr0" in o.regs})
         if len(rtmr0s) > 1:
             print(f"    rtmr0  {len(rtmr0s)} distinct VM shapes in this group "
