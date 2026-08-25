@@ -403,6 +403,12 @@ func TestWarmer_CancelDuringLastProviderDoesNotPublishSweep(t *testing.T) {
 type cancellingRegistry struct {
 	cancel context.CancelFunc
 	armed  atomic.Bool
+	// failWhenArmed makes the armed refresh return ctx.Err() instead of a healthy
+	// reading — the truer shutdown shape, where the cancellation the registry is
+	// reporting is the one it just caused. A caller wants it when the point is what the
+	// warmer does with a FAILED lookup on a dying context, rather than merely that the
+	// sweep stops.
+	failWhenArmed bool
 }
 
 func (c *cancellingRegistry) arm() { c.armed.Store(true) }
@@ -414,6 +420,9 @@ func (c *cancellingRegistry) AcknowledgedSigner(context.Context, string) (chain.
 func (c *cancellingRegistry) RefreshSigner(ctx context.Context, addr string) (chain.Signer, error) {
 	if c.armed.Load() {
 		c.cancel()
+		if c.failWhenArmed {
+			return chain.Signer{}, context.Canceled
+		}
 	}
 	return chain.Signer{Address: qvSignerStr, Acknowledged: true}, nil
 }

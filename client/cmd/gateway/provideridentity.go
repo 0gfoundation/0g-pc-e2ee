@@ -12,7 +12,10 @@ import (
 // providerIdentityPath is the public route this serves. The {address} wildcard is
 // the provider's on-chain account — the same value the gateway returns in the
 // X-Provider response header, so a panel asks about the provider it was actually
-// sealed to and pinned to rather than one the router named.
+// sealed to and pinned to rather than one the router named. With the warmer running
+// it also answers for a provider no request has used yet (see client/route's
+// identity store), which is what lets a panel show the fleet before the first
+// prompt; the header remains how it names the one that served a given response.
 const providerIdentityPath = "/v1/providers/{address}/identity"
 
 // THIS ENDPOINT REPORTS VERDICTS, AND THAT IS DELIBERATE — it is the one place the
@@ -23,9 +26,9 @@ const providerIdentityPath = "/v1/providers/{address}/identity"
 // so it carries no verdict of any shape and never should. Here the gateway reports
 // checks it genuinely PERFORMED on a THIRD PARTY — a DCAP verification of the
 // provider's quote against Intel's roots, and a comparison of the quote-bound signer
-// against the on-chain registry — before it agreed to seal a user's prompt to that
-// enclave. Withholding those would not make the endpoint humbler; it would hide the
-// only verification in the picture.
+// against the on-chain registry — the checks that decide whether it is willing to
+// seal a user's prompt to that enclave at all. Withholding those would not make the
+// endpoint humbler; it would hide the only verification in the picture.
 //
 // What the verdicts are NOT is the reader's own verification. They are RELAYED:
 // their weight rests entirely on the reader being able to check this gateway itself
@@ -36,10 +39,11 @@ const providerIdentityPath = "/v1/providers/{address}/identity"
 //
 // Three things it deliberately does not do:
 //
-//   - It never fetches anything. The record is a byproduct of a request that already
-//     happened (client/route's identity store), so an address this gateway has not
-//     verified while serving one is a 404 rather than a lookup. That is what keeps the
-//     route from becoming a quote proxy — or a scanner — for arbitrary addresses.
+//   - It never fetches anything. The record is a byproduct of a verification that
+//     already happened — a served request, or a warmer sweep (client/route's identity
+//     store) — so an address this gateway has not verified itself is a 404 rather than
+//     a lookup. That is what keeps the route from becoming a quote proxy — or a
+//     scanner — for arbitrary addresses, whichever writer filled the store.
 //   - It does not return the raw quote. A reader who wants to redo the work should
 //     fetch it from the provider DIRECT (the note names the URL), not through the
 //     party whose claims are under examination — the same reason the §8 signature is
@@ -171,7 +175,7 @@ func providerIdentityHandler(src route.ProviderIdentitySource) http.Handler {
 		id, ok := src.ProviderIdentity(r.PathValue("address"))
 		if !ok {
 			openaiproxy.WriteError(w, http.StatusNotFound, "gateway",
-				"this gateway has verified no provider at that address (it reports only providers it has checked while serving a request, and only for a few minutes afterwards)")
+				"this gateway has verified no provider at that address (it reports only providers it has checked itself — while serving a request, or in a background sweep — and only for a few minutes afterwards)")
 			return
 		}
 		body, err := json.MarshalIndent(providerIdentityDoc{

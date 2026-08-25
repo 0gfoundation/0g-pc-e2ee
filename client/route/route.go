@@ -551,7 +551,7 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 	// quote verification off there is no verdict to report, and reporting the router's
 	// word for it would be worse than reporting nothing.
 	if c.router.verifier != nil {
-		c.router.recordProviderIdentity(providerIdentityOf(prov, verified, onchain))
+		c.router.recordProviderIdentity(providerIdentityOf(prov.Address, prov.Endpoint, verified, onchain))
 	}
 	if grounded != nil {
 		return core.Provider{}, grounded

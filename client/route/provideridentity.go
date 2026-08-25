@@ -8,23 +8,41 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/client/compose"
 )
 
-// This file holds what a request path already established about a provider but
-// used to throw away: the outcome of the checks THIS process ran before it agreed
-// to seal to that provider.
+// This file holds what a verification already established about a provider but
+// used to throw away: the outcome of the checks THIS process ran before it was
+// willing to seal to that provider.
 //
 // The verification itself is not new — verifyQuoteAt has always DCAP-verified the
-// quote and compared the boot chain, and groundSignerOnChain has always compared
-// the quote-bound signer against the on-chain registry. What is new is that the
-// outcome survives the request, so a verification panel can show the user the
-// broker hop of the trust chain instead of a blank.
+// quote and compared the boot chain, and the on-chain signer has always been
+// compared against the registry. What is new is that the outcome survives the
+// verification, so a verification panel can show the user the broker hop of the
+// trust chain instead of a blank.
 //
-// Two properties are load-bearing, and both come from where the record is WRITTEN
-// (routeCandidates.Provider, after the checks) rather than from anything here:
+// Two writers, running the same checks at different times and against endpoints they
+// source differently:
 //
-//   - A record exists only for a provider this gateway actually verified while
-//     serving a request. Nothing in this file can fetch a quote, resolve an
+//   - routeCandidates.Provider, for the provider a real request was sealed to, at the
+//     endpoint the router's route preview named.
+//   - Router.WarmOnce, for every provider the background warmer sweeps, at the
+//     endpoint the ON-CHAIN registry names. It runs the same DCAP verification and the
+//     same on-chain signer comparison, ahead of any request, so the panel can name a
+//     provider's containers before the user has made one. Without it the endpoint
+//     could only ever answer about a request that had already happened, which made
+//     "show me who I would be sealed to" impossible to answer and left every provider
+//     in the catalog invisible until it was picked.
+//
+// The endpoints agree in any healthy deployment, and where they do the fresher
+// verification simply replaces the older one. Where they DISAGREE the served record
+// wins — see identityStore.putWarmed for why that ordering is not a preference.
+//
+// Three properties are load-bearing, and all three come from where the record is
+// WRITTEN (after the checks, in both writers) rather than from anything here:
+//
+//   - A record exists only for a provider this process verified ITSELF, and only
+//     once its quote passed DCAP. Nothing in this file can fetch a quote, resolve an
 //     endpoint, or reach the chain, so the surface it feeds cannot be turned into a
-//     quote proxy or a scanner for arbitrary addresses.
+//     quote proxy or a scanner for arbitrary addresses — an address neither writer
+//     has verified is absent however often it is asked for.
 //   - It is written on the way past the checks, not on the way to a successful seal.
 //     A candidate the on-chain check REJECTS (enforce mode) is recorded with the
 //     verdict that rejected it, because the alternative is worse: an earlier pass
@@ -37,6 +55,16 @@ import (
 //     Intel-rooted quote; VerdictNoBaseline on the measurement means the audited
 //     allowlist is empty and nothing was compared. A reader that cannot tell those
 //     apart is exactly what the explicit vocabulary below exists to prevent.
+//
+// What the warmer as a writer DOES change is how much the set of records discloses.
+// With the warmer on, the store holds the whole router catalog rather than only the
+// providers this gateway has recently been asked to use, so probing address by
+// address confirms catalog membership. That discloses nothing new: the catalog is
+// GET /v1/providers, which the gateway proxies to the router unauthenticated and
+// which the warmer itself reads without a credential. What it must not become is a
+// LIST — see providerIdentityHandler — because the set of providers a gateway
+// recently SERVED is fleet telemetry, and that is precisely the distinction the
+// warmer erases by covering every provider uniformly.
 //
 // The records are kept HERE rather than inside quoteCache, which holds the same
 // verifications, for two reasons that are properties of the data and not of taste.
@@ -122,8 +150,10 @@ func onchainVerdictOf(outcome groundingOutcome) Verdict {
 	}
 }
 
-// ProviderIdentity is the record of what this gateway verified about one provider,
-// as of the last request that used it.
+// ProviderIdentity is the record of what this gateway verified about one provider:
+// the most recent verification it ran against that provider — the last request sealed
+// to it, or the last warmer sweep that swept it, the later of the two except where
+// they disagree about the provider's endpoint (see identityStore.putWarmed).
 //
 // It carries no quote bytes and no measurement registers, on purpose. A caller who
 // wants to redo the verification should fetch the quote from the provider DIRECT
@@ -133,13 +163,20 @@ func onchainVerdictOf(outcome groundingOutcome) Verdict {
 // them against; the reader who needs observed values is the operator filling the
 // hop-3 allowlist, and that is pcverify's job.
 type ProviderIdentity struct {
-	// Address is the provider's on-chain account, as the router spelled it in the
-	// route preview (EIP-55 or lowercase). It is the same value the gateway returns
-	// in the X-Provider response header, which is how a panel knows what to ask for.
+	// Address is the provider's on-chain account, as the router spelled it (EIP-55 or
+	// lowercase) in whichever list the writer read — the route preview for a served
+	// request, the provider catalog for a warmer sweep. It is the same value the
+	// gateway returns in the X-Provider response header, which is how a panel knows
+	// what to ask for. Lookups canonicalize, so the spelling is a display detail.
 	Address string
 	// Endpoint is the provider's serving origin (scheme://host[:port]) — the host a
-	// panel names as "who answered", reported so a reader can leave this gateway and go
-	// to the source.
+	// panel names as "who answered" (or, for a warmed record, who would), reported so
+	// a reader can leave this gateway and go to the source.
+	//
+	// The two writers source it differently and both are right: a request records the
+	// endpoint the route preview named and then verified, a sweep records the one it
+	// resolved from the on-chain registry. Either way it is the endpoint whose quote
+	// this record describes, which is the only property a reader needs from it.
 	//
 	// It is a DISPLAY value: do not build paths off it. The router may advertise an
 	// endpoint under a base path, which an origin necessarily drops, so
@@ -228,17 +265,28 @@ type ProviderIdentitySource interface {
 // panel's data source.
 //
 // Sized to match the quote cache's default so a reported verdict is never much
-// older than the verification a request would itself have relied on.
+// older than the verification a request would itself have relied on. That also
+// puts it above the warmer's default interval (proxycli.defaultWarmInterval, 4m),
+// which is what makes a warmed record CONTINUOUSLY available rather than
+// intermittently: each sweep replaces the entry before the previous one expires, so
+// a panel loading at an arbitrary moment finds an answer. A deployment that widens
+// -warm-interval past this TTL gets gaps between sweeps, and the endpoint honestly
+// 404s in them rather than reporting a verification that has lapsed.
 const providerIdentityTTL = 5 * time.Minute
 
 // maxProviderIdentities caps how many records are held.
 //
-// The address in a record comes from the route preview, and the router is
-// untrusted: a compromised one could name a new address per candidate (all pointing
-// at one genuinely-verifiable endpoint, since a record requires a passing quote
-// check) and grow this map for as long as it keeps answering. The cap turns that
-// into a fixed cost. It is far above any real fleet — the router's catalog is tens
-// of providers — so a legitimate deployment never reaches it.
+// The address in a record comes from the router, which is untrusted: a compromised
+// one could name a new address per candidate (all pointing at one
+// genuinely-verifiable endpoint, since a record requires a passing quote check) and
+// grow this map for as long as it keeps answering. The cap turns that into a fixed
+// cost. It is far above any real fleet — the router's catalog is tens of providers —
+// so a legitimate deployment never reaches it.
+//
+// The warmer, despite reading the same untrusted catalog, cannot be used this way at
+// all: it resolves every address's endpoint from the ON-CHAIN registry before
+// verifying anything, so an invented address fails that lookup and is skipped. Only
+// providers the chain knows about can ever reach the store through a sweep.
 const maxProviderIdentities = 1024
 
 // identityStore holds the records, keyed by provider address through
@@ -256,6 +304,30 @@ type identityStore struct {
 type identityEntry struct {
 	id  ProviderIdentity
 	exp time.Time
+	// served marks a record the REQUEST path wrote — a verification of the endpoint a
+	// user's prompt was actually sealed to, as opposed to a sweep's verification of the
+	// endpoint the chain names. It exists only to order the two writers when they
+	// disagree (see putWarmed) and is deliberately not reported: which internal path
+	// last verified a provider is not a claim about that provider, and a wire field for
+	// it would invite a panel to rank one verification above the other when both are
+	// the same checks against the same roots.
+	served bool
+}
+
+// shieldedFrom reports whether this entry must survive a sweep that verified (or
+// tried to verify) quoteURL — because it is a served record describing a DIFFERENT
+// endpoint, so the sweep's outcome, good or bad, says nothing about it.
+//
+// One predicate for both directions on purpose: a sweep may neither overwrite such a
+// record with its own verdict (putWarmed) nor drop it because its own verification
+// failed (delWarmed). Those are the same claim — "what happened at the endpoint the
+// chain names does not describe the endpoint a user's prompt went to" — and splitting
+// them invites the two halves to drift.
+//
+// An expired entry is shielded from nothing: no reader can reach it, so keeping it
+// would only block the sweep from filling the slot.
+func (e identityEntry) shieldedFrom(quoteURL string, now time.Time) bool {
+	return e.served && now.Before(e.exp) && e.id.QuoteURL != quoteURL
 }
 
 func newIdentityStore(ttl time.Duration, max int) *identityStore {
@@ -268,10 +340,36 @@ func newIdentityStore(ttl time.Duration, max int) *identityStore {
 	return &identityStore{ttl: ttl, max: max, m: make(map[string]identityEntry)}
 }
 
-// put records (or replaces) one provider's identity. An empty address is dropped:
-// direct-broker mode pins no on-chain address, and a record no one can look up
-// would only consume the cap.
-func (s *identityStore) put(id ProviderIdentity) {
+// put records (or replaces) what a SERVED REQUEST verified. An empty address is
+// dropped: direct-broker mode pins no on-chain address, and a record no one can look
+// up would only consume the cap.
+//
+// It always wins. A record describing the endpoint a user's prompt actually went to
+// is the one a panel is asking about, so nothing defers to a sweep here.
+func (s *identityStore) put(id ProviderIdentity) { s.record(id, true) }
+
+// putWarmed records what a WARMER SWEEP verified, unless that would overwrite a
+// served record for a DIFFERENT endpoint.
+//
+// The exception is the whole reason the two writers are distinguished. They resolve a
+// provider's endpoint from different places — the request path from the router's
+// route preview, a sweep from the on-chain registry — so for one address they can
+// verify two different enclaves and reach two different verdicts. Where that happens,
+// last-write-wins would let a sweep's `pass` at the on-chain endpoint replace the
+// `no_match` a request reached at the router's, and under warn mode (the shipped
+// configuration) the request still proceeds: the panel would report agreement for the
+// very provider whose signer this gateway could not ground for the prompt it just
+// sealed. That is precisely the "states something the gateway no longer believes"
+// failure routeCandidates.Provider takes care to avoid by recording rejected
+// candidates in the first place, and it must not come back in through the warmer.
+//
+// Same endpoint — the case in every healthy deployment, where the router advertises
+// what the chain says — is not a conflict at all: both writers verified the same
+// artifact, so the fresher verification is simply better and replaces the older one,
+// which is what keeps a warmed record continuously refreshed.
+func (s *identityStore) putWarmed(id ProviderIdentity) { s.record(id, false) }
+
+func (s *identityStore) record(id ProviderIdentity, served bool) {
 	key := chain.ProviderKey(id.Address)
 	// A nil store is a Router assembled field-by-field (tests do this for the
 	// on-chain and warmer paths); recording nowhere is the right behavior, not a
@@ -282,10 +380,46 @@ func (s *identityStore) put(id ProviderIdentity) {
 	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, replacing := s.m[key]; !replacing && len(s.m) >= s.max {
+	cur, replacing := s.m[key]
+	if !served && replacing && cur.shieldedFrom(id.QuoteURL, now) {
+		return
+	}
+	if !replacing && len(s.m) >= s.max {
 		s.makeRoomLocked(now)
 	}
-	s.m[key] = identityEntry{id: id, exp: now.Add(s.ttl)}
+	s.m[key] = identityEntry{id: id, exp: now.Add(s.ttl), served: served}
+}
+
+// delWarmed drops the record for a provider whose quote a sweep just FAILED to
+// verify, at the endpoint quoteURL.
+//
+// It is the identity store's half of the eviction refreshQuote already does on the
+// quote cache, and it exists for the same reason: a verification attests a point in
+// time, and once a provider has gone bad — TCB downgrade, unreachable, revoked — the
+// last good answer must stop being served rather than ride out its TTL. Leaving it
+// would publish `quote_dcap: pass` for an enclave this gateway has just established
+// it cannot verify at all, which is worse than 404 by exactly the margin a reader
+// trusts the verdict.
+//
+// The failure has to be re-established each sweep for the record to stay gone, which
+// is the correct shape: a sweep that succeeds again re-records, so a provider
+// recovering from a blip is described again on the next sweep rather than waiting out
+// a penalty.
+//
+// A served record for a different endpoint is shielded, symmetrically with putWarmed:
+// a sweep failing at the endpoint the chain names has established nothing about the
+// endpoint a user's prompt actually went to.
+func (s *identityStore) delWarmed(address, quoteURL string) {
+	key := chain.ProviderKey(address)
+	if s == nil || key == "" {
+		return
+	}
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cur, ok := s.m[key]; ok && !cur.shieldedFrom(quoteURL, now) {
+		delete(s.m, key)
+	}
 }
 
 // makeRoomLocked frees one slot: expired entries first, and failing that the entry
@@ -337,17 +471,23 @@ func (r *Router) ProviderIdentity(address string) (ProviderIdentity, bool) {
 	return r.identities.get(address)
 }
 
-// providerIdentityOf assembles the record from a materialized candidate: the
-// address and endpoint the preview named, the facts the quote verification
-// established, and the on-chain verdict.
+// providerIdentityOf assembles the record from a verified provider: its on-chain
+// address, the endpoint the quote was verified at, the facts that verification
+// established, and the on-chain signer verdict.
+//
+// It takes the address and endpoint as plain strings rather than the previewProvider
+// the request path holds, because the warmer reaches it with neither — it enumerates
+// an address from the catalog and resolves the endpoint from chain, and there is no
+// route preview anywhere in a sweep. Naming the two fields it actually reads keeps
+// the second writer from having to fabricate a preview candidate to satisfy a type.
 //
 // QuoteDCAP is VerdictPass unconditionally, and only here: this function is reached
-// only from the path where r.verifier.Verify returned without error, which is the
+// only from a path where r.verifier.Verify returned without error, which is the
 // definition of that verdict. A caller that reaches it any other way would be
 // asserting something no check made — see ProviderIdentity.QuoteDCAP.
-func providerIdentityOf(prov previewProvider, res quoteResult, onchain Verdict) ProviderIdentity {
+func providerIdentityOf(address, endpoint string, res quoteResult, onchain Verdict) ProviderIdentity {
 	id := ProviderIdentity{
-		Address:       prov.Address,
+		Address:       address,
 		QuoteDCAP:     VerdictPass,
 		OnChainSigner: onchain,
 		Measurement:   res.facts.measurement,
@@ -368,19 +508,32 @@ func providerIdentityOf(prov previewProvider, res quoteResult, onchain Verdict) 
 	// going to fetch the quote wants a URL they can reason about. Both derivations are
 	// best-effort — a malformed endpoint could not have been verified in the first
 	// place, so in practice they always succeed; an empty field beats a half-parsed URL.
-	if origin, err := deriveOrigin(prov.Endpoint); err == nil {
+	if origin, err := deriveOrigin(endpoint); err == nil {
 		id.Endpoint = origin
 	}
-	if quoteURL, err := deriveQuoteURL(prov.Endpoint); err == nil {
+	if quoteURL, err := deriveQuoteURL(endpoint); err == nil {
 		id.QuoteURL = quoteURL
 	}
 	return id
 }
 
 // recordProviderIdentity stores what the checks in routeCandidates.Provider just
-// established. It is called once the quote has been verified, the keys bound and the
-// on-chain check made — so a record means "this gateway ran its checks against this
-// provider for a real request", never "the router mentioned it".
+// established for a served request. It is called once the quote has been verified,
+// the keys bound and the on-chain check made — so a record means "this gateway ran
+// its checks against this provider", never "the router mentioned it".
 func (r *Router) recordProviderIdentity(id ProviderIdentity) {
 	r.identities.put(id)
+}
+
+// recordWarmedProviderIdentity is the same for a warmer sweep, which defers to a
+// served record when the two verified different endpoints — see putWarmed.
+func (r *Router) recordWarmedProviderIdentity(id ProviderIdentity) {
+	r.identities.putWarmed(id)
+}
+
+// forgetWarmedProviderIdentity drops what a sweep can no longer stand behind: the
+// provider's quote failed to verify at quoteURL, so any record of an earlier success
+// must go rather than outlive the verification it reports — see delWarmed.
+func (r *Router) forgetWarmedProviderIdentity(address, quoteURL string) {
+	r.identities.delWarmed(address, quoteURL)
 }

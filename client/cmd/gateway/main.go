@@ -170,11 +170,13 @@ func main() {
 			"container list, matching release). Public, unauthenticated, and NOT evidence — every "+
 			"value is independently rederivable with pcverify (env ZG_GATEWAY_IDENTITY_ENDPOINT)")
 	// The provider-side counterpart (GET /v1/providers/{address}/identity, issue #80):
-	// what this gateway VERIFIED about the provider it sealed a request to — the DCAP
-	// verdict on that provider's quote, the on-chain signer comparison, the boot-chain
-	// verdict, its compose hash. The gateway already did all of it before sealing (see
-	// client/route); until now the results died with the request, leaving a
-	// verification panel with nothing to show for the broker hop.
+	// what this gateway VERIFIED about a provider — the DCAP verdict on that provider's
+	// quote, the on-chain signer comparison, the boot-chain verdict, its compose hash.
+	// The gateway already does all of it before sealing, and again on every warmer
+	// sweep (see client/route); the endpoint exists because those results used to die
+	// with the verification, leaving a verification panel with nothing to show for the
+	// broker hop. With -warm on it answers for the whole catalog, so the panel is not
+	// blank until the user's first prompt.
 	//
 	// ON by default, like the self-description, and for the same reason: every value is
 	// obtainable by fetching that provider's own public /v1/quote, so there is nothing
@@ -187,10 +189,11 @@ func main() {
 	// verification nothing is verified, and a route that could only ever 404 is worse
 	// than an absent one.
 	providerIdentityOn := flag.Bool("provider-identity-endpoint", proxycli.EnvBool("ZG_GATEWAY_PROVIDER_IDENTITY_ENDPOINT", true),
-		"serve what this gateway verified about each provider it sealed to at "+providerIdentityPath+
+		"serve what this gateway verified about each provider at "+providerIdentityPath+
 			" (DCAP verdict, on-chain signer check, boot-chain verdict, compose_hash). Public and "+
-			"unauthenticated; answers only for providers already used (no address triggers a quote "+
-			"fetch), and requires -attest (env ZG_GATEWAY_PROVIDER_IDENTITY_ENDPOINT)")
+			"unauthenticated; answers only for providers this gateway has verified itself — those it "+
+			"has sealed to, plus every provider the -warm sweep covers — and never fetches a quote "+
+			"for an address on demand; requires -attest (env ZG_GATEWAY_PROVIDER_IDENTITY_ENDPOINT)")
 	// Where the endpoint's container list comes from: the manifest cmd/cvmid wrote to
 	// the shared identity volume. Preferred over the platform lookup below because it
 	// needs no network, no third-party host and no DNS — and, like -identity-file, it
