@@ -335,6 +335,14 @@ Three rules the implementation holds to (`client/cmd/gateway/provideridentity.go
   store: the warmer enumerates from the catalog on its own schedule, never from a
   caller's path parameter. Records are bounded in count and expire, because a verdict
   attests a point in time.
+- **A verification that stops holding is withdrawn, not left to expire.** A sweep that
+  can no longer verify a provider's quote drops that provider's record, the same
+  eviction it performs on the quote cache. Declining to *write* is not enough once the
+  warmer is running: a record then exists for practically every provider, so a failing
+  sweep would leave the previous one's `pass` standing for the rest of its TTL —
+  reporting an enclave as verified minutes after the gateway established it cannot
+  verify it at all. The withdrawal is re-established per sweep, so a provider
+  recovering from a blip is described again on the next one.
 - **It returns no raw quote and no boot-chain registers.** Anyone who wants to redo
   the work should fetch the quote **direct from the provider** (`verify` names the
   URL), not through the party whose claims are under examination — the same reasoning

@@ -314,6 +314,22 @@ type identityEntry struct {
 	served bool
 }
 
+// shieldedFrom reports whether this entry must survive a sweep that verified (or
+// tried to verify) quoteURL — because it is a served record describing a DIFFERENT
+// endpoint, so the sweep's outcome, good or bad, says nothing about it.
+//
+// One predicate for both directions on purpose: a sweep may neither overwrite such a
+// record with its own verdict (putWarmed) nor drop it because its own verification
+// failed (delWarmed). Those are the same claim — "what happened at the endpoint the
+// chain names does not describe the endpoint a user's prompt went to" — and splitting
+// them invites the two halves to drift.
+//
+// An expired entry is shielded from nothing: no reader can reach it, so keeping it
+// would only block the sweep from filling the slot.
+func (e identityEntry) shieldedFrom(quoteURL string, now time.Time) bool {
+	return e.served && now.Before(e.exp) && e.id.QuoteURL != quoteURL
+}
+
 func newIdentityStore(ttl time.Duration, max int) *identityStore {
 	if max <= 0 {
 		// A non-positive cap would make the eviction below a no-op that still admits
@@ -365,18 +381,45 @@ func (s *identityStore) record(id ProviderIdentity, served bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cur, replacing := s.m[key]
-	// Expiry is tested too: an entry past its TTL is unreachable through get, so
-	// deferring to it would block the sweep on a record no reader can see — leaving the
-	// provider undescribed until the NEXT sweep, the gap this whole feature exists to
-	// close.
-	if !served && replacing && now.Before(cur.exp) &&
-		cur.served && cur.id.QuoteURL != id.QuoteURL {
+	if !served && replacing && cur.shieldedFrom(id.QuoteURL, now) {
 		return
 	}
 	if !replacing && len(s.m) >= s.max {
 		s.makeRoomLocked(now)
 	}
 	s.m[key] = identityEntry{id: id, exp: now.Add(s.ttl), served: served}
+}
+
+// delWarmed drops the record for a provider whose quote a sweep just FAILED to
+// verify, at the endpoint quoteURL.
+//
+// It is the identity store's half of the eviction refreshQuote already does on the
+// quote cache, and it exists for the same reason: a verification attests a point in
+// time, and once a provider has gone bad — TCB downgrade, unreachable, revoked — the
+// last good answer must stop being served rather than ride out its TTL. Leaving it
+// would publish `quote_dcap: pass` for an enclave this gateway has just established
+// it cannot verify at all, which is worse than 404 by exactly the margin a reader
+// trusts the verdict.
+//
+// The failure has to be re-established each sweep for the record to stay gone, which
+// is the correct shape: a sweep that succeeds again re-records, so a provider
+// recovering from a blip is described again on the next sweep rather than waiting out
+// a penalty.
+//
+// A served record for a different endpoint is shielded, symmetrically with putWarmed:
+// a sweep failing at the endpoint the chain names has established nothing about the
+// endpoint a user's prompt actually went to.
+func (s *identityStore) delWarmed(address, quoteURL string) {
+	key := chain.ProviderKey(address)
+	if s == nil || key == "" {
+		return
+	}
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cur, ok := s.m[key]; ok && !cur.shieldedFrom(quoteURL, now) {
+		delete(s.m, key)
+	}
 }
 
 // makeRoomLocked frees one slot: expired entries first, and failing that the entry
@@ -486,4 +529,11 @@ func (r *Router) recordProviderIdentity(id ProviderIdentity) {
 // served record when the two verified different endpoints — see putWarmed.
 func (r *Router) recordWarmedProviderIdentity(id ProviderIdentity) {
 	r.identities.putWarmed(id)
+}
+
+// forgetWarmedProviderIdentity drops what a sweep can no longer stand behind: the
+// provider's quote failed to verify at quoteURL, so any record of an earlier success
+// must go rather than outlive the verification it reports — see delWarmed.
+func (r *Router) forgetWarmedProviderIdentity(address, quoteURL string) {
+	r.identities.delWarmed(address, quoteURL)
 }

@@ -91,10 +91,15 @@ func (r *Router) listProviderAddrs(ctx context.Context) ([]string, error) {
 // successful refresh means a usable provider; the facts are what the provider-identity
 // record is built from, and this is the only place in a sweep that holds them (they
 // are derived from the quote reply, which nothing downstream sees).
-func (r *Router) refreshQuote(ctx context.Context, endpoint string) (quoteResult, error) {
+//
+// The quote URL comes back too, and on the FAILURE path as well as the success one —
+// the caller needs it to evict that provider's identity record, which is this
+// eviction's counterpart in the other store. Empty only when the endpoint itself
+// would not parse, in which case there was no URL to attempt.
+func (r *Router) refreshQuote(ctx context.Context, endpoint string) (quoteResult, string, error) {
 	quoteURL, err := deriveQuoteURL(endpoint)
 	if err != nil {
-		return quoteResult{}, err
+		return quoteResult{}, "", err
 	}
 	res, err := r.verifyAndCache(ctx, quoteURL)
 	if err != nil {
@@ -104,9 +109,9 @@ func (r *Router) refreshQuote(ctx context.Context, endpoint string) (quoteResult
 		if ctx.Err() == nil {
 			r.quoteCache.del(quoteURL)
 		}
-		return quoteResult{}, err
+		return quoteResult{}, quoteURL, err
 	}
-	return res, nil
+	return res, quoteURL, nil
 }
 
 // WarmState describes what the most recently completed warmer sweep found. It is
@@ -215,7 +220,7 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 			continue
 		}
 		prepared := true
-		verified, err := r.refreshQuote(ctx, info.URL)
+		verified, quoteURL, err := r.refreshQuote(ctx, info.URL)
 		// Tracked apart from prepared, which the on-chain block below also lowers: only
 		// the QUOTE's outcome decides whether a provider-identity record may be written
 		// at all, and a provider that verified but failed its signer check is recorded
@@ -308,28 +313,41 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 				onchain = VerdictPass
 			}
 		}
-		// Record what these checks established, so a panel can name this provider —
-		// its compose hash, its containers, the verdicts — before any request has been
-		// sealed to it (see provideridentity.go). Gated on the quote alone: QuoteDCAP is
-		// VerdictPass in every record that exists, so a provider whose quote did not
-		// verify leaves none and the endpoint 404s for it rather than reporting a
-		// failure. The on-chain verdict rides along whatever it turned out to be,
-		// mirroring the request path, which records a candidate enforce mode REJECTS
-		// rather than letting an older pass stand while the gateway refuses it.
+		// Publish or withdraw what a panel may say about this provider, so it can be
+		// named — compose hash, containers, verdicts — before any request has been sealed
+		// to it (see provideridentity.go). The quote's outcome decides which, because
+		// QuoteDCAP is VerdictPass in every record that exists: a verified provider is
+		// recorded with whatever on-chain verdict it reached (mirroring the request path,
+		// which records a candidate enforce mode REJECTS rather than letting an older pass
+		// stand), and one whose quote did NOT verify has its record dropped.
 		//
-		// recordWarmed, not record: where a sweep and a served request verified DIFFERENT
-		// endpoints for one address — the router advertising something other than what the
-		// chain says — the served record wins, because it describes the enclave a user's
-		// prompt actually went to. Same endpoint and the fresher verification replaces the
-		// older one as usual. See identityStore.putWarmed.
+		// The drop is the half that only matters once the warmer is running. Before it,
+		// "the quote did not verify" meant no record was ever written; now a record
+		// already exists for practically every provider, so a failing sweep that only
+		// declined to write would leave the previous sweep's `pass` standing for the rest
+		// of its TTL — publishing an enclave as verified minutes after this gateway
+		// established it cannot verify it at all. Symmetric with refreshQuote's eviction
+		// of the quote cache, and re-established every sweep: a provider that recovers is
+		// recorded again on the next one rather than serving a penalty.
 		//
-		// Skipped on a cancelled context, for the same reason the sweep counters are: a
-		// cancellation is OURS, not the provider's. The signer refresh above returns
-		// ctx.Err() when we are shutting down, which lands in its `failed` arm and would
-		// stamp VerdictUnavailable over a perfectly good `pass` — publishing "we could
-		// not check this provider" about a shutdown that checked nothing.
-		if quoteVerified && ctx.Err() == nil {
-			r.recordWarmedProviderIdentity(providerIdentityOf(addr, info.URL, verified, onchain))
+		// Warmed, not served, in both directions: where a sweep and a request verified
+		// DIFFERENT endpoints for one address — the router advertising something other
+		// than what the chain says — the served record wins, because it describes the
+		// enclave a user's prompt actually went to. A sweep neither overwrites it nor
+		// drops it. See identityStore.putWarmed and delWarmed.
+		//
+		// Both skipped on a cancelled context, for the same reason the sweep counters and
+		// the quote-cache eviction are: a cancellation is OURS, not the provider's. The
+		// signer refresh returns ctx.Err() when we are shutting down, which lands in its
+		// `failed` arm and would stamp VerdictUnavailable over a perfectly good `pass`;
+		// the quote fetch fails the same way, and would drop a record on the strength of
+		// our own shutdown.
+		if ctx.Err() == nil {
+			if quoteVerified {
+				r.recordWarmedProviderIdentity(providerIdentityOf(addr, info.URL, verified, onchain))
+			} else {
+				r.forgetWarmedProviderIdentity(addr, quoteURL)
+			}
 		}
 		if prepared {
 			ready++

@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
@@ -686,6 +687,123 @@ func TestProviderIdentity_CancelledSweepLeavesTheRecordAlone(t *testing.T) {
 	if got.OnChainSigner != VerdictPass {
 		t.Errorf("OnChainSigner = %q after a cancelled sweep, want the confirmed %q left standing",
 			got.OnChainSigner, VerdictPass)
+	}
+}
+
+// pidCatalogServer serves the provider catalog and a /v1/quote whose status is
+// switchable, so a test can take a provider's quote endpoint down between sweeps.
+func pidCatalogServer(t *testing.T, raw []byte, status *int32) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/providers", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"object": "list",
+			"data":   []map[string]string{{"address": testProviderAddr}},
+		})
+	})
+	mux.HandleFunc("GET /v1/quote", func(w http.ResponseWriter, r *http.Request) {
+		if s := int(atomic.LoadInt32(status)); s != 0 {
+			http.Error(w, "boom", s)
+			return
+		}
+		_, _ = fmt.Fprintf(w, `{"quote":%q}`, hex.EncodeToString(raw))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// A sweep that can no longer verify a provider must WITHDRAW its record, not merely
+// decline to write a new one. "A quote that fails DCAP leaves no record" holds
+// trivially for a provider never seen before; with the warmer running, a record
+// already exists for practically everyone, so declining to write leaves the previous
+// sweep's `pass` standing for the rest of its TTL — reporting an enclave as verified
+// minutes after this gateway established it cannot verify it at all. The quote cache
+// is evicted on exactly this failure; the record has to be too.
+func TestProviderIdentity_FailedSweepWithdrawsTheRecord(t *testing.T) {
+	var status int32
+	srv := pidCatalogServer(t, pidQuote(t, qvMeasurement(0xaa), pidMRConfigID(t, 1, pidComposeHashHex)), &status)
+	r := pidRouter(t, srv.URL, pidAllowAll(), attest.ModeEnforce, &stubRegistry{signer: qvSignerStr, ack: true})
+	res := fakeResolver{url: srv.URL}
+
+	r.WarmOnce(context.Background(), res)
+	if id, ok := r.ProviderIdentity(testProviderAddr); !ok || id.QuoteDCAP != VerdictPass {
+		t.Fatalf("setup: record = %+v (found %v), want QuoteDCAP pass", id, ok)
+	}
+
+	// The provider's quote endpoint goes down. The sweep re-verifies, fails, and evicts
+	// the quote cache; the record must go with it.
+	atomic.StoreInt32(&status, http.StatusServiceUnavailable)
+	r.WarmOnce(context.Background(), res)
+	if id, ok := r.ProviderIdentity(testProviderAddr); ok {
+		t.Errorf("record survived a failed sweep as %+v; the endpoint would report quote_dcap pass for an enclave it cannot verify", id)
+	}
+
+	// And it comes back on recovery: the withdrawal is re-established per sweep, not a
+	// penalty a provider has to serve out.
+	atomic.StoreInt32(&status, 0)
+	r.WarmOnce(context.Background(), res)
+	if id, ok := r.ProviderIdentity(testProviderAddr); !ok || id.QuoteDCAP != VerdictPass {
+		t.Errorf("record = %+v (found %v), want it restored once the provider verifies again", id, ok)
+	}
+}
+
+// cancellingResolver hands back an endpoint and cancels the sweep on the way out, so
+// the quote fetch that follows fails because WE are going down. It is the shutdown
+// shape for the quote half, as cancellingRegistry is for the chain half.
+type cancellingResolver struct {
+	url    string
+	cancel context.CancelFunc
+}
+
+func (c cancellingResolver) ServiceInfo(context.Context, string) (chain.ServiceInfo, error) {
+	c.cancel()
+	return chain.ServiceInfo{URL: c.url, Signer: qvSignerStr, Acknowledged: true}, nil
+}
+
+// Shutdown is not a provider failure. A cancelled sweep's quote fetch fails like any
+// other, and withdrawing a record on the strength of it would make a process delete
+// what it knows on its way out — the same false-negative the quote-cache eviction and
+// the sweep counters already guard against.
+func TestProviderIdentity_CancelledSweepDoesNotWithdrawTheRecord(t *testing.T) {
+	var status int32
+	srv := pidCatalogServer(t, pidQuote(t, qvMeasurement(0xaa), pidMRConfigID(t, 1, pidComposeHashHex)), &status)
+	r := pidRouter(t, srv.URL, pidAllowAll(), attest.ModeEnforce, &stubRegistry{signer: qvSignerStr, ack: true})
+
+	r.WarmOnce(context.Background(), fakeResolver{url: srv.URL})
+	if _, ok := r.ProviderIdentity(testProviderAddr); !ok {
+		t.Fatal("setup: no record to preserve")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.WarmOnce(ctx, cancellingResolver{url: srv.URL, cancel: cancel})
+
+	if id, ok := r.ProviderIdentity(testProviderAddr); !ok {
+		t.Errorf("record = %+v (found %v), want the confirmed record left standing through a shutdown", id, ok)
+	}
+}
+
+// The withdrawal defers to a served record for another endpoint, symmetrically with
+// the write. A sweep failing at the endpoint the chain names has established nothing
+// about the endpoint a user's prompt actually went to, so it must not delete what that
+// request verified.
+func TestProviderIdentity_FailedSweepSparesAServedRecordForAnotherEndpoint(t *testing.T) {
+	quote := pidQuote(t, qvMeasurement(0xaa), pidMRConfigID(t, 1, pidComposeHashHex))
+	served := pidServerWithAppCompose(t, quote, nil, nil)
+	var status int32 = http.StatusServiceUnavailable // the chain's endpoint is down
+	onchain := pidCatalogServer(t, quote, &status)
+	r := pidRouter(t, served.URL, pidAllowAll(), attest.ModeEnforce, &stubRegistry{signer: qvSignerStr, ack: true})
+
+	pidResolve(t, r)
+	r.WarmOnce(context.Background(), fakeResolver{url: onchain.URL})
+
+	id, ok := r.ProviderIdentity(testProviderAddr)
+	if !ok {
+		t.Fatalf("the served record for %q was deleted by a sweep that failed at %q", served.URL, onchain.URL)
+	}
+	if id.Endpoint != served.URL {
+		t.Errorf("Endpoint = %q, want the served %q", id.Endpoint, served.URL)
 	}
 }
 
