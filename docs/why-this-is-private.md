@@ -11,11 +11,12 @@ This is the short version. The procedure is
 
 ## The short answer
 
-**Your prompt is encrypted before it leaves your browser, and the plaintext only ever
-exists inside TEE memory.** 0G's router — the layer that carries and bills every
-request — holds nothing but ciphertext, from end to end. That part is unconditional:
-the request body is sealed to the provider's enclave key, and the router does not have
-that key.
+**The plaintext of your prompt only ever exists inside TEE memory.** Getting it there is
+ordinary TLS, the same as any HTTPS site; what is *not* ordinary is where that TLS **ends**
+— inside the enclave, on a key generated in there, rather than at a load balancer the
+operator controls. From that point on, 0G's router — the layer that carries and bills every
+request — holds nothing but ciphertext, end to end. That part is unconditional: the request
+body is sealed to the provider enclave's key, and the router does not have that key.
 
 **TEE memory is not readable from outside the TEE.** Not by the cloud machine the
 enclave runs on, not by 0G's operators. The encryption keys are generated inside the
@@ -34,7 +35,7 @@ our word for it. That is what the rest of this document is about.
 
 | Stage | Form | Note |
 |---|---|---|
-| your browser → the gateway | **ciphertext** (TLS) | the TLS session ends *inside* the gateway TEE, not at a load balancer in front of it |
+| your browser → the gateway | **ciphertext** (ordinary TLS) | the session ends *inside* the gateway TEE, not at a load balancer in front of it. The sealing to the provider happens in the gateway, not in your browser |
 | inside the gateway TEE | plaintext, in memory | unreadable from outside the enclave |
 | the gateway → the provider | **ciphertext** (HPKE, sealed to the provider enclave's key) | this is the only form 0G's router ever carries |
 | 0G's router | **ciphertext only** | it can route and bill; it cannot open the body |
