@@ -31,6 +31,14 @@ fixed offset, exactly like attest.ParseTDXQuoteBody, and skips the DCAP signatur
 chain entirely (the gateway and `pcverify -provider` do that). Values collected
 this way are inputs to a human decision, never to a trust decision.
 
+The one check it DOES run is --compose's hash gate, and only because skipping it
+would make the output meaningless rather than merely incomplete: an app-compose is
+either the manifest the enclave booted (sha256 == the quote's compose_hash) or it
+is text the reply chose, and there is nothing useful to say about the second. The
+gate is still not a trust decision here — the quote it compares against was never
+DCAP-verified in this process — it is what makes the reported manifest the same
+document the gateway would be looking at.
+
 USAGE
 
   # census from a gateway log (or stdin)
@@ -47,6 +55,11 @@ USAGE
 
   # emit a draft allowlist next to the table
   ./collect-bootchains.py --log gateway.log --json bootchains.json
+
+  # the APPLICATION half: which manifest each provider booted, past the hash gate
+  ./collect-bootchains.py --endpoints-file endpoints.txt --compose
+  ./collect-bootchains.py --endpoints-file endpoints.txt --compose-out composes/
+  diff composes/host-a.app-compose.json composes/host-b.app-compose.json
 
 Sources combine: pass --log and --endpoint together and the census covers both.
 
@@ -115,13 +128,15 @@ WARN_RE = re.compile(
 class Observation:
     """One provider, as one source reported it."""
 
-    def __init__(self, quote_url, regs, signer=None, source="", vm=None, app=None):
+    def __init__(self, quote_url, regs, signer=None, source="", vm=None, app=None,
+                 compose=None):
         self.quote_url = quote_url
         self.regs = regs  # dict of register name -> lowercase hex
         self.signer = (signer or "").lower() or None
         self.source = source
         self.vm = vm or {}      # UNAUTHENTICATED vm_config provenance
         self.app = app or {}    # compose_hash / app_id, from mr_config_id
+        self.compose = compose  # app-compose facts, PAST the hash gate (see compose_facts)
 
     @property
     def boot_chain(self):
@@ -246,6 +261,131 @@ def compose_identity(mr_config_id_hex):
     }
 
 
+# Keys inside one docker-compose service that decide what the container can reach
+# beyond its own image: reported because an image allowlist says nothing about
+# them, and every one of them can change what the allowlisted image DOES.
+COMPOSE_SERVICE_FLAGS = ("privileged", "pid", "ipc", "network_mode", "cap_add",
+                         "devices", "security_opt", "user", "entrypoint", "command")
+
+# app-compose fields OUTSIDE docker_compose_file. They are covered by the same
+# compose_hash, so they are equally authenticated — and equally invisible to any
+# check that looks only at container images. pre_launch_script is the one that
+# matters most: arbitrary shell, run as root before any container starts.
+APPCOMPOSE_FIELDS = ("manifest_version", "name", "runner", "features",
+                     "allowed_envs", "kms_enabled", "local_key_provider_enabled",
+                     "gateway_enabled", "tproxy_enabled", "no_instance_id",
+                     "secure_time", "storage_fs", "public_logs", "public_sysinfo",
+                     "public_tcbinfo", "default_gateway_domain")
+
+
+def split_image_ref(ref):
+    """Split a docker image reference into (repo, tag, digest), mirroring
+    client/compose SplitImageRef: digest from the last "@", tag only from a ":"
+    after the last "/" so a registry port is not read as a tag."""
+    ref = (ref or "").strip()
+    if not ref:
+        return "", "", ""
+    digest = ""
+    if "@" in ref:
+        ref, digest = ref.rsplit("@", 1)
+    image, tag = ref, ""
+    colon = image.rfind(":")
+    if colon > image.rfind("/"):
+        image, tag = image[:colon], image[colon + 1:]
+    return image, tag, digest
+
+
+def parse_compose_services(text):
+    """Return [{name, ref, image, tag, digest, flags{}}] for a docker-compose text.
+
+    Uses PyYAML when importable and a line scanner otherwise, saying which ran.
+    Both are REPORTING parsers: this whole script is a census, and a fail-closed
+    policy evaluator (the thing a gate would need) is a different program with a
+    different contract — see client/compose's package comment on exactly this
+    distinction.
+    """
+    try:
+        import yaml  # noqa: PLC0415 — optional, and its absence is handled
+    except ImportError:
+        return _scan_compose_services(text), "line-scan (PyYAML not installed)"
+    try:
+        doc = yaml.safe_load(text)
+    except Exception as e:  # yaml raises several unrelated types
+        return [], f"unparseable YAML: {e}"
+    services = (doc or {}).get("services")
+    if not isinstance(services, dict):
+        return [], "no services mapping"
+    out = []
+    for name, body in services.items():
+        body = body if isinstance(body, dict) else {}
+        ref = body.get("image") if isinstance(body.get("image"), str) else ""
+        image, tag, digest = split_image_ref(ref)
+        flags = {k: body[k] for k in COMPOSE_SERVICE_FLAGS if k in body}
+        if body.get("volumes"):
+            flags["volumes"] = body["volumes"]
+        out.append({"name": str(name), "ref": ref.strip(), "image": image,
+                    "tag": tag, "digest": digest, "flags": flags})
+    return out, "yaml"
+
+
+def _scan_compose_services(text):
+    """Fallback: pull `image:` values and note which flag keys appear anywhere.
+    Cannot attribute a flag to a service, so it reports them at document level."""
+    svcs = []
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("image:"):
+            ref = s[len("image:"):].strip().strip('"\'')
+            image, tag, digest = split_image_ref(ref)
+            svcs.append({"name": "?", "ref": ref, "image": image, "tag": tag,
+                         "digest": digest, "flags": {}})
+    present = {k: "(present somewhere in the document)" for k in COMPOSE_SERVICE_FLAGS
+               if re.search(rf"^\s*{k}\s*:", text, re.M)}
+    if re.search(r"^\s*volumes\s*:", text, re.M):
+        present["volumes"] = "(present somewhere in the document)"
+    if svcs and present:
+        svcs[0]["flags"] = present
+    return svcs
+
+
+def compose_facts(app_compose, compose_hash_hex):
+    """Read an app-compose, but only AFTER the hash gate.
+
+    The gate is the whole security argument, and it is one line: sha256 over these
+    exact bytes must equal the compose_hash the quote's mr_config_id commits to
+    (evidence.VerifyAppCompose does the same check, and route.go's containersOf
+    already gates its container list on it). Before it, the text is whatever the
+    reply carried; after it, it is the manifest the enclave actually booted. A
+    mismatch returns the facts NOT AT ALL, only the mismatch — there is no partial
+    credit, and reporting an ungated compose beside a gated one would erase the
+    only distinction that matters.
+    """
+    got = hashlib.sha256(app_compose).hexdigest()
+    facts = {"sha256": got, "gate": "ok" if got == compose_hash_hex else "MISMATCH"}
+    if facts["gate"] != "ok":
+        facts["expected"] = compose_hash_hex
+        return facts
+    try:
+        ac = json.loads(app_compose)
+    except json.JSONDecodeError as e:
+        facts["error"] = f"authenticated bytes are not JSON: {e}"
+        return facts
+    facts["fields"] = {k: ac[k] for k in APPCOMPOSE_FIELDS if k in ac}
+    if isinstance(ac.get("pre_launch_script"), str) and ac["pre_launch_script"].strip():
+        script = ac["pre_launch_script"]
+        facts["pre_launch_script"] = {
+            "bytes": len(script.encode()),
+            "sha256": hashlib.sha256(script.encode()).hexdigest(),
+        }
+    text = ac.get("docker_compose_file")
+    if not isinstance(text, str) or not text.strip():
+        facts["error"] = "app-compose carries no docker_compose_file"
+        return facts
+    facts["services"], facts["parser"] = parse_compose_services(text)
+    facts["compose_text"] = text
+    return facts
+
+
 def observe_endpoint(endpoint, timeout):
     """Fetch and parse one provider's quote. Returns (Observation, None) or
     (None, error-string) — a fetch failure is per-provider news, not a reason to
@@ -286,11 +426,22 @@ def observe_endpoint(endpoint, timeout):
             break
     app = compose_identity(regs["mr_config_id"])
     tcb = unwrap_json_string(reply.get("tcb_info"))
+    compose = None
     if isinstance(tcb.get("app_compose"), str):
-        app["app_compose_sha256"] = hashlib.sha256(
-            tcb["app_compose"].encode()
-        ).hexdigest()
-    return Observation(url, regs, signer, source="live", vm=provenance, app=app), None
+        # The bytes must be the ones the reply carried, never re-encoded JSON:
+        # dstack hashes app-compose.json as it wrote it, so re-marshalling equal
+        # JSON changes the digest and turns a genuine manifest into a mismatch.
+        raw_ac = tcb["app_compose"].encode()
+        app["app_compose_sha256"] = hashlib.sha256(raw_ac).hexdigest()
+        if app.get("compose_hash"):
+            compose = compose_facts(raw_ac, app["compose_hash"])
+        else:
+            # No compose_hash to gate against (v2/v3 mr_config_id, or absent): the
+            # text cannot be authenticated here, so it is not read at all.
+            compose = {"gate": "no compose_hash in mr_config_id",
+                       "sha256": app["app_compose_sha256"]}
+    return Observation(url, regs, signer, source="live", vm=provenance, app=app,
+                       compose=compose), None
 
 
 # ---------------------------------------------------------------------------
@@ -454,6 +605,85 @@ def draft_json(groups, gateway_images):
     }
 
 
+def render_compose(observations, out):
+    """Report the application half of the identity, grouped by compose_hash.
+
+    Separate from the boot-chain table on purpose: the OS image and the app are two
+    questions with two lifetimes (attest.BootChain's comment says why), and one
+    compose_hash can appear across several OS images while one OS image carries many
+    apps. Grouping by compose_hash is what makes "these N providers boot the same
+    manifest" visible — which is the question an app-level allowlist has to answer.
+    """
+    withc = [o for o in observations if o.compose]
+    if not withc:
+        print("no app-compose collected (log-only census, or replies carried none)\n",
+              file=out)
+        return
+    groups = collections.OrderedDict()
+    for o in sorted(withc, key=lambda o: o.host):
+        groups.setdefault(o.compose.get("sha256", "?"), []).append(o)
+    groups = collections.OrderedDict(sorted(groups.items(), key=lambda kv: -len(kv[1])))
+
+    print(f"\n=== app-compose: {len(groups)} distinct manifest(s) across "
+          f"{len(withc)} provider(s)\n", file=out)
+    unpinned, sockets = [], []
+    for i, (digest, obs) in enumerate(groups.items(), 1):
+        c = obs[0].compose
+        gate = c.get("gate")
+        print(f"[{i}] {len(obs)} provider(s)  compose_hash {digest}", file=out)
+        if gate != "ok":
+            # A mismatch is the one security signal in this whole report: the reply
+            # carried a manifest that is not the one its own quote commits to.
+            print(f"    HASH GATE: {gate}"
+                  + (f" (quote binds {c['expected']})" if "expected" in c else ""),
+                  file=out)
+            print("    nothing below is authenticated; not reading it\n", file=out)
+            continue
+        if c.get("error"):
+            print(f"    note: {c['error']}", file=out)
+        f = c.get("fields", {})
+        if f:
+            print("    " + "  ".join(f"{k}={json.dumps(v, ensure_ascii=False)}"
+                                     for k, v in f.items()), file=out)
+        if pls := c.get("pre_launch_script"):
+            print(f"    pre_launch_script: {pls['bytes']} bytes of shell, "
+                  f"sha256 {pls['sha256']}", file=out)
+            print("    ^^ runs as root before any container, and is NOT in "
+                  "docker_compose_file — an image-only check never sees it", file=out)
+        for s in c.get("services", []):
+            # The reference verbatim, as client/compose keeps it: a digest-pinned ref
+            # usually carries a tag too, and showing what the file says beats showing
+            # what this made of it.
+            mark = "" if s["digest"] else "   ** NOT PINNED BY DIGEST **"
+            print(f"    service {s['name']}: {s['ref'] or '<no image>'}{mark}", file=out)
+            if not s["digest"]:
+                unpinned.append((s["ref"], [o.host for o in obs]))
+            for k, v in s.get("flags", {}).items():
+                v = json.dumps(v, ensure_ascii=False)
+                print(f"      {k}: {v[:160]}", file=out)
+                if ".sock" in v:
+                    sockets.append((s["ref"], k, v))
+        if parser := c.get("parser"):
+            if parser != "yaml":
+                print(f"    (compose parsed by {parser})", file=out)
+        for o in obs:
+            print(f"      {o.host:<52} {o.signer or '-'}", file=out)
+        print(file=out)
+
+    if unpinned:
+        print("images NOT pinned by digest — the manifest commits to a NAME whose "
+              "contents can change:", file=out)
+        for ref, hosts in unpinned:
+            print(f"    {ref}   on {len(hosts)} provider(s)", file=out)
+        print(file=out)
+    if sockets:
+        print("socket mounts — whoever holds the guest-agent socket can mint quotes "
+              "over any report_data, i.e. speak for the enclave:", file=out)
+        for ref, k, v in sockets:
+            print(f"    {ref}  {k}: {v[:120]}", file=out)
+        print(file=out)
+
+
 def endpoints_file(groups):
     """Render the census as an endpoints file for a follow-up --endpoints-file
     sweep. The point of that second pass is what a log cannot carry: RTMR0, the
@@ -508,6 +738,17 @@ def main(argv):
     ap.add_argument("--endpoints-out", metavar="FILE",
                     help='write the census as an endpoints file for a follow-up '
                          '--endpoints-file sweep ("-" for stdout)')
+    ap.add_argument("--compose", action="store_true",
+                    help="also report the app-compose behind each provider, grouped "
+                         "by compose_hash: container images (and whether they are "
+                         "pinned by digest), the compose keys an image allowlist "
+                         "would not cover, and the app-compose fields outside "
+                         "docker_compose_file. Live mode only, and only past the "
+                         "sha256 gate against the quote's compose_hash")
+    ap.add_argument("--compose-out", metavar="DIR",
+                    help="write each provider's AUTHENTICATED app-compose to "
+                         "DIR/<host>.app-compose.json, for diffing them against each "
+                         "other. Only manifests that pass the hash gate are written")
     ap.add_argument("--osimages", metavar="FILE",
                     help="gateway allowlist to cross-reference (default: the repo's "
                          "client/evidence/osimages.json, found relative to this "
@@ -557,6 +798,27 @@ def main(argv):
     render(groups, gateway_images, sys.stdout)
     if problem:
         print(f"note: {problem}", file=sys.stderr)
+
+    if args.compose or args.compose_out:
+        render_compose(observations, sys.stdout)
+    if args.compose_out:
+        written = 0
+        for o in observations:
+            if not o.compose or o.compose.get("gate") != "ok":
+                continue
+            # Written from the compose TEXT the gate authenticated, so a diff across
+            # providers compares manifests the enclaves actually booted.
+            path = os.path.join(args.compose_out, f"{o.host}.app-compose.json")
+            os.makedirs(args.compose_out, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"host": o.host, "compose_hash": o.app.get("compose_hash"),
+                           "fields": o.compose.get("fields", {}),
+                           "pre_launch_script": o.compose.get("pre_launch_script"),
+                           "docker_compose_file": o.compose.get("compose_text", "")},
+                          f, indent=2, ensure_ascii=False)
+            written += 1
+        print(f"{written} authenticated app-compose file(s) written to "
+              f"{args.compose_out}", file=sys.stderr)
 
     if errors:
         print(f"{len(errors)} source(s) yielded nothing:", file=sys.stderr)
