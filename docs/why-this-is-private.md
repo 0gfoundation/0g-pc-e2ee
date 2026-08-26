@@ -154,8 +154,6 @@ covered by the enclave's signature, so it reads and bills but cannot forge.
 - **Verifiable relay, not verifiable computation.** The chain proves that the attested
   enclave produced *this* response to *this* request. It does not prove anything about
   the quality or behaviour of the model running inside it.
-- **Availability is not attested.** Nothing here stops a deployment from being taken
-  offline.
 - **The hosted gateway is one more attested party than sealing on your own machine.**
   If a second enclave holding plaintext is unacceptable for your use case, the
   client-side forms in [`../client/README.md`](../client/README.md) seal on your own
