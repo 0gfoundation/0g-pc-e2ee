@@ -809,9 +809,10 @@ func (r *Router) containersOf(appCompose []byte, composeHash [attest.ComposeHash
 // audited none, and those must never be shown as the same thing (see
 // attest.Verifier.MeasurementBaselineConfigured).
 //
-// Today every deployment lands on VerdictNoBaseline — hop 3's allowlist is empty
-// (docs/design/trust-chain.md) — and saying exactly that is the point: the panel
-// marks the hop "observed only" rather than implying either a pass or a finding.
+// VerdictNoBaseline is reached only by a build whose embedded allowlist
+// (client/evidence/brokerimages.json) has no entries, and saying exactly that is the
+// point: the panel marks the hop "observed only" rather than implying either a pass or
+// a finding.
 func (r *Router) measurementVerdict(verified attest.Verified) Verdict {
 	switch {
 	case verified.MeasurementTrusted:

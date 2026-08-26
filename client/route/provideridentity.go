@@ -53,7 +53,7 @@ import (
 //   - Every verdict is the one the gateway REACHED, not a restatement of what it
 //     would like to be true. VerdictPass on the DCAP check means a genuine,
 //     Intel-rooted quote; VerdictNoBaseline on the measurement means the audited
-//     allowlist is empty and nothing was compared. A reader that cannot tell those
+//     allowlist held no entry and nothing was compared. A reader that cannot tell those
 //     apart is exactly what the explicit vocabulary below exists to prevent.
 //
 // What the warmer as a writer DOES change is how much the set of records discloses.
@@ -102,9 +102,10 @@ const (
 	// acknowledge, a signer that disagrees with the registry.
 	VerdictNoMatch Verdict = "no_match"
 	// VerdictNoBaseline — the check had nothing to compare against, so it did not
-	// run: the audited boot-chain allowlist is empty (trust-chain hop 3, still
-	// unfilled). Not a finding about the provider; a panel must render it as
-	// "observed only", never as a pass and never as a failure.
+	// run: the audited boot-chain allowlist holds no entry at all. Not a finding about
+	// the provider; a panel must render it as "observed only", never as a pass and
+	// never as a failure. With brokerimages.json populated this is reached only by a
+	// build whose allowlist was emptied.
 	VerdictNoBaseline Verdict = "no_baseline"
 	// VerdictUnavailable — the check should have run but could not complete (the
 	// chain RPC was unreachable or errored). The answer is unknown, which is
@@ -206,16 +207,16 @@ type ProviderIdentity struct {
 	OnChainSigner Verdict
 	// Measurement is the boot-chain check against the audited allowlist (hop 3):
 	// VerdictPass in the allowlist, VerdictNoMatch not in it, VerdictNoBaseline when
-	// the allowlist is empty — which is every deployment today, since that allowlist
-	// is the half of hop 3 still unfilled (docs/design/trust-chain.md).
+	// the allowlist holds no entry (client/evidence/brokerimages.json).
 	Measurement Verdict
 	// OSImage names the allowlisted OS image the boot chain matched, or "" when
 	// nothing was matched.
 	//
-	// It is "" in every record today, and the reason is worth stating rather than
-	// leaving to be discovered: hop 3's allowlist is empty (so Measurement is
-	// VerdictNoBaseline and there is nothing to name), and even once filled,
-	// attest.BootChainPolicy holds boot chains without labels. Unlike the gateway's
+	// It is "" on a matched provider too, and the reason is worth stating rather than
+	// leaving to be discovered: attest.BootChainPolicy holds boot chains without
+	// labels, so a match knows the registers agreed but not which entry's name to
+	// report. (evidence.OSImage carries the name; wiring it through would mean the
+	// verifier returning which entry matched.) Unlike the gateway's
 	// own os_image — where null conflated "matched nothing" with "checked nothing" —
 	// an empty value here is never ambiguous: Measurement says which case it is.
 	OSImage string

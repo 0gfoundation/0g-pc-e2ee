@@ -55,11 +55,18 @@ type osImagesFile struct {
 // about the deployment being verified — so callers should surface it loudly instead of
 // degrading to "not configured", which would silently drop the check.
 func BuiltinOSImages() ([]OSImage, error) {
-	raw, err := osImagesFS.ReadFile("osimages.json")
+	const file = "osimages.json"
+	raw, err := osImagesFS.ReadFile(file)
 	if err != nil {
 		return nil, fmt.Errorf("read embedded OS-image allowlist: %w", err)
 	}
-	return ParseOSImages(raw)
+	imgs, err := ParseOSImages(raw)
+	if err != nil {
+		// Named for the same reason BuiltinBrokerImages names its file: the parser is
+		// shared, so without this the two allowlists fail identically.
+		return nil, fmt.Errorf("%s: %w", file, err)
+	}
+	return imgs, nil
 }
 
 // ParseOSImages decodes an allowlist. Every measurement must be a full-length hex
@@ -130,6 +137,21 @@ type OSImageCheck struct {
 // check is unavailable, and Report.Note is where that is disclosed.
 func (o OSImageCheck) OK() bool { return !o.Configured || o.Err == nil }
 
+// BootChainPolicyOf projects an allowlist onto the type attest.Verifier compares
+// with, dropping the provenance fields that are never matched on.
+//
+// Exported for the same reason CheckOSImage is: the gateway's own OS-image check and
+// the PROVIDER-side allowlist (brokerimages.json, which the sealing path enforces)
+// must agree on what a list of entries means. A second projection would be a second
+// answer to "which boot chains does this file accept".
+func BootChainPolicyOf(allowed []OSImage) attest.BootChainPolicy {
+	policy := attest.BootChainPolicy{Allowed: make([]attest.BootChain, 0, len(allowed))}
+	for _, img := range allowed {
+		policy.Allowed = append(policy.Allowed, img.BootChain)
+	}
+	return policy
+}
+
 // CheckOSImage compares a quote's boot chain against the allowlist.
 //
 // Exported because two callers must reach the same verdict from the same
@@ -145,11 +167,7 @@ func CheckOSImage(allowed []OSImage, m attest.Measurement) OSImageCheck {
 	if !out.Configured {
 		return out
 	}
-	policy := attest.BootChainPolicy{Allowed: make([]attest.BootChain, 0, len(allowed))}
-	for _, img := range allowed {
-		policy.Allowed = append(policy.Allowed, img.BootChain)
-	}
-	if !policy.Permits(out.Observed) {
+	if !BootChainPolicyOf(allowed).Permits(out.Observed) {
 		names := make([]string, 0, len(allowed))
 		for _, img := range allowed {
 			names = append(names, img.Name)

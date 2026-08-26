@@ -46,8 +46,7 @@ func pidFullRecord() route.ProviderIdentity {
 		QuoteURL:      "https://broker-07.0g.ai/v1/quote?legacy=false",
 		QuoteDCAP:     route.VerdictPass,
 		OnChainSigner: route.VerdictPass,
-		// Today's real value: hop 3's audited allowlist is empty, so nothing was
-		// compared and no image was named.
+		// The no-entry case: nothing was compared, so no image was named.
 		Measurement: route.VerdictNoBaseline,
 		ComposeHash: "8779f38c1b2d4e5a6071829304a5b6c7d8e9f00112233445566778899aabbccd",
 	}
@@ -129,7 +128,7 @@ func TestProviderIdentityRoute_ReportsTheVerdicts(t *testing.T) {
 	}
 	// os_image is null and NOT ambiguous: verdicts.measurement says which case it is.
 	if doc.OSImage != nil {
-		t.Errorf("os_image = %q, want null while the audited allowlist is empty", *doc.OSImage)
+		t.Errorf("os_image = %q, want null: the policy carries no entry labels", *doc.OSImage)
 	}
 	// The caveat rides with the value, and it names where to go to check for yourself:
 	// the provider direct, not this gateway.

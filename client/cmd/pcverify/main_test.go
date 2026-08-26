@@ -23,11 +23,17 @@ func (s stubService) ServiceInfo(context.Context, string) (chain.ServiceInfo, er
 type stubQuote struct {
 	v   attest.Verified
 	err error
+	// noBaseline makes the stub report an unconfigured allowlist, the state that
+	// separates "not in the list" from "there is no list". Default false, i.e. a
+	// baseline IS configured, matching the shipped brokerimages.json.
+	noBaseline bool
 }
 
 func (s stubQuote) FetchAndVerify(context.Context, string) (attest.Verified, error) {
 	return s.v, s.err
 }
+
+func (s stubQuote) BaselineConfigured() bool { return !s.noBaseline }
 
 const (
 	prov   = "0xaabbccddeeff00112233445566778899aabbccdd"
@@ -71,9 +77,11 @@ func TestReport_WithQuote(t *testing.T) {
 		wantCode int
 		contains string
 	}{
-		// 3, not 0: hop 3's allowlist is empty, so the boot chain was never compared.
-		// Every provider-mode run is incomplete until providerBootChains is populated.
-		{"hops pass, hop 3 never ran", stubService{info: acked}, stubQuote{v: attest.Verified{SignerAddr: signer}}, 3, "PASS (INCOMPLETE)"},
+		// 3, not 0: this stub reports no baseline, so the boot chain was never compared.
+		// A build whose embedded allowlist has no entries cannot compare, so the run is
+		// incomplete however well every other hop went.
+		{"hops pass, hop 3 never ran", stubService{info: acked},
+			stubQuote{v: attest.Verified{SignerAddr: signer}, noBaseline: true}, 3, "PASS (INCOMPLETE)"},
 		{"quote signer mismatch", stubService{info: acked},
 			stubQuote{v: attest.Verified{SignerAddr: "0x0000000000000000000000000000000000000002"}}, 1, "FAIL"},
 		{"quote fetch/verify error", stubService{info: acked}, stubQuote{err: errors.New("not a genuine TDX quote")}, 1, "FAIL"},
@@ -109,7 +117,8 @@ func TestReport_PrintsTheBootChainInAllowlistShape(t *testing.T) {
 
 	var out bytes.Buffer
 	code := report(context.Background(), &out, stubService{info: acked},
-		stubQuote{v: attest.Verified{SignerAddr: signer, Measurement: m}}, prov, "0xcontract", "", "", false)
+		stubQuote{v: attest.Verified{SignerAddr: signer, Measurement: m}, noBaseline: true},
+		prov, "0xcontract", "", "", false)
 	// An unconfigured allowlist is not a verdict on the provider — nothing FAILED — but
 	// it is a check that did not run, which is exit 3.
 	if code != 3 {
@@ -137,13 +146,10 @@ func TestReport_PrintsTheBootChainInAllowlistShape(t *testing.T) {
 }
 
 // A configured allowlist that the provider misses is a finding, and must fail the run
-// rather than print observed registers and pass. Guards the branch that only becomes
-// reachable once providerBootChains is populated.
+// rather than print observed registers and pass. This is the shipped state — the stub
+// reports a configured baseline by default — so it guards the ordinary path, not a
+// hypothetical one.
 func TestReport_BootChainMismatchFails(t *testing.T) {
-	restore := providerBootChains
-	providerBootChains = []attest.BootChain{attest.BootChainOf(attest.Measurement{})}
-	t.Cleanup(func() { providerBootChains = restore })
-
 	acked := chain.ServiceInfo{URL: "https://prov.example/v1", Signer: signer, Acknowledged: true}
 	var out bytes.Buffer
 	// MeasurementTrusted false with a non-empty allowlist: the provider's image is not
@@ -164,13 +170,10 @@ func TestReport_BootChainMismatchFails(t *testing.T) {
 // would be told "verified" by a run that never checked the code root at all.
 func TestReport_ProviderVerdicts(t *testing.T) {
 	acked := chain.ServiceInfo{URL: "https://prov.example/v1", Signer: signer, Acknowledged: true}
-	good := stubQuote{v: attest.Verified{SignerAddr: signer}}
+	// Unconfigured on purpose: this is the input the "no allowlist" verdicts describe.
+	good := stubQuote{v: attest.Verified{SignerAddr: signer}, noBaseline: true}
 
 	t.Run("allowlist populated and matched is a clean 0", func(t *testing.T) {
-		restore := providerBootChains
-		providerBootChains = []attest.BootChain{attest.BootChainOf(attest.Measurement{})}
-		t.Cleanup(func() { providerBootChains = restore })
-
 		var out bytes.Buffer
 		trusted := stubQuote{v: attest.Verified{SignerAddr: signer, MeasurementTrusted: true}}
 		if code := report(context.Background(), &out, stubService{info: acked}, trusted,
@@ -182,7 +185,7 @@ func TestReport_ProviderVerdicts(t *testing.T) {
 		}
 	})
 
-	t.Run("strict turns the empty allowlist into a failure", func(t *testing.T) {
+	t.Run("strict turns an unconfigured allowlist into a failure", func(t *testing.T) {
 		var out bytes.Buffer
 		code := report(context.Background(), &out, stubService{info: acked}, good,
 			prov, "0xcontract", "", "", true)
@@ -224,7 +227,9 @@ func TestRun_StrictRejectsNoQuote(t *testing.T) {
 func TestReport_EndpointOverride(t *testing.T) {
 	var out bytes.Buffer
 	svc := stubService{info: chain.ServiceInfo{URL: "https://from-chain/v1", Signer: signer, Acknowledged: true}}
-	code := report(context.Background(), &out, svc, stubQuote{v: attest.Verified{SignerAddr: signer}}, prov, "0xc", "https://override/v1", "", false)
+	code := report(context.Background(), &out, svc,
+		stubQuote{v: attest.Verified{SignerAddr: signer}, noBaseline: true},
+		prov, "0xc", "https://override/v1", "", false)
 	// 3 because hop 3 never ran; this test is about the endpoint line, not the verdict.
 	if code != 3 {
 		t.Fatalf("code = %d, want 3\n%s", code, out.String())

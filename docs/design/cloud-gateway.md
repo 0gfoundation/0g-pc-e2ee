@@ -351,12 +351,14 @@ Three rules the implementation holds to (`client/cmd/gateway/provideridentity.go
   filling hop 3's allowlist, and that is `pcverify`'s job.
 - **Every verdict is an explicit enum, never a null to be interpreted.** `pass` /
   `no_match` / `no_baseline` / `unavailable` / `not_checked` separate a finding about
-  the provider from a gap in our own configuration. It matters immediately:
-  `measurement` is `no_baseline` in every deployment today, because hop 3's audited
-  allowlist is empty (`docs/design/trust-chain.md`), and a panel that rendered that as
-  a failure would accuse every provider of running unaudited code when the truth is
-  that we have audited none. `os_image` may still be `null`, but it is no longer
-  ambiguous — the verdict says which case produced it.
+  the provider from a gap in our own configuration. The distinction is the reason the
+  vocabulary exists: `no_match` says this provider's image is not one we audited, while
+  `no_baseline` says we audited none — and a panel that rendered the second as a failure
+  would accuse every provider of running unaudited code. With
+  `client/evidence/brokerimages.json` populated, `no_baseline` means a build whose
+  allowlist was emptied; a provider on an unlisted image is `no_match`. `os_image` may
+  still be `null`, but it is no longer ambiguous — the verdict says which case produced
+  it.
 
 It lives on the gateway rather than the router for the same reason the rest of this
 document exists: the router is untrusted by design, so its account of a provider's

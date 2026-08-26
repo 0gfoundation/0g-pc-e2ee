@@ -339,7 +339,8 @@ curl -s https://<gateway-domain>/v1/providers/0x7B3f…9aC1/identity
   "verdicts": {
     "quote_dcap": "pass",          // genuine, Intel-rooted TDX quote binding these keys
     "onchain_signer": "pass",      // its signer is the acknowledged teeSignerAddress on chain
-    "measurement": "no_baseline"   // the audited boot-chain allowlist is empty (hop 3)
+    "measurement": "no_match"      // its boot chain is not an audited image (hop 3);
+                                   // "no_baseline" would mean we audited none
   },
   "os_image": null,
   "compose_hash": "8779f38c…",
@@ -393,9 +394,11 @@ Reading the verdicts:
 | `unavailable` | the check should have run but could not complete (e.g. the chain RPC was down) |
 | `not_checked` | this deployment does not perform that check at all |
 
-`measurement` is `no_baseline` on every deployment today: that is hop 3's empty
-allowlist (see `docs/design/trust-chain.md`), the same gap `pcverify` reports as an
-incomplete run. Render it as "observed only" — not as a pass, and not as a failure.
+`measurement` is `pass` for a provider on an image in the audited allowlist
+(`client/evidence/brokerimages.json`) and `no_match` for one that is not — most
+providers while the fleet migrates. `no_baseline` means the build carried no entry to
+compare against, so it says nothing about the provider: render that one as "observed
+only", not as a pass and not as a failure.
 `onchain_signer` is `not_checked` unless the deployment runs with `ZG_GATEWAY_ONCHAIN`.
 
 Two things the endpoint will not do. It answers **only for providers this gateway has
