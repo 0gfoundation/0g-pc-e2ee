@@ -267,15 +267,14 @@ def compose_identity(mr_config_id_hex):
 COMPOSE_SERVICE_FLAGS = ("privileged", "pid", "ipc", "network_mode", "cap_add",
                          "devices", "security_opt", "user", "entrypoint", "command")
 
-# app-compose fields OUTSIDE docker_compose_file. They are covered by the same
-# compose_hash, so they are equally authenticated — and equally invisible to any
-# check that looks only at container images. pre_launch_script is the one that
-# matters most: arbitrary shell, run as root before any container starts.
-APPCOMPOSE_FIELDS = ("manifest_version", "name", "runner", "features",
-                     "allowed_envs", "kms_enabled", "local_key_provider_enabled",
-                     "gateway_enabled", "tproxy_enabled", "no_instance_id",
-                     "secure_time", "storage_fs", "public_logs", "public_sysinfo",
-                     "public_tcbinfo", "default_gateway_domain")
+# The two app-compose fields reported specially: one is parsed as compose, the
+# other is too big to print and is reported by digest. EVERY OTHER KEY IS REPORTED
+# AS-IS, deliberately — a fixed list of interesting fields is the same mistake as a
+# field-by-field allowlist, and it fails the same way. dstack adds fields between
+# manifest versions (this fleet spans 0.5.4 to 0.5.9), and a new one that changes
+# the security model would be silently dropped by a list written before it existed.
+# Reporting the unrecognized key is what lets someone notice it.
+APPCOMPOSE_HANDLED = ("docker_compose_file", "pre_launch_script")
 
 
 def split_image_ref(ref):
@@ -370,7 +369,8 @@ def compose_facts(app_compose, compose_hash_hex):
     except json.JSONDecodeError as e:
         facts["error"] = f"authenticated bytes are not JSON: {e}"
         return facts
-    facts["fields"] = {k: ac[k] for k in APPCOMPOSE_FIELDS if k in ac}
+    facts["fields"] = {k: v for k, v in sorted(ac.items())
+                       if k not in APPCOMPOSE_HANDLED}
     if isinstance(ac.get("pre_launch_script"), str) and ac["pre_launch_script"].strip():
         script = ac["pre_launch_script"]
         facts["pre_launch_script"] = {
@@ -626,7 +626,7 @@ def render_compose(observations, out):
 
     print(f"\n=== app-compose: {len(groups)} distinct manifest(s) across "
           f"{len(withc)} provider(s)\n", file=out)
-    unpinned, sockets = [], []
+    unpinned, sockets, envs = [], [], collections.Counter()
     for i, (digest, obs) in enumerate(groups.items(), 1):
         c = obs[0].compose
         gate = c.get("gate")
@@ -641,10 +641,14 @@ def render_compose(observations, out):
             continue
         if c.get("error"):
             print(f"    note: {c['error']}", file=out)
-        f = c.get("fields", {})
-        if f:
-            print("    " + "  ".join(f"{k}={json.dumps(v, ensure_ascii=False)}"
-                                     for k, v in f.items()), file=out)
+        # One field per line, and every key the manifest carries — including one this
+        # script has never heard of, which is the case worth seeing.
+        for k, v in c.get("fields", {}).items():
+            v = json.dumps(v, ensure_ascii=False)
+            print(f"    {k} = {v if len(v) <= 200 else v[:200] + '…'}", file=out)
+        for name in c.get("fields", {}).get("allowed_envs", []) or []:
+            if isinstance(name, str):
+                envs[name] += len(obs)
         if pls := c.get("pre_launch_script"):
             print(f"    pre_launch_script: {pls['bytes']} bytes of shell, "
                   f"sha256 {pls['sha256']}", file=out)
@@ -681,6 +685,16 @@ def render_compose(observations, out):
               "over any report_data, i.e. speak for the enclave:", file=out)
         for ref, k, v in sockets:
             print(f"    {ref}  {k}: {v[:120]}", file=out)
+        print(file=out)
+    if envs:
+        # allowed_envs is the set of variable NAMES the platform may inject at boot
+        # (never their values). It is in the measured manifest, so what it permits is
+        # part of the attested configuration — and it is nowhere near the container
+        # images, so an image check cannot see it widen.
+        print("allowed_envs — variable names the measured manifest lets the platform "
+              "inject at boot:", file=out)
+        for name, n in envs.most_common():
+            print(f"    {name}   on {n} provider(s)", file=out)
         print(file=out)
 
 
