@@ -12,7 +12,7 @@
 #
 #   docker build -f client/cmd/gateway/Dockerfile -t 0g-pc-e2ee-gateway .
 
-FROM golang:1.24-alpine AS build
+FROM golang:1.26-alpine AS build
 WORKDIR /src
 
 COPY protocol/ ./protocol/

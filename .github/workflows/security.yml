@@ -1,0 +1,161 @@
+name: Security
+
+# govulncheck over both modules. Unlike a version-range scanner, it does call-graph
+# analysis and reports a vulnerability only when this code can actually REACH the
+# affected symbol — which is what makes it safe to run as a gate rather than as a
+# feed. That matters here: the dependency tree is mostly cryptography and attestation
+# (circl HPKE, x/crypto, go-tdx-guest, secp256k1), so a version-only scanner would
+# fire on advisories in parts of those modules nothing on the sealed path touches,
+# and a gate people learn to ignore protects nothing.
+#
+# It also scans the standard library and toolchain, against the Go version resolved
+# from protocol/go.mod — the same one the release images are built with.
+#
+# THREE TRIGGERS, TWO DIFFERENT JOBS TO DO. They are not redundant:
+#
+#   - `schedule` is the one that carries the weight. Nearly every finding arrives
+#     because the vulnerability database gained an entry naming a dependency that has
+#     not moved — an event no push and no pull request observes. Without a timer,
+#     a quiet week is indistinguishable from a clean one.
+#   - `pull_request` is the pre-merge gate, and it is deliberately NARROWED to
+#     dependency changes (see `paths`). Run unconditionally, this check would go red
+#     on a docs-only PR because an advisory landed overnight — a failure with no
+#     relation to the diff under review. A few of those and the signal is spent, so
+#     the scope is traded for keeping a red X meaningful.
+#
+# The cost of that trade, stated plainly: a PR that reaches a newly-vulnerable symbol
+# in an ALREADY-vendored dependency changes no go.mod and is not scanned here. The
+# nightly run catches it within a day; it does not catch it before merge.
+
+on:
+  schedule:
+    # Off the hour on purpose: scheduled workflows queue behind everyone else's
+    # on-the-hour crons, and a job that starts 20 minutes late every night is a job
+    # whose failures get read late too.
+    - cron: "17 3 * * *"
+  pull_request:
+    paths:
+      - "**/go.mod"
+      - "**/go.sum"
+      - ".github/workflows/security.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One scan at a time. Two overlapping nightly runs would race to file the same issue.
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  govulncheck:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write # file the nightly report; unused on the pull_request path
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # Both modules pin the same Go; read it from protocol/go.mod. This version
+          # is also what the standard-library half of the scan is judged against.
+          go-version-file: protocol/go.mod
+          # BOTH sums, unlike ci.yml: this job resolves the full dependency graph of
+          # each module in turn, so caching only one leaves the other's downloads
+          # uncached on every run.
+          cache-dependency-path: |
+            protocol/go.sum
+            client/go.sum
+
+      - name: Install govulncheck
+        # Pinned, not @latest: a gate whose own implementation changes underneath it
+        # cannot be told apart from a gate reacting to a real change. The database it
+        # queries is live regardless — pinning the tool costs no freshness, and this
+        # line is the thing to bump deliberately.
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+
+      - name: Scan (per module)
+        id: scan
+        run: |
+          # Deliberately NOT fail-fast: a finding in `protocol` must not hide the
+          # state of `client`. Scan both, then apply the verdict once, so the report
+          # below describes the whole repository rather than its first bad module.
+          rc=0
+          report="${RUNNER_TEMP}/govulncheck.txt"
+          : > "$report"
+          for m in protocol client; do
+            echo "::group::$m"
+            ( cd "$m" && govulncheck ./... ) 2>&1 | tee -a "$report"
+            # PIPESTATUS, not $?: the pipeline's status is tee's, and tee succeeds
+            # whether or not govulncheck reported anything.
+            if [ "${PIPESTATUS[0]}" -ne 0 ]; then rc=1; fi
+            echo "::endgroup::"
+          done
+          echo "report=${report}" >> "$GITHUB_OUTPUT"
+          exit "$rc"
+
+      - name: File an issue on a nightly finding
+        # Scheduled runs have no reviewer and no PR to turn red. GitHub notifies only
+        # the person who last touched this file, by email, which is not a channel
+        # anyone watches — so the finding has to become an issue to be seen at all.
+        # On the pull_request path the failed check IS the notification, so this is
+        # scoped to `schedule` and stays quiet there.
+        if: failure() && steps.scan.outcome == 'failure' && github.event_name == 'schedule'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = 'govulncheck: vulnerabilities reported';
+
+            // Reopening a fresh issue every night for one unfixed advisory buries the
+            // one that is actually new. Comment on the standing issue instead, so the
+            // thread shows how long it has been open.
+            const open = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100,
+            });
+            const existing = open.find(i => !i.pull_request && i.title.startsWith(marker));
+
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}` +
+                        `/actions/runs/${context.runId}`;
+            let out = fs.readFileSync(process.env.REPORT, 'utf8');
+            // Issue bodies cap at 65536 characters; keep the head, where govulncheck
+            // puts the findings themselves.
+            const cap = 60000;
+            if (out.length > cap) out = out.slice(0, cap) + '\n…truncated, see the run log.\n';
+
+            const body = [
+              `\`govulncheck\` reported findings on \`${context.sha.slice(0, 7)}\`.`,
+              ``,
+              `These are call-graph-confirmed: the affected symbol is reachable from`,
+              `this code, so each one wants either a dependency bump or a written`,
+              `reason it does not apply.`,
+              ``,
+              `Run: ${run}`,
+              ``,
+              '```',
+              out.trimEnd(),
+              '```',
+            ].join('\n');
+
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `${marker} (${new Date().toISOString().slice(0, 10)})`,
+                body,
+              });
+            }
+        env:
+          REPORT: ${{ steps.scan.outputs.report }}
