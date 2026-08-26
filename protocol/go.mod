@@ -2,7 +2,7 @@ module github.com/0gfoundation/0g-pc-e2ee/protocol
 
 go 1.24.0
 
-toolchain go1.24.13
+toolchain go1.26.7
 
 require (
 	github.com/cloudflare/circl v1.6.4

@@ -9,7 +9,7 @@
 #
 #   docker build -f client/cmd/sidecar/Dockerfile -t 0g-pc-e2ee-sidecar .
 
-FROM golang:1.24-alpine AS build
+FROM golang:1.26-alpine AS build
 WORKDIR /src
 
 # Copy both modules; protocol must sit next to client for the replace to resolve.

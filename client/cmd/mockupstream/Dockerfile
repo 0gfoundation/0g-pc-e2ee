@@ -13,7 +13,7 @@
 #
 #   docker build -f client/cmd/mockupstream/Dockerfile -t 0g-pc-e2ee-mockupstream .
 
-FROM golang:1.24-alpine AS build
+FROM golang:1.26-alpine AS build
 WORKDIR /src
 
 COPY protocol/ ./protocol/
