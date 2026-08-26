@@ -8,6 +8,11 @@ Everything here is independently checkable, and none of it requires trusting 0G.
 command below is a convenience, not the source of truth — the
 [manual procedure](#doing-it-by-hand) reaches the same conclusions with standard tools.
 
+> **This document is the procedure.** If you came here asking *why* the product is
+> private rather than *how to check it*, start with
+> [`why-this-is-private.md`](./why-this-is-private.md) — the same claims in three
+> paragraphs, with what is and is not hidden, and no tooling to install.
+
 > **Scope.** This document covers the **gateway** — the 0G-operated enclave that takes
 > your request and seals it to a provider. The gateway verifies the *provider* on your
 > behalf per request: two of those checks **reject** (a provider whose TDX quote does not
