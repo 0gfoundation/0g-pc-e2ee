@@ -34,6 +34,7 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/dcap"
+	"github.com/0gfoundation/0g-pc-e2ee/client/evidence"
 	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/0gfoundation/0g-pc-e2ee/client/route"
 	"github.com/0gfoundation/0g-pc-e2ee/client/sig"
@@ -227,7 +228,7 @@ func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen string) *Flags {
 		attestOn: fs.Bool("attest", envBool(env("ATTEST"), false),
 			fmt.Sprintf("DCAP-verify each provider's TDX quote and seal only to the verified enc key (instead of trusting the router-supplied pubkey endpoint) (env %s)", env("ATTEST"))),
 		attestEnforce: fs.Bool("attest-enforce", envBool(env("ATTEST_ENFORCE"), false),
-			fmt.Sprintf("with -attest, reject a provider whose measurement is not in the allowlist instead of only warning; the audited-image allowlist is not wired yet (empty), so enforce currently rejects all providers (env %s)", env("ATTEST_ENFORCE"))),
+			fmt.Sprintf("with -attest, reject a provider whose measurement is not in the allowlist instead of only warning; the allowlist is built into this binary (client/evidence/brokerimages.json) and the startup log names its entries, so turn this on only once every provider being routed to is on a listed image (env %s)", env("ATTEST_ENFORCE"))),
 		onchainOn: fs.Bool("onchain", envBool(env("ONCHAIN"), false),
 			fmt.Sprintf("cross-check each provider's quote-bound TEE signer against its acknowledged on-chain teeSignerAddress in the InferenceServing registry (SPEC §4.4 step 3); requires -attest (env %s)", env("ONCHAIN"))),
 		onchainEnforce: fs.Bool("onchain-enforce", envBool(env("ONCHAIN_ENFORCE"), false),
@@ -547,9 +548,18 @@ const warmerStopGrace = 2 * time.Second
 
 // newVerifier builds the per-request TDX quote verifier. Quote authenticity
 // (genuine TDX + TCB UpToDate + report_data binding) is always enforced; only
-// the measurement-allowlist decision is governed by enforce vs warn. The audited
-// broker-image allowlist is not wired yet (empty), so warn is the usable interim
-// (log an out-of-allowlist measurement but proceed) and enforce rejects all.
+// the measurement-allowlist decision is governed by enforce vs warn.
+//
+// The allowlist is the embedded client/evidence/brokerimages.json — one entry per
+// audited OS image, each computed from a published release rather than read off a
+// deployment (that file's header carries the provenance per entry). A provider whose
+// boot chain is absent is logged and used under warn, refused under enforce.
+//
+// A malformed embedded allowlist is FATAL rather than an empty one. Degrading to
+// empty would silently drop the check in warn mode, and in enforce mode it would
+// report our own broken file as "every provider runs unaudited code" — the exact
+// conflation attest.ErrMeasurementPolicyNotConfigured exists to keep apart. It is a
+// build-time mistake in this repository, so it is also caught by a test.
 //
 // pccsURL (when non-empty) points DCAP collateral fetches at a PCCS mirror
 // instead of Intel PCS, and collateralTTL (when positive) memoizes that
@@ -561,15 +571,35 @@ func newVerifier(label string, enforce bool, pccsURL string, collateralTTL time.
 	if enforce {
 		mode = attest.ModeEnforce
 	}
-	logger.Info("TDX quote verification enabled", "label", label, "enforce", enforce, "allowlist", "empty",
+	images, err := evidence.BuiltinBrokerImages()
+	if err != nil {
+		// Through logger, not log.Fatalf: every other startup failure in Build reports
+		// this way, and the logger writes to STDOUT (newLogger). A log.Fatalf here would
+		// put the one fatal line that says "this build's allowlist is broken" on stderr,
+		// in a different format, i.e. the one place an operator tailing the process's
+		// stdout would not see it.
+		logger.Error("embedded broker-image allowlist is malformed", "err", err)
+		os.Exit(1)
+	}
+	// Name the entries rather than count them: an operator reading this line at
+	// startup is checking that the build carries the images they expect, and a bare
+	// count cannot tell "the one we audited" from "some other one".
+	names := make([]string, 0, len(images))
+	for _, img := range images {
+		names = append(names, img.Name)
+	}
+	// "(none)" rather than an empty value: an operator scanning this line must be able
+	// to tell "this build carries no entry" from a formatting glitch, and that state is
+	// exactly the one that makes enforce refuse every provider.
+	listed := "(none)"
+	if len(names) > 0 {
+		listed = strings.Join(names, ",")
+	}
+	logger.Info("TDX quote verification enabled", "label", label, "enforce", enforce,
+		"allowlist", listed, "allowlist_entries", len(images),
 		"collateral_source", collateralSource(pccsURL), "collateral_ttl", collateralTTL)
-	// TODO: load the audited broker boot chains. The allowlist now has a shape that
-	// CAN be filled — one entry per OS image, computed from a reproducible build and
-	// publishable before a deployment exists (attest.BootChain) — so what remains is
-	// deciding where the values are published: on-chain beside the provider registry,
-	// or as broker release assets. Until then this stays empty and `enforce` off.
 	return attest.New(
-		attest.BootChainPolicy{},
+		evidence.BootChainPolicyOf(images),
 		attest.WithQuoteParser(dcap.NewQuoteParser(dcap.Config{
 			PCCSBaseURL:   pccsURL,
 			CollateralTTL: collateralTTL,

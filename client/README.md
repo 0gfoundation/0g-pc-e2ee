@@ -126,8 +126,9 @@ TLS on the router path.
 
 - **Attestation** — the provider quote is genuine TEE hardware (DCAP-verified;
   enforced). Whether it runs an *audited* image is checked against
-  `attest.BootChainPolicy` — one entry per OS image — but that allowlist is empty today,
-  so the deployed gateway runs that part in warn mode; `pcverify -provider` prints the
+  `attest.BootChainPolicy` — one entry per OS image, from the embedded
+  `client/evidence/brokerimages.json`. The deployed gateway still runs that part in
+  warn mode until the fleet is on listed images; `pcverify -provider` prints the
   observed boot chain in the shape an entry wants. See
   [`trust-chain.md`](../docs/design/trust-chain.md) hop 3.
 - **Response authenticity** — each response carries a §8 TEE signature, checked
@@ -177,10 +178,10 @@ compose text is then matched against the newest 5 published releases by default
 
 Both modes exit non-zero on a failed check, so either works as a deploy gate, and both
 separate "failed" (1) from "did not run" (3) so a skipped check cannot read as a full
-pass. `-strict` makes every check mandatory and turns the latter into the former. Note
-that **provider mode returns 3 on every run today**: hop 3's audited allowlist is empty,
-so the boot chain is never compared — the code root is not doing its job yet, and the
-exit code says so rather than rounding up to 0. See
+pass. `-strict` makes every check mandatory and turns the latter into the former. In
+provider mode a 3 means specifically that hop 3's allowlist held no entry, so the boot
+chain was never compared; with entries a matching provider reaches a clean 0, which is
+what makes `-strict` usable as a gate there. See
 [`docs/design/cloud-gateway.md`](../docs/design/cloud-gateway.md) §10 for what the
 result does and does not cover.
 
@@ -195,7 +196,7 @@ one step no web page can perform. If the two disagree, `pcverify` is right.
 The provider side is a different kind of claim, and has its own route: `GET
 /v1/providers/{address}/identity` reports what the gateway **verified** about a
 provider — the DCAP verdict on that provider's quote, the on-chain signer
-comparison, the boot-chain verdict (`no_baseline` today, hop 3), its `compose_hash`
+comparison, the boot-chain verdict against the audited allowlist (hop 3), its `compose_hash`
 (`cmd/gateway/provideridentity.go`, `route/provideridentity.go`). Those checks really
 happened, on a third party, before any seal; what the endpoint cannot do is make them
 *yours*. It answers only for providers it has checked itself — the ones it has sealed

@@ -198,8 +198,8 @@ func TestProviderIdentity_RecordsWhatWasVerified(t *testing.T) {
 	}
 }
 
-// The measurement verdict is three states, not a bool: an empty audited allowlist
-// (every deployment today — trust-chain hop 3) must report no_baseline, NOT the
+// The measurement verdict is three states, not a bool: a build whose audited allowlist
+// carried no entry (trust-chain hop 3) must report no_baseline, NOT the
 // no_match a provider running an unaudited image gets. Collapsing them would accuse
 // every provider of running unaudited code because we have audited none.
 func TestProviderIdentity_MeasurementVerdictIsThreeState(t *testing.T) {

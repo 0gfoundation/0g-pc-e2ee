@@ -11,13 +11,15 @@
 // provider you will point them at to confirm the whole chain lines up before
 // flipping on enforcement.
 //
-// Hop 3 currently REPORTS rather than checks: the audited-image allowlist
-// (providerBootChains) is empty, so the run prints the observed boot chain — MRTD,
-// RTMR1, RTMR2, the three registers an entry pins — in the shape an allowlist entry
-// wants. That is deliberate: those values have to be read off a real provider before
-// any allowlist can exist, so this is where the first entry comes from. RTMR3 is not
-// printed as a candidate value; it carries per-instance events and pinning it would
-// pin one CVM (see attest.BootChain). RTMR0 is shown, labelled as not compared.
+// Hop 3 compares, against the same embedded allowlist the sealing path enforces
+// (client/evidence/brokerimages.json). An image that is not listed FAILS the run. When
+// that file has no entries the comparison cannot run at all, and the report says so
+// and returns 3 rather than passing — so a run can never read as "audited" on the
+// strength of an allowlist that was never consulted. Either way the observed boot
+// chain is printed in the shape an entry wants — MRTD, RTMR1, RTMR2, the three
+// registers attest.BootChain pins — because that is how the next entry gets recorded.
+// RTMR3 is not offered as a candidate value: it carries per-instance events, so
+// pinning it would pin one CVM. RTMR0 is shown, labelled as not compared.
 //
 //	pcverify -provider 0x... [-chain-rpc-url ...] [-serving-contract 0x...]
 //	         [-endpoint https://...] [-expect-signer 0x...] [-no-quote]
@@ -130,11 +132,11 @@
 // and returns 3; -strict turns that into 1 instead. Treat 3 as failure in a gate
 // unless a partial verification is genuinely acceptable there.
 //
-// Both modes use it, and provider mode reaches it far more easily: hop 3's audited
-// allowlist is empty, so the boot-chain comparison never runs and EVERY provider-mode
-// run is a 3 today. That is the honest report — the code root is not doing its job yet
-// — and it means -strict cannot pass in provider mode until the allowlist is
-// populated. -no-quote is a 3 for the same reason: it skips hops 2–4 by request.
+// Both modes use it. In provider mode a 3 now means one specific thing: the embedded
+// broker-image allowlist has no entry to compare against, so the code root did not
+// run. With entries, provider mode reaches a clean 0 — which is what makes -strict
+// usable there as a gate. -no-quote is a 3 for its own reason: it skips hops 2–4 by
+// request.
 package main
 
 import (
@@ -151,6 +153,7 @@ import (
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
 	"github.com/0gfoundation/0g-pc-e2ee/client/dcap"
+	"github.com/0gfoundation/0g-pc-e2ee/client/evidence"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
 )
 
@@ -170,6 +173,13 @@ type serviceReader interface {
 // it. nil disables the quote hops (on-chain only).
 type quoteChecker interface {
 	FetchAndVerify(ctx context.Context, endpoint string) (attest.Verified, error)
+	// BaselineConfigured reports whether the verifier holds any expected boot chain,
+	// so the report can separate "this image is not in the allowlist" (a finding about
+	// the provider) from "there is no allowlist" (a finding about this build). Under
+	// warn mode Verified.MeasurementTrusted is false for both, which is why the
+	// distinction has to come from here — see attest.Verifier.MeasurementBaselineConfigured,
+	// which exists for exactly this caller shape.
+	BaselineConfigured() bool
 }
 
 func run(ctx context.Context, out io.Writer, args []string) int {
@@ -190,7 +200,7 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 	noDNSDiscovery := fs.Bool("no-dns-discovery", false, "gateway mode: do not derive the platform base domain from DNS; check only what was passed in")
 	expectComposeFile := fs.String("expect-compose-file", "", "gateway mode: path to the docker-compose manifest this deployment should be running (a digest-pinned docker-compose.release.yml), compared against the authenticated app-compose's docker_compose_file. Overrides the default -releases lookup")
 	releases := fs.Int("releases", defaultReleases, "gateway mode: accept the deployment if its compose text matches any of the newest N published releases, and report which one. 0 disables the lookup")
-	strict := fs.Bool("strict", false, "require every check to RUN, not merely to not fail: anything that would report an advisory \"-\" (exit 3) fails the run instead (exit 1). Gateway mode — a releases or app-compose lookup that cannot be completed; it demands the checks without demanding their inputs, so discovery still supplies them. Provider mode — hop 3, which cannot pass today because the audited allowlist is empty")
+	strict := fs.Bool("strict", false, "require every check to RUN, not merely to not fail: anything that would report an advisory \"-\" (exit 3) fails the run instead (exit 1). Gateway mode — a releases or app-compose lookup that cannot be completed; it demands the checks without demanding their inputs, so discovery still supplies them. Provider mode — hop 3, which cannot pass when the audited allowlist has no entry to compare against")
 	releaseRepo := fs.String("repo", defaultReleaseRepo, "gateway mode: owner/name to read releases from, with -releases")
 	releaseAsset := fs.String("release-asset", defaultReleaseAsset, "gateway mode: release asset holding the deployment manifest, with -releases")
 	timeout := fs.Duration("timeout", 30*time.Second, "overall timeout")
@@ -268,7 +278,14 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 
 	var qc quoteChecker
 	if !*noQuote {
-		qc = newDCAPChecker(*pccsURL)
+		// Usage-class exit (2), not a check failure (1): a malformed embedded allowlist
+		// is a defect in this build, and no statement has been made about the provider.
+		checker, err := newDCAPChecker(*pccsURL)
+		if err != nil {
+			fmt.Fprintf(out, "pcverify: %v\n", err)
+			return 2
+		}
+		qc = checker
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, *timeout)
@@ -281,11 +298,11 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 // failed, 3 nothing failed but a check did not run (see verdict). It takes interfaces
 // so tests drive it without a live chain or provider.
 //
-// Provider mode is where "did not run" is the STANDING state rather than an
-// occasional one: hop 3's allowlist is empty, so the boot-chain comparison never
-// happens and every run is incomplete until providerBootChains is populated. That is
-// the more likely way a CI gate is misled — a gateway-mode skip needs a GitHub outage,
-// this one needs nothing at all.
+// Provider mode reaches "did not run" through its own door: an allowlist with no
+// entry means the boot-chain comparison cannot happen, and the run is incomplete
+// however well every other hop went. With entries — the shipped state — a matching
+// provider reaches a clean 0. The distinction matters for a CI gate, which would
+// otherwise read an unconsulted allowlist as a pass.
 func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecker, provider, contract, endpointOverride, expectSigner string, strict bool) int {
 	fmt.Fprintf(out, "provider           %s\n", provider)
 	fmt.Fprintf(out, "contract           %s\n", contract)
@@ -341,7 +358,7 @@ func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecke
 			// A clean match needs only to say so; the registers are the reader's next
 			// action only when there is one.
 			fmt.Fprintf(out, "%s boot chain       in the audited allowlist\n", mark(true))
-		case len(providerBootChains) == 0:
+		case !qc.BaselineConfigured():
 			fmt.Fprintf(out, "- boot chain       not compared (no allowlist configured)\n")
 			reportBootChain(out, attest.BootChainOf(v.Measurement))
 			reportShapeRegister(out, v.Measurement)
@@ -379,24 +396,34 @@ func mark(ok bool) string {
 	return "✗"
 }
 
-// providerBootChains is the audited broker OS-image allowlist for -provider mode:
+// providerBootChains loads the audited broker OS-image allowlist for -provider mode:
 // one entry per image, as attest.BootChain (MRTD + RTMR1 + RTMR2) rather than a full
 // Measurement, so an entry pins a version rather than a single CVM.
 //
-// It is empty, and that is the remaining half of trust-chain hop 3. The shape can now
-// be filled — these values are computable from a reproducible build before any
-// deployment exists — but WHERE they are published is still open: on-chain beside the
-// provider registry, or as broker release assets (which this tool could consume with
-// the same machinery -releases already uses for the gateway). Until that is decided
-// the run reports the observed boot chain instead of comparing it, so that whoever
-// records the first entry is copying rather than transcribing.
-var providerBootChains []attest.BootChain
+// It reads the SAME embedded client/evidence/brokerimages.json the gateway and the
+// sidecar enforce against, deliberately: a diagnostic that answered from its own copy
+// of the allowlist could report a provider as acceptable while the sealing path
+// refuses it, which is worse than having no diagnostic. Where those values come from
+// is that file's header; trust-chain.md hop 3's open question — where the expected
+// values are PUBLISHED — is answered by embedding them here beside the gateway's own.
+//
+// A malformed file is returned as an error for main to report, not swallowed into an
+// empty allowlist: an empty one silently turns the boot-chain comparison into "not
+// configured", and a diagnostic that hides its own broken input is misleading in the
+// direction that matters.
+func providerBootChains() (attest.BootChainPolicy, error) {
+	images, err := evidence.BuiltinBrokerImages()
+	if err != nil {
+		return attest.BootChainPolicy{}, err
+	}
+	return evidence.BootChainPolicyOf(images), nil
+}
 
 // dcapChecker is the real quoteChecker: it GETs the provider's /quote and
 // DCAP-verifies it (genuine TDX + TCB + report_data binding). Measurement runs in
 // warn mode so the tool REPORTS an out-of-allowlist boot chain rather than erroring:
-// a read-only diagnostic should print what it saw, and with providerBootChains empty
-// enforce mode would refuse every provider without saying anything about any of them.
+// a read-only diagnostic should print what it saw, and erroring would say nothing
+// about the provider beyond "not in the list", which the report states more usefully.
 type dcapChecker struct {
 	http     *http.Client
 	verifier *attest.Verifier
@@ -406,15 +433,25 @@ type dcapChecker struct {
 // points collateral fetches at a PCCS mirror instead of Intel PCS — the same knob
 // the gateway mode and the sidecar/gateway binaries take, so a run of either mode
 // can be aimed at the collateral source the deployment actually uses.
-func newDCAPChecker(pccsURL string) *dcapChecker {
+func newDCAPChecker(pccsURL string) (*dcapChecker, error) {
+	policy, err := providerBootChains()
+	if err != nil {
+		return nil, err
+	}
 	return &dcapChecker{
 		http: &http.Client{Timeout: 20 * time.Second},
 		verifier: attest.New(
-			attest.BootChainPolicy{Allowed: providerBootChains},
+			policy,
 			attest.WithQuoteParser(dcap.NewQuoteParser(dcap.Config{PCCSBaseURL: pccsURL})),
 			attest.WithMeasurementMode(attest.ModeWarn),
 		),
-	}
+	}, nil
+}
+
+// BaselineConfigured delegates to the verifier rather than re-reading the embedded
+// file: one source, so the report cannot disagree with what the comparison used.
+func (c *dcapChecker) BaselineConfigured() bool {
+	return c.verifier.MeasurementBaselineConfigured()
 }
 
 func (c *dcapChecker) FetchAndVerify(ctx context.Context, endpoint string) (attest.Verified, error) {

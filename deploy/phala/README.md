@@ -613,10 +613,12 @@ by tag, so `compose_hash` commits to a name whose contents can be republished un
 it. There is no `source` label here, unlike the gateway's own list — no per-provider
 manifest is published, so there is no release to trace an image back to.
 
-Expect `verdicts.measurement: "no_baseline"` on every deployment today — that is hop
-3's empty audited allowlist (`docs/design/trust-chain.md`), the same gap `pcverify`
-reports as an incomplete run, and it must be rendered as "observed only" rather than as
-a failure. Smoke-test after deploying:
+`verdicts.measurement` reads `pass` for a provider on a listed image and `no_match`
+for one that is not — most providers today, since the fleet is still migrating. The
+third value, `no_baseline`, means this build's `client/evidence/brokerimages.json`
+carried no entry to compare against, so it says nothing about the provider and a panel
+must render it as "observed only" rather than as a failure; a release should never show
+it. Smoke-test after deploying:
 
 ```sh
 # the address the sealed request was pinned to
@@ -946,12 +948,18 @@ and warmer liveness).
     stands on the cached quote" (throttled or the quote fetch failed), "the cached quote
     had rotated" (benign, and it resolves), and "the quote signer had not rotated and
     the mismatch stands" (live quote, live chain read, still disagreeing).
-  - the **boot-chain** check (hop 3) has an empty allowlist, so
-    `ZG_GATEWAY_ATTEST_ENFORCE` would reject every provider. It now compares the boot
-    chain (MRTD + RTMR1 + RTMR2) rather than all five registers — the same split the
-    gateway's own OS-image check makes — so an entry pins one audited image instead of
-    one CVM, and the allowlist can be filled. What is still open is where the values are
-    published (see `trust-chain.md` hop 3).
+  - the **boot-chain** check (hop 3) now has an allowlist —
+    `client/evidence/brokerimages.json`, embedded, one entry per audited OS image, and
+    the startup log line names the entries a build carries. It compares MRTD + RTMR1 +
+    RTMR2 rather than all five registers, so an entry pins one image rather than one
+    CVM. `ZG_GATEWAY_ATTEST_ENFORCE` stays off while providers are still on images that
+    are not listed: enforce refuses those outright, and it is only safe to turn on for a
+    deployment whose every routed provider is on a listed image. The same change moved
+    `pcverify -provider`: an unlisted provider is now a FAIL (exit 1) rather than the
+    "not compared" it reported while the allowlist was empty (exit 3). Nothing in this
+    repository gates on that exit code, but a run against a provider not yet migrated
+    now reports a finding rather than a gap — which is the honest report, and worth
+    knowing before wiring it into anything.
 
   Response signatures are always fail-closed.
 - If the gateway container is recreated with a new address, restart
@@ -969,10 +977,13 @@ and warmer liveness).
   it (`trust-chain.md`, "What is *not* in the trust chain"). The gateway narrows
   that window by re-reading live rather than ruling on a cached value, and cannot
   close it. So:
-  1. **Update the measurement allowlist before the rollout.** New code means new
-     MRTD/RTMR values, and with `ZG_GATEWAY_ATTEST_ENFORCE` on an unlisted boot
-     chain rejects the upgraded broker outright. (The allowlist is empty and
-     enforce is off today, so this is a future dependency, not a live one.)
+  1. **Update the measurement allowlist before the rollout — but only if the OS
+     image changes.** `attest.BootChain` covers the guest OS, not the application, so
+     a broker upgrade that reuses the same image needs no allowlist change: it moves
+     `compose_hash`, `enc_pub` and `signer_addr`, none of which hop 3 compares. A CVM
+     moved to a NEW guest-OS release does need an entry first, computed per
+     `client/evidence/brokerimages.json`, or `ZG_GATEWAY_ATTEST_ENFORCE` refuses the
+     upgraded broker outright.
   2. **Keep the on-chain acknowledgement close to the roll** — the gap between the
      two is the window.
   3. **Expect the provider to be skipped during it.** With several providers

@@ -86,8 +86,9 @@ type providerIdentityDoc struct {
 	// Verdicts are the outcomes of the checks this gateway made before sealing.
 	Verdicts providerVerdicts `json:"verdicts"`
 	// OSImage names the allowlisted OS image the provider's boot chain matched, or
-	// null. Null today for every provider, and verdicts.measurement says why (the
-	// audited allowlist is empty — trust-chain hop 3); see route.ProviderIdentity.
+	// null. Null even on a match, because attest.BootChainPolicy holds boot chains
+	// without labels — verdicts.measurement is what distinguishes matched from not
+	// compared, so null here is never ambiguous; see route.ProviderIdentity.
 	OSImage *string `json:"os_image"`
 	// ComposeHash is the dstack compose hash out of the verified quote's mr_config_id
 	// — WHICH application configuration that enclave booted. Null when the register's
@@ -156,9 +157,10 @@ type providerVerdicts struct {
 	// separates the expected provider from a look-alike enclave running the same
 	// image. "not_checked" when the deployment did not enable on-chain grounding.
 	OnChainSigner route.Verdict `json:"onchain_signer"`
-	// Measurement: the boot chain against the audited allowlist. "no_baseline" in
-	// every deployment today, because that allowlist is the half of hop 3 still
-	// unfilled — a panel must render that as "observed only", never as a pass.
+	// Measurement: the boot chain against the audited allowlist (hop 3). "pass" in it,
+	// "no_match" not in it, "no_baseline" when the build carried no entry at all — a
+	// panel must render that last one as "observed only", never as a pass and never as
+	// a failure, since it says nothing about the provider.
 	Measurement route.Verdict `json:"measurement"`
 }
 

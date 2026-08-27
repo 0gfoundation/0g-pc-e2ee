@@ -226,8 +226,10 @@ services:
       # a provider that fails is rejected.
       - "ZG_GATEWAY_ATTEST=true"
       # Reject a provider whose measurement is not in the allowlist instead of only
-      # warning. The audited-image allowlist is not wired yet (empty), so enforce
-      # would reject ALL providers — leave off until it lands.
+      # warning. The allowlist is the embedded client/evidence/brokerimages.json; the
+      # startup log line names the entries the build carries. Turn this on only once
+      # every provider being routed to is on a listed image — a provider that is not
+      # is refused, and with one provider there is no fallback.
       # - "ZG_GATEWAY_ATTEST_ENFORCE=true"
       # Cross-check each provider's quote-bound TEE signer against its acknowledged
       # on-chain teeSignerAddress. The RPC + contract default to 0G mainnet, so they
