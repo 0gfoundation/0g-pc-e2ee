@@ -494,8 +494,13 @@ func reportManifest(out io.Writer, pq providerQuote) (failed bool, skipped strin
 	fmt.Fprintf(out, "%s app-compose      authenticated: sha256 equals the compose_hash the quote binds\n", mark(true))
 	fmt.Fprintf(out, "  compose_hash     %x\n", pq.ComposeHash)
 	fmt.Fprintf(out, "  app_id           %s\n", attest.AppIDFromComposeHash(pq.ComposeHash))
+	// "none" is a claim, so it is only printed when the manifest actually made it. An
+	// unreadable features field renders as such — see ComposeReview.FeaturesUnreadable.
 	features := "none"
-	if len(review.Features) > 0 {
+	switch {
+	case review.FeaturesUnreadable:
+		features = "<unreadable>"
+	case len(review.Features) > 0:
 		features = strings.Join(review.Features, ",")
 	}
 	fmt.Fprintf(out, "  manifest         name=%q runner=%q features=%s\n", review.Name, review.Runner, features)

