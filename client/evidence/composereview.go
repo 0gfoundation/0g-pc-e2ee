@@ -43,7 +43,11 @@ package evidence
 // host path into a container therefore goes through ONE verdict function
 // (hostPathVerdict): a direct bind, a named volume backed by a device, and a top-level
 // secret/config `file:`. Three copies of those rules would have been three chances for
-// one of them to be the lenient one.
+// one of them to be the lenient one — and NORMALIZATION lives inside that function for
+// the same reason. Every rule there matches on a literal, so `//var/run/docker.sock`,
+// `/./etc` and `/opt/../etc` each reported nothing while their canonical spellings were
+// blocking; cleaning at the call sites instead would have been the same mistake one
+// level down.
 //
 // SHAPE IS NEVER READ AS ABSENCE. Every reader that can fail returns an `ok`, and
 // absent is (zero, true) while present-but-wrong-shape is (zero, false) — see the
@@ -61,6 +65,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"path"
 	"sort"
 	"strings"
 
@@ -125,11 +130,17 @@ type ImageOrigin int
 const (
 	// OriginNone: the service names no image (see Finding for the "build:" case).
 	OriginNone ImageOrigin = iota
-	// OriginFirstParty: the repository's namespace is firstPartyNamespace.
+	// OriginFirstParty: our namespace on a registry we publish through.
 	OriginFirstParty
 	// OriginThirdParty: anything else, including an unqualified Docker Hub library
 	// image.
 	OriginThirdParty
+	// OriginForeignRegistry: OUR namespace on a registry that is not ours. It is its own
+	// state because it is neither answer: a pull-through mirror is a legitimate reason to
+	// see it, and so is an image named to look like ours. Either way we cannot answer for
+	// the contents, so calling it first-party would be false — and the namespace part of
+	// the digest-pinning argument only holds when the registry is one we control.
+	OriginForeignRegistry
 )
 
 func (o ImageOrigin) String() string {
@@ -138,6 +149,8 @@ func (o ImageOrigin) String() string {
 		return "first-party"
 	case OriginThirdParty:
 		return "third-party"
+	case OriginForeignRegistry:
+		return "our-name/not-ours"
 	default:
 		return "no image"
 	}
@@ -145,6 +158,19 @@ func (o ImageOrigin) String() string {
 
 // firstPartyNamespace is the organisation whose builds we can answer for.
 const firstPartyNamespace = "0gfoundation"
+
+// firstPartyRegistries are the registries that namespace means anything on.
+//
+// ghcr.io is where we publish. Docker Hub — "docker.io", its "index.docker.io" spelling,
+// and the implicit host of an unqualified reference — is included because a Hub
+// namespace is globally unique, so "0gfoundation/x" there names one specific account
+// rather than a string anyone can choose. On any other host the namespace is just a path
+// segment the manifest's author picked, which is what made
+// "evil.example.com/0gfoundation/broker" read as first-party.
+var firstPartyRegistries = map[string]bool{
+	"": true, "docker.io": true, "index.docker.io": true, "registry-1.docker.io": true,
+	"ghcr.io": true,
+}
 
 // ReviewedService is one compose service as the review read it.
 type ReviewedService struct {
@@ -796,8 +822,21 @@ func (r *ComposeReview) reviewFileSources(n *yaml.Node, section string) {
 		if file == "" {
 			continue
 		}
-		if sev, why := hostPathVerdict(file); why != "" {
-			r.add(sev, "", key, fmt.Sprintf("reads %s from the host and injects it into containers: %s", file, why))
+		// Same three cases as a mount source, and the relative one has to be reported for
+		// the same reason: `file: ../../../etc/shadow` resolves against the deployment
+		// directory, which the manifest does not record. hostPathVerdict returns nothing
+		// for it — path.Clean leaves a relative path relative — so without this branch a
+		// host path reached containers through the section this PR added, unremarked, while
+		// the identical case on a volume was reported.
+		if !strings.HasPrefix(file, "/") {
+			r.add(SeverityJustify, "", key, fmt.Sprintf(
+				"reads %s from the host and injects it into containers, by a RELATIVE path: what it reads depends "+
+					"on the directory the deployment was brought up from, which is not in the manifest", file))
+			continue
+		}
+		if sev, clean, why := hostPathVerdict(file); why != "" {
+			r.add(sev, "", key, fmt.Sprintf("reads %s%s from the host and injects it into containers: %s",
+				file, normalizedAs(file, clean), why))
 		}
 	}
 }
@@ -870,6 +909,17 @@ func (r *ComposeReview) reviewService(name string, body *yaml.Node, mounts *moun
 		r.add(SeverityBlocking, name, "image", fmt.Sprintf(
 			"%s is not pinned by @sha256:; the compose hash then commits to a NAME, and what that name "+
 				"resolves to is the registry's choice, made after the measurement", svc.Ref))
+	}
+	// Our namespace on someone else's registry. Not a verdict — a mirror is a real
+	// reason to see this — but it is the one origin a reviewer must not skim past,
+	// because the line reads as ours at a glance.
+	if svc.Origin == OriginForeignRegistry {
+		reg, _ := splitRegistry(svc.Image)
+		r.add(SeverityJustify, name, "image", fmt.Sprintf(
+			"%s carries our namespace %q on %s, which is not a registry we publish through. It may be a "+
+				"pull-through mirror, and it may be an image named to look like ours — either way we cannot "+
+				"answer for its contents, so it needs an upstream answer like any third-party image",
+			svc.Ref, firstPartyNamespace, reg))
 	}
 	if mapValue(body, "build") != nil && svc.Ref != "" {
 		r.add(SeverityJustify, name, "build",
@@ -1168,23 +1218,29 @@ func (r *ComposeReview) reviewVolumes(name string, val *yaml.Node, mounts *mount
 		}
 		mounts.holders[src] = append(mounts.holders[src], name)
 
-		// A named volume: resolve it through the top-level section before deciding it is
-		// harmless. `- etcbind:/host-etc` over a volume whose driver_opts.device is /etc
-		// is `- /etc:/host-etc`, and this is where the two become the same finding.
-		if !strings.HasPrefix(src, "/") && !isRelativeBind(src) {
+		// Three kinds of source, decided in this order because only the first is not a
+		// host path. An ABSOLUTE path is never the relative case, however many ".."
+		// segments it carries — getting that backwards sent /opt/../etc down the
+		// "unresolvable" branch at Justify, with a detail that was also false (an absolute
+		// path does not depend on the deployment directory). Cleaning decides it now, in
+		// hostPathVerdict.
+		switch {
+		case isNamedVolume(src):
+			// Resolve through the top-level section before deciding it is harmless.
+			// `- etcbind:/host-etc` over a volume whose driver_opts.device is /etc IS
+			// `- /etc:/host-etc`, and this is where the two become the same finding.
 			decl, declared := mounts.volumes[src]
 			switch {
 			case declared && decl.HostPath != "":
 				mounts.named[src] = true
-				if sev, why := hostPathVerdict(decl.HostPath); why != "" {
-					r.add(sev, name, "volumes", fmt.Sprintf(
-						"%s -> %s (%s) resolves to the HOST PATH %s (compose.volumes.%s driver_opts.device): %s",
-						src, target, mode(ro), decl.HostPath, src, why))
+				sev, clean, why := hostPathVerdict(decl.HostPath)
+				where := fmt.Sprintf("%s -> %s (%s) resolves to the HOST PATH %s%s (compose.volumes.%s driver_opts.device)",
+					src, target, mode(ro), decl.HostPath, normalizedAs(decl.HostPath, clean), src)
+				if why != "" {
+					r.add(sev, name, "volumes", where+": "+why)
 				} else {
-					r.add(SeverityJustify, name, "volumes", fmt.Sprintf(
-						"%s -> %s (%s) is a host bind of %s wearing a volume name (compose.volumes.%s "+
-							"driver_opts.device); a baseline reading service mounts alone would not see it",
-						src, target, mode(ro), decl.HostPath, src))
+					r.add(SeverityJustify, name, "volumes", where+
+						": a host bind wearing a volume name, which a baseline reading service mounts alone would not see")
 				}
 			case declared && decl.Opaque != "":
 				mounts.named[src] = true
@@ -1199,28 +1255,29 @@ func (r *ComposeReview) reviewVolumes(name string, val *yaml.Node, mounts *mount
 					"%s -> %s (%s) names a volume the compose file does not declare, so its source is not in "+
 						"the manifest", src, target, mode(ro)))
 			}
-			continue // the shared-mount pass covers the plain-named case
-		}
+			// The shared-mount pass covers the plain-named case.
 
-		if isRelativeBind(src) {
+		case !strings.HasPrefix(src, "/"):
 			// A relative bind resolves against wherever the manifest was deployed FROM,
 			// which the manifest does not record — so "./data" and "../../../etc" are
-			// indistinguishable here, and the path rules below cannot be applied honestly.
+			// indistinguishable here and the path rules cannot be applied honestly.
 			// Reported rather than skipped, which is what treating it as a named volume
 			// would silently do.
 			r.add(SeverityJustify, name, "volumes", fmt.Sprintf(
 				"%s -> %s: a RELATIVE bind mount. What it exposes depends on the directory the deployment was "+
 					"brought up from, which is not in the manifest, so this review cannot say what the container reads",
 				src, target))
-			continue
-		}
-		// A direct host bind. Marking the source named keeps reviewSharedMounts off it: a
-		// line saying which service holds it and what it grants is strictly more than
-		// "two services share this", and printing both makes one mount read as two
-		// problems.
-		if sev, why := hostPathVerdict(src); why != "" {
-			mounts.named[src] = true
-			r.add(sev, name, "volumes", fmt.Sprintf("%s -> %s (%s): %s", src, target, mode(ro), why))
+
+		default:
+			// A direct host bind. Marking the source named keeps reviewSharedMounts off it:
+			// a line saying which service holds it and what it grants is strictly more than
+			// "two services share this", and printing both makes one mount read as two
+			// problems.
+			if sev, clean, why := hostPathVerdict(src); why != "" {
+				mounts.named[src] = true
+				r.add(sev, name, "volumes", fmt.Sprintf("%s%s -> %s (%s): %s",
+					src, normalizedAs(src, clean), target, mode(ro), why))
+			}
 		}
 	}
 }
@@ -1233,31 +1290,54 @@ func mode(ro bool) string {
 	return "rw"
 }
 
-// hostPathVerdict is the one place a host path is judged, and why is "" for a path with
-// nothing to say about it.
+// hostPathVerdict is the one place a host path is judged. why is "" for a path with
+// nothing to say about it; clean is the path the rules were applied to, which a caller
+// prints when it differs from what the manifest wrote.
 //
 // It exists as a function rather than a switch inside reviewVolumes because three
 // different constructs deliver a host path into a container — a direct bind, a named
 // volume whose driver_opts.device is a path, and a top-level secret/config `file:` — and
 // each was a separate way to reach the same exposure. Three copies of the rules would
 // have been three chances for one of them to be the lenient one.
-func hostPathVerdict(path string) (Severity, string) {
+//
+// NORMALIZATION IS PART OF THE VERDICT, and belongs here for exactly that reason. Every
+// rule below matches on a literal — two exact maps and a segment-prefix walk — so all
+// three assume a canonical path, and `//var/run/docker.sock`, `/./etc`, `/opt/../etc`
+// and `/etc/` all reported nothing while their canonical spellings were blocking. A
+// complete runtime escape came back as a clean line. Cleaning at each call site instead
+// would have been the same three-chances-to-be-lenient mistake one level down.
+//
+// path.Clean, not filepath.Clean: these are paths inside a Linux guest, and the verdict
+// must not depend on the OS this tool is built for. It is applied here and NOT before
+// the named-volume-versus-bind decision, where it would rewrite "./data" to "data" and
+// make a relative bind look like a volume name.
+func hostPathVerdict(p string) (sev Severity, clean, why string) {
+	clean = path.Clean(p)
 	switch {
-	case guestAgentSockets[path]:
-		return SeverityJustify, "the guest-agent socket. A container holding it can derive the app's keys and " +
+	case guestAgentSockets[clean]:
+		return SeverityJustify, clean, "the guest-agent socket. A container holding it can derive the app's keys and " +
 			"obtain quotes in the app's name, so every service with it is as trusted as the app itself — a " +
 			"baseline must list them exactly, and read_only changes nothing for a socket"
-	case dockerSockets[path]:
-		return SeverityBlocking, "the container runtime's socket. A container holding it can start any container " +
+	case dockerSockets[clean]:
+		return SeverityBlocking, clean, "the container runtime's socket. A container holding it can start any container " +
 			"it likes, privileged included, so it is a complete escape from everything else in this manifest"
-	case path == "/dev/shm" || strings.HasPrefix(path, "/dev/shm/"):
-		return SeverityJustify, "shared memory. Legitimate for a model server's transport, and a channel between " +
+	case clean == "/dev/shm" || strings.HasPrefix(clean, "/dev/shm/"):
+		return SeverityJustify, clean, "shared memory. Legitimate for a model server's transport, and a channel between " +
 			"whoever holds it"
-	case blockingHostExact[path], hasPrefixPath(path, blockingHostPrefixes):
-		return SeverityBlocking, "a host tree the CVM's own OS owns. Whatever the image digest says the container " +
+	case blockingHostExact[clean], hasPrefixPath(clean, blockingHostPrefixes):
+		return SeverityBlocking, clean, "a host tree the CVM's own OS owns. Whatever the image digest says the container " +
 			"contains, this is what it actually reads"
 	}
-	return SeverityNote, ""
+	return SeverityNote, clean, ""
+}
+
+// normalizedAs renders " (normalizes to X)" when cleaning changed the path, so a
+// blocking line about `//var/run/docker.sock` says which rule it hit.
+func normalizedAs(wrote, clean string) string {
+	if wrote == clean {
+		return ""
+	}
+	return fmt.Sprintf(" (normalizes to %s)", clean)
 }
 
 // reviewSharedMounts reports the sources held by more than one service. A writable
@@ -1321,24 +1401,41 @@ func parseMount(n *yaml.Node) (src, target string, readOnly, ok bool) {
 	}
 }
 
-// classifyOrigin reads the namespace out of an image repository. See ImageOrigin for
-// why the answer is a column in a report and not a rule.
+// classifyOrigin reads the registry AND the namespace out of an image repository. See
+// ImageOrigin for why the answer is a column in a report and not a rule.
+//
+// Both halves, because the namespace alone means nothing: anyone can push
+// "0gfoundation/broker" to a registry they control, and a classifier that read the path
+// and ignored the host called that first-party — i.e. said "ask us and we can resolve
+// this" about an image we never published.
 func classifyOrigin(image string) ImageOrigin {
-	image = strings.TrimSpace(image)
-	if image == "" {
+	registry, repo := splitRegistry(strings.TrimSpace(image))
+	if repo == "" {
 		return OriginNone
 	}
-	parts := strings.Split(image, "/")
-	// A leading segment is a registry host only when it looks like one; otherwise the
-	// reference is a Docker Hub namespace ("0gfoundation/x") or a library image
-	// ("mysql"). Same rule the reference grammar uses.
-	if len(parts) > 1 && (strings.Contains(parts[0], ".") || strings.Contains(parts[0], ":") || parts[0] == "localhost") {
-		parts = parts[1:]
+	ns, _, hasNamespace := strings.Cut(repo, "/")
+	if !hasNamespace || !strings.EqualFold(ns, firstPartyNamespace) {
+		return OriginThirdParty
 	}
-	if len(parts) > 1 && strings.EqualFold(parts[0], firstPartyNamespace) {
+	if firstPartyRegistries[strings.ToLower(registry)] {
 		return OriginFirstParty
 	}
-	return OriginThirdParty
+	return OriginForeignRegistry
+}
+
+// splitRegistry separates an image reference's registry host from its repository path,
+// returning "" for the implicit Docker Hub host.
+//
+// The first segment is a host only when it LOOKS like one — it contains a "." or a ":",
+// or is exactly "localhost" — which is the rule the reference grammar uses. Without it
+// "0gfoundation/broker" would have "0gfoundation" read as a registry, and
+// "mysql" would have no repository left at all.
+func splitRegistry(image string) (registry, repo string) {
+	first, rest, hasSlash := strings.Cut(image, "/")
+	if hasSlash && (strings.Contains(first, ".") || strings.Contains(first, ":") || first == "localhost") {
+		return first, rest
+	}
+	return "", image
 }
 
 // --- small readers -------------------------------------------------------------
@@ -1399,12 +1496,17 @@ func nodeHasContent(n *yaml.Node) bool {
 	}
 }
 
-// isRelativeBind reports whether a mount source is a host path given relative to the
-// deployment directory — which the manifest does not record, so nothing here can resolve
-// it. Distinguished from a NAMED volume, whose name never starts with "." or "~".
-func isRelativeBind(src string) bool {
-	return strings.HasPrefix(src, ".") || strings.HasPrefix(src, "~") ||
-		strings.Contains(src, "/../") || strings.HasSuffix(src, "/..")
+// isNamedVolume reports whether a mount source is a compose VOLUME NAME rather than a
+// host path. Compose names match `[a-zA-Z0-9][a-zA-Z0-9_.-]*`: no slashes, no "~", and
+// never a leading "." — so any other non-absolute source is a relative host path, and
+// the caller says so instead of quietly filing it as a volume.
+//
+// Testing for the name, rather than testing for "looks relative", is what keeps the
+// three cases exhaustive: every source is a name, an absolute path, or a relative path,
+// and each branch of the switch in reviewVolumes handles exactly one.
+func isNamedVolume(src string) bool {
+	return src != "" && !strings.HasPrefix(src, "/") && !strings.HasPrefix(src, ".") &&
+		!strings.ContainsAny(src, "/~")
 }
 
 // nodeScalar reads a scalar node. ok is false when the node is PRESENT but is not a

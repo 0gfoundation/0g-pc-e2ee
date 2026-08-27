@@ -526,7 +526,7 @@ func reportManifest(out io.Writer, pq providerQuote) (failed bool, skipped strin
 		if ref == "" {
 			ref = "(no image)"
 		}
-		fmt.Fprintf(out, "    %-24s %-12s %s\n", s.Name, s.Origin, ref)
+		fmt.Fprintf(out, "    %-24s %-18s %s\n", s.Name, s.Origin, ref)
 	}
 
 	// Never a mark: a ✓ or ✗ here would read as a verdict, and this is the one section

@@ -964,16 +964,172 @@ func TestClassifyOrigin(t *testing.T) {
 		{"mysql", OriginThirdParty},
 		{"library/mysql", OriginThirdParty},
 		{"nvcr.io/nvidia/dcgm-exporter", OriginThirdParty},
-		{"localhost:5000/0gfoundation/broker", OriginFirstParty},
 		{"localhost:5000/other/broker", OriginThirdParty},
 		// The trap: a namespace that merely CONTAINS ours, on a registry an attacker
 		// controls. A prefix match on the whole reference would call this first-party.
 		{"evil.example.com/0gfoundation-fake/broker", OriginThirdParty},
 		{"ghcr.io/not0gfoundation/broker", OriginThirdParty},
 		{"", OriginNone},
+
+		// The simpler trap, which the one above distracted from: OUR namespace, spelled
+		// exactly right, on a registry that is not ours. Anyone can push that path to a
+		// host they control, so reading the namespace and ignoring the host says "ask us
+		// and we can resolve this" about an image we never published — and the
+		// digest-pinning argument for what a namespace binds only holds on a registry we
+		// control in the first place.
+		{"evil.example.com/0gfoundation/broker", OriginForeignRegistry},
+		{"quay.io/0gfoundation/broker", OriginForeignRegistry},
+		{"localhost:5000/0gfoundation/broker", OriginForeignRegistry},
+		{"registry.internal:5000/0gfoundation/broker", OriginForeignRegistry},
 	} {
 		if got := classifyOrigin(tc.image); got != tc.want {
 			t.Errorf("classifyOrigin(%q) = %v, want %v", tc.image, got, tc.want)
+		}
+	}
+}
+
+// A digest-pinned image under our namespace on a registry that is not ours reads as
+// ours at a glance, so it gets a line of its own rather than only a quiet column value.
+func TestReviewCompose_OurNamespaceOnAForeignRegistry(t *testing.T) {
+	ref := "quay.io/0gfoundation/broker@sha256:" + strings.Repeat("a", 64)
+	doc := fmt.Sprintf("services:\n  broker:\n    image: %s\n", ref)
+	r := reviewOf(t, manifest(doc))
+	f := requireFinding(t, r, SeverityJustify, "broker", "image")
+	for _, want := range []string{"quay.io", "0gfoundation", "cannot", "answer for its contents"} {
+		if !strings.Contains(f.Detail, want) {
+			t.Errorf("detail does not mention %q: %q", want, f.Detail)
+		}
+	}
+	if r.Services[0].Origin != OriginForeignRegistry {
+		t.Fatalf("origin = %v, want our-name/not-ours", r.Services[0].Origin)
+	}
+	// The control: the same image on ghcr.io is first-party and says nothing.
+	ours := fmt.Sprintf("services:\n  broker:\n    image: ghcr.io/0gfoundation/broker@sha256:%s\n", strings.Repeat("a", 64))
+	if got := find(reviewOf(t, manifest(ours)), "broker", "image"); len(got) != 0 {
+		t.Fatalf("an image on our own registry was reported: %+v", got)
+	}
+}
+
+// Every rule that judges a host path matches on a literal — two exact maps and a
+// segment-prefix walk — so all of them assume a canonical path. These spellings are the
+// same paths, and a complete runtime escape (`//var/run/docker.sock`) came back as a
+// clean line. Asserted as EQUIVALENCE with the canonical form, since "reports
+// something" would pass for the Justify these used to land on.
+func TestReviewCompose_HostPathsAreNormalizedBeforeJudging(t *testing.T) {
+	pinned := "ghcr.io/0gfoundation/broker@sha256:" + strings.Repeat("a", 64)
+	// The whole "src:/x" pair is quoted, so a leading "//" or a "." cannot be reparsed
+	// by YAML as something other than a mount string.
+	bindReview := func(t *testing.T, src string) ComposeReview {
+		t.Helper()
+		doc := fmt.Sprintf("services:\n  a:\n    image: %s\n    volumes:\n      - %q\n", pinned, src+":/x")
+		return reviewOf(t, manifest(doc))
+	}
+
+	for _, tc := range []struct {
+		name      string
+		src       string
+		canonical string
+		sev       Severity
+		mustSay   string
+	}{
+		{"double slash docker socket", "//var/run/docker.sock", "/var/run/docker.sock", SeverityBlocking, "container runtime's socket"},
+		{"dot segment", "/./etc", "/etc", SeverityBlocking, "a host tree the CVM's own OS owns"},
+		{"dotdot segment", "/opt/../etc", "/etc", SeverityBlocking, "a host tree the CVM's own OS owns"},
+		{"trailing slash", "/etc/", "/etc", SeverityBlocking, "a host tree the CVM's own OS owns"},
+		{"double slash guest agent socket", "//var/run/dstack.sock", "/var/run/dstack.sock", SeverityJustify, "the guest-agent socket"},
+		{"dotdot to root", "/etc/..", "/", SeverityBlocking, "a host tree the CVM's own OS owns"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := requireFinding(t, bindReview(t, tc.src), tc.sev, "a", "volumes")
+			if !strings.Contains(f.Detail, tc.mustSay) {
+				t.Fatalf("detail %q does not reach the same rule as %s", f.Detail, tc.canonical)
+			}
+			// The reader has to be able to see WHY, or a blocking line about
+			// "//var/run/docker.sock" is unexplained.
+			if !strings.Contains(f.Detail, "normalizes to "+tc.canonical) {
+				t.Fatalf("detail %q does not disclose the normalization to %s", f.Detail, tc.canonical)
+			}
+			// And the canonical spelling must reach it too, without the disclosure.
+			c := requireFinding(t, bindReview(t, tc.canonical), tc.sev, "a", "volumes")
+			if strings.Contains(c.Detail, "normalizes to") {
+				t.Fatalf("a canonical path reports a normalization: %q", c.Detail)
+			}
+		})
+	}
+
+	// An ABSOLUTE path with ".." is not the relative case, however it is spelled. Getting
+	// that backwards downgraded /opt/../etc to Justify AND described it wrongly — an
+	// absolute path does not depend on the deployment directory.
+	t.Run("absolute dotdot is not reported as relative", func(t *testing.T) {
+		f := requireFinding(t, bindReview(t, "/opt/../etc"), SeverityBlocking, "a", "volumes")
+		if strings.Contains(f.Detail, "RELATIVE") {
+			t.Fatalf("an absolute path is reported as a relative bind: %q", f.Detail)
+		}
+	})
+
+	// The same normalization has to hold on the OTHER two paths into hostPathVerdict, or
+	// the single-verdict-function argument buys nothing.
+	t.Run("through a named volume's device", func(t *testing.T) {
+		doc := fmt.Sprintf("services:\n  a:\n    image: %s\n    volumes:\n      - etcbind:/x\n"+
+			"volumes:\n  etcbind:\n    driver_opts:\n      type: none\n      device: \"//etc\"\n      o: bind\n", pinned)
+		f := requireFinding(t, reviewOf(t, manifest(doc)), SeverityBlocking, "a", "volumes")
+		if !strings.Contains(f.Detail, "a host tree the CVM's own OS owns") {
+			t.Fatalf("a //etc device did not reach the host-tree rule: %q", f.Detail)
+		}
+	})
+	t.Run("through a top-level secret file", func(t *testing.T) {
+		doc := fmt.Sprintf("services:\n  a:\n    image: %s\nsecrets:\n  s:\n    file: \"//etc/shadow\"\n", pinned)
+		f := requireFinding(t, reviewOf(t, manifest(doc)), SeverityBlocking, "", "compose.secrets.s")
+		if !strings.Contains(f.Detail, "a host tree the CVM's own OS owns") {
+			t.Fatalf("a //etc/shadow secret did not reach the host-tree rule: %q", f.Detail)
+		}
+	})
+	// A relative file: is the same unresolvable case as a relative bind, and the two
+	// entry points must not treat it differently.
+	t.Run("relative secret file", func(t *testing.T) {
+		doc := fmt.Sprintf("services:\n  a:\n    image: %s\nsecrets:\n  s:\n    file: ../../../etc/shadow\n", pinned)
+		f := requireFinding(t, reviewOf(t, manifest(doc)), SeverityJustify, "", "compose.secrets.s")
+		if !strings.Contains(f.Detail, "RELATIVE") {
+			t.Fatalf("a relative secret file is not reported as unresolvable: %q", f.Detail)
+		}
+	})
+}
+
+func TestIsNamedVolume(t *testing.T) {
+	for _, tc := range []struct {
+		src  string
+		want bool
+	}{
+		{"state", true},
+		{"zg-tee", true},
+		{"my_vol.1", true},
+		{"/etc", false},
+		{"/opt/../etc", false},
+		{"./data", false},
+		{"../state", false},
+		{"~/keys", false},
+		{"sub/../../etc", false},
+		{"", false},
+	} {
+		if got := isNamedVolume(tc.src); got != tc.want {
+			t.Errorf("isNamedVolume(%q) = %v, want %v", tc.src, got, tc.want)
+		}
+	}
+}
+
+func TestSplitRegistry(t *testing.T) {
+	for _, tc := range []struct{ ref, registry, repo string }{
+		{"mysql", "", "mysql"},
+		{"0gfoundation/broker", "", "0gfoundation/broker"},
+		{"ghcr.io/0gfoundation/broker", "ghcr.io", "0gfoundation/broker"},
+		{"localhost:5000/x", "localhost:5000", "x"},
+		{"localhost/x", "localhost", "x"},
+		{"library/mysql", "", "library/mysql"},
+		{"", "", ""},
+	} {
+		reg, repo := splitRegistry(tc.ref)
+		if reg != tc.registry || repo != tc.repo {
+			t.Errorf("splitRegistry(%q) = (%q, %q), want (%q, %q)", tc.ref, reg, repo, tc.registry, tc.repo)
 		}
 	}
 }
