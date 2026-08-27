@@ -35,9 +35,18 @@
 // from a real deployment; the baseline, once it exists, is what will adjudicate. A
 // provider that publishes no app_compose at all is a 3, not a pass.
 //
+// Beside each service the run prints its CANONICAL BLOCK fingerprint — two of them,
+// because a baseline will pin them separately: `block` covers everything the deployment
+// decided, and `block-no-image` is the half that must not move when the broker ships a
+// new image digest (see client/evidence/composeblock.go). The fingerprints make a sweep
+// across providers able to say which services are already identical fleet-wide, which is
+// the fact a first baseline has to be written against. -blocks prints the canonical text
+// itself, which is what a baseline entry will hold; it is a comparison form, not
+// deployable YAML.
+//
 //	pcverify -provider 0x... [-chain-rpc-url ...] [-serving-contract 0x...]
 //	         [-endpoint https://...] [-expect-signer 0x...] [-no-quote]
-//	         [-pccs-url https://...]
+//	         [-pccs-url https://...] [-blocks]
 //
 // The provider's serving endpoint is read from the chain (Service.url), so
 // -endpoint is only needed to override it. -no-quote restricts the run to the
@@ -243,6 +252,7 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 	endpoint := fs.String("endpoint", "", "provider serving endpoint for the quote fetch (default: read from chain, Service.url)")
 	expectSigner := fs.String("expect-signer", "", "if set, require the on-chain teeSignerAddress to equal this")
 	noQuote := fs.Bool("no-quote", false, "skip the TDX quote hops; check only the on-chain signer (no provider contact)")
+	blocks := fs.Bool("blocks", false, "provider mode: print each service's canonical block text, not just its fingerprint. This is the text a per-service baseline is written from (client/evidence/composeblock.go); it is a COMPARISON form, not deployable YAML")
 	gateway := fs.String("gateway", "", "cloud-TEE gateway domain (e.g. pc-gateway.example.com); selects gateway mode — verify its /evidences bundle and compare the served certificate")
 	pccsURL := fs.String("pccs-url", "", "fetch DCAP collateral (TCB Info, QE Identity, PCK CRL) from this PCCS mirror instead of api.trustedservices.intel.com (e.g. https://pccs.phala.network); the root-CA CRL still comes from Intel. Applies to whichever mode verifies a quote")
 	allowUntrustedCert := fs.Bool("allow-untrusted-cert", false, "gateway mode: proceed when the served certificate does not chain to a public root (ACME staging). Relaxes no attestation check, but drops the link between the connection and the domain asked for, so an interceptor running its own attested CVM would still pass — smoke-test your own deployment only")
@@ -342,7 +352,21 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 
 	ctx, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
-	return report(ctx, out, reg, qc, *provider, *servingContract, *endpoint, *expectSigner, *strict)
+	return report(ctx, out, reg, qc, *provider, *servingContract, *endpoint, *expectSigner,
+		providerOpts{strict: *strict, blocks: *blocks})
+}
+
+// providerOpts are provider-mode knobs that change what the run REPORTS, not what it
+// checks. Grouped rather than added as more trailing booleans: report already takes
+// eight parameters, and a caller passing `..., false, true)` says nothing about which
+// knob is which.
+type providerOpts struct {
+	// strict turns every "did not run" into a failure (see verdict).
+	strict bool
+	// blocks prints each service's canonical block text, not just its fingerprint. It is
+	// off by default because the text is long and only one reader needs it: whoever is
+	// writing the per-service baseline the fingerprints are for.
+	blocks bool
 }
 
 // report runs the checks and prints a per-hop result, returning the process exit code
@@ -355,7 +379,7 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 // however well every other hop went. With entries — the shipped state — a matching
 // provider reaches a clean 0. The distinction matters for a CI gate, which would
 // otherwise read an unconsulted allowlist as a pass.
-func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecker, provider, contract, endpointOverride, expectSigner string, strict bool) int {
+func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecker, provider, contract, endpointOverride, expectSigner string, opts providerOpts) int {
 	fmt.Fprintf(out, "provider           %s\n", provider)
 	fmt.Fprintf(out, "contract           %s\n", contract)
 
@@ -442,7 +466,7 @@ func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecke
 		// allowlisted image can still run entirely different containers, because
 		// mr_config_id commits to the manifest the OPERATOR chose. This is the only place
 		// in the tool that reads it.
-		failed, skip := reportManifest(out, pq)
+		failed, skip := reportManifest(out, pq, opts.blocks)
 		if failed {
 			ok = false
 		}
@@ -451,7 +475,7 @@ func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecke
 		}
 	}
 
-	return verdict(out, !ok, strings.Join(skipped, "; "), strict)
+	return verdict(out, !ok, strings.Join(skipped, "; "), opts.strict)
 }
 
 // reportManifest prints the provider's app-compose, hash-gated, and the structural
@@ -471,7 +495,7 @@ func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecke
 //     not write, and a heuristic wired to an exit code refuses a provider for being
 //     unusual. It is printed so a human can turn it into a baseline; the baseline is
 //     what will adjudicate. See evidence/composereview.go's header.
-func reportManifest(out io.Writer, pq providerQuote) (failed bool, skipped string) {
+func reportManifest(out io.Writer, pq providerQuote, dumpBlocks bool) (failed bool, skipped string) {
 	switch {
 	case !pq.HaveComposeHash:
 		fmt.Fprintf(out, "- app-compose      not read (%s)\n", reason(pq.ComposeHashErr,
@@ -521,12 +545,42 @@ func reportManifest(out io.Writer, pq providerQuote) (failed bool, skipped strin
 	}
 	fmt.Fprintf(out, "  services         %d (%d pinned by digest, %d first-party)\n",
 		len(review.Services), pinned, firstParty)
-	for _, s := range review.Services {
+	for i, s := range review.Services {
 		ref := s.Ref
 		if ref == "" {
 			ref = "(no image)"
 		}
 		fmt.Fprintf(out, "    %-24s %-18s %s\n", s.Name, s.Origin, ref)
+		// The block's canonical fingerprint, indented under the service it belongs to.
+		// Two values, because a baseline pins them separately: `block` covers everything
+		// the deployment decided, `block-no-image` is the half that must NOT move when
+		// the broker ships a new digest. Printing both is what makes a fleet sweep able
+		// to say "eleven providers run the same broker block" without printing eleven
+		// blocks — and, for the operator writing the first baseline, which services are
+		// already identical across the fleet.
+		if i < len(review.Blocks) {
+			b := review.Blocks[i]
+			if !b.Pinnable() {
+				fmt.Fprintf(out, "      block          cannot be pinned: %v\n", b.Err)
+				continue
+			}
+			fmt.Fprintf(out, "      block          %s\n", b.Digest)
+			if b.DigestNoImage != b.Digest {
+				fmt.Fprintf(out, "      block-no-image %s\n", b.DigestNoImage)
+			}
+			if dumpBlocks {
+				// BOTH forms, because a broker service's baseline entry holds the
+				// image-held-out one — that is the whole reason the split exists — and
+				// printing only the full form left exactly those entries unobtainable from
+				// the tool. Deriving them by hand is the transcription that makes the two
+				// sides drift, which is what CanonicalizeServiceBlock exists to prevent.
+				// Skipped when the two are identical, matching the fingerprint lines.
+				dumpBlock(out, "", b.Canonical)
+				if b.DigestNoImage != b.Digest {
+					dumpBlock(out, "no-image: ", b.CanonicalNoImage)
+				}
+			}
+		}
 	}
 
 	// Never a mark: a ✓ or ✗ here would read as a verdict, and this is the one section
@@ -543,6 +597,18 @@ func reportManifest(out io.Writer, pq providerQuote) (failed bool, skipped strin
 		fmt.Fprintf(out, "    [%s] %s: %s\n", f.Severity, where, f.Detail)
 	}
 	return false, ""
+}
+
+// dumpBlock prints one canonical block, line-prefixed so it cannot be mistaken for the
+// report's own structure. label names which form it is, and is empty for the full one.
+func dumpBlock(out io.Writer, label, canonical string) {
+	for i, line := range strings.Split(strings.TrimRight(canonical, "\n"), "\n") {
+		prefix := ""
+		if i == 0 {
+			prefix = label
+		}
+		fmt.Fprintf(out, "      | %s%s\n", prefix, line)
+	}
 }
 
 // reason renders err, falling back to a description when there is none. A "-" line

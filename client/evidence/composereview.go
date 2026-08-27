@@ -185,7 +185,12 @@ type ReviewedService struct {
 // Pinned reports whether the reference commits to image CONTENT rather than to a
 // name. Without a digest the compose hash pins the string "repo:tag", and what that
 // tag resolves to is the registry's business, not the enclave's.
-func (s ReviewedService) Pinned() bool { return s.Digest != "" }
+//
+// "Has a digest" is not the same as "has something after an @", which is all
+// compose.SplitImageRef can tell us — it returns whatever follows the last one. So this
+// asks isDigestShaped, the same question the reduction asks: `nginx@e` used to report as
+// pinned by digest, which is a reassurance about a reference that pins nothing.
+func (s ReviewedService) Pinned() bool { return isDigestShaped(s.Digest) }
 
 // ComposeReview is everything one authenticated app-compose was found to contain.
 type ComposeReview struct {
@@ -218,6 +223,16 @@ type ComposeReview struct {
 	// Services is the compose file's services, in file order (the author's order — see
 	// compose.ParseServices on why that is the answer and not an accident).
 	Services []ReviewedService
+	// Blocks is each service's canonical form — the material a per-service baseline is
+	// written from (see composeblock.go). Index-aligned with Services BY CONSTRUCTION:
+	// both are appended in the same loop, so they cannot drift even if a manifest
+	// declares the same service name twice.
+	//
+	// It lives on the review rather than beside it because the hash gate is the
+	// expensive, load-bearing step and must happen exactly once. A caller that wanted
+	// blocks separately would either re-run the gate or skip it, and only one of those
+	// is merely wasteful.
+	Blocks []ServiceBlock
 	// Findings is sorted most-severe first, then by service and key, so two runs over
 	// one manifest print identically.
 	Findings []Finding
@@ -880,6 +895,10 @@ type mountIndex struct {
 // reviewService applies the per-service rules and records the service's image.
 func (r *ComposeReview) reviewService(name string, body *yaml.Node, mounts *mountIndex) {
 	svc := ReviewedService{Name: name}
+	// Appended in the same places Services is, so the two stay index-aligned by
+	// construction rather than by a later lookup. blockOf works on a clone, so it cannot
+	// disturb the node tree the rules below walk.
+	r.Blocks = append(r.Blocks, blockOf(name, body))
 	if body == nil || body.Kind != yaml.MappingNode {
 		r.Services = append(r.Services, svc)
 		r.add(SeverityBlocking, name, "",
@@ -905,6 +924,15 @@ func (r *ComposeReview) reviewService(name string, body *yaml.Node, mounts *moun
 				"rather than to image content; there is nothing a baseline could pin")
 	case svc.Ref == "":
 		r.add(SeverityBlocking, name, "image", "the service names no image")
+	case svc.Digest != "" && !svc.Pinned():
+		// An "@" followed by something that is not a digest. Called out separately because
+		// it is the worse of the two: an unpinned tag looks unpinned, while this looks
+		// pinned to a reader skimming for "@sha256:" and pins nothing at all.
+		r.add(SeverityBlocking, name, "image", fmt.Sprintf(
+			"%s carries %q after the @, which is not a digest (an algorithm, a colon, and at least "+
+				"32 hex characters). Nothing is pinned — what the reference resolves to is still the "+
+				"registry's choice — and the malformed digest makes it read as pinned at a glance",
+			svc.Ref, svc.Digest))
 	case !svc.Pinned():
 		r.add(SeverityBlocking, name, "image", fmt.Sprintf(
 			"%s is not pinned by @sha256:; the compose hash then commits to a NAME, and what that name "+
@@ -920,6 +948,14 @@ func (r *ComposeReview) reviewService(name string, body *yaml.Node, mounts *moun
 				"pull-through mirror, and it may be an image named to look like ours — either way we cannot "+
 				"answer for its contents, so it needs an upstream answer like any third-party image",
 			svc.Ref, firstPartyNamespace, reg))
+	}
+	// Two `image` keys in one body: a compose runtime resolves the duplicate to one of
+	// them, so what actually runs is not what the manifest states — and a baseline reading
+	// the first would describe a container the second replaced.
+	if countKey(body, "image") > 1 {
+		r.add(SeverityBlocking, name, "image",
+			"the service declares image more than once, so which one runs depends on how the "+
+				"runtime resolves a duplicate key rather than on the manifest")
 	}
 	if mapValue(body, "build") != nil && svc.Ref != "" {
 		r.add(SeverityJustify, name, "build",
@@ -1457,6 +1493,22 @@ func splitRegistry(image string) (registry, repo string) {
 // `privileged:` at all produce the same zero, and a reader that collapsed them would
 // hand every rule a silent way to pass. The compiler enforces the discipline: there is
 // no single-value form of these to call by accident.
+
+// countKey counts how many times a key appears in a mapping node. YAML permits a
+// duplicate key and yaml.v3 keeps both pairs, so "present" and "present once" are
+// different questions and only one of them is answered by mapValue.
+func countKey(n *yaml.Node, key string) int {
+	if n == nil || n.Kind != yaml.MappingNode {
+		return 0
+	}
+	count := 0
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		if n.Content[i].Value == key {
+			count++
+		}
+	}
+	return count
+}
 
 func mapValue(n *yaml.Node, key string) *yaml.Node {
 	if n == nil || n.Kind != yaml.MappingNode {
