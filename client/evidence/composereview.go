@@ -994,17 +994,24 @@ func (r *ComposeReview) reviewServiceKey(name, key string, val *yaml.Node) bool 
 		return true
 
 	case "device_cgroup_rules":
-		if rules, ok := nodeStrings(val); !ok || len(rules) > 0 {
-			r.add(SeverityBlocking, name, key,
-				"the service grants itself device access by cgroup rule, which names devices the manifest does not list")
+		rules, ok := nodeStrings(val)
+		if !ok {
+			r.add(SeverityBlocking, name, key, "the value is not a list of rules, so it could not be read")
+		} else if len(rules) > 0 {
+			r.add(SeverityBlocking, name, key, fmt.Sprintf(
+				"the service grants itself device access by cgroup rule (%s), which names devices the manifest "+
+					"does not list", strings.Join(rules, ", ")))
 		}
 		return true
 
 	case "volumes_from":
-		if from, ok := nodeStrings(val); !ok || len(from) > 0 {
-			r.add(SeverityBlocking, name, key,
-				"the service takes another container's mounts wholesale, so its filesystem surface is whatever "+
-					"that container's is — not something this manifest states")
+		from, ok := nodeStrings(val)
+		if !ok {
+			r.add(SeverityBlocking, name, key, "the value is not a list, so it could not be read")
+		} else if len(from) > 0 {
+			r.add(SeverityBlocking, name, key, fmt.Sprintf(
+				"the service takes %s's mounts wholesale, so its filesystem surface is whatever that "+
+					"container's is — not something this manifest states", strings.Join(from, ", ")))
 		}
 		return true
 
@@ -1106,10 +1113,13 @@ func (r *ComposeReview) reviewServiceKey(name, key string, val *yaml.Node) bool 
 		return true
 
 	case "group_add":
-		if groups, ok := nodeStrings(val); !ok || len(groups) > 0 {
-			r.add(SeverityJustify, name, key,
-				"the container joins extra groups, which is how access to a device or socket is granted "+
-					"without a capability")
+		groups, ok := nodeStrings(val)
+		if !ok {
+			r.add(SeverityJustify, name, key, "the value is not a list of groups, so it could not be read")
+		} else if len(groups) > 0 {
+			r.add(SeverityJustify, name, key, fmt.Sprintf(
+				"the container joins extra groups (%s), which is how access to a device or socket is granted "+
+					"without a capability", strings.Join(groups, ", ")))
 		}
 		return true
 
@@ -1542,6 +1552,13 @@ func nodeBool(n *yaml.Node) (val, ok bool) {
 // is not the same as unreadable.
 func nodeStrings(n *yaml.Node) ([]string, bool) {
 	if n == nil {
+		return nil, true
+	}
+	// An explicit null — `volumes_from:` with nothing after it — is EMPTY, not
+	// unreadable. Compose reads it as an empty list, and so do the JSON readers below
+	// for their own null; without this the whole list family reports "could not be
+	// read" for a key that says nothing.
+	if n.Kind == yaml.ScalarNode && (n.Tag == "!!null" || strings.TrimSpace(n.Value) == "") {
 		return nil, true
 	}
 	if n.Kind != yaml.SequenceNode {

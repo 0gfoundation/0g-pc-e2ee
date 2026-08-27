@@ -432,6 +432,17 @@ func TestReviewCompose_EmptyValuesAreNotFindings(t *testing.T) {
 		{"devices", "devices: []", "devices"},
 		{"group_add", "group_add: []", "group_add"},
 		{"volumes", "volumes: []", "volumes"},
+		{"device_cgroup_rules", "device_cgroup_rules: []", "device_cgroup_rules"},
+		{"volumes_from", "volumes_from: []", "volumes_from"},
+		// An explicit null is compose's empty list, not an unreadable value. `volumes_from:`
+		// with nothing after it used to report Blocking, asserting the service had taken
+		// another container's mounts.
+		{"null cap_add", "cap_add:", "cap_add"},
+		{"null devices", "devices:", "devices"},
+		{"null group_add", "group_add:", "group_add"},
+		{"null volumes_from", "volumes_from:", "volumes_from"},
+		{"null device_cgroup_rules", "device_cgroup_rules:", "device_cgroup_rules"},
+		{"null security_opt", "security_opt:", "security_opt"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			doc := fmt.Sprintf("services:\n  broker:\n    image: %s\n    %s\n", pinned, tc.body)
@@ -602,6 +613,7 @@ func TestReviewCompose_UnreadableValueIsNotReadAsAbsent(t *testing.T) {
 		{"privileged is not a bool", "privileged: sort-of", SeverityBlocking, "privileged"},
 		{"cap_add is a scalar", "cap_add: SYS_ADMIN", SeverityBlocking, "cap_add"},
 		{"cap_add is a mapping", "cap_add:\n      a: b", SeverityBlocking, "cap_add"},
+		{"cap_add holds a mapping", "cap_add:\n      - a: b", SeverityBlocking, "cap_add"},
 		{"security_opt is a scalar", "security_opt: seccomp:unconfined", SeverityBlocking, "security_opt"},
 		{"volumes_from is a scalar", "volumes_from: other", SeverityBlocking, "volumes_from"},
 		{"device_cgroup_rules is a scalar", "device_cgroup_rules: 'c 1:1 rmw'", SeverityBlocking, "device_cgroup_rules"},
@@ -623,6 +635,68 @@ func TestReviewCompose_UnreadableValueIsNotReadAsAbsent(t *testing.T) {
 	doc := fmt.Sprintf("services:\n  broker:\n    image: %s\n    privileged: false\n", pinned)
 	if got := find(reviewOf(t, manifest(doc)), "broker", "privileged"); len(got) != 0 {
 		t.Fatalf("privileged: false was reported: %+v", got)
+	}
+}
+
+// An unreadable value must produce a finding that says SO — never the rule's own
+// sentence, which asserts the construct is there. `volumes_from:` reported "the service
+// takes another container's mounts wholesale" about a key with nothing after it, which
+// is a fabricated fact rather than a conservative one; and a reviewer who checks it and
+// finds nothing learns to distrust the whole blocking list.
+//
+// Written as one sweep over every list-shaped rule rather than per case, because the
+// bug was a copy-paste pattern (`!ok || len(x) > 0`) that three rules shared while the
+// rule twenty lines above them did it correctly.
+func TestReviewCompose_UnreadableValueNeverAssertsTheConstructExists(t *testing.T) {
+	pinned := "ghcr.io/0gfoundation/broker@sha256:" + strings.Repeat("a", 64)
+	// For each key: a value of the wrong shape, and a phrase from the rule's real
+	// sentence that must NOT appear when nothing could be read.
+	for _, tc := range []struct{ key, badValue, mustNotSay string }{
+		{"cap_add", "SYS_ADMIN", "beyond the default set"},
+		{"device_cgroup_rules", "'c 195:* rmw'", "grants itself device access"},
+		{"volumes_from", "other", "mounts wholesale"},
+		{"group_add", "'44'", "joins extra groups"},
+		{"devices", "/dev/nvidia0", "GPU work needs this"},
+		{"security_opt", "seccomp:unconfined", "switches off a confinement"},
+	} {
+		t.Run(tc.key, func(t *testing.T) {
+			doc := fmt.Sprintf("services:\n  broker:\n    image: %s\n    %s: %s\n", pinned, tc.key, tc.badValue)
+			got := find(reviewOf(t, manifest(doc)), "broker", tc.key)
+			if len(got) != 1 {
+				t.Fatalf("want 1 finding for an unreadable %s, got %d", tc.key, len(got))
+			}
+			if !strings.Contains(got[0].Detail, "could not be read") {
+				t.Errorf("%s: detail does not say the value was unreadable: %q", tc.key, got[0].Detail)
+			}
+			if strings.Contains(got[0].Detail, tc.mustNotSay) {
+				t.Errorf("%s: an unreadable value asserts the construct exists (%q): %q",
+					tc.key, tc.mustNotSay, got[0].Detail)
+			}
+		})
+	}
+}
+
+// A rule that fires on a real value should name it: "adds SYS_ADMIN" is actionable,
+// "adds capabilities" sends the reader back to the manifest.
+func TestReviewCompose_FindingsNameTheValueTheyFireOn(t *testing.T) {
+	pinned := "ghcr.io/0gfoundation/broker@sha256:" + strings.Repeat("a", 64)
+	for _, tc := range []struct{ body, key, mustSay string }{
+		{"cap_add:\n      - SYS_ADMIN", "cap_add", "SYS_ADMIN"},
+		{"device_cgroup_rules:\n      - c 195:* rmw", "device_cgroup_rules", "c 195:* rmw"},
+		{"volumes_from:\n      - sidecar", "volumes_from", "sidecar"},
+		{"group_add:\n      - '44'", "group_add", "44"},
+		{"devices:\n      - /dev/nvidia0:/dev/nvidia0", "devices", "/dev/nvidia0"},
+	} {
+		t.Run(tc.key, func(t *testing.T) {
+			doc := fmt.Sprintf("services:\n  broker:\n    image: %s\n    %s\n", pinned, tc.body)
+			got := find(reviewOf(t, manifest(doc)), "broker", tc.key)
+			if len(got) != 1 {
+				t.Fatalf("want 1 finding for %s, got %d", tc.key, len(got))
+			}
+			if !strings.Contains(got[0].Detail, tc.mustSay) {
+				t.Errorf("%s: detail does not name %q: %q", tc.key, tc.mustSay, got[0].Detail)
+			}
+		})
 	}
 }
 
