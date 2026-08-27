@@ -248,9 +248,17 @@ matters:
   `-onchain-enforce` is deliberately off while on-chain provider data is still filling
   in; it is wired and observed, and turning it on is a switch rather than work.
 
-So the **code root is the one root not yet doing its job** — hop 3 is exactly that root.
-Hop 5, once enforced, is what turns "an attested enclave" into "the **expected** attested
-enclave."
+So hops 3 and 5 are now in the same position, and it is worth being exact about which
+one: **both are switches, not work.** The code root's OS half is done — the allowlist is
+populated, and a provider on a listed image reaches a clean `pcverify -provider` — so
+what holds `-attest-enforce` off is that some providers are not yet on listed images,
+which is a migration and not a gap in the mechanism. Hop 5, once enforced, is what turns
+"an attested enclave" into "the **expected** attested enclave."
+
+What is genuinely not done is the code root's OTHER half: hop 3 pins the guest OS and
+says nothing about the containers inside it. That half is **read but not adjudicated**
+(see below) — and unlike the two switches, closing it needs a baseline that does not
+exist yet.
 
 Hop 3 is no longer blocked on either. Its allowlist takes one entry per OS image
 (`attest.BootChain`), computable from a published release before any deployment exists,

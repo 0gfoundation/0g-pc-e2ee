@@ -368,7 +368,12 @@ are deliberate:
   underneath it while the hash holds still.
 
 And as with the verdicts: the list being present is not approval. Nothing compared
-these images against an expected set — that is hop 3's empty allowlist again.
+these images against an expected set, and hop 3 is not that set — its allowlist is
+populated, but it pins the provider's guest **OS image**, and would say nothing about
+container images even fully enforced. What is missing is a per-service baseline, which
+does not exist yet: `pcverify -provider` reads the same authenticated manifest and
+reports what would have to change before one could be written (unpinned images,
+`privileged`, host mounts), and reports it precisely because nothing adjudicates it.
 
 **Unlike the self-description above, this one does carry verdicts — and that is
 correct.** These are checks the gateway actually ran on a *third party* before it
