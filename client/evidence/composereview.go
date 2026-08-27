@@ -218,6 +218,16 @@ type ComposeReview struct {
 	// Services is the compose file's services, in file order (the author's order — see
 	// compose.ParseServices on why that is the answer and not an accident).
 	Services []ReviewedService
+	// Blocks is each service's canonical form — the material a per-service baseline is
+	// written from (see composeblock.go). Index-aligned with Services BY CONSTRUCTION:
+	// both are appended in the same loop, so they cannot drift even if a manifest
+	// declares the same service name twice.
+	//
+	// It lives on the review rather than beside it because the hash gate is the
+	// expensive, load-bearing step and must happen exactly once. A caller that wanted
+	// blocks separately would either re-run the gate or skip it, and only one of those
+	// is merely wasteful.
+	Blocks []ServiceBlock
 	// Findings is sorted most-severe first, then by service and key, so two runs over
 	// one manifest print identically.
 	Findings []Finding
@@ -880,6 +890,10 @@ type mountIndex struct {
 // reviewService applies the per-service rules and records the service's image.
 func (r *ComposeReview) reviewService(name string, body *yaml.Node, mounts *mountIndex) {
 	svc := ReviewedService{Name: name}
+	// Appended in the same places Services is, so the two stay index-aligned by
+	// construction rather than by a later lookup. blockOf works on a clone, so it cannot
+	// disturb the node tree the rules below walk.
+	r.Blocks = append(r.Blocks, blockOf(name, body))
 	if body == nil || body.Kind != yaml.MappingNode {
 		r.Services = append(r.Services, svc)
 		r.add(SeverityBlocking, name, "",

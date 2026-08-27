@@ -118,7 +118,7 @@ func TestReport_OnChainOnly(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var out bytes.Buffer
-			code := report(context.Background(), &out, tc.svc, nil, prov, "0xcontract", "", tc.expectSigner, false)
+			code := report(context.Background(), &out, tc.svc, nil, prov, "0xcontract", "", tc.expectSigner, providerOpts{})
 			if code != tc.wantCode {
 				t.Errorf("code = %d, want %d\n%s", code, tc.wantCode, out.String())
 			}
@@ -150,7 +150,7 @@ func TestReport_WithQuote(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var out bytes.Buffer
-			code := report(context.Background(), &out, tc.svc, tc.qc, prov, "0xcontract", "", "", false)
+			code := report(context.Background(), &out, tc.svc, tc.qc, prov, "0xcontract", "", "", providerOpts{})
 			if code != tc.wantCode {
 				t.Errorf("code = %d, want %d\n%s", code, tc.wantCode, out.String())
 			}
@@ -177,7 +177,7 @@ func TestReport_PrintsTheBootChainInAllowlistShape(t *testing.T) {
 	var out bytes.Buffer
 	code := report(context.Background(), &out, stubService{info: acked},
 		stubQuote{v: attest.Verified{SignerAddr: signer, Measurement: m}, noBaseline: true},
-		prov, "0xcontract", "", "", false)
+		prov, "0xcontract", "", "", providerOpts{})
 	// An unconfigured allowlist is not a verdict on the provider — nothing FAILED — but
 	// it is a check that did not run, which is exit 3.
 	if code != 3 {
@@ -214,7 +214,7 @@ func TestReport_BootChainMismatchFails(t *testing.T) {
 	// MeasurementTrusted false with a non-empty allowlist: the provider's image is not
 	// one that was audited.
 	code := report(context.Background(), &out, stubService{info: acked},
-		stubQuote{v: attest.Verified{SignerAddr: signer}}, prov, "0xcontract", "", "", false)
+		stubQuote{v: attest.Verified{SignerAddr: signer}}, prov, "0xcontract", "", "", providerOpts{})
 	if code != 1 {
 		t.Errorf("code = %d, want 1\n%s", code, out.String())
 	}
@@ -239,7 +239,7 @@ func TestReport_ProviderVerdicts(t *testing.T) {
 		trusted := stubQuote{v: attest.Verified{SignerAddr: signer, MeasurementTrusted: true}}.
 			withManifest(t, cleanCompose, nil)
 		if code := report(context.Background(), &out, stubService{info: acked}, trusted,
-			prov, "0xcontract", "", "", false); code != 0 {
+			prov, "0xcontract", "", "", providerOpts{}); code != 0 {
 			t.Errorf("code = %d, want 0 — every hop ran and passed\n%s", code, out.String())
 		}
 		if strings.Contains(out.String(), "INCOMPLETE") {
@@ -252,7 +252,7 @@ func TestReport_ProviderVerdicts(t *testing.T) {
 		// No allowlist AND no manifest. The verdict line exists to disclose what went
 		// unchecked, so reporting one of two gaps is the failure mode to guard against.
 		code := report(context.Background(), &out, stubService{info: acked}, good,
-			prov, "0xcontract", "", "", false)
+			prov, "0xcontract", "", "", providerOpts{})
 		if code != 3 {
 			t.Fatalf("code = %d, want 3\n%s", code, out.String())
 		}
@@ -266,7 +266,7 @@ func TestReport_ProviderVerdicts(t *testing.T) {
 	t.Run("strict turns an unconfigured allowlist into a failure", func(t *testing.T) {
 		var out bytes.Buffer
 		code := report(context.Background(), &out, stubService{info: acked}, good,
-			prov, "0xcontract", "", "", true)
+			prov, "0xcontract", "", "", providerOpts{strict: true})
 		if code != 1 {
 			t.Errorf("code = %d, want 1 under -strict\n%s", code, out.String())
 		}
@@ -279,7 +279,7 @@ func TestReport_ProviderVerdicts(t *testing.T) {
 		var out bytes.Buffer
 		bad := stubQuote{v: attest.Verified{SignerAddr: "0x0000000000000000000000000000000000000002"}}
 		if code := report(context.Background(), &out, stubService{info: acked}, bad,
-			prov, "0xcontract", "", "", false); code != 1 {
+			prov, "0xcontract", "", "", providerOpts{}); code != 1 {
 			t.Errorf("code = %d, want 1\n%s", code, out.String())
 		}
 		if strings.Contains(out.String(), "INCOMPLETE") {
@@ -298,7 +298,7 @@ func TestReport_Manifest(t *testing.T) {
 		t.Helper()
 		var out bytes.Buffer
 		code := report(context.Background(), &out, stubService{info: acked}, qc,
-			prov, "0xcontract", "", "", strict)
+			prov, "0xcontract", "", "", providerOpts{strict: strict})
 		return code, out.String()
 	}
 
@@ -378,6 +378,49 @@ func TestReport_Manifest(t *testing.T) {
 		}
 	})
 
+	// The block fingerprints are what a per-service baseline will be written from, so
+	// the report has to carry them — and has to carry BOTH, because a baseline pins the
+	// block and the image separately (a broker release moves the image and nothing else).
+	t.Run("block fingerprints", func(t *testing.T) {
+		_, got := runReport(t, base.withManifest(t, cleanCompose, nil), false)
+		if !strings.Contains(got, "block          ") {
+			t.Errorf("no block fingerprint in the report:\n%s", got)
+		}
+		if !strings.Contains(got, "block-no-image ") {
+			t.Errorf("no image-held-out fingerprint in the report:\n%s", got)
+		}
+		// Off by default: the canonical text is long, and only a baseline author needs it.
+		if strings.Contains(got, "      | ") {
+			t.Errorf("canonical block text printed without -blocks:\n%s", got)
+		}
+	})
+
+	t.Run("-blocks prints the canonical text", func(t *testing.T) {
+		var out bytes.Buffer
+		code := report(context.Background(), &out, stubService{info: acked},
+			base.withManifest(t, cleanCompose, nil), prov, "0xcontract", "", "",
+			providerOpts{blocks: true})
+		if code != 0 {
+			t.Fatalf("code = %d, want 0\n%s", code, out.String())
+		}
+		got := out.String()
+		for _, want := range []string{"      | image:", "      | restart: always"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("output missing %q:\n%s", want, got)
+			}
+		}
+	})
+
+	// A block with no canonical form must say so where its fingerprint would be, not go
+	// blank — a missing line reads as "nothing to report".
+	t.Run("a block that cannot be pinned says so", func(t *testing.T) {
+		doc := "x-base: &base\n  privileged: true\nservices:\n  broker:\n    <<: *base\n    image: mysql:8.0\n"
+		_, got := runReport(t, base.withManifest(t, doc, nil), false)
+		if !strings.Contains(got, "cannot be pinned") {
+			t.Errorf("an unpinnable block printed no reason:\n%s", got)
+		}
+	})
+
 	// The review reports and does not adjudicate. A manifest full of blocking findings
 	// still exits 0 — deliberately: these rules are heuristics about a manifest we did
 	// not write, and wiring them to an exit code refuses a provider for being unusual.
@@ -431,7 +474,7 @@ func TestReport_EndpointOverride(t *testing.T) {
 	svc := stubService{info: chain.ServiceInfo{URL: "https://from-chain/v1", Signer: signer, Acknowledged: true}}
 	code := report(context.Background(), &out, svc,
 		stubQuote{v: attest.Verified{SignerAddr: signer}, noBaseline: true},
-		prov, "0xc", "https://override/v1", "", false)
+		prov, "0xc", "https://override/v1", "", providerOpts{})
 	// 3 because hop 3 never ran; this test is about the endpoint line, not the verdict.
 	if code != 3 {
 		t.Fatalf("code = %d, want 3\n%s", code, out.String())

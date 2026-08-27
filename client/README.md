@@ -170,6 +170,12 @@ provider that publishes none makes the run incomplete (exit 3). The review itsel
 **gates nothing** — it exists so a per-service baseline can be written from a real
 deployment, and that baseline, compared byte-exact, is what will adjudicate.
 
+Each service also carries its **canonical block** fingerprint, and `-blocks` prints the
+canonical text. That is the form the future baseline will be written and compared in:
+comments, indentation and quoting are dropped, everything that changes what runs is kept,
+and the image reference is held out separately so a broker release does not force a
+gateway release. See `evidence/composeblock.go`.
+
 The gateway mode matters for the third form above, which adds one attested trust
 party: it verifies the dstack-ingress cert-binding quote, confirms the certificate
 the domain **actually serves** is the one that quote committed to, and — given the

@@ -306,6 +306,19 @@ decision: enforce refuses an unlisted image, so it waits on the fleet, not on us
 > not write, and the adjudicating comparison has to be byte-exact against a baseline,
 > which is what the review exists to help write.
 >
+> The comparison form that baseline will use already exists:
+> `client/evidence/composeblock.go` reduces each service to a **canonical block**, keeping
+> every difference that changes what runs (values, keys, key order, scalar types) and
+> dropping every one that does not (comments, indentation, quoting, flow-versus-block
+> style). It emits two forms per service — the whole block, and the block with the image
+> reference held out — because the baseline pins them separately: everything a deployment
+> decided should not move without review, while the image moves on every broker release,
+> and pinning it exactly would mean a gateway release per broker release. The baseline
+> will store canonical **text**, not digests, so that both sides are reduced by the same
+> function at comparison time and the linked YAML library's formatting preferences cancel
+> out — and so that a reviewer can read the file and a broker upgrade shows up as a
+> legible diff. `pcverify -provider` prints the fingerprints; `-blocks` prints the text.
+>
 > And where the expected values are *published* remains open: on-chain alongside the
 > provider registry, or as release assets of the broker repo (which `pcverify` could
 > consume with the same machinery `-releases` already uses for the gateway).
