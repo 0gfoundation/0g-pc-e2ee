@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -27,13 +29,70 @@ type stubQuote struct {
 	// separates "not in the list" from "there is no list". Default false, i.e. a
 	// baseline IS configured, matching the shipped brokerimages.json.
 	noBaseline bool
+	// The manifest half. Zero value means "the quote exposes no compose_hash", which is
+	// the state a V2/V3 mr_config_id is in — deliberately the default, so a test that
+	// does not care about the manifest still exercises the skip path rather than
+	// silently getting a pass. withManifest builds the populated shape.
+	appCompose      []byte
+	composeHash     [attest.ComposeHashLen]byte
+	haveComposeHash bool
+	composeHashErr  error
+	appComposeErr   error
 }
 
-func (s stubQuote) FetchAndVerify(context.Context, string) (attest.Verified, error) {
-	return s.v, s.err
+func (s stubQuote) FetchAndVerify(context.Context, string) (providerQuote, error) {
+	if s.err != nil {
+		return providerQuote{}, s.err
+	}
+	hashErr := s.composeHashErr
+	if !s.haveComposeHash && hashErr == nil {
+		hashErr = errors.New("mr_config_id does not expose compose_hash")
+	}
+	acErr := s.appComposeErr
+	if len(s.appCompose) == 0 && acErr == nil {
+		acErr = attest.ErrNoAppCompose
+	}
+	return providerQuote{
+		Verified:        s.v,
+		ComposeHash:     s.composeHash,
+		HaveComposeHash: s.haveComposeHash,
+		ComposeHashErr:  hashErr,
+		AppCompose:      s.appCompose,
+		AppComposeErr:   acErr,
+	}, nil
 }
 
 func (s stubQuote) BaselineConfigured() bool { return !s.noBaseline }
+
+// withManifest gives the stub an app-compose and the compose_hash a genuine quote
+// would bind to it, so the manifest section runs its real gate rather than being
+// stubbed past it. That is the point: the gate is the check, and a fake that returned
+// "authenticated" would test nothing.
+func (s stubQuote) withManifest(t *testing.T, composeText string, extra map[string]any) stubQuote {
+	t.Helper()
+	fields := map[string]any{
+		"manifest_version":    2,
+		"name":                "broker",
+		"runner":              "docker-compose",
+		"docker_compose_file": composeText,
+	}
+	for k, v := range extra {
+		fields[k] = v
+	}
+	raw, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatalf("marshal app-compose: %v", err)
+	}
+	s.appCompose = raw
+	s.composeHash = sha256.Sum256(raw)
+	s.haveComposeHash = true
+	return s
+}
+
+// cleanCompose trips no rule in the reviewer, so a test asserting a verdict is not
+// quietly asserting the shape of a finding list.
+const cleanCompose = "services:\n  broker:\n    image: ghcr.io/0gfoundation/broker@sha256:" +
+	"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n    restart: always\n"
 
 const (
 	prov   = "0xaabbccddeeff00112233445566778899aabbccdd"
@@ -175,13 +234,32 @@ func TestReport_ProviderVerdicts(t *testing.T) {
 
 	t.Run("allowlist populated and matched is a clean 0", func(t *testing.T) {
 		var out bytes.Buffer
-		trusted := stubQuote{v: attest.Verified{SignerAddr: signer, MeasurementTrusted: true}}
+		// A manifest too: the run is only complete when the provider's app-compose was
+		// read AND gated, so a stub without one belongs in the skip cases below.
+		trusted := stubQuote{v: attest.Verified{SignerAddr: signer, MeasurementTrusted: true}}.
+			withManifest(t, cleanCompose, nil)
 		if code := report(context.Background(), &out, stubService{info: acked}, trusted,
 			prov, "0xcontract", "", "", false); code != 0 {
 			t.Errorf("code = %d, want 0 — every hop ran and passed\n%s", code, out.String())
 		}
 		if strings.Contains(out.String(), "INCOMPLETE") {
 			t.Errorf("a fully-checked run must not be marked incomplete:\n%s", out.String())
+		}
+	})
+
+	t.Run("two gaps are both named, not just the first", func(t *testing.T) {
+		var out bytes.Buffer
+		// No allowlist AND no manifest. The verdict line exists to disclose what went
+		// unchecked, so reporting one of two gaps is the failure mode to guard against.
+		code := report(context.Background(), &out, stubService{info: acked}, good,
+			prov, "0xcontract", "", "", false)
+		if code != 3 {
+			t.Fatalf("code = %d, want 3\n%s", code, out.String())
+		}
+		for _, want := range []string{"hop 3", "manifest was not read"} {
+			if !strings.Contains(out.String(), want) {
+				t.Errorf("verdict does not name %q:\n%s", want, out.String())
+			}
 		}
 	})
 
@@ -206,6 +284,130 @@ func TestReport_ProviderVerdicts(t *testing.T) {
 		}
 		if strings.Contains(out.String(), "INCOMPLETE") {
 			t.Errorf("a failed check must not be reported as merely incomplete:\n%s", out.String())
+		}
+	})
+}
+
+// The manifest section has three outcomes and they must stay distinguishable, because
+// the whole reason it exists is that hop 3 pins the OS and says nothing about what
+// runs inside it. Its gate is the check; its review is not.
+func TestReport_Manifest(t *testing.T) {
+	acked := chain.ServiceInfo{URL: "https://prov.example/v1", Signer: signer, Acknowledged: true}
+	base := stubQuote{v: attest.Verified{SignerAddr: signer, MeasurementTrusted: true}}
+	runReport := func(t *testing.T, qc stubQuote, strict bool) (int, string) {
+		t.Helper()
+		var out bytes.Buffer
+		code := report(context.Background(), &out, stubService{info: acked}, qc,
+			prov, "0xcontract", "", "", strict)
+		return code, out.String()
+	}
+
+	t.Run("authenticated manifest is read and reviewed", func(t *testing.T) {
+		code, got := runReport(t, base.withManifest(t, cleanCompose, nil), false)
+		if code != 0 {
+			t.Fatalf("code = %d, want 0\n%s", code, got)
+		}
+		for _, want := range []string{
+			"✓ app-compose",
+			"authenticated: sha256 equals the compose_hash the quote binds",
+			"compose_hash     ",
+			"app_id           ",
+			"services         1 (1 pinned by digest, 1 first-party)",
+			"broker",
+			"first-party",
+			"0 blocking, 0 to justify, 0 notes — reported, never a gate",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("output missing %q:\n%s", want, got)
+			}
+		}
+	})
+
+	// The gate. A provider serving a manifest that is not the one its own quote binds
+	// is a finding about the provider, so it FAILS — and nothing from inside those
+	// bytes may be printed, since none of it is authenticated.
+	t.Run("a manifest the quote does not bind fails the run", func(t *testing.T) {
+		qc := base.withManifest(t, cleanCompose, nil)
+		qc.composeHash[0] ^= 0xff
+		code, got := runReport(t, qc, false)
+		if code != 1 {
+			t.Fatalf("code = %d, want 1\n%s", code, got)
+		}
+		if !strings.Contains(got, "✗ app-compose") {
+			t.Errorf("the mismatch is not marked as a failure:\n%s", got)
+		}
+		if strings.Contains(got, "compose review") || strings.Contains(got, "services ") {
+			t.Errorf("unauthenticated manifest contents were printed:\n%s", got)
+		}
+	})
+
+	// Absence is a skip, never a pass: a gate reading exit 0 must not be told the
+	// manifest was checked when the provider published nothing to check.
+	t.Run("skips", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			qc   stubQuote
+			says string
+		}{
+			{"no compose_hash in mr_config_id", base, "exposes no compose_hash"},
+			{
+				"reply carries no app_compose",
+				func() stubQuote {
+					q := base.withManifest(t, cleanCompose, nil)
+					q.appCompose = nil
+					return q
+				}(),
+				"carries no app_compose",
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				code, got := runReport(t, tc.qc, false)
+				if code != 3 {
+					t.Fatalf("code = %d, want 3\n%s", code, got)
+				}
+				if !strings.Contains(got, "- app-compose") {
+					t.Errorf("the skip is not marked as one:\n%s", got)
+				}
+				if !strings.Contains(got, tc.says) {
+					t.Errorf("output does not say why it was skipped (%q):\n%s", tc.says, got)
+				}
+				if code, got := runReport(t, tc.qc, true); code != 1 {
+					t.Errorf("-strict: code = %d, want 1\n%s", code, got)
+				}
+			})
+		}
+	})
+
+	// The review reports and does not adjudicate. A manifest full of blocking findings
+	// still exits 0 — deliberately: these rules are heuristics about a manifest we did
+	// not write, and wiring them to an exit code refuses a provider for being unusual.
+	// The byte-exact baseline comparison is what will decide; this is how it gets
+	// written.
+	t.Run("findings are printed and gate nothing", func(t *testing.T) {
+		dirty := "services:\n  broker:\n    image: mysql:8.0\n    privileged: true\n"
+		code, got := runReport(t, base.withManifest(t, dirty, map[string]any{
+			"allowed_envs": []string{"DSTACK_AUTHORIZED_KEYS"},
+		}), false)
+		if code != 0 {
+			t.Fatalf("code = %d, want 0 — the review must not gate\n%s", code, got)
+		}
+		for _, want := range []string{
+			"[blocking] broker.privileged",
+			"[blocking] broker.image",
+			"[blocking] app-compose.allowed_envs",
+			"blocking,",
+			"reported, never a gate",
+			"third-party",
+		} {
+			if !strings.Contains(got, want) {
+				t.Errorf("output missing %q:\n%s", want, got)
+			}
+		}
+		// A ✓/✗ on the review line would read as a verdict on findings that carry none.
+		for _, line := range strings.Split(got, "\n") {
+			if strings.Contains(line, "compose review") && (strings.Contains(line, "✓") || strings.Contains(line, "✗")) {
+				t.Errorf("the review line carries a verdict mark: %q", line)
+			}
 		}
 	})
 }

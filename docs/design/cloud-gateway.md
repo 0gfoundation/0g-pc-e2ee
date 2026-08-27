@@ -511,7 +511,8 @@ does not.
    against a live quote, so the step checks rather than reports. An image that is not
    listed is a failure, so a new OS image version needs an entry before it is deployed
    — per version, not per deployment. Hop 3's broker allowlist in `trust-chain.md` is a
-   separate, still-open task.
+   separate file on the same mechanism (`client/evidence/brokerimages.json`) and is
+   populated too; enforcing it waits on the provider fleet, not on the mechanism.
 3. **Publish `measurement ↔ cert` (transparency log / on-chain) + monitoring**,
    so cheating is publicly detectable without per-user effort.
 4. **Optional tier-3 path**: a WASM verify+seal SDK for clients that want

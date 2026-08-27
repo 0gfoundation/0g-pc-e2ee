@@ -21,6 +21,20 @@
 // RTMR3 is not offered as a candidate value: it carries per-instance events, so
 // pinning it would pin one CVM. RTMR0 is shown, labelled as not compared.
 //
+// Hop 3 pins the OS and stops there, so the run then reads WHAT RUNS INSIDE it. Two
+// providers on one allowlisted image can run entirely different containers, because
+// mr_config_id commits to the app-compose the operator chose. The reply's app-compose
+// is checked against the compose_hash that register carries — a mismatch means the
+// provider served a manifest its own enclave did not boot, and fails the run — and
+// what it authenticated is then printed: every service with its image reference,
+// whether that reference is digest-pinned, whether it comes from our namespace or
+// upstream, and a structural review of the manifest (client/evidence's
+// composereview.go). The review REPORTS and never gates: its rules are heuristics
+// about a manifest we did not write, and a heuristic wired to an exit code refuses a
+// provider for being unusual. It is there so a per-service baseline can be written
+// from a real deployment; the baseline, once it exists, is what will adjudicate. A
+// provider that publishes no app_compose at all is a 3, not a pass.
+//
 //	pcverify -provider 0x... [-chain-rpc-url ...] [-serving-contract 0x...]
 //	         [-endpoint https://...] [-expect-signer 0x...] [-no-quote]
 //	         [-pccs-url https://...]
@@ -132,11 +146,14 @@
 // and returns 3; -strict turns that into 1 instead. Treat 3 as failure in a gate
 // unless a partial verification is genuinely acceptable there.
 //
-// Both modes use it. In provider mode a 3 now means one specific thing: the embedded
-// broker-image allowlist has no entry to compare against, so the code root did not
-// run. With entries, provider mode reaches a clean 0 — which is what makes -strict
-// usable there as a gate. -no-quote is a 3 for its own reason: it skips hops 2–4 by
-// request.
+// Both modes use it. In provider mode a 3 means one of three things, and the verdict
+// line names every one that applies rather than the first: the embedded broker-image
+// allowlist has no entry to compare against, so the code root did not run; the
+// provider published no app-compose (or a quote whose mr_config_id exposes no
+// compose_hash to gate one against), so what runs inside the audited image was not
+// read; or -no-quote skipped hops 2–4 by request. A provider that is allowlisted and
+// publishes its manifest reaches a clean 0 — which is what makes -strict usable here
+// as a gate.
 package main
 
 import (
@@ -157,8 +174,13 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
 )
 
-// maxQuoteBodyBytes bounds the provider /quote response read.
-const maxQuoteBodyBytes = 1 << 20
+// maxQuoteBodyBytes bounds the provider /quote response read. It matches
+// evidence's guest-agent cap, because the reply carries the same nested documents: the
+// quote hex plus a tcb_info holding the whole app-compose (which holds the whole
+// docker-compose text) and the RTMR3 event log. A limit that merely fitted the quote
+// would truncate the manifest, and the JSON error that followed would be reported as a
+// malformed quote — a false accusation against the provider for a bound of ours.
+const maxQuoteBodyBytes = 4 << 20
 
 func main() {
 	os.Exit(run(context.Background(), os.Stdout, os.Args[1:]))
@@ -169,10 +191,40 @@ type serviceReader interface {
 	ServiceInfo(ctx context.Context, provider string) (chain.ServiceInfo, error)
 }
 
+// providerQuote is everything one /v1/quote fetch established, in the order it
+// becomes trustworthy.
+//
+// The three fields are NOT equally believable and the type keeps them apart on
+// purpose. Verified is signed by Intel. ComposeHash comes out of the signed report's
+// mr_config_id, so it is as good as Verified — but only because it was re-parsed from
+// the same authenticated bytes under the measurement-equality guard (see
+// FetchAndVerify). AppCompose is the reply's own text: nothing signs it, and it means
+// nothing until sha256 over it equals ComposeHash. Collapsing them into one struct
+// with one comment is how a caller ends up reading the third as if it were the first.
+type providerQuote struct {
+	Verified attest.Verified
+	// ComposeHash is the compose_hash the verified quote commits to, and HaveComposeHash
+	// says whether there is one to read — a V2/V3 mr_config_id folds it into a digest
+	// instead of carrying it in the clear, which is not a fault in the quote.
+	ComposeHash     [attest.ComposeHashLen]byte
+	HaveComposeHash bool
+	// ComposeHashErr says why there is no hash, for the report. Distinct from
+	// HaveComposeHash because "this layout does not expose one" and "the re-parse
+	// disagreed with the verified measurement" are very different findings.
+	ComposeHashErr error
+	// AppCompose is the reply's app-compose text, UNAUTHENTICATED. It exists to be fed
+	// to evidence.ReviewCompose together with ComposeHash, which is the only sanctioned
+	// use: that call performs the gate, so there is no path here that reads this text
+	// without one.
+	AppCompose []byte
+	// AppComposeErr says why the reply carried none.
+	AppComposeErr error
+}
+
 // quoteChecker fetches a provider's TDX quote from its endpoint and DCAP-verifies
 // it. nil disables the quote hops (on-chain only).
 type quoteChecker interface {
-	FetchAndVerify(ctx context.Context, endpoint string) (attest.Verified, error)
+	FetchAndVerify(ctx context.Context, endpoint string) (providerQuote, error)
 	// BaselineConfigured reports whether the verifier holds any expected boot chain,
 	// so the report can separate "this image is not in the allowlist" (a finding about
 	// the provider) from "there is no allowlist" (a finding about this build). Under
@@ -200,7 +252,7 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 	noDNSDiscovery := fs.Bool("no-dns-discovery", false, "gateway mode: do not derive the platform base domain from DNS; check only what was passed in")
 	expectComposeFile := fs.String("expect-compose-file", "", "gateway mode: path to the docker-compose manifest this deployment should be running (a digest-pinned docker-compose.release.yml), compared against the authenticated app-compose's docker_compose_file. Overrides the default -releases lookup")
 	releases := fs.Int("releases", defaultReleases, "gateway mode: accept the deployment if its compose text matches any of the newest N published releases, and report which one. 0 disables the lookup")
-	strict := fs.Bool("strict", false, "require every check to RUN, not merely to not fail: anything that would report an advisory \"-\" (exit 3) fails the run instead (exit 1). Gateway mode — a releases or app-compose lookup that cannot be completed; it demands the checks without demanding their inputs, so discovery still supplies them. Provider mode — hop 3, which cannot pass when the audited allowlist has no entry to compare against")
+	strict := fs.Bool("strict", false, "require every check to RUN, not merely to not fail: anything that would report an advisory \"-\" (exit 3) fails the run instead (exit 1). Gateway mode — a releases or app-compose lookup that cannot be completed; it demands the checks without demanding their inputs, so discovery still supplies them. Provider mode — hop 3, which cannot pass when the audited allowlist has no entry to compare against, and the app-compose read, which cannot happen when the provider publishes none")
 	releaseRepo := fs.String("repo", defaultReleaseRepo, "gateway mode: owner/name to read releases from, with -releases")
 	releaseAsset := fs.String("release-asset", defaultReleaseAsset, "gateway mode: release asset holding the deployment manifest, with -releases")
 	timeout := fs.Duration("timeout", 30*time.Second, "overall timeout")
@@ -309,9 +361,14 @@ func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecke
 
 	// What this run did not cover, for the verdict. -no-quote is a deliberate skip of
 	// hops 2–4, which is still a skip: the run says nothing about the enclave.
-	skipped := ""
+	//
+	// A slice rather than a string because more than one thing can go unchecked in a
+	// single run — an unconfigured allowlist AND a provider that publishes no manifest —
+	// and reporting only the first would have the verdict line understate the gap it
+	// exists to disclose.
+	var skipped []string
 	if qc == nil {
-		skipped = "the quote hops (2-4) did not run (-no-quote), so nothing here is about the enclave"
+		skipped = append(skipped, "the quote hops (2-4) did not run (-no-quote), so nothing here is about the enclave")
 	}
 
 	info, err := sr.ServiceInfo(ctx, provider)
@@ -340,11 +397,12 @@ func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecke
 		}
 		fmt.Fprintf(out, "endpoint           %s (%s)\n", endpoint, src)
 
-		v, err := qc.FetchAndVerify(ctx, endpoint)
+		pq, err := qc.FetchAndVerify(ctx, endpoint)
 		if err != nil {
 			fmt.Fprintf(out, "%s quote            %v\n", mark(false), err)
 			return fail(out)
 		}
+		v := pq.Verified
 		fmt.Fprintf(out, "%s quote            genuine TDX (DCAP verified)\n", mark(true))
 		// The boot chain, in the shape an allowlist entry wants — MRTD + RTMR1 + RTMR2,
 		// the registers attest.BootChain pins. Printing MRTD alone was enough to see
@@ -365,7 +423,7 @@ func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecke
 			// The code root did not run. Reported, so the verdict cannot be 0 — this is
 			// exactly the "- read as ✓" mistake the exit codes exist to prevent, and here
 			// it fires on every run rather than on a bad day.
-			skipped = "the boot chain was not compared (hop 3: no audited allowlist configured)"
+			skipped = append(skipped, "the boot chain was not compared (hop 3: no audited allowlist configured)")
 		default:
 			fmt.Fprintf(out, "%s boot chain       matches no audited image\n", mark(false))
 			reportBootChain(out, attest.BootChainOf(v.Measurement))
@@ -379,9 +437,118 @@ func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecke
 		match := strings.EqualFold(strings.TrimSpace(v.SignerAddr), strings.TrimSpace(info.Signer))
 		fmt.Fprintf(out, "%s quote signer == on-chain signer\n", mark(match))
 		ok = ok && match
+
+		// What runs INSIDE the audited image. Hop 3 pins the OS; two providers on one
+		// allowlisted image can still run entirely different containers, because
+		// mr_config_id commits to the manifest the OPERATOR chose. This is the only place
+		// in the tool that reads it.
+		failed, skip := reportManifest(out, pq)
+		if failed {
+			ok = false
+		}
+		if skip != "" {
+			skipped = append(skipped, skip)
+		}
 	}
 
-	return verdict(out, !ok, skipped, strict)
+	return verdict(out, !ok, strings.Join(skipped, "; "), strict)
+}
+
+// reportManifest prints the provider's app-compose, hash-gated, and the structural
+// review of it. It returns whether a check FAILED and, separately, what went unchecked.
+//
+// The split between those two return values is the whole design of this section:
+//
+//   - The gate is a real check with a real verdict. sha256 over the reply's app-compose
+//     must equal the compose_hash the verified quote binds. A mismatch means the
+//     provider served a manifest that is not the one its own enclave booted, which is a
+//     finding about the provider and fails the run.
+//   - Absence is a SKIP, not a pass. A provider whose reply carries no app_compose
+//     (public_tcbinfo off, an older broker) or whose mr_config_id does not expose a
+//     compose_hash has not been checked here, and a gate reading exit 0 must not be
+//     told otherwise.
+//   - The review itself gates NOTHING. Its rules are heuristics about a manifest we did
+//     not write, and a heuristic wired to an exit code refuses a provider for being
+//     unusual. It is printed so a human can turn it into a baseline; the baseline is
+//     what will adjudicate. See evidence/composereview.go's header.
+func reportManifest(out io.Writer, pq providerQuote) (failed bool, skipped string) {
+	switch {
+	case !pq.HaveComposeHash:
+		fmt.Fprintf(out, "- app-compose      not read (%s)\n", reason(pq.ComposeHashErr,
+			"the quote's mr_config_id exposes no compose_hash"))
+		return false, "the provider's manifest was not read (the quote exposes no compose_hash to gate it against)"
+	case len(pq.AppCompose) == 0:
+		fmt.Fprintf(out, "  compose_hash     %x\n", pq.ComposeHash)
+		fmt.Fprintf(out, "- app-compose      not served (%s)\n", reason(pq.AppComposeErr,
+			"the /v1/quote reply carries no app_compose"))
+		return false, "the provider's manifest was not read (its /v1/quote reply carries no app_compose)"
+	}
+
+	review, err := evidence.ReviewCompose(pq.AppCompose, pq.ComposeHash)
+	if err != nil {
+		// The gate, or bytes that are not JSON. Either way nothing below it may be
+		// believed, so nothing below it is printed.
+		fmt.Fprintf(out, "%s app-compose      %v\n", mark(false), err)
+		return true, ""
+	}
+	fmt.Fprintf(out, "%s app-compose      authenticated: sha256 equals the compose_hash the quote binds\n", mark(true))
+	fmt.Fprintf(out, "  compose_hash     %x\n", pq.ComposeHash)
+	fmt.Fprintf(out, "  app_id           %s\n", attest.AppIDFromComposeHash(pq.ComposeHash))
+	features := "none"
+	if len(review.Features) > 0 {
+		features = strings.Join(review.Features, ",")
+	}
+	fmt.Fprintf(out, "  manifest         name=%q runner=%q features=%s\n", review.Name, review.Runner, features)
+	// The manifest's WHOLE key surface, not the subset the reviewer has rules for. The
+	// two diverge as dstack adds fields, and printing only the checked half is how a
+	// review goes quietly stale — the unrecognised ones also appear as findings, but the
+	// list is what lets a reader see the shape of the document at a glance.
+	fmt.Fprintf(out, "  fields           %s\n", strings.Join(review.Fields, ", "))
+
+	pinned, firstParty := 0, 0
+	for _, s := range review.Services {
+		if s.Pinned() {
+			pinned++
+		}
+		if s.Origin == evidence.OriginFirstParty {
+			firstParty++
+		}
+	}
+	fmt.Fprintf(out, "  services         %d (%d pinned by digest, %d first-party)\n",
+		len(review.Services), pinned, firstParty)
+	for _, s := range review.Services {
+		ref := s.Ref
+		if ref == "" {
+			ref = "(no image)"
+		}
+		fmt.Fprintf(out, "    %-24s %-12s %s\n", s.Name, s.Origin, ref)
+	}
+
+	// Never a mark: a ✓ or ✗ here would read as a verdict, and this is the one section
+	// of the report that deliberately has none.
+	fmt.Fprintf(out, "  compose review   %s — reported, never a gate\n", review.Summary())
+	for _, f := range review.Findings {
+		where := f.Service
+		if where == "" {
+			where = "app-compose"
+		}
+		if f.Key != "" {
+			where += "." + f.Key
+		}
+		fmt.Fprintf(out, "    [%s] %s: %s\n", f.Severity, where, f.Detail)
+	}
+	return false, ""
+}
+
+// reason renders err, falling back to a description when there is none. A "-" line
+// whose parenthetical reads "(<nil>)" tells a reader nothing about what to do, and the
+// fallback keeps that out of the report even if a future caller forgets to set the
+// error alongside the flag.
+func reason(err error, fallback string) string {
+	if err == nil {
+		return fallback
+	}
+	return err.Error()
 }
 
 func fail(out io.Writer) int {
@@ -454,15 +621,63 @@ func (c *dcapChecker) BaselineConfigured() bool {
 	return c.verifier.MeasurementBaselineConfigured()
 }
 
-func (c *dcapChecker) FetchAndVerify(ctx context.Context, endpoint string) (attest.Verified, error) {
-	raw, err := c.fetchQuote(ctx, endpoint)
+// FetchAndVerify runs the whole quote fetch: verify first, then read the two
+// application-identity values out of what was verified.
+//
+// Order is the security argument, not a style choice. The reply's app-compose is read
+// only after c.verifier.Verify has succeeded, and it is returned UNGATED for
+// reportManifest to hash — so no code path here can act on provider-chosen text. The
+// compose hash is taken from a structural re-parse of the same raw quote, admitted
+// only when its measurement equals the verified one: that guard is what makes
+// mr_config_id "in the signed report" rather than "read from bytes nobody checked".
+// route.composeHashOf carries the long form of the argument; this is the same shape,
+// which is deliberate — a diagnostic that derived compose_hash differently from the
+// sealing path could report a manifest the gateway never authenticated.
+func (c *dcapChecker) FetchAndVerify(ctx context.Context, endpoint string) (providerQuote, error) {
+	reply, err := c.fetchQuoteReply(ctx, endpoint)
 	if err != nil {
-		return attest.Verified{}, err
+		return providerQuote{}, err
 	}
-	return c.verifier.Verify(raw)
+	raw, err := attest.DecodeQuoteResponse(reply)
+	if err != nil {
+		return providerQuote{}, err
+	}
+	verified, err := c.verifier.Verify(raw)
+	if err != nil {
+		return providerQuote{}, err
+	}
+	pq := providerQuote{Verified: verified}
+
+	switch qb, err := attest.ParseTDXQuoteBody(raw); {
+	case err != nil:
+		pq.ComposeHashErr = fmt.Errorf("cannot structurally re-parse the verified quote: %w", err)
+	case qb.Measurement != verified.Measurement:
+		// Unreachable with the wired parser, which extracts through this same function —
+		// and that is exactly why it is checked rather than assumed. It earns its place
+		// against a future decoder that derives the measurement some other way, where "the
+		// bytes I read describe the TD you verified" stops being self-evident.
+		pq.ComposeHashErr = errors.New("the structural re-parse disagrees with the verified measurement")
+	default:
+		hash, err := attest.ComposeHashFromMRConfigID(qb.MRConfigID)
+		if err != nil {
+			pq.ComposeHashErr = err
+		} else {
+			pq.ComposeHash, pq.HaveComposeHash = hash, true
+		}
+	}
+
+	if ac, err := attest.AppComposeFromQuoteResponse(reply); err != nil {
+		pq.AppComposeErr = err
+	} else {
+		pq.AppCompose = ac
+	}
+	return pq, nil
 }
 
-func (c *dcapChecker) fetchQuote(ctx context.Context, endpoint string) ([]byte, error) {
+// fetchQuoteReply GETs the provider's /quote and returns the raw JSON reply. The reply
+// rather than just the decoded quote: the app-compose rides in the same body, and
+// fetching twice would let a provider serve a manifest belonging to a different quote.
+func (c *dcapChecker) fetchQuoteReply(ctx context.Context, endpoint string) ([]byte, error) {
 	quoteURL, err := quoteURLFromEndpoint(endpoint)
 	if err != nil {
 		return nil, err
@@ -476,14 +691,20 @@ func (c *dcapChecker) fetchQuote(ctx context.Context, endpoint string) ([]byte, 
 		return nil, fmt.Errorf("fetch quote: %w", err)
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxQuoteBodyBytes))
+	// One byte past the cap, so hitting it is DETECTED rather than delivered as a
+	// truncated document: silent truncation would surface downstream as invalid JSON and
+	// be reported as a bad quote.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxQuoteBodyBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("read quote: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("quote endpoint returned %d", resp.StatusCode)
 	}
-	return attest.DecodeQuoteResponse(body)
+	if len(body) > maxQuoteBodyBytes {
+		return nil, fmt.Errorf("quote reply from %s is larger than %d bytes", quoteURL, maxQuoteBodyBytes)
+	}
+	return body, nil
 }
 
 // quoteURLFromEndpoint turns a provider endpoint into its DCAP quote URL,

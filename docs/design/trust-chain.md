@@ -284,12 +284,23 @@ decision: enforce refuses an unlisted image, so it waits on the fleet, not on us
 > machine. `attest.Policy` remains only as a deprecated type, documenting why the
 > obvious shape does not work.
 >
-> One half is still missing: pinning the application by compose hash needs the quote's
-> `mr_config_id`, which the `quoteParser` seam does not return, so the provider path
-> cannot do it yet. The gateway pins it separately (`client/evidence`). And where the
-> expected values are *published* remains open: on-chain alongside the provider
-> registry, or as release assets of the broker repo (which `pcverify` could consume
-> with the same machinery `-releases` already uses for the gateway).
+> The other half — pinning the *application* rather than the OS — is **read but not
+> yet adjudicated**. The `quoteParser` seam does not return `mr_config_id`, so the
+> compose hash is recovered by structurally re-parsing the same bytes the verifier
+> authenticated, admitted only when that parse's measurement equals the verified one
+> (`route.composeHashOf`, and the same shape in `pcverify`). With it, the provider's
+> `app-compose` is checked against the hash the quote binds, and what it authenticates
+> is reported: the container list on the identity endpoint, and in `pcverify -provider`
+> a structural review of the manifest as well. What is still missing is the thing that
+> would make it a *check*: a recorded per-service baseline to compare an authenticated
+> manifest against. The review deliberately gates nothing (see
+> `client/evidence/composereview.go`) — its rules are heuristics about a manifest we do
+> not write, and the adjudicating comparison has to be byte-exact against a baseline,
+> which is what the review exists to help write.
+>
+> And where the expected values are *published* remains open: on-chain alongside the
+> provider registry, or as release assets of the broker repo (which `pcverify` could
+> consume with the same machinery `-releases` already uses for the gateway).
 
 **Checking a provider (`client/cmd/pcverify -provider`).** A read-only diagnostic
 walks hops 2–5 for one provider in a single command — DCAP-verify its quote
@@ -298,6 +309,14 @@ against its acknowledged on-chain `teeSignerAddress`. Use it as the pre-enable g
 before flipping the sidecar/gateway into `-attest` / `-onchain`. The provider's
 endpoint is read from the chain (`Service.url`), so only `-provider` is required.
 `-no-quote` restricts the run to the on-chain hop.
+
+It then reads one thing beyond the hops: the provider's `app-compose`, gated on the
+`compose_hash` its verified quote binds. Hop 3 pins the OS and stops there, so this is
+where "what runs inside that OS" becomes visible — every service with its image
+reference, whether that reference is digest-pinned, whether it comes from our namespace
+or upstream, and a structural review of the manifest. A manifest that does not match
+the hash **fails** the run; a provider that publishes none is an incomplete run (exit
+3), not a pass. The review itself is reported and gates nothing, for the reason above.
 
 **Checking the gateway itself (`pcverify -gateway <domain>`).** The chain above
 covers the *provider* hop; in cloud-gateway mode there is one more attested party
@@ -332,8 +351,9 @@ gateway is deployed on: the three values were computed with `dstack-mr` from the
 published guest-OS release whose `digest.txt` equals the CVM's `os_image_hash`, and then
 confirmed to equal what a live quote reports. So the step checks rather than reports, and
 an image that is not listed FAILS — a new OS image version needs an entry before it is
-deployed. Hop 3's broker allowlist is a separate, still-open task — it now uses the same
-mechanism, and what it lacks is values and a place to publish them.
+deployed. Hop 3's broker allowlist is a separate file on the same mechanism
+(`client/evidence/brokerimages.json`) and is populated too; what waits on the fleet is
+only the decision to enforce it.
 
 Two further limits are worth stating: the compose hash is only as strong as the image
 pinning inside the compose text — a floating tag keeps it stable while the code changes

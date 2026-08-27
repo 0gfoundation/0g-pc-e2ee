@@ -46,6 +46,15 @@ type AppCompose struct {
 	AllowedEnvs []string `json:"allowed_envs"`
 }
 
+// ErrNoDockerCompose reports an app-compose that PASSED the hash gate but embeds no
+// docker-compose text. It is a sentinel because the two halves of a VerifyAppCompose
+// failure mean opposite things and callers must be able to tell them apart without
+// re-hashing: a digest mismatch says the bytes are not the manifest the quote binds
+// (nothing in them may be believed), while this says the bytes ARE that manifest and
+// simply carry no compose file — authenticated, just not comparable. Treating the
+// second as the first would report a substitution that did not happen.
+var ErrNoDockerCompose = errors.New("app-compose has no docker_compose_file")
+
 // VerifyAppCompose checks that raw really is the app-compose the quote committed
 // to — sha256(raw) == composeHash — and only then decodes it.
 //
@@ -74,8 +83,9 @@ func VerifyAppCompose(raw []byte, composeHash [attest.ComposeHashLen]byte) (AppC
 	if strings.TrimSpace(ac.DockerComposeFile) == "" {
 		// Authenticated, but with nothing to compare: an app-compose that runs no
 		// docker-compose cannot support the compose-file check, so say so here rather
-		// than reporting an empty diff as a match.
-		return ac, errors.New("app-compose has no docker_compose_file")
+		// than reporting an empty diff as a match. ac is returned populated — the
+		// caller may still read the fields that did decode (see ErrNoDockerCompose).
+		return ac, ErrNoDockerCompose
 	}
 	return ac, nil
 }

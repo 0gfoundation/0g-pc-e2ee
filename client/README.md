@@ -155,9 +155,20 @@ auditors who would rather not run our binary.
 `cmd/pcverify` is a read-only diagnostic with one mode per attested party:
 
 ```sh
-pcverify -provider 0x…            # a provider: DCAP quote + on-chain signer (trust-chain hops 2–5)
+pcverify -provider 0x…            # a provider: DCAP quote + on-chain signer (trust-chain hops 2–5), then its hash-gated app-compose
 pcverify -gateway <domain>        # the cloud-TEE gateway: its /evidences bundle + served certificate
 ```
+
+Provider mode goes one step past the hops: hop 3 pins the provider's **OS image** and
+says nothing about the containers inside it, so the run also checks the provider's
+`app-compose` against the `compose_hash` its verified quote binds, then prints what it
+authenticated — each service's image reference, whether it is digest-pinned, whether it
+is ours or upstream, and a structural review of the manifest (unpinned images,
+`privileged`, host mounts, `allowed_envs` that hand the host a way in, and every field
+the review has no rule for). A manifest that does not match the hash fails the run; a
+provider that publishes none makes the run incomplete (exit 3). The review itself
+**gates nothing** — it exists so a per-service baseline can be written from a real
+deployment, and that baseline, compared byte-exact, is what will adjudicate.
 
 The gateway mode matters for the third form above, which adds one attested trust
 party: it verifies the dstack-ingress cert-binding quote, confirms the certificate
