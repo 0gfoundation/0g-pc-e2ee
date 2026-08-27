@@ -300,9 +300,12 @@ the enclave actually booted; short of it, it is discarded — a mismatch reports
 containers rather than a probably-right list, and logs, because the same shape covers
 both a stale reply and a substitution attempt.
 
-What it is **not** is a check. Nothing compared those images against an expected set —
-that is hop 3's unfilled allowlist — so a panel may render the list but must not read
-its existence as approval. The one finding it carries unaided is an **empty digest**:
+What it is **not** is a check. Nothing compared those images against an expected set, so
+a panel may render the list but must not read its existence as approval. Hop 3 is not
+that set: its allowlist is populated, but it pins the guest **OS image** and would say
+nothing about container images even fully enforced. The missing piece is a per-service
+baseline — see `client/evidence/composereview.go`, which reads the same authenticated
+manifest and reports how far it is from being one, and deliberately adjudicates nothing. The one finding it carries unaided is an **empty digest**:
 an image pinned by tag leaves `compose_hash` committing to a *name* whose contents can
 be republished under it, so the absence is rendered rather than hidden. Unlike §6.3's
 container list there is no `source` label, because no per-provider manifest is
@@ -511,7 +514,8 @@ does not.
    against a live quote, so the step checks rather than reports. An image that is not
    listed is a failure, so a new OS image version needs an entry before it is deployed
    — per version, not per deployment. Hop 3's broker allowlist in `trust-chain.md` is a
-   separate, still-open task.
+   separate file on the same mechanism (`client/evidence/brokerimages.json`) and is
+   populated too; enforcing it waits on the provider fleet, not on the mechanism.
 3. **Publish `measurement ↔ cert` (transparency log / on-chain) + monitoring**,
    so cheating is publicly detectable without per-user effort.
 4. **Optional tier-3 path**: a WASM verify+seal SDK for clients that want

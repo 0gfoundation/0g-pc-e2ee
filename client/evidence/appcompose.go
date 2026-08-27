@@ -46,6 +46,15 @@ type AppCompose struct {
 	AllowedEnvs []string `json:"allowed_envs"`
 }
 
+// ErrNoDockerCompose reports an app-compose that PASSED the hash gate but embeds no
+// docker-compose text. It is a sentinel because the two halves of a VerifyAppCompose
+// failure mean opposite things and callers must be able to tell them apart without
+// re-hashing: a digest mismatch says the bytes are not the manifest the quote binds
+// (nothing in them may be believed), while this says the bytes ARE that manifest and
+// simply carry no compose file — authenticated, just not comparable. Treating the
+// second as the first would report a substitution that did not happen.
+var ErrNoDockerCompose = errors.New("app-compose has no docker_compose_file")
+
 // VerifyAppCompose checks that raw really is the app-compose the quote committed
 // to — sha256(raw) == composeHash — and only then decodes it.
 //
@@ -61,11 +70,8 @@ type AppCompose struct {
 // verbatim, so callers must not reformat, re-indent, or re-marshal raw — that
 // would change the digest while leaving the JSON "equal".
 func VerifyAppCompose(raw []byte, composeHash [attest.ComposeHashLen]byte) (AppCompose, error) {
-	got := sha256.Sum256(raw)
-	if got != composeHash {
-		return AppCompose{}, fmt.Errorf(
-			"app-compose digest %x does not match the compose_hash %x the quote binds "+
-				"(wrong app/instance, stale record, or reformatted bytes)", got, composeHash)
+	if err := gateAppCompose(raw, composeHash); err != nil {
+		return AppCompose{}, err
 	}
 	var ac AppCompose
 	if err := json.Unmarshal(raw, &ac); err != nil {
@@ -74,10 +80,31 @@ func VerifyAppCompose(raw []byte, composeHash [attest.ComposeHashLen]byte) (AppC
 	if strings.TrimSpace(ac.DockerComposeFile) == "" {
 		// Authenticated, but with nothing to compare: an app-compose that runs no
 		// docker-compose cannot support the compose-file check, so say so here rather
-		// than reporting an empty diff as a match.
-		return ac, errors.New("app-compose has no docker_compose_file")
+		// than reporting an empty diff as a match. ac is returned populated — the
+		// caller may still read the fields that did decode (see ErrNoDockerCompose).
+		return ac, ErrNoDockerCompose
 	}
 	return ac, nil
+}
+
+// gateAppCompose is the security-relevant half of VerifyAppCompose on its own: the
+// digest check, and nothing else.
+//
+// It is factored out for a caller that reads the manifest's fields ITSELF and must not
+// inherit AppCompose's narrow struct as a second, stricter gate. Without the split, an
+// authenticated manifest whose `allowed_envs` is an object rather than a list of
+// strings fails the struct decode — and a caller branching on "VerifyAppCompose
+// returned an error" would report that as a digest mismatch, i.e. accuse the provider
+// of serving a manifest its own quote does not bind. The gate is one function with one
+// implementation; what a caller decodes past it is that caller's business.
+func gateAppCompose(raw []byte, composeHash [attest.ComposeHashLen]byte) error {
+	got := sha256.Sum256(raw)
+	if got != composeHash {
+		return fmt.Errorf(
+			"app-compose digest %x does not match the compose_hash %x the quote binds "+
+				"(wrong app/instance, stale record, or reformatted bytes)", got, composeHash)
+	}
+	return nil
 }
 
 // infoResponse is the dstack guest-agent `Info` reply. Both nested documents
