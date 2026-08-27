@@ -409,6 +409,43 @@ func TestReport_Manifest(t *testing.T) {
 				t.Errorf("output missing %q:\n%s", want, got)
 			}
 		}
+		// cleanCompose's block has nothing outside the image, so the two forms differ only
+		// by the image key and the no-image text is worth printing; what must NOT happen is
+		// the label appearing when the forms are identical (asserted below).
+	})
+
+	// The image-held-out form is the one a broker service's baseline entry holds — that is
+	// the whole reason the split exists. Printing only the full form left exactly those
+	// entries unobtainable from the tool, and deriving them by hand is the transcription
+	// CanonicalizeServiceBlock exists to prevent.
+	t.Run("-blocks prints the image-held-out form too", func(t *testing.T) {
+		// The cn-20 shape: the digest is copied into an environment variable, so the two
+		// forms differ in more than the image line.
+		digest := strings.Repeat("e", 64)
+		doc := "services:\n  0g-controller:\n    image: ghcr.io/0gfoundation/0g-serving-broker@sha256:" +
+			digest + "\n    environment:\n      - IMAGE_DIGEST=sha256:" + digest + "\n"
+		var out bytes.Buffer
+		report(context.Background(), &out, stubService{info: acked},
+			base.withManifest(t, doc, nil), prov, "0xcontract", "", "", providerOpts{blocks: true})
+		got := out.String()
+		if !strings.Contains(got, "      | no-image: ") {
+			t.Fatalf("the image-held-out text was not printed:\n%s", got)
+		}
+		// It must be the reduced text, not a second copy of the full one.
+		noImagePart := got[strings.Index(got, "| no-image: "):]
+		if strings.Contains(noImagePart, digest) {
+			t.Errorf("the held-out form still carries the digest:\n%s", noImagePart)
+		}
+
+		// And when the two forms are identical there is nothing to label — matching the
+		// fingerprint lines, which already skip block-no-image in that case.
+		var plain bytes.Buffer
+		report(context.Background(), &plain, stubService{info: acked},
+			base.withManifest(t, "services:\n  a:\n    restart: always\n", nil),
+			prov, "0xcontract", "", "", providerOpts{blocks: true})
+		if strings.Contains(plain.String(), "no-image: ") {
+			t.Errorf("a service with no image printed a held-out form:\n%s", plain.String())
+		}
 	})
 
 	// A block with no canonical form must say so where its fingerprint would be, not go

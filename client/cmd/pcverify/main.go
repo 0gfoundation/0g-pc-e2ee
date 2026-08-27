@@ -569,8 +569,15 @@ func reportManifest(out io.Writer, pq providerQuote, dumpBlocks bool) (failed bo
 				fmt.Fprintf(out, "      block-no-image %s\n", b.DigestNoImage)
 			}
 			if dumpBlocks {
-				for _, line := range strings.Split(strings.TrimRight(b.Canonical, "\n"), "\n") {
-					fmt.Fprintf(out, "      | %s\n", line)
+				// BOTH forms, because a broker service's baseline entry holds the
+				// image-held-out one — that is the whole reason the split exists — and
+				// printing only the full form left exactly those entries unobtainable from
+				// the tool. Deriving them by hand is the transcription that makes the two
+				// sides drift, which is what CanonicalizeServiceBlock exists to prevent.
+				// Skipped when the two are identical, matching the fingerprint lines.
+				dumpBlock(out, "", b.Canonical)
+				if b.DigestNoImage != b.Digest {
+					dumpBlock(out, "no-image: ", b.CanonicalNoImage)
 				}
 			}
 		}
@@ -590,6 +597,18 @@ func reportManifest(out io.Writer, pq providerQuote, dumpBlocks bool) (failed bo
 		fmt.Fprintf(out, "    [%s] %s: %s\n", f.Severity, where, f.Detail)
 	}
 	return false, ""
+}
+
+// dumpBlock prints one canonical block, line-prefixed so it cannot be mistaken for the
+// report's own structure. label names which form it is, and is empty for the full one.
+func dumpBlock(out io.Writer, label, canonical string) {
+	for i, line := range strings.Split(strings.TrimRight(canonical, "\n"), "\n") {
+		prefix := ""
+		if i == 0 {
+			prefix = label
+		}
+		fmt.Fprintf(out, "      | %s%s\n", prefix, line)
+	}
 }
 
 // reason renders err, falling back to a description when there is none. A "-" line

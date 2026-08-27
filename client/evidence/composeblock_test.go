@@ -3,10 +3,13 @@ package evidence
 import (
 	"crypto/sha256"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/0gfoundation/0g-pc-e2ee/client/compose"
 )
 
 // blocksOf runs the REAL path — ReviewCompose, hash gate included — over a compose text
@@ -44,14 +47,22 @@ func requireBlock(t *testing.T, doc, name string) ServiceBlock {
 	return b
 }
 
-// oneBlock is the shape most cases want: a single service named "svc".
+// oneBlock is the shape most cases want: a single service named "svc", which must have
+// reduced cleanly.
 func oneBlock(t *testing.T, body string) ServiceBlock {
 	t.Helper()
-	b := requireBlock(t, "services:\n  svc:\n"+body, "svc")
+	b := oneBlock2(t, body)
 	if b.Err != nil {
 		t.Fatalf("block has no canonical form: %v", b.Err)
 	}
 	return b
+}
+
+// oneBlock2 is oneBlock without the success requirement, for cases whose subject IS the
+// refusal.
+func oneBlock2(t *testing.T, body string) ServiceBlock {
+	t.Helper()
+	return requireBlock(t, "services:\n  svc:\n"+body, "svc")
 }
 
 // --- the equivalences the design claims -----------------------------------------
@@ -494,6 +505,120 @@ func TestServiceBlock_ReducedFormIsIdempotent(t *testing.T) {
 			strings.Contains(b.CanonicalNoImage, `'`+imageHeldOut+`'`) {
 			t.Fatalf("the placeholder is being quoted:\n%s", b.CanonicalNoImage)
 		}
+	}
+}
+
+// The needle is provider-controlled text, and compose.SplitImageRef performs no shape
+// check — it returns whatever follows the last "@". So `image: nginx@e` yielded the
+// one-character needle "e", and substituting it across every scalar shredded the block:
+// the mapping key `environment` came out as `<image-held-out>nvironm<image-held-out>nt`,
+// leaving a reduced form that described no service. Erasing too much is the direction
+// this file's header calls dangerous, and the input is entirely the provider's.
+func TestServiceBlock_MalformedDigestIsNotANeedle(t *testing.T) {
+	for _, tc := range []struct{ name, ref string }{
+		{"single character", "nginx@e"},
+		{"no algorithm", "nginx@" + cn20Digest},
+		{"hex too short", "nginx@sha256:abcdef"},
+		{"not hex", "nginx@sha256:" + strings.Repeat("z", 64)},
+		{"empty after the at", "nginx@"},
+		{"algorithm only", "nginx@sha256:"},
+		{"uppercase hex", "nginx@sha256:" + strings.Repeat("A", 64)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The reference is quoted: a few of these end in a colon, which unquoted
+			// would change what YAML parses rather than what the hold-out sees.
+			b := oneBlock(t, "    image: "+strconv.Quote(tc.ref)+"\n    command: exec server\n"+
+				"    environment:\n      - MODE=production\n")
+			// Nothing may be substituted — not the digest half, and not the full reference
+			// either, which is short enough to be dangerous when the digest half is junk.
+			if strings.Contains(b.CanonicalNoImage, imageHeldOut) {
+				t.Fatalf("a malformed digest was used as a needle:\n%s", b.CanonicalNoImage)
+			}
+			for _, intact := range []string{"command: exec server", "environment:", "MODE=production"} {
+				if !strings.Contains(b.CanonicalNoImage, intact) {
+					t.Fatalf("the block lost %q:\n%s", intact, b.CanonicalNoImage)
+				}
+			}
+			// And the review must not call it pinned: it reads as pinned to anyone skimming
+			// for "@sha256:", which is worse than an obviously unpinned tag.
+			r := reviewOf(t, manifest("services:\n  svc:\n    image: "+strconv.Quote(tc.ref)+"\n"))
+			if r.Services[0].Pinned() {
+				t.Fatalf("%s reports as pinned by digest", tc.ref)
+			}
+			requireFinding(t, r, SeverityBlocking, "svc", "image")
+		})
+	}
+
+	// The control: a real digest still works, and still holds out.
+	b := oneBlock(t, "    image: nginx@sha256:"+cn20Digest+"\n    environment:\n      - D=sha256:"+cn20Digest+"\n")
+	if !strings.Contains(b.CanonicalNoImage, imageHeldOut) {
+		t.Fatalf("a well-formed digest was not held out:\n%s", b.CanonicalNoImage)
+	}
+	// A longer algorithm name and a longer hex are digests too.
+	for _, ref := range []string{
+		"nginx@sha512:" + strings.Repeat("a", 128),
+		"nginx@multihash.sha2-256:" + strings.Repeat("b", 64),
+	} {
+		if _, _, d := compose.SplitImageRef(ref); !isDigestShaped(d) {
+			t.Errorf("%s: digest %q rejected, but it is one", ref, d)
+		}
+	}
+}
+
+// The substitution is one-way and unescaped, so a manifest that literally carries the
+// placeholder would reduce to the same text as one whose digest was erased at that
+// position — two different deployments, one fingerprint. Refused for the same reason
+// indirection is: a manifest has no legitimate reason to carry it, and the reduction a
+// baseline matcher will be built on must not have a collision in it.
+func TestServiceBlock_RefusesAManifestCarryingThePlaceholder(t *testing.T) {
+	b := oneBlock2(t, "    image: nginx@sha256:"+cn20Digest+"\n    environment:\n      - D="+imageHeldOut+"\n")
+	if b.Err == nil {
+		t.Fatalf("a block carrying the placeholder was reduced:\n%s", b.Canonical)
+	}
+	if !strings.Contains(b.Err.Error(), imageHeldOut) {
+		t.Fatalf("err = %v, want it to name the string", b.Err)
+	}
+	if b.Canonical != "" || b.CanonicalNoImage != "" {
+		t.Fatalf("a refused block still carries forms: %+v", b)
+	}
+
+	// Refused even with no digest to hold out, where no substitution would run: the rule
+	// is uniform rather than conditional on the image happening to be pinned today.
+	if got := oneBlock2(t, "    image: nginx:1.25\n    environment:\n      - D="+imageHeldOut+"\n"); got.Err == nil {
+		t.Fatal("a tag-only block carrying the placeholder was reduced")
+	}
+
+	// And the collision it closes: without the refusal these two reduced identically.
+	a := oneBlock(t, "    image: x@sha256:"+strings.Repeat("d", 64)+"\n    environment:\n      - D=sha256:"+strings.Repeat("d", 64)+"\n")
+	if strings.Contains(a.CanonicalNoImage, imageHeldOut) != true {
+		t.Fatalf("expected the held-out form to contain the placeholder:\n%s", a.CanonicalNoImage)
+	}
+}
+
+// The corrected form of a claim this file's header used to make. `"3000:3000"` does come
+// out unquoted, but a colon is a mapping indicator only when followed by whitespace, so it
+// reads back as the same scalar — and the emitter keeps quotes exactly where they are
+// load-bearing. That second half is the property replaceScalars depends on: it substitutes
+// into a VALUE and lets the emitter re-decide how to write it.
+func TestServiceBlock_QuotingIsDroppedButMeaningIsNot(t *testing.T) {
+	b := oneBlock(t, "    image: mysql:8\n    ports: [\"3000:3000\", \"127.0.0.1:8080:80\"]\n"+
+		"    environment: [\"KEY=a: b\", \"OTHER=x#y\"]\n")
+	// A value that needs no quotes loses them...
+	if !strings.Contains(b.Canonical, "- 3000:3000") {
+		t.Fatalf("expected an unquoted port:\n%s", b.Canonical)
+	}
+	// ...and one that does keeps them.
+	if !strings.Contains(b.Canonical, `'KEY=a: b'`) {
+		t.Fatalf("a value whose colon-space needs quoting lost them:\n%s", b.Canonical)
+	}
+	// Neither reading changed: reducing the canonical text again is a no-op, so the
+	// unquoted form parsed back to the same scalar rather than to a mapping.
+	again, err := CanonicalizeServiceBlock([]byte(b.Canonical))
+	if err != nil {
+		t.Fatalf("CanonicalizeServiceBlock: %v", err)
+	}
+	if again != b.Canonical {
+		t.Fatalf("the canonical text did not survive a re-read:\n%s\nvs\n%s", again, b.Canonical)
 	}
 }
 

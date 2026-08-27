@@ -43,11 +43,17 @@ package evidence
 //     knob here that could reasonably go the other way: sorting would remove a source
 //     of churn at the cost of a canonical text that no longer resembles the file.
 //
-// THE CANONICAL TEXT IS NOT DEPLOYABLE YAML. Dropping quote style means a value like
-// "3000:3000" comes out unquoted, which a YAML parser would read back as a mapping, and
-// the image hold-out replaces a real reference with a placeholder. It is a comparison
-// form, not a template — anything that copies it into a compose file is misusing it. That
-// costs nothing here, because nothing ever re-parses it.
+// THE CANONICAL TEXT IS NOT DEPLOYABLE YAML, because the image hold-out replaces a real
+// reference with a placeholder. It is a comparison form, not a template — anything that
+// copies it into a compose file is misusing it. That costs nothing here, because nothing
+// ever re-parses it.
+//
+// Dropping quote style is NOT part of that hazard, contrary to what this note used to
+// claim: `"3000:3000"` does come out unquoted, but a colon is only a mapping indicator
+// when followed by whitespace, so it reads straight back as the same scalar. The emitter
+// re-decides quoting per value and keeps it exactly where it is load-bearing — `KEY=a: b`
+// stays quoted — which is the same property replaceScalars relies on when it substitutes
+// into a value rather than into rendered text.
 //
 // THE IMAGE HOLD-OUT IS BY IDENTITY, NOT BY KEY, and that distinction came from a live
 // provider rather than from reasoning. Deleting the `image` key looks sufficient until a
@@ -59,6 +65,7 @@ package evidence
 import (
 	"crypto/sha256"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -153,6 +160,22 @@ func blockOf(name string, body *yaml.Node) ServiceBlock {
 	canonical, err := canonicalizeNode(body)
 	if err != nil {
 		b.Err = err
+		return b
+	}
+	// A block that already contains the placeholder is REFUSED, for the same reason
+	// indirection is: the substitution below is one-way and unescaped, so a value the
+	// provider wrote as the placeholder lands in the reduced form at exactly the position
+	// a real held-out digest would. Two different manifests then reduce identically. The
+	// collision is unlikely and, today, worth nothing to an attacker — the field it would
+	// realistically hit is the one being held out anyway — but a baseline matcher will be
+	// built on this reduction, and a manifest has no legitimate reason to carry the string.
+	//
+	// Refused uniformly, including when there is no digest to hold out and no substitution
+	// would run: "harmless until this service's image gets pinned" is not a state worth
+	// having, and one rule is easier to reason about than a conditional one.
+	if strings.Contains(canonical, imageHeldOut) {
+		b.Err = fmt.Errorf("the block contains %s, the string the image hold-out substitutes in, "+
+			"so its reduced form would be indistinguishable from one whose digest was erased", imageHeldOut)
 		return b
 	}
 	b.Canonical, b.Digest = canonical, digestOf(canonical)
@@ -314,11 +337,36 @@ func stripImageIdentity(n *yaml.Node, imageRef string) {
 		return
 	}
 	_, _, digest := compose.SplitImageRef(imageRef)
-	if digest == "" {
-		return // tag-only, or unparseable: nothing specific enough to erase
+	if !isDigestShaped(digest) {
+		// Tag-only, or an "@" followed by something that is not a digest. Nothing is
+		// erased in either case — including the full reference, which is short enough to
+		// be dangerous on its own when the digest half is junk.
+		return
 	}
 	replaceScalars(n, []string{imageRef, digest})
 }
+
+// digestShape is the OCI digest grammar — an algorithm, a colon, and its hex — with the
+// hex length floored at 32 so the needle is long enough to be specific.
+//
+// The floor is the whole point, because SplitImageRef performs NO shape check: it returns
+// whatever follows the last "@". A manifest naming `image: nginx@e` therefore yielded the
+// one-character needle "e", and substituting that across every scalar in the block shredded
+// it — the mapping key `environment` came out as `<image-held-out>nvironm<image-held-out>nt`,
+// leaving a reduced form that described no service at all. That is the direction this file's
+// header calls the dangerous one, on input the provider chooses freely.
+//
+// The tag branch already reasoned this way ("a tag is short and easy to hit by accident");
+// the digest branch simply assumed 64 hex because every real one is. Assuming a shape while
+// accepting whatever arrives is what left the gap.
+var digestShape = regexp.MustCompile(`^[a-z0-9]+(?:[.+_-][a-z0-9]+)*:[0-9a-f]{32,}$`)
+
+// isDigestShaped reports whether a reference's digest half really is a digest.
+//
+// Shared with composereview.go on purpose: "is this image pinned by content" must have one
+// answer. Without that, the review reported `nginx@e` as pinned by digest — a reassurance
+// about a reference that pins nothing — while the reduction refused to treat it as one.
+func isDigestShaped(digest string) bool { return digestShape.MatchString(digest) }
 
 // replaceScalars rewrites every scalar value in the subtree, substituting each needle in
 // the order given. Keys are scalars too and are covered by the same walk: a digest can

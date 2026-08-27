@@ -185,7 +185,12 @@ type ReviewedService struct {
 // Pinned reports whether the reference commits to image CONTENT rather than to a
 // name. Without a digest the compose hash pins the string "repo:tag", and what that
 // tag resolves to is the registry's business, not the enclave's.
-func (s ReviewedService) Pinned() bool { return s.Digest != "" }
+//
+// "Has a digest" is not the same as "has something after an @", which is all
+// compose.SplitImageRef can tell us — it returns whatever follows the last one. So this
+// asks isDigestShaped, the same question the reduction asks: `nginx@e` used to report as
+// pinned by digest, which is a reassurance about a reference that pins nothing.
+func (s ReviewedService) Pinned() bool { return isDigestShaped(s.Digest) }
 
 // ComposeReview is everything one authenticated app-compose was found to contain.
 type ComposeReview struct {
@@ -919,6 +924,15 @@ func (r *ComposeReview) reviewService(name string, body *yaml.Node, mounts *moun
 				"rather than to image content; there is nothing a baseline could pin")
 	case svc.Ref == "":
 		r.add(SeverityBlocking, name, "image", "the service names no image")
+	case svc.Digest != "" && !svc.Pinned():
+		// An "@" followed by something that is not a digest. Called out separately because
+		// it is the worse of the two: an unpinned tag looks unpinned, while this looks
+		// pinned to a reader skimming for "@sha256:" and pins nothing at all.
+		r.add(SeverityBlocking, name, "image", fmt.Sprintf(
+			"%s carries %q after the @, which is not a digest (an algorithm, a colon, and at least "+
+				"32 hex characters). Nothing is pinned — what the reference resolves to is still the "+
+				"registry's choice — and the malformed digest makes it read as pinned at a glance",
+			svc.Ref, svc.Digest))
 	case !svc.Pinned():
 		r.add(SeverityBlocking, name, "image", fmt.Sprintf(
 			"%s is not pinned by @sha256:; the compose hash then commits to a NAME, and what that name "+
