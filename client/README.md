@@ -184,6 +184,20 @@ wherever they appear in the block — and no further: a value that merely looks 
 digest is left alone, because erasing too much hides a real change while erasing too
 little only churns. See `evidence/composeblock.go`.
 
+Those blocks are then compared against the **recorded per-service baseline**
+(`evidence/brokercompose.json`) — the check that adjudicates, and the only part of the
+manifest section that can fail a run. Every direction: a recorded service the manifest
+does not declare, a declared service the baseline does not record (an unlisted container
+runs in the same guest as the reviewed ones), a service declared twice, a differing
+block, an image outside its rule. A mismatch carries no severity — it is not a review
+finding; either the deployment is the one we approved or it is not.
+
+The baseline **ships empty**, because recording cn-20's manifest as it stands would bless
+the ten blocking findings the review reports on it. So provider mode returns 3 until it is
+filled, saying the containers were not compared against anything. `-app-baseline <file>`
+reads a candidate instead, which is how the first one gets written and checked against a
+live provider before it is committed.
+
 The gateway mode matters for the third form above, which adds one attested trust
 party: it verifies the dstack-ingress cert-binding quote, confirms the certificate
 the domain **actually serves** is the one that quote committed to, and — given the

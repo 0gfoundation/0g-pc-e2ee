@@ -44,9 +44,21 @@
 // itself, which is what a baseline entry will hold; it is a comparison form, not
 // deployable YAML.
 //
+// Those blocks are then COMPARED against the recorded per-service baseline
+// (client/evidence/brokercompose.json) — the check that adjudicates, and the only part of
+// the manifest section that can fail a run. Every direction is checked: a recorded
+// service missing from the manifest, a manifest service the baseline does not record (an
+// unlisted container runs in the same guest as the reviewed ones), a service declared
+// twice, a block that differs, and an image outside its rule. The baseline ships EMPTY,
+// because recording cn-20's manifest as it stands would bless the ten blocking findings
+// the review reports on it — so provider mode returns 3 until it is filled, saying the
+// containers were not compared against anything. -app-baseline reads a candidate file
+// instead, which is how the first one gets written and checked against a live provider
+// before it is committed.
+//
 //	pcverify -provider 0x... [-chain-rpc-url ...] [-serving-contract 0x...]
 //	         [-endpoint https://...] [-expect-signer 0x...] [-no-quote]
-//	         [-pccs-url https://...] [-blocks]
+//	         [-pccs-url https://...] [-blocks] [-app-baseline brokercompose.json]
 //
 // The provider's serving endpoint is read from the chain (Service.url), so
 // -endpoint is only needed to override it. -no-quote restricts the run to the
@@ -155,14 +167,14 @@
 // and returns 3; -strict turns that into 1 instead. Treat 3 as failure in a gate
 // unless a partial verification is genuinely acceptable there.
 //
-// Both modes use it. In provider mode a 3 means one of three things, and the verdict
-// line names every one that applies rather than the first: the embedded broker-image
-// allowlist has no entry to compare against, so the code root did not run; the
-// provider published no app-compose (or a quote whose mr_config_id exposes no
-// compose_hash to gate one against), so what runs inside the audited image was not
-// read; or -no-quote skipped hops 2–4 by request. A provider that is allowlisted and
-// publishes its manifest reaches a clean 0 — which is what makes -strict usable here
-// as a gate.
+// Both modes use it. In provider mode a 3 means one of four things, and the verdict line
+// names every one that applies rather than the first: the embedded broker-image allowlist
+// has no entry to compare against, so the code root did not run; the provider published
+// no app-compose (or a quote whose mr_config_id exposes no compose_hash to gate one
+// against), so what runs inside the audited image was not read; no per-service baseline
+// is recorded, so the containers were not compared against anything; or -no-quote skipped
+// hops 2–4 by request. As shipped the third always applies, since brokercompose.json is
+// deliberately empty — pass -app-baseline with a candidate to reach a clean 0.
 package main
 
 import (
@@ -252,6 +264,7 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 	endpoint := fs.String("endpoint", "", "provider serving endpoint for the quote fetch (default: read from chain, Service.url)")
 	expectSigner := fs.String("expect-signer", "", "if set, require the on-chain teeSignerAddress to equal this")
 	noQuote := fs.Bool("no-quote", false, "skip the TDX quote hops; check only the on-chain signer (no provider contact)")
+	appBaseline := fs.String("app-baseline", "", "provider mode: read the per-service compose baseline from this file instead of the one built into the binary (see client/evidence/brokercompose.json). For writing and checking a candidate baseline against a live provider before committing it")
 	blocks := fs.Bool("blocks", false, "provider mode: print each service's canonical block text, not just its fingerprint. This is the text a per-service baseline is written from (client/evidence/composeblock.go); it is a COMPARISON form, not deployable YAML")
 	gateway := fs.String("gateway", "", "cloud-TEE gateway domain (e.g. pc-gateway.example.com); selects gateway mode — verify its /evidences bundle and compare the served certificate")
 	pccsURL := fs.String("pccs-url", "", "fetch DCAP collateral (TCB Info, QE Identity, PCK CRL) from this PCCS mirror instead of api.trustedservices.intel.com (e.g. https://pccs.phala.network); the root-CA CRL still comes from Intel. Applies to whichever mode verifies a quote")
@@ -338,6 +351,17 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 		return 2
 	}
 
+	// Loaded here rather than inside report so a malformed file is a caller/build error
+	// (exit 2) before any claim is made about the provider, matching how the broker-image
+	// allowlist is handled. An unreadable -app-baseline is the caller's mistake; a
+	// malformed EMBEDDED one is a defect in this build, and both are worth exiting on
+	// rather than degrading to "not configured", which would silently drop the check.
+	baseline, err := loadComposeBaseline(*appBaseline)
+	if err != nil {
+		fmt.Fprintf(out, "pcverify: %v\n", err)
+		return 2
+	}
+
 	var qc quoteChecker
 	if !*noQuote {
 		// Usage-class exit (2), not a check failure (1): a malformed embedded allowlist
@@ -353,7 +377,7 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 	ctx, cancel := context.WithTimeout(ctx, *timeout)
 	defer cancel()
 	return report(ctx, out, reg, qc, *provider, *servingContract, *endpoint, *expectSigner,
-		providerOpts{strict: *strict, blocks: *blocks})
+		providerOpts{strict: *strict, blocks: *blocks, baseline: baseline})
 }
 
 // providerOpts are provider-mode knobs that change what the run REPORTS, not what it
@@ -367,6 +391,10 @@ type providerOpts struct {
 	// off by default because the text is long and only one reader needs it: whoever is
 	// writing the per-service baseline the fingerprints are for.
 	blocks bool
+	// baseline is the per-service baseline to compare the manifest against. Passed in
+	// rather than loaded inside report so a test can drive the comparison, and so
+	// -app-baseline can substitute a candidate file for the embedded one.
+	baseline []evidence.BaselineService
 }
 
 // report runs the checks and prints a per-hop result, returning the process exit code
@@ -466,7 +494,7 @@ func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecke
 		// allowlisted image can still run entirely different containers, because
 		// mr_config_id commits to the manifest the OPERATOR chose. This is the only place
 		// in the tool that reads it.
-		failed, skip := reportManifest(out, pq, opts.blocks)
+		failed, skip := reportManifest(out, pq, opts.baseline, opts.blocks)
 		if failed {
 			ok = false
 		}
@@ -495,7 +523,7 @@ func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecke
 //     not write, and a heuristic wired to an exit code refuses a provider for being
 //     unusual. It is printed so a human can turn it into a baseline; the baseline is
 //     what will adjudicate. See evidence/composereview.go's header.
-func reportManifest(out io.Writer, pq providerQuote, dumpBlocks bool) (failed bool, skipped string) {
+func reportManifest(out io.Writer, pq providerQuote, baseline []evidence.BaselineService, dumpBlocks bool) (failed bool, skipped string) {
 	switch {
 	case !pq.HaveComposeHash:
 		fmt.Fprintf(out, "- app-compose      not read (%s)\n", reason(pq.ComposeHashErr,
@@ -585,6 +613,11 @@ func reportManifest(out io.Writer, pq providerQuote, dumpBlocks bool) (failed bo
 
 	// Never a mark: a ✓ or ✗ here would read as a verdict, and this is the one section
 	// of the report that deliberately has none.
+	// The baseline comparison, which is the check that ADJUDICATES — printed before the
+	// review so a reader meets the verdict before the advice. It is also the only part of
+	// this section that can fail the run.
+	failed = reportBaseline(out, review.Blocks, baseline)
+
 	fmt.Fprintf(out, "  compose review   %s — reported, never a gate\n", review.Summary())
 	for _, f := range review.Findings {
 		where := f.Service
@@ -596,7 +629,51 @@ func reportManifest(out io.Writer, pq providerQuote, dumpBlocks bool) (failed bo
 		}
 		fmt.Fprintf(out, "    [%s] %s: %s\n", f.Severity, where, f.Detail)
 	}
-	return false, ""
+	return failed, baselineSkip(baseline)
+}
+
+// baselineSkip names the gap when no baseline is recorded. An empty baseline is not a
+// pass: the comparison that would say "these are the containers we approved" did not
+// run, and exit 3 is what keeps a gate from reading that as a full verification —
+// exactly the contract an unconfigured boot-chain allowlist has one layer up.
+func baselineSkip(baseline []evidence.BaselineService) string {
+	if len(baseline) > 0 {
+		return ""
+	}
+	return "the manifest was not compared against a per-service baseline (none is recorded yet)"
+}
+
+// reportBaseline prints the baseline comparison and reports whether it FAILED.
+//
+// This is the adjudicating half of the manifest section, and the only part of it that
+// can fail a run. Its vocabulary is deliberately not the review's: a mismatch carries no
+// severity, because there is nothing to rank — either the deployment is the one that was
+// reviewed and recorded, or it is not.
+func reportBaseline(out io.Writer, blocks []evidence.ServiceBlock, baseline []evidence.BaselineService) bool {
+	check := evidence.CheckCompose(baseline, blocks)
+	if !check.Configured {
+		fmt.Fprintf(out, "- baseline         not compared (no per-service baseline recorded; see "+
+			"client/evidence/brokercompose.json)\n")
+		return false
+	}
+	if check.OK() {
+		fmt.Fprintf(out, "%s baseline         all %d service(s) match the recorded baseline\n",
+			mark(true), check.Matched)
+		return false
+	}
+	fmt.Fprintf(out, "%s baseline         %d of %d service(s) match; %d mismatch(es)\n",
+		mark(false), check.Matched, len(baseline), len(check.Mismatches))
+	for _, m := range check.Mismatches {
+		where := m.Service
+		if where == "" {
+			where = "manifest"
+		}
+		fmt.Fprintf(out, "    %s: %s\n", where, m.Reason)
+		if m.Diff != "" {
+			fmt.Fprintf(out, "      %s\n", m.Diff)
+		}
+	}
+	return true
 }
 
 // dumpBlock prints one canonical block, line-prefixed so it cannot be mistaken for the
@@ -655,6 +732,29 @@ func providerBootChains() (attest.BootChainPolicy, error) {
 		return attest.BootChainPolicy{}, err
 	}
 	return evidence.BootChainPolicyOf(images), nil
+}
+
+// loadComposeBaseline reads the per-service baseline, from path when given and from the
+// embedded file otherwise.
+//
+// A file given explicitly may legitimately be EMPTY — that is how an operator checks a
+// candidate baseline one service at a time — so unlike -os-image-allowlist this does not
+// reject an empty one. What it does reject is an unreadable or malformed one, in either
+// source: a baseline that failed to load and a baseline with no entries reach the report
+// as the same "not configured" state, and only one of them should be silent.
+func loadComposeBaseline(path string) ([]evidence.BaselineService, error) {
+	if strings.TrimSpace(path) == "" {
+		return evidence.BuiltinComposeBaseline()
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read -app-baseline: %w", err)
+	}
+	svcs, err := evidence.ParseComposeBaseline(raw)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	return svcs, nil
 }
 
 // dcapChecker is the real quoteChecker: it GETs the provider's /quote and

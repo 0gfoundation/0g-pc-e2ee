@@ -299,12 +299,25 @@ decision: enforce refuses an unlisted image, so it waits on the fleet, not on us
 > (`route.composeHashOf`, and the same shape in `pcverify`). With it, the provider's
 > `app-compose` is checked against the hash the quote binds, and what it authenticates
 > is reported: the container list on the identity endpoint, and in `pcverify -provider`
-> a structural review of the manifest as well. What is still missing is the thing that
-> would make it a *check*: a recorded per-service baseline to compare an authenticated
-> manifest against. The review deliberately gates nothing (see
+> a structural review of the manifest as well. The review deliberately gates nothing (see
 > `client/evidence/composereview.go`) — its rules are heuristics about a manifest we do
 > not write, and the adjudicating comparison has to be byte-exact against a baseline,
 > which is what the review exists to help write.
+>
+> That comparison now exists: `client/evidence/composebaseline.go` checks an
+> authenticated manifest against the recorded per-service baseline in
+> `brokercompose.json`, in every direction — a recorded service the manifest does not
+> declare, a declared service the baseline does not record, a service declared twice, a
+> differing block, an image outside its rule. A mismatch is not a review finding and
+> carries no severity: either the deployment is the one that was reviewed and recorded,
+> or it is not. What is still missing is the baseline's CONTENT. It ships empty, because
+> recording cn-20's manifest as it stands would bless the ten blocking findings the
+> review reports on it — four images pinned only by tag, `privileged` on
+> prometheus-node-exporter, and the container runtime's socket held by 0g-controller. So
+> `pcverify -provider` reports the containers as not compared (exit 3) until the file is
+> filled, and `-app-baseline` reads a candidate for checking one against a live provider
+> first. Wiring it into the SEALING path, behind its own enforce switch, waits on there
+> being a baseline worth enforcing.
 >
 > The comparison form that baseline will use already exists:
 > `client/evidence/composeblock.go` reduces each service to a **canonical block**, keeping
