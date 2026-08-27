@@ -105,15 +105,24 @@ func (b ServiceBlock) Pinnable() bool { return b.Err == nil }
 // would silently change what the review sees, in a way no test of either file alone
 // would catch. yaml.v3 has no Clone, hence cloneNode.
 func blockOf(name string, body *yaml.Node) ServiceBlock {
-	body = cloneNode(body)
 	b := ServiceBlock{Name: name}
-	// Indirection first, because an alias body is not a mapping either and would
-	// otherwise be refused with the wrong reason. Both are refusals, but "the body is
-	// not a mapping" sends a reader looking for a syntax error in a file that has none.
+	// BEFORE the clone, and that order is load-bearing rather than tidy. yaml.v3 resolves
+	// an alias by pointing Node.Alias at the anchored node, so a body that is anchored and
+	// references itself — `a: &x {depends_on: [*x]}` — gives a node graph with a CYCLE, not
+	// a tree. Cloning that first recursed forever and took the process down with an
+	// unrecoverable stack overflow, on input a provider chooses freely (they hash their own
+	// manifest, so the compose_hash gate is no obstacle at all). refuseIndirection walks
+	// only Content, which stays acyclic, and hits the AliasNode before anything follows the
+	// back-edge.
+	//
+	// It also still has the reason it was moved ahead of the mapping check: an alias body
+	// is not a mapping either, and "the body is not a mapping" would send a reader looking
+	// for a syntax error in a file that has none.
 	if err := refuseIndirection(body); err != nil {
 		b.Err = err
 		return b
 	}
+	body = cloneNode(body)
 	if body == nil || body.Kind != yaml.MappingNode {
 		b.Err = fmt.Errorf("the service body is not a mapping, so it has no canonical form")
 		return b
@@ -205,14 +214,24 @@ func refuseIndirection(n *yaml.Node) error {
 	return nil
 }
 
-// cloneNode deep-copies a node tree. Content and Alias are pointers, so a struct copy
+// cloneNode deep-copies a node tree. Content is a slice of pointers, so a struct copy
 // alone would leave the clone sharing children with the original — which is the failure
 // mode that makes "I only mutate my own copy" untrue.
+//
+// Alias is DROPPED rather than followed, for two independent reasons. It is the only edge
+// in a yaml.v3 node graph that can point backwards — an anchored node that references
+// itself makes a cycle — so following it is what turned this function into an infinite
+// recursion, and clearing it makes the walk structurally unable to loop regardless of
+// what any future caller does first. And it would be wrong even without the cycle: the
+// clone's Alias would point into a second copy of the tree rather than into the clone,
+// so nothing could use it correctly anyway. Every alias is refused upstream
+// (refuseIndirection), so no caller reaches here needing one.
 func cloneNode(n *yaml.Node) *yaml.Node {
 	if n == nil {
 		return nil
 	}
 	c := *n
+	c.Alias = nil
 	c.Content = nil
 	if len(n.Content) > 0 {
 		c.Content = make([]*yaml.Node, len(n.Content))
@@ -220,7 +239,6 @@ func cloneNode(n *yaml.Node) *yaml.Node {
 			c.Content[i] = cloneNode(child)
 		}
 	}
-	c.Alias = cloneNode(n.Alias)
 	return &c
 }
 

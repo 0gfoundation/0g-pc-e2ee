@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 // blocksOf runs the REAL path — ReviewCompose, hash gate included — over a compose text
@@ -22,10 +24,30 @@ func blocksOf(t *testing.T, doc string) map[string]ServiceBlock {
 	return out
 }
 
+// requireBlock looks a block up by name and fails when it is ABSENT.
+//
+// The plain map index would hand back a zero ServiceBlock instead — Err nil, Canonical
+// "" — which reads exactly like "this block reduced cleanly and is empty". A test written
+// against that would pass while asserting nothing; this happened once already, on a
+// fixture whose compose text turned out not to parse at all.
+func requireBlock(t *testing.T, doc, name string) ServiceBlock {
+	t.Helper()
+	blocks := blocksOf(t, doc)
+	b, ok := blocks[name]
+	if !ok {
+		names := make([]string, 0, len(blocks))
+		for n := range blocks {
+			names = append(names, n)
+		}
+		t.Fatalf("no block named %q — the compose text produced %v", name, names)
+	}
+	return b
+}
+
 // oneBlock is the shape most cases want: a single service named "svc".
 func oneBlock(t *testing.T, body string) ServiceBlock {
 	t.Helper()
-	b := blocksOf(t, "services:\n  svc:\n"+body)["svc"]
+	b := requireBlock(t, "services:\n  svc:\n"+body, "svc")
 	if b.Err != nil {
 		t.Fatalf("block has no canonical form: %v", b.Err)
 	}
@@ -259,7 +281,7 @@ func TestServiceBlock_RefusesIndirection(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			b := blocksOf(t, tc.doc)["svc"]
+			b := requireBlock(t, tc.doc, "svc")
 			if b.Err == nil {
 				t.Fatalf("indirection was reduced to a canonical form:\n%s", b.Canonical)
 			}
@@ -277,8 +299,105 @@ func TestServiceBlock_RefusesIndirection(t *testing.T) {
 	}
 }
 
+// A CYCLE, not just an indirection. yaml.v3 resolves an alias by pointing Node.Alias at
+// the anchored node, so a body that is anchored and references itself gives a node graph
+// with a back-edge — and a deep copy that followed Alias recursed until the runtime
+// killed the process with an unrecoverable stack overflow. The input is entirely the
+// provider's: they write the manifest and hash it themselves, so nothing upstream filters
+// it.
+//
+// The three cases above all put the anchor OUTSIDE the service body (`x-base: &base`),
+// which is why they missed this: those graphs are still trees from the body's point of
+// view. These put the anchor ON the body, which is what closes the loop.
+//
+// Asserted as a normal return rather than with a recover(): a stack overflow is a runtime
+// fatal, so this test can only pass by not crashing — if the bug comes back, the whole
+// test binary dies and no assertion runs.
+func TestServiceBlock_SelfReferencingAnchorDoesNotCrash(t *testing.T) {
+	for _, tc := range []struct{ name, doc string }{
+		{
+			"body anchors itself and a value aliases it",
+			"services:\n  a: &x\n    image: mysql:8.0\n    depends_on: [*x]\n",
+		},
+		{
+			"the alias is nested deeper",
+			"services:\n  a: &x\n    image: mysql:8.0\n    deploy:\n      labels:\n        self: *x\n",
+		},
+		{
+			"a mapping key is the alias",
+			"services:\n  a: &x\n    image: mysql:8.0\n    labels:\n      ? *x\n      : self\n",
+		},
+		{
+			// A later service aliasing an earlier one is legal and is NOT a cycle, but it
+			// is the shape closest to one, so it belongs in this table: the refusal must
+			// cover it too, since its canonical form would be `*x`.
+			"a later service aliases an earlier body",
+			"services:\n  a: &x\n    image: mysql:8.0\n  b: *x\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Every case names the service whose body carries the alias.
+			name := "a"
+			if strings.Contains(tc.doc, "  b: *x") {
+				name = "b"
+			}
+			b := requireBlock(t, tc.doc, name)
+			if b.Err == nil {
+				t.Fatalf("a self-referencing anchor was reduced to a canonical form:\n%s", b.Canonical)
+			}
+			if !strings.Contains(b.Err.Error(), "anchor") {
+				t.Fatalf("err = %v, want it to name the anchor", b.Err)
+			}
+		})
+	}
+
+	// Mutual cycles between two services are not expressible: YAML requires an anchor to
+	// be defined before it is referenced, so a forward reference is a parse error and the
+	// text never reaches a block at all. Asserted so nobody adds a fixture for it and
+	// mistakes "no block" for "refused".
+	t.Run("a forward anchor reference never becomes a block", func(t *testing.T) {
+		doc := "services:\n  a:\n    image: mysql:8.0\n    depends_on: [*y]\n  b: &y\n    image: redis:7\n"
+		r := reviewOf(t, manifest(doc))
+		if len(r.Blocks) != 0 {
+			t.Fatalf("blocks = %+v, want none — the compose text does not parse", r.Blocks)
+		}
+		requireFinding(t, r, SeverityBlocking, "", "docker_compose_file")
+	})
+}
+
+// The cycle is only reachable through Alias, so clearing it in the clone is what makes
+// cloneNode structurally unable to loop — independently of refuseIndirection running
+// first. Asserted directly, because it is the reason a future caller that forgets the
+// ordering still cannot crash the process.
+func TestCloneNode_DropsAliasAndDoesNotFollowCycles(t *testing.T) {
+	var root yaml.Node
+	if err := yaml.Unmarshal([]byte("a: &x\n  self: *x\n"), &root); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	body := root.Content[0].Content[1]
+	alias := body.Content[1]
+	// The premise: yaml.v3 really does close the loop. If this stops holding, the guard
+	// below is no longer testing anything and should be revisited rather than deleted.
+	if alias.Kind != yaml.AliasNode || alias.Alias != body {
+		t.Fatalf("yaml.v3 did not build a cycle: alias kind=%d Alias=%p body=%p", alias.Kind, alias.Alias, body)
+	}
+
+	clone := cloneNode(body) // must terminate
+	if clone == body {
+		t.Fatal("cloneNode returned the original node")
+	}
+	if clone.Content[1].Alias != nil {
+		t.Fatal("the clone still carries an Alias pointer, so the walk can still loop")
+	}
+	// And it is a real deep copy: mutating the clone must not reach the original.
+	clone.Content[0].Value = "mutated"
+	if body.Content[0].Value == "mutated" {
+		t.Fatal("the clone shares nodes with the original")
+	}
+}
+
 func TestServiceBlock_BodyThatIsNotAMapping(t *testing.T) {
-	b := blocksOf(t, "services:\n  svc: notamapping\n")["svc"]
+	b := requireBlock(t, "services:\n  svc: notamapping\n", "svc")
 	if b.Err == nil {
 		t.Fatalf("a scalar body was reduced: %q", b.Canonical)
 	}
