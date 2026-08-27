@@ -173,8 +173,16 @@ deployment, and that baseline, compared byte-exact, is what will adjudicate.
 Each service also carries its **canonical block** fingerprint, and `-blocks` prints the
 canonical text. That is the form the future baseline will be written and compared in:
 comments, indentation and quoting are dropped, everything that changes what runs is kept,
-and the image reference is held out separately so a broker release does not force a
-gateway release. See `evidence/composeblock.go`.
+and the image **identity** is held out separately so a broker release does not force a
+gateway release.
+
+Identity rather than the `image` key, because a real manifest defeats the simpler
+version: cn-20's broker services copy the digest into an environment variable
+(`IMAGE_DIGEST=sha256:…`), so deleting the key left the copy behind and the held-out
+fingerprint moved on every release anyway. The reference and its digest are erased
+wherever they appear in the block — and no further: a value that merely looks like a
+digest is left alone, because erasing too much hides a real change while erasing too
+little only churns. See `evidence/composeblock.go`.
 
 The gateway mode matters for the third form above, which adds one attested trust
 party: it verifies the dstack-ingress cert-binding quote, confirms the certificate

@@ -935,6 +935,14 @@ func (r *ComposeReview) reviewService(name string, body *yaml.Node, mounts *moun
 				"answer for its contents, so it needs an upstream answer like any third-party image",
 			svc.Ref, firstPartyNamespace, reg))
 	}
+	// Two `image` keys in one body: a compose runtime resolves the duplicate to one of
+	// them, so what actually runs is not what the manifest states — and a baseline reading
+	// the first would describe a container the second replaced.
+	if countKey(body, "image") > 1 {
+		r.add(SeverityBlocking, name, "image",
+			"the service declares image more than once, so which one runs depends on how the "+
+				"runtime resolves a duplicate key rather than on the manifest")
+	}
 	if mapValue(body, "build") != nil && svc.Ref != "" {
 		r.add(SeverityJustify, name, "build",
 			"the service declares both an image and a build; which one ran depends on how the deployment was "+
@@ -1471,6 +1479,22 @@ func splitRegistry(image string) (registry, repo string) {
 // `privileged:` at all produce the same zero, and a reader that collapsed them would
 // hand every rule a silent way to pass. The compiler enforces the discipline: there is
 // no single-value form of these to call by accident.
+
+// countKey counts how many times a key appears in a mapping node. YAML permits a
+// duplicate key and yaml.v3 keeps both pairs, so "present" and "present once" are
+// different questions and only one of them is answered by mapValue.
+func countKey(n *yaml.Node, key string) int {
+	if n == nil || n.Kind != yaml.MappingNode {
+		return 0
+	}
+	count := 0
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		if n.Content[i].Value == key {
+			count++
+		}
+	}
+	return count
+}
 
 func mapValue(n *yaml.Node, key string) *yaml.Node {
 	if n == nil || n.Kind != yaml.MappingNode {

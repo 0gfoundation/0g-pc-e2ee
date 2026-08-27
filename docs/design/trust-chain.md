@@ -311,9 +311,16 @@ decision: enforce refuses an unlisted image, so it waits on the fleet, not on us
 > every difference that changes what runs (values, keys, key order, scalar types) and
 > dropping every one that does not (comments, indentation, quoting, flow-versus-block
 > style). It emits two forms per service — the whole block, and the block with the image
-> reference held out — because the baseline pins them separately: everything a deployment
-> decided should not move without review, while the image moves on every broker release,
-> and pinning it exactly would mean a gateway release per broker release. The baseline
+> **identity** held out — because the baseline pins them separately: everything a
+> deployment decided should not move without review, while the image moves on every broker
+> release, and pinning it exactly would mean a gateway release per broker release.
+>
+> Identity, not the `image` key: cn-20's broker services copy the digest into an
+> environment variable, so deleting the key left the copy behind and the held-out
+> fingerprint moved on every release regardless — for three services at once, since they
+> share a digest. The reference and its digest are erased wherever they appear in the
+> block, and deliberately no further, because erasing too much would let a modified block
+> compare equal to its baseline while erasing too little only causes churn. The baseline
 > will store canonical **text**, not digests, so that both sides are reduced by the same
 > function at comparison time and the linked YAML library's formatting preferences cancel
 > out — and so that a reviewer can read the file and a broker upgrade shows up as a

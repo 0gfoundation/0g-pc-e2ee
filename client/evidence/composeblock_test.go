@@ -247,13 +247,253 @@ func TestServiceBlock_ImageHoldOut(t *testing.T) {
 		t.Fatal("a change outside the image did not move both digests")
 	}
 
-	// A service with no image at all still reduces, and the two forms then agree.
-	noImg := oneBlock(t, "    restart: always\n")
+	// A service with no image at all still reduces, and the two forms then agree — the
+	// hold-out has nothing to remove and must not invent a placeholder.
+	noImg := oneBlock(t, "    restart: always\n    environment:\n      - SOME=sha256:deadbeef\n")
 	if noImg.ImageRef != "" {
 		t.Fatalf("ImageRef = %q for a service with no image", noImg.ImageRef)
 	}
-	if noImg.Digest != noImg.DigestNoImage {
-		t.Fatal("with no image to hold out, the two forms must be identical")
+	if noImg.Digest != noImg.DigestNoImage || noImg.Canonical != noImg.CanonicalNoImage {
+		t.Fatalf("with no image to hold out, the two forms must be identical:\n%s\nvs\n%s",
+			noImg.Canonical, noImg.CanonicalNoImage)
+	}
+	if strings.Contains(noImg.CanonicalNoImage, imageHeldOut) {
+		t.Fatalf("a placeholder appeared with no image to hold out:\n%s", noImg.CanonicalNoImage)
+	}
+}
+
+// --- the hold-out is by identity, not by key ------------------------------------
+
+// cn20BrokerService is the real shape from provider
+// 0x4870CbC4D07d6Ac2EE5aA865588e5985FE77a4E9: the digest appears twice, once as the
+// image reference and once copied into an environment variable. Verbatim rather than
+// simplified, because the whole finding is that a plausible-looking manifest does this
+// and a key-based hold-out silently fails on it.
+const cn20BrokerService = `    image: ghcr.io/0gfoundation/0g-serving-broker@sha256:%[1]s
+    environment:
+      - IMAGE_REPO=ghcr.io/0gfoundation/0g-serving-broker
+      - IMAGE_DIGEST=sha256:%[1]s
+    volumes:
+      - zg-tee:/var/lib/zg-tee
+      - ./logs/broker:/var/log/inference
+    restart: always
+`
+
+const (
+	cn20Digest = "ec5df8347f91c3b28a6638db4e24dba343799c0a3a7e2cdd44845a3a27f2e734"
+	nextDigest = "1111111111111111111111111111111111111111111111111111111111111111"
+)
+
+// The core assertion of the identity hold-out. Deleting the `image` key left the copy in
+// `environment` behind, so DigestNoImage moved on every broker release and the hold-out
+// bought nothing — which is the coupling ("a broker release forces a gateway release")
+// this split exists to prevent.
+func TestServiceBlock_HoldsOutDigestCopiedIntoEnvironment(t *testing.T) {
+	a := oneBlock(t, fmt.Sprintf(cn20BrokerService, cn20Digest))
+	b := oneBlock(t, fmt.Sprintf(cn20BrokerService, nextDigest))
+
+	if a.DigestNoImage != b.DigestNoImage {
+		t.Fatalf("a digest bump moved DigestNoImage:\n%s\nvs\n%s", a.CanonicalNoImage, b.CanonicalNoImage)
+	}
+	if a.Digest == b.Digest {
+		t.Fatal("a digest bump did not move the full Digest")
+	}
+	// Nothing digest-shaped may survive in the reduced form, in any spelling.
+	for _, leak := range []string{cn20Digest, "sha256:" + cn20Digest, a.ImageRef} {
+		if strings.Contains(a.CanonicalNoImage, leak) {
+			t.Fatalf("CanonicalNoImage still carries %q:\n%s", leak, a.CanonicalNoImage)
+		}
+	}
+	// The full form must still describe the deployment as it stands.
+	if !strings.Contains(a.Canonical, cn20Digest) {
+		t.Fatalf("Canonical lost the real digest:\n%s", a.Canonical)
+	}
+}
+
+// cn-20 runs the same broker digest in three services. A key-based hold-out therefore
+// broke three baseline entries per release, not one — which is what made the churn
+// intolerable rather than merely annoying.
+func TestServiceBlock_ThreeServicesSharingOneBrokerDigest(t *testing.T) {
+	doc := func(digest string) string {
+		return fmt.Sprintf(`services:
+  0g-serving-provider-broker:
+    image: ghcr.io/0gfoundation/0g-serving-broker@sha256:%[1]s
+    environment:
+      - IMAGE_DIGEST=sha256:%[1]s
+    volumes:
+      - zg-tee:/var/lib/zg-tee
+  0g-serving-provider-event:
+    image: ghcr.io/0gfoundation/0g-serving-broker@sha256:%[1]s
+    environment:
+      - IMAGE_DIGEST=sha256:%[1]s
+    volumes:
+      - zg-tee:/var/lib/zg-tee
+      - ./logs/event:/var/log/inference
+  0g-controller:
+    image: ghcr.io/0gfoundation/0g-serving-broker@sha256:%[1]s
+    environment:
+      - IMAGE_DIGEST=sha256:%[1]s
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+volumes:
+  zg-tee:
+`, digest)
+	}
+	before, after := blocksOf(t, doc(cn20Digest)), blocksOf(t, doc(nextDigest))
+
+	for _, name := range []string{"0g-serving-provider-broker", "0g-serving-provider-event", "0g-controller"} {
+		a, b := before[name], after[name]
+		if !a.Pinnable() || !b.Pinnable() {
+			t.Fatalf("%s: %v / %v", name, a.Err, b.Err)
+		}
+		if a.DigestNoImage != b.DigestNoImage {
+			t.Errorf("%s: one digest bump moved its block-no-image", name)
+		}
+		if a.Digest == b.Digest {
+			t.Errorf("%s: the full block did not move", name)
+		}
+	}
+	// The three still differ from each other — the hold-out erases the image, not the
+	// per-service differences a baseline is there to pin.
+	seen := map[string]string{}
+	for name, b := range before {
+		if other, dup := seen[b.DigestNoImage]; dup {
+			t.Errorf("%s and %s reduced to the same block despite different volumes", name, other)
+		}
+		seen[b.DigestNoImage] = name
+	}
+}
+
+// The two values that must survive, both from cn-20. A looser matcher would erase either,
+// and each erasure is a real loss: the repository says where the broker came from, and the
+// model revision is what a baseline would notice a model swap by.
+func TestServiceBlock_HoldOutDoesNotOverreach(t *testing.T) {
+	t.Run("IMAGE_REPO survives", func(t *testing.T) {
+		b := oneBlock(t, fmt.Sprintf(cn20BrokerService, cn20Digest))
+		if !strings.Contains(b.CanonicalNoImage, "IMAGE_REPO=ghcr.io/0gfoundation/0g-serving-broker") {
+			t.Fatalf("the repository was erased along with the digest:\n%s", b.CanonicalNoImage)
+		}
+		// And it is load-bearing: changing the registry must move the reduced form.
+		swapped := strings.Replace(fmt.Sprintf(cn20BrokerService, cn20Digest),
+			"IMAGE_REPO=ghcr.io/0gfoundation", "IMAGE_REPO=evil.example.com/0gfoundation", 1)
+		if oneBlock(t, swapped).DigestNoImage == b.DigestNoImage {
+			t.Fatal("changing IMAGE_REPO did not move DigestNoImage")
+		}
+	})
+
+	t.Run("a model revision is untouched", func(t *testing.T) {
+		// 0gm-sglang's shape: a 40-hex git revision, which is not an image digest.
+		const rev = "802e58f5c8211f04079bfb5c27fb2c6ab629b686"
+		body := "    image: lmsysorg/sglang@sha256:" + cn20Digest + "\n" +
+			"    ipc: host\n    command: --revision " + rev + "\n"
+		b := oneBlock(t, body)
+		if !strings.Contains(b.CanonicalNoImage, rev) {
+			t.Fatalf("the model revision was erased:\n%s", b.CanonicalNoImage)
+		}
+		// Changing the model must move the reduced form — that is the point of keeping it.
+		other := strings.Replace(body, rev, strings.Repeat("f", 40), 1)
+		if oneBlock(t, other).DigestNoImage == b.DigestNoImage {
+			t.Fatal("swapping the model revision did not move DigestNoImage")
+		}
+	})
+
+	t.Run("a tag-only image behaves as before", func(t *testing.T) {
+		// cn-20 has four of these (prometheus, grafana, node-exporter, dcgm-exporter). No
+		// value replacement happens: a tag is short and easy to hit by accident, and such a
+		// service's reduced form is not worth much anyway.
+		body := "    image: prom/prometheus:v2.45.2\n    environment:\n      - TAG=v2.45.2\n"
+		b := oneBlock(t, body)
+		if !strings.Contains(b.CanonicalNoImage, "TAG=v2.45.2") {
+			t.Fatalf("a tag was erased from a value:\n%s", b.CanonicalNoImage)
+		}
+		if strings.Contains(b.CanonicalNoImage, "image:") {
+			t.Fatalf("the image key survived:\n%s", b.CanonicalNoImage)
+		}
+	})
+}
+
+// Both awkward positions for the digest: on the key side of a mapping, and buried inside
+// a longer scalar. The second is the cn-20 case; the first is the one a text-level
+// substitution would be most likely to mishandle.
+func TestServiceBlock_HoldOutCoversKeysAndSubstrings(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{
+			"digest inside a longer scalar",
+			"    image: mysql@sha256:%[1]s\n    command: --check sha256:%[1]s --go\n",
+		},
+		{
+			"digest as a mapping key",
+			"    image: mysql@sha256:%[1]s\n    labels:\n      sha256:%[1]s: self\n",
+		},
+		{
+			"the whole reference repeated",
+			"    image: mysql@sha256:%[1]s\n    environment:\n      REF: mysql@sha256:%[1]s\n",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := oneBlock(t, fmt.Sprintf(tc.body, cn20Digest))
+			b := oneBlock(t, fmt.Sprintf(tc.body, nextDigest))
+			if a.DigestNoImage != b.DigestNoImage {
+				t.Fatalf("a digest bump moved DigestNoImage:\n%s\nvs\n%s", a.CanonicalNoImage, b.CanonicalNoImage)
+			}
+			if strings.Contains(a.CanonicalNoImage, cn20Digest) {
+				t.Fatalf("the digest survived:\n%s", a.CanonicalNoImage)
+			}
+			// Longest-match-first: a repeated full reference must not come out as
+			// "<held-out>@<held-out>".
+			if strings.Contains(a.CanonicalNoImage, imageHeldOut+"@") {
+				t.Fatalf("a full reference was replaced piecewise:\n%s", a.CanonicalNoImage)
+			}
+		})
+	}
+}
+
+// A duplicate `image` key would leave the second one in the reduced form if removeKey
+// stopped at the first — leaving exactly the reference the hold-out exists to remove.
+func TestServiceBlock_DuplicateImageKey(t *testing.T) {
+	doc := "services:\n  svc:\n    image: mysql@sha256:" + cn20Digest +
+		"\n    restart: always\n    image: redis@sha256:" + nextDigest + "\n"
+	b := requireBlock(t, doc, "svc")
+	if b.Err != nil {
+		t.Fatalf("block: %v", b.Err)
+	}
+	if strings.Contains(b.CanonicalNoImage, "image:") {
+		t.Fatalf("an image key survived the hold-out:\n%s", b.CanonicalNoImage)
+	}
+	// Only the first reference's identity is erased by value, so the second's digest may
+	// remain — but its KEY must be gone, which is what removeKey now guarantees.
+	if strings.Contains(b.CanonicalNoImage, "redis@") {
+		t.Fatalf("the second image reference survived:\n%s", b.CanonicalNoImage)
+	}
+	// And the review reports the ambiguity, since which image runs is not stated.
+	requireFinding(t, reviewOf(t, manifest(doc)), SeverityBlocking, "svc", "image")
+}
+
+// Idempotence has to hold for the REDUCED form too, or a stored baseline would not
+// survive being reduced again at comparison time — which is the whole reason the baseline
+// stores text.
+func TestServiceBlock_ReducedFormIsIdempotent(t *testing.T) {
+	for _, body := range []string{
+		fmt.Sprintf(cn20BrokerService, cn20Digest),
+		"    image: prom/prometheus:v2.45.2\n    restart: always\n",
+		"    restart: always\n",
+	} {
+		b := oneBlock(t, body)
+		for _, form := range []string{b.Canonical, b.CanonicalNoImage} {
+			again, err := CanonicalizeServiceBlock([]byte(form))
+			if err != nil {
+				t.Fatalf("CanonicalizeServiceBlock: %v", err)
+			}
+			if again != form {
+				t.Fatalf("reducing a canonical form changed it:\n%s\nvs\n%s", again, form)
+			}
+		}
+		// The placeholder must be a plain scalar the emitter leaves alone — if it started
+		// getting quoted, the round trip above would already have failed, but say why.
+		if strings.Contains(b.CanonicalNoImage, `"`+imageHeldOut+`"`) ||
+			strings.Contains(b.CanonicalNoImage, `'`+imageHeldOut+`'`) {
+			t.Fatalf("the placeholder is being quoted:\n%s", b.CanonicalNoImage)
+		}
 	}
 }
 
@@ -520,6 +760,33 @@ func TestServiceBlocks_DoNotDisturbTheReview(t *testing.T) {
 	}
 	if strings.Contains(b.Canonical, "#") {
 		t.Fatalf("canonical form carries the comment:\n%s", b.Canonical)
+	}
+
+	// The image hold-out now REWRITES scalar values, not just deletes a key — so the
+	// clone matters more than it did. If a substitution leaked back into the caller's
+	// tree, the review would report a placeholder as the provider's image reference, and
+	// every downstream judgement (pinned? which namespace?) would be about a string we
+	// invented. This is the assertion most likely to break in a future change here.
+	cn20 := fmt.Sprintf(`services:
+  0g-serving-provider-broker:
+    image: ghcr.io/0gfoundation/0g-serving-broker@sha256:%[1]s
+    environment:
+      - IMAGE_DIGEST=sha256:%[1]s
+`, cn20Digest)
+	rc := reviewOf(t, manifest(cn20))
+	svc := rc.Services[0]
+	if !strings.Contains(svc.Ref, cn20Digest) || svc.Digest != "sha256:"+cn20Digest {
+		t.Fatalf("the review lost the real digest to the hold-out: ref=%q digest=%q", svc.Ref, svc.Digest)
+	}
+	if !svc.Pinned() || svc.Origin != OriginFirstParty {
+		t.Fatalf("the review's image judgement changed: %+v", svc)
+	}
+	if strings.Contains(svc.Ref, imageHeldOut) {
+		t.Fatalf("a placeholder reached the review: %q", svc.Ref)
+	}
+	// The reduced form did erase it, on the clone.
+	if strings.Contains(rc.Blocks[0].CanonicalNoImage, cn20Digest) {
+		t.Fatalf("the block kept the digest:\n%s", rc.Blocks[0].CanonicalNoImage)
 	}
 
 	// The alignment claim is by construction, so it has to hold for the shapes that
