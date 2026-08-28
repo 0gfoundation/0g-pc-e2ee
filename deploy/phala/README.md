@@ -580,12 +580,13 @@ it sealed a request to
 is the one the response carried in `X-Provider`.
 
 No new setting is required — the route is on by default and reads results the request
-path already produced. Three settings govern whether it can answer anything, and what
+path already produced. Four settings govern whether it can answer anything, and what
 it can say:
 
 | Setting | Effect |
 |---|---|
 | `ZG_GATEWAY_ATTEST` | **required.** Without quote verification nothing is verified, so there is no verdict to report and the route is not mounted at all. |
+| `ZG_GATEWAY_ATTEST_ENFORCE` | on (as deployed), an out-of-allowlist boot chain fails the verification, so that provider gets no record and its address 404s — `verdicts.measurement` is `pass` in every record that exists. Off, the same provider is sealed to and reported as `no_match`. |
 | `ZG_GATEWAY_ONCHAIN` | when off, `verdicts.onchain_signer` is `not_checked` rather than a comparison result. When on but the chain could not be read, it is `unavailable` — a chain-RPC problem is never reported as a finding against the provider. |
 | `ZG_GATEWAY_PROVIDER_IDENTITY_ENDPOINT` | on by default; set `false` to remove the route entirely. Appears in the compose only as a commented-out line, per this file's convention. |
 
@@ -621,12 +622,17 @@ to, and nothing corresponds to `matched_release`. Use it to tell which lines to 
 about and which need an upstream answer; it says nothing about *which build* of an
 image is running.
 
-`verdicts.measurement` reads `pass` for a provider on a listed image and `no_match`
-for one that is not — most providers today, since the fleet is still migrating. The
-third value, `no_baseline`, means this build's `client/evidence/brokerimages.json`
-carried no entry to compare against, so it says nothing about the provider and a panel
-must render it as "observed only" rather than as a failure; a release should never show
-it. Smoke-test after deploying:
+`verdicts.measurement` reads `pass` for a provider on a listed image and `no_match` for
+one that is not — but on this deployment, which enforces the allowlist, only the first
+of those is reachable: a provider on an unlisted image never becomes a record, so it
+404s instead of being reported as `no_match` (see the table above). `no_match` is what a
+gateway running that check in warn mode reports, and reading it out of a *warn-mode*
+gateway is how you check whether the fleet is on listed images before enabling enforce —
+an enforcing gateway cannot answer that question, because every provider it can describe
+has already passed. The third value, `no_baseline`, means this build's
+`client/evidence/brokerimages.json` carried no entry to compare against, so it says
+nothing about the provider and a panel must render it as "observed only" rather than as
+a failure; a release should never show it. Smoke-test after deploying:
 
 ```sh
 # the address the sealed request was pinned to
@@ -639,6 +645,17 @@ curl -s "https://<DOMAIN>/v1/providers/$ADDR/identity" | jq
 # an address never used must 404
 curl -sS -o /dev/null -w '%{http_code}\n' "https://<DOMAIN>/v1/providers/0x0000000000000000000000000000000000000000/identity"
 ```
+
+Under enforce this smoke test is self-selecting, which changes how to read both of its
+outcomes. The request completes only if some candidate cleared the allowlist, so the
+address it returns necessarily reports `measurement: "pass"` — that is not evidence
+about the rest of the fleet. And an **empty `ADDR`** (the completion itself failed) is
+the shape a fleet problem takes here: no candidate the router offered was on a listed
+image, rather than anything wrong with this endpoint. Tell the two apart from
+`quote_verifications_total{result="error"}` and
+`candidate_fallbacks_total{reason="materialize"}` rising together, and note there is no
+"boot chain not in the allowlist" log line to look for — that one belongs to warn mode;
+under enforce the refusal is a verification failure like any other.
 
 ## Pin the image digest
 
@@ -924,14 +941,45 @@ and warmer liveness).
   header and are unaffected by any of this. The default carries two `localhost`
   ports as development conveniences — drop them via the override on a deployment
   that does not need dev hosts reaching this enclave.
-- **Provider verification** is on, part enforced and part verify-and-warn. Each provider's TDX
+- **Provider verification** is on and enforced, with one check still verify-and-warn. Each provider's TDX
   quote is DCAP-verified (`ZG_GATEWAY_ATTEST`), its quote-bound signer is
   cross-checked against the on-chain `teeSignerAddress`
   (`ZG_GATEWAY_ONCHAIN`), and each response's §8 TEE signature is verified
   fail-closed against that signer (`ZG_GATEWAY_VERIFY_RESPONSES`). A background
   warmer (`ZG_GATEWAY_WARM`) pre-verifies quotes so requests hit a warm cache.
-  Two checks only *warn*, for **different** reasons — worth keeping apart, because one
-  is a switch and the other is not:
+  The **boot-chain** check (hop 3) is **enforced** (`ZG_GATEWAY_ATTEST_ENFORCE`): a
+  provider whose boot chain is not in the allowlist is refused rather than warned about,
+  and the request falls back to the next candidate — with a single provider registered
+  there is none, so it fails. The allowlist is `client/evidence/brokerimages.json`,
+  embedded, one entry per audited OS image; it compares MRTD + RTMR1 + RTMR2 rather than
+  all five registers, so an entry pins one image rather than one CVM. Three things follow
+  from enforcing it, and they are the whole operational cost of this switch:
+
+  - **The allowlist travels with the build, not with the compose.** The startup log line
+    names the entries the running image carries; read it after every deploy, because an
+    enforcing gateway on a build carrying the wrong entries refuses the entire fleet.
+  - **Check the fleet before each rollout, not once.** A provider that moves to a new
+    guest-OS release is refused until an entry for that release is computed and shipped
+    in a new gateway build — see "When a PROVIDER upgrades its broker" below, whose
+    step 1 is now load-bearing rather than advisory. `pcverify -provider <address>`
+    answers it per provider (an unlisted provider is a FAIL, exit 1). Note that the
+    running gateway answers it only *while enforce is off*: in warn mode
+    `GET /v1/providers/{address}/identity` reports `verdicts.measurement: "no_match"`
+    for exactly the providers enforce would refuse, whereas under enforce those
+    providers have no record at all and the endpoint 404s — a refused candidate is not
+    a verified one. So a survey taken from an enforcing gateway shows a clean fleet
+    whether or not the fleet is clean; take it from a warn-mode gateway, or from
+    `pcverify`.
+  - **`quote_measurement_untrusted_total` stops counting.** Under enforce an unlisted
+    image never reaches the warn path — it becomes a quote-verification failure instead,
+    so watch `quote_verifications_total{result="error"}` and `warmer_ready_providers`
+    for refusals. That counter sitting at zero is the switch working, not the fleet
+    converging.
+
+  To ride out a fleet that has drifted, set `ZG_GATEWAY_ATTEST_ENFORCE=false` and
+  redeploy: the verification stays, only the verdict softens.
+
+  One check still only *warns*:
   - the **on-chain signer** check (trust-chain hop 5) is wired and observed;
     `ZG_GATEWAY_ONCHAIN_ENFORCE` is simply off, so turning it on is a config change.
     Read `onchain_grounding_total` from `/metrics` before flipping it: warn mode is
@@ -956,18 +1004,6 @@ and warmer liveness).
     stands on the cached quote" (throttled or the quote fetch failed), "the cached quote
     had rotated" (benign, and it resolves), and "the quote signer had not rotated and
     the mismatch stands" (live quote, live chain read, still disagreeing).
-  - the **boot-chain** check (hop 3) now has an allowlist —
-    `client/evidence/brokerimages.json`, embedded, one entry per audited OS image, and
-    the startup log line names the entries a build carries. It compares MRTD + RTMR1 +
-    RTMR2 rather than all five registers, so an entry pins one image rather than one
-    CVM. `ZG_GATEWAY_ATTEST_ENFORCE` stays off while providers are still on images that
-    are not listed: enforce refuses those outright, and it is only safe to turn on for a
-    deployment whose every routed provider is on a listed image. The same change moved
-    `pcverify -provider`: an unlisted provider is now a FAIL (exit 1) rather than the
-    "not compared" it reported while the allowlist was empty (exit 3). Nothing in this
-    repository gates on that exit code, but a run against a provider not yet migrated
-    now reports a finding rather than a gap — which is the honest report, and worth
-    knowing before wiring it into anything.
 
   Response signatures are always fail-closed.
 - If the gateway container is recreated with a new address, restart
@@ -990,8 +1026,9 @@ and warmer liveness).
      a broker upgrade that reuses the same image needs no allowlist change: it moves
      `compose_hash`, `enc_pub` and `signer_addr`, none of which hop 3 compares. A CVM
      moved to a NEW guest-OS release does need an entry first, computed per
-     `client/evidence/brokerimages.json`, or `ZG_GATEWAY_ATTEST_ENFORCE` refuses the
-     upgraded broker outright.
+     `client/evidence/brokerimages.json` and shipped in a new gateway build — with
+     `ZG_GATEWAY_ATTEST_ENFORCE` on, a broker that boots an unlisted release is refused
+     outright, so this step is a prerequisite of the rollout rather than a note about it.
   2. **Keep the on-chain acknowledgement close to the roll** — the gap between the
      two is the window.
   3. **Expect the provider to be skipped during it.** With several providers

@@ -201,7 +201,12 @@ screen:
      `result="failed"`; the panels here deliberately do not.
 5. **Attestation & E2EE**: quote-cache hit ratio, verifications by result, verify
    latency, response-signature verification failures by reason (fetch vs
-   signature), untrusted-measurement rate, E2EE open failures.
+   signature), untrusted-measurement rate, E2EE open failures. Read the
+   untrusted-measurement rate against the mode: with `ZG_GATEWAY_ATTEST_ENFORCE` on
+   (as deployed) it is zero **by construction** — an unlisted boot chain fails the
+   verification instead of taking the warn path, so it lands in "verifications by
+   result" as an `error`. It is a signal only in warn mode, where it is the baseline
+   that says whether enforce can be turned on.
 6. **On-chain grounding (hop 5)**: ready-provider count, chain-RPC lookup-failure
    and signer-mismatch rates, all grounding outcomes, and revalidations. This row
    is what says whether `ZG_GATEWAY_ONCHAIN_ENFORCE` can be turned on: while

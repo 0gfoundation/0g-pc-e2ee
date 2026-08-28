@@ -180,7 +180,10 @@ type providerVerdicts struct {
 	// Measurement: the boot chain against the audited allowlist (hop 3). "pass" in it,
 	// "no_match" not in it, "no_baseline" when the build carried no entry at all — a
 	// panel must render that last one as "observed only", never as a pass and never as
-	// a failure, since it says nothing about the provider.
+	// a failure, since it says nothing about the provider. Which values a panel can
+	// actually receive depends on the deployment's mode: under -attest-enforce
+	// "no_match" is unreachable, because that provider is refused rather than recorded
+	// and the address 404s (route.ProviderIdentity.Measurement).
 	Measurement route.Verdict `json:"measurement"`
 }
 

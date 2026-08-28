@@ -15,9 +15,10 @@ command below is a convenience, not the source of truth — the
 
 > **Scope.** This document covers the **gateway** — the 0G-operated enclave that takes
 > your request and seals it to a provider. The gateway verifies the *provider* on your
-> behalf per request: two of those checks **reject** (a provider whose TDX quote does not
-> DCAP-verify is not used, a response whose TEE signature does not verify is not returned
-> to you) and two currently only **warn**. That is a separate chain, and
+> behalf per request: three of those checks **reject** (a provider whose TDX quote does
+> not DCAP-verify is not used, nor is one whose OS image is not in the audited allowlist,
+> and a response whose TEE signature does not verify is not returned to you) and one —
+> the on-chain signer cross-check — currently only **warns**. That is a separate chain, and
 > [`design/trust-chain.md`](./design/trust-chain.md) marks the status of each of its links.
 
 ---
@@ -347,7 +348,7 @@ curl -s https://<gateway-domain>/v1/providers/0x7B3f…9aC1/identity
   "verdicts": {
     "quote_dcap": "pass",          // genuine, Intel-rooted TDX quote binding these keys
     "onchain_signer": "pass",      // its signer is the acknowledged teeSignerAddress on chain
-    "measurement": "no_match"      // its boot chain is not an audited image (hop 3);
+    "measurement": "pass"          // its boot chain is one of the audited OS images (hop 3);
                                    // "no_baseline" would mean we audited none
   },
   "os_image": null,
@@ -410,10 +411,13 @@ Reading the verdicts:
 | `not_checked` | this deployment does not perform that check at all |
 
 `measurement` is `pass` for a provider on an image in the audited allowlist
-(`client/evidence/brokerimages.json`) and `no_match` for one that is not — most
-providers while the fleet migrates. `no_baseline` means the build carried no entry to
-compare against, so it says nothing about the provider: render that one as "observed
-only", not as a pass and not as a failure.
+(`client/evidence/brokerimages.json`) and `no_match` for one that is not. On the deployed
+gateway, which runs `ZG_GATEWAY_ATTEST_ENFORCE`, you will not see `no_match` here: an
+unlisted image makes the candidate unusable, so nothing is sealed to it and no record is
+written — the address `404`s instead (same as a quote that fails DCAP, below).
+`no_match` is what a gateway running that check in *warn* mode reports. `no_baseline`
+means the build carried no entry to compare against, so it says nothing about the
+provider: render that one as "observed only", not as a pass and not as a failure.
 `onchain_signer` is `not_checked` unless the deployment runs with `ZG_GATEWAY_ONCHAIN`.
 
 Two things the endpoint will not do. It answers **only for providers this gateway has
@@ -424,8 +428,9 @@ with those is verify the quote, which you should do at the source.
 
 A provider the gateway *rejected* is reported too, with the verdict that rejected it —
 better than leaving an earlier `pass` standing while every request is refusing that
-provider. The one exception is a quote that failed DCAP outright: that leaves no record,
-so the address simply `404`s.
+provider. The exceptions are the rejections that happen inside quote verification itself:
+a quote that failed DCAP outright, and (under `ZG_GATEWAY_ATTEST_ENFORCE`) one whose boot
+chain is not allowlisted. Neither leaves a record, so the address simply `404`s.
 
 It needs `ZG_GATEWAY_ATTEST` (without quote verification there are no verdicts to
 report, and the route is not mounted at all) and can be switched off with
