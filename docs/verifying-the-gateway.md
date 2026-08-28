@@ -378,13 +378,15 @@ curl -s https://<gateway-domain>/v1/providers/0x7B3f…9aC1/identity
   underneath it while the hash holds still. It is independent of `source` — an image
   can be ours and unpinned, and pinned and not ours.
 
-And as with the verdicts: the list being present is not approval. Nothing compared
-these images against an expected set, and hop 3 is not that set — its allowlist is
-populated, but it pins the provider's guest **OS image**, and would say nothing about
-container images even fully enforced. What is missing is a per-service baseline, which
-does not exist yet: `pcverify -provider` reads the same authenticated manifest and
-reports what would have to change before one could be written (unpinned images,
-`privileged`, host mounts), and reports it precisely because nothing adjudicates it.
+And as with the verdicts: the list being present is not approval. Nothing *the gateway
+served you* compared these images against an expected set, and hop 3 is not that set —
+its allowlist is populated, but it pins the provider's guest **OS image**, and would say
+nothing about container images even fully enforced. The per-service baseline that does
+compare them exists — the one `pcverify -provider` carries records cn-20's twelve
+services, and reports any other manifest as a mismatch — but it is not yet wired into
+the gateway's sealing path, so it is a check you can run and not one this record reflects. Alongside it,
+`pcverify` reports what would still have to change in that manifest (unpinned images,
+`privileged`, host mounts) precisely because recording a deployment is not approving it.
 
 **Unlike the self-description above, this one does carry verdicts — and that is
 correct.** These are checks the gateway actually ran on a *third party* before it

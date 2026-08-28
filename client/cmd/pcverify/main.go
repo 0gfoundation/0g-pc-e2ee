@@ -32,16 +32,16 @@
 // composereview.go). The review REPORTS and never gates: its rules are heuristics
 // about a manifest we did not write, and a heuristic wired to an exit code refuses a
 // provider for being unusual. It is there so a per-service baseline can be written
-// from a real deployment; the baseline, once it exists, is what will adjudicate. A
-// provider that publishes no app_compose at all is a 3, not a pass.
+// from a real deployment, and it keeps reporting after one has been; the baseline is
+// what adjudicates. A provider that publishes no app_compose at all is a 3, not a pass.
 //
 // Beside each service the run prints its CANONICAL BLOCK fingerprint — two of them,
-// because a baseline will pin them separately: `block` covers everything the deployment
+// because the baseline pins them separately: `block` covers everything the deployment
 // decided, and `block-no-image` is the half that must not move when the broker ships a
 // new image digest (see client/evidence/composeblock.go). The fingerprints make a sweep
 // across providers able to say which services are already identical fleet-wide, which is
-// the fact a first baseline has to be written against. -blocks prints the canonical text
-// itself, which is what a baseline entry will hold; it is a comparison form, not
+// the fact a baseline revision has to be written against. -blocks prints the canonical
+// text itself, which is what a baseline entry holds; it is a comparison form, not
 // deployable YAML.
 //
 // Those blocks are then COMPARED against the recorded per-service baseline
@@ -49,12 +49,11 @@
 // the manifest section that can fail a run. Every direction is checked: a recorded
 // service missing from the manifest, a manifest service the baseline does not record (an
 // unlisted container runs in the same guest as the reviewed ones), a service declared
-// twice, a block that differs, and an image outside its rule. The baseline ships EMPTY,
-// because recording cn-20's manifest as it stands would bless the ten blocking findings
-// the review reports on it — so provider mode returns 3 until it is filled, saying the
-// containers were not compared against anything. -app-baseline reads a candidate file
-// instead, which is how the first one gets written and checked against a live provider
-// before it is committed.
+// twice, a block that differs, and an image outside its rule. The baseline records cn-20's
+// twelve services; recording is not approval, and the ten blocking findings the review
+// reports on that manifest are still reported on every run (see the file's header, and
+// the per-entry notes). -app-baseline reads a candidate file instead, which is how the
+// next revision gets checked against a live provider before it is committed.
 //
 //	pcverify -provider 0x... [-chain-rpc-url ...] [-serving-contract 0x...]
 //	         [-endpoint https://...] [-expect-signer 0x...] [-no-quote]
@@ -173,8 +172,9 @@
 // no app-compose (or a quote whose mr_config_id exposes no compose_hash to gate one
 // against), so what runs inside the audited image was not read; no per-service baseline
 // is recorded, so the containers were not compared against anything; or -no-quote skipped
-// hops 2–4 by request. As shipped the third always applies, since brokercompose.json is
-// deliberately empty — pass -app-baseline with a candidate to reach a clean 0.
+// hops 2–4 by request. The third no longer applies as shipped — brokercompose.json
+// records cn-20's twelve services — so against a provider running that manifest a clean 0
+// is now reachable, and any other manifest fails the comparison rather than skipping it.
 package main
 
 import (
@@ -275,7 +275,7 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 	noDNSDiscovery := fs.Bool("no-dns-discovery", false, "gateway mode: do not derive the platform base domain from DNS; check only what was passed in")
 	expectComposeFile := fs.String("expect-compose-file", "", "gateway mode: path to the docker-compose manifest this deployment should be running (a digest-pinned docker-compose.release.yml), compared against the authenticated app-compose's docker_compose_file. Overrides the default -releases lookup")
 	releases := fs.Int("releases", defaultReleases, "gateway mode: accept the deployment if its compose text matches any of the newest N published releases, and report which one. 0 disables the lookup")
-	strict := fs.Bool("strict", false, "require every check to RUN, not merely to not fail: anything that would report an advisory \"-\" (exit 3) fails the run instead (exit 1). Gateway mode — a releases or app-compose lookup that cannot be completed; it demands the checks without demanding their inputs, so discovery still supplies them. Provider mode — hop 3, which cannot pass when the audited allowlist has no entry to compare against; the app-compose read, which cannot happen when the provider publishes none; and the per-service baseline comparison, which cannot run when no baseline is recorded. That last one applies to EVERY run as shipped, since client/evidence/brokercompose.json is deliberately empty — pass -app-baseline with a candidate to reach a clean run")
+	strict := fs.Bool("strict", false, "require every check to RUN, not merely to not fail: anything that would report an advisory \"-\" (exit 3) fails the run instead (exit 1). Gateway mode — a releases or app-compose lookup that cannot be completed; it demands the checks without demanding their inputs, so discovery still supplies them. Provider mode — hop 3, which cannot pass when the audited allowlist has no entry to compare against; the app-compose read, which cannot happen when the provider publishes none; the per-service baseline comparison, which cannot run when no baseline is recorded (client/evidence/brokercompose.json records cn-20's services, so as shipped this gap applies only to a provider whose manifest could not be read at all); and -no-quote, which skips hops 2-4 by request and so cannot be combined with this flag")
 	releaseRepo := fs.String("repo", defaultReleaseRepo, "gateway mode: owner/name to read releases from, with -releases")
 	releaseAsset := fs.String("release-asset", defaultReleaseAsset, "gateway mode: release asset holding the deployment manifest, with -releases")
 	timeout := fs.Duration("timeout", 30*time.Second, "overall timeout")
@@ -402,16 +402,17 @@ type providerOpts struct {
 // failed, 3 nothing failed but a check did not run (see verdict). It takes interfaces
 // so tests drive it without a live chain or provider.
 //
-// Provider mode reaches "did not run" through three doors, and the verdict line names
+// Provider mode reaches "did not run" through four doors, and the verdict line names
 // every one that applies rather than the first: an allowlist with no entry means the
 // boot-chain comparison cannot happen, a provider that publishes no app-compose means
-// what runs inside it was not read, and an empty per-service baseline means the
-// containers were not compared against anything. Any of them leaves the run incomplete
-// however well every other hop went, which is the distinction a CI gate needs — it would
-// otherwise read an unconsulted check as a pass.
+// what runs inside it was not read, an empty per-service baseline means the containers
+// were not compared against anything, and -no-quote skips hops 2–4 outright. Any of them
+// leaves the run incomplete however well every other hop went, which is the distinction a
+// CI gate needs — it would otherwise read an unconsulted check as a pass.
 //
-// As SHIPPED the third always applies: brokercompose.json is deliberately empty (see its
-// header), so a clean 0 requires -app-baseline with a candidate.
+// The third no longer applies as shipped: brokercompose.json records cn-20's twelve
+// services (see its header). Against a different manifest the comparison FAILS rather
+// than skipping, which is the point — it now has something to say.
 func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecker, provider, contract, endpointOverride, expectSigner string, opts providerOpts) int {
 	fmt.Fprintf(out, "provider           %s\n", provider)
 	fmt.Fprintf(out, "contract           %s\n", contract)
@@ -589,7 +590,7 @@ func reportManifest(out io.Writer, pq providerQuote, baseline []evidence.Baselin
 		// the deployment decided, `block-no-image` is the half that must NOT move when
 		// the broker ships a new digest. Printing both is what makes a fleet sweep able
 		// to say "eleven providers run the same broker block" without printing eleven
-		// blocks — and, for the operator writing the first baseline, which services are
+		// blocks — and, for the operator writing a baseline revision, which services are
 		// already identical across the fleet.
 		if i < len(review.Blocks) {
 			b := review.Blocks[i]
