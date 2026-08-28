@@ -535,7 +535,9 @@ func OnChainRevalidation(result string) { onchainRevalidations.WithLabelValues(r
 func WarmerSignerRefresh(result string) { warmerSignerRefresh.WithLabelValues(result).Inc() }
 
 // WarmerReadyProviders records how many providers the last sweep prepared end to
-// end (endpoint resolved, quote verified, on-chain signer read).
+// end (endpoint resolved, quote verified, on-chain signer read — and, under
+// -onchain-enforce, in agreement: a signer the registry does not vouch for, or one
+// that could not be read, leaves that provider out).
 func WarmerReadyProviders(n int) { warmerReadyProviders.Set(float64(n)) }
 
 // WarmerSweep records the outcome of one warmer sweep.

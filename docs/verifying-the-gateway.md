@@ -15,11 +15,12 @@ command below is a convenience, not the source of truth — the
 
 > **Scope.** This document covers the **gateway** — the 0G-operated enclave that takes
 > your request and seals it to a provider. The gateway verifies the *provider* on your
-> behalf per request: three of those checks **reject** (a provider whose TDX quote does
-> not DCAP-verify is not used, nor is one whose OS image is not in the audited allowlist,
-> and a response whose TEE signature does not verify is not returned to you) and one —
-> the on-chain signer cross-check — currently only **warns**. That is a separate chain, and
-> [`design/trust-chain.md`](./design/trust-chain.md) marks the status of each of its links.
+> behalf per request, and all four of those checks now **reject**: a provider whose TDX
+> quote does not DCAP-verify is not used, nor is one whose OS image is not in the audited
+> allowlist, nor one whose TEE signer the on-chain registry does not vouch for, and a
+> response whose TEE signature does not verify is not returned to you. That is a separate
+> chain, and [`design/trust-chain.md`](./design/trust-chain.md) marks the status of each
+> of its links.
 
 ---
 
@@ -419,6 +420,12 @@ written — the address `404`s instead (same as a quote that fails DCAP, below).
 means the build carried no entry to compare against, so it says nothing about the
 provider: render that one as "observed only", not as a pass and not as a failure.
 `onchain_signer` is `not_checked` unless the deployment runs with `ZG_GATEWAY_ONCHAIN`.
+On the deployed gateway, which also runs `ZG_GATEWAY_ONCHAIN_ENFORCE`, a `no_match` here
+means that provider was **refused** — nothing was sealed to it — rather than used with
+the disagreement merely logged. Unlike `measurement` above, the record is still written
+and readable, because an earlier `pass` left standing while the gateway refuses that
+provider would be the worse answer. `unavailable` is our own chain RPC, not a finding
+about the provider, and under enforce it too means the candidate was not used.
 
 Two things the endpoint will not do. It answers **only for providers this gateway has
 checked while serving a request**, and only for a few minutes afterwards — any other
