@@ -1056,8 +1056,8 @@ func TestClassifyOrigin(t *testing.T) {
 		{"localhost:5000/0gfoundation/broker", OriginForeignRegistry},
 		{"registry.internal:5000/0gfoundation/broker", OriginForeignRegistry},
 	} {
-		if got := classifyOrigin(tc.image); got != tc.want {
-			t.Errorf("classifyOrigin(%q) = %v, want %v", tc.image, got, tc.want)
+		if got := ClassifyImageOrigin(tc.image); got != tc.want {
+			t.Errorf("ClassifyImageOrigin(%q) = %v, want %v", tc.image, got, tc.want)
 		}
 	}
 }

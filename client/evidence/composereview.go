@@ -913,7 +913,7 @@ func (r *ComposeReview) reviewService(name string, body *yaml.Node, mounts *moun
 		// "not pinned" finding below. A splitter that erred the other way, inventing a
 		// digest, would be the one thing that must not happen here.
 		svc.Image, svc.Tag, svc.Digest = compose.SplitImageRef(svc.Ref)
-		svc.Origin = classifyOrigin(svc.Image)
+		svc.Origin = ClassifyImageOrigin(svc.Image)
 	}
 	r.Services = append(r.Services, svc)
 
@@ -1447,14 +1447,21 @@ func parseMount(n *yaml.Node) (src, target string, readOnly, ok bool) {
 	}
 }
 
-// classifyOrigin reads the registry AND the namespace out of an image repository. See
-// ImageOrigin for why the answer is a column in a report and not a rule.
+// ClassifyImageOrigin reads the registry AND the namespace out of an image repository.
+// See ImageOrigin for why the answer is a column in a report and not a rule.
 //
 // Both halves, because the namespace alone means nothing: anyone can push
 // "0gfoundation/broker" to a registry they control, and a classifier that read the path
 // and ignored the host called that first-party — i.e. said "ask us and we can resolve
 // this" about an image we never published.
-func classifyOrigin(image string) ImageOrigin {
+//
+// Exported because it is the ONE place this repository decides whether an image is
+// ours, and both of the gateway's identity endpoints label their container lists with
+// it (`client/cmd/gateway`). It takes a repository — no tag, no digest — which is what
+// compose.Service.Image and ReviewedService.Image both hold; passing a full reference
+// would put the tag inside the namespace comparison and answer third-party for
+// everything.
+func ClassifyImageOrigin(image string) ImageOrigin {
 	registry, repo := splitRegistry(strings.TrimSpace(image))
 	if repo == "" {
 		return OriginNone

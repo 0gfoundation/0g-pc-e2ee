@@ -298,11 +298,47 @@ func TestProviderIdentityRoute_ReportsContainers(t *testing.T) {
 	if doc.Containers[2].Digest != "" {
 		t.Errorf("prometheus digest = %q, want empty for a tag-only reference", doc.Containers[2].Digest)
 	}
-	// No `source` field: no per-provider manifest is published, so there is no release
-	// to trace an image to, and a "third-party" stamp on 0G's own broker image (a
-	// different repository) would be worse than saying nothing.
-	if strings.Contains(body, `"source"`) {
-		t.Errorf("provider containers must not carry a source label; body:\n%s", body)
+	// The `source` label, in the same vocabulary as /v1/gateway/identity. The broker is
+	// the case that decides the classifier: it is 0G's, and it ships from a DIFFERENT
+	// repository, so a repo-scoped rule would stamp it third-party.
+	for i, want := range []string{sourceOwn, sourceThirdParty, sourceThirdParty} {
+		if got := doc.Containers[i].Source; got != want {
+			t.Errorf("containers[%d] (%s) source = %q, want %q",
+				i, doc.Containers[i].Image, got, want)
+		}
+	}
+}
+
+// The label describes the image's publisher and nothing else. In particular it must not
+// be read as — or quietly become — a claim that the image is pinned, since the two are
+// independent and a reader who conflates them reads "0g-release" as "and it is the
+// build we published".
+func TestProviderIdentityRoute_SourceIsIndependentOfPinning(t *testing.T) {
+	rec := pidFullRecord()
+	rec.Containers = []compose.Service{
+		// Ours, pinned by nothing but a tag.
+		{Name: "broker", Ref: "ghcr.io/0gfoundation/0g-serving-broker:v1.2.3",
+			Image: "ghcr.io/0gfoundation/0g-serving-broker", Tag: "v1.2.3"},
+		// Our namespace on a registry we do not publish through, pinned by digest. The
+		// digest makes it no more ours than the tag made the first one less.
+		{Name: "mirror", Ref: "evil.example.com/0gfoundation/0g-serving-broker@sha256:aa11",
+			Image: "evil.example.com/0gfoundation/0g-serving-broker", Digest: "sha256:aa11"},
+	}
+	gw, _ := pidGateway(t, &stubIdentities{record: rec, have: true})
+
+	_, body := pidGet(t, gw.URL+pidPath)
+	var doc providerIdentityDoc
+	if err := json.Unmarshal([]byte(body), &doc); err != nil {
+		t.Fatalf("decode: %v\n%s", err, body)
+	}
+	if got := doc.Containers[0].Source; got != sourceOwn {
+		t.Errorf("an unpinned image of ours = %q, want %q — pinning is reported by digest, not by source", got, sourceOwn)
+	}
+	if doc.Containers[0].Digest != "" {
+		t.Errorf("digest = %q, want empty — the tag-only reference must still read as unpinned", doc.Containers[0].Digest)
+	}
+	if got := doc.Containers[1].Source; got != sourceThirdParty {
+		t.Errorf("our namespace on a foreign registry = %q, want %q — a digest does not make it ours", got, sourceThirdParty)
 	}
 }
 

@@ -247,10 +247,13 @@ Two properties follow, and both are enforced in code (`client/cmd/gateway/identi
   mismatch reports `containers: null` rather than a list. Publishing a container list
   out of unchecked bytes would be the gateway vouching for itself, which is precisely
   what §6.2 says it must not do.
-- **`containers[].source` distinguishes what can be traced from what cannot.** All
-  four containers are covered by `compose_hash`, but only the images built from this
-  repository correspond to a GitHub release; third-party images (`dstack-ingress`,
-  `prometheus`) get a digest and never a release link.
+- **`containers[].source` says who published each image.** All four containers are
+  covered by `compose_hash`; what differs is who answers for the contents. The label
+  reads the reference's registry and namespace, so it is a fact about the
+  authenticated compose text rather than about whether a release lookup succeeded —
+  `matched_release` is a property of the *deployment*, `source` of each *image*, and
+  third-party images (`dstack-ingress`, `prometheus`) get a digest and never a release
+  link. The same label, computed the same way, appears on §6.4's provider list.
 
 This does not reopen the "no `/quote` route" decision: publishing a parsed
 *description* of an attestation is a different act from signing one.
@@ -307,10 +310,25 @@ nothing about container images even fully enforced. The missing piece is a per-s
 baseline — see `client/evidence/composereview.go`, which reads the same authenticated
 manifest and reports how far it is from being one, and deliberately adjudicates nothing. The one finding it carries unaided is an **empty digest**:
 an image pinned by tag leaves `compose_hash` committing to a *name* whose contents can
-be republished under it, so the absence is rendered rather than hidden. Unlike §6.3's
-container list there is no `source` label, because no per-provider manifest is
-published — there is no release to trace an image to, and the label would end up
-stamping "third-party" on 0G's own broker image for shipping from another repository.
+be republished under it, so the absence is rendered rather than hidden.
+
+Each entry carries §6.3's `source` label, in the same two values, and making that
+possible meant narrowing what the label claims. It cannot mean "traceable to a GitHub
+release": no per-provider manifest is published, so for a provider there is no release
+to trace to. It means **who published the image**, which an authenticated compose text
+answers for a provider exactly as well as it does for us — and which one classifier
+now answers for both endpoints, reading the reference's registry and namespace rather
+than this repository's release namespace. That is the load-bearing part: a repo-scoped
+rule stamps "third-party" on 0G's own broker image for shipping from another
+repository, which is why the label was withheld here until it was replaced. Our
+namespace on a registry we do *not* publish through collapses into `third-party`, a
+direction that can fail to flag a lookalike but can never bless one; `pcverify`'s
+origin column keeps that case distinct for a reader who needs it.
+
+The label is not a check either, and for a sharper reason than the list is: "0G
+published it" says nothing about *which build* of it this is, so an image of ours with
+a year-old CVE carries the same label as the current one. It sorts a list into "ask 0G"
+and "ask upstream", and does not adjudicate.
 
 The asymmetry with §6.3 is the point, so state it precisely. There, the gateway is
 describing **itself**, and nothing verified anything, so a verdict of any shape would
