@@ -8,13 +8,13 @@ boundary, limitations); this doc assembles them into one chain so a reviewer can
 see there are no gaps — and where the gaps still are.
 
 > Status: every link below is **implemented**; what differs is how far each one is
-> actually carried in the deployed gateway. Four are qualified, and the qualifications are
-> not the same kind:
+> actually carried in the deployed gateway. Four are worth a note, and the notes are not
+> the same kind:
 >
 > - **hop 3** (the *code root*) — the allowlist is populated
->   (`client/evidence/brokerimages.json`, one entry per audited OS image) but enforce is
->   off: it refuses an unlisted image, and providers are still running images that are
->   not listed. A deployment decision now, not a code change.
+>   (`client/evidence/brokerimages.json`, one entry per audited OS image) and enforce is
+>   **on**: an unlisted image is refused, not warned about. Its OS half is closed; the
+>   container half below it is read but not adjudicated.
 > - **hop 5** — wired and observed; its enforce switch is deliberately off.
 > - **hop 11** — enforced, but only because `-verify-responses` is on; it is off by default.
 > - **hop 12** — replay is defeated client-side only; a server-side freshness field is TODO.
@@ -222,13 +222,13 @@ Honest gaps — half the value of this diagram is marking them (see
 
 The chain is fully *specified* and wired, including the on-chain identity grounding
 (hop 5). Read the Status note above for which links are enforced and which only observed:
-the table below says what exists, not how far the deployment carries it, and hop 3 in
-particular has its allowlist while its enforce switch waits on the fleet.
+the table below says what exists, not how far the deployment carries it — hop 3 now has
+both, and hop 5 has the mechanism with its switch still off.
 
 | Link | Status | Where |
 |------|--------|-------|
 | Hop 2 — TDX quote signature-chain verification | **Implemented.** A real go-tdx-guest DCAP verifier (quote chain → Intel root + QE identity + TCB status) fills the `WithQuoteParser` seam, wired into the sidecar, gateway, and route resolver. The seam stays in `protocol/attest` by design (keeps `protocol` lean/portable); the heavy verifier lives in the client. | `client/dcap/tdxverify.go`, `client/cmd/{sidecar,gateway}/main.go`, #29 / #31 |
-| Hop 3 — boot-chain allowlist | **Implemented, allowlist populated.** `Verifier.Verify` compares the quote's `BootChain` (MRTD + RTMR1 + RTMR2) against `BootChainPolicy` in enforce/warn modes (`-attest-enforce`). The expected values are **published as an embedded file in this repository** — `client/evidence/brokerimages.json`, one entry per audited OS image, beside the gateway's own `osimages.json` — which answers what used to be the open half of this hop. Each entry records the release it was computed from with `dstack-mr` and confirmed against a live quote; an entry that cannot say that is refused in review. `-attest-enforce` is still off in deployment, not for want of a mechanism but because providers are still running images that are not listed, and enforce refuses those. | `attest/verify.go`, `attest/measurement.go`, `client/evidence/brokerimage.go`, #31 |
+| Hop 3 — boot-chain allowlist | **Implemented, allowlist populated, enforced.** `Verifier.Verify` compares the quote's `BootChain` (MRTD + RTMR1 + RTMR2) against `BootChainPolicy` in enforce/warn modes (`-attest-enforce`). The expected values are **published as an embedded file in this repository** — `client/evidence/brokerimages.json`, one entry per audited OS image, beside the gateway's own `osimages.json` — which answers what used to be the open half of this hop. Each entry records the release it was computed from with `dstack-mr` and confirmed against a live quote; an entry that cannot say that is refused in review. `-attest-enforce` is **on** in deployment, so an unlisted image is refused before anything is sealed to it; the allowlist ships with the gateway build, which makes a provider's guest-OS upgrade something to sequence against a gateway release. | `attest/verify.go`, `attest/measurement.go`, `client/evidence/brokerimage.go`, #31 |
 | Hop 4 — `report_data` → `enc_pub`/`signer_addr` | **Implemented.** `ParseReportData` (SPEC §4.2 layout). | `attest/reportdata.go` |
 | Hop 5 — `signer_addr == on-chain teeSignerAddress` | **Implemented (warn/enforce).** The route resolver cross-checks the DCAP-quote-bound signer against the provider's *acknowledged* `teeSignerAddress` read from the on-chain InferenceServing registry (`getService`), keyed on the provider's on-chain account — a mapping the untrusted router cannot forge. This is what catches a *genuine* enclave running audited code but operated by an unregistered party ([Why the on-chain root exists](#why-the-on-chain-root-exists)). Enforce skips a missing/unacknowledged/mismatched candidate; warn observes only. A failed *lookup* is fail-closed too, with no opt-out — so enforce means the chain was actually read — but is counted as its own class rather than as a provider accusation; and a negative is never returned on stale or cached evidence without a live re-read ([What hop 5 concludes, and what it does not](#what-hop-5-concludes-and-what-it-does-not)). Reads the chain over a client-trusted RPC (`-onchain`, `-chain-rpc-url`), not the router. | `client/chain/registry.go`, `client/route` `WithOnChainVerification`, #18 |
 | Hops 6–9 — HPKE seal/open, AAD binding | **Implemented.** | `crypto/`, `wire/` |
@@ -237,38 +237,40 @@ particular has its allowlist while its enforce switch waits on the fleet.
 So today every link is **wired**, but they are not all **enforced**, and the difference
 matters:
 
-- **Enforced** — hop 2 (quote authenticity, with `-attest`), hop 4 (`report_data` →
-  `enc_pub`), hops 6–9 (seal/open and AAD binding), and hop 11 (the §8 response
-  signature, with `-verify-responses`; fail-closed by construction). A candidate or a
-  response that fails any of these is refused.
-- **Warn only** — hop 3, because the fleet is not yet all on listed images: the
-  allowlist exists and is populated, but enforce refuses an unlisted image, so
-  `-attest-enforce` stays off until the providers being routed to are on entries the
-  build carries. And hop 5, whose
-  `-onchain-enforce` is deliberately off while on-chain provider data is still filling
-  in; it is wired and observed, and turning it on is a switch rather than work.
+- **Enforced** — hop 2 (quote authenticity, with `-attest`), hop 3 (the boot-chain
+  allowlist, with `-attest-enforce`), hop 4 (`report_data` → `enc_pub`), hops 6–9
+  (seal/open and AAD binding), and hop 11 (the §8 response signature, with
+  `-verify-responses`; fail-closed by construction). A candidate or a response that
+  fails any of these is refused.
+- **Warn only** — hop 5, whose `-onchain-enforce` is deliberately off while on-chain
+  provider data is still filling in; it is wired and observed, and turning it on is a
+  switch rather than work.
 
-So hops 3 and 5 are now in the same position, and it is worth being exact about which
-one: **both are switches, not work.** The code root's OS half is done — the allowlist is
-populated, and a provider on a listed image *clears hop 3* in `pcverify -provider` (the
-container-layer comparison is a separate matter and waits on a baseline; see below) — so
-what holds `-attest-enforce` off is that some providers are not yet on listed images,
-which is a migration and not a gap in the mechanism. Hop 5, once enforced, is what turns
-"an attested enclave" into "the **expected** attested enclave."
+The code root's OS half is therefore closed in the deployment as well as in the code: a
+provider whose MRTD/RTMR1/RTMR2 is not an entry the gateway build carries is refused
+before anything is sealed to it, rather than sealed to and logged. That makes the
+allowlist an operational dependency of the fleet — a provider moving to a guest-OS
+release with no entry is refused until an entry is computed and shipped in a new gateway
+build, which is a migration to sequence rather than a gap in the mechanism (see
+`deploy/phala/README.md`, "When a PROVIDER upgrades its broker"). Hop 5, once enforced,
+is what turns "an attested enclave" into "the **expected** attested enclave."
 
 What is genuinely not done is the code root's OTHER half: hop 3 pins the guest OS and
 says nothing about the containers inside it. That half is **read but not adjudicated**
-(see below) — and unlike the two switches, closing it needs a baseline that does not
+(see below) — and unlike hop 5's switch, closing it needs a baseline that does not
 exist yet.
 
-Hop 3 is no longer blocked on either. Its allowlist takes one entry per OS image
+Hop 3 is no longer blocked on either of the two things that used to hold it — the shape
+of an allowlist entry, and having no published source for its values. Its allowlist takes one entry per OS image
 (`attest.BootChain`), computable from a published release before any deployment exists,
 and the values are published as `client/evidence/brokerimages.json` — embedded, so a
 verifier needs no configuration and cannot be pointed at a friendlier list by accident.
 Publishing them on-chain beside the provider registry, or as broker release assets,
 remains possible later; embedding them beside the gateway's own allowlist was the
-smaller step and the same trust argument. What is blocked now is only the deployment
-decision: enforce refuses an unlisted image, so it waits on the fleet, not on us.
+smaller step and the same trust argument. The deployment decision that used to wait on
+the fleet is taken: enforce is on, so an unlisted image is refused, and keeping the
+fleet on listed images is now a standing operational requirement rather than a
+precondition for flipping a switch.
 
 > **Why the allowlist stayed empty, and what changed.** It used to compare the full
 > `Measurement` — all five registers, including **RTMR3**. In dstack, RTMR3 is where

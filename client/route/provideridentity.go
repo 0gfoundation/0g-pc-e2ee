@@ -208,6 +208,14 @@ type ProviderIdentity struct {
 	// Measurement is the boot-chain check against the audited allowlist (hop 3):
 	// VerdictPass in the allowlist, VerdictNoMatch not in it, VerdictNoBaseline when
 	// the allowlist holds no entry (client/evidence/brokerimages.json).
+	//
+	// Which of those a reader can actually see depends on the mode, and the difference
+	// matters to anyone using this endpoint to survey a fleet: under -attest-enforce an
+	// out-of-allowlist boot chain makes the candidate unusable, so — exactly as for
+	// QuoteDCAP above — no record is written and the endpoint 404s rather than reporting
+	// VerdictNoMatch. VerdictNoMatch is therefore reachable only in warn mode, which is
+	// what makes warn mode the state in which "is every provider on a listed image?" can
+	// be answered from these records at all.
 	Measurement Verdict
 	// OSImage names the allowlisted OS image the boot chain matched, or "" when
 	// nothing was matched.

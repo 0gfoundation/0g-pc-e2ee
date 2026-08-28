@@ -388,9 +388,12 @@ Three rules the implementation holds to (`client/cmd/gateway/provideridentity.go
   `no_baseline` says we audited none — and a panel that rendered the second as a failure
   would accuse every provider of running unaudited code. With
   `client/evidence/brokerimages.json` populated, `no_baseline` means a build whose
-  allowlist was emptied; a provider on an unlisted image is `no_match`. `os_image` may
-  still be `null`, but it is no longer ambiguous — the verdict says which case produced
-  it.
+  allowlist was emptied; a provider on an unlisted image is `no_match` — in warn mode.
+  Under `-attest-enforce` (the deployed setting) that provider has no record at all:
+  the verification fails, nothing is sealed to it, and the address 404s, exactly as for
+  a quote that fails DCAP. So `no_match` is a verdict this endpoint can report only
+  where the check it reports on is observing rather than gating. `os_image` may still
+  be `null`, but it is no longer ambiguous — the verdict says which case produced it.
 
 It lives on the gateway rather than the router for the same reason the rest of this
 document exists: the router is untrusted by design, so its account of a provider's

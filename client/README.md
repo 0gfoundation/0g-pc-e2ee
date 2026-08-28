@@ -127,9 +127,10 @@ TLS on the router path.
 - **Attestation** — the provider quote is genuine TEE hardware (DCAP-verified;
   enforced). Whether it runs an *audited* image is checked against
   `attest.BootChainPolicy` — one entry per OS image, from the embedded
-  `client/evidence/brokerimages.json`. The deployed gateway still runs that part in
-  warn mode until the fleet is on listed images; `pcverify -provider` prints the
-  observed boot chain in the shape an entry wants. See
+  `client/evidence/brokerimages.json`. Off by default in the library (`-attest-enforce`),
+  and **on** in the deployed gateway, where a provider on an unlisted image is refused
+  rather than warned about; `pcverify -provider` prints the observed boot chain in the
+  shape an entry wants. See
   [`trust-chain.md`](../docs/design/trust-chain.md) hop 3.
 - **Response authenticity** — each response carries a §8 TEE signature, checked
   fail-closed against the **quote-bound** signer. Opt-in in the library
