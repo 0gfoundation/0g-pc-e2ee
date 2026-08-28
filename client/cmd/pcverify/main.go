@@ -275,7 +275,7 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 	noDNSDiscovery := fs.Bool("no-dns-discovery", false, "gateway mode: do not derive the platform base domain from DNS; check only what was passed in")
 	expectComposeFile := fs.String("expect-compose-file", "", "gateway mode: path to the docker-compose manifest this deployment should be running (a digest-pinned docker-compose.release.yml), compared against the authenticated app-compose's docker_compose_file. Overrides the default -releases lookup")
 	releases := fs.Int("releases", defaultReleases, "gateway mode: accept the deployment if its compose text matches any of the newest N published releases, and report which one. 0 disables the lookup")
-	strict := fs.Bool("strict", false, "require every check to RUN, not merely to not fail: anything that would report an advisory \"-\" (exit 3) fails the run instead (exit 1). Gateway mode — a releases or app-compose lookup that cannot be completed; it demands the checks without demanding their inputs, so discovery still supplies them. Provider mode — hop 3, which cannot pass when the audited allowlist has no entry to compare against, and the app-compose read, which cannot happen when the provider publishes none")
+	strict := fs.Bool("strict", false, "require every check to RUN, not merely to not fail: anything that would report an advisory \"-\" (exit 3) fails the run instead (exit 1). Gateway mode — a releases or app-compose lookup that cannot be completed; it demands the checks without demanding their inputs, so discovery still supplies them. Provider mode — hop 3, which cannot pass when the audited allowlist has no entry to compare against; the app-compose read, which cannot happen when the provider publishes none; and the per-service baseline comparison, which cannot run when no baseline is recorded. That last one applies to EVERY run as shipped, since client/evidence/brokercompose.json is deliberately empty — pass -app-baseline with a candidate to reach a clean run")
 	releaseRepo := fs.String("repo", defaultReleaseRepo, "gateway mode: owner/name to read releases from, with -releases")
 	releaseAsset := fs.String("release-asset", defaultReleaseAsset, "gateway mode: release asset holding the deployment manifest, with -releases")
 	timeout := fs.Duration("timeout", 30*time.Second, "overall timeout")
@@ -402,11 +402,16 @@ type providerOpts struct {
 // failed, 3 nothing failed but a check did not run (see verdict). It takes interfaces
 // so tests drive it without a live chain or provider.
 //
-// Provider mode reaches "did not run" through its own door: an allowlist with no
-// entry means the boot-chain comparison cannot happen, and the run is incomplete
-// however well every other hop went. With entries — the shipped state — a matching
-// provider reaches a clean 0. The distinction matters for a CI gate, which would
-// otherwise read an unconsulted allowlist as a pass.
+// Provider mode reaches "did not run" through three doors, and the verdict line names
+// every one that applies rather than the first: an allowlist with no entry means the
+// boot-chain comparison cannot happen, a provider that publishes no app-compose means
+// what runs inside it was not read, and an empty per-service baseline means the
+// containers were not compared against anything. Any of them leaves the run incomplete
+// however well every other hop went, which is the distinction a CI gate needs — it would
+// otherwise read an unconsulted check as a pass.
+//
+// As SHIPPED the third always applies: brokercompose.json is deliberately empty (see its
+// header), so a clean 0 requires -app-baseline with a candidate.
 func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecker, provider, contract, endpointOverride, expectSigner string, opts providerOpts) int {
 	fmt.Fprintf(out, "provider           %s\n", provider)
 	fmt.Fprintf(out, "contract           %s\n", contract)
@@ -611,13 +616,13 @@ func reportManifest(out io.Writer, pq providerQuote, baseline []evidence.Baselin
 		}
 	}
 
-	// Never a mark: a ✓ or ✗ here would read as a verdict, and this is the one section
-	// of the report that deliberately has none.
 	// The baseline comparison, which is the check that ADJUDICATES — printed before the
 	// review so a reader meets the verdict before the advice. It is also the only part of
-	// this section that can fail the run.
+	// this section that can fail the run, and the one line here that DOES carry a mark.
 	failed = reportBaseline(out, review.Blocks, baseline)
 
+	// Never a mark on the review line: a ✓ or ✗ would read as a verdict, and the review
+	// deliberately has none. The contrast with the baseline line above is the whole point.
 	fmt.Fprintf(out, "  compose review   %s — reported, never a gate\n", review.Summary())
 	for _, f := range review.Findings {
 		where := f.Service

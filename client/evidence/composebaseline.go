@@ -44,8 +44,10 @@ type BaselineService struct {
 	// observed block's image-held-out form when Image allows the image to move, and
 	// against its full form otherwise — see CheckCompose.
 	Block string
-	// Image is the rule the observed image reference must satisfy. A zero value means
-	// the service must name no image at all.
+	// Image is how much the image is allowed to move. A ZERO VALUE means the recorded
+	// Block above pins it as written — a digest, a bare tag, or no image at all,
+	// whichever the recorded text says — which is how every service is recorded except
+	// one whose image is meant to move within a repository. See ImageRule.
 	Image ImageRule
 }
 

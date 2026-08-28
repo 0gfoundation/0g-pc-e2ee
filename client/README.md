@@ -218,9 +218,11 @@ compose text is then matched against the newest 5 published releases by default
 Both modes exit non-zero on a failed check, so either works as a deploy gate, and both
 separate "failed" (1) from "did not run" (3) so a skipped check cannot read as a full
 pass. `-strict` makes every check mandatory and turns the latter into the former. In
-provider mode a 3 means specifically that hop 3's allowlist held no entry, so the boot
-chain was never compared; with entries a matching provider reaches a clean 0, which is
-what makes `-strict` usable as a gate there. See
+provider mode a 3 means one of three things — hop 3's allowlist held no entry, the
+provider published no app-compose, or no per-service baseline is recorded — and the
+verdict line names every one that applies. **The last always applies as shipped**, since
+`evidence/brokercompose.json` is deliberately empty, so a clean 0 needs `-app-baseline`
+with a candidate. See
 [`docs/design/cloud-gateway.md`](../docs/design/cloud-gateway.md) §10 for what the
 result does and does not cover.
 
