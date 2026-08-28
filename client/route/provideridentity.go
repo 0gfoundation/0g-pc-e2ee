@@ -365,10 +365,13 @@ func (s *identityStore) put(id ProviderIdentity) { s.record(id, true) }
 // route preview, a sweep from the on-chain registry — so for one address they can
 // verify two different enclaves and reach two different verdicts. Where that happens,
 // last-write-wins would let a sweep's `pass` at the on-chain endpoint replace the
-// `no_match` a request reached at the router's, and under warn mode (the shipped
-// configuration) the request still proceeds: the panel would report agreement for the
-// very provider whose signer this gateway could not ground for the prompt it just
-// sealed. That is precisely the "states something the gateway no longer believes"
+// `no_match` a request reached at the router's: the panel would report agreement for the
+// very provider whose signer this gateway could not ground. Wrong under either verdict
+// mode, and differently wrong in each — under warn the request proceeded anyway, so the
+// record would vouch for an enclave the prompt was actually sealed to ungrounded; under
+// enforce (the shipped configuration) the candidate was refused, so it would vouch for
+// one the gateway declined to seal to at all. That is precisely the
+// "states something the gateway no longer believes"
 // failure routeCandidates.Provider takes care to avoid by recording rejected
 // candidates in the first place, and it must not come back in through the warmer.
 //

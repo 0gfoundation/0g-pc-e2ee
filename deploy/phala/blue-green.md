@@ -342,7 +342,7 @@ The gateway serves both, and the difference decides which one a gate should use:
 | Route | Asserts | Used by | Failing means |
 | --- | --- | --- | --- |
 | `/healthz` | the process is serving HTTP | container healthcheck (`gateway -health`), which compose uses to gate **dstack-ingress startup**; the post-switch public check | ingress never starts — a dark CVM with no certificate |
-| `/readyz` | at least one provider is fully usable — endpoint resolved, quote DCAP-verified, on-chain signer read — as of a recent warmer sweep | **gate 2**, the pre-switch standby probe | the cutover stops and the live side keeps serving |
+| `/readyz` | at least one provider is fully usable — endpoint resolved, quote DCAP-verified, on-chain signer read **and in agreement** (see below) — as of a recent warmer sweep | **gate 2**, the pre-switch standby probe | the cutover stops and the live side keeps serving |
 
 `/healthz` is deliberately *not* widened to cover provider reachability. Because
 compose gates the ingress's startup on it, a side booting during an upstream
@@ -355,11 +355,24 @@ on the same condition is safe, because the live side is unaffected.
 > always answers ready — the gate silently becomes liveness-only. The shipped
 > compose has the warmer on.
 
+> **`ZG_GATEWAY_ONCHAIN_ENFORCE` widens what this gate asserts, and couples the
+> cutover to the chain RPC.** Under warn, a sweep counts a provider ready once its
+> signer was *read*; under enforce (the shipped setting) the reading must also
+> **agree**, so a provider the registry does not vouch for is not counted — and a
+> lookup that fails outright counts against readiness too. The consequence to plan
+> for is a **cold** side: a freshly started gateway has no cached signer readings, so
+> the cache's grace window has nothing to fall back on, and a side booting during a
+> chain-RPC outage reports `warmer_ready_providers` at zero for as long as the outage
+> lasts. That is a refused cutover, correctly — you do not want traffic on a side
+> that can ground nothing — but it means the chain RPC is now a cutover dependency,
+> not only a request-path one. `deploy/phala/README.md` "Notes" has the cache windows
+> and the metrics to read.
+
 The readiness window is sized to a **cold first sweep**, not to a DNS TTL:
 `PROBE_RETRIES` × `PROBE_INTERVAL` (30 × 10s ≈ 5 min by default). A freshly
 started side DCAP-verifies each provider's quote one at a time, fetches Intel
-collateral cold, and reads each provider's on-chain signer, so it is legitimately
-not-ready for a while.
+collateral cold, and reads and checks each provider's on-chain signer, so it is
+legitimately not-ready for a while.
 
 > **That default assumes today's fleet size.** The sweep is serial, so its duration
 > grows with the number of registered providers — and each provider costs more when

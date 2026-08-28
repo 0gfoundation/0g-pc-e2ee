@@ -494,12 +494,16 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 		// verify on EVERY request against a provider that keeps mismatching, since the
 		// re-verification refills the very cache entry that gates it.
 		//
-		// Note this does NOT depend on err: warn mode returns nil for a mismatch it
-		// merely logged, and the recovery matters just as much there. It is not only
-		// about the verdict — the stale quote also carries a stale enc_pub, so without
-		// re-verifying, warn mode would go on sealing to an enclave that has rotated
-		// and the request would fail at the provider. Warn mode is the shipped
-		// configuration, so this is the path that runs today.
+		// Note this does NOT depend on err: the OUTCOME is what says a recovery is
+		// owed, and the verdict mode only changes what the recovery is worth. Under
+		// enforce — the shipped configuration — it is the whole difference between "the
+		// provider routinely rotated its signer" and a candidate refused outright: err
+		// is non-nil here, and re-grounding the fresh quote in the rotated arm below is
+		// what clears it. Under warn, err is nil for a mismatch it merely logged and the
+		// recovery still matters, because the verdict was never the only thing at stake:
+		// the stale quote carries a stale enc_pub too, so without re-verifying, warn
+		// mode would go on sealing to an enclave that has rotated and the request would
+		// fail at the provider.
 		if g.outcome == groundingMismatch && quoteCached {
 			fresh, rerr := c.router.reverifiedProvider(ctx, prov.Endpoint)
 			// All three arms say something, because a mismatch that survives to the

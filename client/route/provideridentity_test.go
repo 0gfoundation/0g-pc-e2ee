@@ -884,9 +884,10 @@ func TestProviderIdentity_FailedSweepSparesAServedRecordForAnotherEndpoint(t *te
 // The two writers resolve a provider's endpoint from different places — the request
 // path from the router's route preview, a sweep from the on-chain registry — so for
 // one address they can verify two different enclaves. A sweep must not overwrite the
-// served record then: under warn mode the request went through, and reporting the
-// on-chain endpoint's verdicts for a prompt sealed to the router's endpoint would
-// describe an enclave the user never talked to. Last-write-wins would decide this on
+// served record then: reporting the on-chain endpoint's verdicts would describe an
+// enclave the request never reached — under warn the prompt was sealed to the router's
+// endpoint ungrounded, and under enforce the candidate was refused there outright.
+// Last-write-wins would decide this on
 // sweep timing, which is the same "states something the gateway no longer believes"
 // failure the request path records rejected candidates to avoid.
 func TestProviderIdentity_SweepDoesNotOverwriteAServedRecordForAnotherEndpoint(t *testing.T) {

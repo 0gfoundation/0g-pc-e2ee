@@ -136,7 +136,9 @@ TLS on the router path.
   fail-closed against the **quote-bound** signer. Opt-in in the library
   (`-verify-responses`, off by default); the deployed gateway turns it on, so a response
   whose signature does not verify is not returned. Whether that signer is the one
-  *registered on chain* is a separate hop, and it currently only warns — see
+  *registered on chain* is a separate hop, also opt-in in the library
+  (`-onchain-enforce`) and also enforced by the deployed gateway, so a provider the
+  registry does not vouch for is skipped rather than sealed to — see
   [`trust-chain.md`](../docs/design/trust-chain.md) hops 5 and 11.
 - **Routing / confidentiality** — on the router path, the sensitive request
   fields (prompt, tool defs) are sealed to the provider enclave; the router reads

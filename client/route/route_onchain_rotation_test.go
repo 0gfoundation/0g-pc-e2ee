@@ -215,12 +215,12 @@ func TestProvider_ReverificationIsRateLimited(t *testing.T) {
 	}
 }
 
-// Warn mode is the SHIPPED configuration, and the rotation recovery has to run
-// there too. It is not only about the verdict: the stale quote carries a stale
-// enc_pub, so without re-verifying, warn mode goes on sealing to an enclave that
-// has rotated and the request fails at the provider — while every request also
-// files a `mismatch`, the counter whose whole purpose is to say whether enforce is
-// safe to turn on yet.
+// The rotation recovery has to run in WARN mode too, which the deployed gateway no
+// longer uses but the library still defaults to. The verdict was never the only thing
+// at stake: the stale quote carries a stale enc_pub, so without re-verifying, warn mode
+// goes on sealing to an enclave that has rotated and the request fails at the provider
+// — while every request also files a `mismatch`, the counter an operator reads as an
+// accusation against that provider.
 func TestProvider_RotationRecoveryRunsInWarnMode(t *testing.T) {
 	var quoteHits int32
 	srv := rotatingQuoteServer(t, &quoteHits)

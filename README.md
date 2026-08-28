@@ -96,8 +96,9 @@ And three directories that are not modules:
   image, derived from the published guest-OS release and confirmed against a live quote. An
   image not on that list *fails*, so a new OS version needs an entry before deployment.
 - On the **provider** hop the gateway walks on your behalf, DCAP quote verification, the
-  OS-image measurement allowlist and the §8 response signature are **enforced**; the
-  on-chain signer cross-check is **warn only**. The allowlist pins the provider's guest
+  OS-image measurement allowlist, the on-chain signer cross-check and the §8 response
+  signature are all **enforced** — a provider that fails any of them is refused before
+  anything is sealed to it. The allowlist pins the provider's guest
   **OS image** — what runs in the containers above it is reported, not adjudicated.
   [`trust-chain.md`](docs/design/trust-chain.md) marks the status of every link.
 
