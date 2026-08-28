@@ -580,12 +580,13 @@ it sealed a request to
 is the one the response carried in `X-Provider`.
 
 No new setting is required — the route is on by default and reads results the request
-path already produced. Three settings govern whether it can answer anything, and what
+path already produced. Four settings govern whether it can answer anything, and what
 it can say:
 
 | Setting | Effect |
 |---|---|
 | `ZG_GATEWAY_ATTEST` | **required.** Without quote verification nothing is verified, so there is no verdict to report and the route is not mounted at all. |
+| `ZG_GATEWAY_ATTEST_ENFORCE` | on (as deployed), an out-of-allowlist boot chain fails the verification, so that provider gets no record and its address 404s — `verdicts.measurement` is `pass` in every record that exists. Off, the same provider is sealed to and reported as `no_match`. |
 | `ZG_GATEWAY_ONCHAIN` | when off, `verdicts.onchain_signer` is `not_checked` rather than a comparison result. When on but the chain could not be read, it is `unavailable` — a chain-RPC problem is never reported as a finding against the provider. |
 | `ZG_GATEWAY_PROVIDER_IDENTITY_ENDPOINT` | on by default; set `false` to remove the route entirely. Appears in the compose only as a commented-out line, per this file's convention. |
 
@@ -621,12 +622,17 @@ to, and nothing corresponds to `matched_release`. Use it to tell which lines to 
 about and which need an upstream answer; it says nothing about *which build* of an
 image is running.
 
-`verdicts.measurement` reads `pass` for a provider on a listed image and `no_match`
-for one that is not — most providers today, since the fleet is still migrating. The
-third value, `no_baseline`, means this build's `client/evidence/brokerimages.json`
-carried no entry to compare against, so it says nothing about the provider and a panel
-must render it as "observed only" rather than as a failure; a release should never show
-it. Smoke-test after deploying:
+`verdicts.measurement` reads `pass` for a provider on a listed image and `no_match` for
+one that is not — but on this deployment, which enforces the allowlist, only the first
+of those is reachable: a provider on an unlisted image never becomes a record, so it
+404s instead of being reported as `no_match` (see the table above). `no_match` is what a
+gateway running that check in warn mode reports, and reading it out of a *warn-mode*
+gateway is how you check whether the fleet is on listed images before enabling enforce —
+an enforcing gateway cannot answer that question, because every provider it can describe
+has already passed. The third value, `no_baseline`, means this build's
+`client/evidence/brokerimages.json` carried no entry to compare against, so it says
+nothing about the provider and a panel must render it as "observed only" rather than as
+a failure; a release should never show it. Smoke-test after deploying:
 
 ```sh
 # the address the sealed request was pinned to
@@ -639,6 +645,17 @@ curl -s "https://<DOMAIN>/v1/providers/$ADDR/identity" | jq
 # an address never used must 404
 curl -sS -o /dev/null -w '%{http_code}\n' "https://<DOMAIN>/v1/providers/0x0000000000000000000000000000000000000000/identity"
 ```
+
+Under enforce this smoke test is self-selecting, which changes how to read both of its
+outcomes. The request completes only if some candidate cleared the allowlist, so the
+address it returns necessarily reports `measurement: "pass"` — that is not evidence
+about the rest of the fleet. And an **empty `ADDR`** (the completion itself failed) is
+the shape a fleet problem takes here: no candidate the router offered was on a listed
+image, rather than anything wrong with this endpoint. Tell the two apart from
+`quote_verifications_total{result="error"}` and
+`candidate_fallbacks_total{reason="materialize"}` rising together, and note there is no
+"boot chain not in the allowlist" log line to look for — that one belongs to warn mode;
+under enforce the refusal is a verification failure like any other.
 
 ## Pin the image digest
 
