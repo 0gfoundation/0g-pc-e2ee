@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -123,15 +122,24 @@ type containerRef struct {
 	// in an attested deployment means compose_hash commits to a NAME whose contents
 	// can change under it.
 	Digest string `json:"digest"`
-	// Source is "0g-release" for images built from this repository and
-	// "third-party" for everything else. All of them are covered by compose_hash;
-	// what differs is whether there is a GitHub release to trace the image back to.
-	// A third-party image must never be given a release link — see classifySource.
+	// Source is "0g-release" for images 0G published and "third-party" for everything
+	// else. All of them are covered by compose_hash; what differs is who answers for
+	// the contents. A third-party image must never be given a release link — see
+	// classifySource.
 	Source string `json:"source"`
 }
 
 const (
-	sourceOwn        = "0g-release"
+	// sourceOwn marks an image 0G PUBLISHED: our namespace on a registry we publish
+	// through. Despite the name it is not on its own a claim that some GitHub release
+	// commits to this exact image — on this endpoint matched_release is what
+	// establishes that, and on the provider endpoint nothing does, because no
+	// per-provider manifest is published. The name is kept because one vocabulary
+	// across both container lists is worth more to a panel than a more literal word on
+	// one of them.
+	sourceOwn = "0g-release"
+	// sourceThirdParty marks everything else, including our namespace on a registry we
+	// do not publish through — see classifySource.
 	sourceThirdParty = "third-party"
 )
 
@@ -269,7 +277,7 @@ func buildIdentity(ctx context.Context, cfg identityConfig, logger *slog.Logger)
 					"source", source, "err", err)
 				break
 			}
-			res.doc.Containers = containersOf(services, cfg.ReleaseRepo)
+			res.doc.Containers = containersOf(services)
 			logger.Info("identity: container list resolved", "source", source, "containers", len(services))
 		}
 	}
@@ -311,33 +319,45 @@ func buildIdentity(ctx context.Context, cfg identityConfig, logger *slog.Logger)
 }
 
 // containersOf turns the parsed services into the response's container list.
-func containersOf(services []compose.Service, repo string) []containerRef {
+func containersOf(services []compose.Service) []containerRef {
 	out := make([]containerRef, 0, len(services))
 	for _, s := range services {
 		out = append(out, containerRef{
 			Name:   s.Name,
 			Image:  s.Image,
 			Digest: s.Digest,
-			Source: classifySource(s.Image, repo),
+			Source: classifySource(s.Image),
 		})
 	}
 	return out
 }
 
-// classifySource says whether an image is built from THIS repository.
+// classifySource says whether an image was PUBLISHED BY 0G. It is the label on both
+// identity endpoints' container lists, so the word means the same thing on each.
 //
-// It keys off the registry namespace the release workflow publishes to
-// (ghcr.io/<owner>/<repo>-<component>, see .github/workflows/release.yml), which
-// is a fact about the image reference in the authenticated compose text — not
-// about whether a release lookup happened to succeed. The two are deliberately
-// independent: matched_release is a property of the DEPLOYMENT, source is a
-// property of each IMAGE, and collapsing them would either drop the label when
-// GitHub is unreachable or, far worse, imply that a third-party image is
-// traceable to one of our releases.
-func classifySource(image, repo string) string {
-	base := "ghcr.io/" + strings.ToLower(strings.TrimSpace(orDefaultRepo(repo)))
-	img := strings.ToLower(strings.TrimSpace(image))
-	if img == base || strings.HasPrefix(img, base+"-") {
+// It reads the reference's registry and namespace (evidence.ClassifyImageOrigin), and
+// that choice is what lets the provider endpoint carry the label at all. The rule this
+// replaces was repo-scoped — does the reference start with ghcr.io/<owner>/<repo>-,
+// the namespace .github/workflows/release.yml publishes to — which answers
+// "third-party" for ghcr.io/0gfoundation/0g-serving-broker: 0G's own broker image,
+// stamped as someone else's for the sole reason that it ships from a different
+// repository. On the gateway's own four containers the two rules agree; on a
+// provider's they do not, and the repo-scoped one is simply wrong there.
+//
+// It stays a fact about the image reference in the authenticated compose text, never
+// about whether a release lookup succeeded. matched_release is a property of the
+// DEPLOYMENT, source is a property of each IMAGE, and collapsing them would either
+// drop the label when GitHub is unreachable or, far worse, imply that a third-party
+// image is traceable to one of our releases.
+//
+// Everything that is not first-party collapses to sourceThirdParty, our namespace on a
+// registry we do not publish through (evidence.OriginForeignRegistry) included. That
+// collapse only ever states LESS than the classifier knows, which is the safe direction
+// for a two-value label: it can fail to flag a lookalike, never bless one. The
+// distinction survives where a reader can act on it — `pcverify`'s origin column, and
+// the justify-severity finding the compose review raises for exactly that shape.
+func classifySource(image string) string {
+	if evidence.ClassifyImageOrigin(image) == evidence.OriginFirstParty {
 		return sourceOwn
 	}
 	return sourceThirdParty
@@ -349,13 +369,6 @@ func deref(s *string) string {
 		return ""
 	}
 	return *s
-}
-
-func orDefaultRepo(repo string) string {
-	if strings.TrimSpace(repo) == "" {
-		return release.DefaultRepo
-	}
-	return repo
 }
 
 // readQuoteBody reads and structurally parses the bundle's quote.json. See

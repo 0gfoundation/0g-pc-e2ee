@@ -159,18 +159,31 @@ func (o ImageOrigin) String() string {
 // firstPartyNamespace is the organisation whose builds we can answer for.
 const firstPartyNamespace = "0gfoundation"
 
-// firstPartyRegistries are the registries that namespace means anything on.
+// firstPartyRegistries are the registries that namespace means anything on: the ones we
+// PUBLISH THROUGH, which is ghcr.io and nothing else (.github/workflows/release.yml and
+// docker.yml both set REGISTRY: ghcr.io, and no workflow here pushes anywhere else).
 //
-// ghcr.io is where we publish. Docker Hub — "docker.io", its "index.docker.io" spelling,
-// and the implicit host of an unqualified reference — is included because a Hub
-// namespace is globally unique, so "0gfoundation/x" there names one specific account
-// rather than a string anyone can choose. On any other host the namespace is just a path
-// segment the manifest's author picked, which is what made
-// "evil.example.com/0gfoundation/broker" read as first-party.
-var firstPartyRegistries = map[string]bool{
-	"": true, "docker.io": true, "index.docker.io": true, "registry-1.docker.io": true,
-	"ghcr.io": true,
-}
+// Docker Hub used to be in this set — "docker.io", its "index.docker.io" spelling, and
+// the implicit host of an unqualified reference — on the argument that a Hub namespace is
+// globally unique, so "0gfoundation/x" there names one specific account rather than a
+// string anyone can choose. The argument is sound and the conclusion did not follow: a
+// Hub namespace names one account, but nothing in this repository establishes that the
+// account is OURS. We never push there, so if that name is unregistered or held by
+// someone else, "0gfoundation/broker" is a path a stranger can publish under and this
+// function would have called it ours.
+//
+// That was survivable while the answer only reached a human-read report column. It is
+// not now: it labels a container list taken from a PROVIDER's compose text, which the
+// provider writes, so an unqualified reference would have been an unregistered
+// namespace away from a "published by 0G" stamp on someone else's image. Registering
+// the Hub name would not fix it either — the fix is that this set means "where we
+// publish", and a registry we do not publish through cannot vouch for a namespace.
+//
+// On any other host the namespace is just a path segment the manifest's author picked,
+// which is what made "evil.example.com/0gfoundation/broker" read as first-party. Our
+// namespace off ghcr.io is now uniformly OriginForeignRegistry — the state that exists
+// for "reads as ours at a glance, and we cannot answer for it".
+var firstPartyRegistries = map[string]bool{"ghcr.io": true}
 
 // ReviewedService is one compose service as the review read it.
 type ReviewedService struct {
@@ -913,7 +926,7 @@ func (r *ComposeReview) reviewService(name string, body *yaml.Node, mounts *moun
 		// "not pinned" finding below. A splitter that erred the other way, inventing a
 		// digest, would be the one thing that must not happen here.
 		svc.Image, svc.Tag, svc.Digest = compose.SplitImageRef(svc.Ref)
-		svc.Origin = classifyOrigin(svc.Image)
+		svc.Origin = ClassifyImageOrigin(svc.Image)
 	}
 	r.Services = append(r.Services, svc)
 
@@ -947,7 +960,7 @@ func (r *ComposeReview) reviewService(name string, body *yaml.Node, mounts *moun
 			"%s carries our namespace %q on %s, which is not a registry we publish through. It may be a "+
 				"pull-through mirror, and it may be an image named to look like ours — either way we cannot "+
 				"answer for its contents, so it needs an upstream answer like any third-party image",
-			svc.Ref, firstPartyNamespace, reg))
+			svc.Ref, firstPartyNamespace, displayRegistry(reg)))
 	}
 	// Two `image` keys in one body: a compose runtime resolves the duplicate to one of
 	// them, so what actually runs is not what the manifest states — and a baseline reading
@@ -1447,14 +1460,26 @@ func parseMount(n *yaml.Node) (src, target string, readOnly, ok bool) {
 	}
 }
 
-// classifyOrigin reads the registry AND the namespace out of an image repository. See
-// ImageOrigin for why the answer is a column in a report and not a rule.
+// ClassifyImageOrigin reads the registry AND the namespace out of an image repository.
+// See ImageOrigin for why the answer is a column in a report and not a rule.
 //
 // Both halves, because the namespace alone means nothing: anyone can push
 // "0gfoundation/broker" to a registry they control, and a classifier that read the path
 // and ignored the host called that first-party — i.e. said "ask us and we can resolve
 // this" about an image we never published.
-func classifyOrigin(image string) ImageOrigin {
+//
+// Exported because it is the ONE place this repository decides whether an image is
+// ours, and both of the gateway's identity endpoints label their container lists with
+// it (`client/cmd/gateway`).
+//
+// It takes a REPOSITORY — no tag, no digest — which is what compose.Service.Image and
+// ReviewedService.Image both hold; a caller starting from a raw reference should split
+// it with compose.SplitImageRef first. Today a full reference happens to classify the
+// same way, since only the host and the FIRST path segment are read and a tag or digest
+// rides on the last one, but that is a coincidence of this implementation and not a
+// promise: the parameter is a repository, and a caller relying on the coincidence would
+// be relying on where the split lands.
+func ClassifyImageOrigin(image string) ImageOrigin {
 	registry, repo := splitRegistry(strings.TrimSpace(image))
 	if repo == "" {
 		return OriginNone
@@ -1467,6 +1492,21 @@ func classifyOrigin(image string) ImageOrigin {
 		return OriginFirstParty
 	}
 	return OriginForeignRegistry
+}
+
+// displayRegistry names a reference's registry for a reader.
+//
+// An unqualified reference carries no host at all — it resolves at Docker Hub by
+// convention — and splitRegistry reports that as "". Since Hub left
+// firstPartyRegistries this is a shape the foreign-registry finding can actually
+// reach, and an empty host would render it as "on , which is not a registry we publish
+// through": a sentence the reader has to decode rather than act on, about the one
+// origin they must not skim past.
+func displayRegistry(registry string) string {
+	if registry == "" {
+		return "docker.io (the reference names no registry, so it resolves there)"
+	}
+	return registry
 }
 
 // splitRegistry separates an image reference's registry host from its repository path,

@@ -101,9 +101,10 @@ type providerIdentityDoc struct {
 	// enclave runs no containers", which is never true.
 	//
 	// Reaching the wire means the bytes hashed to ComposeHash, so this is as
-	// authenticated as the hash. It is NOT a check: nothing compared these images
-	// against an expected set, so a panel may render them but must not present the
-	// list's existence as approval.
+	// authenticated as the hash — the `source` label on each entry included, since it
+	// is derived from those same bytes and from nothing else. It is NOT a check:
+	// nothing compared these images against an expected set, so a panel may render
+	// them but must not present the list's existence, or the label, as approval.
 	Containers []providerContainerRef `json:"containers"`
 	// Verify is providerVerifyNote. See the file comment.
 	Verify string `json:"verify"`
@@ -111,13 +112,21 @@ type providerIdentityDoc struct {
 
 // providerContainerRef is one container of a provider's deployment.
 //
-// It deliberately carries no `source` field, unlike the gateway's own
-// containerRef. There, source answers "can I trace this image to a GitHub release
-// of this repository", and the answer is useful because the gateway's manifest is
-// published. No per-provider manifest is published (docs/design/request-verification.md
-// §6), so for a provider there is no release to trace to and the label would be
-// either meaningless or — worse — a "third-party" stamp on 0G's own broker image
-// merely because it ships from a different repository.
+// It carries the same `source` label as the gateway's own containerRef, and the
+// question that label answers had to be narrowed before it could: not "can I trace
+// this image to a GitHub release of this repository" — no per-provider manifest is
+// published (docs/design/cloud-gateway.md §6.4), so for a provider there is no release
+// to trace to — but "who PUBLISHED this image", which an authenticated compose text
+// answers for a provider exactly as well as it does for us. See classifySource: it is
+// one classifier for both endpoints, reading the reference's registry and namespace
+// rather than this repository's release namespace, which is what stops it stamping
+// "third-party" on 0G's own broker image for shipping from a different repository.
+//
+// What the label is NOT is a check. Nothing compared these images against an expected
+// set, and "0G published it" says nothing about WHICH build of it this is — an image
+// of ours with a year-old CVE carries the same label as the current one. A panel may
+// use it to sort the list into "ask 0G" and "ask upstream"; it must not render it as
+// approval, any more than the list's existence is approval.
 type providerContainerRef struct {
 	// Name is the compose service name.
 	Name string `json:"name"`
@@ -128,6 +137,12 @@ type providerContainerRef struct {
 	// unaided, so it is rendered rather than hidden: an unpinned image leaves
 	// compose_hash committing to a NAME whose contents can be republished under it.
 	Digest string `json:"digest"`
+	// Source is "0g-release" for an image 0G published and "third-party" for
+	// everything else, in the same vocabulary as /v1/gateway/identity so a panel
+	// switches on one set of values across both hops. Unlike there, no matched_release
+	// stands behind it: for a provider this is a statement about the image's
+	// publisher and nothing more.
+	Source string `json:"source"`
 }
 
 // providerContainersOf renders the record's service list for the wire, preserving
@@ -138,7 +153,12 @@ func providerContainersOf(services []compose.Service) []providerContainerRef {
 	}
 	out := make([]providerContainerRef, 0, len(services))
 	for _, s := range services {
-		out = append(out, providerContainerRef{Name: s.Name, Image: s.Image, Digest: s.Digest})
+		out = append(out, providerContainerRef{
+			Name:   s.Name,
+			Image:  s.Image,
+			Digest: s.Digest,
+			Source: classifySource(s.Image),
+		})
 	}
 	return out
 }

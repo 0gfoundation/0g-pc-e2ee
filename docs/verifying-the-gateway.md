@@ -307,10 +307,18 @@ Two fields are worth reading carefully:
   that the allowlist was empty and nothing was checked. The endpoint does not
   distinguish them; `pcverify` does, and reports the second as an incomplete run
   (exit 3) rather than a pass.
-- **`containers[].source`** says whether an image can be traced to a published
-  release of this repository. All of them are covered by `compose_hash` either way;
-  `third-party` simply means there is no release of ours to compare it against, and
-  the endpoint will never invent one.
+- **`containers[].source`** says **who published an image**, and only that:
+  `0g-release` for one pushed to our namespace on the registry we publish through
+  (`ghcr.io/0gfoundation/…`), `third-party` for everything else. All of them are
+  covered by `compose_hash` either way.
+
+  It is not a claim that a release exists for that image, in either direction. Images
+  of ours built from *other* repositories read `0g-release` with no release of this
+  one to compare them against, and `0g-release` says nothing about *which build* is
+  running — an image of ours with a year-old CVE carries the same label as the current
+  one. `matched_release` is the field that ties this deployment to a published release,
+  and it is a property of the whole deployment rather than of any single image. The
+  same label, computed the same way, appears on the provider list below.
 
 `matched_release` is `null` for a deployment whose compose text is not byte-identical
 to a published release asset — expected for a development deployment, since the
@@ -346,8 +354,9 @@ curl -s https://<gateway-domain>/v1/providers/0x7B3f…9aC1/identity
   "compose_hash": "8779f38c…",
   "containers": [                  // what compose_hash commits to, in file order
     {"name": "broker", "image": "ghcr.io/0gfoundation/0g-serving-broker",
-                                     "digest": "sha256:ec5df834…"},
-    {"name": "prometheus", "image": "prom/prometheus", "digest": ""}
+                                     "digest": "sha256:ec5df834…", "source": "0g-release"},
+    {"name": "prometheus", "image": "prom/prometheus", "digest": "",
+                                     "source": "third-party"}
   ],
   "verify": "recheck this provider yourself: GET https://broker-07.0g.ai/v1/quote?legacy=false direct from the provider and DCAP-verify it. …"
 }
@@ -355,17 +364,18 @@ curl -s https://<gateway-domain>/v1/providers/0x7B3f…9aC1/identity
 
 `containers` appears only when the app-compose in the provider's reply hashes to the
 `compose_hash` in its verified quote — the same gate as above, and a mismatch reports
-`null` rather than a probably-right list. Two differences from the gateway's own list
-are deliberate:
+`null` rather than a probably-right list. Two things to read carefully:
 
-- **No `source`.** That label answers "can I trace this image to a release of this
-  repository", which works for the gateway because its manifest is published. No
-  per-provider manifest is, so there would be no release to trace to — and the label
-  would end up stamping "third-party" on 0G's own broker image for shipping from a
-  different repository. Absent beats misleading.
+- **`source` means who published the image, and only that.** It is the same two
+  values as the gateway's own list, but nothing here corresponds to a
+  `matched_release`: no per-provider manifest is published, so `0g-release` cannot and
+  does not claim that some release commits to this exact image — it says 0G pushed it,
+  which is what tells you whom to ask about its contents. An image of ours running a
+  known-vulnerable build carries the same label as the current one.
 - **An empty `digest` is the finding**, exactly as it is above: that image is pinned
   by tag, so `compose_hash` commits to a *name* whose contents can be republished
-  underneath it while the hash holds still.
+  underneath it while the hash holds still. It is independent of `source` — an image
+  can be ours and unpinned, and pinned and not ours.
 
 And as with the verdicts: the list being present is not approval. Nothing compared
 these images against an expected set, and hop 3 is not that set — its allowlist is

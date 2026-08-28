@@ -424,7 +424,7 @@ func TestLoadAppCompose_ReportsEverySourceItTried(t *testing.T) {
 	}
 }
 
-// The image-to-source rule, stated on its own: it keys off the registry namespace
+// The image-to-source rule, stated on its own: it keys off the registry and namespace
 // in the authenticated compose text, so it holds whether or not a release lookup
 // succeeded — and a third-party image can never be labelled as ours.
 func TestClassifySource(t *testing.T) {
@@ -434,26 +434,49 @@ func TestClassifySource(t *testing.T) {
 		"GHCR.IO/0gfoundation/0g-pc-e2ee-gateway": sourceOwn,
 		"dstacktee/dstack-ingress":                sourceThirdParty,
 		"prom/prometheus":                         sourceThirdParty,
-		// A different repo under the same owner is not this repository's release.
-		"ghcr.io/0gfoundation/something-else": sourceThirdParty,
-		// Nor is a lookalike registry.
+		// An unqualified library image has no namespace at all.
+		"nginx": sourceThirdParty,
+		"":      sourceThirdParty,
+		// The case this label exists to get right, and the one the repo-scoped rule got
+		// wrong: 0G's broker ships from a DIFFERENT repository, and it is still ours.
+		// Without this the provider endpoint could not carry the label at all. Any repo
+		// under our namespace reads the same way — the rule is the namespace, not this
+		// repository's release names.
+		"ghcr.io/0gfoundation/0g-serving-broker": sourceOwn,
+		"ghcr.io/0gfoundation/something-else":    sourceOwn,
+		// Our namespace on a registry we do not publish through is NOT ours. It collapses
+		// into third-party here rather than getting a state of its own: a two-value label
+		// may fail to flag a lookalike, but it must never bless one.
 		"evil.io/0gfoundation/0g-pc-e2ee-gateway": sourceThirdParty,
-		"": sourceThirdParty,
+		// Docker Hub is not a registry we publish through, so our namespace there is a
+		// name we do not hold — and on the provider endpoint the compose text naming it
+		// is the PROVIDER's. Both spellings must stay unblessed. See
+		// evidence.firstPartyRegistries.
+		"0gfoundation/0g-serving-broker":           sourceThirdParty,
+		"docker.io/0gfoundation/0g-serving-broker": sourceThirdParty,
 	} {
-		if got := classifySource(image, ""); got != want {
+		if got := classifySource(image); got != want {
 			t.Errorf("classifySource(%q) = %q, want %q", image, got, want)
 		}
 	}
-	// A configured repo moves the namespace with it rather than the default being
-	// baked in — a fork publishing its own images must not have all of them read as
-	// third-party, and ours must not stay privileged under someone else's repo.
-	for image, want := range map[string]string{
-		"ghcr.io/acme/fork-gateway":               sourceOwn,
-		"ghcr.io/0gfoundation/0g-pc-e2ee-gateway": sourceThirdParty,
-	} {
-		if got := classifySource(image, "acme/fork"); got != want {
-			t.Errorf("classifySource(%q, acme/fork) = %q, want %q", image, got, want)
-		}
+}
+
+// The label follows the PUBLISHER, not the deployer. A fork's own images are not 0G
+// releases, and 0G's images stay 0G's when a fork deploys them — which is the only
+// reading under which the string "0g-release" means what it says. The repo-scoped rule
+// this replaces answered the opposite on both: pointed at a fork's repo it labelled
+// `ghcr.io/acme/fork-gateway` a 0G release, and 0G's own image third-party.
+//
+// That was reachable only in principle. identityConfig.ReleaseRepo has no flag or
+// environment variable behind it and main.go never sets it, so orDefaultRepo always
+// fell back to release.DefaultRepo and the fork branch was dead — which is part of why
+// the parameter went rather than being carried forward.
+func TestClassifySource_FollowsThePublisherNotTheDeployer(t *testing.T) {
+	if got := classifySource("ghcr.io/acme/fork-gateway"); got != sourceThirdParty {
+		t.Errorf("a fork's own image = %q, want %q — it is not something 0G published", got, sourceThirdParty)
+	}
+	if got := classifySource("ghcr.io/0gfoundation/0g-pc-e2ee-gateway"); got != sourceOwn {
+		t.Errorf("0G's image = %q, want %q — who deploys it does not change who built it", got, sourceOwn)
 	}
 }
 
