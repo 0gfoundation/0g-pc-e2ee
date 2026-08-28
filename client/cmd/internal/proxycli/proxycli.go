@@ -458,11 +458,19 @@ const warmStateMaxAge = 3
 // treat a nil func as "always ready".
 //
 // The signal is the last warmer sweep: at least one provider prepared end to end
-// (endpoint resolved, quote verified, on-chain signer read) and the sweep recent
-// enough to believe. That covers, in one predicate, every reason a freshly started
-// side would fail every request — router catalog unreachable, provider quote
-// endpoints down, chain RPC unreadable — without probing anything itself, so the
-// check costs a mutex and stays safe to call on every poll.
+// (endpoint resolved, quote verified, on-chain signer read — and in agreement, under
+// -onchain-enforce) and the sweep recent enough to believe. That covers, in one
+// predicate, every reason a freshly started side would fail every request — router
+// catalog unreachable, provider quote endpoints down, chain RPC unreadable — without
+// probing anything itself, so the check costs a mutex and stays safe to call on every
+// poll.
+//
+// Under -onchain-enforce that last reason is sharper than it reads: a freshly started
+// side has no cached signer readings, so the registry cache's grace window has nothing
+// to fall back on and a chain-RPC outage leaves this predicate false for the outage's
+// duration. Correct — a side that can ground nothing should not be cut over to — but it
+// makes the chain RPC a cutover dependency, not only a request-path one
+// (deploy/phala/blue-green.md).
 //
 // It exists for the blue/green standby probe: with on-chain grounding enforced, a
 // side that cannot read the chain serves nothing, and the deploy must not point

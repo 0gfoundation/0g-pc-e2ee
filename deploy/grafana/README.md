@@ -209,13 +209,15 @@ screen:
    that says whether enforce can be turned on.
 6. **On-chain grounding (hop 5)**: ready-provider count, chain-RPC lookup-failure
    and signer-mismatch rates, all grounding outcomes, and revalidations. This row
-   is what says whether `ZG_GATEWAY_ONCHAIN_ENFORCE` can be turned on: while
-   `lookup_failed` and `mismatch` sit at zero in warn mode, enforce costs nothing,
-   because every other outcome is one enforce would also have allowed. Read the two
-   failure classes separately — `mismatch`/`not_acknowledged` are verdicts about a
-   provider, `lookup_failed` is our own chain RPC — and note "Ready providers" uses
-   `min` across the selected replicas, not a sum: one replica that can ground
-   nothing is the number that matters, since it is the one failing every request.
+   is what said whether `ZG_GATEWAY_ONCHAIN_ENFORCE` could be turned on — the criterion
+   was `lookup_failed` and `mismatch` sitting at zero in warn mode, since every other
+   outcome is one enforce would also have allowed — and now that it is on, the row is
+   what says whether the gate is costing anything. Read the two failure classes
+   separately — `mismatch`/`not_acknowledged` are verdicts about a provider,
+   `lookup_failed` is our own chain RPC, and under enforce both are refused candidates —
+   and note "Ready providers" uses `min` across the selected replicas, not a sum: one
+   replica that can ground nothing is the number that matters, since it is the one
+   failing every request.
 7. **Warmer & DCAP collateral**: warmer last-success age (with alert-colored
    thresholds), sweep/provider outcomes, collateral cache + fetch latency.
 8. **Process runtime**: goroutines, resident memory, CPU. These are the panels
@@ -272,9 +274,9 @@ highest-signal ones:
   a live re-read. Not an operational blip: it means the enclave that answered is not
   the one the registry says it should be. Alert on any of it.
 - `rate(zg_gateway_onchain_grounding_total{outcome="lookup_failed"}[5m]) > 0` — our
-  chain RPC could not be read, past the retry AND the cache's grace window. Under
-  `ZG_GATEWAY_ONCHAIN_ENFORCE` these are refused requests; in warn mode they are
-  the baseline that says whether enforce is safe to turn on yet.
+  chain RPC could not be read, past the retry AND the cache's grace window. With
+  `ZG_GATEWAY_ONCHAIN_ENFORCE` on (as deployed) these are refused requests, so this is
+  an availability alert on our own dependency, not a finding about a provider.
 - `min by(instance)(zg_gateway_warmer_ready_providers) == 0 and on(instance)
   sum by(instance)(zg_gateway_warmer_sweeps_total) > 0` — a replica is up but has no
   usable provider at all, so it can serve nothing. This is the shape of a cold start

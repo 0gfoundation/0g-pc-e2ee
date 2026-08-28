@@ -281,12 +281,15 @@ router's route preview, a sweep from the on-chain registry — so for one addres
 can, in principle, verify two different enclaves and reach two different verdicts.
 They agree in any healthy deployment, and where they agree the fresher verification
 replaces the older one. Where they disagree the **served** record wins, and that
-ordering is load-bearing rather than a preference: under warn mode the request went
-through, so reporting the on-chain endpoint's `pass` for a prompt that was sealed to
-the router's endpoint — and whose signer this gateway could not ground — would state
-something the gateway does not believe about the request that actually happened. That
-is the same failure the request path avoids by recording rejected candidates instead
-of leaving an older `pass` standing, and it must not return through the warmer.
+ordering is load-bearing rather than a preference: reporting the on-chain endpoint's
+`pass` for a provider whose signer this gateway could not ground at the router's
+endpoint would state something the gateway does not believe. That is wrong under either
+verdict mode, and differently wrong in each — under warn the request went through, so
+the record would vouch for the enclave a prompt was actually sealed to ungrounded;
+under `-onchain-enforce` (the deployed setting) the candidate was refused, so it would
+vouch for one the gateway declined to seal to at all. Either way it is the same failure
+the request path avoids by recording rejected candidates instead of leaving an older
+`pass` standing, and it must not return through the warmer.
 
 That widens what the *set* of records discloses, and the widening is deliberate:
 probing address by address now confirms catalog membership. It leaks nothing, because
@@ -391,9 +394,15 @@ Three rules the implementation holds to (`client/cmd/gateway/provideridentity.go
   allowlist was emptied; a provider on an unlisted image is `no_match` — in warn mode.
   Under `-attest-enforce` (the deployed setting) that provider has no record at all:
   the verification fails, nothing is sealed to it, and the address 404s, exactly as for
-  a quote that fails DCAP. So `no_match` is a verdict this endpoint can report only
-  where the check it reports on is observing rather than gating. `os_image` may still
-  be `null`, but it is no longer ambiguous — the verdict says which case produced it.
+  a quote that fails DCAP. Whether an enforced check's `no_match` survives to this
+  endpoint turns on **where the check sits relative to the record write**, not on
+  whether it gates: the measurement is adjudicated inside quote verification, which
+  fails before there is anything to record, whereas hop 5 is adjudicated after —
+  `recordProviderIdentity` runs before the grounding error is returned — so a candidate
+  refused by `-onchain-enforce` is recorded, carrying `onchain_signer: no_match`. Which
+  is why a hop 5 fleet survey stays readable under enforce and a measurement survey has
+  to be taken from a warn-mode gateway or `pcverify`. `os_image` may still be `null`,
+  but it is no longer ambiguous — the verdict says which case produced it.
 
 It lives on the gateway rather than the router for the same reason the rest of this
 document exists: the router is untrusted by design, so its account of a provider's

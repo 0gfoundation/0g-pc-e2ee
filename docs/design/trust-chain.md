@@ -16,7 +16,8 @@ see there are no gaps — and where the gaps still are.
 >   **on**: an unlisted image is refused, not warned about. Its OS half is closed. The
 >   container half below it is read and adjudicated *in the verifier* — the per-service
 >   baseline is populated — but that comparison is not yet in the gateway's sealing path.
-> - **hop 5** — wired and observed; its enforce switch is deliberately off.
+> - **hop 5** — wired, observed, and enforce is **on**: a provider the registry does not
+>   vouch for is skipped, not warned about.
 > - **hop 11** — enforced, but only because `-verify-responses` is on; it is off by default.
 > - **hop 12** — replay is defeated client-side only; a server-side freshness field is TODO.
 >
@@ -222,30 +223,42 @@ Honest gaps — half the value of this diagram is marking them (see
 ## Implementation status
 
 The chain is fully *specified* and wired, including the on-chain identity grounding
-(hop 5). Read the Status note above for which links are enforced and which only observed:
-the table below says what exists, not how far the deployment carries it — hop 3 now has
-both, and hop 5 has the mechanism with its switch still off.
+(hop 5). Read the Status note above for how far the deployment carries each link, which
+the table below does not say — it says what exists in the code. Hops 3 and 5 now have
+both: the mechanism, and the switch turned on.
 
 | Link | Status | Where |
 |------|--------|-------|
 | Hop 2 — TDX quote signature-chain verification | **Implemented.** A real go-tdx-guest DCAP verifier (quote chain → Intel root + QE identity + TCB status) fills the `WithQuoteParser` seam, wired into the sidecar, gateway, and route resolver. The seam stays in `protocol/attest` by design (keeps `protocol` lean/portable); the heavy verifier lives in the client. | `client/dcap/tdxverify.go`, `client/cmd/{sidecar,gateway}/main.go`, #29 / #31 |
 | Hop 3 — boot-chain allowlist | **Implemented, allowlist populated, enforced.** `Verifier.Verify` compares the quote's `BootChain` (MRTD + RTMR1 + RTMR2) against `BootChainPolicy` in enforce/warn modes (`-attest-enforce`). The expected values are **published as an embedded file in this repository** — `client/evidence/brokerimages.json`, one entry per audited OS image, beside the gateway's own `osimages.json` — which answers what used to be the open half of this hop. Each entry records the release it was computed from with `dstack-mr` and confirmed against a live quote; an entry that cannot say that is refused in review. `-attest-enforce` is **on** in deployment, so an unlisted image is refused before anything is sealed to it; the allowlist ships with the gateway build, which makes a provider's guest-OS upgrade something to sequence against a gateway release. | `attest/verify.go`, `attest/measurement.go`, `client/evidence/brokerimage.go`, #31 |
 | Hop 4 — `report_data` → `enc_pub`/`signer_addr` | **Implemented.** `ParseReportData` (SPEC §4.2 layout). | `attest/reportdata.go` |
-| Hop 5 — `signer_addr == on-chain teeSignerAddress` | **Implemented (warn/enforce).** The route resolver cross-checks the DCAP-quote-bound signer against the provider's *acknowledged* `teeSignerAddress` read from the on-chain InferenceServing registry (`getService`), keyed on the provider's on-chain account — a mapping the untrusted router cannot forge. This is what catches a *genuine* enclave running audited code but operated by an unregistered party ([Why the on-chain root exists](#why-the-on-chain-root-exists)). Enforce skips a missing/unacknowledged/mismatched candidate; warn observes only. A failed *lookup* is fail-closed too, with no opt-out — so enforce means the chain was actually read — but is counted as its own class rather than as a provider accusation; and a negative is never returned on stale or cached evidence without a live re-read ([What hop 5 concludes, and what it does not](#what-hop-5-concludes-and-what-it-does-not)). Reads the chain over a client-trusted RPC (`-onchain`, `-chain-rpc-url`), not the router. | `client/chain/registry.go`, `client/route` `WithOnChainVerification`, #18 |
+| Hop 5 — `signer_addr == on-chain teeSignerAddress` | **Implemented (warn/enforce), enforced in deployment.** `-onchain-enforce` is **on**, spelled out as a literal in the deployed compose so `app_id` commits to the verdict mode. The route resolver cross-checks the DCAP-quote-bound signer against the provider's *acknowledged* `teeSignerAddress` read from the on-chain InferenceServing registry (`getService`), keyed on the provider's on-chain account — a mapping the untrusted router cannot forge. This is what catches a *genuine* enclave running audited code but operated by an unregistered party ([Why the on-chain root exists](#why-the-on-chain-root-exists)). Enforce skips a missing/unacknowledged/mismatched candidate; warn observes only. A failed *lookup* is fail-closed too, with no opt-out — so enforce means the chain was actually read — but is counted as its own class rather than as a provider accusation; and a negative is never returned on stale or cached evidence without a live re-read ([What hop 5 concludes, and what it does not](#what-hop-5-concludes-and-what-it-does-not)). Reads the chain over a client-trusted RPC (`-onchain`, `-chain-rpc-url`), not the router. | `client/chain/registry.go`, `client/route` `WithOnChainVerification`, #18 |
 | Hops 6–9 — HPKE seal/open, AAD binding | **Implemented.** | `crypto/`, `wire/` |
 | Hop 11 — signature verify against signer | **Implemented (opt-in, `-verify-responses`).** The client recomputes the §8 ciphertext binding over the on-wire `aad‖ciphertext` it received (non-stream, and streamed via an ordered per-frame aggregate), recovers the EIP-191 signer, and accepts only if it equals `provider.SignerAddr` — the quote-bound signer, itself grounded on-chain when `-onchain` is on (hop 5) — never the self-reported `signing_address`. The signature is fetched **directly from the provider's broker endpoint** (the router does not proxy `/v1/proxy/signature`). Fail-closed; off by default. The versioned signed-text/binding contract is shared with the broker in `protocol/proof` (no drift). | `protocol/proof`, `client/sig`, `client/core` (verify.go), `client/route` (sigfetch.go) |
 
-So today every link is **wired**, but they are not all **enforced**, and the difference
-matters:
+Every link in the table above is now **enforced** as well as wired — a distinction this
+section existed to draw while hop 5 was still only observed. (Hop 12 is not in the table:
+replay is defeated client-side only, and that gap is unchanged.)
 
 - **Enforced** — hop 2 (quote authenticity, with `-attest`), hop 3 (the boot-chain
-  allowlist, with `-attest-enforce`), hop 4 (`report_data` → `enc_pub`), hops 6–9
-  (seal/open and AAD binding), and hop 11 (the §8 response signature, with
-  `-verify-responses`; fail-closed by construction). A candidate or a response that
-  fails any of these is refused.
-- **Warn only** — hop 5, whose `-onchain-enforce` is deliberately off while on-chain
-  provider data is still filling in; it is wired and observed, and turning it on is a
-  switch rather than work.
+  allowlist, with `-attest-enforce`), hop 4 (`report_data` → `enc_pub`), hop 5 (the
+  on-chain signer, with `-onchain-enforce`), hops 6–9 (seal/open and AAD binding), and
+  hop 11 (the §8 response signature, with `-verify-responses`; fail-closed by
+  construction). A candidate or a response that fails any of these is refused.
+
+Hop 5 was the last of these to flip, and it moved from "warn only" to enforced once warn
+mode had supplied the baseline that says the flip is free: `mismatch` and `lookup_failed`
+sitting at zero mean every outcome observed was one enforce would also have allowed.
+Softening it again means editing the deployed compose and redeploying, which is what
+`app_id` committing to the verdict mode buys — a verifier can tell an enforcing gateway
+from a warning one.
+
+What the switch costs in practice is not a risk of false accusations — a negative is
+never returned on stale or cached evidence without a live re-read — but a routine
+availability nick: a provider re-registering its signer drops out of the fleet for the
+gap between its enclave coming up and the registry re-acknowledging it. That makes a
+spare candidate an operational requirement, the same shape hop 3's allowlist gave the
+fleet (`deploy/phala/README.md`, "Notes").
 
 The code root's OS half is therefore closed in the deployment as well as in the code: a
 provider whose MRTD/RTMR1/RTMR2 is not an entry the gateway build carries is refused
@@ -253,8 +266,9 @@ before anything is sealed to it, rather than sealed to and logged. That makes th
 allowlist an operational dependency of the fleet — a provider moving to a guest-OS
 release with no entry is refused until an entry is computed and shipped in a new gateway
 build, which is a migration to sequence rather than a gap in the mechanism (see
-`deploy/phala/README.md`, "When a PROVIDER upgrades its broker"). Hop 5, once enforced,
-is what turns "an attested enclave" into "the **expected** attested enclave."
+`deploy/phala/README.md`, "When a PROVIDER upgrades its broker"). And with hop 5 enforced
+beside it, the deployment no longer merely seals to "an attested enclave" but to "the
+**expected** attested enclave" — the audited image *and* the registered operator.
 
 The code root's OTHER half — hop 3 pins the guest OS and says nothing about the
 containers inside it — is now **read and adjudicated** in `pcverify -provider`: the

@@ -255,10 +255,14 @@ services:
       # - "ZG_GATEWAY_CHAIN_RPC_URL=https://evmrpc.0g.ai"
       # - "ZG_GATEWAY_SERVING_CONTRACT=0x47340d900bdFec2BD393c626E12ea0656F938d84"
       # Skip a provider whose on-chain signer is missing/unacknowledged/mismatched
-      # instead of only warning. Left OFF: verify-and-warn. It also fails closed on a
-      # signer that could not be READ at all, with no knob to relax that — so read
-      # onchain_grounding_total first; README "Notes" says what to look for.
-      # - "ZG_GATEWAY_ONCHAIN_ENFORCE=true"
+      # instead of only warning. ON, so hop 5 is a gate: a provider the registry does not
+      # vouch for is refused before anything is sealed to it, and the request falls back
+      # to the next candidate — so this needs a fleet with a candidate to spare.
+      #
+      # A signer that could not be READ at all also fails closed, with no knob to relax
+      # it. README "Notes" has the rest: what to watch before and after a rollout, and
+      # why a mismatch is read together with the log line beside it.
+      - "ZG_GATEWAY_ONCHAIN_ENFORCE=true"
       # Verify each response's §8 TEE signature (trust-chain hop 11) fail-closed
       # against the quote-bound signer. A response that does not verify is rejected.
       - "ZG_GATEWAY_VERIFY_RESPONSES=true"

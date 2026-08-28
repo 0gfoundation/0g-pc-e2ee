@@ -588,6 +588,7 @@ it can say:
 | `ZG_GATEWAY_ATTEST` | **required.** Without quote verification nothing is verified, so there is no verdict to report and the route is not mounted at all. |
 | `ZG_GATEWAY_ATTEST_ENFORCE` | on (as deployed), an out-of-allowlist boot chain fails the verification, so that provider gets no record and its address 404s — `verdicts.measurement` is `pass` in every record that exists. Off, the same provider is sealed to and reported as `no_match`. |
 | `ZG_GATEWAY_ONCHAIN` | when off, `verdicts.onchain_signer` is `not_checked` rather than a comparison result. When on but the chain could not be read, it is `unavailable` — a chain-RPC problem is never reported as a finding against the provider. |
+| `ZG_GATEWAY_ONCHAIN_ENFORCE` | on (as deployed), a provider the registry does not vouch for is skipped — but **unlike the boot-chain check above it still gets a record**, carrying the `no_match` that rejected it, because a stale earlier `pass` standing for the rest of its TTL while the gateway refuses that provider is the worse failure. So `verdicts.onchain_signer: "no_match"` stays readable under enforce, and a survey of hop 5 does not have to be taken from a warn-mode gateway the way a measurement survey does. |
 | `ZG_GATEWAY_PROVIDER_IDENTITY_ENDPOINT` | on by default; set `false` to remove the route entirely. Appears in the compose only as a commented-out line, per this file's convention. |
 
 **This endpoint does report verdicts, unlike the self-description above — and that is
@@ -941,10 +942,11 @@ and warmer liveness).
   header and are unaffected by any of this. The default carries two `localhost`
   ports as development conveniences — drop them via the override on a deployment
   that does not need dev hosts reaching this enclave.
-- **Provider verification** is on and enforced, with one check still verify-and-warn. Each provider's TDX
+- **Provider verification** is on and enforced at every hop it covers. Each provider's TDX
   quote is DCAP-verified (`ZG_GATEWAY_ATTEST`), its quote-bound signer is
-  cross-checked against the on-chain `teeSignerAddress`
-  (`ZG_GATEWAY_ONCHAIN`), and each response's §8 TEE signature is verified
+  cross-checked against the on-chain `teeSignerAddress` and skipped if the registry
+  does not vouch for it (`ZG_GATEWAY_ONCHAIN`, `ZG_GATEWAY_ONCHAIN_ENFORCE`), and each
+  response's §8 TEE signature is verified
   fail-closed against that signer (`ZG_GATEWAY_VERIFY_RESPONSES`). A background
   warmer (`ZG_GATEWAY_WARM`) pre-verifies quotes so requests hit a warm cache.
   The **boot-chain** check (hop 3) is **enforced** (`ZG_GATEWAY_ATTEST_ENFORCE`): a
@@ -979,31 +981,60 @@ and warmer liveness).
   To ride out a fleet that has drifted, set `ZG_GATEWAY_ATTEST_ENFORCE=false` and
   redeploy: the verification stays, only the verdict softens.
 
-  One check still only *warns*:
-  - the **on-chain signer** check (trust-chain hop 5) is wired and observed;
-    `ZG_GATEWAY_ONCHAIN_ENFORCE` is simply off, so turning it on is a config change.
-    Read `onchain_grounding_total` from `/metrics` before flipping it: warn mode is
-    the baseline that says whether enforce is safe here, since every outcome other
-    than `ok`/`ok_stale` becomes a skipped candidate. The negatives are counted apart
-    because they need different responses — `mismatch`/`not_acknowledged` are verdicts
-    about the provider and are what enforce is for, while `lookup_failed` is our own
-    chain RPC. Both fail-closed under enforce, with no opt-out for the second, so
-    enforce means the chain was actually read rather than merely consulted; if a
-    chain-RPC outage ever has to be ridden out, the lever is turning enforce off. A
-    blip will not get that far — `eth_call` retries, the reading is cached 5m, the
-    warmer refreshes ahead of expiry, a 30m grace window serves the last known-good
-    value, and a 30s cooldown after a failed lookup keeps an ongoing outage from
-    costing every request the retry budget — so watch `lookup_failed` and
-    `warmer_signer_refreshes_total{result="failed"}` for the sustained case. A provider
-    is never rejected on a stale or cached reading without a live re-read first, so a
-    broker upgrade rotating its signer does not read as an attack (see
-    `trust-chain.md`, "What hop 5 concludes, and what it does not"). Read a `mismatch`
-    together with the log line beside it rather than on its own: the counter cannot say
-    whether the recovery re-verification ran, and only a mismatch that survived one is
-    an accusation. The three are logged apart — "could not re-verify … the mismatch
-    stands on the cached quote" (throttled or the quote fetch failed), "the cached quote
-    had rotated" (benign, and it resolves), and "the quote signer had not rotated and
-    the mismatch stands" (live quote, live chain read, still disagreeing).
+  The **on-chain signer** check (trust-chain hop 5) is now enforced too
+  (`ZG_GATEWAY_ONCHAIN_ENFORCE`): a provider whose acknowledged `teeSignerAddress` is
+  missing, unacknowledged, or disagrees with its quote-bound signer is skipped rather
+  than warned about, and the request falls back to the next candidate. Like the other
+  verification settings it is part of the measured compose text, so each environment
+  picks it up on its next redeploy and there is no per-environment override: enabling it
+  for staging alone is not a thing this file can express. Two things to know before a
+  rollout:
+
+  - **The fleet needs a provider to spare.** The fallback is what makes a refusal a
+    degradation rather than an outage; with a single provider registered there is no
+    next candidate. Read `zg_gateway_warmer_ready_providers` for the environment you
+    are about to redeploy, filtered to *that* `env` label — the dashboard's default
+    view spans both, and the gauge is a `min`, so it otherwise reports whichever
+    environment has fewer rather than the one you are changing.
+  - **A chain-RPC outage is now refused traffic.** A lookup that fails outright is
+    fail-closed with no opt-out, so enforce means the chain was actually read rather
+    than merely consulted. A blip does not get that far — `eth_call` retries, the
+    reading is cached 5m, the warmer refreshes ahead of expiry, and a 30m grace window
+    serves the last known-good value, giving ~35m of usable life after the last
+    successful read — but a sustained outage costs requests, and the lever for riding
+    one out is setting this back to `false` and redeploying.
+
+    Note the grace window can only ever *confirm* a signer, never condemn one, so
+    lengthening it (`onchainCacheGrace`, a constant in
+    `client/cmd/internal/proxycli`) buys outage tolerance without widening what a
+    cached reading may decide. Nothing protects a **cold** cache, though: a gateway
+    that boots into a chain outage has no entry to fall back on, every lookup fails,
+    and under enforce that leaves `warmer_ready_providers` at zero — which is what
+    `/readyz` gates the blue/green cutover on, so enforce couples a cutover to the
+    chain RPC being reachable.
+
+  `onchain_grounding_total` is the counter to watch, before a rollout and after: every
+  outcome other than `ok`/`ok_stale` is now a skipped candidate. The negatives are
+  counted apart because they need different responses — `mismatch`/`not_acknowledged`
+  are verdicts about the provider and are what enforce is for, while `lookup_failed` is
+  our own chain RPC. A 30s cooldown after a failed lookup keeps an ongoing outage from
+  costing every request the retry budget, so watch `lookup_failed` together with
+  `warmer_signer_refreshes_total{result="failed"}` — the warmer's read is forced past
+  the cache and the grace window, which makes it the leading indicator of the two.
+
+  A provider is never rejected on a stale or cached reading without a live re-read
+  first, so a broker upgrade rotating its signer does not read as an attack (see
+  `trust-chain.md`, "What hop 5 concludes, and what it does not"). It does, however,
+  drop that provider for the gap between its enclave coming up with a new signer and
+  the registry re-acknowledging it — the routine cost of this switch, and the reason
+  the fleet needs a spare candidate.
+
+  Read a `mismatch` together with the log line beside it rather than on its own: the
+  counter cannot say whether the recovery re-verification ran, and only a mismatch that
+  survived one is an accusation. The three are logged apart — "could not re-verify … the
+  mismatch stands on the cached quote" (throttled or the quote fetch failed), "the cached
+  quote had rotated" (benign, and it resolves), and "the quote signer had not rotated and
+  the mismatch stands" (live quote, live chain read, still disagreeing).
 
   Response signatures are always fail-closed.
 - If the gateway container is recreated with a new address, restart
