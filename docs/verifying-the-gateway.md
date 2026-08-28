@@ -307,12 +307,18 @@ Two fields are worth reading carefully:
   that the allowlist was empty and nothing was checked. The endpoint does not
   distinguish them; `pcverify` does, and reports the second as an incomplete run
   (exit 3) rather than a pass.
-- **`containers[].source`** says who published an image: `0g-release` for one of
-  ours, `third-party` for everything else. All of them are covered by `compose_hash`
-  either way; `third-party` simply means there is no release of ours to compare it
-  against, and the endpoint will never invent one. It is about the image, not the
-  build — an image of ours with a year-old CVE reads `0g-release` too, and only
-  `matched_release` ties this deployment to a published release.
+- **`containers[].source`** says **who published an image**, and only that:
+  `0g-release` for one pushed to our namespace on the registry we publish through
+  (`ghcr.io/0gfoundation/…`), `third-party` for everything else. All of them are
+  covered by `compose_hash` either way.
+
+  It is not a claim that a release exists for that image, in either direction. Images
+  of ours built from *other* repositories read `0g-release` with no release of this
+  one to compare them against, and `0g-release` says nothing about *which build* is
+  running — an image of ours with a year-old CVE carries the same label as the current
+  one. `matched_release` is the field that ties this deployment to a published release,
+  and it is a property of the whole deployment rather than of any single image. The
+  same label, computed the same way, appears on the provider list below.
 
 `matched_release` is `null` for a deployment whose compose text is not byte-identical
 to a published release asset — expected for a development deployment, since the

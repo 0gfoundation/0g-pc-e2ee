@@ -249,7 +249,8 @@ Two properties follow, and both are enforced in code (`client/cmd/gateway/identi
   what §6.2 says it must not do.
 - **`containers[].source` says who published each image.** All four containers are
   covered by `compose_hash`; what differs is who answers for the contents. The label
-  reads the reference's registry and namespace, so it is a fact about the
+  reads the reference's registry and namespace — our namespace on `ghcr.io`, the only
+  registry we publish through — so it is a fact about the
   authenticated compose text rather than about whether a release lookup succeeded —
   `matched_release` is a property of the *deployment*, `source` of each *image*, and
   third-party images (`dstack-ingress`, `prometheus`) get a digest and never a release
@@ -324,6 +325,16 @@ repository, which is why the label was withheld here until it was replaced. Our
 namespace on a registry we do *not* publish through collapses into `third-party`, a
 direction that can fail to flag a lookalike but can never bless one; `pcverify`'s
 origin column keeps that case distinct for a reader who needs it.
+
+Which registries count is therefore the narrow set we actually publish through —
+`ghcr.io`, and nothing else. Docker Hub sat in that set on the argument that a Hub
+namespace is globally unique, so `0gfoundation/x` there names one specific account. It
+came out when the label started describing a *provider's* compose text, which the
+provider writes: the namespace does name one account, but nothing in this repository
+establishes that the account is **ours**, since we never push there — so an
+unregistered or squatted name was one unqualified reference away from a "published by
+0G" stamp on a stranger's image. A registry we do not publish through cannot vouch for
+a namespace, whether or not the name is unique.
 
 The label is not a check either, and for a sharper reason than the list is: "0G
 published it" says nothing about *which build* of it this is, so an image of ours with

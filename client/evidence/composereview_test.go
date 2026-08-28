@@ -1032,8 +1032,6 @@ func TestClassifyOrigin(t *testing.T) {
 	}{
 		{"ghcr.io/0gfoundation/broker", OriginFirstParty},
 		{"ghcr.io/0gFoundation/broker", OriginFirstParty},
-		{"0gfoundation/broker", OriginFirstParty},
-		{"docker.io/0gfoundation/broker", OriginFirstParty},
 		{"ghcr.io/0gfoundation/nested/broker", OriginFirstParty},
 		{"mysql", OriginThirdParty},
 		{"library/mysql", OriginThirdParty},
@@ -1055,6 +1053,16 @@ func TestClassifyOrigin(t *testing.T) {
 		{"quay.io/0gfoundation/broker", OriginForeignRegistry},
 		{"localhost:5000/0gfoundation/broker", OriginForeignRegistry},
 		{"registry.internal:5000/0gfoundation/broker", OriginForeignRegistry},
+
+		// Docker Hub is the same trap wearing a uniqueness argument. A Hub namespace does
+		// name one account — but not necessarily OURS, since nothing here ever pushes
+		// there, so an unregistered or squatted "0gfoundation" would otherwise have read
+		// as first-party. Both the explicit spellings and the implicit host of an
+		// unqualified reference must land in the foreign-registry state.
+		{"0gfoundation/broker", OriginForeignRegistry},
+		{"docker.io/0gfoundation/broker", OriginForeignRegistry},
+		{"index.docker.io/0gfoundation/broker", OriginForeignRegistry},
+		{"registry-1.docker.io/0gfoundation/broker", OriginForeignRegistry},
 	} {
 		if got := ClassifyImageOrigin(tc.image); got != tc.want {
 			t.Errorf("ClassifyImageOrigin(%q) = %v, want %v", tc.image, got, tc.want)
@@ -1081,6 +1089,28 @@ func TestReviewCompose_OurNamespaceOnAForeignRegistry(t *testing.T) {
 	ours := fmt.Sprintf("services:\n  broker:\n    image: ghcr.io/0gfoundation/broker@sha256:%s\n", strings.Repeat("a", 64))
 	if got := find(reviewOf(t, manifest(ours)), "broker", "image"); len(got) != 0 {
 		t.Fatalf("an image on our own registry was reported: %+v", got)
+	}
+}
+
+// The same finding for an UNQUALIFIED reference, which is the shape Docker Hub leaving
+// firstPartyRegistries made reachable. Two things have to hold: our namespace on Hub is
+// not ours (we publish nowhere but ghcr.io, so the name is one we may not even hold),
+// and the finding has to name the registry a reader should go look at — splitRegistry
+// reports the implicit host as "", which would otherwise render as "on , which is not a
+// registry we publish through".
+func TestReviewCompose_OurNamespaceOnImplicitDockerHub(t *testing.T) {
+	ref := "0gfoundation/broker@sha256:" + strings.Repeat("a", 64)
+	doc := fmt.Sprintf("services:\n  broker:\n    image: %s\n", ref)
+	r := reviewOf(t, manifest(doc))
+	if r.Services[0].Origin != OriginForeignRegistry {
+		t.Fatalf("origin = %v, want our-name/not-ours — we do not publish to Docker Hub", r.Services[0].Origin)
+	}
+	f := requireFinding(t, r, SeverityJustify, "broker", "image")
+	if !strings.Contains(f.Detail, "docker.io") {
+		t.Errorf("detail must name the registry the reference resolves at: %q", f.Detail)
+	}
+	if strings.Contains(f.Detail, "on , ") {
+		t.Errorf("the implicit host reached the message as an empty string: %q", f.Detail)
 	}
 }
 

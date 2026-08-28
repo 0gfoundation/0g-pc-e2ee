@@ -612,7 +612,10 @@ containers). An entry with an **empty digest** is worth reading: that image is p
 by tag, so `compose_hash` commits to a name whose contents can be republished under
 it. Each entry also carries `source` — `0g-release` or `third-party`, the same two
 values as the gateway's own list — which says **who published the image**, read off its
-registry and namespace. It is the weaker of the two claims the gateway's list makes:
+registry and namespace: our namespace on `ghcr.io`, the only registry we publish
+through, and nothing else (our name on any other host, Docker Hub included, reads
+`third-party`, since a registry we do not push to cannot vouch for the name). It is the
+weaker of the two claims the gateway's list makes:
 no per-provider manifest is published, so there is no release to trace an image back
 to, and nothing corresponds to `matched_release`. Use it to tell which lines to ask us
 about and which need an upstream answer; it says nothing about *which build* of an
