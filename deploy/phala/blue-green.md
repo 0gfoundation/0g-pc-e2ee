@@ -30,24 +30,29 @@ So "blue" and "green" are two CVMs with two `app_id`s, both serving `<DOMAIN>`,
 and releasing = repointing `_dstack-app-address.<DOMAIN>` from one to the other.
 [`switch.sh`](./switch.sh) does that flip safely.
 
-> **What actually sets `app_id` — the sides must be different builds.** dstack
-> measures the compose *text*, and the only literal, side-distinguishing field in
-> it is the **gateway image digest**. `DOMAIN`, `DELEGATION_ZONE`,
-> `GATEWAY_DOMAIN`, `ZG_GATEWAY_ROUTER_URL` and friends are `${...}` placeholders
-> injected from the CVM's encrypted env at boot, so **changing them does not
-> change `app_id`** (the compose comments call this out for the router URL). Their
-> *values* are invisible to `app_id`, but the **`allowed_envs` list is part of the
-> measured app-compose** — so it must be **identical on both sides**, and the two
-> sides then differ by exactly the image digest. Keep `DNS_SETUP_MODE` and
-> `ACME_STAGING` **permanently listed** in `allowed_envs` (a fixed superset) and
-> toggle behaviour by the injected *value*, never by adding/removing the key —
-> otherwise `allowed_envs` differs and the sides diverge by more than the image.
-> The consequence that matters here: run the **same image** on both sides and they
-> share one `app_id` — dstack sees one app with two replicas, both per-side
-> records carry the same value, and the traffic switch **cannot select between
-> them**. Blue/green only isolates the two sides when they are genuinely
-> different gateway builds (the normal release case). To rehearse the flow before
-> a real release, use two different builds, not the same image twice.
+> **What actually sets `app_id`.** `app_id` hashes the **app-compose manifest**, not
+> the docker-compose text alone. Two of its fields distinguish one side from the
+> other: the **gateway image digest** inside the embedded compose text, and the
+> manifest's **`name`** — the CVM name given at create time, which `pcverify` prints
+> as `app name`. So two sides differ by their build, by their name, or by both, and
+> `deploy.sh`'s `0g-pc-gateway-<env>-<side>` default means they always differ by name
+> even before the image does.
+>
+> Everything else the two sides configure differently is **invisible** to `app_id`:
+> `DOMAIN`, `DELEGATION_ZONE`, `GATEWAY_DOMAIN`, `ZG_GATEWAY_ROUTER_URL`,
+> `ACME_STAGING` and friends are `${...}` placeholders injected from the encrypted
+> env at boot, and only the placeholder text is measured (the compose comments call
+> this out for the router URL). The **`allowed_envs` list**, however, *is* part of the
+> measured manifest — so it must be **identical on both sides**. Keep `DNS_SETUP_MODE`
+> and `ACME_STAGING` **permanently listed** there (a fixed superset) and toggle
+> behaviour by the injected *value*, never by adding or removing a key.
+>
+> The consequence that matters here: two CVMs sharing a build **and** a name are one
+> app with two replicas — dstack sees a single `app_id`, both per-side records carry
+> the same value, and the traffic switch cannot select between them. That is the
+> configuration [Scaling one side](#scaling-one-side-replicas) wants and blue/green
+> must avoid. It is also why the name is not a label to be tidied later: changing it
+> is a different `app_id`, i.e. a new CVM and a re-audit, never a rename.
 
 > **No percentage canary.** If you need gradual rollout, it has to be a *replica*
 > story (same `app_id`, more instances) or a second layer you build yourself.
@@ -470,9 +475,13 @@ you no second side to cut over to safely.)
 ## Scaling one side (replicas)
 
 Independent of releases: to scale or add HA **within** a side, deploy more CVMs
-from that side's *exact* compose (same `app_id`). dstack spreads traffic across
-them by `app_id`, and each publishes the same `_dstack-app-address` value, so no
-switch-layer change is needed. Releases (this document) change `app_id` and flip
+from that side's *exact* compose **under that side's exact name** (same `app_id`).
+The name is measured, so a second CVM of side b called anything else is a
+different app, not a replica — which is precisely the check `deploy.sh` refuses on
+(`--allow-duplicate-name` is how you deliberately deploy a second CVM under one
+name, and `phala cvms replicate --cvm-id <name>` is the platform's own way).
+dstack spreads traffic across them by `app_id`, and each publishes the same
+`_dstack-app-address` value, so no switch-layer change is needed. Releases (this document) change `app_id` and flip
 the pointer; scaling keeps `app_id` and adds instances. They compose cleanly —
 `switch.sh` neither knows nor cares how many CVMs back the side it points at.
 

@@ -144,9 +144,14 @@ decision (see [`blue-green.md`](./blue-green.md) for the order the two run in,
 which is not the obvious one — issuance is aimed at a side *before* that side is
 built).
 
-Every choice the dashboard's form would ask for is an input to `app_id`:
-`allowed_envs`, and the `public_logs` / `public_sysinfo` / `public_tcbinfo` /
-`secure_time` flags all live in the measured app-compose. That is why they
+Every choice the dashboard's form would ask for is an input to `app_id`: the CVM
+**name**, `allowed_envs`, and the `public_logs` / `public_sysinfo` /
+`public_tcbinfo` / `secure_time` flags all live in the measured app-compose. The
+name catches people out — it looks like a label, but app-compose has a `name`
+field and `app_id` is that manifest's hash, so `pcverify` prints it as `app name`
+and changing it is a new `app_id`, not a rename. `deploy.sh` names a CVM
+`0g-pc-gateway-<ZG_PROM_ENV>-<side>` and refuses to create a second one under a
+name already in use. That is why they
 belong in `deploy.env` — a file a reviewer can read and two blue/green sides can
 be shown to share — rather than in a browser session nobody can audit. The
 defaults it applies: logs and sysinfo **off** (this CVM handles sealed prompts,

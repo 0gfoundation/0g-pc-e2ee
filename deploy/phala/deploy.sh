@@ -50,12 +50,15 @@
 #                       ("latest" for the newest); its sha256 is checked against
 #                       the one the release notes publish
 #   --compose PATH      deploy a local manifest instead (must be digest-pinned)
-#   --name NAME         CVM name (default: 0g-pc-gateway-<side>)
+#   --name NAME         CVM name (default: 0g-pc-gateway-<ZG_PROM_ENV>-<side>).
+#                       MEASURED — it is a field of the app-compose, so it is part of
+#                       app_id; see check_name_free() below before choosing one.
 #   --env-file PATH     load config from PATH instead of ./deploy.env
 #   --dry-run           print the phala command (secrets redacted), do nothing
 #   --yes               do not prompt
 #   --no-probe          skip the post-deploy readiness wait
 #   --skip-acme-check   deploy even though issuance is not aimed at this side
+#   --allow-duplicate-name  deploy even though a CVM already carries this name
 #   --allow-floating-tag  deploy a manifest with an unpinned gateway image
 #                       (development only — it voids the attestation, see
 #                       README "Pin the image digest")
@@ -70,6 +73,7 @@ ASSUME_YES=0
 NO_PROBE=0
 SKIP_ACME_CHECK=0
 ALLOW_FLOATING=0
+ALLOW_DUP_NAME=0
 SIDE=""
 RELEASE=""
 COMPOSE_ARG=""
@@ -287,6 +291,40 @@ check_cli() {
   fi
 }
 
+# THE CVM NAME IS MEASURED. dstack's app-compose carries a `name` field (dstack-types
+# AppCompose), and compose_hash is the SHA-256 of that manifest — so the name is inside
+# app_id, exactly like the compose text and allowed_envs. `pcverify -gateway` prints it
+# as `app name`, read out of the manifest the quote anchors. Three consequences:
+#
+#   * A name is not a label you can fix later. Renaming means a different app_id, which
+#     means a different CVM and a re-audit, not an edit.
+#   * Two sides with the SAME image but different names are different app_ids. That is
+#     what keeps a staging CVM and a production one from colliding into a single app —
+#     nothing else in the manifest distinguishes them, since DOMAIN and the router URL
+#     are `${…}` references whose values are never measured.
+#   * Replicas of ONE side must share the name, or they are not replicas: dstack load
+#     balances within an app_id, and a differently-named CVM is a different app.
+#
+# It is also the CLI's handle — `--cvm-id` accepts a name — which is what makes a
+# collision worth refusing below rather than discovering later.
+check_name_free() {
+  if ! phala cvms get --cvm-id "$CVM_NAME" --json >/dev/null 2>&1; then
+    ok "no CVM named ${CVM_NAME} yet"
+    return 0
+  fi
+  bad "a CVM named ${CVM_NAME} already exists"
+  if [ "$ALLOW_DUP_NAME" = 1 ]; then
+    warn "continuing anyway (--allow-duplicate-name); '--cvm-id ${CVM_NAME}' is now ambiguous"
+    return 0
+  fi
+  die "retire it first (phala cvms delete --cvm-id ${CVM_NAME}), or pass --name for a new one.
+    Updating that CVM in place is a different operation and this script does not do it:
+    'phala deploy --cvm-id ${CVM_NAME}' replaces the app on the SAME CVM, which is not a
+    blue/green release — the point of a release here is a second CVM to cut over to and
+    roll back from. --allow-duplicate-name overrides, at the cost of a name that no
+    longer addresses one CVM."
+}
+
 # app_id / instance_id out of whatever shape the CLI's JSON has this version:
 # scan every object for a key named like the one we want and take the first
 # 40-hex value. Keyed lookup at a fixed path is what breaks on a CLI upgrade,
@@ -470,6 +508,7 @@ cmd_preflight() {
   check_compose_pinned "$COMPOSE_FILE"
   check_serving_alias
   check_acme_aimed_here
+  check_name_free
   [ -n "$INSTANCE_TYPE" ] || warn "INSTANCE_TYPE unset — the platform picks the shape, and GOMEMLIMIT=24GiB in the compose assumes 32 GiB (README 'CVM shape')"
   build_env_file >/dev/null && ok "all required environment values present"
   warn "two prerequisites this script CANNOT check:"
@@ -488,6 +527,7 @@ cmd_deploy() {
   check_compose_pinned "$COMPOSE_FILE"
   check_serving_alias
   check_acme_aimed_here
+  check_name_free
 
   local envfile; envfile="$(build_env_file)"
 
@@ -632,6 +672,7 @@ while [ $# -gt 0 ]; do
     --no-probe)  NO_PROBE=1 ;;
     --skip-acme-check) SKIP_ACME_CHECK=1 ;;
     --allow-floating-tag) ALLOW_FLOATING=1 ;;
+    --allow-duplicate-name) ALLOW_DUP_NAME=1 ;;
     -h|--help)   usage 0 ;;
     -*)          die "unknown flag: $1 (try --help)" ;;
     *)           POSITIONAL+=("$1") ;;
@@ -657,7 +698,12 @@ if [ -n "$SIDE" ]; then
 else
   SIDE_LABEL=""; SIDE_ZONE=""
 fi
-CVM_NAME="${NAME_ARG:-${CVM_NAME:-0g-pc-gateway${SIDE:+-$SIDE}}}"
+# Default: 0g-pc-gateway-<env>-<side>, e.g. 0g-pc-gateway-staging-b. The env comes
+# from ZG_PROM_ENV, which is already required and already means exactly this, so
+# there is one place to state which deployment a CVM belongs to. Both parts earn
+# their place in a MEASURED field: without the env, a staging CVM and a mainnet
+# one on the same build would share app_id.
+CVM_NAME="${NAME_ARG:-${CVM_NAME:-0g-pc-gateway${ZG_PROM_ENV:+-$ZG_PROM_ENV}${SIDE:+-$SIDE}}}"
 RELEASE_TAG=""
 APP_ID=""; INSTANCE_ID=""
 
