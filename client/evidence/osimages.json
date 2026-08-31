@@ -31,6 +31,12 @@
     "it is constant for a platform, but it means MRTD is (image, page-add mode). The",
     "mode each entry was computed for is recorded below.",
     "",
+    "AND MRTD DOES NOT IDENTIFY AN IMAGE BY ITSELF. It measures the virtual firmware,",
+    "so two releases that ship the same ovmf.fd have the same MRTD — dstack-0.5.9 and",
+    "dstack-nvidia-0.5.4.1 below carry an identical one, and their ovmf.fd files are",
+    "byte-identical. RTMR1 (kernel) and RTMR2 (cmdline + initrd) are what separate",
+    "them, which is why a match is on all three together and never on MRTD alone.",
+    "",
     "HOW TO DERIVE ONE. Do not copy values out of a running deployment: that only",
     "records what it currently reports, which is the thing being verified. Compute them",
     "from the published image, then confirm they match a live quote — the computation is",
@@ -84,6 +90,25 @@
       "mrtd": "b24d3b24e9e3c16012376b52362ca09856c4adecb709d5fac33addf1c47e193da075b125b6c364115771390a5461e217",
       "rtmr1": "6e1afb7464ed0b941e8f5bf5b725cf1df9425e8105e3348dca52502f27c453f3018a28b90749cf05199d5a17820101a7",
       "rtmr2": "89e73cedf48f976ffebe8ac1129790ff59a0f52d54d969cb73455b1a79793f1dc16edc3b1fccc0fd65ea5905774bbd57"
+    },
+    {
+      "name": "dstack-0.5.9",
+      "os_image_hash": "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033",
+      "source": "github.com/Dstack-TEE/meta-dstack releases/download/v0.5.9/dstack-0.5.9.tar.gz",
+      "page_add": "two-pass (vm_config.qemu_single_pass_add_pages = false)",
+      "note": [
+        "Computed from the published artifact with dstack-mr (dstack e2d70a3),",
+        "tdx::tdx_measurements_for_image_dir_without_rtmr0, and identical at 1/2G,",
+        "2/4G, 4/8G and 16/32G. STEP 5 IS STILL OPEN: these have not yet been",
+        "confirmed against a live quote, because no CVM runs this image yet. The",
+        "same command on the same tool reproduces all three of the entry above,",
+        "which a live quote HAS confirmed — that is what this entry rests on until",
+        "the first deployment on 0.5.9 either agrees or does not. A wrong value here",
+        "can only reject that deployment, never accept a foreign one."
+      ],
+      "mrtd": "b24d3b24e9e3c16012376b52362ca09856c4adecb709d5fac33addf1c47e193da075b125b6c364115771390a5461e217",
+      "rtmr1": "07e6f51aa763abfe75c3ddfbf4f425fe3f0ceff66d807a75e049303dce9addf68e7218729bd419638af63a370f65878c",
+      "rtmr2": "df67e467e60edc1737bcf8e682d48131bfb427f523226aa7f197a7608e9b3784783fa759ef5b28191fa12f9ddb36b858"
     }
   ]
 }
