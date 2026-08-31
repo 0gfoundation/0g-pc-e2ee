@@ -24,7 +24,8 @@
 #   ./deploy.sh deploy --side b …      # 2. this script: build the side, wait for /readyz
 #   ./switch.sh switch b               # 3. cut traffic over (probes b first, rolls back itself)
 #   ./deploy.sh verify                 # 4. full pcverify gate on the served domain
-#   phala cvms delete --cvm-id <a>     # 5. retire the old side
+#   phala cvms delete --cvm-id <a's id> # 5. retire the old side (an id, not a name —
+#                                     #    see cvm_id_by_name below)
 # Step 1 comes first for a reason (blue-green.md "About the certificate"): a
 # side whose ACME challenge still points at its sibling burns the
 # 5-failed-validations-per-hour budget for the HOSTNAME, which blocks the live
@@ -357,21 +358,37 @@ check_cli() {
 #   * Replicas of ONE side must share the name, or they are not replicas: dstack load
 #     balances within an app_id, and a differently-named CVM is a different app.
 #
-# It is also the CLI's handle — `--cvm-id` accepts a name — which is what makes a
-# collision worth refusing below rather than discovering later.
+# A NAME IS NOT AN ID, so nothing here hands one to `--cvm-id`. The CLI advertises
+# "UUID, app_id, instance_id, or name" for that flag, but it passes the value straight
+# into the `cvms/{id}` path and its SDK schemas accept only id / uuid / app_id /
+# instance_id — any name resolution is the API's, undocumented, and unverified here.
+# Depending on it would be worst in the check below: if a name never resolves, every
+# lookup answers "not found" and the collision guard silently never fires. So the name
+# is resolved against the CVM LIST, and every later call uses the platform's own id.
+cvm_id_by_name() { # name -> that CVM's platform id, or empty
+  phala cvms list --json 2>/dev/null | jq -r --arg n "$1" '
+    [.. | objects
+     | select(any(to_entries[]; (.key | ascii_downcase) == "name"
+                                and (.value | type) == "string" and .value == $n))]
+    | first // {}
+    | (.uuid // .id // .vm_uuid // .cvm_id // .app_id // empty)' 2>/dev/null || true
+}
+
 check_name_free() {
-  if ! phala cvms get --cvm-id "$CVM_NAME" --json >/dev/null 2>&1; then
+  local id; id="$(cvm_id_by_name "$CVM_NAME")"
+  if [ -z "$id" ]; then
     ok "no CVM named ${CVM_NAME} yet"
     return 0
   fi
-  bad "a CVM named ${CVM_NAME} already exists"
+  bad "a CVM named ${CVM_NAME} already exists (${id})"
   if [ "$ALLOW_DUP_NAME" = 1 ]; then
-    warn "continuing anyway (--allow-duplicate-name); '--cvm-id ${CVM_NAME}' is now ambiguous"
+    warn "continuing anyway (--allow-duplicate-name); the name no longer names one CVM,"
+    warn "so address them by the ids 'phala cvms list' shows"
     return 0
   fi
-  die "retire it first (phala cvms delete --cvm-id ${CVM_NAME}), or pass --name for a new one.
+  die "retire it first (phala cvms delete --cvm-id ${id}), or pass --name for a new one.
     Updating that CVM in place is a different operation and this script does not do it:
-    'phala deploy --cvm-id ${CVM_NAME}' replaces the app on the SAME CVM, which is not a
+    'phala deploy --cvm-id ${id}' replaces the app on the SAME CVM, which is not a
     blue/green release — the point of a release here is a second CVM to cut over to and
     roll back from. --allow-duplicate-name overrides, at the cost of a name that no
     longer addresses one CVM."
@@ -426,7 +443,7 @@ wait_ready() { # app_id
   warn "a serving process that is not READY usually means no provider passed the"
   warn "enforced checks — ZG_GATEWAY_ATTEST_ENFORCE / ZG_GATEWAY_ONCHAIN_ENFORCE are"
   warn "fail-closed, so an unreachable PCCS, router or chain RPC looks exactly like this."
-  warn "Logs:  phala logs --cvm-id ${CVM_NAME}"
+  warn "Logs:  phala cvms list, then  phala logs --cvm-id <this CVM's id>"
   return 1
 }
 
@@ -618,16 +635,20 @@ cmd_deploy() {
   printf '%s\n' "$out" > "$WORKDIR/deploy.json"
 
   APP_ID="$(json_id "$out" app_id)"
-  # Not every CLI version returns the ids from deploy; ask for them explicitly.
-  if [ -z "$APP_ID" ]; then
-    out="$(phala cvms get --cvm-id "$CVM_NAME" --json 2>/dev/null || true)"
+  # Not every CLI version returns the ids from deploy; ask for them explicitly — by
+  # the platform's own id, resolved from the list, never by handing it the name.
+  CVM_ID="$(cvm_id_by_name "$CVM_NAME")"
+  if [ -z "$APP_ID" ] && [ -n "$CVM_ID" ]; then
+    out="$(phala cvms get --cvm-id "$CVM_ID" --json 2>/dev/null || true)"
     APP_ID="$(json_id "$out" app_id)"
   fi
-  [ -n "$APP_ID" ] || die "deployed, but could not read app_id — 'phala cvms get --cvm-id $CVM_NAME --json'"
+  [ -n "$APP_ID" ] || die "deployed, but could not read app_id.
+    Find the CVM with 'phala cvms list' and read it with 'phala cvms get --cvm-id <id> --json'."
   INSTANCE_ID="$(json_id "$out" instance_id)"
 
   info "app_id      ${APP_ID}"
   [ -n "$INSTANCE_ID" ] && info "instance_id ${INSTANCE_ID}"
+  [ -n "$CVM_ID" ] && info "cvm id      ${CVM_ID}   (what --cvm-id takes; the NAME is not an id)"
   info "probe       $(probe_url "$APP_ID")"
 
   [ "$NO_PROBE" = 1 ] || wait_ready "$APP_ID"
@@ -643,8 +664,9 @@ ${c_grn}==>${c_rst} side ${SIDE} is up. Next:
   # then the full attestation gate against the served domain
   ./deploy.sh verify
 
-  # and retire the old side once ${SIDE} is confirmed live
-  phala cvms delete --cvm-id <old-side>
+  # and retire the old side once ${SIDE} is confirmed live — by its id from
+  # 'phala cvms list', not by its name
+  phala cvms delete --cvm-id <old side's id>
 EOF
 }
 
@@ -667,11 +689,14 @@ cmd_verify() {
 
 cmd_status() {
   check_cli
-  local out app
-  out="$(phala cvms get --cvm-id "$CVM_NAME" --json 2>/dev/null || true)"
-  [ -n "$out" ] || die "no CVM named ${CVM_NAME} (try: phala cvms list)"
+  local out app id
+  id="$(cvm_id_by_name "$CVM_NAME")"
+  [ -n "$id" ] || die "no CVM named ${CVM_NAME} (try: phala cvms list)"
+  out="$(phala cvms get --cvm-id "$id" --json 2>/dev/null || true)"
+  [ -n "$out" ] || die "CVM ${CVM_NAME} (${id}) could not be read"
   app="$(json_id "$out" app_id)"
   printf 'cvm name    : %s\n' "$CVM_NAME"
+  printf 'cvm id      : %s\n' "$id"
   printf 'app_id      : %s\n' "${app:-<unreadable>}"
   printf 'instance_id : %s\n' "$(json_id "$out" instance_id)"
   printf 'cluster     : %s\n' "$PLATFORM_BASE"

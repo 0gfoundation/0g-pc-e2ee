@@ -72,7 +72,8 @@ below.
                                             #    then waits on b's /readyz by app-id
 ./switch.sh switch b                        # 3. probe b's /readyz directly, flip traffic, confirm b is
                                             #    really serving (cert changed) + /healthz; auto-rollback otherwise
-phala cvms delete --cvm-id <side a>         # 4. once b is confirmed live, retire a to free resources
+phala cvms list                             # 4. once b is confirmed live, retire a — by its
+phala cvms delete --cvm-id <side a's id>    #    platform id; --cvm-id does not take a name
 ```
 
 Step 2 is [`deploy.sh`](./deploy.sh) rather than a dashboard form because the
@@ -479,7 +480,8 @@ from that side's *exact* compose **under that side's exact name** (same `app_id`
 The name is measured, so a second CVM of side b called anything else is a
 different app, not a replica — which is precisely the check `deploy.sh` refuses on
 (`--allow-duplicate-name` is how you deliberately deploy a second CVM under one
-name, and `phala cvms replicate --cvm-id <name>` is the platform's own way).
+name, and `phala cvms replicate --cvm-id <the side's id>` is the platform's own
+way — `--cvm-id` takes an id from `phala cvms list`, not a name).
 dstack spreads traffic across them by `app_id`, and each publishes the same
 `_dstack-app-address` value, so no switch-layer change is needed. Releases (this document) change `app_id` and flip
 the pointer; scaling keeps `app_id` and adds instances. They compose cleanly —

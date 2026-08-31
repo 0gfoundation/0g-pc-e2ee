@@ -151,7 +151,8 @@ name catches people out — it looks like a label, but app-compose has a `name`
 field and `app_id` is that manifest's hash, so `pcverify` prints it as `app name`
 and changing it is a new `app_id`, not a rename. `deploy.sh` names a CVM
 `0g-pc-gateway-<ZG_PROM_ENV>-<side>` and refuses to create a second one under a
-name already in use. That is why they
+name already in use — a name is not an identifier, and `--cvm-id` wants the id
+`phala cvms list` shows, so two CVMs sharing a name leave the lookup ambiguous. That is why they
 belong in `deploy.env` — a file a reviewer can read and two blue/green sides can
 be shown to share — rather than in a browser session nobody can audit. The
 defaults it applies: logs and sysinfo **off** (this CVM handles sealed prompts,
