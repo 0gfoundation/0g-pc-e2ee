@@ -71,7 +71,9 @@ func providerVerifyNote(quoteURL string) string {
 // are different claims — but nothing here depends on reading a null correctly: the
 // verdicts say which case produced it. That is the whole point of the vocabulary in
 // route.Verdict, and the fix for the ambiguity the gateway's own os_image shipped
-// with.
+// with. os_image is the case to watch: it is null whenever the boot chain matched
+// nothing, and only verdicts.measurement distinguishes "not in the allowlist" from
+// "there was no allowlist".
 type providerIdentityDoc struct {
 	// Address is the provider's on-chain account as RECORDED (the spelling the route
 	// preview used), not as spelled in the request path: matching is case-insensitive,
@@ -85,10 +87,17 @@ type providerIdentityDoc struct {
 	Endpoint string `json:"endpoint"`
 	// Verdicts are the outcomes of the checks this gateway made before sealing.
 	Verdicts providerVerdicts `json:"verdicts"`
-	// OSImage names the allowlisted OS image the provider's boot chain matched, or
-	// null. Null even on a match, because attest.BootChainPolicy holds boot chains
-	// without labels — verdicts.measurement is what distinguishes matched from not
-	// compared, so null here is never ambiguous; see route.ProviderIdentity.
+	// OSImage names the allowlisted OS image the provider's boot chain matched — the
+	// entry's `name` in client/evidence/brokerimages.json, e.g. "dstack-nvidia-0.5.9" —
+	// or null when it matched none. It is the name the VERIFIER reported for the entry
+	// it matched, so it can never name a different entry than verdicts.measurement
+	// decided on (route.ProviderIdentity.OSImage).
+	//
+	// A panel must render it as a label on the pass, never as the pass itself: it is
+	// non-null only alongside measurement "pass", and what it adds is WHICH audited
+	// image, not whether. Null is unambiguous for the same reason it always was —
+	// verdicts.measurement says whether the check found nothing, had nothing to compare
+	// against, or (in principle) matched an entry that carried no name.
 	OSImage *string `json:"os_image"`
 	// ComposeHash is the dstack compose hash out of the verified quote's mr_config_id
 	// — WHICH application configuration that enclave booted. Null when the register's

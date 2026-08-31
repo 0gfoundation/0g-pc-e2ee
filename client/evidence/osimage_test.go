@@ -148,6 +148,55 @@ func TestCheckOSImage(t *testing.T) {
 	})
 }
 
+// The projection the verifier compares with must carry each entry's NAME as well as
+// its boot chain, and the two consumers of one allowlist — the gateway's own check
+// (CheckOSImage) and the sealing path's verifier (attest.BootChainPolicy) — must name
+// the same entry for the same quote. A second answer to "which image is this" is
+// exactly what one shared projection exists to prevent.
+func TestBootChainPolicyOf_CarriesTheNames(t *testing.T) {
+	m := mkMeasurement(0x11)
+	allowed := []OSImage{
+		{Name: "other", BootChain: mkBootChain(0x99)},
+		{Name: "dstack-0.5.3", BootChain: attest.BootChainOf(m)},
+	}
+	policy := BootChainPolicyOf(allowed)
+
+	if got := policy.Name(attest.BootChainOf(m)); got != "dstack-0.5.3" {
+		t.Errorf("policy.Name = %q, want the entry's name", got)
+	}
+	if got, want := policy.Name(attest.BootChainOf(m)), CheckOSImage(allowed, m).Matched; got != want {
+		t.Errorf("the policy names %q where CheckOSImage names %q; one allowlist must give one answer", got, want)
+	}
+	// Names label; they never admit. An unlisted chain has no name, whatever the map holds.
+	if got := policy.Name(mkBootChain(0x44)); got != "" {
+		t.Errorf("policy.Name(unlisted) = %q, want \"\"", got)
+	}
+
+	// Two entries for one boot chain (a duplicate, or two names for the same measured
+	// image): both surfaces must settle it the same way, so neither can be used to
+	// argue the other is wrong about which entry matched.
+	dup := []OSImage{
+		{Name: "first", BootChain: attest.BootChainOf(m)},
+		{Name: "second", BootChain: attest.BootChainOf(m)},
+	}
+	if got := BootChainPolicyOf(dup).Name(attest.BootChainOf(m)); got != "first" {
+		t.Errorf("duplicate boot chains named %q, want the first entry", got)
+	}
+	if got := CheckOSImage(dup, m).Matched; got != "first" {
+		t.Errorf("CheckOSImage named %q for duplicates, want the first entry", got)
+	}
+
+	// An allowlisted entry with no name is still a MATCH — reporting it as a miss
+	// would be a false finding about the enclave, drawn from a gap in our own file.
+	// ParseOSImages rejects a nameless entry, so this shape only reaches a hand-built
+	// list, which is precisely why the behavior is pinned rather than assumed.
+	unnamed := []OSImage{{BootChain: attest.BootChainOf(m)}}
+	if got := CheckOSImage(unnamed, m); !got.OK() || got.Err != nil || got.Matched != "" {
+		t.Errorf("unnamed match: OK=%v err=%v matched=%q, want a clean match with no name",
+			got.OK(), got.Err, got.Matched)
+	}
+}
+
 // reg builds a full-length register as hex.
 func reg(fill byte) string {
 	return strings.Repeat(string("0123456789abcdef"[fill>>4])+string("0123456789abcdef"[fill&0xf]), 48)

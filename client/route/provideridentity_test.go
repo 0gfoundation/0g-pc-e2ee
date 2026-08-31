@@ -143,9 +143,19 @@ func pidRouter(t *testing.T, srvURL string, policy attest.BootChainPolicy, mode 
 	return New(srvURL, opts...)
 }
 
-// pidAllowAll is the policy that allowlists the fake quote's boot chain.
+// pidOSImage is the name the allowlist entry below carries — what the shipped
+// brokerimages.json spells as `name`, and what a matched record reports as its image.
+const pidOSImage = "dstack-test-1.0"
+
+// pidAllowAll is the policy that allowlists the fake quote's boot chain, LABELLED as
+// the real one is: evidence.BootChainPolicyOf carries every entry's name, so a policy
+// without them would be a shape the binaries never build.
 func pidAllowAll() attest.BootChainPolicy {
-	return attest.BootChainPolicy{Allowed: []attest.BootChain{attest.BootChainOf(qvMeasurement(0xaa))}}
+	bc := attest.BootChainOf(qvMeasurement(0xaa))
+	return attest.BootChainPolicy{
+		Allowed: []attest.BootChain{bc},
+		Names:   map[attest.BootChain]string{bc: pidOSImage},
+	}
 }
 
 // pidResolve materializes the head candidate, i.e. runs exactly the checks a real
@@ -195,6 +205,89 @@ func TestProviderIdentity_RecordsWhatWasVerified(t *testing.T) {
 	}
 	if id.ComposeHash != pidComposeHashHex {
 		t.Errorf("ComposeHash = %q, want %q", id.ComposeHash, pidComposeHashHex)
+	}
+	if id.OSImage != pidOSImage {
+		t.Errorf("OSImage = %q, want the matched allowlist entry %q", id.OSImage, pidOSImage)
+	}
+}
+
+// The image NAME is the answer to "which audited image", and it must be exactly as
+// available as the pass it labels — and no more available than that.
+//
+// The three cases below are the ones a panel can encounter, and the failure that
+// matters is the second: a name surviving a verdict that did not pass would show a
+// reader an audited image beside a boot chain nobody audited. The third is our own
+// configuration showing through (an entry with no label), and it must read as a match
+// with nothing to call it rather than as a miss.
+func TestProviderIdentity_NamesTheMatchedOSImage(t *testing.T) {
+	bcOther := attest.BootChainOf(qvMeasurement(0xbb))
+	unnamed := attest.BootChainPolicy{Allowed: []attest.BootChain{attest.BootChainOf(qvMeasurement(0xaa))}}
+	otherNamed := attest.BootChainPolicy{
+		Allowed: []attest.BootChain{bcOther},
+		Names:   map[attest.BootChain]string{bcOther: "some-other-image"},
+	}
+	for _, tc := range []struct {
+		name            string
+		policy          attest.BootChainPolicy
+		mode            attest.MeasurementMode
+		wantVerdict     Verdict
+		wantOSImage     string
+		wantOSImageWhy  string
+		wantQuoteRecord bool
+	}{
+		{"matched entry", pidAllowAll(), attest.ModeEnforce, VerdictPass, pidOSImage,
+			"the entry the boot chain matched", true},
+		{"unlisted image, warn mode", otherNamed, attest.ModeWarn, VerdictNoMatch, "",
+			"nothing matched, so there is no audited image to name", true},
+		{"no allowlist at all", attest.BootChainPolicy{}, attest.ModeWarn, VerdictNoBaseline, "",
+			"nothing was compared", true},
+		{"matched an unlabelled entry", unnamed, attest.ModeEnforce, VerdictPass, "",
+			"a match whose entry carried no name is still a match", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := pidServer(t, pidQuote(t, qvMeasurement(0xaa), pidMRConfigID(t, 1, pidComposeHashHex)), nil)
+			r := pidRouter(t, srv.URL, tc.policy, tc.mode, nil)
+			pidResolve(t, r)
+
+			id, ok := r.ProviderIdentity(testProviderAddr)
+			if !ok {
+				t.Fatal("expected a record")
+			}
+			if id.Measurement != tc.wantVerdict {
+				t.Fatalf("Measurement = %q, want %q", id.Measurement, tc.wantVerdict)
+			}
+			if id.OSImage != tc.wantOSImage {
+				t.Errorf("OSImage = %q, want %q (%s)", id.OSImage, tc.wantOSImage, tc.wantOSImageWhy)
+			}
+			// The invariant a reader is entitled to assume, stated once here rather than
+			// per case: a named image means the boot-chain check passed.
+			if id.OSImage != "" && id.Measurement != VerdictPass {
+				t.Errorf("OSImage = %q beside measurement %q; a name must only accompany a pass",
+					id.OSImage, id.Measurement)
+			}
+		})
+	}
+}
+
+// The warmer's record must name the image too. It is the writer that fills the store
+// for providers no request has used yet — i.e. the one a panel reads before the first
+// prompt — so an os_image that only the request path filled would be null in exactly
+// the case the warmer exists to serve.
+func TestProviderIdentity_WarmedRecordNamesTheOSImage(t *testing.T) {
+	srv := pidServer(t, pidQuote(t, qvMeasurement(0xaa), pidMRConfigID(t, 1, pidComposeHashHex)), nil)
+	r := pidRouter(t, srv.URL, pidAllowAll(), attest.ModeEnforce, &stubRegistry{signer: qvSignerStr, ack: true})
+	// No request at all — only a sweep, resolving the endpoint from the "chain".
+	r.WarmOnce(context.Background(), fakeResolver{url: srv.URL})
+
+	id, ok := r.ProviderIdentity(testProviderAddr)
+	if !ok {
+		t.Fatal("the warmer recorded nothing for the provider it swept")
+	}
+	if id.Measurement != VerdictPass {
+		t.Fatalf("Measurement = %q, want %q", id.Measurement, VerdictPass)
+	}
+	if id.OSImage != pidOSImage {
+		t.Errorf("OSImage = %q, want the matched allowlist entry %q", id.OSImage, pidOSImage)
 	}
 }
 

@@ -121,6 +121,56 @@ func TestVerify_EnforceWithEmptyAllowlistNamesTheConfigGap(t *testing.T) {
 	}
 }
 
+// A verification reports WHICH audited image the enclave booted, not merely that it
+// booted one — the value a report needs to name the entry, and the one it must never
+// invent. The three cases below are the whole contract: a labelled match names the
+// entry, a miss names nothing even where the policy holds labels, and a match against
+// an unlabelled policy names nothing while staying trusted.
+func TestVerify_ReportsTheMatchedOSImage(t *testing.T) {
+	audited, other := mkMeasurement(0xaa), mkMeasurement(0xbb)
+	rd := makeReportData(sampleEncPub(), sampleSigner(), ReportDataVersion, [reservedLen]byte{})
+	labelled := BootChainPolicy{
+		Allowed: []BootChain{BootChainOf(audited)},
+		Names:   map[BootChain]string{BootChainOf(audited): "dstack-test-1.0"},
+	}
+
+	got, err := New(labelled, WithQuoteParser(fakeParser(audited, rd, nil))).Verify([]byte("raw-quote"))
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if !got.MeasurementTrusted || got.MeasurementImage != "dstack-test-1.0" {
+		t.Errorf("trusted/image = %v/%q, want true/\"dstack-test-1.0\"", got.MeasurementTrusted, got.MeasurementImage)
+	}
+
+	// Warn mode on an unlisted image: the quote is genuine and its keys are bound, but
+	// nothing in the allowlist matched — so there is no image to name. Naming one here
+	// would be the single worst way this field could fail, since a panel would show an
+	// audited image beside a boot chain nobody audited.
+	got, err = New(labelled, WithQuoteParser(fakeParser(other, rd, nil)),
+		WithMeasurementMode(ModeWarn)).Verify([]byte("raw-quote"))
+	if err != nil {
+		t.Fatalf("Verify (warn, unlisted): %v", err)
+	}
+	if got.MeasurementTrusted {
+		t.Fatal("MeasurementTrusted = true for an unlisted boot chain")
+	}
+	if got.MeasurementImage != "" {
+		t.Errorf("MeasurementImage = %q for an unlisted boot chain, want \"\"", got.MeasurementImage)
+	}
+
+	// An unlabelled policy — every caller before Names existed — decides identically
+	// and reports no name. MeasurementImage adds to MeasurementTrusted; it never
+	// restates it.
+	got, err = New(BootChainPolicy{Allowed: []BootChain{BootChainOf(audited)}},
+		WithQuoteParser(fakeParser(audited, rd, nil))).Verify([]byte("raw-quote"))
+	if err != nil {
+		t.Fatalf("Verify (unlabelled policy): %v", err)
+	}
+	if !got.MeasurementTrusted || got.MeasurementImage != "" {
+		t.Errorf("trusted/image = %v/%q, want true/\"\"", got.MeasurementTrusted, got.MeasurementImage)
+	}
+}
+
 // A caller that REPORTS the measurement outcome, rather than only acting on it, has
 // to tell "this image is not one we audited" from "we have audited none" — and under
 // ModeWarn, MeasurementTrusted=false is both. This is the accessor that separates

@@ -56,6 +56,11 @@ type quoteFacts struct {
 	// known: whether the observed chain was permitted, and whether there was any
 	// allowlist to permit it (see attest.Verifier.MeasurementBaselineConfigured).
 	measurement Verdict
+	// osImage is the NAME of the allowlist entry the boot chain matched
+	// (attest.Verified.MeasurementImage), or "" when it matched none. It comes from the
+	// same lookup as measurement above — the verifier's — rather than from a second
+	// comparison here, so the name and the verdict can never describe different entries.
+	osImage string
 	// composeHash is the hex dstack compose hash from the verified quote's
 	// mr_config_id, or "" when that register's layout does not expose one.
 	composeHash string

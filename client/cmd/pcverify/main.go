@@ -471,8 +471,17 @@ func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecke
 		switch {
 		case v.MeasurementTrusted:
 			// A clean match needs only to say so; the registers are the reader's next
-			// action only when there is one.
-			fmt.Fprintf(out, "%s boot chain       in the audited allowlist\n", mark(true))
+			// action only when there is one. The entry's NAME is the exception worth
+			// printing: "which audited image is this provider on" is the next question
+			// after "is it on one", and the verifier already knows — it reports the entry
+			// it matched, so naming it here cannot disagree with the decision above.
+			// Unnamed is possible in principle (a policy with no labels) and reads as the
+			// bare line this printed before.
+			if v.MeasurementImage != "" {
+				fmt.Fprintf(out, "%s boot chain       in the audited allowlist (%s)\n", mark(true), v.MeasurementImage)
+			} else {
+				fmt.Fprintf(out, "%s boot chain       in the audited allowlist\n", mark(true))
+			}
 		case !qc.BaselineConfigured():
 			fmt.Fprintf(out, "- boot chain       not compared (no allowlist configured)\n")
 			reportBootChain(out, attest.BootChainOf(v.Measurement))

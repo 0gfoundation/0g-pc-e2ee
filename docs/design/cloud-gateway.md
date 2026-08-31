@@ -401,8 +401,18 @@ Three rules the implementation holds to (`client/cmd/gateway/provideridentity.go
   `recordProviderIdentity` runs before the grounding error is returned — so a candidate
   refused by `-onchain-enforce` is recorded, carrying `onchain_signer: no_match`. Which
   is why a hop 5 fleet survey stays readable under enforce and a measurement survey has
-  to be taken from a warn-mode gateway or `pcverify`. `os_image` may still be `null`,
-  but it is no longer ambiguous — the verdict says which case produced it.
+  to be taken from a warn-mode gateway or `pcverify`.
+- **A passing measurement names the image it matched.** `os_image` carries the
+  allowlist entry's `name` (`client/evidence/brokerimages.json`, e.g.
+  `dstack-nvidia-0.5.9`), so hop 3 reads as "this audited image" rather than a bare
+  `pass`. The name comes from the verifier — `attest.BootChainPolicy` labels its
+  entries and `attest.Verified.MeasurementImage` reports the one that matched — rather
+  than from a second pass over the allowlist, which could name an entry other than the
+  one the comparison actually accepted. It is a *label on the verdict*, not a check of
+  its own: it is non-null only alongside `measurement: pass`, and what stands behind it
+  is that file's audit — where the entry's values came from and whether they were
+  recomputed from a published release. `null` still means nothing matched, and, as
+  above, the verdict says which case produced it.
 
 It lives on the gateway rather than the router for the same reason the rest of this
 document exists: the router is untrusted by design, so its account of a provider's

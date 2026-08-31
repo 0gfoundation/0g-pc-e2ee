@@ -49,6 +49,47 @@ func TestBootChainPolicy_Permits(t *testing.T) {
 	}
 }
 
+// Name reports the label of the entry that MATCHED, and reports one only for a boot
+// chain the policy actually permits. That gate is the whole guarantee: a caller
+// displaying a name ("this enclave runs the image we audited, and it is this one") is
+// entitled to read a non-empty result as membership, so a stray label must not be able
+// to name an image the allowlist never accepted.
+func TestBootChainPolicy_Name(t *testing.T) {
+	listed, other := mkBootChain(0x11), mkBootChain(0x44)
+	p := BootChainPolicy{
+		Allowed: []BootChain{mkBootChain(0x99), listed},
+		Names: map[BootChain]string{
+			listed: "dstack-test-1.0",
+			// A label for a chain nobody allowlisted, which is what a mis-assembled policy
+			// looks like. It must stay inert.
+			other: "not-in-the-allowlist",
+		},
+	}
+	if got := p.Name(listed); got != "dstack-test-1.0" {
+		t.Errorf("Name(listed) = %q, want the entry's label", got)
+	}
+	if got := p.Name(other); got != "" {
+		t.Errorf("Name(unlisted) = %q, want \"\": a label must never stand in for membership", got)
+	}
+	// An allowlisted entry with no label: still a match, just nothing to call it. The
+	// caller reads the verdict from Permits, never from the name's emptiness.
+	if got := p.Name(mkBootChain(0x99)); got != "" {
+		t.Errorf("Name(unlabelled) = %q, want \"\"", got)
+	}
+	if !p.Permits(mkBootChain(0x99)) {
+		t.Error("an unlabelled entry stopped being permitted")
+	}
+	// Labels are not a second allowlist: a policy without Names decides exactly as one
+	// with them, and reports nothing.
+	bare := BootChainPolicy{Allowed: []BootChain{listed}}
+	if !bare.Permits(listed) || bare.Name(listed) != "" {
+		t.Error("a policy with no Names must still permit, and name nothing")
+	}
+	if (BootChainPolicy{}).Name(listed) != "" {
+		t.Error("an empty policy named a boot chain")
+	}
+}
+
 // "Not configured" must not degrade into "permits everything".
 func TestBootChainPolicy_EmptyPermitsNothing(t *testing.T) {
 	var p BootChainPolicy

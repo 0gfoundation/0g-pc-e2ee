@@ -217,16 +217,29 @@ type ProviderIdentity struct {
 	// what makes warn mode the state in which "is every provider on a listed image?" can
 	// be answered from these records at all.
 	Measurement Verdict
-	// OSImage names the allowlisted OS image the boot chain matched, or "" when
-	// nothing was matched.
+	// OSImage names the allowlisted OS image the boot chain matched — the entry's
+	// `name` in client/evidence/brokerimages.json, e.g. "dstack-nvidia-0.5.9" — or ""
+	// when nothing was matched.
 	//
-	// It is "" on a matched provider too, and the reason is worth stating rather than
-	// leaving to be discovered: attest.BootChainPolicy holds boot chains without
-	// labels, so a match knows the registers agreed but not which entry's name to
-	// report. (evidence.OSImage carries the name; wiring it through would mean the
-	// verifier returning which entry matched.) Unlike the gateway's
-	// own os_image — where null conflated "matched nothing" with "checked nothing" —
-	// an empty value here is never ambiguous: Measurement says which case it is.
+	// The name comes from the verification itself (attest.Verified.MeasurementImage),
+	// not from a second pass over the allowlist: the verifier reports which entry it
+	// matched, so the name and Measurement above are two readings of one lookup and
+	// cannot describe different entries. That is what makes it safe to display beside
+	// the verdict rather than only in a log.
+	//
+	// It is a LABEL, not evidence, and one step further from the quote than everything
+	// else in this record: the registers are in the signed report, but the name is what
+	// this repository chose to call the entry they matched. Its weight is the audit
+	// behind that file's entry — where the values came from and whether they were
+	// recomputed from a published release (see brokerimages.json's header) — which is
+	// exactly the trust a reader already extends to hop 3 by using this gateway.
+	//
+	// Empty is not ambiguous here, unlike the gateway's own os_image (where null
+	// conflated "matched nothing" with "checked nothing"): Measurement says which case
+	// produced it. VerdictNoMatch and VerdictNoBaseline mean nothing was matched, so
+	// there is no name to give. With VerdictPass it means the allowlist entry that
+	// matched carried no label — unreachable for the embedded file, whose parser
+	// requires a name on every entry, but possible for a hand-built policy in a test.
 	OSImage string
 	// ComposeHash is the dstack compose hash from the verified quote's mr_config_id,
 	// hex-encoded: SHA-256 over the provider CVM's app-compose.json, i.e. WHICH
@@ -503,6 +516,7 @@ func providerIdentityOf(address, endpoint string, res quoteResult, onchain Verdi
 		QuoteDCAP:     VerdictPass,
 		OnChainSigner: onchain,
 		Measurement:   res.facts.measurement,
+		OSImage:       res.facts.osImage,
 		ComposeHash:   res.facts.composeHash,
 		Containers:    res.facts.containers,
 	}
@@ -513,6 +527,15 @@ func providerIdentityOf(address, endpoint string, res quoteResult, onchain Verdi
 	// blank.
 	if id.Measurement == "" {
 		id.Measurement = VerdictUnavailable
+	}
+	// A name only ever accompanies a pass. attest already guarantees it — the entry's
+	// label is returned only for a boot chain the policy permits, which is the same
+	// condition measurementVerdict reports VerdictPass on — so this drops nothing
+	// today; it holds the invariant a reader is entitled to assume (an image named
+	// beside a verdict that did not pass would read as an audited image we nonetheless
+	// rejected) against a future path that fills the two from different places.
+	if id.Measurement != VerdictPass {
+		id.OSImage = ""
 	}
 	// Report the provider's ORIGIN rather than the endpoint spelling the router
 	// happened to send (a bare origin, a /v1 base, or a full chat URL are all the same

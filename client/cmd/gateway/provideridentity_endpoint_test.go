@@ -126,9 +126,10 @@ func TestProviderIdentityRoute_ReportsTheVerdicts(t *testing.T) {
 	if doc.ComposeHash == nil || *doc.ComposeHash != want.ComposeHash {
 		t.Errorf("compose_hash = %v, want %q", doc.ComposeHash, want.ComposeHash)
 	}
-	// os_image is null and NOT ambiguous: verdicts.measurement says which case it is.
+	// This record matched nothing (no_baseline), so there is no image to name. Null
+	// here is NOT ambiguous: verdicts.measurement says which case produced it.
 	if doc.OSImage != nil {
-		t.Errorf("os_image = %q, want null: the policy carries no entry labels", *doc.OSImage)
+		t.Errorf("os_image = %q, want null: nothing was compared, so nothing matched", *doc.OSImage)
 	}
 	// The caveat rides with the value, and it names where to go to check for yourself:
 	// the provider direct, not this gateway.
@@ -140,6 +141,36 @@ func TestProviderIdentityRoute_ReportsTheVerdicts(t *testing.T) {
 	}
 	if len(src.lookups) != 1 || src.lookups[0] != pidAddr {
 		t.Errorf("lookups = %v, want exactly one for %s", src.lookups, pidAddr)
+	}
+}
+
+// A matched boot chain reaches the wire as the entry's NAME, not as a bare pass: the
+// panel's hop-3 row can say WHICH audited image the provider booted. The pairing is
+// what the test is for — the name rides with measurement "pass", and it is absent
+// wherever that verdict is, so no reader can see an audited image named beside a check
+// that did not pass.
+func TestProviderIdentityRoute_NamesTheMatchedOSImage(t *testing.T) {
+	matched := pidFullRecord()
+	matched.Measurement = route.VerdictPass
+	matched.OSImage = "dstack-nvidia-0.5.9"
+
+	gw, _ := pidGateway(t, &stubIdentities{record: matched, have: true})
+	_, body := pidGet(t, gw.URL+pidPath)
+
+	var doc providerIdentityDoc
+	if err := json.Unmarshal([]byte(body), &doc); err != nil {
+		t.Fatalf("decode: %v\n%s", err, body)
+	}
+	if doc.OSImage == nil || *doc.OSImage != "dstack-nvidia-0.5.9" {
+		t.Errorf("os_image = %v, want the matched allowlist entry", doc.OSImage)
+	}
+	if doc.Verdicts.Measurement != route.VerdictPass {
+		t.Errorf("measurement = %q; a named image must ride with a pass", doc.Verdicts.Measurement)
+	}
+	// It is a string, not an object: the name is a label on the verdict, and giving it
+	// a shape of its own would invite a panel to render it as a check of its own.
+	if !strings.Contains(body, `"os_image": "dstack-nvidia-0.5.9"`) {
+		t.Errorf("os_image is not rendered as a plain string:\n%s", body)
 	}
 }
 

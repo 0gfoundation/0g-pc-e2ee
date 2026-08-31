@@ -202,6 +202,19 @@ func TestBuiltinBrokerImages_VerifierAdmitsAuditedAndRefusesOthers(t *testing.T)
 			if err == nil && got.MeasurementTrusted != tc.wantTrusted {
 				t.Errorf("MeasurementTrusted = %v, want %v", got.MeasurementTrusted, tc.wantTrusted)
 			}
+			// The name travels with the decision, through the same composition: it is what
+			// the gateway's provider-identity endpoint reports as os_image, so a projection
+			// that dropped the labels would leave that field permanently null while every
+			// verdict still passed — a regression no assertion on MeasurementTrusted can see.
+			if err == nil {
+				want := ""
+				if tc.wantTrusted {
+					want = imgs[0].Name
+				}
+				if got.MeasurementImage != want {
+					t.Errorf("MeasurementImage = %q, want %q", got.MeasurementImage, want)
+				}
+			}
 		})
 	}
 }

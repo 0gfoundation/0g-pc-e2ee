@@ -352,7 +352,7 @@ curl -s https://<gateway-domain>/v1/providers/0x7B3f…9aC1/identity
     "measurement": "pass"          // its boot chain is one of the audited OS images (hop 3);
                                    // "no_baseline" would mean we audited none
   },
-  "os_image": null,
+  "os_image": "dstack-nvidia-0.5.9",  // which audited image; null if none matched
   "compose_hash": "8779f38c…",
   "containers": [                  // what compose_hash commits to, in file order
     {"name": "broker", "image": "ghcr.io/0gfoundation/0g-serving-broker",
@@ -419,6 +419,16 @@ written — the address `404`s instead (same as a quote that fails DCAP, below).
 `no_match` is what a gateway running that check in *warn* mode reports. `no_baseline`
 means the build carried no entry to compare against, so it says nothing about the
 provider: render that one as "observed only", not as a pass and not as a failure.
+`os_image` names *which* audited image that `pass` refers to — the entry's `name` in
+that same file. It is a label on the verdict, not a verdict: it is present only
+alongside `measurement: pass`, and it is `null` wherever nothing matched (`no_match`,
+`no_baseline`), so it never has to be interpreted on its own. Unlike the gateway's own
+`os_image` above, this `null` is unambiguous — the verdict beside it says which case
+produced it. What the name is worth is the audit behind that allowlist entry: whether
+its registers were recomputed from a published release or copied off a running provider
+(`client/evidence/brokerimages.json` records the provenance of each entry, and
+`pcverify -provider` prints the same name for a provider you check yourself).
+
 `onchain_signer` is `not_checked` unless the deployment runs with `ZG_GATEWAY_ONCHAIN`.
 On the deployed gateway, which also runs `ZG_GATEWAY_ONCHAIN_ENFORCE`, a `no_match` here
 means that provider was **refused** — nothing was sealed to it — rather than used with
