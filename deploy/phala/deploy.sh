@@ -108,9 +108,40 @@ confirm() {
   [[ "$reply" =~ ^[Yy]$ ]]
 }
 
-# Identical loader to switch.sh: the two scripts share `switch.env` conventions
-# and an operator should not have to remember two dialects. Only point it at a
-# file you trust — the values are assigned through the shell.
+# TWO ENVIRONMENTS, AND THEY MUST NOT BLEED INTO EACH OTHER -------------------
+# deploy.env holds both kinds of setting — how this script behaves (INSTANCE_TYPE,
+# PROBE_*, CVM_NAME) and what the CVM's containers are given (DOMAIN, the tokens,
+# the ZG_PROM_* values). They are separated in two directions:
+#
+#   deploy.env -> the CVM   an explicit allowlist, written by build_env_file. A
+#                           name it does not list cannot reach a container, no
+#                           matter what the file says. That is deliberate: the
+#                           compose interpolates a fixed set of ${…} references
+#                           and the app's allowed_envs is MEASURED, so "just add
+#                           a variable" is a change to app_id, not to config.
+#   deploy.env -> children  this loader. Values become shell variables of THIS
+#                           script and, by default, nothing more.
+#
+# That second one is why this loader is no longer identical to switch.sh's, which
+# exports everything. switch.sh's children are curl and openssl; ours include the
+# phala CLI, which has an env contract of its own (`phala help envs`:
+# PHALA_CLOUD_API_KEY, PRIVATE_KEY, ETH_RPC_URL, DEBUG …). Exporting the whole
+# file would put the Cloudflare token and the Prometheus password in the
+# environment of every child process, and would let an innocuous-looking
+# `DEBUG=1` in deploy.env change what the CLI does — `DEBUG=phala::api-client`
+# makes it print every HTTP request, bodies included. So only the names below,
+# which a child genuinely needs, are exported.
+TOOL_ENV_EXPORTS="PHALA_CLOUD_API_KEY PHALA_CLOUD_API_PREFIX PRIVATE_KEY ETH_RPC_URL"
+
+# Names the compose actually interpolates from the CVM's environment. Anything
+# else beginning ZG_GATEWAY_ is a silent no-op — those settings are spelled out
+# literally in the measured compose text, so changing one means editing that file
+# (and getting a new app_id), never setting a variable here.
+CVM_ZG_GATEWAY_VARS="ZG_GATEWAY_ROUTER_URL ZG_GATEWAY_ALLOWED_ORIGINS"
+
+LOADED_KEYS=""
+
+# Only point it at a file you trust — the values are assigned through the shell.
 load_env_file() { # path
   local f="$1" line key
   [ -f "$f" ] || die "env file not found: $f"
@@ -124,10 +155,31 @@ load_env_file() { # path
     [ "$key" = "$line" ] && continue
     key="${key%"${key##*[![:space:]]}"}"
     case "$key" in ''|*[!A-Za-z0-9_]*) continue ;; esac
+    LOADED_KEYS="$LOADED_KEYS $key"
     # The real environment wins, so a one-off `FOO=… ./deploy.sh` still overrides.
     [ -n "${!key+set}" ] && continue
-    eval "export $line"
+    # A plain assignment, not an export: inside a function with no `local` for
+    # this name, it lands in the shell's global scope and stays out of every
+    # child's environment.
+    eval "$line"
+    case " $TOOL_ENV_EXPORTS " in *" $key "*) export "$key" ;; esac
   done < "$f"
+}
+
+# Settings in deploy.env that do nothing, and would take a deploy to discover.
+check_env_namespaces() {
+  local key
+  for key in $LOADED_KEYS; do
+    case "$key" in
+      ZG_GATEWAY_*)
+        case " $CVM_ZG_GATEWAY_VARS " in
+          *" $key "*) ;;
+          *) warn "$key is set here but the compose does not reference it — the gateway's other settings are literal, measured text. Edit docker-compose.yml (and take the new app_id) instead." ;;
+        esac ;;
+      DEBUG)
+        warn "DEBUG is set here. It is NOT passed on — the phala CLI reads it (DEBUG=phala::api-client prints every request body), which is not something a config file should switch on by accident." ;;
+    esac
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -685,6 +737,7 @@ need curl; need jq; need sha256sum
 
 [ -n "$ENV_FILE" ] && load_env_file "$ENV_FILE"
 [ -z "$ENV_FILE" ] && [ -f "$SCRIPT_DIR/deploy.env" ] && load_env_file "$SCRIPT_DIR/deploy.env"
+check_env_namespaces
 
 resolve_config
 
