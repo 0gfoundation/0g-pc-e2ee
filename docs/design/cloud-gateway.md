@@ -156,8 +156,8 @@ controlled only by that enclave?"**
 > (see `deploy/phala/docker-compose.yml`), whose `/evidences` quote has
 > `report_data = SHA-256(sha256sum.txt)` covering the served certificate, and a
 > `mr_config_id` committing to `compose_hash = SHA-256(the whole app-compose)`
-> (`app_id` is a separate, platform-assigned value — see §6.1). That register is part of the signed TD
-> report, so it needs no event-log replay — see
+> (`app_id` is a separate, platform-assigned value — see §6.1). That register is
+> part of the signed TD report, so it needs no event-log replay — see
 > `attest.ComposeHashFromMRConfigID`. Because the compose hash covers the whole
 > app-compose, it attests **every** container in the CVM at once — ingress and
 > gateway on the request path, plus the `cvm-identity` init container and the
@@ -185,9 +185,9 @@ controlled only by that enclave?"**
 > authenticity rides the provider's own SPEC §8 signature instead.
 
 1. **Cert-binding quote**: a TDX quote from inside the CVM that commits to the served
-   cert (via `report_data`) and to the deployment's `compose_hash` (via `mr_config_id`).
-   Emitted by **dstack-ingress**
-   (`/evidences`, see the decision box above), not by a gateway-issued quote API.
+   cert (via `report_data`) and to the deployment's `compose_hash` (via
+   `mr_config_id`). Emitted by **dstack-ingress** (`/evidences`, see the decision box
+   above), not by a gateway-issued quote API.
 2. **Bind the TLS cert into that quote**: dstack-ingress puts
    `SHA-256(sha256sum.txt)` (which covers the served cert) in the quote's
    `report_data`, so the quote proves "measurement X controls *this* cert".
@@ -559,7 +559,8 @@ does not.
    nor GitHub is trusted to decide anything: DNS only *locates* the app-compose — which
    `app_id` to ask about and which host to ask (a wrong or hijacked answer yields a
    failed lookup or a failed binding, never a false pass) — and a release asset is only
-   ever compared against text the quote already authenticated. Both lookups are advisory when they happen by default and fatal when
+   ever compared against text the quote already authenticated. Both lookups are
+   advisory when they happen by default and fatal when
    explicitly requested (or under `-strict`), so a network problem is never reported as
    a verification failure — nor silently as a pass: an advisory skip exits **3**, the
    code for "nothing failed, and not everything ran", never 0.

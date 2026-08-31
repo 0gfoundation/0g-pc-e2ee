@@ -2,8 +2,8 @@
 
 How to run two gateway CVMs side by side and cut traffic between them with zero
 downtime and instant rollback. Read [`README.md`](./README.md) first — this
-document assumes its record model, the `app_id`-from-compose binding, and the
-Let's Encrypt notes.
+document assumes its record model, how a deployment is named (`app_id`) and
+measured (`compose_hash`), and the Let's Encrypt notes.
 
 ## Why blue/green here is a DNS pointer flip, not a load-balancer weight
 
@@ -17,10 +17,11 @@ side is a separately created, separately attested CVM (README "Pin the image
 digest"), which is what gives the two sides distinct `app_id`s to point DNS at.
 
 > **So never upgrade a side in place to make it "the new side".** It keeps its
-> `app_id`, the switch record still names it, and the platform will spread traffic
+> `app_id`, so the switch record still names it and the platform spreads traffic
 > across both CVMs of that id instead of holding the old side steady — a silent
-> half-cutover with no record to flip back. That single
-fact shapes everything:
+> half-cutover with no record left to flip back.
+
+That single fact shapes everything:
 
 - **dstack only spreads traffic *within one `app_id`*.** Deploy N CVMs from the
   *same* compose and dstack's gateway picks among them per connection ("when

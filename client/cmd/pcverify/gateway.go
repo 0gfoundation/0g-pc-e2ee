@@ -427,6 +427,23 @@ func appIDLine(code evidence.CodeIdentity) string {
 	return code.AppID + " (" + code.AppIDSource + ")"
 }
 
+// codeValueIndent is the column a code-identity line's value starts at: one mark
+// character, a space, the widest label ("app-compose"), and its padding. Kept beside
+// the Fprintf calls that produce it, because it is those format strings' width.
+const codeValueIndent = "                     "
+
+// alignErr renders a multi-line error under the value column instead of against the
+// left margin.
+//
+// The app-compose lookup now reports errors.Join over every path it tried — the
+// cloud API, the guest agent, and where the app_id came from — and a joined error's
+// text is one line per cause. Printed raw, the second and third causes fall outside
+// the column and the report stops being scannable exactly when it has the most to
+// say. This does not shorten or reorder anything: every cause is still printed.
+func alignErr(err error) string {
+	return strings.ReplaceAll(err.Error(), "\n", "\n"+codeValueIndent)
+}
+
 // reportCodeIdentity prints the mr_config_id → compose_hash → app-compose →
 // docker_compose_file chain. compose_hash and app_id are printed whenever they are
 // available even if nothing else was requested: they are reproducible values an
@@ -459,10 +476,10 @@ func reportCodeIdentity(out io.Writer, code evidence.CodeIdentity, expect expect
 	case code.FetchErr != nil:
 		// A lookup nobody asked for is a "-", not a "✗": DNS or the platform endpoint
 		// being unavailable says nothing about the deployment.
-		fmt.Fprintf(out, "%s app-compose        %v\n", failMark(code, code.Discovered), code.FetchErr)
+		fmt.Fprintf(out, "%s app-compose        %v\n", failMark(code, code.Discovered), alignErr(code.FetchErr))
 		return
 	case code.BoundErr != nil:
-		fmt.Fprintf(out, "%s app-compose        %v\n", mark(false), code.BoundErr)
+		fmt.Fprintf(out, "%s app-compose        %v\n", mark(false), alignErr(code.BoundErr))
 		if code.Source != "" {
 			fmt.Fprintf(out, "  source           %s\n", code.Source)
 		}

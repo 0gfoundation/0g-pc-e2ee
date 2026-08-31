@@ -105,6 +105,20 @@ func parseAppAddress(record string) (string, error) {
 	return id, nil
 }
 
+// normalizeAppID cleans up an app_id a CALLER supplied: whitespace, case, and a
+// leading "0x".
+//
+// The 0x is not a courtesy. Phala Cloud reports the same 20 bytes as the app's
+// `contract_address` in that form, and it is the field an operator is most likely to
+// copy from when pinning `-app-id` by hand — rejecting it would be rejecting the
+// right value for looking like the neighbouring one. DNS records are held to the
+// strict form instead (see parseAppAddress): there a stray prefix is a malformed
+// record, not a paste.
+func normalizeAppID(s string) string {
+	id := strings.ToLower(strings.TrimSpace(s))
+	return strings.TrimPrefix(id, "0x")
+}
+
 // validAppID reports whether s is the shape dstack writes an app_id in: exactly
 // appIDHexLen lowercase hex digits. The check is here so a garbled or truncated DNS
 // record fails at the point it is read, rather than becoming a hostname or a URL

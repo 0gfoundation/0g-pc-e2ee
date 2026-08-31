@@ -829,9 +829,12 @@ func (c *Checker) checkCodeIdentity(ctx context.Context, rep *Report) {
 		var errs []error
 		cloudUsable := !c.cfg.NoCloudAPI &&
 			(strings.TrimSpace(c.cfg.AppID) != "" || !c.cfg.NoDNSDiscovery)
+		fallbackPossible := strings.TrimSpace(c.cfg.BaseDomain) != "" || !c.cfg.NoDNSDiscovery
 		if cloudUsable {
 			base := strings.TrimSpace(c.cfg.CloudAPIBase)
-			b, instance, err := FetchAppComposeFromCloud(ctx, c.http, base, code.AppID, composeHash)
+			cloudCtx, cancel := cloudLookupCtx(ctx, fallbackPossible)
+			b, instance, err := FetchAppComposeFromCloud(cloudCtx, c.http, base, code.AppID, composeHash)
+			cancel()
 			if err != nil {
 				errs = append(errs, err)
 			} else {
@@ -895,6 +898,32 @@ func (c *Checker) checkCodeIdentity(ctx context.Context, rep *Report) {
 	}
 }
 
+// cloudLookupCtx bounds the cloud attempt to HALF the run's remaining budget when a
+// guest-agent fallback is still available.
+//
+// The failure the split is for is a HANG, not a refusal. A 404 or a connection reset
+// costs nothing and the fallback runs immediately; a request that never answers —
+// a firewall blackholing the API on a network that has no business reaching Phala at
+// all, which is exactly the self-hosted case the fallback exists for — would
+// otherwise burn the whole deadline and leave the path that would have worked with
+// no time to run in. Halving is deliberately crude: the point is that neither path
+// can starve the other, not that the division is optimal.
+//
+// With no deadline on ctx there is nothing to divide, and the HTTP client's own
+// timeout is the bound; with no fallback to protect, the cloud attempt is welcome to
+// the whole budget.
+func cloudLookupCtx(ctx context.Context, fallbackPossible bool) (context.Context, context.CancelFunc) {
+	deadline, ok := ctx.Deadline()
+	if !ok || !fallbackPossible {
+		return context.WithCancel(ctx)
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, remaining/2)
+}
+
 // The three values CodeIdentity.AppIDSource can hold. They are strings rather than
 // an enum because their only consumer is a report line, and a reader of that line
 // needs the words, not a constant.
@@ -917,7 +946,7 @@ func (c *Checker) resolveAppID(
 	domain string,
 	composeHash [attest.ComposeHashLen]byte,
 ) (id, source string, err error) {
-	if pinned := strings.ToLower(strings.TrimSpace(c.cfg.AppID)); pinned != "" {
+	if pinned := normalizeAppID(c.cfg.AppID); pinned != "" {
 		return pinned, appIDFromConfig, nil
 	}
 	if c.cfg.NoDNSDiscovery {
@@ -937,7 +966,7 @@ func (c *Checker) resolveAppID(
 // round trip — and a lookup performed only to print a value would fail runs that
 // have nothing left to look up.
 func (c *Checker) appIDWithoutDNS(composeHash [attest.ComposeHashLen]byte) (id, source string) {
-	if pinned := strings.ToLower(strings.TrimSpace(c.cfg.AppID)); pinned != "" {
+	if pinned := normalizeAppID(c.cfg.AppID); pinned != "" {
 		return pinned, appIDFromConfig
 	}
 	return attest.AppIDFromComposeHash(composeHash), appIDFromComposeHash

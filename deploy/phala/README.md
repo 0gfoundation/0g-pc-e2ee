@@ -325,11 +325,12 @@ Then code identity. `compose_hash` is in the verified quote's **`mr_config_id`**
 the signed TD report, with no event-log replay (the `compose-hash` runtime event in
 RTMR3 carries the same value if you want a cross-check).
 
-`app_id` is a **different value**, and getting this wrong is a whole afternoon: dstack
-derives it from the compose hash when the app is *created* and then keeps it fixed
-across upgrades, so `compose_hash[:20]` names the app only until the first redeploy.
-After that the platform has no such app, and a lookup keyed on it does not 404 — it
-hangs until your timeout. Take it from the record the platform routes this domain by:
+`app_id` is a **different value**. dstack assigns it when the app is *created* — from
+the app registry for a KMS-enabled app, or `truncate(compose_hash, 20)` only when
+nothing assigned one — and then keeps it across compose upgrades, so
+`compose_hash[:20]` names the app only until its first upgrade, if ever. Get this
+wrong and the platform has no such app, so the lookup does not 404: it hangs until
+your timeout. Take it from the record the platform routes this domain by:
 
 ```bash
 APP=$(dig +short TXT _dstack-app-address.<DOMAIN> | tr -d '"' | cut -d: -f1)

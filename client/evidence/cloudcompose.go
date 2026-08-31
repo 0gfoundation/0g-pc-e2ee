@@ -94,7 +94,7 @@ func FetchAppComposeFromCloud(
 	apiBase, appID string,
 	composeHash [attest.ComposeHashLen]byte,
 ) ([]byte, string, error) {
-	id := strings.ToLower(strings.TrimSpace(appID))
+	id := normalizeAppID(appID)
 	if id == "" {
 		return nil, "", errors.New("no app_id to fetch app-compose for")
 	}
@@ -158,15 +158,16 @@ func pickCloudAppCompose(
 		if inst.Name != "" {
 			label += " (" + inst.Name + ")"
 		}
-		raw, err := cloudInstanceAppCompose(inst)
-		switch {
-		case err != nil:
+		candidates, err := cloudInstanceAppCompose(inst)
+		if err != nil {
 			seen = append(seen, fmt.Sprintf("%s: %v", label, err))
 			continue
-		case sha256.Sum256(raw) == composeHash:
-			return raw, label, nil
-		default:
-			seen = append(seen, fmt.Sprintf("%s: %x", label, sha256.Sum256(raw)))
+		}
+		for _, c := range candidates {
+			if sha256.Sum256(c.raw) == composeHash {
+				return c.raw, label, nil
+			}
+			seen = append(seen, fmt.Sprintf("%s %s: %x", label, c.field, sha256.Sum256(c.raw)))
 		}
 	}
 	// Not a digest MISMATCH in the VerifyAppCompose sense — no instance here claimed
@@ -178,19 +179,43 @@ func pickCloudAppCompose(
 		appID, base, composeHash, strings.Join(seen, ", "))
 }
 
-// cloudInstanceAppCompose pulls the verbatim app-compose bytes out of one instance's
-// tcb_info. The string's bytes are returned as delivered — they are the digest
+// composeCandidate is one field's bytes, named so a report and an error can say
+// which field they came from. The bytes are as delivered — they are the digest
 // preimage, so re-marshalling or re-indenting them anywhere in this path would break
 // the very check they exist for.
-func cloudInstanceAppCompose(inst cloudInstance) ([]byte, error) {
-	if raw, err := tcbInfoAppCompose(inst.TCBInfo); err == nil {
-		return raw, nil
-	} else if inst.ComposeFile == "" {
-		// Only the tcb_info error is reported when there is no second field to try: it
-		// is the specific one, and "neither field had it" would hide which.
-		return nil, err
+type composeCandidate struct {
+	field string
+	raw   []byte
+}
+
+// cloudInstanceAppCompose returns every manifest this instance offers: what the CVM
+// reported in tcb_info, and what the platform holds in compose_file.
+//
+// Both are returned rather than one being preferred, because the caller decides by
+// DIGEST and the digest is a better judge than any priority rule here could be. The
+// two fields are written by different halves of the platform and can legitimately
+// disagree — mid-upgrade, the platform's record can be the compose the CVM has not
+// booted yet — so a rule that always reads one field would miss a manifest that is
+// sitting in the other and hashes correctly. Nothing is trusted either way: bytes
+// that fail the digest are discarded whichever field carried them.
+func cloudInstanceAppCompose(inst cloudInstance) ([]composeCandidate, error) {
+	var out []composeCandidate
+	raw, tcbErr := tcbInfoAppCompose(inst.TCBInfo)
+	if tcbErr == nil {
+		out = append(out, composeCandidate{field: "tcb_info.app_compose", raw: raw})
 	}
-	return []byte(inst.ComposeFile), nil
+	// Usually the two fields hold the same document; listing it twice would only pad
+	// the "none of these matched" error with a repeated digest.
+	if inst.ComposeFile != "" && (tcbErr != nil || !bytes.Equal(raw, []byte(inst.ComposeFile))) {
+		out = append(out, composeCandidate{field: "compose_file", raw: []byte(inst.ComposeFile)})
+	}
+	if len(out) == 0 {
+		// Report the tcb_info error rather than "this instance had nothing": it is the
+		// specific one, and it distinguishes a stopped instance from an app that hides
+		// its tcb_info.
+		return nil, tcbErr
+	}
+	return out, nil
 }
 
 // tcbInfoAppCompose reads app_compose out of an instance's tcb_info, in whichever

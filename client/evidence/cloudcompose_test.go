@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // cloudInstanceJSON builds one instance of an attestations reply. tcbInfoAsString
@@ -267,5 +268,120 @@ func TestCheck_CodeIdentity_AppIDFallbackIsLabelled(t *testing.T) {
 	}
 	if want := fmt.Sprintf("%x", composeHashOf(testAppCompose))[:appIDHexLen]; rep.Code.AppID != want {
 		t.Errorf("AppID = %q, want the compose_hash prefix %q", rep.Code.AppID, want)
+	}
+}
+
+// cloudLookupCtx is what keeps a HANGING cloud API from spending the budget the
+// guest-agent fallback needs. The halving itself is arbitrary; what must hold is
+// that a fallback always has time left, and that a run with nothing to fall back
+// to is not shortened for no reason.
+func TestCloudLookupCtx(t *testing.T) {
+	const budget = time.Second
+
+	t.Run("halves the budget when a fallback exists", func(t *testing.T) {
+		parent, cancelParent := context.WithTimeout(context.Background(), budget)
+		defer cancelParent()
+		ctx, cancel := cloudLookupCtx(parent, true)
+		defer cancel()
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("no deadline on the cloud context")
+		}
+		if left := time.Until(deadline); left > budget*3/4 {
+			t.Errorf("cloud context keeps %v of a %v budget; the fallback would be starved", left, budget)
+		}
+	})
+
+	t.Run("keeps the whole budget with no fallback", func(t *testing.T) {
+		parent, cancelParent := context.WithTimeout(context.Background(), budget)
+		defer cancelParent()
+		ctx, cancel := cloudLookupCtx(parent, false)
+		defer cancel()
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("no deadline on the cloud context")
+		}
+		if left := time.Until(deadline); left < budget*3/4 {
+			t.Errorf("cloud context keeps only %v of a %v budget, with no fallback to save it for", left, budget)
+		}
+	})
+
+	// A library caller with no deadline is bounded by the HTTP client's own timeout;
+	// inventing one here would cap a run the caller deliberately left open.
+	t.Run("adds no deadline when the parent has none", func(t *testing.T) {
+		ctx, cancel := cloudLookupCtx(context.Background(), true)
+		defer cancel()
+		if _, ok := ctx.Deadline(); ok {
+			t.Error("a deadline was invented for a parent that had none")
+		}
+	})
+
+	// An already-spent budget must still produce a usable (immediately-done) context
+	// rather than a negative timeout.
+	t.Run("survives an expired parent", func(t *testing.T) {
+		parent, cancelParent := context.WithTimeout(context.Background(), -time.Second)
+		defer cancelParent()
+		ctx, cancel := cloudLookupCtx(parent, true)
+		defer cancel()
+		if ctx.Err() == nil {
+			t.Error("an expired parent produced a live cloud context")
+		}
+	})
+}
+
+// The two fields of one instance can disagree mid-upgrade: the platform's record
+// moves before the CVM has booted the new manifest. Whichever field holds the one
+// this quote binds must win, so neither may be read as the only candidate.
+func TestFetchAppComposeFromCloud_EitherFieldCanHoldTheMatch(t *testing.T) {
+	other := strings.Replace(testAppCompose, "staging-a", "staging-b", 1)
+
+	t.Run("match in compose_file while tcb_info holds another", func(t *testing.T) {
+		inst := cloudInstanceJSON(t, "a", other, true)
+		inst["compose_file"] = testAppCompose
+		base, _ := cloudAPI(t, map[string]any{"instances": []any{inst}}, http.StatusOK)
+
+		raw, _, err := FetchAppComposeFromCloud(
+			context.Background(), http.DefaultClient, base, testAppID, composeHashOf(testAppCompose))
+		if err != nil {
+			t.Fatalf("FetchAppComposeFromCloud: %v", err)
+		}
+		if string(raw) != testAppCompose {
+			t.Errorf("app-compose = %q, want the compose_file one", raw)
+		}
+	})
+
+	t.Run("match in tcb_info while compose_file holds another", func(t *testing.T) {
+		inst := cloudInstanceJSON(t, "a", testAppCompose, true)
+		inst["compose_file"] = other
+		base, _ := cloudAPI(t, map[string]any{"instances": []any{inst}}, http.StatusOK)
+
+		raw, _, err := FetchAppComposeFromCloud(
+			context.Background(), http.DefaultClient, base, testAppID, composeHashOf(testAppCompose))
+		if err != nil {
+			t.Fatalf("FetchAppComposeFromCloud: %v", err)
+		}
+		if string(raw) != testAppCompose {
+			t.Errorf("app-compose = %q, want the tcb_info one", raw)
+		}
+	})
+}
+
+// An app_id pasted from the Cloud API's contract_address carries a 0x. It is the
+// same 20 bytes, so it must be accepted rather than rejected for its prefix.
+func TestFetchAppComposeFromCloud_AcceptsHexPrefixedAppID(t *testing.T) {
+	base, path := cloudAPI(t, map[string]any{
+		"instances": []any{cloudInstanceJSON(t, "a", testAppCompose, true)},
+	}, http.StatusOK)
+
+	raw, _, err := FetchAppComposeFromCloud(
+		context.Background(), http.DefaultClient, base, "0x"+strings.ToUpper(testAppID), composeHashOf(testAppCompose))
+	if err != nil {
+		t.Fatalf("FetchAppComposeFromCloud: %v", err)
+	}
+	if string(raw) != testAppCompose {
+		t.Errorf("app-compose = %q", raw)
+	}
+	if want := "/apps/" + testAppID + "/attestations"; !strings.HasSuffix(*path, want) {
+		t.Errorf("requested %q, want the normalized app_id in %q", *path, want)
 	}
 }
