@@ -94,7 +94,9 @@ And three directories that are not modules:
 - **Code identity is closed for the images we deploy on.** The OS-image allowlist
   ([`client/evidence/osimages.json`](client/evidence/osimages.json)) carries the deployed
   image, derived from the published guest-OS release and confirmed against a live quote. An
-  image not on that list *fails*, so a new OS version needs an entry before deployment.
+  image not on that list *fails*, so a new OS version needs an entry before deployment —
+  and an entry added ahead of its first CVM records, in the file, what a quote has not
+  confirmed yet.
 - On the **provider** hop the gateway walks on your behalf, DCAP quote verification, the
   OS-image measurement allowlist, the on-chain signer cross-check and the §8 response
   signature are all **enforced** — a provider that fails any of them is refused before

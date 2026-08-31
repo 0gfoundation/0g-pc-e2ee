@@ -306,7 +306,8 @@ precondition for flipping a switch.
 >
 > So the allowlist is **one entry per image**, computed with `dstack-mr` from the
 > published release and confirmed against a live quote — never copied off a running
-> machine. `attest.Policy` remains only as a deprecated type, documenting why the
+> machine. (An image has to be listed *before* it can be deployed on, so an entry may
+> be added ahead of the quote that confirms it; the entry records that.) `attest.Policy` remains only as a deprecated type, documenting why the
 > obvious shape does not work.
 >
 > The other half — pinning the *application* rather than the OS — is **read but not
@@ -407,7 +408,8 @@ shape, which this check does not need) — against an allowlist embedded in the 
 (`client/evidence/osimages.json`). **That allowlist is populated** for the image the
 gateway is deployed on: the three values were computed with `dstack-mr` from the
 published guest-OS release whose `digest.txt` equals the CVM's `os_image_hash`, and then
-confirmed to equal what a live quote reports. So the step checks rather than reports, and
+confirmed to equal what a live quote reports. (It also carries images queued for a
+deployment that has not happened yet — those entries name what is still unconfirmed.) So the step checks rather than reports, and
 an image that is not listed FAILS — a new OS image version needs an entry before it is
 deployed. Hop 3's broker allowlist is a separate file on the same mechanism
 (`client/evidence/brokerimages.json`) and is populated too; what waits on the fleet is
