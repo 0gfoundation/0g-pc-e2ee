@@ -109,15 +109,15 @@ A matched `os image` prints only the name. An image **not** in the allowlist is 
 **failure**, not a soft note — the run prints the observed registers and exits non-zero:
 
 ```
-✗ os image           MRTD/RTMR1/RTMR2 match no allowlisted OS image (dstack-nvidia-0.5.4.1)
+✗ os image           MRTD/RTMR1/RTMR2 match no allowlisted OS image (dstack-nvidia-0.5.4.1, dstack-0.5.9)
   observed mrtd   3f7c02e1…
   observed rtmr1  aa1908bd…
   observed rtmr2  5d64c7f0…
   rtmr0 (vm shape, not pinned) 01361d27…
 ```
 
-The name in parentheses is what the allowlist **contains**, not what was observed; the
-four lines under it are the observation. `rtmr0` is listed apart because nothing compares
+The names in parentheses are what the allowlist **contains** — every entry, not what was
+observed; the four lines under them are the observation. `rtmr0` is listed apart because nothing compares
 it (see step 7).
 
 ---
@@ -467,9 +467,11 @@ than asserted: [`client/evidence/osimages.json`](../client/evidence/osimages.jso
 records, per entry, the exact release it was computed from and that release's
 `digest.txt`, so you can fetch the same artifact and recompute with `dstack-mr`.
 
-Note *which* release, because it is a second GitHub organisation and not the obvious one.
-dstack's own `meta-dstack` publishes no `dstack-nvidia` asset below v0.5.6, so the entry
-for `dstack-nvidia-0.5.4.1` comes from
+Note *which* release, because for one entry it is a second GitHub organisation and not
+the obvious one. `dstack-0.5.9` comes from dstack's own
+[`meta-dstack`](https://github.com/Dstack-TEE/meta-dstack/releases), but that repository
+publishes no `dstack-nvidia` asset below v0.5.6, so the entry for `dstack-nvidia-0.5.4.1`
+comes from
 [`nearai/private-ml-sdk`](https://github.com/nearai/private-ml-sdk/releases) — the split
 Phala's own verifier encodes. Trusting that entry means trusting that publisher's tarball,
 which the `digest.txt` check ties down but does not itself audit. Closing that gap is a
@@ -524,9 +526,13 @@ check that catches a deployment running unpublished code.
 
 **The OS-image allowlist covers the images 0G deploys on, and nothing else.** Step 7
 checks against [`client/evidence/osimages.json`](../client/evidence/osimages.json), which
-is populated — but only with images whose measurements have been derived and confirmed
-against a live quote. An image that is **not** listed is a *failed* check, not an unpinned
-one, so moving a deployment to a new OS image version needs an entry added first.
+is populated — but only with images whose measurements were **derived from the published
+release**, never copied off a running machine, and then confirmed against a live quote.
+An image that is **not** listed is a *failed* check, not an unpinned one, so moving a
+deployment to a new OS image version needs an entry added **first** — which means an
+entry can be added before any CVM runs that image and therefore before a quote has
+confirmed it. Such an entry says so in its own `note`, and says which of its registers
+are already anchored by a confirmed entry for a sibling image.
 Verifying a deployment 0G does not operate may well mean adding its image yourself; the
 run prints the registers to compare, and the file documents the derivation step by step
 along with the two caveats on how the entries were computed (see

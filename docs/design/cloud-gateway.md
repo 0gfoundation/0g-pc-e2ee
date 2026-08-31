@@ -592,7 +592,8 @@ does not.
   (`attest.BootChainPolicy`, `client/evidence/osimages.json`) carries the deployed
   image, computed with `dstack-mr` from the published guest-OS release matched to the
   CVM's `os_image_hash` and confirmed against a live quote — so a modified OS image that
-  skipped the boot check no longer passes. The two caveats: the values come from the
+  skipped the boot check no longer passes. (An image must be listed before it can be
+  deployed on, so an entry can precede the quote that confirms it and says so.) The two caveats: the values come from the
   published release rather than a source rebuild, so that tarball is in the trust path
   until `reproduce.sh` runs in CI; and `MRTD` also depends on the host's page-add mode
   (`two_pass_add_pages`), recorded per entry. Both are properties of the derivation, not
