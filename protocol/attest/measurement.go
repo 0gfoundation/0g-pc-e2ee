@@ -84,6 +84,19 @@ func (b BootChain) IsZero() bool { return b == BootChain{} }
 // unavailable rather than as a failure. Callers must say which they are doing.
 type BootChainPolicy struct {
 	Allowed []BootChain
+	// Names optionally labels entries in Allowed — the image name the allowlist entry
+	// was published under (evidence.OSImage.Name, e.g. "dstack-nvidia-0.5.9"). It is
+	// what lets a verifier report WHICH audited image an enclave booted rather than
+	// only that it booted one, and it is why the label lives on the policy rather than
+	// beside it: a name looked up from a second copy of the allowlist could disagree
+	// with the entry that actually matched, which is the one thing a "this is the image
+	// you audited" claim must not do.
+	//
+	// Optional, and never load-bearing. Matching reads Allowed and nothing else, so a
+	// policy built without Names decides exactly as it did before — it can only report
+	// less. A name for a boot chain that is NOT in Allowed is inert: Name refuses to
+	// return one (see Name), so a label can never stand in for membership.
+	Names map[BootChain]string
 }
 
 // Permits reports whether b is allowlisted. An empty allowlist permits nothing, and a
@@ -98,6 +111,25 @@ func (p BootChainPolicy) Permits(b BootChain) bool {
 		}
 	}
 	return false
+}
+
+// Name returns the label of the allowlist entry b matched, or "" when b is not
+// allowlisted or the entry carries no label.
+//
+// It is gated on Permits rather than being a plain map read, and that is the whole
+// point of the method: a non-empty result therefore MEANS "this boot chain is in the
+// allowlist, under this name". A reader can act on the name without re-deriving the
+// verdict, and a mislabelled policy (a name for a chain nobody allowlisted) cannot
+// turn into an accidental pass.
+//
+// The reverse implication does not hold and must not be read into it: "" is also what
+// a matched chain returns when the policy carries no Names at all, so a caller
+// reporting the name still has to report the verdict separately.
+func (p BootChainPolicy) Name(b BootChain) string {
+	if !p.Permits(b) {
+		return ""
+	}
+	return p.Names[b]
 }
 
 // Configured reports whether the policy holds any expected value at all.

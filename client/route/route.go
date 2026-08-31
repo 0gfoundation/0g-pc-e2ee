@@ -745,7 +745,14 @@ func (r *Router) verifyQuoteAt(ctx context.Context, quoteURL string) (res quoteR
 			"signer_addr", verified.SignerAddr)
 	}
 	composeHash, haveHash := composeHashOf(raw, verified, r.logger)
-	facts := quoteFacts{measurement: r.measurementVerdict(verified)}
+	facts := quoteFacts{
+		measurement: r.measurementVerdict(verified),
+		// The verifier reports which audited image matched, so the record can name it
+		// instead of leaving a panel with a bare "pass". Empty unless the boot chain was
+		// allowlisted AND the entry carried a label, which is exactly when there is an
+		// image to name — see attest.Verified.MeasurementImage.
+		osImage: verified.MeasurementImage,
+	}
 	if haveHash {
 		facts.composeHash = hex.EncodeToString(composeHash[:])
 		facts.containers = r.containersOf(appCompose, composeHash, quoteURL)

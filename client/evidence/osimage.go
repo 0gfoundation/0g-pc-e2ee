@@ -138,16 +138,33 @@ type OSImageCheck struct {
 func (o OSImageCheck) OK() bool { return !o.Configured || o.Err == nil }
 
 // BootChainPolicyOf projects an allowlist onto the type attest.Verifier compares
-// with, dropping the provenance fields that are never matched on.
+// with: the boot chains it matches on, plus each entry's NAME, which it does not.
 //
 // Exported for the same reason CheckOSImage is: the gateway's own OS-image check and
 // the PROVIDER-side allowlist (brokerimages.json, which the sealing path enforces)
 // must agree on what a list of entries means. A second projection would be a second
 // answer to "which boot chains does this file accept".
+//
+// The names ride along so a verifier can say WHICH audited image an enclave booted
+// (attest.Verified.MeasurementImage) — the one provenance field a report needs, and
+// the reason os_image on the gateway's provider-identity endpoint can carry a value
+// rather than a permanent null. They are inert for matching: attest.BootChainPolicy
+// compares Allowed and consults Names only after a match.
+//
+// Two entries sharing one boot chain (different names for the same measured image, or
+// a copy-paste in the file) keep the FIRST name, matching CheckOSImage's first-match
+// report below. Neither is more correct than the other; what matters is that the two
+// do not disagree about the same file.
 func BootChainPolicyOf(allowed []OSImage) attest.BootChainPolicy {
-	policy := attest.BootChainPolicy{Allowed: make([]attest.BootChain, 0, len(allowed))}
+	policy := attest.BootChainPolicy{
+		Allowed: make([]attest.BootChain, 0, len(allowed)),
+		Names:   make(map[attest.BootChain]string, len(allowed)),
+	}
 	for _, img := range allowed {
 		policy.Allowed = append(policy.Allowed, img.BootChain)
+		if _, named := policy.Names[img.BootChain]; !named {
+			policy.Names[img.BootChain] = img.Name
+		}
 	}
 	return policy
 }
@@ -167,19 +184,25 @@ func CheckOSImage(allowed []OSImage, m attest.Measurement) OSImageCheck {
 	if !out.Configured {
 		return out
 	}
-	if !BootChainPolicyOf(allowed).Permits(out.Observed) {
-		names := make([]string, 0, len(allowed))
-		for _, img := range allowed {
-			names = append(names, img.Name)
-		}
-		out.Err = fmt.Errorf("MRTD/RTMR1/RTMR2 match no allowlisted OS image (%s)", strings.Join(names, ", "))
+	// One policy, one lookup, for both halves of the answer: attest.BootChainPolicy.Name
+	// returns a name only for a chain it permits, so Matched cannot name an entry the
+	// comparison did not match — and it is the same call the sealing path's verifier
+	// makes, so this endpoint and that one cannot report different images for one quote.
+	policy := BootChainPolicyOf(allowed)
+	if matched := policy.Name(out.Observed); matched != "" {
+		out.Matched = matched
 		return out
 	}
-	for _, img := range allowed {
-		if img.BootChain == out.Observed {
-			out.Matched = img.Name
-			break
-		}
+	if policy.Permits(out.Observed) {
+		// Allowlisted but unlabelled — unreachable from ParseOSImages, which requires a
+		// name on every entry, but reachable for a hand-built list. A match with no name
+		// to report is still a match, and reporting it as a miss would be a false finding.
+		return out
 	}
+	names := make([]string, 0, len(allowed))
+	for _, img := range allowed {
+		names = append(names, img.Name)
+	}
+	out.Err = fmt.Errorf("MRTD/RTMR1/RTMR2 match no allowlisted OS image (%s)", strings.Join(names, ", "))
 	return out
 }

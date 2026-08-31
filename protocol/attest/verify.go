@@ -142,6 +142,18 @@ type Verified struct {
 	// false, under ModeWarn, when no allowlist is configured at all; the two are
 	// distinguishable only under ModeEnforce, via the error.
 	MeasurementTrusted bool
+	// MeasurementImage names the allowlist entry BootChainOf(Measurement) matched —
+	// the audited OS image this enclave booted (BootChainPolicy.Names). Empty when
+	// nothing matched, and empty when the policy carries no labels, so it ADDS to
+	// MeasurementTrusted rather than restating it: a caller decides on the bool and
+	// reports the name.
+	//
+	// It comes from the same lookup that produced MeasurementTrusted, which is what
+	// makes it safe to display. A name derived by a second pass over the allowlist
+	// could name an entry other than the one that matched; this one cannot, and it is
+	// non-empty only when the boot chain is genuinely allowlisted (see
+	// BootChainPolicy.Name).
+	MeasurementImage string
 }
 
 // Verify runs the full SPEC §4.4 pre-seal check on a raw provider quote:
@@ -178,7 +190,8 @@ func (v *Verifier) Verify(rawQuote []byte) (Verified, error) {
 	// routes to an enclave running unaudited (malicious) code. Under ModeEnforce
 	// a miss is fatal (checked before trusting any key the quote carries); under
 	// ModeWarn it is recorded on the result for the caller to log and decide.
-	trusted := v.policy.Permits(BootChainOf(measurement))
+	bootChain := BootChainOf(measurement)
+	trusted := v.policy.Permits(bootChain)
 	if !trusted && v.mode == ModeEnforce {
 		// An empty allowlist rejects every provider. Still fail-closed, but report it
 		// as the configuration gap it is rather than as a verdict on this enclave.
@@ -201,5 +214,9 @@ func (v *Verifier) Verify(rawQuote []byte) (Verified, error) {
 		SignerAddr:         rd.SignerAddr,
 		Measurement:        measurement,
 		MeasurementTrusted: trusted,
+		// Read off the policy that just decided, not looked up again: same allowlist,
+		// same boot chain, one lookup. Name is empty unless that lookup permitted the
+		// chain, so an untrusted quote in ModeWarn carries no image name.
+		MeasurementImage: v.policy.Name(bootChain),
 	}, nil
 }
