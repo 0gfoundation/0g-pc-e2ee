@@ -81,12 +81,14 @@ type Info struct {
 	// dstack gateway routes by, and what a blue and a green side of one deployment
 	// share.
 	//
-	// It is NOT a function of the running compose. dstack derives it from the compose
-	// hash when the app is CREATED and then keeps it fixed across upgrades — with KMS
-	// it comes from the app registry — so `compose_hash[:20]` equals it only until the
-	// first redeploy. This field, read from the guest agent, is the authoritative one;
-	// anything that needs to address the app by name should carry it rather than
-	// recompute it (see evidence.DiscoverAppID for the same point from outside).
+	// It is NOT a function of the running compose. The id is assigned when the app is
+	// created — from the app registry with KMS, or, only when nothing assigned one, by
+	// deriving `truncate(compose_hash, 20)` — and is then persisted and kept across
+	// compose upgrades, so `compose_hash[:20]` equals it only until the first upgrade
+	// (and only for an app that derived its own id at all). This field, read from the
+	// guest agent, is the authoritative one; anything that needs to address the app by
+	// name should carry it rather than recompute it (see evidence.DiscoverAppID for
+	// the same point from outside).
 	AppID string `json:"app_id"`
 	// AppName and ComposeHash are logged at startup for operator orientation only;
 	// they are not exported as metric labels.

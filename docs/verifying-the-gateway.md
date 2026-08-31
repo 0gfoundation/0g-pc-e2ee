@@ -243,9 +243,10 @@ this against the newest 5 by default and reports **which** release is live.
 > `mr_config_id` is part of the signed hardware report, so recovering `compose_hash`
 > needs no replay of any log and no cooperation from anyone. `app_id` — the identifier
 > the hosting platform routes and labels the deployment by — is a *separate* value:
-> dstack derives it from the compose hash when the app is **created** and then keeps it
-> fixed across upgrades, so `compose_hash[:20]` is the app_id only until the first
-> redeploy. It is read from DNS (`_dstack-app-address`) and used only to locate the
+> it is assigned when the app is **created** (from the app registry for a KMS-enabled
+> app; `truncate(compose_hash, 20)` only when nothing assigned one) and then kept
+> across compose upgrades, so `compose_hash[:20]` is the app_id only until the first
+> upgrade, if ever. It is read from DNS (`_dstack-app-address`) and used only to locate the
 > manifest, never as evidence.
 
 **7. OS image.** `mr_config_id` is supplied by the (untrusted) host when the enclave is
@@ -695,6 +696,10 @@ jq -j '.instances[0].tcb_info.app_compose' attestations.json > app-compose.json 
 #   curl -s "https://$APP-8090.<platform-base-domain>/prpc/Info" > info.json
 #   jq -r '.tcb_info' info.json | jq -j '.app_compose' > app-compose.json
 
+# The app's own compose_hash is NOT a field of that reply — see the warning below.
+# Take it from the quote, or from the event log, or just hash the bytes:
+jq -r '.instances[0].tcb_info.event_log[]|select(.event=="compose-hash").event_payload' attestations.json
+
 # the digest must be the compose_hash the quote committed to — THIS is the step
 # that makes the bytes above trustworthy, whatever their source
 sha256sum app-compose.json
@@ -755,8 +760,29 @@ Release manifests are the `docker-compose.release.yml` asset on
 | served certificate is not the one in the bundle | three causes, in rising order of seriousness — see [below](#the-served-certificate-mismatch) |
 | certificate does not validate | ordinary TLS failure, an interception, or a deliberately untrusted staging certificate |
 | `app-compose` digest does not match `compose_hash` | the manifest is for a different deployment or instance — under blue/green, most often the standby side rather than the live one |
+| a `compose_hash` seen elsewhere does not match this one | check *whose* enclave it names before treating it as a discrepancy — see [three enclaves, three compose hashes](#three-enclaves-three-compose-hashes) |
 | compose text matches no published release | **the finding that matters.** The deployment is running something that was not published. Report it. |
 | `os image` matches no allowlisted image | either the deployment was upgraded to an OS this tool does not know yet, or it is not running the OS it should be. The observed registers are printed so the two can be told apart against the reproducible build. |
+
+### Three enclaves, three compose hashes
+
+A `compose_hash` is only meaningful together with **which CVM it belongs to**, and a
+verification touches three different ones. They are supposed to differ; two of them
+agreeing would be the surprise.
+
+| Value seen at | Whose enclave | Notes |
+|---|---|---|
+| the quote's `mr_config_id`, and `<app_id>-8090.<base>/prpc/Info` | **this gateway's CVM** | the only one `pcverify` checks the app-compose against |
+| `kms_guest_agent_info.compose_hash` in the Cloud attestations reply | the **cluster's KMS enclave** (a Phala-operated CVM) | present so a verifier can appraise the key provider; nothing to do with your app |
+| `/v1/providers/{address}/identity` | the **inference provider's** CVM | a different operator's enclave, the one this gateway seals prompts to |
+
+> **The trap.** In `GET /apps/<app_id>/attestations` your app's own instance carries
+> `mrtd`, `rtmr0..3`, `event_log` and `app_compose` — but **no `compose_hash` field**.
+> The only key literally named `compose_hash` in that document belongs to the KMS
+> enclave, so `grep compose_hash`, a browser search, or `jq '..|.compose_hash?'` all
+> land on a hash that is not yours. Read the `compose-hash` *event* (hyphen) from the
+> event log, strip the `0x01` version byte off `mr_config_id`, or simply hash
+> `app_compose` — which is the definition anyway.
 
 ### The served-certificate mismatch
 

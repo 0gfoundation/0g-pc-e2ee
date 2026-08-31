@@ -156,7 +156,7 @@ controlled only by that enclave?"**
 > (see `deploy/phala/docker-compose.yml`), whose `/evidences` quote has
 > `report_data = SHA-256(sha256sum.txt)` covering the served certificate, and a
 > `mr_config_id` committing to `compose_hash = SHA-256(the whole app-compose)`
-> (`app_id` is its leading 20 bytes). That register is part of the signed TD
+> (`app_id` is a separate, platform-assigned value — see §6.1). That register is part of the signed TD
 > report, so it needs no event-log replay — see
 > `attest.ComposeHashFromMRConfigID`. Because the compose hash covers the whole
 > app-compose, it attests **every** container in the CVM at once — ingress and
@@ -185,8 +185,8 @@ controlled only by that enclave?"**
 > authenticity rides the provider's own SPEC §8 signature instead.
 
 1. **Cert-binding quote**: a TDX quote from inside the CVM that commits to the served
-   cert (via `report_data`) and to the deployment's `compose_hash` (via `mr_config_id`;
-   `app_id` is that hash's leading 20 bytes). Emitted by **dstack-ingress**
+   cert (via `report_data`) and to the deployment's `compose_hash` (via `mr_config_id`).
+   Emitted by **dstack-ingress**
    (`/evidences`, see the decision box above), not by a gateway-issued quote API.
 2. **Bind the TLS cert into that quote**: dstack-ingress puts
    `SHA-256(sha256sum.txt)` (which covers the served cert) in the quote's
@@ -529,26 +529,37 @@ does not.
    the signed TD report, so **no event-log replay is needed**: whatever verified
    the quote already authenticated it. `attest.ComposeHashFromMRConfigID` reads it
    (failing closed on the V2/V3 layouts, which commit to the hash inside a digest
-   rather than carrying it), and `attest.AppIDFromComposeHash` derives the `app_id`
-   the platform labels by. The `compose-hash` runtime event in RTMR3 carries the
+   rather than carrying it). The `compose-hash` runtime event in RTMR3 carries the
    same value and is kept only as a cross-check in the KAT.
 
-   From there `pcverify -gateway` closes the chain with no extra arguments: it
-   derives the platform base domain from the served domain's CNAME chain
-   (`evidence.DeriveBaseDomain` — dstack points a served name at `_.<base_domain>`),
-   fetches the app-compose from the guest agent of the `app_id` **the quote itself
-   names**, and checks `sha256 == compose_hash` (`evidence.VerifyAppCompose`) before
-   believing anything in it. `-app-compose` supplies those bytes from a file
-   instead — a deploy record, a release asset, a copy-paste — because the compose
-   hash anchors them; no Phala Cloud API access is required.
+   **`app_id` is not in that register, and is not derivable from it.** dstack assigns
+   an app its id at creation and keeps it across compose upgrades
+   (`dstack-util` derives `truncate(compose_hash, 20)` only when nothing assigned
+   one), so the two agree only until a deployment's first upgrade.
+   `attest.AppIDFromComposeHash` is that creation-time derivation and nothing more.
+
+   From there `pcverify -gateway` closes the chain with no extra arguments: it reads
+   the `app_id` from the served domain's `_dstack-app-address` TXT record — the
+   record the platform's own gateway routes this domain by (`evidence.DiscoverAppID`)
+   — fetches the app-compose from Phala Cloud's public attestations API
+   (`evidence.FetchAppComposeFromCloud`, no API key), falling back to the CVM's guest
+   agent at `<app_id>-8090.<base_domain>` with the base domain derived from the served
+   domain's CNAME chain (`evidence.DeriveBaseDomain` — dstack points a served name at
+   `_.<base_domain>`), and checks `sha256 == compose_hash`
+   (`evidence.VerifyAppCompose`) before believing anything in it. With several
+   instances the one whose manifest hashes to *this* quote's `compose_hash` is the one
+   read, so a blue/green pair cannot be reported as a mismatch. `-app-compose`
+   supplies those bytes from a file instead — a deploy record, a release asset, a
+   copy-paste — because the compose hash anchors them; nothing here needs Phala Cloud
+   credentials, and `-no-cloud-api` drops the API entirely.
 
    Naming what *should* be running defaults to the newest 5 published releases
    (`-releases`), so the report says which release is live and flags "none of them";
    `-expect-compose-file` overrides that with a single pinned manifest. Neither DNS
-   nor GitHub is trusted to decide anything: DNS only *locates* the app-compose (a
-   wrong or hijacked answer yields a failed lookup or a failed binding, never a false
-   pass), and a release asset is only ever compared against text the quote already
-   authenticated. Both lookups are advisory when they happen by default and fatal when
+   nor GitHub is trusted to decide anything: DNS only *locates* the app-compose — which
+   `app_id` to ask about and which host to ask (a wrong or hijacked answer yields a
+   failed lookup or a failed binding, never a false pass) — and a release asset is only
+   ever compared against text the quote already authenticated. Both lookups are advisory when they happen by default and fatal when
    explicitly requested (or under `-strict`), so a network problem is never reported as
    a verification failure — nor silently as a pass: an advisory skip exits **3**, the
    code for "nothing failed, and not everything ran", never 0.

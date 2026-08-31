@@ -29,12 +29,15 @@ const appIDHexLen = 2 * attest.AppIDLen
 // gateway's own SNI routing (deploy/phala/README.md "Serving domain" creates the
 // CNAME that delegates it; dstack-ingress keeps the record itself up to date).
 //
-// **WHY THIS EXISTS: app_id is not a function of compose_hash.** dstack fixes an
-// app's id once, when the app is first created — with KMS, from the app registry —
-// and it then stays put while the app is upgraded, so compose_hash moves under a
-// stable app_id. `compose_hash[:20]` (attest.AppIDFromComposeHash) therefore names
-// the app only for a deployment still running the very first compose it was created
-// with. Using it anywhere else asks the platform about an app that does not exist,
+// **WHY THIS EXISTS: app_id is not a function of compose_hash.** dstack assigns an
+// app its id when the app is created and then persists it — the guest only derives
+// one when nothing assigned one (dstack-util system_setup.rs: `if
+// instance_info.app_id.is_empty() { app_id = truncate(compose_hash, 20) }`), which
+// for a KMS-enabled app on Phala Cloud never happens; there the id is the app's
+// registry entry. compose_hash then moves under a fixed app_id on every upgrade, so
+// `compose_hash[:20]` (attest.AppIDFromComposeHash) names the app only for a
+// deployment that both derived its own id and still runs the compose it derived it
+// from. Using it anywhere else asks the platform about an app that does not exist,
 // whose symptom is not an error but a hostname nothing routes: the request hangs
 // until the client's own timeout. That is what broke verification of a gateway moved
 // to a new cluster, where the app was created once and upgraded since.
