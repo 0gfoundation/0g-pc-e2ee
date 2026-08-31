@@ -60,13 +60,21 @@ holds the token ([One-time setup](#one-time-setup)); details are in the sections
 below.
 
 ```sh
-./switch.sh acme b           # 1. aim the issuance switch at side b FIRST
-phala cvm create ...         # 2. deploy side b — new image digest (=> new app_id),
-                             #    DELEGATION_ZONE=b.integratenetwork.work, DNS_SETUP_MODE=print
-./switch.sh switch b         # 3. probe b's /readyz directly, flip traffic, confirm b is
-                             #    really serving (cert changed) + /healthz; auto-rollback otherwise
-phala cvm delete <side a>    # 4. once b is confirmed live, retire a to free resources
+./switch.sh acme b                          # 1. aim the issuance switch at side b FIRST
+./deploy.sh deploy --side b --release latest # 2. deploy side b — new image digest (=> new
+                                            #    app_id); deploy.sh sets DELEGATION_ZONE=
+                                            #    b.integratenetwork.work and DNS_SETUP_MODE=print,
+                                            #    then waits on b's /readyz by app-id
+./switch.sh switch b                        # 3. probe b's /readyz directly, flip traffic, confirm b is
+                                            #    really serving (cert changed) + /healthz; auto-rollback otherwise
+phala cvms delete --cvm-id <side a>         # 4. once b is confirmed live, retire a to free resources
 ```
+
+Step 2 is [`deploy.sh`](./deploy.sh) rather than a dashboard form because the
+side's `DELEGATION_ZONE`, `DNS_SETUP_MODE` and measured app-compose flags are
+exactly the things the two sides must agree on — see
+[README "Deploy"](./README.md#deploy). It also refuses to build a side whose
+issuance switch is still pointed elsewhere, which is step 1's whole purpose.
 
 With `PLATFORM_BASE` set in `switch.env`, step 3 checks side b's **readiness**
 before the flip — can it actually serve, not just is it listening — so a b that
