@@ -23,7 +23,7 @@
 #   ./switch.sh acme b                 # 1. aim issuance at the side about to be built
 #   ./deploy.sh deploy --side b …      # 2. this script: build the side, wait for /readyz
 #   ./switch.sh switch b               # 3. cut traffic over (probes b first, rolls back itself)
-#   ./deploy.sh verify                 # 4. full pcverify gate on the served domain
+#   ./deploy.sh verify --release … # 4. full pcverify gate on the served domain
 #   phala cvms delete --cvm-id <a's id> # 5. retire the old side (an id, not a name —
 #                                     #    see cvm_id_by_name below)
 # Step 1 comes first for a reason (blue-green.md "About the certificate"): a
@@ -42,8 +42,12 @@
 #   ./deploy.sh deploy --side b --release latest   # deploy the newest release asset
 #   ./deploy.sh deploy --side b --release release-2026.08.30.1
 #   ./deploy.sh deploy --side b --compose ./docker-compose.release.yml
-#   ./deploy.sh status                             # app_id / instance / probe URL
-#   ./deploy.sh verify                             # pcverify gate against DOMAIN
+#   ./deploy.sh status --side b                    # app_id / cvm id / probe URLs
+#   ./deploy.sh verify --release latest            # pcverify gate against DOMAIN
+#
+# `verify` compares the DEPLOYED manifest byte-for-byte, so it takes the same
+# --release / --compose the deploy did; `status` takes the same --side, since that
+# is half of the CVM's name.
 #
 # Flags:
 #   --side a|b          which blue/green side this CVM is (sets DELEGATION_ZONE)
@@ -222,8 +226,11 @@ $digests"
   # Any other image on a tag is a weaker version of the same problem: it is
   # measured by name, and the name's contents can be republished. Upstream
   # images are pinned in the checked-in compose, so this only fires on a hand-edit.
+  # Filter FIRST, number after: `grep -n` prefixes "NN:", which the ^-anchored
+  # gateway pattern can no longer match, so numbering first would re-list the very
+  # lines the check above already accounted for.
   local floating
-  floating="$(grep -nE '^[[:space:]]*image:' "$f" | grep -v '@sha256:' | grep -vE "${GW_IMAGE_RE}" || true)"
+  floating="$(grep -E '^[[:space:]]*image:' "$f" | grep -v '@sha256:' | grep -vE "${GW_IMAGE_RE}" || true)"
   [ -z "$floating" ] || warn "image line(s) not pinned by digest:
 $floating"
 }
@@ -241,14 +248,16 @@ fetch_release_compose() { # tag ("latest" or a tag name) -> path on stdout
   local -a auth=()
   [ -n "${GITHUB_TOKEN:-}" ] && auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
 
-  body="$(curl -sSfL "${auth[@]}" -H 'Accept: application/vnd.github+json' "$api")" \
+  # ${arr[@]+…}: an empty array under `set -u` aborts on bash < 4.4, which macOS
+  # still ships as /bin/bash and this script re-execs into.
+  body="$(curl -sSfL ${auth[@]+"${auth[@]}"} -H 'Accept: application/vnd.github+json' "$api")" \
     || die "cannot read release '$tag' from $GH_REPO — private repo or rate limited? set GITHUB_TOKEN"
 
   tag="$(printf '%s' "$body" | jq -r '.tag_name')"
   url="$(printf '%s' "$body" | jq -r --arg n "$RELEASE_ASSET" '.assets[]? | select(.name==$n) | .browser_download_url')"
   [ -n "$url" ] && [ "$url" != null ] || die "release $tag has no $RELEASE_ASSET asset"
 
-  curl -sSfL "${auth[@]}" -o "$out" "$url" || die "download failed: $url"
+  curl -sSfL ${auth[@]+"${auth[@]}"} -o "$out" "$url" || die "download failed: $url"
 
   # Two independent statements of what the asset should hash to: the API's own
   # `digest` field, and the `| Release compose sha256 | <hex> |` row the workflow
@@ -267,7 +276,9 @@ fetch_release_compose() { # tag ("latest" or a tag name) -> path on stdout
   else
     warn "release $tag publishes no compose sha256 in its notes; downloaded sha256 $got"
   fi
-  RELEASE_TAG="$tag"
+  # This function runs inside $( ), so an assignment here dies with the subshell.
+  # The tag goes to a file the parent reads back (resolve_compose).
+  printf '%s' "$tag" > "$WORKDIR/release-tag"
   printf '%s\n' "$out"
 }
 
@@ -365,30 +376,49 @@ check_cli() {
 # Depending on it would be worst in the check below: if a name never resolves, every
 # lookup answers "not found" and the collision guard silently never fires. So the name
 # is resolved against the CVM LIST, and every later call uses the platform's own id.
-cvm_id_by_name() { # name -> that CVM's platform id, or empty
-  phala cvms list --json 2>/dev/null | jq -r --arg n "$1" '
+# Prints one id per CVM carrying that name — none, one, or (under
+# --allow-duplicate-name) several. A LIST THAT COULD NOT BE READ IS FATAL, never an
+# empty result: "no CVM answers to this name" and "the API did not answer" look
+# identical downstream, and treating the second as the first is what would let a
+# blip wave a duplicate of a MEASURED name straight through check_name_free.
+cvm_ids_by_name() { # name -> zero or more ids, one per line
+  local raw
+  raw="$(phala cvms list --json 2>/dev/null)" \
+    || die "could not list CVMs, so '$1' cannot be checked for. Retry, or check 'phala status'."
+  printf '%s' "$raw" | jq -r --arg n "$1" '
     [.. | objects
      | select(any(to_entries[]; (.key | ascii_downcase) == "name"
                                 and (.value | type) == "string" and .value == $n))]
-    | first // {}
-    | (.uuid // .id // .vm_uuid // .cvm_id // .app_id // empty)' 2>/dev/null || true
+    | .[] | (.uuid // .id // .vm_uuid // .cvm_id // .app_id // empty)' \
+    || die "could not parse the CVM list returned by 'phala cvms list --json'"
+}
+
+# The single id for a name, or empty when there is none — or when there is more than
+# one, because then there is no single answer and guessing would address the wrong
+# CVM (the caller says which case it is in).
+cvm_id_by_name() { # name -> that CVM's platform id, or empty
+  local ids; ids="$(cvm_ids_by_name "$1")"
+  [ "$(printf '%s' "$ids" | grep -c . || true)" = 1 ] || return 0
+  printf '%s' "$ids"
 }
 
 check_name_free() {
-  local id; id="$(cvm_id_by_name "$CVM_NAME")"
-  if [ -z "$id" ]; then
+  local ids n; ids="$(cvm_ids_by_name "$CVM_NAME")"
+  n="$(printf '%s' "$ids" | grep -c . || true)"
+  if [ "$n" = 0 ]; then
     ok "no CVM named ${CVM_NAME} yet"
     return 0
   fi
-  bad "a CVM named ${CVM_NAME} already exists (${id})"
+  bad "$n CVM(s) named ${CVM_NAME} already exist: $(printf '%s' "$ids" | tr '\n' ' ')"
   if [ "$ALLOW_DUP_NAME" = 1 ]; then
     warn "continuing anyway (--allow-duplicate-name); the name no longer names one CVM,"
     warn "so address them by the ids 'phala cvms list' shows"
     return 0
   fi
-  die "retire it first (phala cvms delete --cvm-id ${id}), or pass --name for a new one.
+  die "retire it first (phala cvms delete --cvm-id <one of the ids above>), or pass --name
+    for a new one.
     Updating that CVM in place is a different operation and this script does not do it:
-    'phala deploy --cvm-id ${id}' replaces the app on the SAME CVM, which is not a
+    'phala deploy --cvm-id <that id>' replaces the app on the SAME CVM, which is not a
     blue/green release — the point of a release here is a second CVM to cut over to and
     roll back from. --allow-duplicate-name overrides, at the cost of a name that no
     longer addresses one CVM."
@@ -494,6 +524,15 @@ resolve_config() {
   PUBLIC_TCBINFO="${PUBLIC_TCBINFO:-true}"
   SECURE_TIME="${SECURE_TIME:-false}"
   LISTED="${LISTED:-false}"
+
+  # Each of these five is MEASURED, and each is applied as a --flag/--no-flag pair,
+  # so anything that is not exactly `true` would otherwise read as `false` and change
+  # app_id silently: PUBLIC_TCBINFO=True would send --no-public-tcbinfo while the plan
+  # printed `True`, and every user's pcverify would then fail the code-identity step.
+  local b
+  for b in PUBLIC_LOGS PUBLIC_SYSINFO PUBLIC_TCBINFO SECURE_TIME LISTED; do
+    case "${!b}" in true|false) ;; *) die "$b must be exactly 'true' or 'false' (got '${!b}')" ;; esac
+  done
 
   # Container env. DNS_SETUP_MODE=print because each side lives under its own
   # sub-zone while the served CNAMEs stay pinned at the base zone, so the
@@ -637,12 +676,18 @@ cmd_deploy() {
   APP_ID="$(json_id "$out" app_id)"
   # Not every CLI version returns the ids from deploy; ask for them explicitly — by
   # the platform's own id, resolved from the list, never by handing it the name.
+  # Empty when the name is ambiguous (--allow-duplicate-name), which is exactly when
+  # picking one would be wrong: the first match is usually the CVM that was ALREADY
+  # there, so its app_id would probe a healthy old CVM and report the new one ready.
   CVM_ID="$(cvm_id_by_name "$CVM_NAME")"
   if [ -z "$APP_ID" ] && [ -n "$CVM_ID" ]; then
     out="$(phala cvms get --cvm-id "$CVM_ID" --json 2>/dev/null || true)"
     APP_ID="$(json_id "$out" app_id)"
   fi
-  [ -n "$APP_ID" ] || die "deployed, but could not read app_id.
+  [ -n "$APP_ID" ] || die "deployed, but could not read app_id.$(
+    [ -z "$CVM_ID" ] && printf '%s' "
+    The name ${CVM_NAME} does not resolve to a single CVM, so it could not be looked up
+    by name either." )
     Find the CVM with 'phala cvms list' and read it with 'phala cvms get --cvm-id <id> --json'."
   INSTANCE_ID="$(json_id "$out" instance_id)"
 
@@ -651,7 +696,17 @@ cmd_deploy() {
   [ -n "$CVM_ID" ] && info "cvm id      ${CVM_ID}   (what --cvm-id takes; the NAME is not an id)"
   info "probe       $(probe_url "$APP_ID")"
 
-  [ "$NO_PROBE" = 1 ] || wait_ready "$APP_ID"
+  # A CVM that never becomes ready is a failed deploy, and the script exits — but it
+  # says so, and says that the CVM is still there. `set -e` on a bare `wait_ready`
+  # would end the run on a silent non-zero, leaving an operator with a half-finished
+  # transcript and a running CVM nobody mentioned.
+  if [ "$NO_PROBE" != 1 ] && ! wait_ready "$APP_ID"; then
+    die "CVM ${CVM_NAME} (app_id ${APP_ID}) was created but never became ready.
+    It is still running and still costs resources: retire it with
+    'phala cvms delete --cvm-id ${CVM_ID:-<its id from: phala cvms list>}' once you have
+    read the logs, or leave it up and re-probe with './deploy.sh status --side ${SIDE}'.
+    NOTHING has been pointed at it — switch.sh has not run."
+  fi
 
   cat >&2 <<EOF
 
@@ -661,8 +716,9 @@ ${c_grn}==>${c_rst} side ${SIDE} is up. Next:
   ./switch.sh status
   ./switch.sh switch ${SIDE}
 
-  # then the full attestation gate against the served domain
-  ./deploy.sh verify
+  # then the full attestation gate against the served domain, comparing against
+  # the very manifest this run deployed
+  ./deploy.sh verify ${VERIFY_SOURCE}
 
   # and retire the old side once ${SIDE} is confirmed live — by its id from
   # 'phala cvms list', not by its name
@@ -688,10 +744,15 @@ cmd_verify() {
 }
 
 cmd_status() {
+  # The CVM name is <prefix>-<env>-<side>, so without --side (or an explicit --name)
+  # there is no name to look up — and the resulting "no CVM named …" would blame the
+  # deployment for a missing argument.
+  [ -n "$SIDE" ] || [ "$CVM_NAME_EXPLICIT" = 1 ] \
+    || die "status needs --side a|b (or --name / CVM_NAME) to know which CVM to describe"
   check_cli
   local out app id
   id="$(cvm_id_by_name "$CVM_NAME")"
-  [ -n "$id" ] || die "no CVM named ${CVM_NAME} (try: phala cvms list)"
+  [ -n "$id" ] || die "no single CVM named ${CVM_NAME} — none, or more than one (try: phala cvms list)"
   out="$(phala cvms get --cvm-id "$id" --json 2>/dev/null || true)"
   [ -n "$out" ] || die "CVM ${CVM_NAME} (${id}) could not be read"
   app="$(json_id "$out" app_id)"
@@ -716,8 +777,14 @@ resolve_compose() {
   if [ -n "$COMPOSE_ARG" ]; then
     [ -f "$COMPOSE_ARG" ] || die "compose file not found: $COMPOSE_ARG"
     COMPOSE_FILE="$(cd -- "$(dirname -- "$COMPOSE_ARG")" && pwd)/$(basename -- "$COMPOSE_ARG")"
+    VERIFY_SOURCE="--compose $COMPOSE_FILE"
   elif [ -n "$RELEASE" ]; then
     COMPOSE_FILE="$(fetch_release_compose "$RELEASE")"
+    [ -f "$WORKDIR/release-tag" ] && RELEASE_TAG="$(cat "$WORKDIR/release-tag")"
+    # The RESOLVED tag, not "latest": by the time anyone runs the printed command,
+    # latest may be a different release, and then `verify` would compare the
+    # deployment against a manifest it was never given.
+    VERIFY_SOURCE="--release ${RELEASE_TAG:-$RELEASE}"
   else
     die "pass --release <tag|latest> (the attested artifact) or --compose <path>"
   fi
@@ -781,9 +848,15 @@ fi
 # there is one place to state which deployment a CVM belongs to. Both parts earn
 # their place in a MEASURED field: without the env, a staging CVM and a mainnet
 # one on the same build would share app_id.
+# Whether the name was GIVEN (--name, or CVM_NAME in deploy.env) or derived from
+# --side: `status` needs one or the other, and a derived name with no side is just
+# the prefix, which names nothing.
+CVM_NAME_EXPLICIT=0
+{ [ -n "$NAME_ARG" ] || [ -n "${CVM_NAME:-}" ]; } && CVM_NAME_EXPLICIT=1
 CVM_NAME="${NAME_ARG:-${CVM_NAME:-0g-pc-gateway${ZG_PROM_ENV:+-$ZG_PROM_ENV}${SIDE:+-$SIDE}}}"
 RELEASE_TAG=""
-APP_ID=""; INSTANCE_ID=""
+VERIFY_SOURCE=""
+APP_ID=""; INSTANCE_ID=""; CVM_ID=""
 
 # Everything transient — the downloaded manifest and the env file with the
 # tokens in it — lives in one 0700 directory that is removed on any exit.
