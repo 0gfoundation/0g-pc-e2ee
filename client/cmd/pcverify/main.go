@@ -78,18 +78,27 @@
 //	pcverify -gateway pc-gateway.example.com [-pccs-url https://...]
 //	         [-allow-untrusted-cert]
 //	         [-expect-compose-file docker-compose.release.yml | -releases N]
-//	         [-app-compose app-compose.json | -base-domain <cluster>.phala.network]
+//	         [-app-compose app-compose.json | -app-id <40 hex> [-base-domain <cluster>.phala.network]]
+//	         [-cloud-api-base https://... | -no-cloud-api]
 //	         [-no-dns-discovery] [-os-image-allowlist osimages.json]
 //
 // Code identity — which configuration, and so which images, the CVM booted — comes
 // from the same verified quote: its mr_config_id carries
 // compose_hash = SHA-256(app-compose.json), so no event-log replay is involved. It
-// needs no extra arguments: the platform base domain is derived from the served
-// domain's CNAME chain, the app_id comes from the QUOTE (never from the caller or
-// from DNS), and the app-compose is fetched from the platform guest agent and checked
-// against compose_hash before anything in it is believed. -app-compose supplies those
-// bytes from a file instead; -base-domain overrides the derived domain;
-// -no-dns-discovery keeps the run to the endpoint and the inputs given.
+// needs no extra arguments. The app_id comes from the served domain's
+// _dstack-app-address TXT record — the record the platform itself routes by, because
+// an app_id is NOT compose_hash[:20] once the app has been upgraded — and the
+// app-compose is fetched from Phala Cloud's public attestations API, falling back to
+// the CVM's guest agent at `<app_id>-8090.<base-domain>` (base domain derived from
+// the served domain's CNAME chain). Whichever answers, the bytes are checked against
+// compose_hash before anything in them is believed, which is why none of these
+// sources has to be trusted.
+//
+// -app-compose supplies those bytes from a file instead and skips both lookups;
+// -app-id pins the app_id when the TXT record cannot be read; -base-domain overrides
+// the derived domain; -no-cloud-api leaves the guest agent as the only path (a
+// self-hosted dstack has no such API); -no-dns-discovery keeps the run to the
+// endpoint and the inputs given.
 //
 // The last step — what SHOULD be running — defaults to -releases 5: the deployment
 // matches if its compose text equals any of the newest 5 published releases, and the
@@ -269,8 +278,11 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 	gateway := fs.String("gateway", "", "cloud-TEE gateway domain (e.g. pc-gateway.example.com); selects gateway mode — verify its /evidences bundle and compare the served certificate")
 	pccsURL := fs.String("pccs-url", "", "fetch DCAP collateral (TCB Info, QE Identity, PCK CRL) from this PCCS mirror instead of api.trustedservices.intel.com (e.g. https://pccs.phala.network); the root-CA CRL still comes from Intel. Applies to whichever mode verifies a quote")
 	allowUntrustedCert := fs.Bool("allow-untrusted-cert", false, "gateway mode: proceed when the served certificate does not chain to a public root (ACME staging). Relaxes no attestation check, but drops the link between the connection and the domain asked for, so an interceptor running its own attested CVM would still pass — smoke-test your own deployment only")
-	appCompose := fs.String("app-compose", "", "gateway mode: path to the CVM's app-compose.json, checked against the compose_hash the quote binds. Its source need not be trusted — the hash anchors it. Takes precedence over the guest-agent fetch")
-	baseDomain := fs.String("base-domain", "", "gateway mode: platform base domain (e.g. in1.phala.network) to fetch app-compose.json from the guest agent of the app_id the QUOTE names. Default: derived from the served domain's CNAME chain")
+	appCompose := fs.String("app-compose", "", "gateway mode: path to the CVM's app-compose.json, checked against the compose_hash the quote binds. Its source need not be trusted — the hash anchors it. Takes precedence over both fetch paths")
+	baseDomain := fs.String("base-domain", "", "gateway mode: platform base domain (e.g. in1.phala.network) for the guest-agent fallback, `<app_id>-8090.<base-domain>`, used when the Phala Cloud lookup does not answer. Default: derived from the served domain's CNAME chain")
+	appID := fs.String("app-id", "", "gateway mode: the dstack app_id to look the app-compose up by. Default: read from the served domain's _dstack-app-address TXT record, falling back to compose_hash's first 20 bytes — which is only the app_id for an app still running the compose it was created with, so pin this if that lookup cannot be made. It only locates the bytes; the compose_hash gate is what accepts them")
+	cloudAPIBase := fs.String("cloud-api-base", evidence.DefaultCloudAPIBase, "gateway mode: Phala Cloud API root for the app-compose lookup (GET <base>/apps/<app_id>/attestations)")
+	noCloudAPI := fs.Bool("no-cloud-api", false, "gateway mode: do not ask Phala Cloud for the app-compose, leaving the guest agent as the only fetch path (a self-hosted dstack cluster, or a run that must not touch Phala's API)")
 	osImages := fs.String("os-image-allowlist", "", "gateway mode: read the expected OS-image boot-chain measurements from this file instead of the ones built into the binary (see client/evidence/osimages.json). For testing and for pinning an image before it is committed")
 	noDNSDiscovery := fs.Bool("no-dns-discovery", false, "gateway mode: do not derive the platform base domain from DNS; check only what was passed in")
 	expectComposeFile := fs.String("expect-compose-file", "", "gateway mode: path to the docker-compose manifest this deployment should be running (a digest-pinned docker-compose.release.yml), compared against the authenticated app-compose's docker_compose_file. Overrides the default -releases lookup")
@@ -305,6 +317,9 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 			allowUntrustedCert: *allowUntrustedCert,
 			appComposePath:     *appCompose,
 			baseDomain:         *baseDomain,
+			appID:              *appID,
+			cloudAPIBase:       *cloudAPIBase,
+			noCloudAPI:         *noCloudAPI,
 			noDNSDiscovery:     *noDNSDiscovery,
 			osImagesPath:       *osImages,
 			expectComposePath:  *expectComposeFile,

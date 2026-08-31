@@ -28,6 +28,9 @@ type gatewayConfig struct {
 	allowUntrustedCert bool
 	appComposePath     string
 	baseDomain         string
+	appID              string
+	cloudAPIBase       string
+	noCloudAPI         bool
 	noDNSDiscovery     bool
 	osImagesPath       string
 	expectComposePath  string
@@ -113,6 +116,9 @@ func newEvidenceChecker(ctx context.Context, out io.Writer, g gatewayConfig) (*e
 		QuoteParser:    dcap.NewQuoteParser(dcap.Config{PCCSBaseURL: g.pccsURL}),
 		Timeout:        g.timeout,
 		BaseDomain:     g.baseDomain,
+		AppID:          g.appID,
+		CloudAPIBase:   g.cloudAPIBase,
+		NoCloudAPI:     g.noCloudAPI,
 		NoDNSDiscovery: g.noDNSDiscovery,
 	}
 	if p := strings.TrimSpace(g.osImagesPath); p != "" {
@@ -406,6 +412,21 @@ func verdict(out io.Writer, failed bool, skipped string, strict bool) int {
 	return 0
 }
 
+// appIDLine renders the app_id together with where it came from.
+//
+// The provenance is not decoration. compose_hash's leading bytes are the app_id
+// only for a deployment still running the compose it was created with; when that
+// guess is wrong, the platform has no such app, so the lookup fails by TIMING OUT
+// rather than by saying anything useful. Naming the source turns that into
+// something a reader can act on — and the fetch error, when there is one, carries
+// the reason the better source did not answer (see checkCodeIdentity).
+func appIDLine(code evidence.CodeIdentity) string {
+	if code.AppIDSource == "" {
+		return code.AppID
+	}
+	return code.AppID + " (" + code.AppIDSource + ")"
+}
+
 // reportCodeIdentity prints the mr_config_id → compose_hash → app-compose →
 // docker_compose_file chain. compose_hash and app_id are printed whenever they are
 // available even if nothing else was requested: they are reproducible values an
@@ -420,7 +441,7 @@ func reportCodeIdentity(out io.Writer, code evidence.CodeIdentity, expect expect
 		return
 	}
 	fmt.Fprintf(out, "%s compose_hash       %x\n", mark(true), code.ComposeHash)
-	fmt.Fprintf(out, "  app_id           %s\n", code.AppID)
+	fmt.Fprintf(out, "  app_id           %s\n", appIDLine(code))
 
 	if code.NoSource {
 		// Discovery was switched off and no bytes were supplied, so the app-compose stage
@@ -430,7 +451,7 @@ func reportCodeIdentity(out io.Writer, code evidence.CodeIdentity, expect expect
 		// comparison never made. Say what would close the gap, next to the value it would
 		// resolve; a ✗ when the caller explicitly asked for a comparison, since they
 		// demanded one that cannot be performed without a source.
-		fmt.Fprintf(out, "%s app-compose        not checked (-no-dns-discovery; pass -app-compose or -base-domain)\n",
+		fmt.Fprintf(out, "%s app-compose        not checked (-no-dns-discovery -no-cloud-api; pass -app-compose, or -base-domain with -app-id)\n",
 			failMark(code, !code.ExpectExplicit))
 		return
 	}

@@ -91,9 +91,9 @@ gateway            pc-gateway.0g.ai
   not after        2026-11-05T14:35:22Z
 ✓ chain trust        validates for pc-gateway.0g.ai
 ✓ compose_hash       55d872aa…
-  app_id           55d872aaa9c0b148228ebcf89302a52e7cd3d252
+  app_id           08f84bbaee1e78db04d3623eb564ad486b41f7fe (_dstack-app-address TXT)
 ✓ app-compose        sha256 == compose_hash (authenticated)
-  source           55d872aaa9c0b148228ebcf89302a52e7cd3d252-8090.in1.phala.network
+  source           https://cloud-api.phala.com/api/v1/apps/08f84bba…/attestations (instance 1 of 2)
   app name         0g-pc-gateway-a-1
   allowed_envs     ZG_GATEWAY_ROUTER_URL DOMAIN GATEWAY_DOMAIN …
 ✓ compose file       matches release-2026.08.07.1 byte-for-byte
@@ -241,8 +241,12 @@ digests out of it. Then compare the embedded compose text against the
 this against the newest 5 by default and reports **which** release is live.
 
 > `mr_config_id` is part of the signed hardware report, so recovering `compose_hash`
-> needs no replay of any log and no cooperation from anyone. `app_id`, the identifier
-> the hosting platform labels the deployment by, is simply its first 20 bytes.
+> needs no replay of any log and no cooperation from anyone. `app_id` — the identifier
+> the hosting platform routes and labels the deployment by — is a *separate* value:
+> dstack derives it from the compose hash when the app is **created** and then keeps it
+> fixed across upgrades, so `compose_hash[:20]` is the app_id only until the first
+> redeploy. It is read from DNS (`_dstack-app-address`) and used only to locate the
+> manifest, never as evidence.
 
 **7. OS image.** `mr_config_id` is supplied by the (untrusted) host when the enclave is
 built, so step 6 needs one more thing to stand up: the guest OS reads its own quote at
@@ -276,7 +280,7 @@ curl -s https://<gateway-domain>/v1/gateway/identity
 ```jsonc
 {
   "instance_id": "…",             // which replica answered
-  "app_id": "55d872aa…",          // from the quote's mr_config_id
+  "app_id": "08f84bba…",          // the runtime's app_id (cvm-identity), or, absent that, compose_hash[:20]
   "compose_hash": "55d872aa…",
   "os_image": "dstack-nvidia-0.5.4.1",   // null if it matched no allowlisted image
   "matched_release": { "tag": "release-2026.08.07.1", "url": "https://github.com/…" },
@@ -506,10 +510,16 @@ learned the truth — not because the API was honest, but because SHA-256 is
 collision-resistant. This is why the manifest may come from anywhere: the platform, a
 mirror, an operator's records, or a hostile party.
 
-**DNS.** Used only to *locate* things: which platform host to ask for the manifest.
-A wrong or hijacked answer produces a failed lookup or a failed digest comparison,
-never a false pass. The deployment's identity is never taken from DNS — it comes from
-the quote.
+**DNS.** Used only to *locate* things: which `app_id` to ask about, and which platform
+host to ask. A wrong or hijacked answer produces a failed lookup or a failed digest
+comparison, never a false pass — a manifest that is not this quote's does not hash to
+this quote's `compose_hash`. The deployment's identity is never taken from DNS: what
+the CVM ran comes from the quote, and DNS only says where to find the preimage.
+
+**Which `app_id` the lookup used.** `pcverify` prints its source next to the value
+(`_dstack-app-address TXT`, `supplied`, or `compose_hash prefix`). The last is a
+fallback that holds only for an app still running the compose it was created with;
+pass `-app-id` if the record cannot be read.
 
 ---
 
@@ -668,10 +678,22 @@ them would make the whole exercise circular. In the verified body, `report_data`
 
 ```bash
 # --- 6. code identity ---
-APP=<first 20 bytes of compose_hash, as hex>    # from the verified quote
-curl -s "https://$APP-8090.<platform-base-domain>/prpc/Info" > info.json
-jq -r '.tcb_info' info.json > tcb.json
-jq -j '.app_compose' tcb.json > app-compose.json    # -j: no trailing newline
+# The app_id is the name the PLATFORM routes by. It is NOT compose_hash[:20]: dstack
+# fixes it when the app is created and keeps it across upgrades, so the two agree only
+# until the first redeploy. Read it from the record the platform itself routes this
+# domain by:
+APP=$(dig +short TXT _dstack-app-address.<domain> | tr -d '"' | cut -d: -f1)
+
+# Phala Cloud's public attestations API carries the verbatim manifest per instance.
+# Pick the instance whose app_compose hashes to the quote's compose_hash — under
+# blue/green the other one legitimately differs.
+curl -s "https://cloud-api.phala.com/api/v1/apps/$APP/attestations" > attestations.json
+jq -j '.instances[0].tcb_info.app_compose' attestations.json > app-compose.json  # -j: no trailing newline
+
+# Or, equivalently, from the CVM's own guest agent — same document, but it depends on
+# the platform routing port 8090 into this app:
+#   curl -s "https://$APP-8090.<platform-base-domain>/prpc/Info" > info.json
+#   jq -r '.tcb_info' info.json | jq -j '.app_compose' > app-compose.json
 
 # the digest must be the compose_hash the quote committed to — THIS is the step
 # that makes the bytes above trustworthy, whatever their source

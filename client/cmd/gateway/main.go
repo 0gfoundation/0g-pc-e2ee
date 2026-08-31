@@ -263,12 +263,12 @@ func main() {
 	// gateway from serving. Telemetry loses a dimension; the data path is
 	// unaffected. It is logged at Warn rather than Info so a deployment that MEANT
 	// to wire this up (deploy/phala/) and didn't sees it.
-	instanceID := ""
+	instanceID, runtimeAppID := "", ""
 	if info, source, err := loadIdentity(*identityFile, *dstackSocket); err != nil {
 		logger.Warn("dstack identity unavailable; logs and responses carry no instance dimension",
 			"source", source, "err", err)
 	} else if source != "" {
-		instanceID = info.InstanceID
+		instanceID, runtimeAppID = info.InstanceID, info.AppID
 		logger = logger.With("instance_id", info.InstanceID)
 		logger.Info("dstack identity", "source", source, "app_id", info.AppID,
 			"app_name", info.AppName, "compose_hash", info.ComposeHash)
@@ -344,6 +344,7 @@ func main() {
 		}
 		identity, stopIdentity = startIdentity(identityConfig{
 			InstanceID:     instanceID,
+			AppID:          runtimeAppID,
 			QuotePath:      quotePath,
 			AppComposePath: *appComposeFile,
 			BaseDomain:     *platformBaseDomain,

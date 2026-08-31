@@ -77,9 +77,16 @@ type Info struct {
 	// value the dstack gateway routes by in the per-instance hostname form
 	// (<instance_id>-443s.<base_domain>), so it is already public.
 	InstanceID string `json:"instance_id"`
-	// AppID is SHA-256(app-compose) TRUNCATED to 20 bytes (40 hex, which is why an
-	// app id is 40 characters and not 64) — the same value the cert-binding quote
-	// commits to, and the one that distinguishes a blue side from a green one.
+	// AppID is the platform's 20-byte (40 hex) name for the app: the address the
+	// dstack gateway routes by, and what a blue and a green side of one deployment
+	// share.
+	//
+	// It is NOT a function of the running compose. dstack derives it from the compose
+	// hash when the app is CREATED and then keeps it fixed across upgrades — with KMS
+	// it comes from the app registry — so `compose_hash[:20]` equals it only until the
+	// first redeploy. This field, read from the guest agent, is the authoritative one;
+	// anything that needs to address the app by name should carry it rather than
+	// recompute it (see evidence.DiscoverAppID for the same point from outside).
 	AppID string `json:"app_id"`
 	// AppName and ComposeHash are logged at startup for operator orientation only;
 	// they are not exported as metric labels.

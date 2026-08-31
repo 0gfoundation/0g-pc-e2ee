@@ -148,6 +148,13 @@ const (
 type identityConfig struct {
 	// InstanceID is this replica's id, already resolved at startup.
 	InstanceID string
+	// AppID is this CVM's app_id as the RUNTIME reports it (cmd/cvmid read it from the
+	// guest agent). Empty falls back to compose_hash's leading bytes, which is a guess:
+	// dstack fixes an app's id when the app is created and keeps it across upgrades, so
+	// the two agree only until the first redeploy. The difference is not cosmetic — it
+	// is the address the platform routes by, so the fallback lookup in loadAppCompose
+	// asks about an app that does not exist and hangs until its timeout.
+	AppID string
 	// QuotePath is the cert-binding quote in the evidence bundle. It is the source
 	// of app_id, compose_hash and the boot chain. Empty disables all three.
 	QuotePath string
@@ -219,7 +226,14 @@ func buildIdentity(ctx context.Context, cfg identityConfig, logger *slog.Logger)
 				logger.Warn("identity: cannot read compose_hash from this quote", "err", err)
 			} else {
 				composeHash, haveHash = hash, true
-				appID := attest.AppIDFromComposeHash(hash)
+				// The runtime's own app_id when there is one; otherwise the derivation, which
+				// holds only for an app still running the compose it was created with (see
+				// identityConfig.AppID). Both are self-reported and neither is evidence — what
+				// differs is which one a reader can look the deployment up by.
+				appID := cfg.AppID
+				if appID == "" {
+					appID = attest.AppIDFromComposeHash(hash)
+				}
 				hexHash := hex.EncodeToString(hash[:])
 				res.doc.AppID, res.doc.ComposeHash = &appID, &hexHash
 			}
@@ -394,6 +408,11 @@ func readQuoteBody(path string) (attest.QuoteBody, error) {
 // PLATFORM's gateway rather than in this CVM, which is acceptable only because
 // the caller checks these bytes against the quote's compose_hash. Neither source
 // is trusted; both are checked.
+//
+// appID is the value the document reports, which is the RUNTIME's app_id whenever
+// cmd/cvmid supplied one (see identityConfig.AppID). That matters here and nowhere
+// else in this file: it is the name the platform routes by, and the derivation from
+// compose_hash stops being that name the first time the app is upgraded.
 func loadAppCompose(ctx context.Context, cfg identityConfig, appID string) ([]byte, string, error) {
 	var errs []error
 	if cfg.AppComposePath != "" {
