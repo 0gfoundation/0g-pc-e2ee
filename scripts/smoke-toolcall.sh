@@ -129,6 +129,14 @@ post() {
 # of the file being absent (a request that never got off the ground writes none).
 excerpt() { head -c "${2:-400}" "$1" 2>/dev/null || true; }
 
+# jqr <jq args...> — read a value out of a RESPONSE body, empty on any failure.
+# Use this for anything the upstream produced. A 200 whose body is not JSON — a
+# proxy error page, a captive portal — makes plain `x=$(jq ...)` abort the entire
+# run at the assignment under `set -e`, losing the FAIL line and every check
+# after it. Reading the model catalog does not need this: that branch is gated on
+# the body already parsing.
+jqr() { jq -r "$@" 2>/dev/null || true; }
+
 # oneline <text> [bytes] — collapse whitespace to a single line. Model answers
 # arrive wrapped and often with leading blank lines, which would otherwise break
 # the indentation of everything quoted below.
@@ -166,10 +174,12 @@ echo "model    $MODEL"
 # And you cannot tell them apart by name. router-api-tee-staging.0g.ai IS a
 # gateway; production's is pc-gateway.0g.ai and the router it forwards to is
 # router-api.0g.ai. Hence a probe rather than a hostname rule: only the gateway
-# serves /v1/gateway/identity (client/cmd/gateway/identity.go). Its absence is
-# not fatal — baselining a model against the router direct is a legitimate thing
-# to want — but it must never be mistaken for a sealed run, so it is said loudly
-# here and repeated in the summary.
+# serves /v1/gateway/identity (client/cmd/gateway/identity.go).
+#
+# Its absence counts as a FAILURE, so the run exits nonzero — but it does not
+# abort: the checks below still say something useful about the model, and running
+# against the router direct is a legitimate thing to want. It just must never be
+# mistaken for a sealed run, so the summary repeats it.
 # ---------------------------------------------------------------------------
 SEALED=1
 if [ "$(curl -sS --max-time 20 -o "$WORK/identity.json" -w '%{http_code}' \
@@ -180,11 +190,12 @@ if [ "$(curl -sS --max-time 20 -o "$WORK/identity.json" -w '%{http_code}' \
 else
 	SEALED=0
 	bad "target does NOT serve /v1/gateway/identity — it is not a 0G gateway"
-	note "if this is the router (router-api*.0g.ai), the chat calls below reach the"
-	note "model but are NOT end-to-end encrypted: the gateway is what seals, and the"
-	note "router is the party it seals past. The tool checks still mean something"
-	note "about the MODEL; they mean nothing about E2EE. Point --gateway at the"
-	note "gateway domain (e.g. pc-gateway.0g.ai) for a sealed run."
+	note "if this is the router, the chat calls below reach the model but are NOT"
+	note "end-to-end encrypted: the gateway is what seals, and the router is the"
+	note "party it seals past. The tool checks still mean something about the MODEL;"
+	note "they mean nothing about E2EE. The hostname will not tell you which you"
+	note "have — router-api-tee-staging.0g.ai is a gateway — so confirm with the"
+	note "operator which domain fronts the gateway."
 fi
 echo
 
@@ -244,7 +255,14 @@ if curl -sS --max-time 30 -H "Authorization: Bearer ${ZG_API_KEY:-}" \
 			exit 2
 		fi
 
-		ok "preflight: \"$MODEL\" advertises tools and tool_choice"
+		ok "preflight: \"$MODEL\" advertises \"tools\""
+		# Reported separately because the fleet lists it separately: deepseek-v4-pro
+		# and the qwen3.x models advertise "tools" without "tool_choice", and every
+		# request below sends tool_choice:auto. Not a refusal — a provider that
+		# ignores an unsupported param still tool-calls — but it belongs on the
+		# record when a run misbehaves.
+		jq -e '(.supported_parameters // []) | index("tool_choice")' <<<"$capable" >/dev/null 2>&1 ||
+			note "note: it does NOT advertise \"tool_choice\", which these requests send as \"auto\""
 		if [ -z "$PROVIDER" ]; then
 			PROVIDER=$(jq -r '.address // ""' <<<"$capable")
 			# A listing that names no address is the reason a pin can go missing
@@ -252,7 +270,7 @@ if curl -sS --max-time 30 -H "Authorization: Bearer ${ZG_API_KEY:-}" \
 			# it was, since "no pin" alone sends you looking in the wrong place.
 			[ -n "$PROVIDER" ] ||
 				note "note: this catalog gives no address for it, so there is nothing to pin"
-			[ "$(jq -r '.is_healthy' <<<"$capable")" = true ] ||
+			[ "$(jqr '.is_healthy' <<<"$capable")" != false ] ||
 				note "warning: that provider reports is_healthy=false (staging flags go stale; a call may still work)"
 		fi
 	fi
@@ -290,19 +308,25 @@ CALL_ID=; CALL_ARGS=
 if [ "$code" != 200 ]; then
 	bad "non-streaming tool call: HTTP $code"
 	note "$(excerpt "$WORK/r1.json")"
+elif ! jq -e . "$WORK/r1.json" >/dev/null 2>&1; then
+	# A 200 carrying something that is not JSON — an intermediary's error page,
+	# a captive portal. Named for what it is: every field read below would come
+	# back empty and the run would blame the model for answering in prose.
+	bad "non-streaming tool call: HTTP 200 but the body is not JSON"
+	note "$(excerpt "$WORK/r1.json" 240)"
 else
-	name=$(jq -r '.choices[0].message.tool_calls[0].function.name // ""' "$WORK/r1.json")
-	reason=$(jq -r '.choices[0].finish_reason // ""' "$WORK/r1.json")
+	name=$(jqr '.choices[0].message.tool_calls[0].function.name // ""' "$WORK/r1.json")
+	reason=$(jqr '.choices[0].finish_reason // ""' "$WORK/r1.json")
 	if [ "$name" = get_current_weather ]; then
-		CALL_ID=$(jq -r '.choices[0].message.tool_calls[0].id // "call_1"' "$WORK/r1.json")
-		CALL_ARGS=$(jq -r '.choices[0].message.tool_calls[0].function.arguments // "{}"' "$WORK/r1.json")
+		CALL_ID=$(jqr '.choices[0].message.tool_calls[0].id // "call_1"' "$WORK/r1.json")
+		CALL_ARGS=$(jqr '.choices[0].message.tool_calls[0].function.arguments // "{}"' "$WORK/r1.json")
 		ok "non-streaming: model called get_current_weather (finish_reason=$reason)"
 		note "arguments: $CALL_ARGS"
 		[ "$reason" = tool_calls ] ||
 			note "warning: finish_reason is \"$reason\", expected \"tool_calls\""
 	else
 		bad "non-streaming: no tool call (finish_reason=$reason)"
-		note "the model answered in prose instead: $(jq -r '.choices[0].message.content // "" | .[0:160]' "$WORK/r1.json")"
+		note "the model answered in prose instead: $(oneline "$(jqr '.choices[0].message.content // ""' "$WORK/r1.json")")"
 	fi
 	# "sealed to" only when there is a gateway doing the sealing; otherwise this
 	# header is just whoever answered.
@@ -334,7 +358,7 @@ EOF
 		bad "tool result round trip: HTTP $code"
 		note "$(excerpt "$WORK/r2.json")"
 	else
-		answer=$(jq -r '.choices[0].message.content // ""' "$WORK/r2.json")
+		answer=$(jqr '.choices[0].message.content // ""' "$WORK/r2.json")
 		if printf '%s' "$answer" | grep -q 21; then
 			ok "tool result round trip: model answered from the tool output"
 			note "$(oneline "$answer")"
@@ -373,9 +397,9 @@ EOF
 			jq -c 'select(type == "object")' >"$WORK/r3.frames" 2>/dev/null || true
 
 		frames=$(wc -l <"$WORK/r3.frames" | tr -d ' ')
-		name=$(jq -rs '[.[] | .choices[0].delta.tool_calls[]? | .function.name? // empty] | first // ""' "$WORK/r3.frames")
-		args=$(jq -rs '[.[] | .choices[0].delta.tool_calls[]? | .function.arguments? // empty] | add // ""' "$WORK/r3.frames")
-		reason=$(jq -rs '[.[] | .choices[0].finish_reason? // empty] | last // ""' "$WORK/r3.frames")
+		name=$(jqr -s '[.[] | .choices[0].delta.tool_calls[]? | .function.name? // empty] | first // ""' "$WORK/r3.frames")
+		args=$(jqr -s '[.[] | .choices[0].delta.tool_calls[]? | .function.arguments? // empty] | add // ""' "$WORK/r3.frames")
+		reason=$(jqr -s '[.[] | .choices[0].finish_reason? // empty] | last // ""' "$WORK/r3.frames")
 
 		if [ "$name" = get_current_weather ]; then
 			ok "streaming: reassembled get_current_weather from $frames frames (finish_reason=$reason)"
