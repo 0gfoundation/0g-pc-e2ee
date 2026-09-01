@@ -589,3 +589,34 @@ Out of scope for v1 (tracked):
   §5.1 trade-off for high-privacy users).
 - Sender-authenticated HPKE / PSK modes.
 - A server-side freshness field in the signed proof.
+
+## 12. Where each invariant is enforced
+
+Every rule above has a side that can *prevent* a violation and a side that can
+only *detect* one, and they are not the same side. The recurring mistake this
+table exists to stop is implementing a rule where it is convenient — the sender —
+and calling it done, when the threat is a counterparty that violates it on
+purpose and the only party who can refuse is the receiver.
+
+The reading rule: **the sender's check protects a conforming implementation from
+misconfiguring itself; the receiver's check is the one that holds against a
+counterparty that is not conforming.** Where a rule protects one party from the
+other, that party's column is the load-bearing one.
+
+| Invariant | Sender must refuse to build | Receiver must refuse to accept |
+|---|---|---|
+| sealed set covers the request payload field (§5.1) | yes | **yes — enclave** (a third-party client is not obliged to check) |
+| pinned cleartext field: correct value, not sealed, not unbound (§5.1/§7.1) | yes | **yes — enclave** |
+| response sealed set covers the generated content (§7) | yes | **yes — client** (otherwise the content rides in the clear and Open still succeeds) |
+| `usage` not sealed (§7) | yes | client (loud either way: the router cannot bill) |
+| `usage` not unbound (§5.2/§7.1) | yes | **yes — client** (otherwise a rewritten count verifies) |
+| decrypted keys == declared `sealed_fields` (§5.1/§6) | by construction | **yes** |
+| no sealed/cleartext collision (§5.1) | by construction | **yes** |
+| envelope `v` / `kem_id` supported (§9) | by construction | **yes** |
+| `signer_addr` is this enclave (§4.4/§6) | client pins | **yes — enclave** |
+| final frame received (§7) | sealer emits | **yes — client** (its absence is a truncation) |
+| frame order (§7) | sealer sequence | **yes — client** (the AEAD sequence enforces it) |
+| response is sealed at all | n/a | **yes — client** (a frame with no `_e2ee` is not a sealed response) |
+
+A new rule added to this spec MUST fill in both columns explicitly, including
+when the honest entry is "cannot be checked here, and here is why".

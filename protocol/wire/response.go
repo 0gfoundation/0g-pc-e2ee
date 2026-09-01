@@ -256,12 +256,33 @@ func (rs *ResponseSealer) SealFrame(frame Response, sealedFields []string, final
 
 // ResponseOpener opens a sequence of response frames in seal order.
 type ResponseOpener struct {
-	opener *crypto.Opener
+	opener  *crypto.Opener
+	profile Profile
 }
 
 // NewResponseOpener builds the receive context from the first frame (which
 // carries enc) and the client's ephemeral private key.
 func NewResponseOpener(clientEphPriv crypto.PrivateKey, firstFrame Response) (*ResponseOpener, error) {
+	return NewResponseOpenerFor(ProfileChat, clientEphPriv, firstFrame)
+}
+
+// NewResponseOpenerFor builds the receive context and binds it to the profile
+// the client's REQUEST used, so every frame can be checked against what that
+// profile requires the response to seal.
+//
+// That check is the reason this variant exists. Without it a client cannot tell
+// a protected response from an unprotected one: an enclave may declare
+// `sealed_fields: ["created"]`, seal the timestamp, and ship `choices` in the
+// CLEAR. Open succeeds (the decrypted keys do match the declared set), the
+// content merges back exactly as the caller expects, and the §8 signature
+// verifies too — the cleartext content is inside the AAD the binding hashes. The
+// caller gets its answer, correct and complete, having no way to learn that
+// every intermediary read it. It is the response-side twin of a request whose
+// sealed set omits the prompt, and it is silent in the same way.
+func NewResponseOpenerFor(profile Profile, clientEphPriv crypto.PrivateKey, firstFrame Response) (*ResponseOpener, error) {
+	if _, err := profile.spec(); err != nil {
+		return nil, err
+	}
 	e2ee, err := firstFrame.E2EE()
 	if err != nil {
 		return nil, err
@@ -280,7 +301,7 @@ func NewResponseOpener(clientEphPriv crypto.PrivateKey, firstFrame Response) (*R
 	if err != nil {
 		return nil, err
 	}
-	return &ResponseOpener{opener: o}, nil
+	return &ResponseOpener{opener: o, profile: profile}, nil
 }
 
 // OpenFrame opens one frame and returns it reconstructed (cleartext ∪
@@ -297,6 +318,14 @@ func (ro *ResponseOpener) OpenFrame(frame Response) (Response, error) {
 	// other verification the client runs — Open, and the §8 binding, which hashes
 	// the same AAD — would still pass over a router-rewritten count.
 	if err := ValidateResponseUnboundFields(e2ee.UnboundFields); err != nil {
+		return nil, err
+	}
+	// And refuse a frame whose sealed set does not actually cover this profile's
+	// generated content — otherwise the content rides in the cleartext half and
+	// opening succeeds anyway. Per frame, not once on the first: sealed_fields is
+	// carried on every frame, so a stream could seal the content for a while and
+	// then stop.
+	if err := ValidateResponseSealedFieldsFor(ro.profile, e2ee.SealedFields); err != nil {
 		return nil, err
 	}
 	ct, err := b64.DecodeString(e2ee.Ciphertext)
@@ -351,9 +380,16 @@ func SealResponse(clientEphPub crypto.PublicKey, resp Response, sealedFields []s
 	return rs.SealFrame(resp, sealedFields, true)
 }
 
-// OpenResponse opens a complete non-streaming (single-frame) response.
+// OpenResponse opens a complete non-streaming (single-frame) chat response —
+// shorthand for OpenResponseFor(ProfileChat, …).
 func OpenResponse(clientEphPriv crypto.PrivateKey, resp Response) (Response, error) {
-	ro, err := NewResponseOpener(clientEphPriv, resp)
+	return OpenResponseFor(ProfileChat, clientEphPriv, resp)
+}
+
+// OpenResponseFor opens a complete non-streaming (single-frame) response and
+// checks it against the profile the request used (see NewResponseOpenerFor).
+func OpenResponseFor(profile Profile, clientEphPriv crypto.PrivateKey, resp Response) (Response, error) {
+	ro, err := NewResponseOpenerFor(profile, clientEphPriv, resp)
 	if err != nil {
 		return nil, err
 	}

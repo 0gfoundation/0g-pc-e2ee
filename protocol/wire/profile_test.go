@@ -351,7 +351,7 @@ func TestImageResponseSealsDataAndLeavesUsageCleartext(t *testing.T) {
 		t.Fatal("image bytes leaked into the sealed frame")
 	}
 
-	out, err := wire.OpenResponse(ephPriv, frame)
+	out, err := wire.OpenResponseFor(wire.ProfileImage, ephPriv, frame)
 	if err != nil {
 		t.Fatalf("open response: %v", err)
 	}
@@ -395,13 +395,13 @@ func TestImageResponseSurvivesRouterRewritesButDetectsUsageTampering(t *testing.
 	rewritten := seal()
 	rewritten["model"] = json.RawMessage(`"z-image"`) // router restores the alias
 	rewritten["x_0g_trace"] = json.RawMessage(`{"provider":"0xabc"}`)
-	if _, err := wire.OpenResponse(ephPriv, rewritten); err != nil {
+	if _, err := wire.OpenResponseFor(wire.ProfileImage, ephPriv, rewritten); err != nil {
 		t.Fatalf("unbound router rewrites must not break Open: %v", err)
 	}
 
 	tampered := seal()
 	tampered["usage"] = json.RawMessage(`{"output_images":99}`) // bound → must fail closed
-	if _, err := wire.OpenResponse(ephPriv, tampered); err == nil {
+	if _, err := wire.OpenResponseFor(wire.ProfileImage, ephPriv, tampered); err == nil {
 		t.Fatal("tampering with the bound usage field must fail Open")
 	}
 }
@@ -510,7 +510,7 @@ func TestOpenFrameRefusesAFrameThatFreesUsage(t *testing.T) {
 	}
 	frame[e2eeKeyForTest] = raw
 
-	if _, err := wire.OpenResponse(ephPriv, frame); err == nil {
+	if _, err := wire.OpenResponseFor(wire.ProfileImage, ephPriv, frame); err == nil {
 		t.Fatal("the client must refuse a frame declaring `usage` unbound, whoever sealed it")
 	} else if !strings.Contains(err.Error(), "usage") {
 		t.Fatalf("error should name the field, got: %v", err)
