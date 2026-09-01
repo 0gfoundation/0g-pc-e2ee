@@ -2,18 +2,26 @@
 
 How to run two gateway CVMs side by side and cut traffic between them with zero
 downtime and instant rollback. Read [`README.md`](./README.md) first — this
-document assumes its record model, the `app_id`-from-compose binding, and the
-Let's Encrypt notes.
+document assumes its record model, how a deployment is named (`app_id`) and
+measured (`compose_hash`), and the Let's Encrypt notes.
 
 ## Why blue/green here is a DNS pointer flip, not a load-balancer weight
 
-The gateway's `app_id` is `SHA-256(app-compose)` **truncated to 20 bytes** (which
-is why an app id is 40 hex characters, not 64 — `dstack-util` does
-`truncate(compose_hash, 20)`; recompute it that way or it will never match), and
-the compose embeds the gateway image **by digest**. So a new gateway build is a
-**different `app_id`** —
-a separate, separately-attested CVM (README "Pin the image digest"). That single
-fact shapes everything:
+A dstack `app_id` is 20 bytes (40 hex, not 64) and is assigned when the app is
+**created**: `dstack-util` derives it as `truncate(compose_hash, 20)` only when
+nothing else assigned one (system_setup.rs `if instance_info.app_id.is_empty()`),
+and then it is persisted for the app's life. **Deploying** a new CVM from a changed
+compose therefore gets a new `app_id`; **upgrading** an existing CVM's compose in
+place does not — it moves `compose_hash` under the same `app_id`. Each blue/green
+side is a separately created, separately attested CVM (README "Pin the image
+digest"), which is what gives the two sides distinct `app_id`s to point DNS at.
+
+> **So never upgrade a side in place to make it "the new side".** It keeps its
+> `app_id`, so the switch record still names it and the platform spreads traffic
+> across both CVMs of that id instead of holding the old side steady — a silent
+> half-cutover with no record left to flip back.
+
+That single fact shapes everything:
 
 - **dstack only spreads traffic *within one `app_id`*.** Deploy N CVMs from the
   *same* compose and dstack's gateway picks among them per connection ("when
@@ -217,13 +225,15 @@ per-side pre-switch probe ([Health-checking the standby](#health-checking-the-st
    dstack-ingress. You never hand-edit those.
 
 2. **Deploy side a and side b.** Two CVMs from [`docker-compose.yml`](./docker-compose.yml).
-   The **image digest** is what gives each side its own `app_id` (above), so the
-   two sides must be pinned to **different** gateway builds; `DELEGATION_ZONE`
+   Each side is a separately created CVM, which is what gives it its own `app_id`
+   (above); the differing **image digest** is what makes their compose hashes — and
+   so their quotes — differ, so the two sides must be pinned to **different**
+   gateway builds; `DELEGATION_ZONE`
    differs too, but only to keep their DNS records apart:
 
    | | side a (blue) | side b (green) |
    |---|---|---|
-   | gateway image digest | current build | **new build** (this is what makes it a distinct `app_id`) |
+   | gateway image digest | current build | **new build** (what makes it a distinct `compose_hash`) |
    | `DELEGATION_ZONE` | `a.integratenetwork.work` | `b.integratenetwork.work` |
    | `DNS_SETUP_MODE` | `print` | `print` |
    | `DOMAIN` | `router-api-tee.0g.ai` | `router-api-tee.0g.ai` |

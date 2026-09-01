@@ -323,16 +323,28 @@ Then DCAP-verify `quote.json` and check its `report_data` — the first 32 bytes
 Then code identity. `compose_hash` is in the verified quote's **`mr_config_id`** —
 `0x01 ‖ SHA-256(app-compose.json) ‖ zero padding` — so it is read straight out of
 the signed TD report, with no event-log replay (the `compose-hash` runtime event in
-RTMR3 carries the same value if you want a cross-check). `app_id` is its leading 20
-bytes:
+RTMR3 carries the same value if you want a cross-check).
+
+`app_id` is a **different value**. dstack assigns it when the app is *created* — from
+the app registry for a KMS-enabled app, or `truncate(compose_hash, 20)` only when
+nothing assigned one — and then keeps it across compose upgrades, so
+`compose_hash[:20]` names the app only until its first upgrade, if ever. Get this
+wrong and the platform has no such app, so the lookup does not 404: it hangs until
+your timeout. Take it from the record the platform routes this domain by:
 
 ```bash
-# app-compose.json, from the platform guest agent (public_tcbinfo defaults on).
-# APP is the app_id from the quote's mr_config_id — not one you pick.
-APP=<app_id>
-curl -s "https://$APP-8090.<cluster>.phala.network/prpc/Info" > info.json
-jq -r '.tcb_info' info.json > tcb.json
-jq -j '.app_compose' tcb.json > app-compose.json   # -j: no trailing newline
+APP=$(dig +short TXT _dstack-app-address.<DOMAIN> | tr -d '"' | cut -d: -f1)
+
+# app-compose.json from Phala Cloud's public attestations API — no API key, and no
+# dependency on port 8090 being routed into this app. Several instances is normal
+# (blue/green): take the one whose app_compose hashes to the quote's compose_hash.
+curl -s "https://cloud-api.phala.com/api/v1/apps/$APP/attestations" > attestations.json
+jq -j '.instances[0].tcb_info.app_compose' attestations.json > app-compose.json  # -j: no trailing newline
+
+# Same document from the CVM's own guest agent, when 8090 is routed (public_tcbinfo
+# defaults on):
+#   curl -s "https://$APP-8090.<cluster>.phala.network/prpc/Info" \
+#     | jq -r '.tcb_info' | jq -j '.app_compose' > app-compose.json
 
 # it must hash to the quote's compose_hash — this is what makes the bytes trustworthy
 shasum -a 256 app-compose.json
@@ -568,7 +580,8 @@ unchanged**. Smoke-test after deploying:
 ```sh
 curl -s "https://<DOMAIN>/v1/gateway/identity" | jq
 
-# the app_id it reports must be the one pcverify derives from the quote
+# the app_id it reports must be the one the platform routes by — the same value
+# pcverify prints, and the same one in _dstack-app-address
 pcverify -gateway <DOMAIN>
 ```
 

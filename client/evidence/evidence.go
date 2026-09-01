@@ -137,18 +137,33 @@ type Config struct {
 	// Its source does not need to be trusted (see VerifyAppCompose); what matters is
 	// that the bytes are verbatim, since the digest is over them.
 	AppCompose []byte
-	// BaseDomain, when set and AppCompose is nil, is the platform base domain to
-	// fetch app-compose from — e.g. "in1.phala.network", giving
+	// BaseDomain, when set and AppCompose is nil, is the platform base domain for the
+	// guest-agent fallback — e.g. "in1.phala.network", giving
 	// `<app_id>-8090.in1.phala.network` (see FetchAppCompose). Leave it empty to let
 	// Check derive it from the served domain's DNS (see DeriveBaseDomain), which is
 	// what makes `Check(domain)` alone able to do code identity.
-	//
-	// The app_id in that hostname always comes from the quote, never from a caller.
-	// That is deliberate: picking one by hand is how an operator ends up verifying
-	// the standby side of a blue/green pair while the other one serves traffic.
 	BaseDomain string
-	// NoDNSDiscovery disables deriving BaseDomain from DNS. Set it to keep the run
-	// to the endpoint and the inputs given.
+	// AppID pins the dstack app_id both app-compose lookups address. Empty is the
+	// normal case: Check discovers it from the served domain's `_dstack-app-address`
+	// TXT record (see DiscoverAppID), falling back to compose_hash's leading bytes.
+	//
+	// Supplying one cannot weaken a verification, and it is worth being explicit
+	// about why, because the opposite used to be assumed here: the app_id only
+	// LOCATES candidate bytes, and those bytes must hash to the quote's compose_hash
+	// before anything is read out of them. Pointing this at another app therefore
+	// costs a failed lookup, not a false pass — and pointing it at the wrong side of
+	// a blue/green pair cannot mislead either, because FetchAppComposeFromCloud
+	// selects the instance by digest rather than by position.
+	AppID string
+	// CloudAPIBase overrides Phala Cloud's API root for the attestations lookup.
+	// Empty uses DefaultCloudAPIBase.
+	CloudAPIBase string
+	// NoCloudAPI disables the Phala Cloud attestations lookup, leaving the guest
+	// agent as the only fetch path. Set it for a self-hosted dstack cluster, which
+	// has no such API, or to keep a run off Phala's infrastructure entirely.
+	NoCloudAPI bool
+	// NoDNSDiscovery disables the DNS lookups — the base domain and the app_id. Set
+	// it to keep the run to the endpoint and the inputs given.
 	NoDNSDiscovery bool
 	// OSImages is the allowlist of acceptable OS-image boot chains (step 7). Nil loads
 	// the embedded builtin, which is what makes the check need no configuration; pass
@@ -454,9 +469,26 @@ type Report struct {
 // nothing to compare the authenticated one to.
 type CodeIdentity struct {
 	// ComposeHash is SHA-256 of the CVM's app-compose.json, read from the verified
-	// quote's mr_config_id. AppID is its first bytes, hex — the platform's label.
+	// quote's mr_config_id.
 	ComposeHash [attest.ComposeHashLen]byte
+	// AppID is the platform's label for the app, used to LOCATE the app-compose.
+	// AppIDSource says where it came from and AppIDErr why a better source did not
+	// produce one — both belong in a report, because the three sources are not
+	// equally trustworthy as *names* (none of them is trusted as evidence):
+	//
+	//   "supplied"                 Config.AppID, the operator's own record
+	//   "_dstack-app-address TXT"  the record the platform routes this domain by
+	//   "compose_hash prefix"      a GUESS, correct only for an app still running
+	//                              the first compose it was created with
+	//
+	// The last one is why AppIDErr exists. It is what dstack derives an app_id from
+	// at creation, so it is right often enough to look reliable and wrong exactly
+	// when an app has been upgraded — and its failure mode is a hostname nothing
+	// routes, i.e. a timeout with no explanation. Saying which one was used turns
+	// that into a diagnosis. See DiscoverAppID.
 	AppID       string
+	AppIDSource string
+	AppIDErr    error
 	// HashErr is set when mr_config_id does not expose a compose hash (an
 	// unsupported dstack layout, or no quote to read it from). Everything below is
 	// then unavailable.
@@ -494,13 +526,15 @@ type CodeIdentity struct {
 	// advisory lookup — see OK.
 	ExpectExplicit bool
 
-	// Discovered reports that BaseDomain was derived from DNS rather than supplied.
-	// A failure of a discovered lookup is informational: the caller did not ask for
-	// it, so it does not fail the run (see OK).
+	// Discovered reports that the app-compose lookup ran entirely on inputs the
+	// caller did not supply — the app_id, the base domain, or both, worked out from
+	// DNS and defaults. A failure of a discovered lookup is informational: nobody
+	// asked for it, so it does not fail the run (see OK).
 	Discovered bool
 	// NoSource reports that the app-compose stage never ran because there was nothing
-	// to run it with: DNS discovery is off and neither AppCompose nor BaseDomain was
-	// given. Deliberately distinct from FetchErr — nothing was attempted, so nothing
+	// to run it with: no AppCompose, the cloud lookup off, and no base domain to
+	// reach a guest agent at (DNS discovery being off too).
+	// Deliberately distinct from FetchErr — nothing was attempted, so nothing
 	// failed — and it exists so that no later step can read the resulting zero
 	// ComposeFile / nil ExpectErr as a success.
 	NoSource bool
@@ -736,7 +770,13 @@ func (c *Checker) Check(ctx context.Context, domain string) (rep Report, err err
 // when the caller supplied the material (see CodeIdentity).
 func (c *Checker) checkCodeIdentity(ctx context.Context, rep *Report) {
 	code := &rep.Code
-	code.Requested = c.cfg.AppCompose != nil || strings.TrimSpace(c.cfg.BaseDomain) != ""
+	// Naming any of the three inputs is a caller asking for these checks, so a failure
+	// to complete them stops being advisory (see OK). AppID counts for the same reason
+	// BaseDomain does: it is an input to the lookup the caller took the trouble to
+	// pin, not a default this code chose.
+	code.Requested = c.cfg.AppCompose != nil ||
+		strings.TrimSpace(c.cfg.BaseDomain) != "" ||
+		strings.TrimSpace(c.cfg.AppID) != ""
 	code.ExpectRequested = len(c.cfg.ExpectComposeFiles) > 0
 	code.ExpectExplicit = c.cfg.ExpectComposeExplicit
 
@@ -754,41 +794,93 @@ func (c *Checker) checkCodeIdentity(ctx context.Context, rep *Report) {
 		return
 	}
 	code.ComposeHash = composeHash
-	code.AppID = attest.AppIDFromComposeHash(composeHash)
 
 	// Obtain the app-compose. A caller-supplied copy wins over fetching: it is what
 	// an operator uses to assert "this is the release I deployed", and it works when
-	// the platform endpoint is unreachable or public_tcbinfo is off.
+	// neither platform path is reachable.
 	var raw []byte
 	switch {
 	case c.cfg.AppCompose != nil:
 		raw, code.Source = c.cfg.AppCompose, "supplied"
+		// Still settle an app_id, for the report only — the bytes are already in hand,
+		// so no lookup depends on it and none is worth a DNS round trip here.
+		code.AppID, code.AppIDSource = c.appIDWithoutDNS(composeHash)
 	default:
-		baseDomain := strings.TrimSpace(c.cfg.BaseDomain)
-		if baseDomain == "" {
-			// Nothing supplied: derive the platform base domain from the served domain's
-			// DNS so `Check(domain)` alone can do code identity. Marked Discovered, so a
-			// lookup the caller never asked for cannot fail the run on its own.
-			if c.cfg.NoDNSDiscovery {
-				// Say so explicitly. Returning with every field at its zero value left
-				// ComposeFile empty and ExpectErr nil, which downstream read as "compared,
-				// matched" — two ✓ for work that never happened.
-				code.NoSource = true
-				return
-			}
-			code.Discovered = true
-			baseDomain, err = DeriveBaseDomain(ctx, rep.Domain)
+		// Nothing supplied, so every input of the lookup is discovered: a failure to
+		// reach either platform path says nothing about the deployment, and nobody
+		// asked for it (see OK). Requested — the caller naming an app_id, a base
+		// domain, or the bytes — is what turns that into a demand.
+		code.Discovered = !code.Requested
+		code.AppID, code.AppIDSource, code.AppIDErr = c.resolveAppID(ctx, rep.Domain, composeHash)
+
+		// Two paths to the same document, cloud first. It is the one that does not
+		// depend on the platform routing port 8090 into this particular CVM, and a
+		// cluster where it does not (a self-hosted dstack, an app whose port policy
+		// omits 8090) is exactly where the other one has to take over — so the order
+		// is "most likely to answer" and the fallback is not redundancy for its own
+		// sake. Both are hash-gated below; neither is trusted to be right.
+		//
+		// NoDNSDiscovery with no pinned app_id withholds the cloud lookup, because the
+		// only app_id left is compose_hash's prefix — a guess. "Check only what was
+		// passed in" has to mean not putting a guessed identifier to a platform API
+		// that was also not passed in. The guest-agent path stays available there, and
+		// still uses the guess: it needs -base-domain, which IS an input given, and
+		// that pairing is what the flag has always meant.
+		var errs []error
+		cloudUsable := !c.cfg.NoCloudAPI &&
+			(strings.TrimSpace(c.cfg.AppID) != "" || !c.cfg.NoDNSDiscovery)
+		fallbackPossible := strings.TrimSpace(c.cfg.BaseDomain) != "" || !c.cfg.NoDNSDiscovery
+		if cloudUsable {
+			base := strings.TrimSpace(c.cfg.CloudAPIBase)
+			cloudCtx, cancel := cloudLookupCtx(ctx, fallbackPossible)
+			b, instance, err := FetchAppComposeFromCloud(cloudCtx, c.http, base, code.AppID, composeHash)
+			cancel()
 			if err != nil {
-				code.FetchErr = err
-				return
+				errs = append(errs, err)
+			} else {
+				raw, code.Source = b, cloudAppComposeSource(base, code.AppID, instance)
 			}
 		}
-		// The app_id comes from the quote, never from the caller or from DNS, so this
-		// cannot be pointed at a different app's compose.
-		code.Source = appIDHost(code.AppID, baseDomain)
-		raw, err = FetchAppCompose(ctx, c.http, code.AppID, baseDomain)
-		if err != nil {
-			code.FetchErr = err
+		if raw == nil {
+			baseDomain := strings.TrimSpace(c.cfg.BaseDomain)
+			switch {
+			case baseDomain != "":
+			case c.cfg.NoDNSDiscovery:
+				// No base domain and no way to work one out. When the cloud path was off too,
+				// nothing was attempted at all — say so explicitly rather than returning with
+				// every field at its zero value, which downstream read as "compared, matched":
+				// two ✓ for work that never happened.
+				if len(errs) == 0 {
+					code.NoSource = true
+					return
+				}
+				errs = append(errs, errors.New("no guest-agent fallback: -base-domain not given and DNS discovery is off"))
+			default:
+				// Derive the platform base domain from the served domain's DNS, so
+				// `Check(domain)` alone can do code identity.
+				baseDomain, err = DeriveBaseDomain(ctx, rep.Domain)
+				if err != nil {
+					errs = append(errs, err)
+				}
+			}
+			if baseDomain != "" {
+				host := appIDHost(code.AppID, baseDomain)
+				b, err := FetchAppCompose(ctx, c.http, code.AppID, baseDomain)
+				if err != nil {
+					errs = append(errs, err)
+				} else {
+					raw, code.Source = b, host
+				}
+			}
+		}
+		if raw == nil {
+			// Every path that was tried, in one error. Reporting only the last one sent a
+			// reader after the fallback's symptom while the cloud lookup held the reason —
+			// and with a wrong app_id BOTH fail, so the app_id's provenance goes in too.
+			if code.AppIDErr != nil {
+				errs = append(errs, fmt.Errorf("app_id came from the %s: %w", code.AppIDSource, code.AppIDErr))
+			}
+			code.FetchErr = errors.Join(errs...)
 			return
 		}
 	}
@@ -804,6 +896,80 @@ func (c *Checker) checkCodeIdentity(ctx context.Context, rep *Report) {
 	if code.ExpectRequested {
 		code.MatchedExpect, code.ExpectErr = MatchCompose(code.ComposeFile, c.cfg.ExpectComposeFiles)
 	}
+}
+
+// cloudLookupCtx bounds the cloud attempt to HALF the run's remaining budget when a
+// guest-agent fallback is still available.
+//
+// The failure the split is for is a HANG, not a refusal. A 404 or a connection reset
+// costs nothing and the fallback runs immediately; a request that never answers —
+// a firewall blackholing the API on a network that has no business reaching Phala at
+// all, which is exactly the self-hosted case the fallback exists for — would
+// otherwise burn the whole deadline and leave the path that would have worked with
+// no time to run in. Halving is deliberately crude: the point is that neither path
+// can starve the other, not that the division is optimal.
+//
+// With no deadline on ctx there is nothing to divide, and the HTTP client's own
+// timeout is the bound; with no fallback to protect, the cloud attempt is welcome to
+// the whole budget.
+func cloudLookupCtx(ctx context.Context, fallbackPossible bool) (context.Context, context.CancelFunc) {
+	deadline, ok := ctx.Deadline()
+	if !ok || !fallbackPossible {
+		return context.WithCancel(ctx)
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return context.WithCancel(ctx)
+	}
+	return context.WithTimeout(ctx, remaining/2)
+}
+
+// The three values CodeIdentity.AppIDSource can hold. They are strings rather than
+// an enum because their only consumer is a report line, and a reader of that line
+// needs the words, not a constant.
+const (
+	appIDFromConfig      = "supplied"
+	appIDFromDNS         = appAddressPrefix + " TXT"
+	appIDFromComposeHash = "compose_hash prefix"
+)
+
+// resolveAppID settles which app_id the lookups address, preferring the most
+// specific source available: what the caller pinned, then the record the platform
+// itself routes this domain by, then compose_hash's leading bytes.
+//
+// The last is a fallback rather than the rule, and the returned error says so when
+// it is used. It is what dstack derives an app_id from when an app is CREATED, so it
+// holds for a deployment still on its first compose and silently stops holding after
+// the first upgrade — see DiscoverAppID for why that mattered enough to reorder this.
+func (c *Checker) resolveAppID(
+	ctx context.Context,
+	domain string,
+	composeHash [attest.ComposeHashLen]byte,
+) (id, source string, err error) {
+	if pinned := normalizeAppID(c.cfg.AppID); pinned != "" {
+		return pinned, appIDFromConfig, nil
+	}
+	if c.cfg.NoDNSDiscovery {
+		err = errors.New("DNS discovery is off")
+	} else {
+		discovered, dnsErr := DiscoverAppID(ctx, domain)
+		if dnsErr == nil {
+			return discovered, appIDFromDNS, nil
+		}
+		err = dnsErr
+	}
+	return attest.AppIDFromComposeHash(composeHash), appIDFromComposeHash, err
+}
+
+// appIDWithoutDNS is resolveAppID for the path that already holds the app-compose
+// bytes: the app_id is then reported and nothing more, so it is not worth a DNS
+// round trip — and a lookup performed only to print a value would fail runs that
+// have nothing left to look up.
+func (c *Checker) appIDWithoutDNS(composeHash [attest.ComposeHashLen]byte) (id, source string) {
+	if pinned := normalizeAppID(c.cfg.AppID); pinned != "" {
+		return pinned, appIDFromConfig
+	}
+	return attest.AppIDFromComposeHash(composeHash), appIDFromComposeHash
 }
 
 // requireEntries confirms the manifest covers the files this check depends on. A

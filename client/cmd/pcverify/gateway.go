@@ -28,6 +28,9 @@ type gatewayConfig struct {
 	allowUntrustedCert bool
 	appComposePath     string
 	baseDomain         string
+	appID              string
+	cloudAPIBase       string
+	noCloudAPI         bool
 	noDNSDiscovery     bool
 	osImagesPath       string
 	expectComposePath  string
@@ -113,6 +116,9 @@ func newEvidenceChecker(ctx context.Context, out io.Writer, g gatewayConfig) (*e
 		QuoteParser:    dcap.NewQuoteParser(dcap.Config{PCCSBaseURL: g.pccsURL}),
 		Timeout:        g.timeout,
 		BaseDomain:     g.baseDomain,
+		AppID:          g.appID,
+		CloudAPIBase:   g.cloudAPIBase,
+		NoCloudAPI:     g.noCloudAPI,
 		NoDNSDiscovery: g.noDNSDiscovery,
 	}
 	if p := strings.TrimSpace(g.osImagesPath); p != "" {
@@ -406,6 +412,45 @@ func verdict(out io.Writer, failed bool, skipped string, strict bool) int {
 	return 0
 }
 
+// appIDLine renders the app_id together with where it came from.
+//
+// The provenance is not decoration. compose_hash's leading bytes are the app_id
+// only for a deployment still running the compose it was created with; when that
+// guess is wrong, the platform has no such app, so the lookup fails by TIMING OUT
+// rather than by saying anything useful. Naming the source turns that into
+// something a reader can act on — and the fetch error, when there is one, carries
+// the reason the better source did not answer (see checkCodeIdentity).
+func appIDLine(code evidence.CodeIdentity) string {
+	if code.AppIDSource == "" {
+		return code.AppID
+	}
+	return code.AppID + " (" + code.AppIDSource + ")"
+}
+
+// The columns a code-identity line's value starts at. codeValueIndent is a checked
+// line ("✓ app-compose        "); appIDValueIndent is a sub-value line
+// ("  app_id           "). Kept beside the Fprintf calls that produce them, because
+// they are those format strings' widths.
+const (
+	codeValueIndent  = "                     "
+	appIDValueIndent = "                   "
+)
+
+// alignErr renders a multi-line error under the checked-line value column instead of
+// against the left margin.
+//
+// The app-compose lookup reports errors.Join over every path it tried — the cloud
+// API, the guest agent, and where the app_id came from — and a joined error's text is
+// one line per cause. Printed raw, the second and third causes fall outside the column
+// and the report stops being scannable exactly when it has the most to say. This does
+// not shorten or reorder anything: every cause is still printed.
+func alignErr(err error) string { return alignAt(codeValueIndent, err.Error()) }
+
+// alignAt indents every line of s after the first to the given column.
+func alignAt(indent, s string) string {
+	return strings.ReplaceAll(s, "\n", "\n"+indent)
+}
+
 // reportCodeIdentity prints the mr_config_id → compose_hash → app-compose →
 // docker_compose_file chain. compose_hash and app_id are printed whenever they are
 // available even if nothing else was requested: they are reproducible values an
@@ -420,7 +465,17 @@ func reportCodeIdentity(out io.Writer, code evidence.CodeIdentity, expect expect
 		return
 	}
 	fmt.Fprintf(out, "%s compose_hash       %x\n", mark(true), code.ComposeHash)
-	fmt.Fprintf(out, "  app_id           %s\n", code.AppID)
+	fmt.Fprintf(out, "  app_id           %s\n", appIDLine(code))
+	// Why the guess was used, said HERE rather than only inside a later fetch error.
+	// The fallback is silent by nature — it produces a plausible-looking 40-hex value
+	// — so without this line a reader who sees the wrong app_id has nothing to act on,
+	// and a resolver that cannot answer this query looks identical to a deployment
+	// that publishes no record. AppIDErr is set only when a better source was tried
+	// and did not produce one.
+	if code.AppIDErr != nil {
+		fmt.Fprintf(out, "%s%s\n", appIDValueIndent, alignAt(appIDValueIndent, code.AppIDErr.Error()))
+		fmt.Fprintf(out, "%spass -app-id to pin it\n", appIDValueIndent)
+	}
 
 	if code.NoSource {
 		// Discovery was switched off and no bytes were supplied, so the app-compose stage
@@ -430,7 +485,7 @@ func reportCodeIdentity(out io.Writer, code evidence.CodeIdentity, expect expect
 		// comparison never made. Say what would close the gap, next to the value it would
 		// resolve; a ✗ when the caller explicitly asked for a comparison, since they
 		// demanded one that cannot be performed without a source.
-		fmt.Fprintf(out, "%s app-compose        not checked (-no-dns-discovery; pass -app-compose or -base-domain)\n",
+		fmt.Fprintf(out, "%s app-compose        not checked (-no-dns-discovery -no-cloud-api; pass -app-compose, or -base-domain with -app-id)\n",
 			failMark(code, !code.ExpectExplicit))
 		return
 	}
@@ -438,10 +493,10 @@ func reportCodeIdentity(out io.Writer, code evidence.CodeIdentity, expect expect
 	case code.FetchErr != nil:
 		// A lookup nobody asked for is a "-", not a "✗": DNS or the platform endpoint
 		// being unavailable says nothing about the deployment.
-		fmt.Fprintf(out, "%s app-compose        %v\n", failMark(code, code.Discovered), code.FetchErr)
+		fmt.Fprintf(out, "%s app-compose        %v\n", failMark(code, code.Discovered), alignErr(code.FetchErr))
 		return
 	case code.BoundErr != nil:
-		fmt.Fprintf(out, "%s app-compose        %v\n", mark(false), code.BoundErr)
+		fmt.Fprintf(out, "%s app-compose        %v\n", mark(false), alignErr(code.BoundErr))
 		if code.Source != "" {
 			fmt.Fprintf(out, "  source           %s\n", code.Source)
 		}

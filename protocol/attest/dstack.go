@@ -197,13 +197,25 @@ func ComposeHashFromMRConfigID(mrConfigID [mrConfigIDLen]byte) ([ComposeHashLen]
 	return out, nil
 }
 
-// AppIDLen is the length of a dstack app_id: the leading bytes of compose_hash.
+// AppIDLen is the length of a dstack app_id in bytes.
 const AppIDLen = 20
 
-// AppIDFromComposeHash derives the dstack `app_id` — the first AppIDLen bytes of
-// compose_hash, hex-encoded (dstack's own `short(&hash, 40)`). It is the name the
-// platform routes and labels by, so it is what an operator recognises; the full
-// compose_hash is the stronger value and is what verification should compare.
+// AppIDFromComposeHash returns the first AppIDLen bytes of compose_hash, hex-encoded
+// (dstack's own `short(&hash, 40)`).
+//
+// **This is dstack's FALLBACK for naming an app, not what an app's app_id is.** The
+// guest derives an id this way only when nothing assigned one (dstack-util
+// system_setup.rs, `if instance_info.app_id.is_empty()`); a KMS-enabled app is given
+// its id by the registry at creation. Either way the id is then persisted and the
+// app keeps it across compose upgrades, so this derivation equals the real app_id
+// only for a deployment that derived its own and still runs the compose it derived
+// it from — and silently stops equalling it after the first upgrade. Use it to LABEL a compose hash, never to
+// address a deployment: a lookup keyed on a stale guess asks the platform about an
+// app that does not exist, which fails by hanging rather than by answering.
+// evidence.DiscoverAppID reads the real one, and dstack.Info carries it inside a CVM.
+//
+// The full compose_hash is the stronger value either way, and is what verification
+// compares.
 func AppIDFromComposeHash(composeHash [ComposeHashLen]byte) string {
 	return hex.EncodeToString(composeHash[:AppIDLen])
 }

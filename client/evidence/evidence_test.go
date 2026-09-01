@@ -320,8 +320,17 @@ func (f *fixture) checker(t *testing.T, cfg Config) *Checker {
 	}
 	// testDomain does not resolve, so leave DNS discovery off unless a test asks for
 	// it: otherwise every case would pay a failing lookup and depend on the resolver.
-	if cfg.AppCompose == nil && cfg.BaseDomain == "" && !f.wantDNSDiscovery {
+	// This covers the app_id lookup as well as the base-domain one, which is why it no
+	// longer depends on BaseDomain being unset — a test that supplies a base domain
+	// still resolves an app_id, and would reach the real resolver for it.
+	if !f.wantDNSDiscovery {
 		cfg.NoDNSDiscovery = true
+	}
+	// Likewise for the Phala Cloud lookup, which would otherwise reach the real API
+	// from a unit test. A test that exercises it points CloudAPIBase at an httptest
+	// server, which opts back in.
+	if cfg.CloudAPIBase == "" {
+		cfg.NoCloudAPI = true
 	}
 	c, err := New(cfg)
 	if err != nil {

@@ -8,9 +8,16 @@
 # containers ride along: `cvm-identity`, a one-shot init container naming this
 # replica, and `prometheus-agent`.
 #
-# EVERY byte below is measured into compose_hash (and so into app_id, its 20-byte
-# prefix) — images, volumes, depends_on, env blocks. Editing this file, comments
-# included, changes app_id.
+# EVERY byte below is measured into compose_hash — images, volumes, depends_on, env
+# blocks. Editing this file, comments included, changes compose_hash, and so the
+# mr_config_id every quote from this CVM commits to.
+#
+# It does NOT change app_id. dstack assigns an app its id when the app is CREATED and
+# then keeps it for the app's life (dstack-util system_setup.rs: the derivation
+# `truncate(compose_hash, 20)` runs only when nothing assigned one, which for a
+# KMS-enabled app on Phala Cloud is never). So an in-place compose update moves
+# compose_hash under a fixed app_id, and `compose_hash[:20]` is this deployment's
+# app_id only until its first upgrade — do not compute one from the other.
 #
 # What the attestation proves, how to check it, and the rationale behind the
 # settings here:

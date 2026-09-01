@@ -539,3 +539,82 @@ func TestReportCodeIdentity_NeverMarksWorkThatDidNotHappen(t *testing.T) {
 		})
 	}
 }
+
+// The app_id line must say where the value came from. Its three sources are not
+// equally reliable, and the weakest one — compose_hash's prefix — fails by TIMING
+// OUT rather than by saying anything, so the report is the only place a reader can
+// learn that a guess was used.
+func TestReportGateway_AppIDCarriesItsSource(t *testing.T) {
+	cases := map[string]struct {
+		code evidence.CodeIdentity
+		want string
+	}{
+		"discovered": {
+			evidence.CodeIdentity{AppID: "08f84bba", AppIDSource: "_dstack-app-address TXT"},
+			"08f84bba (_dstack-app-address TXT)",
+		},
+		"supplied": {
+			evidence.CodeIdentity{AppID: "08f84bba", AppIDSource: "supplied"},
+			"08f84bba (supplied)",
+		},
+		"guessed": {
+			evidence.CodeIdentity{AppID: "dd79782d", AppIDSource: "compose_hash prefix"},
+			"dd79782d (compose_hash prefix)",
+		},
+		// Nothing settled it (an older report, or a run that never got that far): print
+		// the value alone rather than an empty parenthesis.
+		"no source": {
+			evidence.CodeIdentity{AppID: "dd79782d"},
+			"dd79782d",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			rep := passing()
+			tc.code.Requested = true
+			tc.code.Source = rep.Code.Source
+			tc.code.ExpectRequested, tc.code.MatchedExpect = true, rep.Code.MatchedExpect
+			rep.Code = tc.code
+
+			var out strings.Builder
+			reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", false, false, expectSource{})
+			if want := "app_id           " + tc.want + "\n"; !strings.Contains(out.String(), want) {
+				t.Errorf("output does not contain %q:\n%s", want, out.String())
+			}
+		})
+	}
+}
+
+// When the app_id came from the guess, the report must say WHY the better source did
+// not answer. Without it a wrong app_id and an unreachable resolver look identical:
+// both print a plausible 40-hex value and nothing else.
+func TestReportGateway_AppIDFallbackExplainsItself(t *testing.T) {
+	rep := passing()
+	rep.Code.AppID = "dd79782d9cd5b8243acf468896d4cc81907b1ae8"
+	rep.Code.AppIDSource = "compose_hash prefix"
+	rep.Code.AppIDErr = errors.New("no usable _dstack-app-address record for gw.example.com: " +
+		"_dstack-app-address.gw.example.com: lookup: server misbehaving")
+
+	var out strings.Builder
+	reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", false, false, expectSource{})
+	got := out.String()
+	for _, want := range []string{"(compose_hash prefix)", "server misbehaving", "pass -app-id to pin it"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output does not contain %q:\n%s", want, got)
+		}
+	}
+}
+
+// A discovered or supplied app_id has nothing to explain, and the extra lines would
+// be noise on every healthy run.
+func TestReportGateway_NoFallbackNoteWhenDiscovered(t *testing.T) {
+	rep := passing()
+	rep.Code.AppID = "08f84bbaee1e78db04d3623eb564ad486b41f7fe"
+	rep.Code.AppIDSource = "_dstack-app-address TXT"
+
+	var out strings.Builder
+	reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", false, false, expectSource{})
+	if strings.Contains(out.String(), "pass -app-id") {
+		t.Errorf("a healthy run carries the fallback hint:\n%s", out.String())
+	}
+}
