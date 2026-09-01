@@ -211,10 +211,21 @@ field** — the field a sealed envelope of that family MUST cover — plus the v
 defaults. (Distinct from the *signature* profile of §8/§9, which versions the
 signed-text format.)
 
-| Profile | Endpoint | Payload field (required) | Default request sealed set | Default response sealed set |
-|---|---|---|---|---|
-| `chat`  | `/v1/chat/completions` | `messages` | `messages`, `tools` | `choices` |
-| `image` | `/v1/images/generations` | `prompt` | `prompt` | `data` |
+| Profile | Endpoint | Payload field (required) | Pinned cleartext field | Default request sealed set | Default response sealed set |
+|---|---|---|---|---|---|
+| `chat`  | `/v1/chat/completions` | `messages` | — | `messages`, `tools` | `choices` |
+| `image` | `/v1/images/generations` | `prompt` | `response_format` = `b64_json` (§7.1) | `prompt` | `data` |
+
+A **pinned cleartext field** is one that stays readable but may hold only one
+value in a sealed request, because the other values direct the server to publish
+the *result* outside the sealed channel. Sealing the payload does not cover this
+— see §7.1 for the image case and why the field is required rather than
+defaulted.
+
+Whatever a profile seals, a response frame MUST leave `usage` and `model`
+cleartext: the router reads them without a key to bill and attribute, so sealing
+one makes the response unbillable rather than merely private. They stay bound
+(§5.2), so tampering is still caught at verify.
 
 A request profile is **not carried on the wire and is not a version**: the
 envelope format, crypto suite, AAD rule and §8 binding are identical across
@@ -380,11 +391,27 @@ Two constraints are specific to this profile:
   read ambiguously. The `input_`/`output_` prefixes are OpenAI's own convention
   in this object. Any token fields the model reports are preserved alongside it;
   only `output_images` is written by the enclave.
-- **`response_format: "url"` MUST be rejected for a sealed request.** URL mode
+- **A sealed image request MUST carry an explicit `response_format: "b64_json"`.**
+  Not "must not be `url`" — **must be present and must be `b64_json`**. URL mode
   has the enclave persist the images and serve them from a plain URL, which puts
-  the plaintext images outside the sealed channel and defeats the profile. A
-  sealed image request MUST be served as `b64_json` inside `data`, or rejected
-  fail-closed — never silently downgraded.
+  the plaintext images (the generated content itself, a worse leak than the
+  prompt) outside the sealed channel and defeats the profile.
+
+  The field is **required, not defaulted**, because the default is the leak:
+  OpenAI's `response_format` defaults to **`url`** for the DALL·E family (only
+  `gpt-image-1` always returns `b64_json`). So an omitted field is a request to
+  publish the images in the clear, spelled as silence — a rule phrased as "reject
+  `url`" would let it through while looking correct.
+
+  A client MUST refuse to seal a request that violates this, at seal time,
+  before any ciphertext exists (`wire.SealRequestFor` does). An enclave MUST
+  reject one it receives, rather than silently downgrading to `b64_json` — the
+  caller asked for a format this mode cannot honour and has to learn that.
+
+  The general rule this instantiates: **a cleartext field that directs the server
+  to publish the RESULT outside the sealed channel is part of the profile's
+  contract**, and sealing the payload is not sufficient on its own. A future
+  profile that gains such a field must pin it the same way.
 
 **Client open:** `SetupBaseR(resp_enc, eph_priv, info="0g-pc/v1/resp")`, then
 `Open` each frame **in order** (fail-closed), merge the decrypted `choices` back

@@ -98,6 +98,130 @@ func TestImageProfileRejectsSealedSetWithoutPrompt(t *testing.T) {
 	}
 }
 
+// Sealing the prompt is not enough on its own: `response_format: "url"` tells
+// the enclave to publish the GENERATED IMAGES from a plain URL, outside the
+// sealed channel — a worse leak than the prompt. The check is at seal time, so
+// such a request is never built.
+//
+// Omitting the field is rejected too, and that is the case that matters: OpenAI's
+// own default for the DALL·E family is "url", so silence is a request to leak.
+func TestImageProfileRequiresExplicitB64ResponseFormat(t *testing.T) {
+	_, pub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	_, ephPub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatalf("eph keygen: %v", err)
+	}
+	seal := func(t *testing.T, body string) error {
+		t.Helper()
+		_, err := wire.SealRequestFor(wire.ProfileImage, pub, mustReq(t, body), nil, testProvider, ephPub)
+		return err
+	}
+
+	tests := []struct {
+		name    string
+		body    string
+		wantErr bool
+	}{
+		{
+			"explicit b64_json is the only accepted value",
+			`{"model":"z-image","response_format":"b64_json","prompt":"p"}`,
+			false,
+		},
+		{
+			"explicit url is rejected",
+			`{"model":"z-image","response_format":"url","prompt":"p"}`,
+			true,
+		},
+		{
+			"OMITTED is rejected — the server default is url, so silence leaks",
+			`{"model":"z-image","prompt":"p"}`,
+			true,
+		},
+		{
+			"null is rejected like any other non-b64_json value",
+			`{"model":"z-image","response_format":null,"prompt":"p"}`,
+			true,
+		},
+		{
+			"a non-string value is rejected rather than coerced",
+			`{"model":"z-image","response_format":1,"prompt":"p"}`,
+			true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := seal(t, tt.body)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("expected the seal to be refused")
+				}
+				if !strings.Contains(err.Error(), "response_format") {
+					t.Fatalf("error should name the offending field, got: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("seal: %v", err)
+			}
+		})
+	}
+}
+
+// The pin is image-only: a chat request has no response_format constraint, and
+// a chat request that happens to carry one is not second-guessed.
+func TestChatProfileHasNoResponseFormatPin(t *testing.T) {
+	_, pub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	_, ephPub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatalf("eph keygen: %v", err)
+	}
+	body := `{"model":"gpt-4o","response_format":{"type":"json_object"},"messages":[{"role":"user","content":"hi"}]}`
+	if _, err := wire.SealRequestFor(wire.ProfileChat, pub, mustReq(t, body), []string{"messages"}, testProvider, ephPub); err != nil {
+		t.Fatalf("a chat request's own response_format must pass through untouched: %v", err)
+	}
+}
+
+// The response sealed set may not swallow a field the router reads without a
+// key — sealing `usage` makes the response unbillable (and for image, hides
+// usage.output_images, the only count the router has).
+func TestResponseSealedFieldsMustLeaveRouterInputsCleartext(t *testing.T) {
+	_, ephPub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	rs, err := wire.NewResponseSealer(ephPub)
+	if err != nil {
+		t.Fatalf("response sealer: %v", err)
+	}
+	frame := wire.Response{
+		"choices": json.RawMessage(`[]`),
+		"usage":   json.RawMessage(`{"output_images":1}`),
+	}
+	if _, err := rs.SealFrame(frame, []string{"choices", "usage"}, true); err == nil {
+		t.Fatal("sealing `usage` must be refused — the router bills on it without a key")
+	}
+
+	// And the profile-aware check additionally requires the generated content.
+	if err := wire.ValidateResponseSealedFieldsFor(wire.ProfileImage, []string{"choices"}); err == nil {
+		t.Error("an image response sealed set that omits `data` must be refused")
+	}
+	if err := wire.ValidateResponseSealedFieldsFor(wire.ProfileImage, []string{"data"}); err != nil {
+		t.Errorf("the image default must satisfy its own profile check: %v", err)
+	}
+	if err := wire.ValidateResponseSealedFieldsFor(wire.ProfileChat, []string{"choices"}); err != nil {
+		t.Errorf("the chat default must satisfy its own profile check: %v", err)
+	}
+	if err := wire.ValidateResponseSealedFieldsFor("audio", []string{"data"}); err == nil {
+		t.Error("an unknown profile must be rejected")
+	}
+}
+
 // Each profile requires its OWN payload field: a chat set does not satisfy the
 // image profile and vice versa, so a caller cannot pass the wrong profile and
 // still get an envelope.

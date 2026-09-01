@@ -56,8 +56,21 @@ func DefaultResponseSealedFieldsFor(p Profile) []string {
 // (SPEC §7) when a caller passes nil: the chat profile's generated content.
 func defaultResponseSealedFields() []string { return DefaultResponseSealedFieldsFor(ProfileChat) }
 
-// validateResponseSealedFields requires a non-empty set with no duplicates.
-// Unlike the request there is no single mandatory field pinned in v1.
+// mustStayCleartextInResponse are response fields a sealed frame MUST NOT seal,
+// whatever the profile: the router reads them WITHOUT a key to bill and to
+// attribute the response, so sealing one does not merely inconvenience it — it
+// makes the response unbillable (SPEC §7). They stay readable but bound, so
+// tampering is still caught at verify.
+//
+// This is a floor for every profile rather than a per-profile list because the
+// reason is the same everywhere: the router's inputs. `usage` covers both the
+// chat token counts and the image `usage.output_images` (§7.1).
+var mustStayCleartextInResponse = []string{"usage", "model"}
+
+// validateResponseSealedFields requires a non-empty set with no duplicates, and
+// no field the router must be able to read. Unlike the request there is no
+// single mandatory field pinned in v1 — profiles differ in WHAT they seal, but
+// agree on what they may not.
 func validateResponseSealedFields(fields []string) error {
 	if len(fields) == 0 {
 		return fmt.Errorf("no sealed fields")
@@ -70,10 +83,38 @@ func validateResponseSealedFields(fields []string) error {
 		if f == e2eeKey {
 			return fmt.Errorf("%q is reserved and cannot be a sealed field", e2eeKey)
 		}
+		if slices.Contains(mustStayCleartextInResponse, f) {
+			return fmt.Errorf("%q must stay cleartext so the router can bill and attribute without decrypting", f)
+		}
 		if _, dup := seen[f]; dup {
 			return fmt.Errorf("duplicate sealed field %q", f)
 		}
 		seen[f] = struct{}{}
+	}
+	return nil
+}
+
+// ValidateResponseSealedFieldsFor checks a response sealed set against a
+// profile: the shared invariants above, plus that it actually covers the
+// profile's generated content ("choices" for chat, "data" for image) rather than
+// sealing something incidental and shipping the content in the clear.
+//
+// It is the response-side counterpart of ValidateSealedFieldsFor. SealFrame
+// applies only the profile-independent invariants, since a caller may legitimately
+// seal a superset; an enclave that knows which endpoint it serves SHOULD call
+// this to check its own configuration fail-closed.
+func ValidateResponseSealedFieldsFor(p Profile, fields []string) error {
+	spec, err := p.spec()
+	if err != nil {
+		return err
+	}
+	if err := validateResponseSealedFields(fields); err != nil {
+		return err
+	}
+	for _, required := range spec.response {
+		if !slices.Contains(fields, required) {
+			return fmt.Errorf("%s-profile response sealed fields must include %q", p, required)
+		}
 	}
 	return nil
 }

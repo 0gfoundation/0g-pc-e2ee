@@ -38,6 +38,9 @@ const (
 	fieldMessages = "messages"
 	// fieldPrompt is the sensitive field an image request MUST always seal.
 	fieldPrompt = "prompt"
+	// fieldResponseFormat is the cleartext image field pinned to "b64_json"
+	// (SPEC §7.1) — see profileSpec.pinnedCleartext.
+	fieldResponseFormat = "response_format"
 	// clientEphPubLen is the byte length of an X25519 public key — the client's
 	// response ephemeral key (SPEC §3 suite).
 	clientEphPubLen = 32
@@ -66,12 +69,18 @@ const (
 	ProfileImage Profile = "image"
 )
 
-// profileSpec fixes, per profile, the field that MUST be sealed and the v1
-// default sealed sets for a request and for the response it produces.
+// profileSpec fixes, per profile, the field that MUST be sealed, any CLEARTEXT
+// field pinned to a specific value, and the v1 default sealed sets for a request
+// and for the response it produces.
 type profileSpec struct {
 	required string   // the field a sealed envelope of this profile MUST cover
 	request  []string // v1 default request sealed set (§5.1)
 	response []string // v1 default response sealed set (§7)
+	// pinnedCleartext maps a cleartext field to the ONLY value a sealed request
+	// of this profile may carry. The field must be present — an absent one is
+	// rejected, never defaulted — because a server-side default is exactly what
+	// this guards against (§7.1). Empty for profiles with no such constraint.
+	pinnedCleartext map[string]string
 }
 
 var profiles = map[Profile]profileSpec{
@@ -89,7 +98,36 @@ var profiles = map[Profile]profileSpec{
 		required: fieldPrompt,
 		request:  []string{"prompt"},
 		response: []string{"data"},
+		// response_format must be an EXPLICIT "b64_json" (§7.1). "url" has the
+		// enclave persist the images and serve them from a plain URL, outside
+		// the sealed channel — a worse leak than the prompt, since it is the
+		// generated content itself. Requiring the field rather than merely
+		// banning "url" is the point: OpenAI's own default for the DALL·E
+		// family IS "url", so an omitted field is a request to leak, spelled
+		// as silence.
+		pinnedCleartext: map[string]string{fieldResponseFormat: "b64_json"},
 	},
+}
+
+// validatePinnedCleartext enforces spec.pinnedCleartext against the request's
+// cleartext fields (§5.1 profiles). It runs at seal time, before any ciphertext
+// exists, so a request that would have leaked is never built — the same reason
+// the sealed-set check lives here rather than only in the enclave.
+func validatePinnedCleartext(spec profileSpec, req Request) error {
+	for field, want := range spec.pinnedCleartext {
+		raw, ok := req[field]
+		if !ok {
+			return fmt.Errorf("sealed request must set %q to %q explicitly (an absent value takes the server's default, which may not be %q)", field, want, want)
+		}
+		var got string
+		if err := json.Unmarshal(raw, &got); err != nil {
+			return fmt.Errorf("sealed request field %q must be the JSON string %q: %w", field, want, err)
+		}
+		if got != want {
+			return fmt.Errorf("sealed request field %q must be %q, got %q", field, want, got)
+		}
+	}
+	return nil
 }
 
 func (p Profile) spec() (profileSpec, error) {
@@ -271,13 +309,20 @@ func SealRequest(encPub crypto.PublicKey, req Request, sealedFields []string, si
 //   - unboundFields: optional cleartext fields excluded from the AAD (§5.2), i.e.
 //     ones an intermediary may add/modify. Empty (the default) binds everything.
 func SealRequestFor(profile Profile, encPub crypto.PublicKey, req Request, sealedFields []string, signerAddr string, clientEphPub []byte, unboundFields ...string) (Request, error) {
-	if _, err := profile.spec(); err != nil {
+	spec, err := profile.spec()
+	if err != nil {
 		return nil, err
 	}
 	if sealedFields == nil {
 		sealedFields = DefaultSealedFieldsFor(profile)
 	}
 	if err := ValidateSealedFieldsFor(profile, sealedFields); err != nil {
+		return nil, err
+	}
+	// Sealing the payload is not enough on its own: a cleartext field can direct
+	// the server to publish the RESULT outside the sealed channel (§7.1). Check
+	// those before building anything.
+	if err := validatePinnedCleartext(spec, req); err != nil {
 		return nil, err
 	}
 	if err := ValidateUnboundFields(unboundFields, sealedFields); err != nil {
