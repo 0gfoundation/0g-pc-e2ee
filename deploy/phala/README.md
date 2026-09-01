@@ -127,11 +127,47 @@ explain:
 
 ## Deploy
 
-Reference [`docker-compose.yml`](./docker-compose.yml) from the Phala Cloud
-dashboard, or via the CLI, passing the environment above:
+Use [`deploy.sh`](./deploy.sh). It takes the attested artifact (a release's
+digest-pinned `docker-compose.release.yml`), refuses to deploy an unpinned one,
+reads back the DNS records whose absence fails silently, hands the CLI an env
+file instead of an argv full of secrets, and then waits on `/readyz` — reaching
+the new CVM **by app-id**, before any traffic points at it:
 
 ```sh
-phala cvm create --compose deploy/phala/docker-compose.yml
+cp deploy.env.example deploy.env   # once: tokens, cluster, CVM shape
+./deploy.sh preflight --side b     # checks only, changes nothing
+./deploy.sh deploy --side b --release latest
+```
+
+It never moves traffic; [`switch.sh`](./switch.sh) does that, as a separate
+decision (see [`blue-green.md`](./blue-green.md) for the order the two run in,
+which is not the obvious one — issuance is aimed at a side *before* that side is
+built).
+
+Every choice the dashboard's form would ask for is an input to `app_id`: the CVM
+**name**, `allowed_envs`, and the `public_logs` / `public_sysinfo` /
+`public_tcbinfo` / `secure_time` flags all live in the measured app-compose. The
+name catches people out — it looks like a label, but app-compose has a `name`
+field and `app_id` is that manifest's hash, so `pcverify` prints it as `app name`
+and changing it is a new `app_id`, not a rename. `deploy.sh` names a CVM
+`0g-pc-gateway-<ZG_PROM_ENV>-<side>` and refuses to create a second one under a
+name already in use — a name is not an identifier, and `--cvm-id` wants the id
+`phala cvms list` shows, so two CVMs sharing a name leave the lookup ambiguous. That is why they
+belong in `deploy.env` — a file a reviewer can read and two blue/green sides can
+be shown to share — rather than in a browser session nobody can audit. The
+defaults it applies: logs and sysinfo **off** (this CVM handles sealed prompts,
+and anything a container logs is disclosed), `public_tcbinfo` **on** (`pcverify`
+fetches `app-compose.json` through it), never `--dev-os` (it wants an SSH key,
+i.e. interactive root inside the enclave).
+
+The equivalent by hand, for reference — note it is `phala deploy`, not the
+`phala cvm create` of older CLI releases, and `--instance-type`, not the
+deprecated `--vcpu`/`--memory`:
+
+```sh
+phala deploy --name 0g-pc-gateway-b --compose docker-compose.release.yml \
+  -e cvm.env --instance-type <type> --disk-size 40G \
+  --no-public-logs --no-public-sysinfo --public-tcbinfo --wait
 ```
 
 ### CVM shape — and the one setting that depends on it
@@ -747,6 +783,75 @@ is intentionally **not** `v*`, so it does not retrigger `docker.yml`'s build
 (which would produce a divergent digest). The per-commit `sha-` tag uses the full
 40-char SHA (`type=sha,format=long` in `docker.yml`) so any input commit maps to
 its image tag deterministically.
+
+## Moving to another dstack cluster
+
+Changing `GATEWAY_DOMAIN` looks like a one-line config edit and is not. Three of
+the things it moves are **verification** inputs, not deployment inputs, and they
+have to be settled *before* the cutover, because the failure lands on users
+running `pcverify`, not on us.
+
+**Establish these on a throwaway CVM in the new cluster first** — deploy one with
+`--side` unused by production and read its quote:
+
+1. **The OS image.** Its `MRTD` + `RTMR1` + `RTMR2` must have an entry in
+   [`client/evidence/osimages.json`](../../client/evidence/osimages.json) or
+   `pcverify -gateway` **fails** the os-image check — not "not configured", a
+   failed check, for every user. A cluster on a newer guest OS therefore needs
+   the entry computed (see [Verify](#verify)), committed, and shipped in a new
+   build, since the allowlist is embedded in the binary. `pcverify` prints the
+   observed registers in `osimages.json` shape when nothing matches, which is the
+   starting point — confirm them against the published release, never paste them
+   in as ground truth.
+2. **The `mr_config_id` layout.** `protocol/attest` reads `compose_hash` out of
+   **V1** (`0x01 ‖ compose_hash ‖ zeros`). dstack's V2 and V3 commit to it inside
+   a digest instead, and `ComposeHashFromMRConfigID` returns
+   `ErrUnsupportedMRConfig` rather than guessing — so a cluster whose quotes start
+   with `0x02`/`0x03` costs the entire code-identity half of the chain until this
+   repository implements that layout. That is a code change, not a redeploy. Read
+   the first byte of the new cluster's `mr_config_id` before committing to the
+   move.
+3. **Where `app_id` comes from.** Everything here — `switch.sh`'s
+   `_dstack-app-address` records, the `<app_id>-443s` standby probe, `pcverify`'s
+   app-compose lookup — assumes `app_id` is `compose_hash`'s leading 20 bytes.
+   Under a KMS key provider it can instead be assigned, at which point the quote
+   no longer names the app the platform routes to. Deploy one CVM and check that
+   the `app_id` the CLI reports equals the one the quote implies.
+
+Then the deployment side:
+
+- **Ask Phala to allowlist the SNI suffix on the new cluster.** It is per-cluster,
+  and until it is done the handshake is dropped before the dstack gateway sees it
+  — DNS and the certificate both look perfect and the client gets a bare TLS
+  error ([Serving domain](#serving-domain)).
+- **Confirm the platform host forms still work**: `<app_id>-443s.<base>` (the
+  standby probe) and `<app_id>-8090.<base>/prpc/Info` (app-compose). Both are
+  documented as validated on the *old* cluster.
+- **`GATEWAY_DOMAIN` and `PLATFORM_BASE` move together** — `deploy.sh` derives the
+  second from the first and rejects a pair naming two clusters, because probes
+  aimed at the old cluster answer nothing for a new `app_id` and read exactly like
+  a broken standby.
+- **The serving alias is the only record that names a cluster**, and both sides
+  share it (`<DOMAIN>.<DELEGATION_ZONE>` → `GATEWAY_DOMAIN`, written by
+  `switch.sh setup`). So blue and green **cannot straddle two clusters**: while
+  the alias points at one gateway, an `app_id` living in the other is unroutable.
+  A cluster move is a cutover with a DNS-shaped gap — repoint the alias and the
+  traffic switch together, TTL 60 s plus the gateway's ~30 s route cache — not a
+  zero-downtime flip. Rehearse it on a second hostname if that gap matters.
+- **Certificates start over.** A new CVM has an empty `cert-data` volume and
+  issues its own; the 5-duplicate-certificates-per-week budget is per hostname, so
+  do the first rounds with `ACME_STAGING=true` ([Deploy](#deploy)).
+- **Check egress from the new cluster**: PCCS, the router, the chain RPC,
+  Cloudflare's API, GitHub, and the `remote_write` endpoint. `ZG_GATEWAY_*_ENFORCE`
+  and `VERIFY_RESPONSES` are fail-closed, so a blocked host is not a degraded
+  gateway — it is one that never becomes ready, which is what the `/readyz` gate
+  is there to catch.
+- **Re-derive `GOMEMLIMIT` if the instance type differs** ([CVM
+  shape](#cvm-shape--and-the-one-setting-that-depends-on-it)).
+
+`./deploy.sh preflight --side <s>` checks what is checkable from here (CLI, auth,
+digest pinning, the serving alias, the issuance switch, required env) and prints
+the two it cannot: the SNI allowlist and the OS-image entry.
 
 ## Metrics (Prometheus)
 
