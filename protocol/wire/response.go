@@ -83,7 +83,7 @@ var mustStayCleartextInResponse = []string{"usage", "model"}
 // justification — nothing downstream needs to rewrite it.
 var mustStayBoundInResponse = []string{"usage"}
 
-// ValidateResponseUnboundFields rejects an unbound set that would strip the
+// validateResponseUnboundFields rejects an unbound set that would strip the
 // authentication from a field the §8 signature must cover.
 //
 // It is enforced on BOTH sides, and the receiving side is the one that matters.
@@ -95,10 +95,10 @@ var mustStayBoundInResponse = []string{"usage"}
 // because a sealer that varies the set could otherwise declare it late in a
 // stream.
 //
-// Not profile-parameterized, unlike ValidateResponseSealedFieldsFor: WHAT a
+// Not profile-parameterized, unlike validateResponseSealedFieldsFor: WHAT a
 // profile seals differs, but which fields must stay authenticated does not, and
 // a per-profile signature would imply a latitude no profile actually has.
-func ValidateResponseUnboundFields(unbound []string) error {
+func validateResponseUnboundFields(unbound []string) error {
 	for _, f := range unbound {
 		if slices.Contains(mustStayBoundInResponse, f) {
 			return fmt.Errorf("%q must stay bound: an unbound field is outside the seal AAD and the §8 binding, so an intermediary could rewrite it undetected", f)
@@ -134,16 +134,16 @@ func validateResponseSealedFields(fields []string) error {
 	return nil
 }
 
-// ValidateResponseSealedFieldsFor checks a response sealed set against a
+// validateResponseSealedFieldsFor checks a response sealed set against a
 // profile: the shared invariants above, plus that it actually covers the
 // profile's generated content ("choices" for chat, "data" for image) rather than
 // sealing something incidental and shipping the content in the clear.
 //
-// It is the response-side counterpart of ValidateSealedFieldsFor. SealFrame
-// applies only the profile-independent invariants, since a caller may legitimately
-// seal a superset; an enclave that knows which endpoint it serves SHOULD call
-// this to check its own configuration fail-closed.
-func ValidateResponseSealedFieldsFor(p Profile, fields []string) error {
+// It is the response-side counterpart of ValidateSealedFieldsFor, and OpenFrame
+// calls it on every frame — the client is the party this protects. SealFrame
+// deliberately applies only the profile-independent invariants, since a sealer
+// may legitimately seal a superset of its profile's default.
+func validateResponseSealedFieldsFor(p Profile, fields []string) error {
 	spec, err := p.spec()
 	if err != nil {
 		return err
@@ -161,7 +161,7 @@ func ValidateResponseSealedFieldsFor(p Profile, fields []string) error {
 	return nil
 }
 
-// ValidateResponseCleartextFor enforces a profile's required cleartext response
+// validateResponseCleartextFor enforces a profile's required cleartext response
 // values (§7.1) on a FINAL frame: for the image profile, that it restates the
 // billable count as a non-negative `usage.output_images`.
 //
@@ -181,7 +181,7 @@ func ValidateResponseSealedFieldsFor(p Profile, fields []string) error {
 // FINAL frames only: `usage` is a property of the whole response, and a
 // streaming profile legitimately omits it until the last frame. A profile with
 // no such requirement (chat) always passes.
-func ValidateResponseCleartextFor(p Profile, frame Response) error {
+func validateResponseCleartextFor(p Profile, frame Response) error {
 	spec, err := p.spec()
 	if err != nil {
 		return err
@@ -234,7 +234,7 @@ func NewResponseSealer(clientEphPub crypto.PublicKey, unboundFields ...string) (
 // everything. They are validated against each frame's sealed set in SealFrame.
 //
 // The profile is what lets SealFrame check the final frame against §7.1's
-// required cleartext (see ValidateResponseCleartextFor); it is the send-side
+// required cleartext (see validateResponseCleartextFor); it is the send-side
 // mirror of NewResponseOpenerFor and, like it, is not carried on the wire.
 func NewResponseSealerFor(profile Profile, clientEphPub crypto.PublicKey, unboundFields ...string) (*ResponseSealer, error) {
 	if _, err := profile.spec(); err != nil {
@@ -243,7 +243,7 @@ func NewResponseSealerFor(profile Profile, clientEphPub crypto.PublicKey, unboun
 	// Before any key material: an unbound set that frees a field the signature
 	// must cover would produce frames that verify no matter what an intermediary
 	// does to them.
-	if err := ValidateResponseUnboundFields(unboundFields); err != nil {
+	if err := validateResponseUnboundFields(unboundFields); err != nil {
 		return nil, err
 	}
 	enc, s, err := crypto.SetupSender(clientEphPub, []byte(RespInfo))
@@ -271,7 +271,7 @@ func (rs *ResponseSealer) SealFrame(frame Response, sealedFields []string, final
 	// that ever seals part of `usage` would be caught by the sealed-set rules
 	// rather than reading as "absent" here.
 	if final {
-		if err := ValidateResponseCleartextFor(rs.profile, frame); err != nil {
+		if err := validateResponseCleartextFor(rs.profile, frame); err != nil {
 			return nil, err
 		}
 	}
@@ -391,7 +391,7 @@ func (ro *ResponseOpener) OpenFrame(frame Response) (Response, error) {
 	// non-conforming enclave can declare `usage` unbound on purpose, and every
 	// other verification the client runs — Open, and the §8 binding, which hashes
 	// the same AAD — would still pass over a router-rewritten count.
-	if err := ValidateResponseUnboundFields(e2ee.UnboundFields); err != nil {
+	if err := validateResponseUnboundFields(e2ee.UnboundFields); err != nil {
 		return nil, err
 	}
 	// And refuse a frame whose sealed set does not actually cover this profile's
@@ -399,7 +399,7 @@ func (ro *ResponseOpener) OpenFrame(frame Response) (Response, error) {
 	// opening succeeds anyway. Per frame, not once on the first: sealed_fields is
 	// carried on every frame, so a stream could seal the content for a while and
 	// then stop.
-	if err := ValidateResponseSealedFieldsFor(ro.profile, e2ee.SealedFields); err != nil {
+	if err := validateResponseSealedFieldsFor(ro.profile, e2ee.SealedFields); err != nil {
 		return nil, err
 	}
 	// And, on the frame that closes the response, refuse one that omits the
@@ -408,7 +408,7 @@ func (ro *ResponseOpener) OpenFrame(frame Response) (Response, error) {
 	// free by a router that cannot tell the omission from a zero, so no
 	// downstream component ever raises it.
 	if e2ee.Final {
-		if err := ValidateResponseCleartextFor(ro.profile, frame); err != nil {
+		if err := validateResponseCleartextFor(ro.profile, frame); err != nil {
 			return nil, err
 		}
 	}

@@ -206,20 +206,6 @@ func TestResponseSealedFieldsMustLeaveRouterInputsCleartext(t *testing.T) {
 	if _, err := rs.SealFrame(frame, []string{"choices", "usage"}, true); err == nil {
 		t.Fatal("sealing `usage` must be refused — the router bills on it without a key")
 	}
-
-	// And the profile-aware check additionally requires the generated content.
-	if err := wire.ValidateResponseSealedFieldsFor(wire.ProfileImage, []string{"choices"}); err == nil {
-		t.Error("an image response sealed set that omits `data` must be refused")
-	}
-	if err := wire.ValidateResponseSealedFieldsFor(wire.ProfileImage, []string{"data"}); err != nil {
-		t.Errorf("the image default must satisfy its own profile check: %v", err)
-	}
-	if err := wire.ValidateResponseSealedFieldsFor(wire.ProfileChat, []string{"choices"}); err != nil {
-		t.Errorf("the chat default must satisfy its own profile check: %v", err)
-	}
-	if err := wire.ValidateResponseSealedFieldsFor("audio", []string{"data"}); err == nil {
-		t.Error("an unknown profile must be rejected")
-	}
 }
 
 // Each profile requires its OWN payload field: a chat set does not satisfy the
@@ -537,54 +523,5 @@ func TestPinnedCleartextFieldCannotBeSealed(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "response_format") {
 		t.Fatalf("error should name the pinned field, got: %v", err)
-	}
-}
-
-// The enclave-side entry point: the same three checks, runnable from a party
-// that only holds the received envelope. SPEC §7.1 requires an enclave to
-// reject a violating request, which it cannot do if the checks are unexported.
-func TestValidatePinnedCleartextForIsUsableByAReceiver(t *testing.T) {
-	_, pub, err := crypto.GenerateRecipientKey()
-	if err != nil {
-		t.Fatalf("keygen: %v", err)
-	}
-	_, ephPub, err := crypto.GenerateRecipientKey()
-	if err != nil {
-		t.Fatalf("eph keygen: %v", err)
-	}
-	good, err := wire.SealRequestFor(wire.ProfileImage, pub, mustReq(t, sampleImageReq),
-		nil, testProvider, ephPub)
-	if err != nil {
-		t.Fatalf("seal: %v", err)
-	}
-	if err := wire.ValidatePinnedCleartextFor(wire.ProfileImage, good); err != nil {
-		t.Fatalf("a conforming envelope must pass the receiver-side check: %v", err)
-	}
-	// Chat has no pinned fields, so it passes anything.
-	if err := wire.ValidatePinnedCleartextFor(wire.ProfileChat, good); err != nil {
-		t.Errorf("a profile with no pinned fields must always pass: %v", err)
-	}
-	if err := wire.ValidatePinnedCleartextFor("audio", good); err == nil {
-		t.Error("an unknown profile must be rejected")
-	}
-
-	// The value flipped in transit, which is what an intermediary would do.
-	tampered := wire.Request{}
-	for k, v := range good {
-		tampered[k] = v
-	}
-	tampered["response_format"] = json.RawMessage(`"url"`)
-	if err := wire.ValidatePinnedCleartextFor(wire.ProfileImage, tampered); err == nil {
-		t.Error("the receiver-side check must catch a rewritten pinned value")
-	}
-	// And the field removed entirely (what sealing it looks like on the wire).
-	stripped := wire.Request{}
-	for k, v := range good {
-		if k != "response_format" {
-			stripped[k] = v
-		}
-	}
-	if err := wire.ValidatePinnedCleartextFor(wire.ProfileImage, stripped); err == nil {
-		t.Error("the receiver-side check must catch a pinned field that is absent from the cleartext")
 	}
 }

@@ -155,16 +155,17 @@ var profiles = map[Profile]profileSpec{
 // caller asked for it (stream_options.include_usage). Requiring it here would
 // reject conforming chat streams to enforce a rule §7 does not state.
 
-// ValidatePinnedCleartextFor enforces a profile's pinned cleartext constraints
+// validatePinnedCleartextFor enforces a profile's pinned cleartext constraints
 // (§5.1 / §7.1) on a RECEIVED envelope. It is the enclave-side counterpart of
-// the checks SealRequestFor runs before sealing, and exists because the SPEC
-// requires an enclave to reject a violating request: the client-side half stops
-// the reference library from BUILDING one, but a third-party client is under no
-// obligation to use it, so the half that does not depend on the sender has to be
-// implementable from this package rather than reimplemented per enclave.
+// the checks SealRequestFor runs before sealing, and the SPEC requires it: the
+// client-side half stops the reference library from BUILDING a violating
+// request, but a third-party client is under no obligation to use it.
 //
-// It checks all three ways the pin can be defeated, which is the point of
-// offering one call instead of three:
+// Unexported because OpenRequestFor is the enclave's entry point and calls this
+// itself. An enclave should not be able to open an envelope without the check
+// having run, which a second, exported way in would allow.
+//
+// It checks all three ways the pin can be defeated:
 //
 //   - the value is wrong, absent, or not a string;
 //   - the field was SEALED, so it is gone from the cleartext the server reads
@@ -174,7 +175,7 @@ var profiles = map[Profile]profileSpec{
 //     in transit and Open would still succeed.
 //
 // A profile with no pinned fields (chat) always passes.
-func ValidatePinnedCleartextFor(p Profile, env Request) error {
+func validatePinnedCleartextFor(p Profile, env Request) error {
 	spec, err := p.spec()
 	if err != nil {
 		return err
@@ -452,7 +453,7 @@ func SealRequestFor(profile Profile, encPub crypto.PublicKey, req Request, seale
 	// the value AND that it will still be readable and authenticated when it gets
 	// there — a pin that is sealed away, or that an intermediary can rewrite, is
 	// not a pin. ValidateSealedFieldsFor above already rejected a set that seals
-	// the pin away; ValidatePinnedCleartextFor runs all three checks together on
+	// the pin away; validatePinnedCleartextFor runs all three checks together on
 	// the receiving side.
 	if err := validatePinnedNotUnbound(spec, unboundFields); err != nil {
 		return nil, err
@@ -559,7 +560,7 @@ func SealRequestFor(profile Profile, encPub crypto.PublicKey, req Request, seale
 //
 //   - ValidateSealedFieldsFor — the sealed set covers this profile's payload
 //     field, so the request did not arrive with its prompt in the clear;
-//   - ValidatePinnedCleartextFor — the pinned cleartext field is present, has
+//   - validatePinnedCleartextFor — the pinned cleartext field is present, has
 //     the required value, and was neither sealed away nor declared unbound.
 //
 // Then OpenRequest's own fail-closed checks (version, suite, AEAD, decrypted
@@ -575,7 +576,7 @@ func OpenRequestFor(profile Profile, priv crypto.PrivateKey, env Request) (Reque
 	if err := ValidateSealedFieldsFor(profile, e2ee.SealedFields); err != nil {
 		return nil, err
 	}
-	if err := ValidatePinnedCleartextFor(profile, env); err != nil {
+	if err := validatePinnedCleartextFor(profile, env); err != nil {
 		return nil, err
 	}
 	return OpenRequest(priv, env)

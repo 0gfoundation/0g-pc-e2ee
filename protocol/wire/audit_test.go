@@ -138,6 +138,11 @@ func TestOpenRequestForRunsEveryReceiverSideCheck(t *testing.T) {
 	if string(out["prompt"]) != `"my secret prompt"` {
 		t.Fatalf("prompt = %s, want it merged back", out["prompt"])
 	}
+	// An unknown profile has no requirements to check against, so opening under
+	// one must fail rather than degrade into an unchecked open.
+	if _, err := wire.OpenRequestFor("audio", priv, sealed); err == nil {
+		t.Error("an unknown profile must be rejected")
+	}
 
 	// Each check the enclave would otherwise have had to remember, exercised
 	// through the single entry point. Every mutation is one an intermediary or a
