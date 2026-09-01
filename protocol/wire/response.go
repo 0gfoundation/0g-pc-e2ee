@@ -59,13 +59,41 @@ func defaultResponseSealedFields() []string { return DefaultResponseSealedFields
 // mustStayCleartextInResponse are response fields a sealed frame MUST NOT seal,
 // whatever the profile: the router reads them WITHOUT a key to bill and to
 // attribute the response, so sealing one does not merely inconvenience it — it
-// makes the response unbillable (SPEC §7). They stay readable but bound, so
-// tampering is still caught at verify.
+// makes the response unbillable (SPEC §7).
 //
 // This is a floor for every profile rather than a per-profile list because the
 // reason is the same everywhere: the router's inputs. `usage` covers both the
 // chat token counts and the image `usage.output_images` (§7.1).
 var mustStayCleartextInResponse = []string{"usage", "model"}
+
+// mustStayBoundInResponse are cleartext response fields that may never be listed
+// in `unbound_fields`. Cleartext is not the whole requirement: an unbound field
+// is excluded from the seal AAD, so an intermediary can rewrite it, the client's
+// Open still succeeds, AND the §8 binding — which hashes that same AAD — comes
+// out byte-identical. A router could therefore restate `usage.output_images`
+// from 2 to 99 with nothing anywhere detecting it. "The router bills on it
+// without decrypting, and a lying count is caught at verify" (§7.1) is only true
+// while `usage` is bound.
+//
+// Deliberately NOT the same list as mustStayCleartextInResponse: `model` is on
+// that one but not this one. The broker declares `model` unbound on purpose, so
+// the router can substitute the served model back to the alias the client asked
+// for, and the resulting un-authenticated `model` is a known, documented
+// trade-off (see DefaultUnboundFields' TODO(model-binding)). `usage` has no such
+// justification — nothing downstream needs to rewrite it.
+var mustStayBoundInResponse = []string{"usage"}
+
+// validateResponseUnboundFields rejects an unbound set that would strip the
+// authentication from a field the §8 signature must cover. Checked once at
+// sealer construction, since the unbound set is fixed for the whole stream.
+func validateResponseUnboundFields(unbound []string) error {
+	for _, f := range unbound {
+		if slices.Contains(mustStayBoundInResponse, f) {
+			return fmt.Errorf("%q must stay bound: an unbound field is outside the seal AAD and the §8 binding, so an intermediary could rewrite it undetected", f)
+		}
+	}
+	return nil
+}
 
 // validateResponseSealedFields requires a non-empty set with no duplicates, and
 // no field the router must be able to read. Unlike the request there is no
@@ -135,6 +163,12 @@ type ResponseSealer struct {
 // applied to every frame; empty binds everything. They are validated against
 // each frame's sealed set in SealFrame.
 func NewResponseSealer(clientEphPub crypto.PublicKey, unboundFields ...string) (*ResponseSealer, error) {
+	// Before any key material: an unbound set that frees a field the signature
+	// must cover would produce frames that verify no matter what an intermediary
+	// does to them.
+	if err := validateResponseUnboundFields(unboundFields); err != nil {
+		return nil, err
+	}
 	enc, s, err := crypto.SetupSender(clientEphPub, []byte(RespInfo))
 	if err != nil {
 		return nil, err

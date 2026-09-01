@@ -224,8 +224,26 @@ defaulted.
 
 Whatever a profile seals, a response frame MUST leave `usage` and `model`
 cleartext: the router reads them without a key to bill and attribute, so sealing
-one makes the response unbillable rather than merely private. They stay bound
-(§5.2), so tampering is still caught at verify.
+one makes the response unbillable rather than merely private.
+
+**Cleartext is only half of it — `usage` MUST also stay BOUND, and a pinned
+cleartext field MUST NOT be declared `unbound` either.** An unbound field is
+excluded from the AAD, so an intermediary may rewrite it, `Open` still succeeds,
+and — because the §8 binding hashes that same AAD — `respH`/`reqH` come out
+byte-identical. Listing `usage` in `unbound_fields` would therefore let a router
+restate the billable count with nothing detecting it, and listing a pinned field
+there would let one flip `response_format` to `url` in transit and hand the
+enclave a request that publishes the images in the clear. `unbound_fields` is the
+one construct that can silently undo every other guarantee in this document, so
+the fields whose *value* must be trusted are excluded from it by rule, not left
+to the §8.2 corollary:
+
+| Field | May be sealed? | May be unbound? |
+|---|---|---|
+| `usage` (response) | no — the router bills on it | **no** — its value must be authenticated |
+| a pinned cleartext field (§5.1) | no — the server must read it | **no** — the pin would hold only at seal time |
+| `model` | no — the router attributes on it | yes — the router rewrites the alias back; the resulting value is *not* authenticated (a known trade-off, see §9 and `DefaultUnboundFields`) |
+| `x_0g_trace` | n/a — router-injected | yes — nothing may trust it (§8.2) |
 
 A request profile is **not carried on the wire and is not a version**: the
 envelope format, crypto suite, AAD rule and §8 binding are identical across
@@ -404,9 +422,12 @@ Two constraints are specific to this profile:
   `url`" would let it through while looking correct.
 
   A client MUST refuse to seal a request that violates this, at seal time,
-  before any ciphertext exists (`wire.SealRequestFor` does). An enclave MUST
-  reject one it receives, rather than silently downgrading to `b64_json` — the
-  caller asked for a format this mode cannot honour and has to learn that.
+  before any ciphertext exists (`wire.SealRequestFor` does), and MUST NOT list
+  `response_format` in `unbound_fields` — an unbound pin binds nothing after the
+  seal (§5.1). An enclave MUST reject a violating request it receives, rather
+  than silently downgrading to `b64_json` — the caller asked for a format this
+  mode cannot honour and has to learn that. The enclave check is not redundant
+  with the client one: it is the half that does not depend on the sender.
 
   The general rule this instantiates: **a cleartext field that directs the server
   to publish the RESULT outside the sealed channel is part of the profile's

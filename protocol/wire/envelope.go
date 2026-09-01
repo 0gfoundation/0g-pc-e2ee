@@ -109,6 +109,21 @@ var profiles = map[Profile]profileSpec{
 	},
 }
 
+// validatePinnedNotUnbound rejects an unbound set that frees a pinned cleartext
+// field. An unbound field is excluded from the AAD, so an intermediary can
+// rewrite it and Open still succeeds — which would let a router flip a pinned
+// `response_format: "b64_json"` to `"url"` in transit and hand the enclave a
+// request that publishes the images in the clear. A pin on an unbound field is
+// a pin in name only: it constrains the value at seal time and nothing after.
+func validatePinnedNotUnbound(spec profileSpec, unbound []string) error {
+	for _, f := range unbound {
+		if want, pinned := spec.pinnedCleartext[f]; pinned {
+			return fmt.Errorf("%q is pinned to %q and cannot be unbound: an unbound field is outside the AAD, so an intermediary could rewrite it in transit and the enclave would accept the result", f, want)
+		}
+	}
+	return nil
+}
+
 // validatePinnedCleartext enforces spec.pinnedCleartext against the request's
 // cleartext fields (§5.1 profiles). It runs at seal time, before any ciphertext
 // exists, so a request that would have leaked is never built — the same reason
@@ -321,7 +336,11 @@ func SealRequestFor(profile Profile, encPub crypto.PublicKey, req Request, seale
 	}
 	// Sealing the payload is not enough on its own: a cleartext field can direct
 	// the server to publish the RESULT outside the sealed channel (§7.1). Check
-	// those before building anything.
+	// both the value AND that it stays authenticated — a pin an intermediary can
+	// rewrite is not a pin.
+	if err := validatePinnedNotUnbound(spec, unboundFields); err != nil {
+		return nil, err
+	}
 	if err := validatePinnedCleartext(spec, req); err != nil {
 		return nil, err
 	}

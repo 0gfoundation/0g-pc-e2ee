@@ -417,3 +417,65 @@ func equalStrings(a, b []string) bool {
 	}
 	return true
 }
+
+// `unbound_fields` is the escape hatch that makes every other guard optional, so
+// the fields whose value must be TRUSTED have to be excluded from it explicitly.
+//
+// Cleartext is only half the requirement. An unbound field is excluded from the
+// seal AAD, so an intermediary can rewrite it, Open still succeeds, and — because
+// the §8 binding hashes that same AAD — respH comes out byte-identical. Declaring
+// `usage` unbound therefore lets a router restate the billable count with nothing
+// anywhere detecting it, which is exactly what §7.1 promises cannot happen.
+func TestUsageCannotBeDeclaredUnboundInAResponse(t *testing.T) {
+	_, ephPub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	resp := wire.Response{
+		"usage": json.RawMessage(`{"output_images":2}`),
+		"data":  json.RawMessage(`[{"b64_json":"aW1n"}]`),
+	}
+	if _, err := wire.SealResponse(ephPub, resp, []string{"data"}, "model", "usage"); err == nil {
+		t.Fatal("declaring `usage` unbound must be refused — it would hide billing tampering from both Open and the §8 binding")
+	}
+	if _, err := wire.NewResponseSealer(ephPub, "usage"); err == nil {
+		t.Fatal("the streaming sealer must refuse it too — the unbound set is fixed for the whole stream")
+	}
+
+	// `model` stays legitimately unbound: the broker declares it so the router can
+	// substitute the alias back, a known trade-off. Refusing it would break the
+	// shipped chat path.
+	if _, err := wire.SealResponse(ephPub, resp, []string{"data"}, "model", "x_0g_trace"); err != nil {
+		t.Fatalf("the broker's own unbound set must stay valid: %v", err)
+	}
+}
+
+// Same hole on the request side: a pinned cleartext field that is unbound is
+// pinned only at seal time. The router flips `response_format` to "url" in
+// transit, OpenRequest recomputes an AAD that excludes it, and the enclave is
+// handed a request that publishes the images in the clear.
+func TestPinnedCleartextFieldCannotBeDeclaredUnbound(t *testing.T) {
+	_, pub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	_, ephPub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatalf("eph keygen: %v", err)
+	}
+	req := mustReq(t, sampleImageReq)
+
+	_, err = wire.SealRequestFor(wire.ProfileImage, pub, req, nil, testProvider, ephPub, "model", "response_format")
+	if err == nil {
+		t.Fatal("declaring the pinned `response_format` unbound must be refused")
+	}
+	if !strings.Contains(err.Error(), "response_format") {
+		t.Fatalf("error should name the pinned field, got: %v", err)
+	}
+
+	// The default unbound set (model only) stays valid for an image request.
+	if _, err := wire.SealRequestFor(wire.ProfileImage, pub, req, nil, testProvider, ephPub,
+		wire.DefaultUnboundFields()...); err != nil {
+		t.Fatalf("the default unbound set must stay valid for the image profile: %v", err)
+	}
+}
