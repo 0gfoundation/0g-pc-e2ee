@@ -7,17 +7,42 @@ import (
 	"testing"
 )
 
-// txtResolver returns a lookupTXT stand-in serving a fixed map, and records the
-// names it was asked for so a test can assert the query order.
-func txtResolver(records map[string][]string) (func(context.Context, string) ([]string, error), *[]string) {
+// txtResolver returns a resolver serving a fixed TXT map and no CNAMEs, recording
+// the names it was asked for so a test can assert the query order.
+func txtResolver(records map[string][]string) (dnsResolver, *[]string) {
 	var asked []string
-	return func(_ context.Context, name string) ([]string, error) {
-		asked = append(asked, name)
-		recs, ok := records[name]
-		if !ok {
-			return nil, errors.New("NXDOMAIN")
-		}
-		return recs, nil
+	return dnsResolver{
+		lookupTXT: func(_ context.Context, name string) ([]string, error) {
+			asked = append(asked, name)
+			recs, ok := records[name]
+			if !ok {
+				return nil, errors.New("NXDOMAIN")
+			}
+			return recs, nil
+		},
+		lookupCNAME: func(_ context.Context, name string) (string, error) {
+			return name, nil // no CNAME: Go returns the name itself
+		},
+	}, &asked
+}
+
+// cnameResolver serves TXT records that are only reachable through a CNAME, which is
+// how this deployment's records are actually published — and what a resolver that
+// does not chase the CNAME for a TXT query leaves the caller holding.
+func cnameResolver(cnames map[string]string, records map[string][]string) (dnsResolver, *[]string) {
+	var asked []string
+	return dnsResolver{
+		lookupTXT: func(_ context.Context, name string) ([]string, error) {
+			asked = append(asked, name)
+			return records[name], nil // empty and no error: the shape the trap takes
+		},
+		lookupCNAME: func(_ context.Context, name string) (string, error) {
+			target, ok := cnames[name]
+			if !ok {
+				return name, nil
+			}
+			return target + ".", nil
+		},
 	}, &asked
 }
 
@@ -131,5 +156,48 @@ func TestParentDomain(t *testing.T) {
 		if got := parentDomain(in); got != want {
 			t.Errorf("parentDomain(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// The record this deployment publishes is always behind a delegation CNAME. A
+// resolver that answers the TXT query with the CNAME alone — no records, no error —
+// must not be read as "this deployment has no app-address record".
+func TestDiscoverAppID_FollowsCNAME(t *testing.T) {
+	const target = "_dstack-app-address.gw.example.com.delegation.example.net"
+	r, asked := cnameResolver(
+		map[string]string{"_dstack-app-address.gw.example.com": target},
+		map[string][]string{target: {testAppID + ":443"}},
+	)
+
+	got, err := discoverAppID(context.Background(), "gw.example.com", r)
+	if err != nil {
+		t.Fatalf("discoverAppID: %v", err)
+	}
+	if got != testAppID {
+		t.Errorf("app_id = %q, want %q", got, testAppID)
+	}
+	// The direct name first, then the CNAME target — never the target alone, since a
+	// resolver that does chase it answers on the first query.
+	want := []string{"_dstack-app-address.gw.example.com", target}
+	if len(*asked) != 2 || (*asked)[0] != want[0] || (*asked)[1] != want[1] {
+		t.Errorf("queried %v, want %v", *asked, want)
+	}
+}
+
+// A name with no CNAME must not cost a second TXT query, and must still report the
+// direct answer's reason rather than one invented by the redirect.
+func TestDiscoverAppID_NoCNAMENoRedirect(t *testing.T) {
+	r, asked := cnameResolver(nil, nil)
+
+	_, err := discoverAppID(context.Background(), "gw.example.com", r)
+	if err == nil {
+		t.Fatal("expected an error when nothing publishes the record")
+	}
+	if !strings.Contains(err.Error(), "no TXT record") {
+		t.Errorf("error does not carry the direct answer's reason: %v", err)
+	}
+	// One query per candidate name (exact, wildcard), and no redirect queries.
+	if len(*asked) != 2 {
+		t.Errorf("queried %v, want one query per candidate name", *asked)
 	}
 }

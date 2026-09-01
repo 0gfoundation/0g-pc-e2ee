@@ -248,5 +248,7 @@ func cloudAppComposeSource(base, appID, instance string) string {
 	if base == "" {
 		base = DefaultCloudAPIBase
 	}
-	return fmt.Sprintf("%s/apps/%s/attestations (%s)", strings.TrimRight(base, "/"), appID, instance)
+	// No parentheses of its own: the instance label already carries the replica's name
+	// in brackets, and wrapping it produced "(instance 1 of 1 (pc-gateway-staging-b))".
+	return fmt.Sprintf("%s/apps/%s/attestations — %s", strings.TrimRight(base, "/"), appID, instance)
 }

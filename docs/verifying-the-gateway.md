@@ -684,6 +684,10 @@ them would make the whole exercise circular. In the verified body, `report_data`
 # until the first redeploy. Read it from the record the platform itself routes this
 # domain by:
 APP=$(dig +short TXT _dstack-app-address.<domain> | tr -d '"' | cut -d: -f1)
+# That name is a CNAME into the delegation zone and the TXT lives at the target. If
+# your resolver answers with the CNAME and no records (Windows and split-horizon
+# corporate resolvers do), query the target it names instead. pcverify chases it
+# itself; `dig`/`Resolve-DnsName` may not.
 
 # Phala Cloud's public attestations API carries the verbatim manifest per instance.
 # Pick the instance whose app_compose hashes to the quote's compose_hash — under

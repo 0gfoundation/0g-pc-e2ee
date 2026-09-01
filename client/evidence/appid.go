@@ -51,12 +51,21 @@ const appIDHexLen = 2 * attest.AppIDLen
 // it cannot point a verification at a *different* app's manifest and have it
 // accepted, because that app's manifest does not hash to this quote's commitment.
 func DiscoverAppID(ctx context.Context, domain string) (string, error) {
-	return discoverAppID(ctx, domain, net.DefaultResolver.LookupTXT)
+	return discoverAppID(ctx, domain, dnsResolver{
+		lookupTXT:   net.DefaultResolver.LookupTXT,
+		lookupCNAME: net.DefaultResolver.LookupCNAME,
+	})
 }
 
-// discoverAppID is DiscoverAppID over an injectable resolver, so the two-name walk
-// and the record parsing are testable without DNS.
-func discoverAppID(ctx context.Context, domain string, lookupTXT func(context.Context, string) ([]string, error)) (string, error) {
+// dnsResolver is the DNS surface DiscoverAppID needs, injectable so the name walk,
+// the CNAME redirect and the record parsing are testable without a resolver.
+type dnsResolver struct {
+	lookupTXT   func(context.Context, string) ([]string, error)
+	lookupCNAME func(context.Context, string) (string, error)
+}
+
+// discoverAppID is DiscoverAppID over an injectable resolver.
+func discoverAppID(ctx context.Context, domain string, r dnsResolver) (string, error) {
 	name := bareHost(domain)
 	if name == "" {
 		return "", errors.New("no domain to discover an app_id for")
@@ -68,25 +77,71 @@ func discoverAppID(ctx context.Context, domain string, lookupTXT func(context.Co
 
 	var errs []error
 	for _, q := range queries {
-		records, err := lookupTXT(ctx, q)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("%s: %w", q, err))
-			continue
-		}
-		if len(records) == 0 {
-			errs = append(errs, fmt.Errorf("%s: no TXT record", q))
-			continue
-		}
-		for _, rec := range records {
-			id, err := parseAppAddress(rec)
-			if err != nil {
-				errs = append(errs, fmt.Errorf("%s: %w", q, err))
-				continue
-			}
+		id, err := appAddressAt(ctx, r, q)
+		if err == nil {
 			return id, nil
 		}
+		errs = append(errs, err)
 	}
 	return "", fmt.Errorf("no usable %s record for %s: %w", appAddressPrefix, name, errors.Join(errs...))
+}
+
+// appAddressAt reads one app-address name, following a CNAME by hand if the direct
+// TXT query comes back with nothing.
+//
+// **The redirect is not defensive programming; this deployment's records are always
+// behind a CNAME.** deploy/phala/README.md has the served zone delegate
+// `_dstack-app-address.<domain>` into the delegation zone, and dstack-ingress writes
+// the TXT at that target — so every lookup here is a CNAME chase. Most resolvers do
+// it for the caller. Some (Windows' among them, and split-horizon corporate
+// resolvers) answer a TXT query for a CNAME'd name with the CNAME alone and no
+// records, which surfaces as an empty, error-free reply: indistinguishable, without
+// this, from a deployment that publishes no record at all. Chasing it ourselves is
+// one extra query on a path that has already failed, and it is the difference
+// between the tool working and not working on an ordinary corporate laptop.
+func appAddressAt(ctx context.Context, r dnsResolver, name string) (string, error) {
+	id, direct := appAddressFromTXT(ctx, r, name)
+	if direct == nil {
+		return id, nil
+	}
+	if r.lookupCNAME == nil {
+		return "", direct
+	}
+	target, err := r.lookupCNAME(ctx, name)
+	if err != nil {
+		// The direct answer is the one worth reporting: it is what the name was asked
+		// for, and "there is also no CNAME" adds nothing a reader can act on.
+		return "", direct
+	}
+	target = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(target)), ".")
+	if target == "" || target == name {
+		return "", direct
+	}
+	id, viaCNAME := appAddressFromTXT(ctx, r, target)
+	if viaCNAME == nil {
+		return id, nil
+	}
+	return "", errors.Join(direct, viaCNAME)
+}
+
+// appAddressFromTXT queries one name and returns the first record that parses.
+func appAddressFromTXT(ctx context.Context, r dnsResolver, name string) (string, error) {
+	records, err := r.lookupTXT(ctx, name)
+	if err != nil {
+		return "", fmt.Errorf("%s: %w", name, err)
+	}
+	if len(records) == 0 {
+		return "", fmt.Errorf("%s: no TXT record", name)
+	}
+	var errs []error
+	for _, rec := range records {
+		id, err := parseAppAddress(rec)
+		if err == nil {
+			return id, nil
+		}
+		errs = append(errs, fmt.Errorf("%s: %w", name, err))
+	}
+	return "", errors.Join(errs...)
 }
 
 // parseAppAddress reads the app_id out of a dstack app-address record, whose format
