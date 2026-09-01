@@ -8,23 +8,31 @@
 # chat smoke test that sends only a prompt exercises half of the sealed request
 # set and none of the sealed tool path. This runs the other half, live.
 #
-# Three things can make a tool-call test quietly pass while proving nothing.
-# None of them surface as an error; each is a check below:
+# Four things can make a tool-call test quietly pass while proving nothing. None
+# of them surface as an error; each is a check below:
 #
-#   1. NOT EVERY MODEL SUPPORTS TOOLS. On the same fleet, 0GM-1.0-35B-A3B
+#   1. THE TARGET MAY NOT BE A GATEWAY AT ALL. The router serves the same OpenAI
+#      surface, so aiming this at router-api*.0g.ai answers every call happily
+#      with NOTHING SEALED — the gateway is what seals, and the router is the
+#      party it seals past. Preflight A probes /v1/gateway/identity, which only
+#      the gateway serves, and says so in the summary if it is absent.
+#
+#   2. NOT EVERY MODEL SUPPORTS TOOLS. On the same fleet, 0GM-1.0-35B-A3B
 #      advertises `tools`/`tool_choice` and 0GM-1.0-35B-A3B-SIA does not. Send
 #      tools to the wrong one and it answers in prose — a green-looking run that
-#      never made a tool call. Preflight reads /v1/models and refuses to go on.
+#      never made a tool call. Preflight B reads /v1/models and refuses to go on.
+#      (A catalog in the bare OpenAI shape — `id` only, no supported_parameters —
+#      cannot answer this; preflight says that rather than guessing.)
 #
-#   2. THE ROUTER CANNOT SEE THAT YOU NEED TOOLS. `tools` is a sealed field, so
+#   3. THE ROUTER CANNOT SEE THAT YOU NEED TOOLS. `tools` is a sealed field, so
 #      the client strips it before asking the router to rank providers
 #      (client/route/route.go, preview). The router ranks on what is left, which
-#      says nothing about tool support. Preflight therefore takes the address of
-#      a tools-capable provider out of /v1/models and PINS it with
+#      says nothing about tool support. Preflight B therefore takes the address
+#      of a tools-capable provider out of /v1/models and PINS it with
 #      X-0G-Provider-Address; `--no-pin` opts out to test what unpinned routing
 #      actually does.
 #
-#   3. STREAMING IS A DIFFERENT CODE PATH. Streaming assembles tool_calls from
+#   4. STREAMING IS A DIFFERENT CODE PATH. Streaming assembles tool_calls from
 #      per-frame deltas, and every frame is sealed and opened separately, in
 #      order (SPEC §7). It is the likeliest thing to break and the one a
 #      non-streaming test never touches. Check 3 reassembles the deltas.
@@ -52,8 +60,10 @@ PROVIDER=${PROVIDER:-}
 PIN=1
 STREAM=1
 
+# The header comment above IS the help text. Printed by walking it rather than a
+# line range, so editing the header cannot silently truncate --help.
 usage() {
-	sed -n '3,48p' "$0" | sed 's/^# \{0,1\}//'
+	awk 'NR > 2 && /^#/ { sub(/^# ?/, ""); print; next } NR > 2 { exit }' "$0"
 	exit "${1:-0}"
 }
 
@@ -132,52 +142,109 @@ TOOLS='[{"type":"function","function":{
     "unit":{"type":"string","enum":["celsius","fahrenheit"]}},
   "required":["city"]}}}]'
 
-echo "gateway  $BASE"
+echo "target   $BASE"
 echo "model    $MODEL"
 
 # ---------------------------------------------------------------------------
-# Preflight: does this model advertise tools, and on which provider?
+# Preflight A: is this a GATEWAY at all?
+#
+# Worth a request of its own, because the failure it catches is silent and total.
+# The router speaks the same OpenAI surface as the gateway, so pointing this
+# script at router-api*.0g.ai answers every chat call quite happily — with NO
+# SEALING ANYWHERE, since sealing is the gateway's job and the router is the
+# party it seals *past*. Every check below would still pass. Only the gateway
+# serves /v1/gateway/identity (client/cmd/gateway/identity.go), so that is the
+# tell. Not fatal — baselining the model against the router direct is a
+# legitimate thing to want — but it must never be mistaken for a sealed run, so
+# it is said loudly here and repeated in the summary.
+# ---------------------------------------------------------------------------
+SEALED=1
+if [ "$(curl -sS --max-time 20 -o "$WORK/identity.json" -w '%{http_code}' \
+	"$BASE/v1/gateway/identity" 2>/dev/null || echo 000)" = 200 ] &&
+	jq -e . "$WORK/identity.json" >/dev/null 2>&1; then
+	ok "target serves /v1/gateway/identity — this is a 0G gateway, so requests are sealed"
+	note "$(jq -r '[(.instance_id // .app_id // empty), (.matched_release.tag // empty)] | join("  ") // ""' "$WORK/identity.json" 2>/dev/null || true)"
+else
+	SEALED=0
+	bad "target does NOT serve /v1/gateway/identity — it is not a 0G gateway"
+	note "if this is the router (router-api*.0g.ai), the chat calls below reach the"
+	note "model but are NOT end-to-end encrypted: the gateway is what seals, and the"
+	note "router is the party it seals past. The tool checks still mean something"
+	note "about the MODEL; they mean nothing about E2EE. Point --gateway at the"
+	note "gateway domain (e.g. pc-gateway.0g.ai) for a sealed run."
+fi
+echo
+
+# ---------------------------------------------------------------------------
+# Preflight B: does this model advertise tools, and on which provider?
+#
+# Catalog shapes differ. 0G's fleet listing carries model_id / canonical_id /
+# address / supported_parameters, which is what the checks below want; a stock
+# OpenAI /v1/models carries only `id`, and there is nothing to check tool support
+# against. Tell those two apart rather than reporting the second as "no such
+# model", which is what an empty capability filter looks like from the outside.
 # ---------------------------------------------------------------------------
 if curl -sS --max-time 30 -H "Authorization: Bearer ${ZG_API_KEY:-}" \
 	"$BASE/v1/models" -o "$WORK/models.json" 2>/dev/null &&
 	jq -e '.data | type == "array"' "$WORK/models.json" >/dev/null 2>&1; then
 
-	entries=$(jq -c --arg m "$MODEL" \
-		'[.data[] | select(.model_id == $m or .canonical_id == $m)]' "$WORK/models.json")
+	total=$(jq '.data | length' "$WORK/models.json")
+	# Does this catalog describe capabilities at all, or is it the bare shape?
+	rich=$(jq '[.data[] | select(has("supported_parameters"))] | length' "$WORK/models.json")
 
-	if [ "$(jq 'length' <<<"$entries")" = 0 ]; then
-		bad "preflight: no model named \"$MODEL\" in the fleet"
-		note "tools-capable chat models on offer:"
-		jq -r '[.data[] | select(.service_type == "chatbot")
-		        | select(.supported_parameters | index("tools"))
-		        | .model_id] | unique | .[] | "          " + .' "$WORK/models.json"
-		exit 2
-	fi
-
-	# Prefer a healthy provider that actually advertises tools. This is both the
-	# capability check and where the pin comes from — trap 1 and trap 2 have the
-	# same answer, so they are resolved in one place.
-	capable=$(jq -c '[.[] | select(.supported_parameters | index("tools"))]
-	                 | sort_by(.is_healthy != true) | first // empty' <<<"$entries")
-
-	if [ -z "$capable" ]; then
-		bad "preflight: \"$MODEL\" does not advertise \"tools\" on any provider"
-		note "what it does advertise:"
-		jq -r '.[] | "          " + .address + "  " + (.supported_parameters | join(","))' <<<"$entries"
-		note "pick a model whose supported_parameters contains \"tools\"."
-		exit 2
-	fi
-
-	ok "preflight: \"$MODEL\" advertises tools and tool_choice"
-	if [ -z "$PROVIDER" ]; then
-		PROVIDER=$(jq -r '.address' <<<"$capable")
-		[ "$(jq -r '.is_healthy' <<<"$capable")" = true ] ||
-			note "warning: that provider reports is_healthy=false"
-	fi
-	if [ "$PIN" = 1 ]; then
-		note "pinning $PROVIDER (the router cannot rank on tools — see the header comment)"
+	if [ "$total" = 0 ]; then
+		note "preflight: the model catalog at $BASE/v1/models is empty"
+		note "(a listing that needs a key returns this when ZG_API_KEY is unset or wrong)"
+	elif [ "$rich" = 0 ]; then
+		note "preflight: that catalog has $total entries but reports no supported_parameters,"
+		note "so tool support cannot be checked here — it is the bare OpenAI /v1/models shape,"
+		note "not 0G's fleet listing. Proceeding; check 1 is then the thing that tells you"
+		note "whether this model does tool calls at all."
+		jq -e --arg m "$MODEL" '[.data[] | select((.model_id // .canonical_id // .id) == $m)] | length > 0' \
+			"$WORK/models.json" >/dev/null 2>&1 ||
+			note "warning: \"$MODEL\" is not among them — $(jq -r '[.data[] | .model_id // .id // .canonical_id] | unique | join(", ")' "$WORK/models.json" | head -c 300)"
 	else
+		entries=$(jq -c --arg m "$MODEL" \
+			'[.data[] | select(.model_id == $m or .canonical_id == $m or .id == $m)]' "$WORK/models.json")
+
+		if [ "$(jq 'length' <<<"$entries")" = 0 ]; then
+			bad "preflight: no model named \"$MODEL\" in this catalog"
+			note "chat models it does list, tools-capable marked [tools]:"
+			jq -r '[.data[] | select((.service_type // "chatbot") == "chatbot")
+			        | (.model_id // .id // .canonical_id)
+			          + (if (.supported_parameters // []) | index("tools") then "  [tools]" else "" end)]
+			       | unique | .[] | "          " + .' "$WORK/models.json"
+			exit 2
+		fi
+
+		# Prefer a healthy provider that actually advertises tools. This is both the
+		# capability check and where the pin comes from — trap 1 and trap 2 have the
+		# same answer, so they are resolved in one place.
+		capable=$(jq -c '[.[] | select((.supported_parameters // []) | index("tools"))]
+		                 | sort_by(.is_healthy != true) | first // empty' <<<"$entries")
+
+		if [ -z "$capable" ]; then
+			bad "preflight: \"$MODEL\" does not advertise \"tools\" on any provider"
+			note "what it does advertise:"
+			jq -r '.[] | "          " + (.address // "?") + "  " + ((.supported_parameters // []) | join(","))' <<<"$entries"
+			note "pick a model whose supported_parameters contains \"tools\"."
+			exit 2
+		fi
+
+		ok "preflight: \"$MODEL\" advertises tools and tool_choice"
+		if [ -z "$PROVIDER" ]; then
+			PROVIDER=$(jq -r '.address // ""' <<<"$capable")
+			[ "$(jq -r '.is_healthy' <<<"$capable")" = true ] ||
+				note "warning: that provider reports is_healthy=false"
+		fi
+	fi
+
+	if [ -n "$PROVIDER" ] && [ "$PIN" = 1 ]; then
+		note "pinning $PROVIDER (the router cannot rank on tools — see the header comment)"
+	elif [ "$PIN" = 0 ]; then
 		note "--no-pin: letting the router choose, which it does without seeing \"tools\""
+	else
+		note "no provider pin: a tools-incapable provider is possible (--provider sets one)"
 	fi
 else
 	note "preflight skipped: could not read $BASE/v1/models"
@@ -218,7 +285,10 @@ else
 		bad "non-streaming: no tool call (finish_reason=$reason)"
 		note "the model answered in prose instead: $(jq -r '.choices[0].message.content // "" | .[0:160]' "$WORK/r1.json")"
 	fi
-	p=$(served "$WORK/r1.hdr"); [ -n "$p" ] && note "sealed to $p"
+	# "sealed to" only when there is a gateway doing the sealing; otherwise this
+	# header is just whoever answered.
+	p=$(served "$WORK/r1.hdr")
+	[ -n "$p" ] && { [ "$SEALED" = 1 ] && note "sealed to $p" || note "X-Provider: $p"; }
 fi
 
 # ---------------------------------------------------------------------------
@@ -303,4 +373,9 @@ fi
 # ---------------------------------------------------------------------------
 echo
 printf '%d passed, %d failed\n' "$pass" "$fail"
+# Repeated here because it is the line people read: a run against a non-gateway
+# can look entirely green while proving nothing at all about sealing.
+[ "$SEALED" = 1 ] ||
+	printf '%sNOT A SEALED RUN — the target is not a 0G gateway, so nothing above was%s\n%sencrypted end to end. These results describe the model, not the E2EE path.%s\n' \
+		"$RED" "$OFF" "$RED" "$OFF"
 [ "$fail" = 0 ] || exit 1
