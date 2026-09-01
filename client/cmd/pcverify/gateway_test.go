@@ -584,3 +584,37 @@ func TestReportGateway_AppIDCarriesItsSource(t *testing.T) {
 		})
 	}
 }
+
+// When the app_id came from the guess, the report must say WHY the better source did
+// not answer. Without it a wrong app_id and an unreachable resolver look identical:
+// both print a plausible 40-hex value and nothing else.
+func TestReportGateway_AppIDFallbackExplainsItself(t *testing.T) {
+	rep := passing()
+	rep.Code.AppID = "dd79782d9cd5b8243acf468896d4cc81907b1ae8"
+	rep.Code.AppIDSource = "compose_hash prefix"
+	rep.Code.AppIDErr = errors.New("no usable _dstack-app-address record for gw.example.com: " +
+		"_dstack-app-address.gw.example.com: lookup: server misbehaving")
+
+	var out strings.Builder
+	reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", false, false, expectSource{})
+	got := out.String()
+	for _, want := range []string{"(compose_hash prefix)", "server misbehaving", "pass -app-id to pin it"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output does not contain %q:\n%s", want, got)
+		}
+	}
+}
+
+// A discovered or supplied app_id has nothing to explain, and the extra lines would
+// be noise on every healthy run.
+func TestReportGateway_NoFallbackNoteWhenDiscovered(t *testing.T) {
+	rep := passing()
+	rep.Code.AppID = "08f84bbaee1e78db04d3623eb564ad486b41f7fe"
+	rep.Code.AppIDSource = "_dstack-app-address TXT"
+
+	var out strings.Builder
+	reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", false, false, expectSource{})
+	if strings.Contains(out.String(), "pass -app-id") {
+		t.Errorf("a healthy run carries the fallback hint:\n%s", out.String())
+	}
+}

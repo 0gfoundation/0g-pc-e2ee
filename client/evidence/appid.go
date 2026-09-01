@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"strings"
 
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
@@ -136,9 +137,22 @@ func validAppID(s string) bool {
 }
 
 // bareHost reduces a served name to the form used to build DNS queries:
-// lowercase, no trailing dot, no port.
+// lowercase, no scheme, no trailing dot, no port.
+//
+// The scheme has to go first, and not only for tidiness: net.SplitHostPort splits
+// on the last colon and does not validate what it produces, so it reads
+// `https://gw.example.com` as the host `https` — which then becomes a query for
+// `_dstack-app-address.https`, an NXDOMAIN that looks exactly like a deployment with
+// no record. Check normalizes its input before reaching here, so this is the guard
+// for a direct caller of DiscoverAppID (and for the day some other path forgets).
 func bareHost(domain string) string {
 	name := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
+	if strings.Contains(name, "://") {
+		if u, err := url.Parse(name); err == nil && u.Host != "" {
+			name = u.Host
+		}
+	}
+	name = strings.Trim(name, "/")
 	if h, _, err := net.SplitHostPort(name); err == nil {
 		name = h
 	}

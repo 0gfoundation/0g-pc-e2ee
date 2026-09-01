@@ -427,21 +427,28 @@ func appIDLine(code evidence.CodeIdentity) string {
 	return code.AppID + " (" + code.AppIDSource + ")"
 }
 
-// codeValueIndent is the column a code-identity line's value starts at: one mark
-// character, a space, the widest label ("app-compose"), and its padding. Kept beside
-// the Fprintf calls that produce it, because it is those format strings' width.
-const codeValueIndent = "                     "
+// The columns a code-identity line's value starts at. codeValueIndent is a checked
+// line ("✓ app-compose        "); appIDValueIndent is a sub-value line
+// ("  app_id           "). Kept beside the Fprintf calls that produce them, because
+// they are those format strings' widths.
+const (
+	codeValueIndent  = "                     "
+	appIDValueIndent = "                   "
+)
 
-// alignErr renders a multi-line error under the value column instead of against the
-// left margin.
+// alignErr renders a multi-line error under the checked-line value column instead of
+// against the left margin.
 //
-// The app-compose lookup now reports errors.Join over every path it tried — the
-// cloud API, the guest agent, and where the app_id came from — and a joined error's
-// text is one line per cause. Printed raw, the second and third causes fall outside
-// the column and the report stops being scannable exactly when it has the most to
-// say. This does not shorten or reorder anything: every cause is still printed.
-func alignErr(err error) string {
-	return strings.ReplaceAll(err.Error(), "\n", "\n"+codeValueIndent)
+// The app-compose lookup reports errors.Join over every path it tried — the cloud
+// API, the guest agent, and where the app_id came from — and a joined error's text is
+// one line per cause. Printed raw, the second and third causes fall outside the column
+// and the report stops being scannable exactly when it has the most to say. This does
+// not shorten or reorder anything: every cause is still printed.
+func alignErr(err error) string { return alignAt(codeValueIndent, err.Error()) }
+
+// alignAt indents every line of s after the first to the given column.
+func alignAt(indent, s string) string {
+	return strings.ReplaceAll(s, "\n", "\n"+indent)
 }
 
 // reportCodeIdentity prints the mr_config_id → compose_hash → app-compose →
@@ -459,6 +466,16 @@ func reportCodeIdentity(out io.Writer, code evidence.CodeIdentity, expect expect
 	}
 	fmt.Fprintf(out, "%s compose_hash       %x\n", mark(true), code.ComposeHash)
 	fmt.Fprintf(out, "  app_id           %s\n", appIDLine(code))
+	// Why the guess was used, said HERE rather than only inside a later fetch error.
+	// The fallback is silent by nature — it produces a plausible-looking 40-hex value
+	// — so without this line a reader who sees the wrong app_id has nothing to act on,
+	// and a resolver that cannot answer this query looks identical to a deployment
+	// that publishes no record. AppIDErr is set only when a better source was tried
+	// and did not produce one.
+	if code.AppIDErr != nil {
+		fmt.Fprintf(out, "%s%s\n", appIDValueIndent, alignAt(appIDValueIndent, code.AppIDErr.Error()))
+		fmt.Fprintf(out, "%spass -app-id to pin it\n", appIDValueIndent)
+	}
 
 	if code.NoSource {
 		// Discovery was switched off and no bytes were supplied, so the app-compose stage
