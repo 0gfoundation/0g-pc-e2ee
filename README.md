@@ -72,13 +72,14 @@ Two Go modules:
 | [`protocol/`](protocol/) | the wire contract: sealing, response-signature verification, quote parsing, and [`SPEC.md`](protocol/SPEC.md), which is normative. Every participant depends on this one module so none of them can drift from the others |
 | [`client/`](client/) | the client core and its forms. [`cmd/gateway`](client/cmd/gateway) is the 0G-operated, attested form that is actually deployed; [`cmd/pcverify`](client/cmd/pcverify) is the read-only verifier users run. The sidecar and in-process SDK forms exist here but are internal for now |
 
-And three directories that are not modules:
+And four directories that are not modules:
 
 | | |
 |---|---|
 | [`docs/`](docs/) | [`why-this-is-private.md`](docs/why-this-is-private.md) is the product-facing answer and [`verifying-the-gateway.md`](docs/verifying-the-gateway.md) the procedure behind it; [`design/`](docs/design/) for the trust model, the router path, and the request envelope |
 | [`deploy/`](deploy/) | [`phala/`](deploy/phala/) is the CVM deployment — the source of the measured manifest, with the release/`:latest` distinction noted above; [`grafana/`](deploy/grafana/) is the operational dashboard |
 | [`loadtest/`](loadtest/) | capacity measurement for the gateway. Internal |
+| [`scripts/`](scripts/) | functional smoke tests against a deployed gateway — [`smoke-toolcall.sh`](scripts/smoke-toolcall.sh) exercises the tool-call path, the half of the sealed field set a prompt-only test never reaches. Internal |
 
 ## Status
 

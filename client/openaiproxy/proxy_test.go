@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -500,6 +501,147 @@ func TestProxySealsConfiguredExtraField(t *testing.T) {
 	if httpResp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(httpResp.Body)
 		t.Fatalf("got %d: %s", httpResp.StatusCode, b)
+	}
+}
+
+// A full tool-calling round trip. The tests above seal a prompt-only request;
+// this one carries "tools" as well, so both halves of the v1 default sealed set
+// (wire.DefaultSealedFields) are exercised on a request that actually uses them:
+// the tool DEFINITIONS go up sealed, the model's tool_calls come back sealed
+// inside "choices", and the second turn — the assistant's tool_calls plus the
+// role:"tool" result — is sealed the same way, since it all lives in "messages".
+func TestProxyToolCallRoundTrip(t *testing.T) {
+	encPriv, encPub, _ := crypto.GenerateRecipientKey()
+	signer := "0x" + strings.Repeat("d", 40)
+
+	turn := 0
+	broker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var env wire.Request
+		if err := json.Unmarshal(body, &env); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		for _, f := range []string{"messages", "tools"} {
+			if _, leaked := env[f]; leaked {
+				t.Errorf("%q reached the broker in cleartext", f)
+				http.Error(w, f+" not sealed", http.StatusBadRequest)
+				return
+			}
+		}
+		e2ee, err := env.E2EE()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if !slices.Equal(e2ee.SealedFields, []string{"messages", "tools"}) {
+			t.Errorf("sealed_fields = %v, want [messages tools]", e2ee.SealedFields)
+		}
+		// "tool_choice" is NOT in the v1 sealed set (SPEC §5.1), so it stays
+		// cleartext and bound. Asserted rather than assumed: a caller who forces
+		// a named function there hands the router that name, and this is the
+		// test that would notice if the default set ever changed underneath it.
+		if _, ok := env["tool_choice"]; !ok {
+			t.Error(`"tool_choice" should stay cleartext for the router`)
+		}
+		req, err := wire.OpenRequest(encPriv, env)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if !bytes.Contains(req["tools"], []byte("get_current_weather")) {
+			http.Error(w, "tool definitions not recovered in enclave", http.StatusInternalServerError)
+			return
+		}
+		ephPub, err := base64.RawURLEncoding.DecodeString(e2ee.ClientEphPub)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		turn++
+		var choices json.RawMessage
+		if turn == 1 {
+			choices = json.RawMessage(`[{"index":0,"message":{"role":"assistant","content":null,` +
+				`"tool_calls":[{"id":"call_1","type":"function","function":` +
+				`{"name":"get_current_weather","arguments":"{\"city\":\"Beijing\"}"}}]},` +
+				`"finish_reason":"tool_calls"}]`)
+		} else {
+			// The second turn must have carried the assistant's tool_calls and
+			// the tool result up — sealed, since both live inside "messages".
+			if !bytes.Contains(req["messages"], []byte("call_1")) ||
+				!bytes.Contains(req["messages"], []byte(`"role":"tool"`)) {
+				http.Error(w, "tool result not recovered in enclave", http.StatusInternalServerError)
+				return
+			}
+			choices = json.RawMessage(`[{"index":0,"message":{"role":"assistant",` +
+				`"content":"It is 21C in Beijing."},"finish_reason":"stop"}]`)
+		}
+		resp := wire.Response{
+			"id":      json.RawMessage(`"chatcmpl-tools"`),
+			"model":   req["model"],
+			"usage":   json.RawMessage(`{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}`),
+			"choices": choices,
+		}
+		sealed, err := wire.SealResponse(crypto.PublicKey(ephPub), resp, nil)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(sealed)
+	}))
+	defer broker.Close()
+
+	client := core.New(core.Provider{URL: broker.URL, EncPubKey: encPub, SignerAddr: signer})
+	proxy := httptest.NewServer(openaiproxy.Handler(client))
+	defer proxy.Close()
+
+	const tools = `[{"type":"function","function":{"name":"get_current_weather",` +
+		`"description":"Get the current weather in a given city",` +
+		`"parameters":{"type":"object","properties":{"city":{"type":"string"},` +
+		`"unit":{"type":"string","enum":["celsius","fahrenheit"]}},"required":["city"]}}}]`
+
+	post := func(userReq string) map[string]json.RawMessage {
+		t.Helper()
+		httpResp, err := http.Post(proxy.URL+"/v1/chat/completions", "application/json", strings.NewReader(userReq))
+		if err != nil {
+			t.Fatalf("post to proxy: %v", err)
+		}
+		defer httpResp.Body.Close()
+		respBody, _ := io.ReadAll(httpResp.Body)
+		if httpResp.StatusCode != http.StatusOK {
+			t.Fatalf("proxy returned %d: %s", httpResp.StatusCode, respBody)
+		}
+		var resp map[string]json.RawMessage
+		if err := json.Unmarshal(respBody, &resp); err != nil {
+			t.Fatalf("proxy response is not JSON: %v", err)
+		}
+		if _, ok := resp["_e2ee"]; ok {
+			t.Fatal("proxy returned a still-sealed response to the user")
+		}
+		return resp
+	}
+
+	// Turn 1: the model asks for the tool.
+	first := post(`{"model":"gpt-4o","messages":[{"role":"user","content":"weather in Beijing?"}],` +
+		`"tools":` + tools + `,"tool_choice":"auto"}`)
+	if !bytes.Contains(first["choices"], []byte(`"tool_calls"`)) ||
+		!bytes.Contains(first["choices"], []byte("call_1")) {
+		t.Fatalf("user did not get the tool call back in plaintext: %s", first["choices"])
+	}
+
+	// Turn 2: the tool result goes back up and the model answers from it.
+	second := post(`{"model":"gpt-4o","messages":[` +
+		`{"role":"user","content":"weather in Beijing?"},` +
+		`{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function",` +
+		`"function":{"name":"get_current_weather","arguments":"{\"city\":\"Beijing\"}"}}]},` +
+		`{"role":"tool","tool_call_id":"call_1","content":"{\"temp_c\":21}"}],` +
+		`"tools":` + tools + `,"tool_choice":"auto"}`)
+	if !bytes.Contains(second["choices"], []byte("21C in Beijing")) {
+		t.Fatalf("user did not get the final answer in plaintext: %s", second["choices"])
+	}
+	if turn != 2 {
+		t.Fatalf("broker saw %d turns, want 2", turn)
 	}
 }
 
