@@ -22,7 +22,7 @@ func TestClientRefusesAResponseThatDidNotSealTheContent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("keygen: %v", err)
 	}
-	frame, err := wire.SealResponse(ephPub, wire.Response{
+	frame, err := wire.SealResponseNonConforming(ephPub, wire.Response{
 		"created": json.RawMessage(`1700000000`),
 		"choices": json.RawMessage(`[{"message":{"content":"THE MODEL OUTPUT"}}]`),
 	}, []string{"created"})
@@ -53,7 +53,7 @@ func TestClientRefusesAStreamThatStopsSealingTheContent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("keygen: %v", err)
 	}
-	rs, err := wire.NewResponseSealer(ephPub)
+	rs, err := wire.NewResponseSealerNonConforming(ephPub)
 	if err != nil {
 		t.Fatalf("sealer: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestResponseOpenerIsBoundToTheRequestProfile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("keygen: %v", err)
 	}
-	imageFrame, err := wire.SealResponse(ephPub, wire.Response{
+	imageFrame, err := wire.SealResponseFor(wire.ProfileImage, ephPub, wire.Response{
 		"usage": json.RawMessage(`{"output_images":1}`),
 		"data":  json.RawMessage(`[{"b64_json":"aW1n"}]`),
 	}, wire.DefaultResponseSealedFieldsFor(wire.ProfileImage))
@@ -281,10 +281,10 @@ func TestClientRefusesASealedImageResponseWithoutTheBillableCount(t *testing.T) 
 	if err != nil {
 		t.Fatalf("keygen: %v", err)
 	}
-	// Seal through the CHAT profile to model a non-conforming enclave: the wire
-	// format is identical across profiles, so this produces exactly the frame an
-	// enclave that skipped the §7.1 check would emit.
-	frame, err := wire.SealResponse(ephPub, wire.Response{
+	// A sealer with the profile checks dropped, modelling a third-party enclave
+	// that never ran them: the wire format is identical, so this is exactly the
+	// frame one that skipped the §7.1 check would emit.
+	frame, err := wire.SealResponseNonConforming(ephPub, wire.Response{
 		"created": json.RawMessage(`1700000000`),
 		"data":    json.RawMessage(`[{"b64_json":"aW1n"}]`),
 	}, wire.DefaultResponseSealedFieldsFor(wire.ProfileImage))
@@ -345,5 +345,65 @@ func TestConfigTimeValidationRejectsASetThatSealsThePin(t *testing.T) {
 	// Chat pins nothing, so the same field name is an ordinary extra there.
 	if err := wire.ValidateSealedFieldsFor(wire.ProfileChat, []string{"messages", "response_format"}); err != nil {
 		t.Fatalf("chat has no pin to violate: %v", err)
+	}
+}
+
+// §12 lists a sender column for "response sealed set covers the generated
+// content", and for a while only the receiver column was implemented. The gap
+// mattered more than the request-side equivalent: by the time the client refuses
+// such a frame, the generated content has already crossed the wire in cleartext
+// and every intermediary has read it. Refusing to build it is the only place the
+// leak is prevented rather than detected.
+func TestSealerRefusesToShipTheContentInTheClear(t *testing.T) {
+	_, ephPub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	for _, tc := range []struct {
+		name    string
+		profile wire.Profile
+		frame   wire.Response
+		want    string
+	}{
+		{
+			"image response seals the timestamp instead of the images",
+			wire.ProfileImage,
+			wire.Response{
+				"created": json.RawMessage(`1700000000`),
+				"usage":   json.RawMessage(`{"output_images":1}`),
+				"data":    json.RawMessage(`[{"b64_json":"SECRET"}]`),
+			},
+			"data",
+		},
+		{
+			"chat response seals the timestamp instead of the completion",
+			wire.ProfileChat,
+			wire.Response{
+				"created": json.RawMessage(`1700000000`),
+				"choices": json.RawMessage(`[{"message":{"content":"SECRET"}}]`),
+			},
+			"choices",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			frame, err := wire.SealResponseFor(tc.profile, ephPub, tc.frame, []string{"created"})
+			if err == nil {
+				raw, _ := json.Marshal(frame)
+				t.Fatalf("the sealer must refuse this; it put the content on the wire: %s", raw)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error should name the content field, got: %v", err)
+			}
+		})
+	}
+
+	// Sealing a SUPERSET stays legal — only the profile's content field is
+	// mandatory, which is what lets this check run at seal time at all.
+	if _, err := wire.SealResponseFor(wire.ProfileImage, ephPub, wire.Response{
+		"created": json.RawMessage(`1700000000`),
+		"usage":   json.RawMessage(`{"output_images":1}`),
+		"data":    json.RawMessage(`[{"b64_json":"aW1n"}]`),
+	}, []string{"data", "created"}); err != nil {
+		t.Fatalf("a superset of the profile's default must still seal: %v", err)
 	}
 }

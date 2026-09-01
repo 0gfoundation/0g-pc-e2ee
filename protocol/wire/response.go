@@ -139,10 +139,13 @@ func validateResponseSealedFields(fields []string) error {
 // profile's generated content ("choices" for chat, "data" for image) rather than
 // sealing something incidental and shipping the content in the clear.
 //
-// It is the response-side counterpart of ValidateSealedFieldsFor, and OpenFrame
-// calls it on every frame — the client is the party this protects. SealFrame
-// deliberately applies only the profile-independent invariants, since a sealer
-// may legitimately seal a superset of its profile's default.
+// It is the response-side counterpart of ValidateSealedFieldsFor, and BOTH sides
+// call it: SealFrame so a conforming enclave cannot emit such a frame, OpenFrame
+// on every frame so a client can refuse one that was emitted anyway.
+//
+// Sealing a superset is still fine — only spec.responseRequired is mandatory, so
+// any superset satisfies it. That distinction is why the check can run at seal
+// time at all.
 func validateResponseSealedFieldsFor(p Profile, fields []string) error {
 	spec, err := p.spec()
 	if err != nil {
@@ -219,6 +222,22 @@ type ResponseSealer struct {
 	first   bool
 	unbound []string // AAD-excluded fields, applied to every frame
 	profile Profile
+	// nonConforming drops the profile-level seal-time checks so a TEST can build
+	// the frame a hostile or third-party enclave would emit — the very frames the
+	// receiver-side checks exist to refuse, and which a conforming sealer can no
+	// longer produce. Never set outside tests: the only way to set it is
+	// newNonConformingResponseSealer, which lives in export_test.go and so is not
+	// compiled into the package.
+	nonConforming bool
+}
+
+// validateSealedFields applies the profile's response sealed-set rule, or only
+// the profile-independent floor for a deliberately non-conforming test sealer.
+func (rs *ResponseSealer) validateSealedFields(sealedFields []string) error {
+	if rs.nonConforming {
+		return validateResponseSealedFields(sealedFields)
+	}
+	return validateResponseSealedFieldsFor(rs.profile, sealedFields)
 }
 
 // NewResponseSealer sets up chat-profile response sealing — shorthand for
@@ -260,7 +279,13 @@ func (rs *ResponseSealer) SealFrame(frame Response, sealedFields []string, final
 	if sealedFields == nil {
 		sealedFields = defaultResponseSealedFields()
 	}
-	if err := validateResponseSealedFields(sealedFields); err != nil {
+	// The profile's own requirement, not just the profile-independent floor: a
+	// set that seals something incidental instead of the generated content puts
+	// that content in the frame's CLEARTEXT half. The client refuses such a frame,
+	// but by then it has been on the wire and every intermediary has read it —
+	// refusing to build it is the only place the leak is prevented rather than
+	// detected (SPEC §12).
+	if err := rs.validateSealedFields(sealedFields); err != nil {
 		return nil, err
 	}
 	if err := ValidateUnboundFields(rs.unbound, sealedFields); err != nil {
@@ -270,7 +295,7 @@ func (rs *ResponseSealer) SealFrame(frame Response, sealedFields []string, final
 	// Checked against `frame` before anything is removed from it, so a profile
 	// that ever seals part of `usage` would be caught by the sealed-set rules
 	// rather than reading as "absent" here.
-	if final {
+	if final && !rs.nonConforming {
 		if err := validateResponseCleartextFor(rs.profile, frame); err != nil {
 			return nil, err
 		}

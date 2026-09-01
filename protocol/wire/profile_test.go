@@ -431,7 +431,7 @@ func TestUsageCannotBeDeclaredUnboundInAResponse(t *testing.T) {
 	// `model` stays legitimately unbound: the broker declares it so the router can
 	// substitute the alias back, a known trade-off. Refusing it would break the
 	// shipped chat path.
-	if _, err := wire.SealResponse(ephPub, resp, []string{"data"}, "model", "x_0g_trace"); err != nil {
+	if _, err := wire.SealResponseFor(wire.ProfileImage, ephPub, resp, []string{"data"}, "model", "x_0g_trace"); err != nil {
 		t.Fatalf("the broker's own unbound set must stay valid: %v", err)
 	}
 }
@@ -478,7 +478,7 @@ func TestOpenFrameRefusesAFrameThatFreesUsage(t *testing.T) {
 	}
 	// Seal legitimately, then rewrite the frame's declared unbound set the way a
 	// non-conforming enclave would have emitted it in the first place.
-	frame, err := wire.SealResponse(ephPub, wire.Response{
+	frame, err := wire.SealResponseFor(wire.ProfileImage, ephPub, wire.Response{
 		"usage": json.RawMessage(`{"output_images":2}`),
 		"data":  json.RawMessage(`[{"b64_json":"aW1n"}]`),
 	}, []string{"data"}, "model")
