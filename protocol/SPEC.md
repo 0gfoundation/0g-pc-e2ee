@@ -9,8 +9,16 @@ MUST agree on it. Keywords MUST / SHOULD / MAY per RFC 2119.
 > Status: draft. This cut covers the **router path**: provider discovery +
 > attestation binding, **field-level request sealing (E2E confidentiality of the
 > sensitive fields)**, **response sealing**, and **response-signature
-> verification**. Candidate scoring is the router's own internal concern
+> verification**, for the **chat** and **image** request profiles (§5.1).
+> Candidate scoring is the router's own internal concern
 > (surfaced through its candidate API), not part of this protocol.
+>
+> The multipart endpoints (`speech-to-text`, `image-editing`) are **not covered**:
+> their request has no top-level JSON object, so the §5.2 AAD rule (`JCS(envelope)`)
+> and the §8 request binding have no defined input for them. They need their own
+> section; until it exists an implementation MUST reject a sealed request on those
+> endpoints rather than forward it (a body that cannot be parsed as an envelope
+> must never be treated as "not sealed" and passed through in the clear).
 
 ## 1. Scope
 
@@ -195,6 +203,80 @@ The request is the original OpenAI JSON with the **sealed fields removed** and a
   cleartext top-level field (collision → reject). It reconstructs the original
   request = cleartext fields (minus `_e2ee`) merged with the decrypted fields.
 
+#### Request profiles
+
+Different endpoints carry their sensitive payload in different fields. A
+**request profile** names one such request family and fixes its **payload
+field** — the field a sealed envelope of that family MUST cover — plus the v1
+defaults. (Distinct from the *signature* profile of §8/§9, which versions the
+signed-text format.)
+
+| Profile | Endpoint | Payload field (required) | Pinned cleartext field | Default request sealed set | Default response sealed set |
+|---|---|---|---|---|---|
+| `chat`  | `/v1/chat/completions` | `messages` | — | `messages`, `tools` | `choices` |
+| `image` | `/v1/images/generations` | `prompt` | `response_format` = `b64_json` (§7.1) | `prompt` | `data` |
+
+A **pinned cleartext field** is one that stays readable but may hold only one
+value in a sealed request, because the other values direct the server to publish
+the *result* outside the sealed channel. Sealing the payload does not cover this
+— see §7.1 for the image case and why the field is required rather than
+defaulted.
+
+Whatever a profile seals, a response frame MUST leave `usage` and `model`
+cleartext: the router reads them without a key to bill and attribute, so sealing
+one makes the response unbillable rather than merely private.
+
+**Cleartext is only half of it — `usage` MUST also stay BOUND, and a pinned
+cleartext field MUST NOT be declared `unbound` either.** An unbound field is
+excluded from the AAD, so an intermediary may rewrite it, `Open` still succeeds,
+and — because the §8 binding hashes that same AAD — `respH`/`reqH` come out
+byte-identical. Listing `usage` in `unbound_fields` would therefore let a router
+restate the billable count with nothing detecting it, and listing a pinned field
+there would let one flip `response_format` to `url` in transit and hand the
+enclave a request that publishes the images in the clear. `unbound_fields` is the
+one construct that can silently undo every other guarantee in this document, so
+the fields whose *value* must be trusted are excluded from it by rule, not left
+to the §8.2 corollary:
+
+| Field | May be sealed? | May be unbound? |
+|---|---|---|
+| `usage` (response) | no — the router bills on it | **no** — its value must be authenticated |
+| a pinned cleartext field (§5.1) | **no** — sealing it removes it from the cleartext the server reads, which then falls back to its own default | **no** — the pin would hold only at seal time |
+| `model` | no — the router attributes on it | yes — the router rewrites the alias back; the resulting value is *not* authenticated (a known trade-off, see §9 and `DefaultUnboundFields`) |
+| `x_0g_trace` | n/a — router-injected | yes — nothing may trust it (§8.2) |
+
+**Both ends enforce this, and for the "may be unbound" column the RECEIVER is
+the end that matters.** Checking only at seal time stops a conforming
+implementation from misconfiguring itself; it does nothing about the case the
+column exists for — a counterparty that declares the field unbound *on purpose*
+so an intermediary can rewrite it while `Open` and the §8 verification both still
+pass. Concretely:
+
+- A **client** MUST reject a response frame whose `unbound_fields` names a field
+  from the "no" column above — on **every frame**, since a sealer that varies the
+  set could otherwise declare it only late in a stream.
+- An **enclave** MUST reject a request whose pinned cleartext field is missing,
+  wrong-valued, sealed, or declared unbound. It cannot delegate this to the
+  client: a third-party client is under no obligation to run the check.
+
+A request profile is **not carried on the wire and is not a version**: the
+envelope format, crypto suite, AAD rule and §8 binding are identical across
+profiles, and `sealed_fields` is already self-describing, so the enclave's §6
+Open check (decrypted keys == declared `sealed_fields`) needs no profile
+knowledge. Adding a profile is therefore additive (§9), not a `v` bump.
+
+The guard has two independent halves, and both SHOULD be implemented:
+
+- **Client side** — the only half that can stop a leak *before it is sent*: a
+  client MUST NOT build an envelope whose `sealed_fields` omits the profile's
+  payload field. (The reference library refuses to.)
+- **Enclave side** — the half that does not depend on the sender's goodwill: an
+  enclave serving a known endpoint SHOULD reject a sealed request whose
+  `sealed_fields` omits that endpoint's payload field, since a third-party
+  client is under no obligation to use the reference library. This is the same
+  deployment policy as the `messages` one above, and it is what makes the
+  requirement enforceable rather than merely advisory.
+
 ### 5.2 AAD (integrity of the cleartext)
 
 Cleartext fields are **authenticated, not encrypted**, so the router can read but
@@ -252,8 +334,9 @@ enclave MUST reject (no plaintext fallback).
 ## 7. Sealed response envelope (v1)
 
 The response is **field-level, symmetric with the request**: the enclave seals
-only the sensitive fields (v1 default: **`choices`** — the generated content and
-per-choice `finish_reason`), and leaves the rest cleartext so the router can bill
+only the sensitive fields (chat profile: **`choices`** — the generated content
+and per-choice `finish_reason`; image profile: **`data`** — the generated
+images), and leaves the rest cleartext so the router can bill
 on them. Cleartext response fields (`usage`, `model`, `id`, `created`,
 `system_fingerprint`) are:
 - **readable** by the router (no decryption needed),
@@ -306,6 +389,80 @@ data: {"model":"gpt-4o","_e2ee":{"v":1,"enc":"<resp_enc>","sealed_fields":["choi
 data: {"model":"gpt-4o","_e2ee":{"sealed_fields":["choices"],"final":false,"ciphertext":"<...>"}}
 data: {"usage":{...},"_e2ee":{"sealed_fields":["choices"],"final":true,"ciphertext":"<...>"}}
 ```
+
+### 7.1 Image responses
+
+An image response is one non-streaming frame with `data` sealed:
+
+```json
+{
+  "created": 1700000000,
+  "model": "z-image",
+  "usage": { "output_images": 2 },
+  "_e2ee": { "v": 1, "enc": "…", "sealed_fields": ["data"], "final": true, "ciphertext": "…" }
+}
+```
+
+Two constraints are specific to this profile:
+
+- **`usage.output_images` is the billable count and MUST be cleartext.** The
+  router bills per delivered image and cannot count a sealed `data[]`. The
+  enclave writes the count of images it actually delivered (not the requested
+  `n` — a provider may clamp it), bound in the AAD and covered by the §8
+  signature, so the router bills without decrypting and a lying count is caught
+  at verify. An enclave that cannot count them MUST reject rather than seal a
+  response with no verifiable count.
+
+  This is enforced on **both** sides, on the **final** frame (`usage` is a
+  property of the whole response; a streaming profile may withhold it until the
+  last frame). A sealer MUST refuse to emit a final frame that omits the count,
+  and **a client MUST refuse a final frame that omits it** — the receiver half
+  being the one that holds when the enclave is not running this library. The
+  value MUST be a non-negative **whole** number. An explicit `0` is a valid count
+  and is not an omission; `null` is an omission and is not a zero. Fractional and
+  exponent forms (`2.5`, `1e3`) are legal JSON numbers but are NOT valid counts —
+  the rule is a whole number so that a producer cannot seal a value the router
+  will refuse to bill.
+
+  The receiver half exists because omission has no loud failure anywhere else:
+  a router parses such a frame perfectly well, counts zero images, and bills
+  nothing. A missing count and a genuine zero are the same bytes downstream, so
+  no component but the client can tell them apart, and only at open time.
+
+  It lives inside `usage` because that is where a quantity billed on belongs,
+  and is named `output_images` rather than `images` for two reasons: `usage` is
+  an OpenAI-defined object (a token-billed image model such as `gpt-image-1`
+  populates it with `input_tokens` / `output_tokens` / `input_tokens_details`,
+  while a per-image model such as `dall-e-3` omits it entirely), so an
+  extension to it should not squat an unqualified common word; and a future
+  image-editing profile has *input* images, against which a bare `images` would
+  read ambiguously. The `input_`/`output_` prefixes are OpenAI's own convention
+  in this object. Any token fields the model reports are preserved alongside it;
+  only `output_images` is written by the enclave.
+- **A sealed image request MUST carry an explicit `response_format: "b64_json"`.**
+  Not "must not be `url`" — **must be present and must be `b64_json`**. URL mode
+  has the enclave persist the images and serve them from a plain URL, which puts
+  the plaintext images (the generated content itself, a worse leak than the
+  prompt) outside the sealed channel and defeats the profile.
+
+  The field is **required, not defaulted**, because the default is the leak:
+  OpenAI's `response_format` defaults to **`url`** for the DALL·E family (only
+  `gpt-image-1` always returns `b64_json`). So an omitted field is a request to
+  publish the images in the clear, spelled as silence — a rule phrased as "reject
+  `url`" would let it through while looking correct.
+
+  A client MUST refuse to seal a request that violates this, at seal time,
+  before any ciphertext exists (`wire.SealRequestFor` does), and MUST NOT list
+  `response_format` in `unbound_fields` — an unbound pin binds nothing after the
+  seal (§5.1). An enclave MUST reject a violating request it receives, rather
+  than silently downgrading to `b64_json` — the caller asked for a format this
+  mode cannot honour and has to learn that. The enclave check is not redundant
+  with the client one: it is the half that does not depend on the sender.
+
+  The general rule this instantiates: **a cleartext field that directs the server
+  to publish the RESULT outside the sealed channel is part of the profile's
+  contract**, and sealing the payload is not sufficient on its own. A future
+  profile that gains such a field must pin it the same way.
 
 **Client open:** `SetupBaseR(resp_enc, eph_priv, info="0g-pc/v1/resp")`, then
 `Open` each frame **in order** (fail-closed), merge the decrypted `choices` back
@@ -404,10 +561,11 @@ broker signer and the client verifier) and locked by the §10 KATs.
   change to any of those (a different hash, the concat convention, the binding
   artifacts) bumps the profile version (`zg-sig-v1/…` → `zg-sig-v2/…`); a verifier
   MUST reject an unknown scheme fail-closed.
-- **Adding a routing field or a new sealed/unbound field is NOT a version bump** —
-  cleartext fields are additive (unknown keys ignored by the router), `sealed_fields`
-  is self-describing, and unbound fields are outside the signature anyway. Only the
-  crypto/format envelope and the signature profile are versioned.
+- **Adding a routing field, a new sealed/unbound field, or a new request profile
+  (§5.1) is NOT a version bump** — cleartext fields are additive (unknown keys
+  ignored by the router), `sealed_fields` is self-describing, and unbound fields
+  are outside the signature anyway. Only the crypto/format envelope and the
+  signature profile are versioned.
 - Consumers (broker, router, client) update in lockstep with a version bump.
 
 ## 10. Test vectors
@@ -447,3 +605,36 @@ Out of scope for v1 (tracked):
   §5.1 trade-off for high-privacy users).
 - Sender-authenticated HPKE / PSK modes.
 - A server-side freshness field in the signed proof.
+
+## 12. Where each invariant is enforced
+
+Every rule above has a side that can *prevent* a violation and a side that can
+only *detect* one, and they are not the same side. The recurring mistake this
+table exists to stop is implementing a rule where it is convenient — the sender —
+and calling it done, when the threat is a counterparty that violates it on
+purpose and the only party who can refuse is the receiver.
+
+The reading rule: **the sender's check protects a conforming implementation from
+misconfiguring itself; the receiver's check is the one that holds against a
+counterparty that is not conforming.** Where a rule protects one party from the
+other, that party's column is the load-bearing one.
+
+| Invariant | Sender must refuse to build | Receiver must refuse to accept |
+|---|---|---|
+| sealed set covers the request payload field (§5.1) | yes | **yes — enclave** (a third-party client is not obliged to check) |
+| pinned cleartext field: correct value, not sealed, not unbound (§5.1/§7.1) | yes | **yes — enclave** |
+| response sealed set covers the generated content (§7) | yes | **yes — client** (otherwise the content rides in the clear and Open still succeeds) |
+| `usage` not sealed (§7) | yes | client (loud either way: the router cannot bill) |
+| `usage` not unbound (§5.2/§7.1) | yes | **yes — client** (otherwise a rewritten count verifies) |
+| final frame carries the profile's billable cleartext — image: `usage.output_images` (§7.1) | yes | **yes — client** (a router cannot distinguish an omitted count from a zero, so it bills nothing and reports nothing) |
+| decrypted keys == declared `sealed_fields` (§5.1/§6) | by construction | **yes** |
+| no sealed/cleartext collision (§5.1) | by construction | **yes** |
+| envelope `v` / `kem_id` supported (§9) | by construction | **yes** |
+| `signer_addr` is this enclave (§4.4/§6) | client pins | **yes — enclave** |
+| final frame received (§7) | sealer emits | **yes — client** (its absence is a truncation). A non-streaming response is one frame, so the opener requires `final` on it directly. For a stream only the caller&#39;s read loop knows the stream ended, so that half is the caller&#39;s and cannot be delegated to a frame-at-a-time opener. |
+| a receive-side check is not gated on a sender-controlled value (§7.1/§12) | n/a | **yes — client**. Obligations that fall due on the final frame are reachable only if `final` itself is checked; `final` is chosen by the sealer, so a check hung on it is a check the sender can decline. |
+| frame order (§7) | sealer sequence | **yes — client** (the AEAD sequence enforces it) |
+| response is sealed at all | n/a | **yes — client** (a frame with no `_e2ee` is not a sealed response) |
+
+A new rule added to this spec MUST fill in both columns explicitly, including
+when the honest entry is "cannot be checked here, and here is why".

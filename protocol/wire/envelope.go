@@ -4,9 +4,11 @@
 // cleartext (so the router can route/bill on it) but is bound as AEAD
 // associated data, so an intermediary can read but not tamper.
 //
-//   - Request (§5–§6): client seals messages/tools to the provider enc key.
-//   - Response (§7): the enclave seals choices to the client's ephemeral key,
-//     one frame for non-streaming or a sequence of frames for streaming.
+//   - Request (§5–§6): client seals the payload fields to the provider enc key —
+//     messages/tools for chat, prompt for image (see Profile).
+//   - Response (§7): the enclave seals the generated content to the client's
+//     ephemeral key — choices for chat, data for image — one frame for
+//     non-streaming or a sequence of frames for streaming.
 //
 // Contract: broker <-> client (byte-for-byte, per SPEC.md). All AAD is taken
 // over JCS (RFC 8785) canonical JSON so Go/TS/Rust agree byte-for-byte.
@@ -17,6 +19,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"slices"
 
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 	"github.com/gowebpki/jcs"
@@ -31,8 +34,22 @@ const (
 	SealInfo = "0g-pc/v1/seal"
 	// e2eeKey is the reserved top-level key that holds the sealing metadata.
 	e2eeKey = "_e2ee"
-	// fieldMessages is the sensitive field that MUST always be sealed.
+	// fieldMessages is the sensitive field a chat request MUST always seal.
 	fieldMessages = "messages"
+	// fieldPrompt is the sensitive field an image request MUST always seal.
+	fieldPrompt = "prompt"
+	// fieldResponseFormat is the cleartext image field pinned to "b64_json"
+	// (SPEC §7.1) — see profileSpec.pinnedCleartext.
+	fieldResponseFormat = "response_format"
+	// fieldChoices / fieldData are the generated content a sealed RESPONSE frame
+	// MUST cover, per profile (SPEC §7).
+	fieldChoices = "choices"
+	fieldData    = "data"
+	// fieldUsage / fieldOutputImages locate the billable image count a sealed
+	// image response MUST carry in cleartext (SPEC §7.1) — see
+	// profileSpec.requiredResponseCleartext.
+	fieldUsage        = "usage"
+	fieldOutputImages = "output_images"
 	// clientEphPubLen is the byte length of an X25519 public key — the client's
 	// response ephemeral key (SPEC §3 suite).
 	clientEphPubLen = 32
@@ -41,13 +58,228 @@ const (
 // b64 is base64url without padding — the wire encoding for binary fields (§3).
 var b64 = base64.RawURLEncoding
 
-// DefaultSealedFields is the v1 default set of request fields to seal (SPEC
-// §5.1). It returns a fresh slice, so a caller may filter it to the fields
-// actually present or append additional sensitive ones (e.g. "metadata",
-// "user") without mutating the shared default. The default lives here in
-// exactly one place; clients reference it rather than re-listing the names.
+// Profile names a request family (SPEC §5.1). The envelope format, crypto suite
+// and AAD rule are identical across profiles — a profile only fixes WHICH field
+// carries the sensitive payload, so the "you cannot accidentally ship the
+// payload in cleartext" check knows what to require.
+//
+// It is deliberately NOT carried on the wire: `sealed_fields` is already
+// self-describing, and the enclave's Open check (decrypted keys == declared
+// sealed_fields) is profile-independent. The profile is the client-side half of
+// the guard — the only half that can stop a leak before it is sent. An enclave
+// serving a known endpoint enforces the same requirement independently, since a
+// third-party client is under no obligation to use this package.
+type Profile string
+
+const (
+	// ProfileChat is /v1/chat/completions and friends: the payload is "messages".
+	ProfileChat Profile = "chat"
+	// ProfileImage is /v1/images/generations: the payload is "prompt".
+	ProfileImage Profile = "image"
+)
+
+// profileSpec fixes, per profile, the field that MUST be sealed, any CLEARTEXT
+// field pinned to a specific value, and the v1 default sealed sets for a request
+// and for the response it produces.
+type profileSpec struct {
+	// required / responseRequired are the fields that MUST be sealed; request /
+	// response are the v1 DEFAULTS, which may be supersets. Keeping the two
+	// distinct on both sides matters: the request side has always had it right
+	// ("tools" is a default but not mandatory), and reusing one field for both on
+	// the response side would silently mean "every default is mandatory" — fine
+	// while each response default has exactly one member, wrong the moment a
+	// profile defaults to sealing two fields of which only one is the content.
+	required         string   // the request field a sealed envelope MUST cover (§5.1)
+	request          []string // v1 default request sealed set (§5.1)
+	responseRequired string   // the response field a sealed frame MUST cover (§7)
+	response         []string // v1 default response sealed set (§7)
+	// pinnedCleartext maps a cleartext field to the ONLY value a sealed request
+	// of this profile may carry. The field must be present — an absent one is
+	// rejected, never defaulted — because a server-side default is exactly what
+	// this guards against (§7.1). Empty for profiles with no such constraint.
+	pinnedCleartext map[string]string
+	// requiredResponseCleartext are numeric values a sealed FINAL response frame
+	// of this profile MUST carry in cleartext, because the router bills on them
+	// and cannot recover them from the sealed content (§7.1). Empty for profiles
+	// with no such requirement.
+	requiredResponseCleartext []cleartextNumber
+}
+
+// cleartextNumber locates a required cleartext number one level inside a
+// top-level response field — `usage.output_images`, and so far only that. A
+// two-level struct rather than general dotted-path resolution because the one
+// requirement that exists is two levels deep, and a path parser would be more
+// machinery than the rule it enforces.
+type cleartextNumber struct {
+	field string // top-level cleartext response field, e.g. "usage"
+	key   string // key within that object, e.g. "output_images"
+}
+
+func (c cleartextNumber) String() string { return c.field + "." + c.key }
+
+var profiles = map[Profile]profileSpec{
+	ProfileChat: {
+		required:         fieldMessages,
+		request:          []string{"messages", "tools"},
+		responseRequired: fieldChoices,
+		response:         []string{"choices"},
+	},
+	ProfileImage: {
+		// "prompt" is the whole sensitive payload of an image request; "data" —
+		// the generated images — is the whole sensitive payload of the response.
+		// The image COUNT stays cleartext as `usage.output_images` so the router
+		// can bill without decrypting (§7.1), the same trade-off chat makes for
+		// `usage`.
+		required:         fieldPrompt,
+		request:          []string{"prompt"},
+		responseRequired: fieldData,
+		response:         []string{"data"},
+		// response_format must be an EXPLICIT "b64_json" (§7.1). "url" has the
+		// enclave persist the images and serve them from a plain URL, outside
+		// the sealed channel — a worse leak than the prompt, since it is the
+		// generated content itself. Requiring the field rather than merely
+		// banning "url" is the point: OpenAI's own default for the DALL·E
+		// family IS "url", so an omitted field is a request to leak, spelled
+		// as silence.
+		pinnedCleartext: map[string]string{fieldResponseFormat: "b64_json"},
+		// The billable count. Sealing `data` makes the images uncountable from
+		// outside, so §7.1 requires the enclave to restate how many it produced
+		// in cleartext; without this the router's own parse of a sealed frame
+		// yields zero images and bills nothing, silently, forever.
+		requiredResponseCleartext: []cleartextNumber{{field: fieldUsage, key: fieldOutputImages}},
+	},
+}
+
+// Deliberately not set for ProfileChat: chat's billable quantities are the token
+// counts, and a streaming chat response omits `usage` on every frame unless the
+// caller asked for it (stream_options.include_usage). Requiring it here would
+// reject conforming chat streams to enforce a rule §7 does not state.
+
+// validatePinnedCleartextFor enforces a profile's pinned cleartext constraints
+// (§5.1 / §7.1) on a RECEIVED envelope. It is the enclave-side counterpart of
+// the checks SealRequestFor runs before sealing, and the SPEC requires it: the
+// client-side half stops the reference library from BUILDING a violating
+// request, but a third-party client is under no obligation to use it.
+//
+// Unexported because OpenRequestFor is the enclave's entry point and calls this
+// itself. An enclave should not be able to open an envelope without the check
+// having run, which a second, exported way in would allow.
+//
+// It checks all three ways the pin can be defeated:
+//
+//   - the value is wrong, absent, or not a string;
+//   - the field was SEALED, so it is gone from the cleartext the server reads
+//     and the server falls back to its own default (which for the image profile
+//     is `url` — the leak);
+//   - the field was declared UNBOUND, so an intermediary could have rewritten it
+//     in transit and Open would still succeed.
+//
+// A profile with no pinned fields (chat) always passes.
+func validatePinnedCleartextFor(p Profile, env Request) error {
+	spec, err := p.spec()
+	if err != nil {
+		return err
+	}
+	if len(spec.pinnedCleartext) == 0 {
+		return nil
+	}
+	e2ee, err := env.E2EE()
+	if err != nil {
+		return err
+	}
+	if err := validatePinnedNotSealed(spec, e2ee.SealedFields); err != nil {
+		return err
+	}
+	if err := validatePinnedNotUnbound(spec, e2ee.UnboundFields); err != nil {
+		return err
+	}
+	return validatePinnedCleartext(spec, env)
+}
+
+// validatePinnedNotSealed rejects a sealed set that swallows a pinned cleartext
+// field. Sealing it removes it from the cleartext envelope entirely, so the
+// server reads nothing where the pin should be and falls back to its own default
+// — for the image profile, `url`. That makes this the one way to satisfy the
+// VALUE check and still leak: the value is verified against the pre-seal
+// request, and the field is then encrypted away.
+func validatePinnedNotSealed(spec profileSpec, sealed []string) error {
+	for _, f := range sealed {
+		if want, pinned := spec.pinnedCleartext[f]; pinned {
+			return fmt.Errorf("%q is pinned to %q and must stay CLEARTEXT: sealing it removes it from the envelope the server reads, which then falls back to its own default", f, want)
+		}
+	}
+	return nil
+}
+
+// validatePinnedNotUnbound rejects an unbound set that frees a pinned cleartext
+// field. An unbound field is excluded from the AAD, so an intermediary can
+// rewrite it and Open still succeeds — which would let a router flip a pinned
+// `response_format: "b64_json"` to `"url"` in transit and hand the enclave a
+// request that publishes the images in the clear. A pin on an unbound field is
+// a pin in name only: it constrains the value at seal time and nothing after.
+func validatePinnedNotUnbound(spec profileSpec, unbound []string) error {
+	for _, f := range unbound {
+		if want, pinned := spec.pinnedCleartext[f]; pinned {
+			return fmt.Errorf("%q is pinned to %q and cannot be unbound: an unbound field is outside the AAD, so an intermediary could rewrite it in transit and the enclave would accept the result", f, want)
+		}
+	}
+	return nil
+}
+
+// validatePinnedCleartext enforces spec.pinnedCleartext against the request's
+// cleartext fields (§5.1 profiles). It runs at seal time, before any ciphertext
+// exists, so a request that would have leaked is never built — the same reason
+// the sealed-set check lives here rather than only in the enclave.
+func validatePinnedCleartext(spec profileSpec, req Request) error {
+	for field, want := range spec.pinnedCleartext {
+		raw, ok := req[field]
+		if !ok {
+			return fmt.Errorf("sealed request must set %q to %q explicitly (an absent value takes the server's default, which may not be %q)", field, want, want)
+		}
+		var got string
+		if err := json.Unmarshal(raw, &got); err != nil {
+			return fmt.Errorf("sealed request field %q must be the JSON string %q: %w", field, want, err)
+		}
+		if got != want {
+			return fmt.Errorf("sealed request field %q must be %q, got %q", field, want, got)
+		}
+	}
+	return nil
+}
+
+func (p Profile) spec() (profileSpec, error) {
+	s, ok := profiles[p]
+	if !ok {
+		return profileSpec{}, fmt.Errorf("unknown profile %q", p)
+	}
+	return s, nil
+}
+
+// DefaultSealedFields is the v1 default set of chat request fields to seal (SPEC
+// §5.1) — shorthand for DefaultSealedFieldsFor(ProfileChat), kept because chat
+// is by far the common case.
 func DefaultSealedFields() []string {
-	return []string{"messages", "tools"}
+	return DefaultSealedFieldsFor(ProfileChat)
+}
+
+// DefaultSealedFieldsFor is the v1 default set of request fields to seal for a
+// profile (SPEC §5.1). It returns a fresh slice, so a caller may filter it to
+// the fields actually present or append additional sensitive ones (e.g.
+// "metadata", "user") without mutating the shared default. The defaults live
+// here in exactly one place; clients reference them rather than re-listing the
+// names.
+//
+// An unknown profile yields an EMPTY BUT NON-NIL slice, so a caller that passes
+// the result straight into SealRequest/SealRequestFor fails closed with "no
+// sealed fields". Returning nil would instead mean "use the default set" at
+// those call sites and silently seal the chat fields for a profile that does not
+// exist. (Same reasoning as the client core's own presence filter.)
+func DefaultSealedFieldsFor(p Profile) []string {
+	s, err := p.spec()
+	if err != nil {
+		return []string{}
+	}
+	return slices.Clone(s.request)
 }
 
 // DefaultUnboundFields is the v1 default set of cleartext request fields excluded
@@ -73,21 +305,44 @@ func DefaultUnboundFields() []string {
 	return []string{"model"}
 }
 
-// ValidateSealedFields enforces the invariants on a sealed-field set: non-empty,
-// no duplicates, and "messages" present. Leaving the prompt cleartext defeats
-// the purpose, so any sealed envelope MUST cover "messages".
+// ValidateSealedFields enforces the chat-profile invariants on a sealed-field
+// set — shorthand for ValidateSealedFieldsFor(ProfileChat, fields).
+func ValidateSealedFields(fields []string) error {
+	return ValidateSealedFieldsFor(ProfileChat, fields)
+}
+
+// ValidateSealedFieldsFor enforces the invariants on a sealed-field set for a
+// profile: non-empty, no duplicates, the profile's payload field present
+// ("messages" for chat, "prompt" for image), and no pinned cleartext field
+// swallowed by the set. Leaving the payload cleartext defeats the purpose, so
+// any sealed envelope MUST cover it.
 //
-// SealRequest calls this fail-closed per request, so a client cannot build an
-// envelope that silently leaves the prompt exposed — the only place a leak can
+// SealRequestFor calls this fail-closed per request, so a client cannot build an
+// envelope that silently leaves the payload exposed — the only place a leak can
 // actually be *prevented*. It is also exported so a caller can validate an
 // operator-supplied sealed set up front (e.g. the sidecar's -seal-fields flag)
 // and fail fast instead of erroring on every request.
-func ValidateSealedFields(fields []string) error {
+//
+// That second use is why the pinned check belongs here and not only in
+// SealRequestFor. The two rules answer the same question — "is this set of field
+// names valid for this profile?" — and depend on nothing but (profile, fields),
+// so an operator validating `-seal-fields` up front must see both verdicts. With
+// the pinned half elsewhere, `prompt,response_format` passed startup validation
+// clean and then failed 100% of requests: the exact failure mode the fail-fast
+// call exists to prevent.
+func ValidateSealedFieldsFor(p Profile, fields []string) error {
+	spec, err := p.spec()
+	if err != nil {
+		return err
+	}
 	if len(fields) == 0 {
 		return fmt.Errorf("no sealed fields")
 	}
+	if err := validatePinnedNotSealed(spec, fields); err != nil {
+		return err
+	}
 	seen := make(map[string]struct{}, len(fields))
-	hasMessages := false
+	hasRequired := false
 	for _, f := range fields {
 		if f == "" {
 			return fmt.Errorf("empty sealed field name")
@@ -99,12 +354,12 @@ func ValidateSealedFields(fields []string) error {
 			return fmt.Errorf("duplicate sealed field %q", f)
 		}
 		seen[f] = struct{}{}
-		if f == fieldMessages {
-			hasMessages = true
+		if f == spec.required {
+			hasRequired = true
 		}
 	}
-	if !hasMessages {
-		return fmt.Errorf("sealed fields must include %q", fieldMessages)
+	if !hasRequired {
+		return fmt.Errorf("%s-profile sealed fields must include %q", p, spec.required)
 	}
 	return nil
 }
@@ -162,22 +417,48 @@ type E2EE struct {
 // Values are kept as raw JSON so unknown fields pass through untouched.
 type Request map[string]json.RawMessage
 
-// SealRequest builds the §5 request envelope. It removes sealedFields from req,
-// JCS-seals their values to encPub, and returns a new Request carrying the
+// SealRequest builds the §5 request envelope for the chat profile — shorthand
+// for SealRequestFor(ProfileChat, …).
+func SealRequest(encPub crypto.PublicKey, req Request, sealedFields []string, signerAddr string, clientEphPub []byte, unboundFields ...string) (Request, error) {
+	return SealRequestFor(ProfileChat, encPub, req, sealedFields, signerAddr, clientEphPub, unboundFields...)
+}
+
+// SealRequestFor builds the §5 request envelope. It removes sealedFields from
+// req, seals their values to encPub, and returns a new Request carrying the
 // cleartext fields plus the `_e2ee` object.
 //
+//   - profile:      the request family (ProfileChat, ProfileImage); it fixes only
+//     which field MUST be sealed — the wire format is identical, and the profile
+//     is not carried on the wire (`sealed_fields` is self-describing).
 //   - encPub:       the provider enc key (verified out of a quote by the caller)
-//   - sealedFields: fields to seal; nil uses the v1 default (messages, tools).
-//     "messages" is required and each field MUST be present in req.
+//   - sealedFields: fields to seal; nil uses the profile's v1 default. The
+//     profile's payload field is required and each field MUST be present in req.
 //   - signerAddr:   the provider's on-chain TEE signer address ("0x…"), the pin
 //   - clientEphPub: the client's response ephemeral X25519 public key (raw bytes)
 //   - unboundFields: optional cleartext fields excluded from the AAD (§5.2), i.e.
 //     ones an intermediary may add/modify. Empty (the default) binds everything.
-func SealRequest(encPub crypto.PublicKey, req Request, sealedFields []string, signerAddr string, clientEphPub []byte, unboundFields ...string) (Request, error) {
-	if sealedFields == nil {
-		sealedFields = DefaultSealedFields()
+func SealRequestFor(profile Profile, encPub crypto.PublicKey, req Request, sealedFields []string, signerAddr string, clientEphPub []byte, unboundFields ...string) (Request, error) {
+	spec, err := profile.spec()
+	if err != nil {
+		return nil, err
 	}
-	if err := ValidateSealedFields(sealedFields); err != nil {
+	if sealedFields == nil {
+		sealedFields = DefaultSealedFieldsFor(profile)
+	}
+	if err := ValidateSealedFieldsFor(profile, sealedFields); err != nil {
+		return nil, err
+	}
+	// Sealing the payload is not enough on its own: a cleartext field can direct
+	// the server to publish the RESULT outside the sealed channel (§7.1). Check
+	// the value AND that it will still be readable and authenticated when it gets
+	// there — a pin that is sealed away, or that an intermediary can rewrite, is
+	// not a pin. ValidateSealedFieldsFor above already rejected a set that seals
+	// the pin away; validatePinnedCleartextFor runs all three checks together on
+	// the receiving side.
+	if err := validatePinnedNotUnbound(spec, unboundFields); err != nil {
+		return nil, err
+	}
+	if err := validatePinnedCleartext(spec, req); err != nil {
 		return nil, err
 	}
 	if err := ValidateUnboundFields(unboundFields, sealedFields); err != nil {
@@ -262,12 +543,56 @@ func SealRequest(encPub crypto.PublicKey, req Request, sealedFields []string, si
 	return env, nil
 }
 
+// OpenRequestFor is the enclave's entry point: it runs every profile check the
+// receiver is responsible for, then opens the envelope. It is the request-side
+// counterpart of OpenResponseFor, and exists for the same reason — a check the
+// caller has to remember to make separately is a check that eventually is not
+// made.
+//
+// SPEC §12 puts a bolded "receiver must refuse" against both of these, on the
+// reasoning that a third-party CLIENT is not obliged to run the sender-side
+// half. The same reasoning applies to a third-party ENCLAVE, and to an enclave
+// living in another repository: neither should have to know that two separate
+// validators exist and must be called in the right order before OpenRequest.
+// Prefer this over calling OpenRequest directly.
+//
+// The checks, in order, all before any decryption:
+//
+//   - ValidateSealedFieldsFor — the sealed set covers this profile's payload
+//     field, so the request did not arrive with its prompt in the clear;
+//   - validatePinnedCleartextFor — the pinned cleartext field is present, has
+//     the required value, and was neither sealed away nor declared unbound.
+//
+// Then OpenRequest's own fail-closed checks (version, suite, AEAD, decrypted
+// keys == declared sealed_fields, no collision with cleartext).
+func OpenRequestFor(profile Profile, priv crypto.PrivateKey, env Request) (Request, error) {
+	if _, err := profile.spec(); err != nil {
+		return nil, err
+	}
+	e2ee, err := env.E2EE()
+	if err != nil {
+		return nil, err
+	}
+	if err := ValidateSealedFieldsFor(profile, e2ee.SealedFields); err != nil {
+		return nil, err
+	}
+	if err := validatePinnedCleartextFor(profile, env); err != nil {
+		return nil, err
+	}
+	return OpenRequest(priv, env)
+}
+
 // OpenRequest reverses SealRequest with the recipient private key (SPEC §6): it
 // recomputes the AAD, opens the sealed object, checks the decrypted keys equal
 // sealed_fields and do not collide with cleartext fields, and returns the
 // reconstructed original request (cleartext ∪ decrypted). It does NOT enforce
 // signer_addr == the enclave's own signer address; that policy check belongs to
 // the caller (the broker), which knows its own identity — read it via E2EE().
+//
+// It also does NOT apply the profile checks: it cannot, since it is not told
+// which profile the request belongs to. An enclave that knows the endpoint it
+// serves should call OpenRequestFor instead, which runs them and then delegates
+// here.
 func OpenRequest(priv crypto.PrivateKey, env Request) (Request, error) {
 	e2ee, err := env.E2EE()
 	if err != nil {

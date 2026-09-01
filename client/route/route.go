@@ -84,6 +84,15 @@ const (
 	// accepts — not the model modality on /v1/models. A chat-completions proxy
 	// always previews "chatbot".
 	DefaultServiceType = "chatbot"
+	// ServiceTypeTextToImage is the preview service type for
+	// /v1/images/generations. Named here so a caller setting WithServiceType gets
+	// the string the router expects and, with it, the right sensitive-field set
+	// (see sensitiveFieldsForServiceType).
+	ServiceTypeTextToImage = "text-to-image"
+	// serviceTypeAnthropicChat is the router's service type for /v1/messages. It
+	// has no sealed path yet (the preview API rejects it), but it maps to the chat
+	// profile here so the payload set is already right if one lands.
+	serviceTypeAnthropicChat = "anthropic-chat"
 	// defaultPubkeyTTL bounds how long a fetched provider enc key is reused
 	// before re-fetching, amortizing the extra round trip the route path adds
 	// (docs/design/router-e2e.md "extra round trip"). Providers rotate keys
@@ -175,8 +184,11 @@ type Router struct {
 	providersURL    string
 	serviceType     string
 	sensitiveFields map[string]struct{}
-	http            *http.Client
-	cache           *pubkeyCache
+	// sensitiveFieldsSet records that WithSensitiveFields was passed, so New does
+	// not overwrite an explicit set with the service type's default.
+	sensitiveFieldsSet bool
+	http               *http.Client
+	cache              *pubkeyCache
 	// verifier, when non-nil, switches candidate materialization from trusting
 	// the router-supplied pubkey endpoint to fetching and DCAP-verifying the
 	// provider's attestation quote, sourcing enc_pub/signer from the verified
@@ -256,17 +268,59 @@ func WithHTTPClient(h *http.Client) Option {
 	}
 }
 
-// WithSensitiveFields sets the request fields stripped before the preview call,
-// so they never reach the (untrusted) router in cleartext. Default is
-// wire.DefaultSealedFields; keep it in sync with the client's seal set so
-// exactly the sealed fields are withheld from routing.
+// WithSensitiveFields overrides the request fields stripped before the preview
+// call, so they never reach the (untrusted) router in cleartext.
+//
+// It is rarely needed: the default is derived from the service type (see
+// sensitiveFieldsForServiceType), so setting WithServiceType alone already
+// withholds the right payload. Use this only to withhold MORE than the profile's
+// sealed set — e.g. an operator who also seals "user" or "metadata". Passing a
+// set that omits a payload field re-opens the leak this default exists to close,
+// so keep it a superset of the client's own seal set.
+// An empty or nil set is a NO-OP, matching WithServiceType and WithHTTPClient,
+// which also ignore their zero values. Honouring it would mean "withhold
+// nothing" — every field of every request, payload included, sent to the router
+// — which is not a configuration anyone wants and is worse than the default it
+// would be replacing. A caller that means "withhold nothing" has no business
+// using this package.
 func WithSensitiveFields(fields []string) Option {
 	return func(r *Router) {
+		if len(fields) == 0 {
+			return
+		}
 		set := make(map[string]struct{}, len(fields))
 		for _, f := range fields {
 			set[f] = struct{}{}
 		}
 		r.sensitiveFields = set
+		r.sensitiveFieldsSet = true
+	}
+}
+
+// sensitiveFieldsForServiceType returns the fields to withhold from the preview
+// for a service type, derived from the wire profile that service type belongs to
+// — so a caller who sets only WithServiceType cannot end up previewing an image
+// request with its `prompt` in the clear.
+//
+// The two used to be independent options that had to be kept in sync by hand,
+// with the chat set hardcoded as the default. That is a leak waiting to happen:
+// the preview body is everything NOT in this set, so a stale set does not fail,
+// it silently ships the payload to the router.
+//
+// An UNRECOGNIZED service type gets the union of every profile's sealed set.
+// Over-stripping is the safe direction — it can only cost routing fidelity (the
+// router ranks on fewer fields), while under-stripping leaks — and a service
+// type this package does not know is exactly the case where guessing narrow
+// would be wrong.
+func sensitiveFieldsForServiceType(t string) []string {
+	switch t {
+	case DefaultServiceType, serviceTypeAnthropicChat:
+		return wire.DefaultSealedFieldsFor(wire.ProfileChat)
+	case ServiceTypeTextToImage:
+		return wire.DefaultSealedFieldsFor(wire.ProfileImage)
+	default:
+		return append(wire.DefaultSealedFieldsFor(wire.ProfileChat),
+			wire.DefaultSealedFieldsFor(wire.ProfileImage)...)
 	}
 }
 
@@ -374,7 +428,6 @@ func New(routerURL string, opts ...Option) *Router {
 		completionsURL:   base + completionsPath,
 		providersURL:     base + providersPath,
 		serviceType:      DefaultServiceType,
-		sensitiveFields:  sliceToSet(wire.DefaultSealedFields()),
 		http:             &http.Client{Transport: tr},
 		previewAttemptTO: previewAttemptTimeout,
 		previewBudgetTO:  previewRetryBudget,
@@ -384,6 +437,12 @@ func New(routerURL string, opts ...Option) *Router {
 	}
 	for _, o := range opts {
 		o(r)
+	}
+	// Resolved AFTER the options, not as a struct default, so it tracks whatever
+	// service type they settled on regardless of the order they were passed in.
+	// An explicit WithSensitiveFields still wins.
+	if !r.sensitiveFieldsSet {
+		r.sensitiveFields = sliceToSet(sensitiveFieldsForServiceType(r.serviceType))
 	}
 	return r
 }

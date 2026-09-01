@@ -3,6 +3,7 @@ package wire
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
@@ -31,12 +32,81 @@ type ResponseE2EE struct {
 	Ciphertext    string   `json:"ciphertext"` // base64url; excluded from the AAD
 }
 
-// defaultResponseSealedFields is the v1 default set of response fields to seal
-// (SPEC §7): the generated content.
-func defaultResponseSealedFields() []string { return []string{"choices"} }
+// DefaultResponseSealedFieldsFor is the v1 default set of response fields to
+// seal for a profile (SPEC §7): the generated content — "choices" for chat,
+// "data" (the images) for image. Everything else in the frame stays cleartext so
+// the router can bill on it without decrypting.
+//
+// An unknown profile yields an EMPTY BUT NON-NIL slice, so a caller that passes
+// the result straight into SealFrame fails closed with "no sealed fields".
+// Returning nil would instead be read by SealFrame as "use the default", sending
+// it back here for a profile that does not exist.
+//
+// The enclave passes this explicitly per service type; it is exported so the
+// broker names the field in one place rather than re-listing it.
+func DefaultResponseSealedFieldsFor(p Profile) []string {
+	s, err := p.spec()
+	if err != nil {
+		return []string{}
+	}
+	return slices.Clone(s.response)
+}
 
-// validateResponseSealedFields requires a non-empty set with no duplicates.
-// Unlike the request there is no single mandatory field pinned in v1.
+// mustStayCleartextInResponse are response fields a sealed frame MUST NOT seal,
+// whatever the profile: the router reads them WITHOUT a key to bill and to
+// attribute the response, so sealing one does not merely inconvenience it — it
+// makes the response unbillable (SPEC §7).
+//
+// This is a floor for every profile rather than a per-profile list because the
+// reason is the same everywhere: the router's inputs. `usage` covers both the
+// chat token counts and the image `usage.output_images` (§7.1).
+var mustStayCleartextInResponse = []string{"usage", "model"}
+
+// mustStayBoundInResponse are cleartext response fields that may never be listed
+// in `unbound_fields`. Cleartext is not the whole requirement: an unbound field
+// is excluded from the seal AAD, so an intermediary can rewrite it, the client's
+// Open still succeeds, AND the §8 binding — which hashes that same AAD — comes
+// out byte-identical. A router could therefore restate `usage.output_images`
+// from 2 to 99 with nothing anywhere detecting it. "The router bills on it
+// without decrypting, and a lying count is caught at verify" (§7.1) is only true
+// while `usage` is bound.
+//
+// Deliberately NOT the same list as mustStayCleartextInResponse: `model` is on
+// that one but not this one. The broker declares `model` unbound on purpose, so
+// the router can substitute the served model back to the alias the client asked
+// for, and the resulting un-authenticated `model` is a known, documented
+// trade-off (see DefaultUnboundFields' TODO(model-binding)). `usage` has no such
+// justification — nothing downstream needs to rewrite it.
+var mustStayBoundInResponse = []string{"usage"}
+
+// validateResponseUnboundFields rejects an unbound set that would strip the
+// authentication from a field the §8 signature must cover.
+//
+// It is enforced on BOTH sides, and the receiving side is the one that matters.
+// Checking only at seal time protects a conforming enclave from misconfiguring
+// itself; it does nothing about the actual threat, which is an enclave that
+// declares `usage` unbound on purpose so a router can restate the billable count
+// with Open and the §8 verification both still passing. Only the client can
+// refuse that, so OpenFrame calls this on every frame — per frame, not once,
+// because a sealer that varies the set could otherwise declare it late in a
+// stream.
+//
+// Not profile-parameterized, unlike validateResponseSealedFieldsFor: WHAT a
+// profile seals differs, but which fields must stay authenticated does not, and
+// a per-profile signature would imply a latitude no profile actually has.
+func validateResponseUnboundFields(unbound []string) error {
+	for _, f := range unbound {
+		if slices.Contains(mustStayBoundInResponse, f) {
+			return fmt.Errorf("%q must stay bound: an unbound field is outside the seal AAD and the §8 binding, so an intermediary could rewrite it undetected", f)
+		}
+	}
+	return nil
+}
+
+// validateResponseSealedFields requires a non-empty set with no duplicates, and
+// no field the router must be able to read. Unlike the request there is no
+// single mandatory field pinned in v1 — profiles differ in WHAT they seal, but
+// agree on what they may not.
 func validateResponseSealedFields(fields []string) error {
 	if len(fields) == 0 {
 		return fmt.Errorf("no sealed fields")
@@ -49,10 +119,106 @@ func validateResponseSealedFields(fields []string) error {
 		if f == e2eeKey {
 			return fmt.Errorf("%q is reserved and cannot be a sealed field", e2eeKey)
 		}
+		if slices.Contains(mustStayCleartextInResponse, f) {
+			return fmt.Errorf("%q must stay cleartext so the router can bill and attribute without decrypting", f)
+		}
 		if _, dup := seen[f]; dup {
 			return fmt.Errorf("duplicate sealed field %q", f)
 		}
 		seen[f] = struct{}{}
+	}
+	return nil
+}
+
+// validateResponseSealedFieldsFor checks a response sealed set against a
+// profile: the shared invariants above, plus that it actually covers the
+// profile's generated content ("choices" for chat, "data" for image) rather than
+// sealing something incidental and shipping the content in the clear.
+//
+// It is the response-side counterpart of ValidateSealedFieldsFor, and BOTH sides
+// call it: SealFrame so a conforming enclave cannot emit such a frame, OpenFrame
+// on every frame so a client can refuse one that was emitted anyway.
+//
+// Sealing a superset is still fine — only spec.responseRequired is mandatory, so
+// any superset satisfies it. That distinction is why the check can run at seal
+// time at all.
+func validateResponseSealedFieldsFor(p Profile, fields []string) error {
+	spec, err := p.spec()
+	if err != nil {
+		return err
+	}
+	if err := validateResponseSealedFields(fields); err != nil {
+		return err
+	}
+	// Only the profile's CONTENT field is mandatory — not every member of its
+	// default set. A caller may legitimately seal a superset, and a future
+	// profile whose default covers something besides the content must not make
+	// that extra field's absence a hard failure.
+	if !slices.Contains(fields, spec.responseRequired) {
+		return fmt.Errorf("%s-profile response sealed fields must include %q", p, spec.responseRequired)
+	}
+	return nil
+}
+
+// validateResponseCleartextFor enforces a profile's required cleartext response
+// values (§7.1) on a FINAL frame: for the image profile, that it restates the
+// billable count as a non-negative `usage.output_images`.
+//
+// Sealing `data` makes the images uncountable from outside the enclave, so this
+// number is the only thing the router has to bill on. Its absence is not a loud
+// failure downstream — the router parses the sealed frame perfectly well and
+// arrives at zero images — so nothing anywhere reports it, and every sealed
+// image request is served free. That is why the requirement is checked here
+// rather than left to the biller: a missing count and a genuine zero are
+// indistinguishable once the frame has left.
+//
+// Enforced on BOTH sides. At seal time so a conforming enclave cannot ship a
+// frame it will not be paid for, and at open time so a client can tell that its
+// counterparty stated a count at all — the receiver half being the one that
+// holds when the enclave is not conforming.
+//
+// FINAL frames only: `usage` is a property of the whole response, and a
+// streaming profile legitimately omits it until the last frame. A profile with
+// no such requirement (chat) always passes.
+func validateResponseCleartextFor(p Profile, frame Response) error {
+	spec, err := p.spec()
+	if err != nil {
+		return err
+	}
+	for _, req := range spec.requiredResponseCleartext {
+		raw, ok := frame[req.field]
+		if !ok {
+			return fmt.Errorf("sealed %s response must carry cleartext %s: the sealed content cannot be billed on, and an absent count is indistinguishable from zero", p, req)
+		}
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			return fmt.Errorf("sealed %s response field %q must be a JSON object carrying %s: %w", p, req.field, req, err)
+		}
+		v, ok := obj[req.key]
+		if !ok {
+			return fmt.Errorf("sealed %s response must carry cleartext %s: the sealed content cannot be billed on, and an absent count is indistinguishable from zero", p, req)
+		}
+		// A POINTER, and an integer one. Decoding JSON `null` into a bare numeric
+		// leaves the variable untouched and returns no error, so `null` read as a
+		// perfectly good 0 — the one value §7.1 spells out as legitimate, which is
+		// why it slipped past a check whose whole job is telling a real count from
+		// the absence of one. A pointer is nil for `null` and only for `null`.
+		//
+		// int64 rather than float64 so this is exactly as strict as the router's
+		// own `*int` parse. The protocol package must not accept a count its
+		// consumer will reject: that would let a conforming enclave seal a response
+		// (2.5 images, 1e3) the router then refuses to bill, turning a spec
+		// question into a 502 nobody can act on.
+		var n *int64
+		if err := json.Unmarshal(v, &n); err != nil {
+			return fmt.Errorf("sealed %s response %s must be a whole number: %w", p, req, err)
+		}
+		if n == nil {
+			return fmt.Errorf("sealed %s response %s is null: a count must be a whole number, and null is the absence of one, not a zero", p, req)
+		}
+		if *n < 0 {
+			return fmt.Errorf("sealed %s response %s must not be negative, got %d", p, req, *n)
+		}
 	}
 	return nil
 }
@@ -65,33 +231,89 @@ type ResponseSealer struct {
 	enc     string // base64url; emitted on the first frame only
 	first   bool
 	unbound []string // AAD-excluded fields, applied to every frame
+	profile Profile
+	// nonConforming drops the profile-level seal-time checks so a TEST can build
+	// the frame a hostile or third-party enclave would emit — the very frames the
+	// receiver-side checks exist to refuse, and which a conforming sealer can no
+	// longer produce. Never set outside tests: the only way to set it is
+	// newNonConformingResponseSealer, which lives in export_test.go and so is not
+	// compiled into the package.
+	nonConforming bool
 }
 
-// NewResponseSealer sets up response sealing to the client's ephemeral public
-// key (carried in the request's _e2ee.client_eph_pub). unboundFields are the
-// cleartext frame fields to exclude from the AAD (§5.2 / D5) — the same set is
-// applied to every frame; empty binds everything. They are validated against
-// each frame's sealed set in SealFrame.
+// validateSealedFields applies the profile's response sealed-set rule, or only
+// the profile-independent floor for a deliberately non-conforming test sealer.
+func (rs *ResponseSealer) validateSealedFields(sealedFields []string) error {
+	if rs.nonConforming {
+		return validateResponseSealedFields(sealedFields)
+	}
+	return validateResponseSealedFieldsFor(rs.profile, sealedFields)
+}
+
+// NewResponseSealer sets up chat-profile response sealing — shorthand for
+// NewResponseSealerFor(ProfileChat, …).
 func NewResponseSealer(clientEphPub crypto.PublicKey, unboundFields ...string) (*ResponseSealer, error) {
+	return NewResponseSealerFor(ProfileChat, clientEphPub, unboundFields...)
+}
+
+// NewResponseSealerFor sets up response sealing to the client's ephemeral public
+// key (carried in the request's _e2ee.client_eph_pub), for the profile the
+// request used. unboundFields are the cleartext frame fields to exclude from the
+// AAD (§5.2 / D5) — the same set is applied to every frame; empty binds
+// everything. They are validated against each frame's sealed set in SealFrame.
+//
+// The profile is what lets SealFrame check the final frame against §7.1's
+// required cleartext (see validateResponseCleartextFor); it is the send-side
+// mirror of NewResponseOpenerFor and, like it, is not carried on the wire.
+func NewResponseSealerFor(profile Profile, clientEphPub crypto.PublicKey, unboundFields ...string) (*ResponseSealer, error) {
+	if _, err := profile.spec(); err != nil {
+		return nil, err
+	}
+	// Before any key material: an unbound set that frees a field the signature
+	// must cover would produce frames that verify no matter what an intermediary
+	// does to them.
+	if err := validateResponseUnboundFields(unboundFields); err != nil {
+		return nil, err
+	}
 	enc, s, err := crypto.SetupSender(clientEphPub, []byte(RespInfo))
 	if err != nil {
 		return nil, err
 	}
-	return &ResponseSealer{sealer: s, enc: b64.EncodeToString(enc), first: true, unbound: unboundFields}, nil
+	return &ResponseSealer{sealer: s, enc: b64.EncodeToString(enc), first: true, unbound: unboundFields, profile: profile}, nil
 }
 
-// SealFrame seals one frame: it removes sealedFields (nil → the v1 default,
-// "choices") from frame, seals their values, and returns the frame carrying
-// `_e2ee`. final marks the last frame.
+// SealFrame seals one frame: it removes sealedFields (nil → this sealer's
+// profile's v1 default) from frame, seals their values, and returns the frame
+// carrying `_e2ee`. final marks the last frame.
 func (rs *ResponseSealer) SealFrame(frame Response, sealedFields []string, final bool) (Response, error) {
 	if sealedFields == nil {
-		sealedFields = defaultResponseSealedFields()
+		// THIS sealer's profile, not chat's. Reading the default from a fixed
+		// profile is what DefaultResponseSealedFieldsFor's own comment warns about,
+		// and it does not take an unknown profile to go wrong: it made nil mean
+		// "seal choices" for every profile, so the documented "nil → the profile's
+		// default" held only for chat.
+		sealedFields = DefaultResponseSealedFieldsFor(rs.profile)
 	}
-	if err := validateResponseSealedFields(sealedFields); err != nil {
+	// The profile's own requirement, not just the profile-independent floor: a
+	// set that seals something incidental instead of the generated content puts
+	// that content in the frame's CLEARTEXT half. The client refuses such a frame,
+	// but by then it has been on the wire and every intermediary has read it —
+	// refusing to build it is the only place the leak is prevented rather than
+	// detected (SPEC §12).
+	if err := rs.validateSealedFields(sealedFields); err != nil {
 		return nil, err
 	}
 	if err := ValidateUnboundFields(rs.unbound, sealedFields); err != nil {
 		return nil, err
+	}
+	// The last frame is where the response's billable totals are due (§7.1).
+	// Checked against `frame` before anything is removed from it, so a profile
+	// that ever seals part of `usage` would be caught by the sealed-set rules
+	// rather than reading as "absent" here.
+	if final && !rs.nonConforming {
+		if err := validateResponseCleartextFor(rs.profile, frame); err != nil {
+			return nil, err
+		}
 	}
 
 	sealedObj := make(map[string]json.RawMessage, len(sealedFields))
@@ -148,12 +370,33 @@ func (rs *ResponseSealer) SealFrame(frame Response, sealedFields []string, final
 
 // ResponseOpener opens a sequence of response frames in seal order.
 type ResponseOpener struct {
-	opener *crypto.Opener
+	opener  *crypto.Opener
+	profile Profile
 }
 
 // NewResponseOpener builds the receive context from the first frame (which
 // carries enc) and the client's ephemeral private key.
 func NewResponseOpener(clientEphPriv crypto.PrivateKey, firstFrame Response) (*ResponseOpener, error) {
+	return NewResponseOpenerFor(ProfileChat, clientEphPriv, firstFrame)
+}
+
+// NewResponseOpenerFor builds the receive context and binds it to the profile
+// the client's REQUEST used, so every frame can be checked against what that
+// profile requires the response to seal.
+//
+// That check is the reason this variant exists. Without it a client cannot tell
+// a protected response from an unprotected one: an enclave may declare
+// `sealed_fields: ["created"]`, seal the timestamp, and ship `choices` in the
+// CLEAR. Open succeeds (the decrypted keys do match the declared set), the
+// content merges back exactly as the caller expects, and the §8 signature
+// verifies too — the cleartext content is inside the AAD the binding hashes. The
+// caller gets its answer, correct and complete, having no way to learn that
+// every intermediary read it. It is the response-side twin of a request whose
+// sealed set omits the prompt, and it is silent in the same way.
+func NewResponseOpenerFor(profile Profile, clientEphPriv crypto.PrivateKey, firstFrame Response) (*ResponseOpener, error) {
+	if _, err := profile.spec(); err != nil {
+		return nil, err
+	}
 	e2ee, err := firstFrame.E2EE()
 	if err != nil {
 		return nil, err
@@ -172,7 +415,7 @@ func NewResponseOpener(clientEphPriv crypto.PrivateKey, firstFrame Response) (*R
 	if err != nil {
 		return nil, err
 	}
-	return &ResponseOpener{opener: o}, nil
+	return &ResponseOpener{opener: o, profile: profile}, nil
 }
 
 // OpenFrame opens one frame and returns it reconstructed (cleartext ∪
@@ -182,6 +425,32 @@ func (ro *ResponseOpener) OpenFrame(frame Response) (Response, error) {
 	e2ee, err := frame.E2EE()
 	if err != nil {
 		return nil, err
+	}
+	// Refuse a frame that frees a field whose value must be authenticated, BEFORE
+	// opening it. This is the half of the check that defends the client: a
+	// non-conforming enclave can declare `usage` unbound on purpose, and every
+	// other verification the client runs — Open, and the §8 binding, which hashes
+	// the same AAD — would still pass over a router-rewritten count.
+	if err := validateResponseUnboundFields(e2ee.UnboundFields); err != nil {
+		return nil, err
+	}
+	// And refuse a frame whose sealed set does not actually cover this profile's
+	// generated content — otherwise the content rides in the cleartext half and
+	// opening succeeds anyway. Per frame, not once on the first: sealed_fields is
+	// carried on every frame, so a stream could seal the content for a while and
+	// then stop.
+	if err := validateResponseSealedFieldsFor(ro.profile, e2ee.SealedFields); err != nil {
+		return nil, err
+	}
+	// And, on the frame that closes the response, refuse one that omits the
+	// billable count §7.1 requires in cleartext. The client is the party with an
+	// interest here: an enclave that drops `usage.output_images` is served for
+	// free by a router that cannot tell the omission from a zero, so no
+	// downstream component ever raises it.
+	if e2ee.Final {
+		if err := validateResponseCleartextFor(ro.profile, frame); err != nil {
+			return nil, err
+		}
 	}
 	ct, err := b64.DecodeString(e2ee.Ciphertext)
 	if err != nil {
@@ -225,19 +494,54 @@ func (ro *ResponseOpener) OpenFrame(frame Response) (Response, error) {
 	return out, nil
 }
 
-// SealResponse seals a complete non-streaming response as a single final frame.
-// unboundFields are the cleartext fields excluded from the AAD (§5.2 / D5).
+// SealResponse seals a complete non-streaming chat response as a single final
+// frame — shorthand for SealResponseFor(ProfileChat, …).
 func SealResponse(clientEphPub crypto.PublicKey, resp Response, sealedFields []string, unboundFields ...string) (Response, error) {
-	rs, err := NewResponseSealer(clientEphPub, unboundFields...)
+	return SealResponseFor(ProfileChat, clientEphPub, resp, sealedFields, unboundFields...)
+}
+
+// SealResponseFor seals a complete non-streaming response as a single final
+// frame, for the profile the request used. unboundFields are the cleartext
+// fields excluded from the AAD (§5.2 / D5).
+//
+// Because the one frame is also the final frame, this is where the image
+// profile's `usage.output_images` requirement (§7.1) bites: a non-streaming
+// image response that omits the count is refused here rather than shipped.
+func SealResponseFor(profile Profile, clientEphPub crypto.PublicKey, resp Response, sealedFields []string, unboundFields ...string) (Response, error) {
+	rs, err := NewResponseSealerFor(profile, clientEphPub, unboundFields...)
 	if err != nil {
 		return nil, err
 	}
 	return rs.SealFrame(resp, sealedFields, true)
 }
 
-// OpenResponse opens a complete non-streaming (single-frame) response.
+// OpenResponse opens a complete non-streaming (single-frame) chat response —
+// shorthand for OpenResponseFor(ProfileChat, …).
 func OpenResponse(clientEphPriv crypto.PrivateKey, resp Response) (Response, error) {
-	ro, err := NewResponseOpener(clientEphPriv, resp)
+	return OpenResponseFor(ProfileChat, clientEphPriv, resp)
+}
+
+// OpenResponseFor opens a complete non-streaming (single-frame) response and
+// checks it against the profile the request used (see NewResponseOpenerFor).
+//
+// The one frame of a non-streaming response IS the final frame by definition, so
+// this requires `final` before opening anything. Without that the receive-side
+// §7.1 check is defeated by the sender setting one bit: those obligations fall
+// due on the final frame, and `final` is a value the sealer chooses. An enclave
+// could ship `data` sealed with no `usage` and `final: false`, and a client
+// calling this — the only shape §7.1 actually describes — would hand back a
+// complete, correct response having verified none of it. A non-final frame here
+// is not a lesser response; it is a stream fragment presented as a whole
+// response, which is a truncation whether or not it was meant as one.
+func OpenResponseFor(profile Profile, clientEphPriv crypto.PrivateKey, resp Response) (Response, error) {
+	e2ee, err := resp.E2EE()
+	if err != nil {
+		return nil, err
+	}
+	if !e2ee.Final {
+		return nil, fmt.Errorf("non-streaming response frame is not marked final: a single-frame response must be the final frame, and the checks that fall due on it would otherwise be skipped")
+	}
+	ro, err := NewResponseOpenerFor(profile, clientEphPriv, resp)
 	if err != nil {
 		return nil, err
 	}
