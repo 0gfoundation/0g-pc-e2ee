@@ -93,14 +93,24 @@ pre-launch script exports into the shell that runs `docker compose`, and prefixe
 the `_.` dstack-ingress expects:
 
 ```yaml
-- GATEWAY_DOMAIN=_.${DSTACK_GATEWAY_DOMAIN:?…}
+- GATEWAY_DOMAIN=_.${DSTACK_GATEWAY_DOMAIN}
 ```
 
-Do not set a `GATEWAY_DOMAIN` secret — it is ignored, and hand-typing the cluster
-is the one way this value can be wrong. It is also why the `:?` guards the *inner*
-variable: `_.${DSTACK_GATEWAY_DOMAIN}` is never empty, so a guard on the whole
-expression could not fire and an absent platform value would be written to DNS as a
-literal `_.`.
+That is Phala's own custom-domain recipe, spelled the same way on purpose — this
+line should stay diff-clean against upstream. Do not set a `GATEWAY_DOMAIN`
+secret: it is ignored, and hand-typing the cluster is the one way this value can
+be wrong.
+
+**No `:?` here, unlike the three above**, and that is a deliberate exception
+rather than an oversight. Those three are secrets a human forgets; this one is
+injected, and neither of its failure modes is one `:?` catches. If the platform
+exports nothing the expression yields the literal `_.` — non-empty, so an outer
+guard never fires. Guarding the *inner* variable would fire, but it fails the
+compose at **parse** time, so nothing starts at all: the gateway goes down with
+the ingress, over a value that under blue/green nothing reads. Ungated, the blast
+radius is the ingress alone — it tries to write `_.` as a CNAME target, the
+provider rejects it, and that one container crash-loops with the reason in its
+log while the gateway keeps serving.
 
 `DSTACK_GATEWAY_DOMAIN` needs no `allowed_envs` entry — that list filters the
 *encrypted* env, and this arrives from the pre-launch script instead. The
@@ -124,11 +134,10 @@ kms_info.gateway_app_url    https://gateway.dstack-pha-prod5.phala.network
                             CNAME → _.dstack-pha-in2.phala.network        ❌ wrong cluster
 ```
 
-The `_._.` form is the one failure the compose cannot catch. `:?` fires only on an
-*empty* value, and `_.${DSTACK_GATEWAY_DOMAIN}` is never empty — so if the
-platform ever exported the `_.`-prefixed form itself, the prefix would be applied
-twice, silently. Compose interpolation offers no way to strip it (`${VAR#_.}` is
-an interpolation error, not a no-op), so the check is by eye. Today the value is
+The `_._.` form is the failure no guard in the file can catch: if the platform
+ever exported the `_.`-prefixed form itself, the prefix would be applied twice,
+and compose interpolation offers no way to strip one (`${VAR#_.}` is an
+interpolation error, not a no-op). So the check is by eye. Today the value is
 bare, on the pre-launch script's own evidence: it builds
 `DSTACK_APP_DOMAIN=$DSTACK_APP_ID"."$DSTACK_GATEWAY_DOMAIN`, which is a hostname
 only if `DSTACK_GATEWAY_DOMAIN` carries no `_.`.

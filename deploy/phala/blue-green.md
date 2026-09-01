@@ -270,11 +270,14 @@ hand-set and unaffected. The record to look at is the side's own, in ③ —
 dig +short CNAME router-api-tee.0g.ai.a.integratenetwork.work
 ```
 
-— and it must read exactly `_.<cluster>.phala.network`. Two ways it can be wrong:
-another cluster, or `_._.<cluster>.phala.network`, a doubled prefix that the
-compose's `:?` cannot catch because the interpolated value is never empty (README,
-"Serving domain"). Both are silent here, for all the reasons above, so this is an
-eyeball check with no fallback.
+— and it must read exactly `_.<cluster>.phala.network`. Two ways it can be wrong
+*and stay silent*: another cluster, or `_._.<cluster>.phala.network` if the
+platform ever exports the `_.` form itself. Both are silent for all the reasons
+above, so this is an eyeball check with no fallback. (A platform exporting
+*nothing* is the loud case instead: the ingress tries to write a bare `_.`, the
+provider rejects it, and that container crash-loops with the reason in its log
+while the gateway keeps serving. README "Serving domain" has why the compose
+deliberately does not guard this.)
 
 Cross-cluster blue/green remains unsupported for the separate reason in
 [Limitations](#limitations--things-to-confirm-in-your-environment): the serving

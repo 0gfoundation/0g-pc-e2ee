@@ -100,7 +100,9 @@ services:
       - "443:443"
     environment:
       - DNS_PROVIDER=cloudflare
-      # `:?` on purpose: an unset var must fail the deploy loudly. An empty
+      # `:?` on the OPERATOR-supplied vars on purpose: one a human forgot to set
+      # must fail the deploy loudly rather than degrade. (GATEWAY_DOMAIN below is
+      # not one of those and is deliberately ungated — see its note.) An empty
       # DELEGATION_ZONE in particular is not a no-op — it switches the container out
       # of delegation mode, at which point it tries to write records into the SERVED
       # domain's own zone with a token that has no access there.
@@ -115,23 +117,29 @@ services:
       # blue-green.md, "Where GATEWAY_DOMAIN does and does not matter".
       #
       # The `_.` is ours: the platform exports the bare base domain, dstack-ingress
-      # wants the gateway form. The `:?` therefore guards the INNER variable, which
-      # is not a style choice — `_.${DSTACK_GATEWAY_DOMAIN}` is never the empty
-      # string, so a `:?` on the whole expression could never fire, and an absent
-      # platform value would sail through as a literal `_.` and be written to DNS as
-      # a garbage CNAME target. Absent is a real case: the pre-launch script sets
-      # this only when `default_gateway_domain` is present in /dstack/user_config or
-      # app-compose.json.
+      # wants the gateway form. Spelled exactly as Phala's own custom-domain example
+      # spells it, deliberately — this line should stay diff-clean against upstream
+      # so a reader can see it is the stock recipe and not a local invention.
       #
-      # The one case `:?` does NOT catch is the platform exporting the `_.` form
-      # itself, which would silently yield `_._.<base>` — and compose cannot
-      # defend, because interpolation has no prefix stripping (`${VAR#_.}` is an
-      # interpolation error, not a no-op). Evidence it is bare: the same
-      # pre-launch script also builds
-      # `DSTACK_APP_DOMAIN=$DSTACK_APP_ID"."$DSTACK_GATEWAY_DOMAIN`, which is only
-      # a hostname if the value carries no `_.`. Verified by eye after the first
-      # deploy all the same — README "Serving domain".
-      - GATEWAY_DOMAIN=_.${DSTACK_GATEWAY_DOMAIN:?Phala Cloud did not inject DSTACK_GATEWAY_DOMAIN - check pre_launch_script in the deployed app-compose}
+      # NO `:?` here, unlike the three operator-supplied vars around it. Those are
+      # secrets a human forgets; this one is injected, and the two ways it can go
+      # wrong are not ones `:?` catches. If the platform exports nothing, this
+      # interpolates to the literal `_.` — non-empty, so a guard on the whole
+      # expression never fires; guarding the inner variable instead would work, but
+      # it fails the compose at PARSE time, taking the gateway down with the ingress
+      # over a value that under blue/green nothing reads. Left ungated, the blast
+      # radius is the ingress alone: it tries to write `_.` as a CNAME target, the
+      # provider rejects it, and that container crash-loops with the reason in its
+      # log while the gateway keeps serving. If the platform ever exports the `_.`
+      # form itself, this yields `_._.<base>` and compose cannot defend either way
+      # (interpolation has no prefix stripping; `${VAR#_.}` is an interpolation
+      # error). Evidence it is bare today: the same pre-launch script builds
+      # `DSTACK_APP_DOMAIN=$DSTACK_APP_ID"."$DSTACK_GATEWAY_DOMAIN`, a hostname only
+      # if the value carries no `_.`.
+      #
+      # So the check is at deploy time, on the record that actually gets published —
+      # README "Serving domain".
+      - GATEWAY_DOMAIN=_.${DSTACK_GATEWAY_DOMAIN}
       - DELEGATION_ZONE=${DELEGATION_ZONE:?set DELEGATION_ZONE, the zone this container may write}
       - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:?set CLOUDFLARE_API_TOKEN, scoped to DELEGATION_ZONE only}
       - TARGET_ENDPOINT=gateway:8443 # forward decrypted traffic to the gateway
