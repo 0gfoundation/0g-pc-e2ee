@@ -75,7 +75,8 @@
 #   DELEGATION_ZONE  base delegation zone           (default: same as CF_ZONE)
 #   PLATFORM_BASE    dstack platform base domain    (e.g. in1.phala.network) — enables the
 #                    per-side app-id probe before a switch (<app_id>-443s.<PLATFORM_BASE>),
-#                    and `setup` derives GATEWAY_DOMAIN from it as _.<PLATFORM_BASE>
+#                    and `setup` derives GATEWAY_DOMAIN from it as _.<PLATFORM_BASE>.
+#                    Either spelling is accepted; a leading `_.` is stripped on read.
 #   GATEWAY_DOMAIN   cluster dstack gateway         (used only by `setup`; defaults to
 #                    _.<PLATFORM_BASE>, and a missing `_.` is added — the alias must
 #                    name the gateway's wildcard hop. Setting both to different
@@ -647,8 +648,9 @@ cmd_setup() {
   # is not harmless: the probe would health-check a side on one cluster while the
   # serving alias hands traffic to another. So derive one from the other when
   # only PLATFORM_BASE is set, and refuse when both are set and disagree.
-  # `#_.` tolerates PLATFORM_BASE having been pasted in the `_.` form; the shell
-  # can strip a prefix even though compose interpolation cannot.
+  # PLATFORM_BASE is already normalised to the bare base where it is read; the
+  # `#_.` here is a fuse, and the one on GATEWAY_DOMAIN does the real work since
+  # that one is not normalised until after this comparison.
   if [ -z "$GATEWAY_DOMAIN" ] && [ -n "$PLATFORM_BASE" ]; then
     GATEWAY_DOMAIN="_.${PLATFORM_BASE#_.}"
     info "GATEWAY_DOMAIN unset; derived from PLATFORM_BASE -> ${GATEWAY_DOMAIN}"
@@ -730,6 +732,14 @@ DOMAIN="${DOMAIN:-router-api-tee.0g.ai}"
 DELEGATION_ZONE="${DELEGATION_ZONE:-$CF_ZONE}"
 GATEWAY_DOMAIN="${GATEWAY_DOMAIN:-}"   # dstack gateway of the cluster; needed only by `setup`
 PLATFORM_BASE="${PLATFORM_BASE:-}"     # dstack platform base domain (e.g. in1.phala.network) for per-side app-id probes
+# Normalise to the BARE base once, here, because platform_probe_url interpolates
+# this value straight into `<app_id>-443s.${PLATFORM_BASE}` and a `_.` in it makes
+# an unresolvable host — a failure that only shows up as gate 2 timing out for
+# PROBE_RETRIES x PROBE_INTERVAL (~5 min by default) and then refusing, on
+# `switch` AND on `rollback`. Accepting the `_.` form is deliberate: `setup`
+# derives GATEWAY_DOMAIN from this, and the two are one cluster written two ways.
+# The `#_.` in setup/status stays as a fuse, but this is what actually holds.
+PLATFORM_BASE="${PLATFORM_BASE#_.}"
 SIDE_A_LABEL="${SIDE_A_LABEL:-a}"
 SIDE_B_LABEL="${SIDE_B_LABEL:-b}"
 TXT_PREFIX="${TXT_PREFIX:-_dstack-app-address}"
