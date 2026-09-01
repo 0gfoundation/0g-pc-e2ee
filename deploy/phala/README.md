@@ -50,7 +50,7 @@ writes this replica's `instance_id`/`app_id` once at boot and exits, and
   The quote's `report_data` holds
   `SHA-256(sha256sum.txt)`, and `sha256sum.txt` covers the served certificate; its
   `mr_config_id` commits to `compose_hash`, the SHA-256 of the app-compose manifest
-  that embeds this compose file verbatim (`app_id` is its leading 20 bytes). So one
+  that embeds this compose file verbatim. So one
   quote proves *"a CVM running exactly this app-compose obtained this certificate
   inside the TEE"*, covering all four containers. See [Verify](#verify) for the steps
   the quote cannot do for you.
@@ -112,13 +112,30 @@ input, not a confidentiality one: TLS terminates inside this CVM and the dstack
 gateway only passes SNI through at L4, so a wrong gateway cannot read anything —
 and a host that wants to deny service can simply not run the CVM.
 
-Verify it landed right after any deploy. The platform names the true cluster in
-the CVM's `kms_info`, and the two `<cluster>`s must match:
+**Verify the published record character for character after the first deploy**,
+and after any deploy that follows a platform change. The platform names the true
+cluster in the CVM's `kms_info`, and what the ingress publishes must be exactly
+`_.` plus that cluster:
 
 ```
 kms_info.gateway_app_url    https://gateway.dstack-pha-prod5.phala.network
-<DOMAIN>.<DELEGATION_ZONE>  CNAME → _.dstack-pha-prod5.phala.network
+<DOMAIN>.<DELEGATION_ZONE>  CNAME → _.dstack-pha-prod5.phala.network      ✅
+                            CNAME → _._.dstack-pha-prod5.phala.network    ❌ see below
+                            CNAME → _.dstack-pha-in2.phala.network        ❌ wrong cluster
 ```
+
+The `_._.` form is the one failure the compose cannot catch. `:?` fires only on an
+*empty* value, and `_.${DSTACK_GATEWAY_DOMAIN}` is never empty — so if the
+platform ever exported the `_.`-prefixed form itself, the prefix would be applied
+twice, silently. Compose interpolation offers no way to strip it (`${VAR#_.}` is
+an interpolation error, not a no-op), so the check is by eye. Today the value is
+bare, on the pre-launch script's own evidence: it builds
+`DSTACK_APP_DOMAIN=$DSTACK_APP_ID"."$DSTACK_GATEWAY_DOMAIN`, which is a hostname
+only if `DSTACK_GATEWAY_DOMAIN` carries no `_.`.
+
+Left unchecked, a doubled prefix reproduces exactly the failure mode this
+arrangement exists to kill: a record written into DNS, read by nobody under
+blue/green, with no symptom anywhere.
 
 Only variables the compose file actually references reach the container. Setting
 anything else in the CVM environment does nothing; changing what the compose
@@ -218,7 +235,7 @@ Encrypt's staging CA by setting `ACME_STAGING=true` in the CVM's encrypted
 environment. Keep `ACME_STAGING` **permanently listed in `allowed_envs`** (its
 default is `false`) and switch between staging and real by the **value**, not by
 adding/removing the key: `allowed_envs` is part of the measured app-compose, so
-editing the list changes `app_id`. Every *successful* issuance for the same
+editing the list changes `compose_hash`. Every *successful* issuance for the same
 hostname counts against the 5-duplicate-certificates-per-week limit, and each
 fresh CVM issues again from an empty `cert-data` volume, so iterating on
 production directly can leave the hostname uncertifiable for days. Staging's
@@ -716,8 +733,9 @@ under enforce the refusal is a verification failure like any other.
 > attestation guarantee below** and must be reverted to a digest pin before any
 > attested / production deploy. dstack-ingress stays digest-pinned throughout.
 
-`app_id` hashes the app-compose manifest, which embeds this compose file
-verbatim — so a floating `:latest` tag keeps the attestation identical while the
+`compose_hash` hashes the app-compose manifest, which embeds this compose file
+verbatim, and the quote commits to it in `mr_config_id` — so a floating `:latest`
+tag keeps the attestation identical while the
 code underneath changes, and anyone who can push to the registry could swap the
 binary inside an "attested" CVM undetectably. Every image is therefore pinned by
 digest for production, and each has to be re-pinned deliberately on upgrade.
@@ -742,8 +760,10 @@ docker buildx imagetools inspect ghcr.io/0gfoundation/0g-pc-e2ee-gateway:latest
 grep -nE '^\s*image:\s*ghcr\.io/0gfoundation/0g-pc-e2ee-gateway' deploy/phala/docker-compose.yml
 ```
 
-Changing any digest changes `app_id`, which is the point: it is a new deployment,
-and verifiers have to re-audit it.
+Changing any digest changes `compose_hash`, which is the point: it is a new
+deployment, and verifiers have to re-audit it. (`app_id` does not move — it is
+assigned when the app is created and kept for its life; see
+[blue-green.md](./blue-green.md).)
 
 ## Release (automated)
 
@@ -1089,8 +1109,10 @@ and warmer liveness).
   Response signatures are always fail-closed.
 - If the gateway container is recreated with a new address, restart
   dstack-ingress too — HAProxy resolves the backend name once, at startup.
-- **Zero-downtime upgrades.** A new gateway image is a new `app_id` (above), i.e.
-  a separate CVM. To roll one out without downtime and with instant rollback, run
+- **Zero-downtime upgrades.** Each side is its own app with its own `app_id`,
+  assigned when that app is created (see [blue-green.md](./blue-green.md)); a new
+  gateway image on its own does not produce one. To roll one out without downtime
+  and with instant rollback, run
   the old and new builds as two sides and flip a single DNS pointer between them
   — see [`blue-green.md`](./blue-green.md) and [`switch.sh`](./switch.sh).
 - **When a PROVIDER upgrades its broker**, expect a brief window where that

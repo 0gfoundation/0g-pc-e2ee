@@ -10,11 +10,12 @@ measured (`compose_hash`), and the Let's Encrypt notes.
 A dstack `app_id` is 20 bytes (40 hex, not 64) and is assigned when the app is
 **created**: `dstack-util` derives it as `truncate(compose_hash, 20)` only when
 nothing else assigned one (system_setup.rs `if instance_info.app_id.is_empty()`),
-and then it is persisted for the app's life. **Deploying** a new CVM from a changed
-compose therefore gets a new `app_id`; **upgrading** an existing CVM's compose in
-place does not — it moves `compose_hash` under the same `app_id`. Each blue/green
-side is a separately created, separately attested CVM (README "Pin the image
-digest"), which is what gives the two sides distinct `app_id`s to point DNS at.
+and then it is persisted for the app's life. Creating a **new app** therefore gets
+a new `app_id`, whether or not its compose differs from anything already
+deployed; **upgrading** an existing app in place does not — it moves
+`compose_hash` under the same `app_id`. Each blue/green side is a separately
+created, separately attested app, and that alone is what gives the two sides
+distinct `app_id`s to point DNS at.
 
 > **So never upgrade a side in place to make it "the new side".** It keeps its
 > `app_id`, so the switch record still names it and the platform spreads traffic
@@ -23,14 +24,16 @@ digest"), which is what gives the two sides distinct `app_id`s to point DNS at.
 
 That single fact shapes everything:
 
-- **dstack only spreads traffic *within one `app_id`*.** Deploy N CVMs from the
-  *same* compose and dstack's gateway picks among them per connection ("when
+- **dstack only spreads traffic *within one `app_id`*.** Add N instances under
+  one `app_id` and dstack's gateway picks among them per connection ("when
   using the app ID, the load balancer selects one of the available instances" —
   though the selection is a connect race, not round-robin; see
   [Scaling one side](#scaling-one-side-replicas)). That is horizontal scaling /
   HA, and it is **orthogonal** to releases.
-- **Two separately created CVMs are two unrelated apps** — distinct `app_id`s
-  whatever their compose says (see the note below). dstack will not blend traffic
+- **Two CVMs created as separate *apps* are two unrelated apps** — distinct
+  `app_id`s whatever their compose says (see the note below; a CVM created
+  *under an existing* `app_id` is the other case, an instance of that app).
+  dstack will not blend traffic
   across them, so a release cannot be a weighted canary at this layer. It is an
   **all-or-nothing flip** of one record: `_dstack-app-address.<DOMAIN>`, the TXT
   the dstack gateway reads to learn which `app_id` owns the domain.
@@ -47,8 +50,17 @@ and releasing = repointing `_dstack-app-address.<DOMAIN>` from one to the other.
 > app's contract address — in a CVM's info dump `app_id` and `contract_address`
 > are the same value, and neither is a prefix of `compose_hash`.
 >
-> So **two separately created CVMs have two `app_id`s no matter what their compose
-> says**, and the traffic switch can always select between them. The live staging
+> Which of the two a new CVM gets is decided at creation, by whether the VMM call
+> carries an `app_id` (`vmm_rpc.proto`: "*optional* … if provided, and KMS is
+> enabled, it assumes the app is upgraded from given app_id"):
+>
+> | creating a CVM | result |
+> |---|---|
+> | **without** an `app_id` | a **new app** — its own `app_id`, whatever the compose says |
+> | **with** an existing `app_id` | another **instance of that app** — same `app_id`; this is what an upgrade and [Scaling one side](#scaling-one-side-replicas) do |
+>
+> So **each side must be created as its own app**, and then the two have distinct
+> `app_id`s and the traffic switch can always select between them. The live staging
 > pair is the proof: both sides run the *same* gateway image digest — the field
 > this note used to call the only thing distinguishing them — yet
 >
@@ -88,7 +100,7 @@ below.
 
 ```sh
 ./switch.sh acme b           # 1. aim the issuance switch at side b FIRST
-phala cvm create ...         # 2. deploy side b — new image digest (=> new app_id),
+phala cvm create ...         # 2. deploy side b — a NEW app (=> its own app_id),
                              #    DELEGATION_ZONE=b.integratenetwork.work, DNS_SETUP_MODE=print
 ./switch.sh switch b         # 3. probe b's /readyz directly, flip traffic, confirm b is
                              #    really serving (cert changed) + /healthz; auto-rollback otherwise
@@ -247,11 +259,22 @@ the value — the compose now derives it from the platform's own
 domain"), so a side cannot name a cluster it is not in. Confirm after any deploy
 that the two agree:
 
+Note `switch.sh status` is no help here: it prints ②'s serving alias, which is
+hand-set and unaffected. The record to look at is the side's own, in ③ —
+
 ```sh
-# the platform's own answer for which cluster a CVM is in, from its info dump:
+# the platform's own answer for which cluster this CVM is in, from its info dump:
 #   kms_info.gateway_app_url = https://gateway.<cluster>.phala.network
-./switch.sh status   # "serving alias -> _.<cluster>.phala.network" must match
+
+# what that side's ingress actually published:
+dig +short CNAME router-api-tee.0g.ai.a.integratenetwork.work
 ```
+
+— and it must read exactly `_.<cluster>.phala.network`. Two ways it can be wrong:
+another cluster, or `_._.<cluster>.phala.network`, a doubled prefix that the
+compose's `:?` cannot catch because the interpolated value is never empty (README,
+"Serving domain"). Both are silent here, for all the reasons above, so this is an
+eyeball check with no fallback.
 
 Cross-cluster blue/green remains unsupported for the separate reason in
 [Limitations](#limitations--things-to-confirm-in-your-environment): the serving
@@ -544,11 +567,14 @@ you no second side to cut over to safely.)
 
 ## Scaling one side (replicas)
 
-Independent of releases: to scale or add HA **within** a side, deploy more CVMs
-from that side's *exact* compose (same `app_id`). dstack spreads traffic across
-them by `app_id`, and each publishes the same `_dstack-app-address` value, so no
-switch-layer change is needed. Releases (this document) change `app_id` and flip
-the pointer; scaling keeps `app_id` and adds instances. They compose cleanly —
+Independent of releases: to scale or add HA **within** a side, add CVMs **under
+that side's existing `app_id`** — the create-with-an-`app_id` row of the table
+above. Deploying a fresh app from the same compose text does *not* do this: it
+would be a new app with a new `app_id`, i.e. a third side rather than a replica.
+dstack spreads traffic across an app's instances by `app_id`, and each publishes
+the same `_dstack-app-address` value, so no switch-layer change is needed.
+Releases (this document) flip the pointer to the *other side's* `app_id`; scaling
+stays inside one `app_id` and adds instances to it. They compose cleanly —
 `switch.sh` neither knows nor cares how many CVMs back the side it points at.
 
 **The custom-domain path uses the same selection code as the platform hostname.**

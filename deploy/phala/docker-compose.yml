@@ -122,6 +122,15 @@ services:
       # a garbage CNAME target. Absent is a real case: the pre-launch script sets
       # this only when `default_gateway_domain` is present in /dstack/user_config or
       # app-compose.json.
+      #
+      # The one case `:?` does NOT catch is the platform exporting the `_.` form
+      # itself, which would silently yield `_._.<base>` — and compose cannot
+      # defend, because interpolation has no prefix stripping (`${VAR#_.}` is an
+      # interpolation error, not a no-op). Evidence it is bare: the same
+      # pre-launch script also builds
+      # `DSTACK_APP_DOMAIN=$DSTACK_APP_ID"."$DSTACK_GATEWAY_DOMAIN`, which is only
+      # a hostname if the value carries no `_.`. Verified by eye after the first
+      # deploy all the same — README "Serving domain".
       - GATEWAY_DOMAIN=_.${DSTACK_GATEWAY_DOMAIN:?Phala Cloud did not inject DSTACK_GATEWAY_DOMAIN - check pre_launch_script in the deployed app-compose}
       - DELEGATION_ZONE=${DELEGATION_ZONE:?set DELEGATION_ZONE, the zone this container may write}
       - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:?set CLOUDFLARE_API_TOKEN, scoped to DELEGATION_ZONE only}
@@ -358,8 +367,9 @@ services:
       # blue/green upgrade looks like mid-flight. Only consulted when the file is
       # unreadable. This wants the BASE domain, which is exactly what the platform
       # exports — so read it straight rather than re-deriving it from the ingress's
-      # `_.`-prefixed form. (appIDHost still strips a leading "_." if one appears, so
-      # either spelling works; this one just cannot disagree with the ingress.)
+      # `_.`-prefixed form; the two then cannot disagree. This side is also the
+      # forgiving one: appIDHost strips a leading "_." if it ever sees one, so only
+      # the ingress line above is sensitive to the platform's spelling.
       - "ZG_GATEWAY_PLATFORM_BASE_DOMAIN=${DSTACK_GATEWAY_DOMAIN:-}"
       # How many published releases the deployed compose text is compared against,
       # byte-for-byte, for matched_release — the same lookup pcverify makes, so the

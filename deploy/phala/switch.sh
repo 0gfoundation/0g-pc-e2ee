@@ -5,10 +5,11 @@
 # WHY THIS EXISTS ------------------------------------------------------------
 # The gateway runs in a dstack CVM, and under a KMS key provider (what Phala
 # Cloud runs) that CVM's app_id is assigned when the app is CREATED and kept for
-# its life — it is NOT derived from the compose text, so two separately created
-# CVMs are two unrelated apps whatever their compose says, and redeploying one
-# does not move its app_id. (`truncate(compose_hash, 20)` is the fallback for the
-# local-key-provider case; see the app_id note in blue-green.md.) dstack only
+# its life — it is NOT derived from the compose text, so two CVMs created as
+# separate *apps* are two unrelated apps whatever their compose says, while a CVM
+# created under an existing app_id joins that app as an instance, and an in-place
+# upgrade keeps the app_id too. (`truncate(compose_hash, 20)` is the fallback for
+# the local-key-provider case; see the app_id note in blue-green.md.) dstack only
 # load-balances *within one app_id*. So a blue/green release is not "shift weight
 # on a load balancer" — it is flipping a single DNS pointer,
 # `_dstack-app-address.<DOMAIN>`, from the blue app_id to the green one. This
@@ -357,11 +358,12 @@ cmd_status() {
       "$s" "$(side_app_addr "$s" || true)" "$(platform_probe_url "$s" || true)"
   done
   if [ -n "$app_a" ] && [ "$app_a" = "$app_b" ]; then
-    warn "both sides publish the same app_id — dstack treats them as replicas of"
-    warn "one app, so the switch cannot select between them. Two separately created"
-    warn "CVMs never share an app_id, so this means one CVM wrote both records:"
-    warn "check that the sides have DIFFERENT DELEGATION_ZONEs, and that a stale"
-    warn "record is not left over from a CVM that has since been replaced."
+    warn "both sides publish the same app_id — dstack treats them as instances of"
+    warn "ONE app and routes to either, so the switch cannot select between them."
+    warn "Usually one side was created under the other's app_id (an instance or an"
+    warn "in-place upgrade) instead of as its own app; a stale record left by a"
+    warn "replaced CVM does it too. Each side must be a separately created app —"
+    warn "adding instances to a side is scaling, not a second side."
   fi
   printf '\n'
 
@@ -422,18 +424,20 @@ cmd_switch() {
   fi
   info "side ${target} publishes app_id: ${tgt_addr}"
 
-  # A side's identity is its app_id, and two separately created CVMs never share
-  # one — it is assigned at creation, not derived from the compose text, so even
-  # byte-identical sides are distinct apps. Both sides publishing the SAME app_id
-  # therefore means one CVM wrote both records, and dstack will treat them as
-  # replicas of one app and route to either, so the switch cannot isolate the
-  # target. That defeats the purpose; make it loud.
+  # A side's identity is its app_id, which is assigned when the app is CREATED,
+  # not derived from the compose text — so two sides created as separate apps are
+  # distinct even when byte-identical, and conversely a CVM created UNDER an
+  # existing app_id joins that app as an instance. Both sides publishing the SAME
+  # app_id therefore means one app is behind both records, and dstack will route
+  # to either instance, so the switch cannot isolate the target. That defeats the
+  # purpose; make it loud.
   local other_addr; other_addr="$(side_app_addr "$(other_side "$target")")"
   if [ -n "$other_addr" ] && [ "$other_addr" = "$tgt_addr" ]; then
-    warn "both sides publish the same app_id (${tgt_addr}) — one CVM wrote both"
-    warn "records, so dstack treats them as replicas and this switch cannot select"
-    warn "between them. Check that the two sides run with DIFFERENT"
-    warn "DELEGATION_ZONEs, and that neither record is stale."
+    warn "both sides publish the same app_id (${tgt_addr}) — one app is behind"
+    warn "both records, so dstack treats them as its instances and this switch"
+    warn "cannot select between them. Check that each side was created as its OWN"
+    warn "app rather than under the other's app_id, and that neither record is a"
+    warn "leftover from a replaced CVM."
   fi
 
   # Gate 2: verify the TARGET side can actually SERVE before we send it any
