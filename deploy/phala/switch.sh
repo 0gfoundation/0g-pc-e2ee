@@ -3,13 +3,17 @@
 # switch.sh — blue/green traffic switch for the cloud-TEE gateway.
 #
 # WHY THIS EXISTS ------------------------------------------------------------
-# The gateway runs in a dstack CVM whose app_id = SHA-256(app-compose), so a new
-# gateway image is a *different app_id* — a separate, separately-attested CVM
-# (see deploy/phala/README.md "Pin the image digest"). dstack only load-balances
-# *within one app_id*; two different images are two unrelated apps. So a
-# blue/green release is not "shift weight on a load balancer" — it is flipping a
-# single DNS pointer, `_dstack-app-address.<DOMAIN>`, from the blue app_id to the
-# green one. This script flips that pointer safely and reversibly.
+# The gateway runs in a dstack CVM, and under a KMS key provider (what Phala
+# Cloud runs) that CVM's app_id is assigned when the app is CREATED and kept for
+# its life — it is NOT derived from the compose text, so two CVMs created as
+# separate *apps* are two unrelated apps whatever their compose says, while a CVM
+# created under an existing app_id joins that app as an instance, and an in-place
+# upgrade keeps the app_id too. (`truncate(compose_hash, 20)` is the fallback for
+# the local-key-provider case; see the app_id note in blue-green.md.) dstack only
+# load-balances *within one app_id*. So a blue/green release is not "shift weight
+# on a load balancer" — it is flipping a single DNS pointer,
+# `_dstack-app-address.<DOMAIN>`, from the blue app_id to the green one. This
+# script flips that pointer safely and reversibly.
 #
 # WHERE THE SWITCH LIVES -----------------------------------------------------
 # The served zone (0g.ai) is operator-delegated and we may not hold a token for
@@ -49,7 +53,8 @@
 #
 # Usage:
 #   ./switch.sh status                               # (reads switch.env if present)
-#   GATEWAY_DOMAIN=_.<cluster>.phala.network ./switch.sh setup   # one-time: static serving alias
+#   ./switch.sh setup                                # one-time: static serving alias
+#                                                    # (derived from PLATFORM_BASE)
 #   ./switch.sh switch b                             # flip traffic (+ acme) to side b
 #   ./switch.sh rollback                             # flip to the other side (live side read from DNS; stateless)
 #   ./switch.sh acme b                               # point ONLY the issuance switch at b
@@ -68,9 +73,16 @@
 #   CF_ZONE          delegation zone name           (default: integratenetwork.work)
 #   DOMAIN           served hostname                (default: router-api-tee.0g.ai)
 #   DELEGATION_ZONE  base delegation zone           (default: same as CF_ZONE)
-#   GATEWAY_DOMAIN   cluster dstack gateway         (no default; required only by `setup`)
-#   PLATFORM_BASE    dstack platform base domain    (e.g. in1.phala.network; enables the
-#                    per-side app-id probe before a switch — <app_id>-443s.<PLATFORM_BASE>)
+#   PLATFORM_BASE    dstack platform base domain    (e.g. in1.phala.network) — enables the
+#                    per-side app-id probe before a switch (<app_id>-443s.<PLATFORM_BASE>),
+#                    and `setup` derives GATEWAY_DOMAIN from it as _.<PLATFORM_BASE>.
+#                    Either spelling is accepted; a leading `_.` is stripped on read.
+#   GATEWAY_DOMAIN   cluster dstack gateway         (used only by `setup`; defaults to
+#                    _.<PLATFORM_BASE>, and a missing `_.` is added — the alias must
+#                    name the gateway's wildcard hop. Setting both to different
+#                    clusters is refused; they are two spellings of one value and
+#                    nothing else cross-checks them. `status` warns if the live alias
+#                    drifts from PLATFORM_BASE or is not a `_.<base>` hop.)
 #   SIDE_A_LABEL     sub-zone label for side a      (default: a)
 #   SIDE_B_LABEL     sub-zone label for side b      (default: b)
 #   TXT_PREFIX       app-address record prefix      (default: _dstack-app-address)
@@ -339,8 +351,27 @@ cmd_status() {
   printf 'delegation zone : %s (zone id %s)\n' "$CF_ZONE" "$ZONE_ID"
   printf 'served domain   : %s\n\n' "$DOMAIN"
 
+  local alias_now; alias_now="$(current_cname "$SERVING_ALIAS" || true)"
   printf 'serving alias   : %s\n' "$SERVING_ALIAS"
-  printf '   -> %s\n' "$(current_cname "$SERVING_ALIAS" || true)"
+  printf '   -> %s\n' "${alias_now:-<unset>}"
+  # The serving alias and PLATFORM_BASE are two hand-typed spellings of one
+  # cluster, and nothing else cross-checks them: a mismatch means the standby
+  # probe health-checks a side on one cluster while traffic goes to another, so
+  # `switch` would pass its gate and then cut over to an unreachable side.
+  if [ -n "$PLATFORM_BASE" ] && [ -n "$alias_now" ] &&
+     [ "${alias_now#_.}" != "${PLATFORM_BASE#_.}" ]; then
+    warn "serving alias and PLATFORM_BASE name different clusters:"
+    warn "  alias -> ${alias_now} vs PLATFORM_BASE=${PLATFORM_BASE}"
+    warn "  the pre-switch probe would test a side the live path cannot reach."
+  fi
+  # Right cluster, wrong form: the alias must name the gateway's wildcard hop.
+  # A bare base domain is not one, and the cluster check above cannot see it
+  # because it compares the two with `_.` stripped.
+  if [ -n "$alias_now" ] && [ "$alias_now" = "${alias_now#_.}" ]; then
+    warn "serving alias is not a gateway hop (wants _.<base>): ${alias_now}"
+    warn "  traffic will not reach a dstack gateway, and pcverify cannot derive"
+    warn "  a base domain from this chain. Re-run 'setup' to rewrite it."
+  fi
   printf 'traffic switch  : %s\n' "${TXT_PREFIX}.${DOMAIN}"
   printf '   -> %s  [%s]\n' "${addr_now:-<unset>}" "${addr_side:-none}"
   printf 'issuance switch : _acme-challenge.%s\n' "$DOMAIN"
@@ -354,8 +385,12 @@ cmd_status() {
       "$s" "$(side_app_addr "$s" || true)" "$(platform_probe_url "$s" || true)"
   done
   if [ -n "$app_a" ] && [ "$app_a" = "$app_b" ]; then
-    warn "both sides publish the same app_id — same build, so the switch cannot"
-    warn "select between them (dstack treats them as replicas). Use two images."
+    warn "both sides publish the same app_id — dstack treats them as instances of"
+    warn "ONE app and routes to either, so the switch cannot select between them."
+    warn "Usually one side was created under the other's app_id (an instance or an"
+    warn "in-place upgrade) instead of as its own app; a stale record left by a"
+    warn "replaced CVM does it too. Each side must be a separately created app —"
+    warn "adding instances to a side is scaling, not a second side."
   fi
   printf '\n'
 
@@ -416,15 +451,20 @@ cmd_switch() {
   fi
   info "side ${target} publishes app_id: ${tgt_addr}"
 
-  # A side's identity is its app_id, which comes from the gateway image digest.
-  # If both sides publish the SAME app_id they are the same build — dstack treats
-  # them as replicas of one app and routes to either, so the switch cannot
-  # isolate the target. That defeats the purpose; make it loud.
+  # A side's identity is its app_id, which is assigned when the app is CREATED,
+  # not derived from the compose text — so two sides created as separate apps are
+  # distinct even when byte-identical, and conversely a CVM created UNDER an
+  # existing app_id joins that app as an instance. Both sides publishing the SAME
+  # app_id therefore means one app is behind both records, and dstack will route
+  # to either instance, so the switch cannot isolate the target. That defeats the
+  # purpose; make it loud.
   local other_addr; other_addr="$(side_app_addr "$(other_side "$target")")"
   if [ -n "$other_addr" ] && [ "$other_addr" = "$tgt_addr" ]; then
-    warn "both sides publish the same app_id (${tgt_addr}) — they are the same"
-    warn "build, so dstack treats them as replicas and this switch cannot select"
-    warn "between them. Blue/green needs two DIFFERENT gateway images."
+    warn "both sides publish the same app_id (${tgt_addr}) — one app is behind"
+    warn "both records, so dstack treats them as its instances and this switch"
+    warn "cannot select between them. Check that each side was created as its OWN"
+    warn "app rather than under the other's app_id, and that neither record is a"
+    warn "leftover from a replaced CVM."
   fi
 
   # Gate 2: verify the TARGET side can actually SERVE before we send it any
@@ -601,14 +641,42 @@ cmd_acme() {
 cmd_setup() {
   resolve_zone_id
   local cur; cur="$(current_cname "$SERVING_ALIAS")"
+  # One cluster, two operator-side spellings: GATEWAY_DOMAIN for the serving
+  # alias here, and PLATFORM_BASE for the standby probe
+  # (`<app_id>-443s.<PLATFORM_BASE>`). The CVMs no longer take a hand-typed
+  # cluster at all, so these are the last two that can drift apart — and drifting
+  # is not harmless: the probe would health-check a side on one cluster while the
+  # serving alias hands traffic to another. So derive one from the other when
+  # only PLATFORM_BASE is set, and refuse when both are set and disagree.
+  # PLATFORM_BASE is already normalised to the bare base where it is read; the
+  # `#_.` here is a fuse, and the one on GATEWAY_DOMAIN does the real work since
+  # that one is not normalised until after this comparison.
+  if [ -z "$GATEWAY_DOMAIN" ] && [ -n "$PLATFORM_BASE" ]; then
+    GATEWAY_DOMAIN="_.${PLATFORM_BASE#_.}"
+    info "GATEWAY_DOMAIN unset; derived from PLATFORM_BASE -> ${GATEWAY_DOMAIN}"
+  elif [ -n "$GATEWAY_DOMAIN" ] && [ -n "$PLATFORM_BASE" ] &&
+       [ "${GATEWAY_DOMAIN#_.}" != "${PLATFORM_BASE#_.}" ]; then
+    info "GATEWAY_DOMAIN : ${GATEWAY_DOMAIN}"
+    info "PLATFORM_BASE  : ${PLATFORM_BASE}"
+    die "these name different clusters — the serving alias and the standby probe would disagree"
+  fi
   if [ -z "$GATEWAY_DOMAIN" ]; then
     # Help the operator "freeze" whatever the single-instance container wrote.
     if [ -n "$cur" ]; then
       info "serving alias ${SERVING_ALIAS} currently -> ${cur}"
       die "set GATEWAY_DOMAIN to pin it (e.g. GATEWAY_DOMAIN=${cur} $0 setup)"
     fi
-    die "set GATEWAY_DOMAIN (the cluster's dstack gateway, e.g. _.<cluster>.phala.network)"
+    die "set PLATFORM_BASE (<cluster>.phala.network) and it is derived, or set GATEWAY_DOMAIN (_.<cluster>.phala.network) directly"
   fi
+  # Normalise the FORM, not just the cluster. The check above strips `_.` from
+  # both sides on purpose — it asks "same cluster?" — so a GATEWAY_DOMAIN given
+  # without the prefix agrees with PLATFORM_BASE and would otherwise be written
+  # bare. Bare is not a harmless variant: the alias must name the gateway's
+  # wildcard hop, this hop carries traffic in the single-instance layout, and
+  # `pcverify` rejects a CNAME chain that does not end at `_.<base>`
+  # (client/evidence/appcompose.go, deriveBaseDomain). Idempotent on a value that
+  # already has it.
+  GATEWAY_DOMAIN="_.${GATEWAY_DOMAIN#_.}"
   info "one-time setup: the static serving alias in the delegation zone"
   info "  ${SERVING_ALIAS}  CNAME ->  ${GATEWAY_DOMAIN}"
   info "the two switch records are created by 'acme'/'switch'; the per-side"
@@ -664,6 +732,14 @@ DOMAIN="${DOMAIN:-router-api-tee.0g.ai}"
 DELEGATION_ZONE="${DELEGATION_ZONE:-$CF_ZONE}"
 GATEWAY_DOMAIN="${GATEWAY_DOMAIN:-}"   # dstack gateway of the cluster; needed only by `setup`
 PLATFORM_BASE="${PLATFORM_BASE:-}"     # dstack platform base domain (e.g. in1.phala.network) for per-side app-id probes
+# Normalise to the BARE base once, here, because platform_probe_url interpolates
+# this value straight into `<app_id>-443s.${PLATFORM_BASE}` and a `_.` in it makes
+# an unresolvable host — a failure that only shows up as gate 2 timing out for
+# PROBE_RETRIES x PROBE_INTERVAL (~5 min by default) and then refusing, on
+# `switch` AND on `rollback`. Accepting the `_.` form is deliberate: `setup`
+# derives GATEWAY_DOMAIN from this, and the two are one cluster written two ways.
+# The `#_.` in setup/status stays as a fuse, but this is what actually holds.
+PLATFORM_BASE="${PLATFORM_BASE#_.}"
 SIDE_A_LABEL="${SIDE_A_LABEL:-a}"
 SIDE_B_LABEL="${SIDE_B_LABEL:-b}"
 TXT_PREFIX="${TXT_PREFIX:-_dstack-app-address}"

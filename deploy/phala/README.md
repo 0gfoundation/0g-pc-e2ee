@@ -50,7 +50,7 @@ writes this replica's `instance_id`/`app_id` once at boot and exits, and
   The quote's `report_data` holds
   `SHA-256(sha256sum.txt)`, and `sha256sum.txt` covers the served certificate; its
   `mr_config_id` commits to `compose_hash`, the SHA-256 of the app-compose manifest
-  that embeds this compose file verbatim (`app_id` is its leading 20 bytes). So one
+  that embeds this compose file verbatim. So one
   quote proves *"a CVM running exactly this app-compose obtained this certificate
   inside the TEE"*, covering all four containers. See [Verify](#verify) for the steps
   the quote cannot do for you.
@@ -75,19 +75,50 @@ zone alone — it needs no access to the served domain's own zone.
 | Variable | Example | Notes |
 |---|---|---|
 | `DOMAIN` | `pc-gateway.example.com` | the hostname we serve |
-| `GATEWAY_DOMAIN` | `_.<cluster>.phala.network` | dstack gateway of the target cluster |
 | `DELEGATION_ZONE` | `delegation.example.net` | zone the container writes into |
 | `CLOUDFLARE_API_TOKEN` | — | DNS edit permission, **`DELEGATION_ZONE` only** |
 
-All four are declared `${VAR:?…}` in the compose file, so a missing one fails the
+All three are declared `${VAR:?…}` in the compose file, so a missing one fails the
 deploy immediately instead of silently degrading. They must also be listed in the
 app's `allowed_envs` — dstack drops any encrypted variable that is not, and the
 only symptom is an interpolation error at boot.
 
+**`GATEWAY_DOMAIN` is not one of them — you do not set it.** dstack-ingress needs
+it, but it names the cluster the CVM booted in, so the compose takes that from the
+platform: `GATEWAY_DOMAIN=_.${DSTACK_GATEWAY_DOMAIN}`, Phala's own recipe. It
+arrives from the pre-launch script rather than the encrypted env, so it needs no
+`allowed_envs` entry, and setting a `GATEWAY_DOMAIN` secret does nothing. The
+`docker-compose.yml` comment has the reasoning, including why that line has no
+`:?` when its neighbours do.
+
+Worth knowing: the pre-launch script reads the value from `/dstack/user_config`,
+which is **not measured**, so a hostile host could change which gateway this CVM's
+CNAME names. Routing only — TLS terminates in this CVM and the gateway passes SNI
+through at L4 — and a host bent on denying service can simply not run the CVM.
+
+**Check the published record after the first deploy**, against the cluster the
+platform reports in the CVM's `kms_info`:
+
+```
+kms_info.gateway_app_url    https://gateway.dstack-pha-prod5.phala.network
+<DOMAIN>.<DELEGATION_ZONE>  CNAME → _.dstack-pha-prod5.phala.network      ✅
+                            CNAME → _._.dstack-pha-prod5.phala.network    ❌ doubled prefix
+                            CNAME → _.dstack-pha-in2.phala.network        ❌ wrong cluster
+```
+
+Nothing in the compose catches either wrong shape, and under blue/green neither
+has any symptom ([blue-green.md](./blue-green.md), "Where `GATEWAY_DOMAIN` does
+and does not matter") — this check is what stands between a wrong value and a
+silent one.
+
+Left unchecked, a doubled prefix reproduces exactly the failure mode this
+arrangement exists to kill: a record written into DNS, read by nobody under
+blue/green, with no symptom anywhere.
+
 Only variables the compose file actually references reach the container. Setting
 anything else in the CVM environment does nothing; changing what the compose
-references means editing the file, which changes `app_id`. Two optional
-dstack-ingress variables are therefore handled differently from the four above.
+references means editing the file, which changes `compose_hash`. Two optional
+dstack-ingress variables are therefore handled differently from the three above.
 `ACME_EMAIL` is **not declared at all** in the compose — a variable absent from the
 env block is never passed to the container. It is optional, and it is published in
 the evidence bundle, so any address there would be world-readable at
@@ -182,7 +213,7 @@ Encrypt's staging CA by setting `ACME_STAGING=true` in the CVM's encrypted
 environment. Keep `ACME_STAGING` **permanently listed in `allowed_envs`** (its
 default is `false`) and switch between staging and real by the **value**, not by
 adding/removing the key: `allowed_envs` is part of the measured app-compose, so
-editing the list changes `app_id`. Every *successful* issuance for the same
+editing the list changes `compose_hash`. Every *successful* issuance for the same
 hostname counts against the 5-duplicate-certificates-per-week limit, and each
 fresh CVM issues again from an empty `cert-data` volume, so iterating on
 production directly can leave the hostname uncertifiable for days. Staging's
@@ -541,7 +572,7 @@ could not do anyway, since JS cannot see its own connection's peer certificate
 |---|---|---|
 | `-out-app-compose /run/identity/app-compose.json` | cvm-identity | publishes this CVM's `app-compose.json` verbatim on the shared `identity` volume, from the same guest-agent call that yields the identity file. |
 | `ZG_GATEWAY_APP_COMPOSE_FILE=/run/identity/app-compose.json` | gateway | where the container list comes from. Spelled out here, not defaulted in the binary, because the path is a contract between containers: it appears three times in the compose, and splitting it between YAML and Go is how a renamed volume becomes a silently empty list. |
-| `ZG_GATEWAY_PLATFORM_BASE_DOMAIN=${GATEWAY_DOMAIN}` | gateway | fallback source for the same manifest, consulted only when the file is unreadable. Empty disables it. |
+| `ZG_GATEWAY_PLATFORM_BASE_DOMAIN=${DSTACK_GATEWAY_DOMAIN}` | gateway | fallback source for the same manifest, consulted only when the file is unreadable. The platform-injected base domain, same value the ingress builds its `GATEWAY_DOMAIN` from. Empty disables it. |
 
 Two more knobs are left at their built-in defaults and appear in the compose only as
 commented-out lines, per this file's convention of stating what *differs* from the
@@ -574,8 +605,9 @@ because any verifier must be able to fetch it; this route rides
 `ZG_GATEWAY_ALLOWED_ORIGINS` instead, since it is a convenience for the first-party
 panel and its values are always obtainable from the bundle regardless.
 
-`GATEWAY_DOMAIN` was already referenced by dstack-ingress, so **`allowed_envs` is
-unchanged**. Smoke-test after deploying:
+`DSTACK_GATEWAY_DOMAIN` comes from the platform's pre-launch script, not the
+encrypted env, so **`allowed_envs` is unchanged** by this route. Smoke-test after
+deploying:
 
 ```sh
 curl -s "https://<DOMAIN>/v1/gateway/identity" | jq
@@ -679,8 +711,9 @@ under enforce the refusal is a verification failure like any other.
 > attestation guarantee below** and must be reverted to a digest pin before any
 > attested / production deploy. dstack-ingress stays digest-pinned throughout.
 
-`app_id` hashes the app-compose manifest, which embeds this compose file
-verbatim — so a floating `:latest` tag keeps the attestation identical while the
+`compose_hash` hashes the app-compose manifest, which embeds this compose file
+verbatim, and the quote commits to it in `mr_config_id` — so a floating `:latest`
+tag keeps the attestation identical while the
 code underneath changes, and anyone who can push to the registry could swap the
 binary inside an "attested" CVM undetectably. Every image is therefore pinned by
 digest for production, and each has to be re-pinned deliberately on upgrade.
@@ -705,8 +738,10 @@ docker buildx imagetools inspect ghcr.io/0gfoundation/0g-pc-e2ee-gateway:latest
 grep -nE '^\s*image:\s*ghcr\.io/0gfoundation/0g-pc-e2ee-gateway' deploy/phala/docker-compose.yml
 ```
 
-Changing any digest changes `app_id`, which is the point: it is a new deployment,
-and verifiers have to re-audit it.
+Changing any digest changes `compose_hash`, which is the point: it is a new
+deployment, and verifiers have to re-audit it. (`app_id` does not move — it is
+assigned when the app is created and kept for its life; see
+[blue-green.md](./blue-green.md).)
 
 ## Release (automated)
 
@@ -1052,8 +1087,10 @@ and warmer liveness).
   Response signatures are always fail-closed.
 - If the gateway container is recreated with a new address, restart
   dstack-ingress too — HAProxy resolves the backend name once, at startup.
-- **Zero-downtime upgrades.** A new gateway image is a new `app_id` (above), i.e.
-  a separate CVM. To roll one out without downtime and with instant rollback, run
+- **Zero-downtime upgrades.** Each side is its own app with its own `app_id`,
+  assigned when that app is created (see [blue-green.md](./blue-green.md)); a new
+  gateway image on its own does not produce one. To roll one out without downtime
+  and with instant rollback, run
   the old and new builds as two sides and flip a single DNS pointer between them
   — see [`blue-green.md`](./blue-green.md) and [`switch.sh`](./switch.sh).
 - **When a PROVIDER upgrades its broker**, expect a brief window where that

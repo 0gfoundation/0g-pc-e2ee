@@ -10,11 +10,12 @@ measured (`compose_hash`), and the Let's Encrypt notes.
 A dstack `app_id` is 20 bytes (40 hex, not 64) and is assigned when the app is
 **created**: `dstack-util` derives it as `truncate(compose_hash, 20)` only when
 nothing else assigned one (system_setup.rs `if instance_info.app_id.is_empty()`),
-and then it is persisted for the app's life. **Deploying** a new CVM from a changed
-compose therefore gets a new `app_id`; **upgrading** an existing CVM's compose in
-place does not — it moves `compose_hash` under the same `app_id`. Each blue/green
-side is a separately created, separately attested CVM (README "Pin the image
-digest"), which is what gives the two sides distinct `app_id`s to point DNS at.
+and then it is persisted for the app's life. Creating a **new app** therefore gets
+a new `app_id`, whether or not its compose differs from anything already
+deployed; **upgrading** an existing app in place does not — it moves
+`compose_hash` under the same `app_id`. Each blue/green side is a separately
+created, separately attested app, and that alone is what gives the two sides
+distinct `app_id`s to point DNS at.
 
 > **So never upgrade a side in place to make it "the new side".** It keeps its
 > `app_id`, so the switch record still names it and the platform spreads traffic
@@ -23,13 +24,16 @@ digest"), which is what gives the two sides distinct `app_id`s to point DNS at.
 
 That single fact shapes everything:
 
-- **dstack only spreads traffic *within one `app_id`*.** Deploy N CVMs from the
-  *same* compose and dstack's gateway picks among them per connection ("when
+- **dstack only spreads traffic *within one `app_id`*.** Add N instances under
+  one `app_id` and dstack's gateway picks among them per connection ("when
   using the app ID, the load balancer selects one of the available instances" —
   though the selection is a connect race, not round-robin; see
   [Scaling one side](#scaling-one-side-replicas)). That is horizontal scaling /
   HA, and it is **orthogonal** to releases.
-- **Two different images are two unrelated apps.** dstack will not blend traffic
+- **Two CVMs created as separate *apps* are two unrelated apps** — distinct
+  `app_id`s whatever their compose says (see the note below; a CVM created
+  *under an existing* `app_id` is the other case, an instance of that app).
+  dstack will not blend traffic
   across them, so a release cannot be a weighted canary at this layer. It is an
   **all-or-nothing flip** of one record: `_dstack-app-address.<DOMAIN>`, the TXT
   the dstack gateway reads to learn which `app_id` owns the domain.
@@ -38,24 +42,51 @@ So "blue" and "green" are two CVMs with two `app_id`s, both serving `<DOMAIN>`,
 and releasing = repointing `_dstack-app-address.<DOMAIN>` from one to the other.
 [`switch.sh`](./switch.sh) does that flip safely.
 
-> **What actually sets `app_id` — the sides must be different builds.** dstack
-> measures the compose *text*, and the only literal, side-distinguishing field in
-> it is the **gateway image digest**. `DOMAIN`, `DELEGATION_ZONE`,
-> `GATEWAY_DOMAIN`, `ZG_GATEWAY_ROUTER_URL` and friends are `${...}` placeholders
-> injected from the CVM's encrypted env at boot, so **changing them does not
-> change `app_id`** (the compose comments call this out for the router URL). Their
-> *values* are invisible to `app_id`, but the **`allowed_envs` list is part of the
-> measured app-compose** — so it must be **identical on both sides**, and the two
-> sides then differ by exactly the image digest. Keep `DNS_SETUP_MODE` and
-> `ACME_STAGING` **permanently listed** in `allowed_envs` (a fixed superset) and
-> toggle behaviour by the injected *value*, never by adding/removing the key —
-> otherwise `allowed_envs` differs and the sides diverge by more than the image.
-> The consequence that matters here: run the **same image** on both sides and they
-> share one `app_id` — dstack sees one app with two replicas, both per-side
-> records carry the same value, and the traffic switch **cannot select between
-> them**. Blue/green only isolates the two sides when they are genuinely
-> different gateway builds (the normal release case). To rehearse the flow before
-> a real release, use two different builds, not the same image twice.
+> **What actually sets `app_id` — creating the CVM, not the compose text.** Under
+> a KMS key provider (which is what Phala Cloud runs) dstack assigns an app its id
+> when the app is **created**, and keeps it for the app's life; the fallback
+> derivation `truncate(compose_hash, 20)` runs only when nothing assigned one,
+> which is the local-key-provider case, not ours. On Phala Cloud the id is the KMS
+> app's contract address — in a CVM's info dump `app_id` and `contract_address`
+> are the same value, and neither is a prefix of `compose_hash`.
+>
+> Which of the two a new CVM gets is decided at creation, by whether the VMM call
+> carries an `app_id` (`vmm_rpc.proto`: "*optional* … if provided, and KMS is
+> enabled, it assumes the app is upgraded from given app_id"):
+>
+> | creating a CVM | result |
+> |---|---|
+> | **without** an `app_id` | a **new app** — its own `app_id`, whatever the compose says |
+> | **with** an existing `app_id` | another **instance of that app** — same `app_id`; this is what an upgrade and [Scaling one side](#scaling-one-side-replicas) do |
+>
+> So **each side must be created as its own app**, and then the two have distinct
+> `app_id`s and the traffic switch can always select between them. The live staging
+> pair is the proof: both sides run the *same* gateway image digest — the field
+> this note used to call the only thing distinguishing them — yet
+>
+> ```
+> side a  app_id 544ae2f3…  compose_hash e5a80e02…
+> side b  app_id 08f84bba…  compose_hash dd79782d…
+> ```
+>
+> Nothing here requires the sides to be different builds. Running the same image
+> on both is fine — for rehearsing the flow, or for sitting on a released build
+> while the standby is rebuilt — and it does **not** collapse them into one app.
+> (What `compose_hash` still governs is the *measurement*: it is what
+> `mr_config_id` commits to, so it does distinguish the two sides' quotes.)
+>
+> `DOMAIN`, `DELEGATION_ZONE`, `ZG_GATEWAY_ROUTER_URL` and friends are `${...}`
+> placeholders injected from the CVM's encrypted env at boot, so their *values*
+> never reach `compose_hash` — but the **`allowed_envs` list is part of the
+> measured app-compose**, and Phala Cloud generates that list from the keys you
+> actually enter. Two consequences worth keeping identical on both sides, now for
+> operational reasons rather than identity ones: a key you never enter is a key
+> the container can never receive, and a list that drifts makes the two sides'
+> measured config differ for no reason anyone can explain later. Enter
+> `DNS_SETUP_MODE` and `ACME_STAGING` on **both** sides always — `ACME_STAGING`
+> even when it is `false` — and toggle by *value*. Today's staging pair shows what
+> skipping that costs: side b's list has no `ACME_STAGING`, so side b cannot be
+> put on the staging CA at all without a config change and redeploy.
 
 > **No percentage canary.** If you need gradual rollout, it has to be a *replica*
 > story (same `app_id`, more instances) or a second layer you build yourself.
@@ -69,7 +100,7 @@ below.
 
 ```sh
 ./switch.sh acme b           # 1. aim the issuance switch at side b FIRST
-phala cvm create ...         # 2. deploy side b — new image digest (=> new app_id),
+phala cvm create ...         # 2. deploy side b — a NEW app (=> its own app_id),
                              #    DELEGATION_ZONE=b.integratenetwork.work, DNS_SETUP_MODE=print
 ./switch.sh switch b         # 3. probe b's /readyz directly, flip traffic, confirm b is
                              #    really serving (cert changed) + /healthz; auto-rollback otherwise
@@ -123,9 +154,11 @@ collide with the other side's:
      side a (DELEGATION_ZONE=a.integratenetwork.work):
        _dstack-app-address.router-api-tee.0g.ai.a.integratenetwork.work  TXT = <app_id_a>:443
        _acme-challenge.router-api-tee.0g.ai.a.integratenetwork.work      TXT = <acme token, during issuance>
+       router-api-tee.0g.ai.a.integratenetwork.work                      CNAME → <that side's GATEWAY_DOMAIN>   ← written, never read
      side b (DELEGATION_ZONE=b.integratenetwork.work):
        _dstack-app-address.router-api-tee.0g.ai.b.integratenetwork.work  TXT = <app_id_b>:443
        _acme-challenge.router-api-tee.0g.ai.b.integratenetwork.work      TXT = <acme token, during issuance>
+       router-api-tee.0g.ai.b.integratenetwork.work                      CNAME → <that side's GATEWAY_DOMAIN>   ← written, never read
 ```
 
 A client connecting to `router-api-tee.0g.ai` resolves ① → ② → ③, so the dstack
@@ -189,6 +222,68 @@ its sub-zone, issues its cert, and serves. It is injected (`${DNS_SETUP_MODE:-wa
 so `DNS_SETUP_MODE` must be in the app's `allowed_envs` — kept there **permanently
 and identically on both sides** (see the `app_id` note above), toggled by value.
 
+### Where `GATEWAY_DOMAIN` does and does not matter
+
+The last line of each side's block in ③ is the one to understand, because it is
+the only place a side's `GATEWAY_DOMAIN` value goes — and here **nothing reads
+it**.
+
+Upstream dstack-ingress's delegation mode assumes the served name is aliased to
+`<DOMAIN>.<DELEGATION_ZONE>` and that *the container owns that hop*, so it writes
+the gateway pointer there on every pass. A single-instance deployment matches that
+assumption exactly, and the pointer is load-bearing: it is the second hop of the
+serving chain, and a wrong value takes the endpoint down. Blue/green does not
+match it. Each side runs under its own sub-zone, so the hop the container writes
+becomes `<DOMAIN>.<side>.<DELEGATION_ZONE>`, while the hop that actually carries
+traffic is ②'s serving alias — hand-set, static, and never touched by either CVM.
+The per-side pointer is written every pass and read by no one. (The `accounturi`
+CAA the container publishes beside it lands on the same orphaned name, so it too
+is off the chain a CA walks from `<DOMAIN>`; the CAA that constrains issuance for
+the served name is the one on ②.)
+
+Three things therefore have to be true at once for a wrong cluster to go
+unnoticed here, and all three are:
+
+- the value reaches only a record no resolver ever queries;
+- delegation mode never validates it — `dnsguide.py` is invoked with `--include
+  delegated` or `challenge-cname`, and the record built from `--alias-target` is
+  emitted only for `--include cname`, so the flag is passed purely to satisfy a
+  required-argument check;
+- dns-01 issuance never contacts the gateway at all — the CA reads a TXT record —
+  so certificates keep renewing regardless.
+
+That combination is not hypothetical: side a was found publishing a different
+cluster than the one it runs in, with no symptom anywhere. The fix is upstream of
+the value — the compose now derives it from the platform's own
+`DSTACK_GATEWAY_DOMAIN` rather than from a hand-typed secret (README, "Serving
+domain"), so a side cannot name a cluster it is not in. Confirm after any deploy
+that the two agree:
+
+Note `switch.sh status` is no help here: it prints ②'s serving alias, which is
+hand-set and unaffected. The record to look at is the side's own, in ③ —
+
+```sh
+# the platform's own answer for which cluster this CVM is in, from its info dump:
+#   kms_info.gateway_app_url = https://gateway.<cluster>.phala.network
+
+# what that side's ingress actually published:
+dig +short CNAME router-api-tee.0g.ai.a.integratenetwork.work
+```
+
+— and it must read exactly `_.<cluster>.phala.network`. Two ways it can be wrong
+*and stay silent*: another cluster, or `_._.<cluster>.phala.network` if the
+platform ever exports the `_.` form itself. Both are silent for all the reasons
+above, so this is an eyeball check with no fallback. (A platform exporting
+*nothing* is the loud case instead: the ingress tries to write a bare `_.`, the
+provider rejects it, and that container crash-loops with the reason in its log
+while the gateway keeps serving. The `docker-compose.yml` comment on that line has
+why it is deliberately unguarded.)
+
+Cross-cluster blue/green remains unsupported for the separate reason in
+[Limitations](#limitations--things-to-confirm-in-your-environment): the serving
+alias is static, so a side in another cluster would be selected by the traffic
+switch and then handed to a gateway that cannot route its `app_id`.
+
 ## One-time setup
 
 You need a Cloudflare API token that can **edit DNS in `integratenetwork.work`**
@@ -204,20 +299,30 @@ cp deploy/phala/switch.env.example deploy/phala/switch.env
 
 Or supply it via the environment instead (`CF_API_TOKEN=... ./switch.sh …`); the
 real environment overrides `switch.env`, and `--env-file PATH` points elsewhere.
-Also set `PLATFORM_BASE` (e.g. `in1.phala.network`) in `switch.env` to enable the
-per-side pre-switch probe ([Health-checking the standby](#health-checking-the-standby-side)).
+Also set `PLATFORM_BASE` (e.g. `in1.phala.network`) in `switch.env`: it is the
+**one place the cluster is named on the operator side**. It enables the per-side
+pre-switch probe ([Health-checking the standby](#health-checking-the-standby-side)),
+and `setup` derives the serving alias from it, so the alias and the probe cannot
+name different clusters. Read `<cluster>` off a CVM's
+`kms_info.gateway_app_url` (`https://gateway.<cluster>.phala.network`) rather than
+from memory.
 
 1. **Serving alias (once).** The one record you create by hand in the delegation
-   zone: `router-api-tee.0g.ai.integratenetwork.work` CNAME → your `GATEWAY_DOMAIN`
-   (the `_.<cluster>.phala.network` value from the compose). It never changes, and
-   both sides route through the same cluster, so one static value serves both.
-   `switch.sh setup` does it for you:
+   zone: `router-api-tee.0g.ai.integratenetwork.work` CNAME → the cluster's dstack
+   gateway, `_.<cluster>.phala.network`. This is the hop that carries traffic (②
+   above), and it is the operator's to set — the CVMs no longer take a cluster
+   value from you at all. It never changes, and both sides route through the same
+   cluster, so one static value serves both. With `PLATFORM_BASE` set as above,
+   `switch.sh setup` derives it:
 
    ```sh
-   GATEWAY_DOMAIN=_.<cluster>.phala.network ./switch.sh setup
-   # already running a single instance? run `./switch.sh setup` with GATEWAY_DOMAIN
-   # unset and it prints the value the container currently publishes, to pin as-is.
+   ./switch.sh setup            # serving alias -> _.${PLATFORM_BASE}
    ```
+
+   Passing `GATEWAY_DOMAIN` explicitly still works and wins, but `setup` refuses
+   if the two name different clusters, and `status` warns if the live alias later
+   drifts from `PLATFORM_BASE`. With neither set, `setup` prints whatever the
+   alias currently points at so you can pin it as-is.
 
    Everything else in `integratenetwork.work` is automatic: the two switch records
    (`_dstack-app-address.…` and `_acme-challenge.…`) are created and flipped by
@@ -225,26 +330,27 @@ per-side pre-switch probe ([Health-checking the standby](#health-checking-the-st
    dstack-ingress. You never hand-edit those.
 
 2. **Deploy side a and side b.** Two CVMs from [`docker-compose.yml`](./docker-compose.yml).
-   Each side is a separately created CVM, which is what gives it its own `app_id`
-   (above); the differing **image digest** is what makes their compose hashes — and
-   so their quotes — differ, so the two sides must be pinned to **different**
-   gateway builds; `DELEGATION_ZONE`
-   differs too, but only to keep their DNS records apart:
+   Each side is a separately created CVM, and *that* is what gives it its own
+   `app_id` (above) — the image digest does not have to differ for the switch to
+   work, though in a real release it will, since releasing a new build is the
+   point. `DELEGATION_ZONE` differs to keep their DNS records apart:
 
    | | side a (blue) | side b (green) |
    |---|---|---|
-   | gateway image digest | current build | **new build** (what makes it a distinct `compose_hash`) |
+   | gateway image digest | current build | **new build** (in a release; identical is also valid) |
    | `DELEGATION_ZONE` | `a.integratenetwork.work` | `b.integratenetwork.work` |
    | `DNS_SETUP_MODE` | `print` | `print` |
    | `DOMAIN` | `router-api-tee.0g.ai` | `router-api-tee.0g.ai` |
 
-   `allowed_envs` **must be identical on both sides** and list `DNS_SETUP_MODE`
-   and `ACME_STAGING` **permanently** — dstack drops any encrypted var not listed
-   (a side would fall back to `wait` and block), and because `allowed_envs` is part
-   of `app_id`, a list that differs between sides (or that you edit to toggle
-   staging) makes the sides diverge by more than the image. Toggle those two by
-   **value**, never by adding/removing the key. Everything else (`GATEWAY_DOMAIN`,
-   `CLOUDFLARE_API_TOKEN`, gateway env) stays as in the shared compose. Each side,
+   Enter the **same set of keys** on both sides, `DNS_SETUP_MODE` and
+   `ACME_STAGING` always among them (`ACME_STAGING` even when it is `false`) —
+   Phala Cloud builds `allowed_envs` from the keys you actually enter, dstack drops
+   any encrypted var not listed, and a key you skipped is one the container can
+   never receive until you redeploy. Toggle both by **value**, never by
+   adding/removing the key. `GATEWAY_DOMAIN` is **not** among them any more: the
+   compose derives it from the platform's `DSTACK_GATEWAY_DOMAIN`, so setting it as
+   a secret does nothing. Everything else (`CLOUDFLARE_API_TOKEN`, gateway env)
+   stays as in the shared compose. Each side,
    on boot, publishes its own `_dstack-app-address.…a/b…` and tries to issue a cert
    for `router-api-tee.0g.ai` — for which it needs the issuance switch (next section).
 
@@ -444,11 +550,11 @@ encrypted-env value, so changing it is a mutation of the one live CVM and leaves
 you no second side to cut over to safely.)
 
 1. **Deploy side a** with `DELEGATION_ZONE=a.integratenetwork.work` and
-   `DNS_SETUP_MODE=print` (in `allowed_envs`). Make this your **next real gateway
-   build** — a different image digest than the legacy instance, so side a has a
-   distinct `app_id` and the cutover is a clean pointer flip (a same-image side
-   would share the legacy `app_id`, i.e. be treated as a replica of it; see the
-   note at the top). It publishes `…a…` records the legacy instance never touches.
+   `DNS_SETUP_MODE=print` (in `allowed_envs`). It is a newly created CVM, so it
+   has its own `app_id` regardless of which image it runs (see the note at the
+   top) and the cutover is a clean pointer flip either way — but making it your
+   **next real gateway build** folds the migration and a release into one step.
+   It publishes `…a…` records the legacy instance never touches.
 2. **Issue side a's cert:** `./switch.sh acme a`. The base-zone `_acme-challenge`
    name is only written transiently during the live instance's own renewals, so
    converting it to a CNAME → side a is safe between renewals; side a completes
@@ -471,11 +577,14 @@ you no second side to cut over to safely.)
 
 ## Scaling one side (replicas)
 
-Independent of releases: to scale or add HA **within** a side, deploy more CVMs
-from that side's *exact* compose (same `app_id`). dstack spreads traffic across
-them by `app_id`, and each publishes the same `_dstack-app-address` value, so no
-switch-layer change is needed. Releases (this document) change `app_id` and flip
-the pointer; scaling keeps `app_id` and adds instances. They compose cleanly —
+Independent of releases: to scale or add HA **within** a side, add CVMs **under
+that side's existing `app_id`** — the create-with-an-`app_id` row of the table
+above. Deploying a fresh app from the same compose text does *not* do this: it
+would be a new app with a new `app_id`, i.e. a third side rather than a replica.
+dstack spreads traffic across an app's instances by `app_id`, and each publishes
+the same `_dstack-app-address` value, so no switch-layer change is needed.
+Releases (this document) flip the pointer to the *other side's* `app_id`; scaling
+stays inside one `app_id` and adds instances to it. They compose cleanly —
 `switch.sh` neither knows nor cares how many CVMs back the side it points at.
 
 **The custom-domain path uses the same selection code as the platform hostname.**
@@ -536,8 +645,10 @@ Two consequences for testing it:
   This scheme flips `_dstack-app-address` (+ `_acme-challenge`) only and treats the
   serving alias as fixed. **Migrating to a new cluster** (or running the sides
   across clusters) is not supported as-is; it additionally needs the serving alias
-  to become a *switched* record (→ the target side's `GATEWAY_DOMAIN`), a per-side
-  `GATEWAY_DOMAIN`/`PLATFORM_BASE`, and Phala's SNI allowlist on both clusters.
+  to become a *switched* record (→ the target side's own gateway pointer, i.e. ③'s
+  last line, which each side already publishes correctly for its own cluster now
+  that the value comes from the platform), a per-side `PLATFORM_BASE` for the
+  standby probe, and Phala's SNI allowlist on both clusters.
   Because the client's gateway and the app-address then live in two records with
   independent DNS caches, that cutover has a brief inconsistency window (shrink it
   by lowering the TTLs first). Defer until a cluster move is actually needed.

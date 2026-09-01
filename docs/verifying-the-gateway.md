@@ -95,7 +95,7 @@ gateway            pc-gateway.0g.ai
 ✓ app-compose        sha256 == compose_hash (authenticated)
   source           https://cloud-api.phala.com/api/v1/apps/08f84bba…/attestations (instance 1 of 2)
   app name         0g-pc-gateway-a-1
-  allowed_envs     ZG_GATEWAY_ROUTER_URL DOMAIN GATEWAY_DOMAIN …
+  allowed_envs     ZG_GATEWAY_ROUTER_URL DNS_SETUP_MODE DOMAIN …
 ✓ compose file       matches release-2026.08.07.1 byte-for-byte
 ✓ os image           dstack-nvidia-0.5.4.1
 
