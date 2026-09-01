@@ -77,9 +77,11 @@
 #                    per-side app-id probe before a switch (<app_id>-443s.<PLATFORM_BASE>),
 #                    and `setup` derives GATEWAY_DOMAIN from it as _.<PLATFORM_BASE>
 #   GATEWAY_DOMAIN   cluster dstack gateway         (used only by `setup`; defaults to
-#                    _.<PLATFORM_BASE>. Setting both to different clusters is refused —
-#                    they are two spellings of one value and nothing else cross-checks
-#                    them. `status` warns if the live alias drifts from PLATFORM_BASE.)
+#                    _.<PLATFORM_BASE>, and a missing `_.` is added — the alias must
+#                    name the gateway's wildcard hop. Setting both to different
+#                    clusters is refused; they are two spellings of one value and
+#                    nothing else cross-checks them. `status` warns if the live alias
+#                    drifts from PLATFORM_BASE or is not a `_.<base>` hop.)
 #   SIDE_A_LABEL     sub-zone label for side a      (default: a)
 #   SIDE_B_LABEL     sub-zone label for side b      (default: b)
 #   TXT_PREFIX       app-address record prefix      (default: _dstack-app-address)
@@ -360,6 +362,14 @@ cmd_status() {
     warn "serving alias and PLATFORM_BASE name different clusters:"
     warn "  alias -> ${alias_now} vs PLATFORM_BASE=${PLATFORM_BASE}"
     warn "  the pre-switch probe would test a side the live path cannot reach."
+  fi
+  # Right cluster, wrong form: the alias must name the gateway's wildcard hop.
+  # A bare base domain is not one, and the cluster check above cannot see it
+  # because it compares the two with `_.` stripped.
+  if [ -n "$alias_now" ] && [ "$alias_now" = "${alias_now#_.}" ]; then
+    warn "serving alias is not a gateway hop (wants _.<base>): ${alias_now}"
+    warn "  traffic will not reach a dstack gateway, and pcverify cannot derive"
+    warn "  a base domain from this chain. Re-run 'setup' to rewrite it."
   fi
   printf 'traffic switch  : %s\n' "${TXT_PREFIX}.${DOMAIN}"
   printf '   -> %s  [%s]\n' "${addr_now:-<unset>}" "${addr_side:-none}"
@@ -656,6 +666,15 @@ cmd_setup() {
     fi
     die "set PLATFORM_BASE (<cluster>.phala.network) and it is derived, or set GATEWAY_DOMAIN (_.<cluster>.phala.network) directly"
   fi
+  # Normalise the FORM, not just the cluster. The check above strips `_.` from
+  # both sides on purpose — it asks "same cluster?" — so a GATEWAY_DOMAIN given
+  # without the prefix agrees with PLATFORM_BASE and would otherwise be written
+  # bare. Bare is not a harmless variant: the alias must name the gateway's
+  # wildcard hop, this hop carries traffic in the single-instance layout, and
+  # `pcverify` rejects a CNAME chain that does not end at `_.<base>`
+  # (client/evidence/appcompose.go, deriveBaseDomain). Idempotent on a value that
+  # already has it.
+  GATEWAY_DOMAIN="_.${GATEWAY_DOMAIN#_.}"
   info "one-time setup: the static serving alias in the delegation zone"
   info "  ${SERVING_ALIAS}  CNAME ->  ${GATEWAY_DOMAIN}"
   info "the two switch records are created by 'acme'/'switch'; the per-side"
