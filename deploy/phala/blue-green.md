@@ -276,8 +276,8 @@ platform ever exports the `_.` form itself. Both are silent for all the reasons
 above, so this is an eyeball check with no fallback. (A platform exporting
 *nothing* is the loud case instead: the ingress tries to write a bare `_.`, the
 provider rejects it, and that container crash-loops with the reason in its log
-while the gateway keeps serving. README "Serving domain" has why the compose
-deliberately does not guard this.)
+while the gateway keeps serving. The `docker-compose.yml` comment on that line has
+why it is deliberately unguarded.)
 
 Cross-cluster blue/green remains unsupported for the separate reason in
 [Limitations](#limitations--things-to-confirm-in-your-environment): the serving

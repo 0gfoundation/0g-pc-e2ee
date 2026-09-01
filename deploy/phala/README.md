@@ -83,64 +83,33 @@ deploy immediately instead of silently degrading. They must also be listed in th
 app's `allowed_envs` — dstack drops any encrypted variable that is not, and the
 only symptom is an interpolation error at boot.
 
-**`GATEWAY_DOMAIN` is deliberately not one of those three.** dstack-ingress requires it —
-the image refuses to start without a non-empty value — but the value is the target
-cluster's dstack gateway, which the platform already knows and the enclave cannot
-work out for itself: the guest agent's `Info` exposes `app_id`, `instance_id`,
-measurements and the compose, and nothing about which gateway fronts the CVM. So
-the compose takes it from **`DSTACK_GATEWAY_DOMAIN`**, which Phala Cloud's
-pre-launch script exports into the shell that runs `docker compose`, and prefixes
-the `_.` dstack-ingress expects:
+**`GATEWAY_DOMAIN` is not one of them — you do not set it.** dstack-ingress needs
+it, but it names the cluster the CVM booted in, so the compose takes that from the
+platform: `GATEWAY_DOMAIN=_.${DSTACK_GATEWAY_DOMAIN}`, Phala's own recipe. It
+arrives from the pre-launch script rather than the encrypted env, so it needs no
+`allowed_envs` entry, and setting a `GATEWAY_DOMAIN` secret does nothing. The
+`docker-compose.yml` comment has the reasoning, including why that line has no
+`:?` when its neighbours do.
 
-```yaml
-- GATEWAY_DOMAIN=_.${DSTACK_GATEWAY_DOMAIN}
-```
+Worth knowing: the pre-launch script reads the value from `/dstack/user_config`,
+which is **not measured**, so a hostile host could change which gateway this CVM's
+CNAME names. Routing only — TLS terminates in this CVM and the gateway passes SNI
+through at L4 — and a host bent on denying service can simply not run the CVM.
 
-That is Phala's own custom-domain recipe, spelled the same way on purpose — this
-line should stay diff-clean against upstream. Do not set a `GATEWAY_DOMAIN`
-secret: it is ignored, and hand-typing the cluster is the one way this value can
-be wrong.
-
-**No `:?` here, unlike the three above**, and that is a deliberate exception
-rather than an oversight. Those three are secrets a human forgets; this one is
-injected, and neither of its failure modes is one `:?` catches. If the platform
-exports nothing the expression yields the literal `_.` — non-empty, so an outer
-guard never fires. Guarding the *inner* variable would fire, but it fails the
-compose at **parse** time, so nothing starts at all: the gateway goes down with
-the ingress, over a value that under blue/green nothing reads. Ungated, the blast
-radius is the ingress alone — it tries to write `_.` as a CNAME target, the
-provider rejects it, and that one container crash-loops with the reason in its
-log while the gateway keeps serving.
-
-`DSTACK_GATEWAY_DOMAIN` needs no `allowed_envs` entry — that list filters the
-*encrypted* env, and this arrives from the pre-launch script instead. The
-trade-off, stated plainly: the pre-launch script reads it from
-`/dstack/user_config` (or a `default_gateway_domain` in the app-compose), and
-`user_config` is **not measured** — no RTMR3 event covers it. A hostile host can
-therefore change which gateway this CVM's CNAME names. That is a routing/DoS
-input, not a confidentiality one: TLS terminates inside this CVM and the dstack
-gateway only passes SNI through at L4, so a wrong gateway cannot read anything —
-and a host that wants to deny service can simply not run the CVM.
-
-**Verify the published record character for character after the first deploy**,
-and after any deploy that follows a platform change. The platform names the true
-cluster in the CVM's `kms_info`, and what the ingress publishes must be exactly
-`_.` plus that cluster:
+**Check the published record after the first deploy**, against the cluster the
+platform reports in the CVM's `kms_info`:
 
 ```
 kms_info.gateway_app_url    https://gateway.dstack-pha-prod5.phala.network
 <DOMAIN>.<DELEGATION_ZONE>  CNAME → _.dstack-pha-prod5.phala.network      ✅
-                            CNAME → _._.dstack-pha-prod5.phala.network    ❌ see below
+                            CNAME → _._.dstack-pha-prod5.phala.network    ❌ doubled prefix
                             CNAME → _.dstack-pha-in2.phala.network        ❌ wrong cluster
 ```
 
-The `_._.` form is the failure no guard in the file can catch: if the platform
-ever exported the `_.`-prefixed form itself, the prefix would be applied twice,
-and compose interpolation offers no way to strip one (`${VAR#_.}` is an
-interpolation error, not a no-op). So the check is by eye. Today the value is
-bare, on the pre-launch script's own evidence: it builds
-`DSTACK_APP_DOMAIN=$DSTACK_APP_ID"."$DSTACK_GATEWAY_DOMAIN`, which is a hostname
-only if `DSTACK_GATEWAY_DOMAIN` carries no `_.`.
+Nothing in the compose catches either wrong shape, and under blue/green neither
+has any symptom ([blue-green.md](./blue-green.md), "Where `GATEWAY_DOMAIN` does
+and does not matter") — this check is what stands between a wrong value and a
+silent one.
 
 Left unchecked, a doubled prefix reproduces exactly the failure mode this
 arrangement exists to kill: a record written into DNS, read by nobody under
