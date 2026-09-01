@@ -509,7 +509,24 @@ func OpenResponse(clientEphPriv crypto.PrivateKey, resp Response) (Response, err
 
 // OpenResponseFor opens a complete non-streaming (single-frame) response and
 // checks it against the profile the request used (see NewResponseOpenerFor).
+//
+// The one frame of a non-streaming response IS the final frame by definition, so
+// this requires `final` before opening anything. Without that the receive-side
+// §7.1 check is defeated by the sender setting one bit: those obligations fall
+// due on the final frame, and `final` is a value the sealer chooses. An enclave
+// could ship `data` sealed with no `usage` and `final: false`, and a client
+// calling this — the only shape §7.1 actually describes — would hand back a
+// complete, correct response having verified none of it. A non-final frame here
+// is not a lesser response; it is a stream fragment presented as a whole
+// response, which is a truncation whether or not it was meant as one.
 func OpenResponseFor(profile Profile, clientEphPriv crypto.PrivateKey, resp Response) (Response, error) {
+	e2ee, err := resp.E2EE()
+	if err != nil {
+		return nil, err
+	}
+	if !e2ee.Final {
+		return nil, fmt.Errorf("non-streaming response frame is not marked final: a single-frame response must be the final frame, and the checks that fall due on it would otherwise be skipped")
+	}
 	ro, err := NewResponseOpenerFor(profile, clientEphPriv, resp)
 	if err != nil {
 		return nil, err

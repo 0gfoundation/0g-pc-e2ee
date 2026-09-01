@@ -465,3 +465,68 @@ func TestNilSealedFieldsMeansThisProfilesDefault(t *testing.T) {
 		})
 	}
 }
+
+// `final` is a bit the SEALER chooses, and the §7.1 obligations fall due on the
+// final frame — so hanging a receive-side check on it hands the sender a way to
+// skip it. A non-streaming response is exactly one frame, which by definition is
+// the final one, so OpenResponseFor requires it: otherwise an enclave ships
+// `data` sealed with no `usage` and `final: false`, and the client — using the
+// only response shape §7.1 describes — gets a complete answer having verified
+// none of what §7.1 promises.
+func TestNonStreamingOpenRequiresTheFinalFrame(t *testing.T) {
+	ephPriv, ephPub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	rs, err := wire.NewResponseSealerNonConforming(ephPub)
+	if err != nil {
+		t.Fatalf("sealer: %v", err)
+	}
+	// Everything a conforming image response has, except the billable count —
+	// and final:false, which is what used to make that omission unreachable.
+	frame, err := rs.SealFrame(wire.Response{
+		"created": json.RawMessage(`1700000000`),
+		"data":    json.RawMessage(`[{"b64_json":"aW1n"}]`),
+	}, []string{"data"}, false)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	if _, err := wire.OpenResponseFor(wire.ProfileImage, ephPriv, frame); err == nil {
+		t.Fatal("a non-final frame must not be accepted as a whole response")
+	} else if !strings.Contains(err.Error(), "final") {
+		t.Fatalf("error should name the missing final marker, got: %v", err)
+	}
+
+	// The same omission on a frame that admits to being final is caught by the
+	// §7.1 check itself — the two together leave no spelling that gets through.
+	// A fresh sealer, since only a first frame carries the enc a lone frame needs.
+	rs2, err := wire.NewResponseSealerNonConforming(ephPub)
+	if err != nil {
+		t.Fatalf("sealer: %v", err)
+	}
+	final, err := rs2.SealFrame(wire.Response{
+		"created": json.RawMessage(`1700000000`),
+		"data":    json.RawMessage(`[{"b64_json":"aW1n"}]`),
+	}, []string{"data"}, true)
+	if err != nil {
+		t.Fatalf("seal final: %v", err)
+	}
+	if _, err := wire.OpenResponseFor(wire.ProfileImage, ephPriv, final); err == nil {
+		t.Fatal("a final frame with no billable count must not be accepted either")
+	} else if !strings.Contains(err.Error(), "output_images") {
+		t.Fatalf("error should name the missing count, got: %v", err)
+	}
+
+	// And a conforming non-streaming response still opens.
+	good, err := wire.SealResponseFor(wire.ProfileImage, ephPub, wire.Response{
+		"created": json.RawMessage(`1700000000`),
+		"usage":   json.RawMessage(`{"output_images":1}`),
+		"data":    json.RawMessage(`[{"b64_json":"aW1n"}]`),
+	}, nil)
+	if err != nil {
+		t.Fatalf("seal good: %v", err)
+	}
+	if _, err := wire.OpenResponseFor(wire.ProfileImage, ephPriv, good); err != nil {
+		t.Fatalf("a conforming single-frame response must open: %v", err)
+	}
+}

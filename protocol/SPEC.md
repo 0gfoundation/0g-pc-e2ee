@@ -628,7 +628,8 @@ other, that party's column is the load-bearing one.
 | no sealed/cleartext collision (§5.1) | by construction | **yes** |
 | envelope `v` / `kem_id` supported (§9) | by construction | **yes** |
 | `signer_addr` is this enclave (§4.4/§6) | client pins | **yes — enclave** |
-| final frame received (§7) | sealer emits | **yes — client** (its absence is a truncation) |
+| final frame received (§7) | sealer emits | **yes — client** (its absence is a truncation). A non-streaming response is one frame, so the opener requires `final` on it directly. For a stream only the caller&#39;s read loop knows the stream ended, so that half is the caller&#39;s and cannot be delegated to a frame-at-a-time opener. |
+| a receive-side check is not gated on a sender-controlled value (§7.1/§12) | n/a | **yes — client**. Obligations that fall due on the final frame are reachable only if `final` itself is checked; `final` is chosen by the sealer, so a check hung on it is a check the sender can decline. |
 | frame order (§7) | sealer sequence | **yes — client** (the AEAD sequence enforces it) |
 | response is sealed at all | n/a | **yes — client** (a frame with no `_e2ee` is not a sealed response) |
 
