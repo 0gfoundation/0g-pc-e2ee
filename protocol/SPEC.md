@@ -413,6 +413,19 @@ Two constraints are specific to this profile:
   at verify. An enclave that cannot count them MUST reject rather than seal a
   response with no verifiable count.
 
+  This is enforced on **both** sides, on the **final** frame (`usage` is a
+  property of the whole response; a streaming profile may withhold it until the
+  last frame). A sealer MUST refuse to emit a final frame that omits the count,
+  and **a client MUST refuse a final frame that omits it** — the receiver half
+  being the one that holds when the enclave is not running this library. The
+  value MUST be a non-negative number; an explicit `0` is a valid count and is
+  not an omission.
+
+  The receiver half exists because omission has no loud failure anywhere else:
+  a router parses such a frame perfectly well, counts zero images, and bills
+  nothing. A missing count and a genuine zero are the same bytes downstream, so
+  no component but the client can tell them apart, and only at open time.
+
   It lives inside `usage` because that is where a quantity billed on belongs,
   and is named `output_images` rather than `images` for two reasons: `usage` is
   an OpenAI-defined object (a token-billed image model such as `gpt-image-1`
@@ -610,6 +623,7 @@ other, that party's column is the load-bearing one.
 | response sealed set covers the generated content (§7) | yes | **yes — client** (otherwise the content rides in the clear and Open still succeeds) |
 | `usage` not sealed (§7) | yes | client (loud either way: the router cannot bill) |
 | `usage` not unbound (§5.2/§7.1) | yes | **yes — client** (otherwise a rewritten count verifies) |
+| final frame carries the profile's billable cleartext — image: `usage.output_images` (§7.1) | yes | **yes — client** (a router cannot distinguish an omitted count from a zero, so it bills nothing and reports nothing) |
 | decrypted keys == declared `sealed_fields` (§5.1/§6) | by construction | **yes** |
 | no sealed/cleartext collision (§5.1) | by construction | **yes** |
 | envelope `v` / `kem_id` supported (§9) | by construction | **yes** |

@@ -332,7 +332,7 @@ func TestImageResponseSealsDataAndLeavesUsageCleartext(t *testing.T) {
 		"usage":   json.RawMessage(`{"output_images":2}`),
 		"data":    json.RawMessage(`[{"b64_json":"c2VjcmV0"},{"b64_json":"aW1hZ2U"}]`),
 	}
-	frame, err := wire.SealResponse(ephPub, resp,
+	frame, err := wire.SealResponseFor(wire.ProfileImage, ephPub, resp,
 		wire.DefaultResponseSealedFieldsFor(wire.ProfileImage), "model", "x_0g_trace")
 	if err != nil {
 		t.Fatalf("seal response: %v", err)
@@ -384,7 +384,7 @@ func TestImageResponseSurvivesRouterRewritesButDetectsUsageTampering(t *testing.
 	}
 	seal := func() wire.Response {
 		t.Helper()
-		f, err := wire.SealResponse(ephPub, base(),
+		f, err := wire.SealResponseFor(wire.ProfileImage, ephPub, base(),
 			wire.DefaultResponseSealedFieldsFor(wire.ProfileImage), "model", "x_0g_trace")
 		if err != nil {
 			t.Fatalf("seal: %v", err)

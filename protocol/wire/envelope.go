@@ -45,6 +45,11 @@ const (
 	// MUST cover, per profile (SPEC §7).
 	fieldChoices = "choices"
 	fieldData    = "data"
+	// fieldUsage / fieldOutputImages locate the billable image count a sealed
+	// image response MUST carry in cleartext (SPEC §7.1) — see
+	// profileSpec.requiredResponseCleartext.
+	fieldUsage        = "usage"
+	fieldOutputImages = "output_images"
 	// clientEphPubLen is the byte length of an X25519 public key — the client's
 	// response ephemeral key (SPEC §3 suite).
 	clientEphPubLen = 32
@@ -93,7 +98,24 @@ type profileSpec struct {
 	// rejected, never defaulted — because a server-side default is exactly what
 	// this guards against (§7.1). Empty for profiles with no such constraint.
 	pinnedCleartext map[string]string
+	// requiredResponseCleartext are numeric values a sealed FINAL response frame
+	// of this profile MUST carry in cleartext, because the router bills on them
+	// and cannot recover them from the sealed content (§7.1). Empty for profiles
+	// with no such requirement.
+	requiredResponseCleartext []cleartextNumber
 }
+
+// cleartextNumber locates a required cleartext number one level inside a
+// top-level response field — `usage.output_images`, and so far only that. A
+// two-level struct rather than general dotted-path resolution because the one
+// requirement that exists is two levels deep, and a path parser would be more
+// machinery than the rule it enforces.
+type cleartextNumber struct {
+	field string // top-level cleartext response field, e.g. "usage"
+	key   string // key within that object, e.g. "output_images"
+}
+
+func (c cleartextNumber) String() string { return c.field + "." + c.key }
 
 var profiles = map[Profile]profileSpec{
 	ProfileChat: {
@@ -120,8 +142,18 @@ var profiles = map[Profile]profileSpec{
 		// family IS "url", so an omitted field is a request to leak, spelled
 		// as silence.
 		pinnedCleartext: map[string]string{fieldResponseFormat: "b64_json"},
+		// The billable count. Sealing `data` makes the images uncountable from
+		// outside, so §7.1 requires the enclave to restate how many it produced
+		// in cleartext; without this the router's own parse of a sealed frame
+		// yields zero images and bills nothing, silently, forever.
+		requiredResponseCleartext: []cleartextNumber{{field: fieldUsage, key: fieldOutputImages}},
 	},
 }
+
+// Deliberately not set for ProfileChat: chat's billable quantities are the token
+// counts, and a streaming chat response omits `usage` on every frame unless the
+// caller asked for it (stream_options.include_usage). Requiring it here would
+// reject conforming chat streams to enforce a rule §7 does not state.
 
 // ValidatePinnedCleartextFor enforces a profile's pinned cleartext constraints
 // (§5.1 / §7.1) on a RECEIVED envelope. It is the enclave-side counterpart of
@@ -279,15 +311,24 @@ func ValidateSealedFields(fields []string) error {
 }
 
 // ValidateSealedFieldsFor enforces the invariants on a sealed-field set for a
-// profile: non-empty, no duplicates, and the profile's payload field present
-// ("messages" for chat, "prompt" for image). Leaving the payload cleartext
-// defeats the purpose, so any sealed envelope MUST cover it.
+// profile: non-empty, no duplicates, the profile's payload field present
+// ("messages" for chat, "prompt" for image), and no pinned cleartext field
+// swallowed by the set. Leaving the payload cleartext defeats the purpose, so
+// any sealed envelope MUST cover it.
 //
 // SealRequestFor calls this fail-closed per request, so a client cannot build an
 // envelope that silently leaves the payload exposed — the only place a leak can
 // actually be *prevented*. It is also exported so a caller can validate an
 // operator-supplied sealed set up front (e.g. the sidecar's -seal-fields flag)
 // and fail fast instead of erroring on every request.
+//
+// That second use is why the pinned check belongs here and not only in
+// SealRequestFor. The two rules answer the same question — "is this set of field
+// names valid for this profile?" — and depend on nothing but (profile, fields),
+// so an operator validating `-seal-fields` up front must see both verdicts. With
+// the pinned half elsewhere, `prompt,response_format` passed startup validation
+// clean and then failed 100% of requests: the exact failure mode the fail-fast
+// call exists to prevent.
 func ValidateSealedFieldsFor(p Profile, fields []string) error {
 	spec, err := p.spec()
 	if err != nil {
@@ -295,6 +336,9 @@ func ValidateSealedFieldsFor(p Profile, fields []string) error {
 	}
 	if len(fields) == 0 {
 		return fmt.Errorf("no sealed fields")
+	}
+	if err := validatePinnedNotSealed(spec, fields); err != nil {
+		return err
 	}
 	seen := make(map[string]struct{}, len(fields))
 	hasRequired := false
@@ -407,11 +451,9 @@ func SealRequestFor(profile Profile, encPub crypto.PublicKey, req Request, seale
 	// the server to publish the RESULT outside the sealed channel (§7.1). Check
 	// the value AND that it will still be readable and authenticated when it gets
 	// there — a pin that is sealed away, or that an intermediary can rewrite, is
-	// not a pin. ValidatePinnedCleartextFor runs the same three checks on the
-	// receiving side.
-	if err := validatePinnedNotSealed(spec, sealedFields); err != nil {
-		return nil, err
-	}
+	// not a pin. ValidateSealedFieldsFor above already rejected a set that seals
+	// the pin away; ValidatePinnedCleartextFor runs all three checks together on
+	// the receiving side.
 	if err := validatePinnedNotUnbound(spec, unboundFields); err != nil {
 		return nil, err
 	}

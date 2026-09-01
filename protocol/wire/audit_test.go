@@ -204,3 +204,141 @@ func TestOpenRequestForRunsEveryReceiverSideCheck(t *testing.T) {
 		})
 	}
 }
+
+// §7.1 requires a sealed image response to restate its billable count in
+// cleartext, because sealing `data` makes the images uncountable from outside.
+// The failure mode when it is missing is the reason this is a MUST and not a
+// convention: the router parses the frame perfectly well, counts zero images,
+// and bills nothing — no error, no log line, no bounded blast radius. A missing
+// count and a genuine zero are the same bytes.
+func TestSealedImageResponseMustCarryTheBillableCount(t *testing.T) {
+	_, ephPub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	sealed := wire.DefaultResponseSealedFieldsFor(wire.ProfileImage)
+	seal := func(resp wire.Response) error {
+		_, err := wire.SealResponseFor(wire.ProfileImage, ephPub, resp, sealed)
+		return err
+	}
+	base := func() wire.Response {
+		return wire.Response{
+			"created": json.RawMessage(`1700000000`),
+			"data":    json.RawMessage(`[{"b64_json":"aW1n"}]`),
+		}
+	}
+
+	withUsage := base()
+	withUsage["usage"] = json.RawMessage(`{"output_images":1}`)
+	if err := seal(withUsage); err != nil {
+		t.Fatalf("a conforming image response must still seal: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		usage json.RawMessage // nil → omit `usage` entirely
+	}{
+		{name: "no usage at all"},
+		{name: "usage without the count", usage: json.RawMessage(`{"input_tokens":10}`)},
+		{name: "count is not a number", usage: json.RawMessage(`{"output_images":"2"}`)},
+		{name: "count is negative", usage: json.RawMessage(`{"output_images":-1}`)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := base()
+			if tc.usage != nil {
+				resp["usage"] = tc.usage
+			}
+			err := seal(resp)
+			if err == nil {
+				t.Fatal("an image response that cannot be billed must not be sealed")
+			}
+			if !strings.Contains(err.Error(), "output_images") {
+				t.Fatalf("error should name the missing count, got: %v", err)
+			}
+		})
+	}
+
+	// A zero count is a legitimate value (a request that produced nothing), and
+	// must not be confused with the absence this test is about.
+	zero := base()
+	zero["usage"] = json.RawMessage(`{"output_images":0}`)
+	if err := seal(zero); err != nil {
+		t.Fatalf("an explicit zero is a valid count, not an omission: %v", err)
+	}
+}
+
+// The receiving half of the same rule, and the half that holds against an
+// enclave which is not running this library — a third-party enclave, or one that
+// drops the count on purpose to be served for free. The client is the only party
+// with both an interest and a way to notice.
+func TestClientRefusesASealedImageResponseWithoutTheBillableCount(t *testing.T) {
+	ephPriv, ephPub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	// Seal through the CHAT profile to model a non-conforming enclave: the wire
+	// format is identical across profiles, so this produces exactly the frame an
+	// enclave that skipped the §7.1 check would emit.
+	frame, err := wire.SealResponse(ephPub, wire.Response{
+		"created": json.RawMessage(`1700000000`),
+		"data":    json.RawMessage(`[{"b64_json":"aW1n"}]`),
+	}, wire.DefaultResponseSealedFieldsFor(wire.ProfileImage))
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	if _, ok := frame["usage"]; ok {
+		t.Fatal("precondition: this frame is supposed to be missing its billable count")
+	}
+
+	if _, err := wire.OpenResponseFor(wire.ProfileImage, ephPriv, frame); err == nil {
+		t.Fatal("the client must refuse an image response that states no billable count")
+	} else if !strings.Contains(err.Error(), "output_images") {
+		t.Fatalf("error should name the missing count, got: %v", err)
+	}
+}
+
+// FINAL frames only. `usage` is a property of the whole response, so a streaming
+// profile legitimately withholds it until the last frame; requiring it on every
+// frame would make streaming impossible for any profile that ever needs one.
+func TestOnlyTheFinalFrameOwesTheBillableCount(t *testing.T) {
+	_, ephPub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	rs, err := wire.NewResponseSealerFor(wire.ProfileImage, ephPub)
+	if err != nil {
+		t.Fatalf("new sealer: %v", err)
+	}
+	sealed := wire.DefaultResponseSealedFieldsFor(wire.ProfileImage)
+	partial := wire.Response{"data": json.RawMessage(`[{"b64_json":"cGFydA"}]`)}
+	if _, err := rs.SealFrame(partial, sealed, false); err != nil {
+		t.Fatalf("a non-final frame owes no count yet: %v", err)
+	}
+	last := wire.Response{"data": json.RawMessage(`[{"b64_json":"cmVzdA"}]`)}
+	if _, err := rs.SealFrame(last, sealed, true); err == nil {
+		t.Fatal("the frame that closes the response must carry the count")
+	}
+}
+
+// ValidateSealedFieldsFor is documented as the fail-fast validator for an
+// operator-supplied set (the sidecar's -seal-fields). Both rules it enforces
+// depend on nothing but (profile, fields), so an operator must get both verdicts
+// at startup. With the pinned half checked only inside SealRequestFor,
+// `prompt,response_format` validated clean and then failed every single request
+// — precisely the outcome the up-front call exists to rule out.
+func TestConfigTimeValidationRejectsASetThatSealsThePin(t *testing.T) {
+	err := wire.ValidateSealedFieldsFor(wire.ProfileImage, []string{"prompt", "response_format"})
+	if err == nil {
+		t.Fatal("a sealed set that swallows the pinned cleartext field must be rejected at config time")
+	}
+	if !strings.Contains(err.Error(), "response_format") {
+		t.Fatalf("error should name the pinned field, got: %v", err)
+	}
+	if err := wire.ValidateSealedFieldsFor(wire.ProfileImage, []string{"prompt"}); err != nil {
+		t.Fatalf("the conforming set must still validate: %v", err)
+	}
+	// Chat pins nothing, so the same field name is an ordinary extra there.
+	if err := wire.ValidateSealedFieldsFor(wire.ProfileChat, []string{"messages", "response_format"}); err != nil {
+		t.Fatalf("chat has no pin to violate: %v", err)
+	}
+}
