@@ -407,3 +407,61 @@ func TestSealerRefusesToShipTheContentInTheClear(t *testing.T) {
 		t.Fatalf("a superset of the profile's default must still seal: %v", err)
 	}
 }
+
+// "nil means this profile's v1 default" — SealFrame read that default from a
+// fixed profile, so it held only for chat, and a nil for any other profile
+// silently meant "seal choices". The request side never had the bug
+// (SealRequestFor reads DefaultSealedFieldsFor(profile)); the response side got
+// its profile later and the nil branch was not moved onto it.
+//
+// It failed closed rather than leaking, but it made the documented contract
+// false for every profile added after chat — including every future one.
+func TestNilSealedFieldsMeansThisProfilesDefault(t *testing.T) {
+	_, ephPub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	for _, tc := range []struct {
+		profile wire.Profile
+		frame   wire.Response
+		sealed  string // the field nil must have selected
+		clear   string // a field that must remain cleartext
+	}{
+		{
+			wire.ProfileImage,
+			wire.Response{
+				"usage": json.RawMessage(`{"output_images":1}`),
+				"data":  json.RawMessage(`[{"b64_json":"aW1n"}]`),
+			},
+			"data", "usage",
+		},
+		{
+			wire.ProfileChat,
+			wire.Response{
+				"usage":   json.RawMessage(`{"total_tokens":3}`),
+				"choices": json.RawMessage(`[{"message":{"content":"hi"}}]`),
+			},
+			"choices", "usage",
+		},
+	} {
+		t.Run(string(tc.profile), func(t *testing.T) {
+			frame, err := wire.SealResponseFor(tc.profile, ephPub, tc.frame, nil)
+			if err != nil {
+				t.Fatalf("nil must select the %s profile's own default: %v", tc.profile, err)
+			}
+			if _, still := frame[tc.sealed]; still {
+				t.Errorf("%q should have been sealed away", tc.sealed)
+			}
+			if _, ok := frame[tc.clear]; !ok {
+				t.Errorf("%q must stay cleartext", tc.clear)
+			}
+			e2ee, err := frame.E2EE()
+			if err != nil {
+				t.Fatalf("read _e2ee: %v", err)
+			}
+			if len(e2ee.SealedFields) != 1 || e2ee.SealedFields[0] != tc.sealed {
+				t.Errorf("sealed_fields = %v, want [%q]", e2ee.SealedFields, tc.sealed)
+			}
+		})
+	}
+}

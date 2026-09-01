@@ -39,8 +39,8 @@ type ResponseE2EE struct {
 //
 // An unknown profile yields an EMPTY BUT NON-NIL slice, so a caller that passes
 // the result straight into SealFrame fails closed with "no sealed fields".
-// Returning nil would instead select the nil default below and silently seal
-// "choices" for a profile that does not exist.
+// Returning nil would instead be read by SealFrame as "use the default", sending
+// it back here for a profile that does not exist.
 //
 // The enclave passes this explicitly per service type; it is exported so the
 // broker names the field in one place rather than re-listing it.
@@ -51,10 +51,6 @@ func DefaultResponseSealedFieldsFor(p Profile) []string {
 	}
 	return slices.Clone(s.response)
 }
-
-// defaultResponseSealedFields is the v1 default set of response fields to seal
-// (SPEC §7) when a caller passes nil: the chat profile's generated content.
-func defaultResponseSealedFields() []string { return DefaultResponseSealedFieldsFor(ProfileChat) }
 
 // mustStayCleartextInResponse are response fields a sealed frame MUST NOT seal,
 // whatever the profile: the router reads them WITHOUT a key to bill and to
@@ -272,12 +268,17 @@ func NewResponseSealerFor(profile Profile, clientEphPub crypto.PublicKey, unboun
 	return &ResponseSealer{sealer: s, enc: b64.EncodeToString(enc), first: true, unbound: unboundFields, profile: profile}, nil
 }
 
-// SealFrame seals one frame: it removes sealedFields (nil → the v1 default,
-// "choices") from frame, seals their values, and returns the frame carrying
-// `_e2ee`. final marks the last frame.
+// SealFrame seals one frame: it removes sealedFields (nil → this sealer's
+// profile's v1 default) from frame, seals their values, and returns the frame
+// carrying `_e2ee`. final marks the last frame.
 func (rs *ResponseSealer) SealFrame(frame Response, sealedFields []string, final bool) (Response, error) {
 	if sealedFields == nil {
-		sealedFields = defaultResponseSealedFields()
+		// THIS sealer's profile, not chat's. Reading the default from a fixed
+		// profile is what DefaultResponseSealedFieldsFor's own comment warns about,
+		// and it does not take an unknown profile to go wrong: it made nil mean
+		// "seal choices" for every profile, so the documented "nil → the profile's
+		// default" held only for chat.
+		sealedFields = DefaultResponseSealedFieldsFor(rs.profile)
 	}
 	// The profile's own requirement, not just the profile-independent floor: a
 	// set that seals something incidental instead of the generated content puts
