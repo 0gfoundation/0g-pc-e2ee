@@ -3,6 +3,7 @@ package wire
 import (
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
@@ -31,9 +32,29 @@ type ResponseE2EE struct {
 	Ciphertext    string   `json:"ciphertext"` // base64url; excluded from the AAD
 }
 
+// DefaultResponseSealedFieldsFor is the v1 default set of response fields to
+// seal for a profile (SPEC §7): the generated content — "choices" for chat,
+// "data" (the images) for image. Everything else in the frame stays cleartext so
+// the router can bill on it without decrypting.
+//
+// An unknown profile yields an EMPTY BUT NON-NIL slice, so a caller that passes
+// the result straight into SealFrame fails closed with "no sealed fields".
+// Returning nil would instead select the nil default below and silently seal
+// "choices" for a profile that does not exist.
+//
+// The enclave passes this explicitly per service type; it is exported so the
+// broker names the field in one place rather than re-listing it.
+func DefaultResponseSealedFieldsFor(p Profile) []string {
+	s, err := p.spec()
+	if err != nil {
+		return []string{}
+	}
+	return slices.Clone(s.response)
+}
+
 // defaultResponseSealedFields is the v1 default set of response fields to seal
-// (SPEC §7): the generated content.
-func defaultResponseSealedFields() []string { return []string{"choices"} }
+// (SPEC §7) when a caller passes nil: the chat profile's generated content.
+func defaultResponseSealedFields() []string { return DefaultResponseSealedFieldsFor(ProfileChat) }
 
 // validateResponseSealedFields requires a non-empty set with no duplicates.
 // Unlike the request there is no single mandatory field pinned in v1.

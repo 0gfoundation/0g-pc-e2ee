@@ -4,9 +4,11 @@
 // cleartext (so the router can route/bill on it) but is bound as AEAD
 // associated data, so an intermediary can read but not tamper.
 //
-//   - Request (§5–§6): client seals messages/tools to the provider enc key.
-//   - Response (§7): the enclave seals choices to the client's ephemeral key,
-//     one frame for non-streaming or a sequence of frames for streaming.
+//   - Request (§5–§6): client seals the payload fields to the provider enc key —
+//     messages/tools for chat, prompt for image (see Profile).
+//   - Response (§7): the enclave seals the generated content to the client's
+//     ephemeral key — choices for chat, data for image — one frame for
+//     non-streaming or a sequence of frames for streaming.
 //
 // Contract: broker <-> client (byte-for-byte, per SPEC.md). All AAD is taken
 // over JCS (RFC 8785) canonical JSON so Go/TS/Rust agree byte-for-byte.
@@ -17,6 +19,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"slices"
 
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 	"github.com/gowebpki/jcs"
@@ -31,8 +34,10 @@ const (
 	SealInfo = "0g-pc/v1/seal"
 	// e2eeKey is the reserved top-level key that holds the sealing metadata.
 	e2eeKey = "_e2ee"
-	// fieldMessages is the sensitive field that MUST always be sealed.
+	// fieldMessages is the sensitive field a chat request MUST always seal.
 	fieldMessages = "messages"
+	// fieldPrompt is the sensitive field an image request MUST always seal.
+	fieldPrompt = "prompt"
 	// clientEphPubLen is the byte length of an X25519 public key — the client's
 	// response ephemeral key (SPEC §3 suite).
 	clientEphPubLen = 32
@@ -41,13 +46,85 @@ const (
 // b64 is base64url without padding — the wire encoding for binary fields (§3).
 var b64 = base64.RawURLEncoding
 
-// DefaultSealedFields is the v1 default set of request fields to seal (SPEC
-// §5.1). It returns a fresh slice, so a caller may filter it to the fields
-// actually present or append additional sensitive ones (e.g. "metadata",
-// "user") without mutating the shared default. The default lives here in
-// exactly one place; clients reference it rather than re-listing the names.
+// Profile names a request family (SPEC §5.1). The envelope format, crypto suite
+// and AAD rule are identical across profiles — a profile only fixes WHICH field
+// carries the sensitive payload, so the "you cannot accidentally ship the
+// payload in cleartext" check knows what to require.
+//
+// It is deliberately NOT carried on the wire: `sealed_fields` is already
+// self-describing, and the enclave's Open check (decrypted keys == declared
+// sealed_fields) is profile-independent. The profile is the client-side half of
+// the guard — the only half that can stop a leak before it is sent. An enclave
+// serving a known endpoint enforces the same requirement independently, since a
+// third-party client is under no obligation to use this package.
+type Profile string
+
+const (
+	// ProfileChat is /v1/chat/completions and friends: the payload is "messages".
+	ProfileChat Profile = "chat"
+	// ProfileImage is /v1/images/generations: the payload is "prompt".
+	ProfileImage Profile = "image"
+)
+
+// profileSpec fixes, per profile, the field that MUST be sealed and the v1
+// default sealed sets for a request and for the response it produces.
+type profileSpec struct {
+	required string   // the field a sealed envelope of this profile MUST cover
+	request  []string // v1 default request sealed set (§5.1)
+	response []string // v1 default response sealed set (§7)
+}
+
+var profiles = map[Profile]profileSpec{
+	ProfileChat: {
+		required: fieldMessages,
+		request:  []string{"messages", "tools"},
+		response: []string{"choices"},
+	},
+	ProfileImage: {
+		// "prompt" is the whole sensitive payload of an image request; "data" —
+		// the generated images — is the whole sensitive payload of the response.
+		// The image COUNT stays cleartext as `usage.output_images` so the router
+		// can bill without decrypting (§7.1), the same trade-off chat makes for
+		// `usage`.
+		required: fieldPrompt,
+		request:  []string{"prompt"},
+		response: []string{"data"},
+	},
+}
+
+func (p Profile) spec() (profileSpec, error) {
+	s, ok := profiles[p]
+	if !ok {
+		return profileSpec{}, fmt.Errorf("unknown profile %q", p)
+	}
+	return s, nil
+}
+
+// DefaultSealedFields is the v1 default set of chat request fields to seal (SPEC
+// §5.1) — shorthand for DefaultSealedFieldsFor(ProfileChat), kept because chat
+// is by far the common case.
 func DefaultSealedFields() []string {
-	return []string{"messages", "tools"}
+	return DefaultSealedFieldsFor(ProfileChat)
+}
+
+// DefaultSealedFieldsFor is the v1 default set of request fields to seal for a
+// profile (SPEC §5.1). It returns a fresh slice, so a caller may filter it to
+// the fields actually present or append additional sensitive ones (e.g.
+// "metadata", "user") without mutating the shared default. The defaults live
+// here in exactly one place; clients reference them rather than re-listing the
+// names.
+//
+// An unknown profile yields an EMPTY BUT NON-NIL slice, so a caller that passes
+// the result straight into SealRequest/SealRequestFor fails closed with "no
+// sealed fields". Returning nil would instead mean "use the default set" at
+// those call sites and silently seal the chat fields for a profile that does not
+// exist. (Same reasoning as the client core's own presence filter.)
+func DefaultSealedFieldsFor(p Profile) []string {
+	s, err := p.spec()
+	if err != nil {
+		return []string{}
+	}
+	return slices.Clone(s.request)
 }
 
 // DefaultUnboundFields is the v1 default set of cleartext request fields excluded
@@ -73,21 +150,32 @@ func DefaultUnboundFields() []string {
 	return []string{"model"}
 }
 
-// ValidateSealedFields enforces the invariants on a sealed-field set: non-empty,
-// no duplicates, and "messages" present. Leaving the prompt cleartext defeats
-// the purpose, so any sealed envelope MUST cover "messages".
+// ValidateSealedFields enforces the chat-profile invariants on a sealed-field
+// set — shorthand for ValidateSealedFieldsFor(ProfileChat, fields).
+func ValidateSealedFields(fields []string) error {
+	return ValidateSealedFieldsFor(ProfileChat, fields)
+}
+
+// ValidateSealedFieldsFor enforces the invariants on a sealed-field set for a
+// profile: non-empty, no duplicates, and the profile's payload field present
+// ("messages" for chat, "prompt" for image). Leaving the payload cleartext
+// defeats the purpose, so any sealed envelope MUST cover it.
 //
-// SealRequest calls this fail-closed per request, so a client cannot build an
-// envelope that silently leaves the prompt exposed — the only place a leak can
+// SealRequestFor calls this fail-closed per request, so a client cannot build an
+// envelope that silently leaves the payload exposed — the only place a leak can
 // actually be *prevented*. It is also exported so a caller can validate an
 // operator-supplied sealed set up front (e.g. the sidecar's -seal-fields flag)
 // and fail fast instead of erroring on every request.
-func ValidateSealedFields(fields []string) error {
+func ValidateSealedFieldsFor(p Profile, fields []string) error {
+	spec, err := p.spec()
+	if err != nil {
+		return err
+	}
 	if len(fields) == 0 {
 		return fmt.Errorf("no sealed fields")
 	}
 	seen := make(map[string]struct{}, len(fields))
-	hasMessages := false
+	hasRequired := false
 	for _, f := range fields {
 		if f == "" {
 			return fmt.Errorf("empty sealed field name")
@@ -99,12 +187,12 @@ func ValidateSealedFields(fields []string) error {
 			return fmt.Errorf("duplicate sealed field %q", f)
 		}
 		seen[f] = struct{}{}
-		if f == fieldMessages {
-			hasMessages = true
+		if f == spec.required {
+			hasRequired = true
 		}
 	}
-	if !hasMessages {
-		return fmt.Errorf("sealed fields must include %q", fieldMessages)
+	if !hasRequired {
+		return fmt.Errorf("%s-profile sealed fields must include %q", p, spec.required)
 	}
 	return nil
 }
@@ -162,22 +250,34 @@ type E2EE struct {
 // Values are kept as raw JSON so unknown fields pass through untouched.
 type Request map[string]json.RawMessage
 
-// SealRequest builds the §5 request envelope. It removes sealedFields from req,
-// JCS-seals their values to encPub, and returns a new Request carrying the
+// SealRequest builds the §5 request envelope for the chat profile — shorthand
+// for SealRequestFor(ProfileChat, …).
+func SealRequest(encPub crypto.PublicKey, req Request, sealedFields []string, signerAddr string, clientEphPub []byte, unboundFields ...string) (Request, error) {
+	return SealRequestFor(ProfileChat, encPub, req, sealedFields, signerAddr, clientEphPub, unboundFields...)
+}
+
+// SealRequestFor builds the §5 request envelope. It removes sealedFields from
+// req, seals their values to encPub, and returns a new Request carrying the
 // cleartext fields plus the `_e2ee` object.
 //
+//   - profile:      the request family (ProfileChat, ProfileImage); it fixes only
+//     which field MUST be sealed — the wire format is identical, and the profile
+//     is not carried on the wire (`sealed_fields` is self-describing).
 //   - encPub:       the provider enc key (verified out of a quote by the caller)
-//   - sealedFields: fields to seal; nil uses the v1 default (messages, tools).
-//     "messages" is required and each field MUST be present in req.
+//   - sealedFields: fields to seal; nil uses the profile's v1 default. The
+//     profile's payload field is required and each field MUST be present in req.
 //   - signerAddr:   the provider's on-chain TEE signer address ("0x…"), the pin
 //   - clientEphPub: the client's response ephemeral X25519 public key (raw bytes)
 //   - unboundFields: optional cleartext fields excluded from the AAD (§5.2), i.e.
 //     ones an intermediary may add/modify. Empty (the default) binds everything.
-func SealRequest(encPub crypto.PublicKey, req Request, sealedFields []string, signerAddr string, clientEphPub []byte, unboundFields ...string) (Request, error) {
-	if sealedFields == nil {
-		sealedFields = DefaultSealedFields()
+func SealRequestFor(profile Profile, encPub crypto.PublicKey, req Request, sealedFields []string, signerAddr string, clientEphPub []byte, unboundFields ...string) (Request, error) {
+	if _, err := profile.spec(); err != nil {
+		return nil, err
 	}
-	if err := ValidateSealedFields(sealedFields); err != nil {
+	if sealedFields == nil {
+		sealedFields = DefaultSealedFieldsFor(profile)
+	}
+	if err := ValidateSealedFieldsFor(profile, sealedFields); err != nil {
 		return nil, err
 	}
 	if err := ValidateUnboundFields(unboundFields, sealedFields); err != nil {

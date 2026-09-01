@@ -9,8 +9,16 @@ MUST agree on it. Keywords MUST / SHOULD / MAY per RFC 2119.
 > Status: draft. This cut covers the **router path**: provider discovery +
 > attestation binding, **field-level request sealing (E2E confidentiality of the
 > sensitive fields)**, **response sealing**, and **response-signature
-> verification**. Candidate scoring is the router's own internal concern
+> verification**, for the **chat** and **image** request profiles (§5.1).
+> Candidate scoring is the router's own internal concern
 > (surfaced through its candidate API), not part of this protocol.
+>
+> The multipart endpoints (`speech-to-text`, `image-editing`) are **not covered**:
+> their request has no top-level JSON object, so the §5.2 AAD rule (`JCS(envelope)`)
+> and the §8 request binding have no defined input for them. They need their own
+> section; until it exists an implementation MUST reject a sealed request on those
+> endpoints rather than forward it (a body that cannot be parsed as an envelope
+> must never be treated as "not sealed" and passed through in the clear).
 
 ## 1. Scope
 
@@ -195,6 +203,37 @@ The request is the original OpenAI JSON with the **sealed fields removed** and a
   cleartext top-level field (collision → reject). It reconstructs the original
   request = cleartext fields (minus `_e2ee`) merged with the decrypted fields.
 
+#### Request profiles
+
+Different endpoints carry their sensitive payload in different fields. A
+**request profile** names one such request family and fixes its **payload
+field** — the field a sealed envelope of that family MUST cover — plus the v1
+defaults. (Distinct from the *signature* profile of §8/§9, which versions the
+signed-text format.)
+
+| Profile | Endpoint | Payload field (required) | Default request sealed set | Default response sealed set |
+|---|---|---|---|---|
+| `chat`  | `/v1/chat/completions` | `messages` | `messages`, `tools` | `choices` |
+| `image` | `/v1/images/generations` | `prompt` | `prompt` | `data` |
+
+A request profile is **not carried on the wire and is not a version**: the
+envelope format, crypto suite, AAD rule and §8 binding are identical across
+profiles, and `sealed_fields` is already self-describing, so the enclave's §6
+Open check (decrypted keys == declared `sealed_fields`) needs no profile
+knowledge. Adding a profile is therefore additive (§9), not a `v` bump.
+
+The guard has two independent halves, and both SHOULD be implemented:
+
+- **Client side** — the only half that can stop a leak *before it is sent*: a
+  client MUST NOT build an envelope whose `sealed_fields` omits the profile's
+  payload field. (The reference library refuses to.)
+- **Enclave side** — the half that does not depend on the sender's goodwill: an
+  enclave serving a known endpoint SHOULD reject a sealed request whose
+  `sealed_fields` omits that endpoint's payload field, since a third-party
+  client is under no obligation to use the reference library. This is the same
+  deployment policy as the `messages` one above, and it is what makes the
+  requirement enforceable rather than merely advisory.
+
 ### 5.2 AAD (integrity of the cleartext)
 
 Cleartext fields are **authenticated, not encrypted**, so the router can read but
@@ -252,8 +291,9 @@ enclave MUST reject (no plaintext fallback).
 ## 7. Sealed response envelope (v1)
 
 The response is **field-level, symmetric with the request**: the enclave seals
-only the sensitive fields (v1 default: **`choices`** — the generated content and
-per-choice `finish_reason`), and leaves the rest cleartext so the router can bill
+only the sensitive fields (chat profile: **`choices`** — the generated content
+and per-choice `finish_reason`; image profile: **`data`** — the generated
+images), and leaves the rest cleartext so the router can bill
 on them. Cleartext response fields (`usage`, `model`, `id`, `created`,
 `system_fingerprint`) are:
 - **readable** by the router (no decryption needed),
@@ -306,6 +346,45 @@ data: {"model":"gpt-4o","_e2ee":{"v":1,"enc":"<resp_enc>","sealed_fields":["choi
 data: {"model":"gpt-4o","_e2ee":{"sealed_fields":["choices"],"final":false,"ciphertext":"<...>"}}
 data: {"usage":{...},"_e2ee":{"sealed_fields":["choices"],"final":true,"ciphertext":"<...>"}}
 ```
+
+### 7.1 Image responses
+
+An image response is one non-streaming frame with `data` sealed:
+
+```json
+{
+  "created": 1700000000,
+  "model": "z-image",
+  "usage": { "output_images": 2 },
+  "_e2ee": { "v": 1, "enc": "…", "sealed_fields": ["data"], "final": true, "ciphertext": "…" }
+}
+```
+
+Two constraints are specific to this profile:
+
+- **`usage.output_images` is the billable count and MUST be cleartext.** The
+  router bills per delivered image and cannot count a sealed `data[]`. The
+  enclave writes the count of images it actually delivered (not the requested
+  `n` — a provider may clamp it), bound in the AAD and covered by the §8
+  signature, so the router bills without decrypting and a lying count is caught
+  at verify. An enclave that cannot count them MUST reject rather than seal a
+  response with no verifiable count.
+
+  It lives inside `usage` because that is where a quantity billed on belongs,
+  and is named `output_images` rather than `images` for two reasons: `usage` is
+  an OpenAI-defined object (a token-billed image model such as `gpt-image-1`
+  populates it with `input_tokens` / `output_tokens` / `input_tokens_details`,
+  while a per-image model such as `dall-e-3` omits it entirely), so an
+  extension to it should not squat an unqualified common word; and a future
+  image-editing profile has *input* images, against which a bare `images` would
+  read ambiguously. The `input_`/`output_` prefixes are OpenAI's own convention
+  in this object. Any token fields the model reports are preserved alongside it;
+  only `output_images` is written by the enclave.
+- **`response_format: "url"` MUST be rejected for a sealed request.** URL mode
+  has the enclave persist the images and serve them from a plain URL, which puts
+  the plaintext images outside the sealed channel and defeats the profile. A
+  sealed image request MUST be served as `b64_json` inside `data`, or rejected
+  fail-closed — never silently downgraded.
 
 **Client open:** `SetupBaseR(resp_enc, eph_priv, info="0g-pc/v1/resp")`, then
 `Open` each frame **in order** (fail-closed), merge the decrypted `choices` back
@@ -404,10 +483,11 @@ broker signer and the client verifier) and locked by the §10 KATs.
   change to any of those (a different hash, the concat convention, the binding
   artifacts) bumps the profile version (`zg-sig-v1/…` → `zg-sig-v2/…`); a verifier
   MUST reject an unknown scheme fail-closed.
-- **Adding a routing field or a new sealed/unbound field is NOT a version bump** —
-  cleartext fields are additive (unknown keys ignored by the router), `sealed_fields`
-  is self-describing, and unbound fields are outside the signature anyway. Only the
-  crypto/format envelope and the signature profile are versioned.
+- **Adding a routing field, a new sealed/unbound field, or a new request profile
+  (§5.1) is NOT a version bump** — cleartext fields are additive (unknown keys
+  ignored by the router), `sealed_fields` is self-describing, and unbound fields
+  are outside the signature anyway. Only the crypto/format envelope and the
+  signature profile are versioned.
 - Consumers (broker, router, client) update in lockstep with a version bump.
 
 ## 10. Test vectors
