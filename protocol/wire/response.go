@@ -151,10 +151,12 @@ func ValidateResponseSealedFieldsFor(p Profile, fields []string) error {
 	if err := validateResponseSealedFields(fields); err != nil {
 		return err
 	}
-	for _, required := range spec.response {
-		if !slices.Contains(fields, required) {
-			return fmt.Errorf("%s-profile response sealed fields must include %q", p, required)
-		}
+	// Only the profile's CONTENT field is mandatory — not every member of its
+	// default set. A caller may legitimately seal a superset, and a future
+	// profile whose default covers something besides the content must not make
+	// that extra field's absence a hard failure.
+	if !slices.Contains(fields, spec.responseRequired) {
+		return fmt.Errorf("%s-profile response sealed fields must include %q", p, spec.responseRequired)
 	}
 	return nil
 }
