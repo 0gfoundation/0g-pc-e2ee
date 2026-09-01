@@ -12,10 +12,12 @@
 # of them surface as an error; each is a check below:
 #
 #   1. THE TARGET MAY NOT BE A GATEWAY AT ALL. The router serves the same OpenAI
-#      surface, so aiming this at router-api*.0g.ai answers every call happily
-#      with NOTHING SEALED — the gateway is what seals, and the router is the
-#      party it seals past. Preflight A probes /v1/gateway/identity, which only
-#      the gateway serves, and says so in the summary if it is absent.
+#      surface, so aiming this at a bare router answers every call happily with
+#      NOTHING SEALED — the gateway is what seals, and the router is the party it
+#      seals past. The hostname does not tell you which you have: the staging
+#      gateway is called router-api-tee-staging.0g.ai and is a gateway. Preflight
+#      A probes /v1/gateway/identity, which only the gateway serves; that answer
+#      is the only reliable tell, and its absence is repeated in the summary.
 #
 #   2. NOT EVERY MODEL SUPPORTS TOOLS. On the same fleet, 0GM-1.0-35B-A3B
 #      advertises `tools`/`tool_choice` and 0GM-1.0-35B-A3B-SIA does not. Send
@@ -127,6 +129,13 @@ post() {
 # of the file being absent (a request that never got off the ground writes none).
 excerpt() { head -c "${2:-400}" "$1" 2>/dev/null || true; }
 
+# oneline <text> [bytes] — collapse whitespace to a single line. Model answers
+# arrive wrapped and often with leading blank lines, which would otherwise break
+# the indentation of everything quoted below.
+oneline() {
+	printf '%s' "$1" | tr '\n\t' '  ' | tr -s ' ' | sed 's/^ *//; s/ *$//' | head -c "${2:-160}"
+}
+
 # served <header-file> — the provider the gateway actually sealed this request
 # to (X-Provider is originated by the gateway from the client's own pin, not
 # relayed from upstream — see openaiproxy/proxy.go setProvider).
@@ -150,13 +159,17 @@ echo "model    $MODEL"
 #
 # Worth a request of its own, because the failure it catches is silent and total.
 # The router speaks the same OpenAI surface as the gateway, so pointing this
-# script at router-api*.0g.ai answers every chat call quite happily — with NO
-# SEALING ANYWHERE, since sealing is the gateway's job and the router is the
-# party it seals *past*. Every check below would still pass. Only the gateway
-# serves /v1/gateway/identity (client/cmd/gateway/identity.go), so that is the
-# tell. Not fatal — baselining the model against the router direct is a
-# legitimate thing to want — but it must never be mistaken for a sealed run, so
-# it is said loudly here and repeated in the summary.
+# script at a bare router answers every chat call quite happily — with NO SEALING
+# ANYWHERE, since sealing is the gateway's job and the router is the party it
+# seals *past*. Every check below would still pass.
+#
+# And you cannot tell them apart by name. router-api-tee-staging.0g.ai IS a
+# gateway; production's is pc-gateway.0g.ai and the router it forwards to is
+# router-api.0g.ai. Hence a probe rather than a hostname rule: only the gateway
+# serves /v1/gateway/identity (client/cmd/gateway/identity.go). Its absence is
+# not fatal — baselining a model against the router direct is a legitimate thing
+# to want — but it must never be mistaken for a sealed run, so it is said loudly
+# here and repeated in the summary.
 # ---------------------------------------------------------------------------
 SEALED=1
 if [ "$(curl -sS --max-time 20 -o "$WORK/identity.json" -w '%{http_code}' \
@@ -234,8 +247,13 @@ if curl -sS --max-time 30 -H "Authorization: Bearer ${ZG_API_KEY:-}" \
 		ok "preflight: \"$MODEL\" advertises tools and tool_choice"
 		if [ -z "$PROVIDER" ]; then
 			PROVIDER=$(jq -r '.address // ""' <<<"$capable")
+			# A listing that names no address is the reason a pin can go missing
+			# even when the capability check just passed — say which of the two
+			# it was, since "no pin" alone sends you looking in the wrong place.
+			[ -n "$PROVIDER" ] ||
+				note "note: this catalog gives no address for it, so there is nothing to pin"
 			[ "$(jq -r '.is_healthy' <<<"$capable")" = true ] ||
-				note "warning: that provider reports is_healthy=false"
+				note "warning: that provider reports is_healthy=false (staging flags go stale; a call may still work)"
 		fi
 	fi
 
@@ -244,7 +262,8 @@ if curl -sS --max-time 30 -H "Authorization: Bearer ${ZG_API_KEY:-}" \
 	elif [ "$PIN" = 0 ]; then
 		note "--no-pin: letting the router choose, which it does without seeing \"tools\""
 	else
-		note "no provider pin: a tools-incapable provider is possible (--provider sets one)"
+		note "no provider pin: the router chooses, without seeing \"tools\" — so a"
+		note "tools-incapable provider is luck of the draw (--provider pins one)"
 	fi
 else
 	note "preflight skipped: could not read $BASE/v1/models"
@@ -318,10 +337,10 @@ EOF
 		answer=$(jq -r '.choices[0].message.content // ""' "$WORK/r2.json")
 		if printf '%s' "$answer" | grep -q 21; then
 			ok "tool result round trip: model answered from the tool output"
-			note "$(printf '%s' "$answer" | head -c 160)"
+			note "$(oneline "$answer")"
 		else
 			bad "tool result round trip: answer does not reflect the tool output (21C)"
-			note "$(printf '%s' "$answer" | head -c 160)"
+			note "$(oneline "$answer")"
 		fi
 	fi
 else
