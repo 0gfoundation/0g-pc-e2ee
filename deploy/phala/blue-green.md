@@ -29,7 +29,8 @@ That single fact shapes everything:
   though the selection is a connect race, not round-robin; see
   [Scaling one side](#scaling-one-side-replicas)). That is horizontal scaling /
   HA, and it is **orthogonal** to releases.
-- **Two different images are two unrelated apps.** dstack will not blend traffic
+- **Two separately created CVMs are two unrelated apps** — distinct `app_id`s
+  whatever their compose says (see the note below). dstack will not blend traffic
   across them, so a release cannot be a weighted canary at this layer. It is an
   **all-or-nothing flip** of one record: `_dstack-app-address.<DOMAIN>`, the TXT
   the dstack gateway reads to learn which `app_id` owns the domain.
@@ -516,11 +517,11 @@ encrypted-env value, so changing it is a mutation of the one live CVM and leaves
 you no second side to cut over to safely.)
 
 1. **Deploy side a** with `DELEGATION_ZONE=a.integratenetwork.work` and
-   `DNS_SETUP_MODE=print` (in `allowed_envs`). Make this your **next real gateway
-   build** — a different image digest than the legacy instance, so side a has a
-   distinct `app_id` and the cutover is a clean pointer flip (a same-image side
-   would share the legacy `app_id`, i.e. be treated as a replica of it; see the
-   note at the top). It publishes `…a…` records the legacy instance never touches.
+   `DNS_SETUP_MODE=print` (in `allowed_envs`). It is a newly created CVM, so it
+   has its own `app_id` regardless of which image it runs (see the note at the
+   top) and the cutover is a clean pointer flip either way — but making it your
+   **next real gateway build** folds the migration and a release into one step.
+   It publishes `…a…` records the legacy instance never touches.
 2. **Issue side a's cert:** `./switch.sh acme a`. The base-zone `_acme-challenge`
    name is only written transiently during the live instance's own renewals, so
    converting it to a CNAME → side a is safe between renewals; side a completes
