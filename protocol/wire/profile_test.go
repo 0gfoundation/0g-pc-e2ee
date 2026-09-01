@@ -479,3 +479,112 @@ func TestPinnedCleartextFieldCannotBeDeclaredUnbound(t *testing.T) {
 		t.Fatalf("the default unbound set must stay valid for the image profile: %v", err)
 	}
 }
+
+// The bound-ness requirement has to hold on the RECEIVING side to be worth
+// anything. Checking only at seal time stops a conforming enclave from
+// misconfiguring itself; the threat is an enclave that declares `usage` unbound
+// deliberately, so a router can restate the billable count while Open and the §8
+// verification both still pass. Only the client can refuse that.
+func TestOpenFrameRefusesAFrameThatFreesUsage(t *testing.T) {
+	ephPriv, ephPub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	// Seal legitimately, then rewrite the frame's declared unbound set the way a
+	// non-conforming enclave would have emitted it in the first place.
+	frame, err := wire.SealResponse(ephPub, wire.Response{
+		"usage": json.RawMessage(`{"output_images":2}`),
+		"data":  json.RawMessage(`[{"b64_json":"aW1n"}]`),
+	}, []string{"data"}, "model")
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	e2ee, err := frame.E2EE()
+	if err != nil {
+		t.Fatalf("read _e2ee: %v", err)
+	}
+	e2ee.UnboundFields = []string{"model", "usage"}
+	raw, err := json.Marshal(e2ee)
+	if err != nil {
+		t.Fatalf("marshal _e2ee: %v", err)
+	}
+	frame[e2eeKeyForTest] = raw
+
+	if _, err := wire.OpenResponse(ephPriv, frame); err == nil {
+		t.Fatal("the client must refuse a frame declaring `usage` unbound, whoever sealed it")
+	} else if !strings.Contains(err.Error(), "usage") {
+		t.Fatalf("error should name the field, got: %v", err)
+	}
+}
+
+// The one way to satisfy the pin's VALUE check and still leak: seal the pinned
+// field. The value is verified against the pre-seal request, then the field is
+// encrypted away, so the enclave reads nothing where the pin should be and falls
+// back to its own default — `url` for the image profile.
+func TestPinnedCleartextFieldCannotBeSealed(t *testing.T) {
+	_, pub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	_, ephPub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatalf("eph keygen: %v", err)
+	}
+	_, err = wire.SealRequestFor(wire.ProfileImage, pub, mustReq(t, sampleImageReq),
+		[]string{"prompt", "response_format"}, testProvider, ephPub)
+	if err == nil {
+		t.Fatal("sealing the pinned `response_format` must be refused — it would leave the enclave nothing to read")
+	}
+	if !strings.Contains(err.Error(), "response_format") {
+		t.Fatalf("error should name the pinned field, got: %v", err)
+	}
+}
+
+// The enclave-side entry point: the same three checks, runnable from a party
+// that only holds the received envelope. SPEC §7.1 requires an enclave to
+// reject a violating request, which it cannot do if the checks are unexported.
+func TestValidatePinnedCleartextForIsUsableByAReceiver(t *testing.T) {
+	_, pub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	_, ephPub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatalf("eph keygen: %v", err)
+	}
+	good, err := wire.SealRequestFor(wire.ProfileImage, pub, mustReq(t, sampleImageReq),
+		nil, testProvider, ephPub)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	if err := wire.ValidatePinnedCleartextFor(wire.ProfileImage, good); err != nil {
+		t.Fatalf("a conforming envelope must pass the receiver-side check: %v", err)
+	}
+	// Chat has no pinned fields, so it passes anything.
+	if err := wire.ValidatePinnedCleartextFor(wire.ProfileChat, good); err != nil {
+		t.Errorf("a profile with no pinned fields must always pass: %v", err)
+	}
+	if err := wire.ValidatePinnedCleartextFor("audio", good); err == nil {
+		t.Error("an unknown profile must be rejected")
+	}
+
+	// The value flipped in transit, which is what an intermediary would do.
+	tampered := wire.Request{}
+	for k, v := range good {
+		tampered[k] = v
+	}
+	tampered["response_format"] = json.RawMessage(`"url"`)
+	if err := wire.ValidatePinnedCleartextFor(wire.ProfileImage, tampered); err == nil {
+		t.Error("the receiver-side check must catch a rewritten pinned value")
+	}
+	// And the field removed entirely (what sealing it looks like on the wire).
+	stripped := wire.Request{}
+	for k, v := range good {
+		if k != "response_format" {
+			stripped[k] = v
+		}
+	}
+	if err := wire.ValidatePinnedCleartextFor(wire.ProfileImage, stripped); err == nil {
+		t.Error("the receiver-side check must catch a pinned field that is absent from the cleartext")
+	}
+}

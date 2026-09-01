@@ -171,22 +171,28 @@ func NewLogger() *slog.Logger {
 // by flag.Parse after RegisterFlags. Callers read Listen to bind their server
 // and pass the rest to Build.
 type Flags struct {
-	Listen           *string
-	RouterURL        *string
-	providerURL      *string
-	sealFieldsCSV    *string
-	unboundFieldsCSV *string
-	attestOn         *bool
-	attestEnforce    *bool
-	onchainOn        *bool
-	onchainEnforce   *bool
-	verifyResponses  *bool
-	chainRPCURL      *string
-	servingContract  *string
-	warmOn           *bool
-	warmInterval     *time.Duration
-	pccsURL          *string
-	collateralTTL    *time.Duration
+	Listen        *string
+	RouterURL     *string
+	providerURL   *string
+	sealFieldsCSV *string
+	// sealFieldsDefault is the PACKAGE default for sealFieldsCSV — deliberately
+	// not the registered default, which folds in the env var. Build compares
+	// against it to tell "the operator chose this set" (by flag OR env) from
+	// "nobody touched it". Only the former should pin the router's
+	// withheld-field set; see the route.WithSensitiveFields call in Build.
+	sealFieldsDefault string
+	unboundFieldsCSV  *string
+	attestOn          *bool
+	attestEnforce     *bool
+	onchainOn         *bool
+	onchainEnforce    *bool
+	verifyResponses   *bool
+	chainRPCURL       *string
+	servingContract   *string
+	warmOn            *bool
+	warmInterval      *time.Duration
+	pccsURL           *string
+	collateralTTL     *time.Duration
 }
 
 // defaultWarmInterval is the refresh-ahead period the background quote-cache
@@ -216,13 +222,18 @@ const defaultCollateralTTL = time.Hour
 // <envPrefix>_LISTEN is set.
 func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen string) *Flags {
 	env := func(name string) string { return envPrefix + "_" + name }
+	// The PACKAGE default, kept separate from the registered default below: an
+	// operator who sets the env var HAS chosen a set, and comparing against a
+	// default that already folded that env var in could never see it.
+	sealFieldsPkgDefault := strings.Join(wire.DefaultSealedFields(), ",")
 	return &Flags{
 		Listen:    fs.String("listen", envOr(env("LISTEN"), defaultListen), fmt.Sprintf("address to listen on (env %s)", env("LISTEN"))),
 		RouterURL: fs.String("router-url", envOr(env("ROUTER_URL"), route.DefaultRouterURL), fmt.Sprintf("0G router base URL/domain (the route-preview path is appended) (env %s)", env("ROUTER_URL"))),
 		providerURL: fs.String("provider-url", envOr(env("PROVIDER_URL"), ""),
 			fmt.Sprintf("direct-broker mode: seal each request straight to this provider endpoint, skipping the router's route-preview (for an environment with a broker but no centralized router, e.g. dev); the provider's enc key + signer are fetched from its broker's /v1/e2ee/pubkey. Empty keeps the default router mode (env %s)", env("PROVIDER_URL"))),
-		sealFieldsCSV: fs.String("seal-fields", envOr(env("SEAL_FIELDS"), strings.Join(wire.DefaultSealedFields(), ",")),
+		sealFieldsCSV: fs.String("seal-fields", envOr(env("SEAL_FIELDS"), sealFieldsPkgDefault),
 			fmt.Sprintf("comma-separated request fields to seal (must include \"messages\") (env %s)", env("SEAL_FIELDS"))),
+		sealFieldsDefault: sealFieldsPkgDefault,
 		unboundFieldsCSV: fs.String("unbound-fields", envOr(env("UNBOUND_FIELDS"), strings.Join(wire.DefaultUnboundFields(), ",")),
 			fmt.Sprintf("comma-separated cleartext fields excluded from the AAD (intermediary-mutable, untrusted); empty binds everything (env %s)", env("UNBOUND_FIELDS"))),
 		attestOn: fs.Bool("attest", envBool(env("ATTEST"), false),
@@ -373,11 +384,23 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 	}
 
 	// Route per request: pick the provider via the router and derive its enc key +
-	// signer from the broker, so no provider key is pinned up front. The router is
-	// told to withhold exactly the sealed fields, so the prompt never reaches it in
-	// cleartext even on the control-plane preview call. The service type is fixed
-	// (route.New defaults to "chatbot"); it is not a startup choice.
-	routeOpts := []route.Option{route.WithSensitiveFields(sealFields)}
+	// signer from the broker, so no provider key is pinned up front. The router
+	// withholds the sealed fields from the control-plane preview call, so the
+	// prompt never reaches it in cleartext there either.
+	//
+	// WithSensitiveFields is passed ONLY when the operator actually chose a seal
+	// set. Passing it unconditionally pins the withheld set to whatever this
+	// binary defaults to — today the CHAT set — and permanently overrides
+	// route.New's derivation of that set from the service type. That is a no-op
+	// while this binary is chat-only, and becomes a prompt leak the moment a
+	// -service-type flag lands and someone runs the image profile: the preview
+	// body is everything NOT withheld, so a stale set does not fail, it uploads
+	// the payload. Leaving the option off keeps the withheld set tied to the
+	// service type by construction.
+	var routeOpts []route.Option
+	if *f.sealFieldsCSV != f.sealFieldsDefault {
+		routeOpts = append(routeOpts, route.WithSensitiveFields(sealFields))
+	}
 	if *f.attestOn {
 		routeOpts = append(routeOpts, route.WithQuoteVerification(
 			newVerifier(label, *f.attestEnforce, *f.pccsURL, *f.collateralTTL, logger), logger))

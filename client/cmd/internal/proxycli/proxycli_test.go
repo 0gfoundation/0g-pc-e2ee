@@ -9,9 +9,12 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
 // testLogger discards output; the shutdown tests assert on serve's return value
@@ -293,6 +296,50 @@ func TestIdleKeepAliveIsBoundedOnlyByIdleTimeout(t *testing.T) {
 			closed := err != nil && !errors.Is(err, os.ErrDeadlineExceeded)
 			if closed != tc.wantClosed {
 				t.Errorf("idle connection closed = %v (err %v), want closed = %v", closed, err, tc.wantClosed)
+			}
+		})
+	}
+}
+
+// Build passes route.WithSensitiveFields only when the operator actually chose a
+// seal set. Passing it unconditionally pins the router's withheld-field set to
+// this binary's default — the CHAT set — permanently overriding route.New's
+// derivation of it from the service type. Today that is a no-op (this binary is
+// chat-only); it becomes a prompt leak the moment a -service-type flag lands and
+// someone runs the image profile, and the preview body is everything NOT
+// withheld, so a stale set uploads the payload rather than failing.
+func TestSealFieldsExplicitnessDrivesTheRouteOption(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		env        string
+		wantCustom bool
+	}{
+		{"untouched flag is not an operator choice", nil, "", false},
+		{"an explicit flag is", []string{"-seal-fields", "messages,tools,user"}, "", true},
+		{"an explicit env var is", nil, "messages,user", true},
+		{
+			// Spelling the default out by hand is indistinguishable from not
+			// setting it, and means the same thing, so it stays a no-op.
+			"restating the default is not a choice",
+			[]string{"-seal-fields", strings.Join(wire.DefaultSealedFields(), ",")},
+			"", false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.env != "" {
+				t.Setenv("ZG_TEST_SEAL_FIELDS", tt.env)
+			}
+			fs := flag.NewFlagSet("t", flag.ContinueOnError)
+			f := RegisterFlags(fs, "ZG_TEST", ":0")
+			if err := fs.Parse(tt.args); err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			gotCustom := *f.sealFieldsCSV != f.sealFieldsDefault
+			if gotCustom != tt.wantCustom {
+				t.Fatalf("treated as operator-chosen = %v, want %v (value=%q default=%q)",
+					gotCustom, tt.wantCustom, *f.sealFieldsCSV, f.sealFieldsDefault)
 			}
 		})
 	}

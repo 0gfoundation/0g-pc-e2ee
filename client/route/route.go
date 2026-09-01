@@ -277,8 +277,17 @@ func WithHTTPClient(h *http.Client) Option {
 // sealed set — e.g. an operator who also seals "user" or "metadata". Passing a
 // set that omits a payload field re-opens the leak this default exists to close,
 // so keep it a superset of the client's own seal set.
+// An empty or nil set is a NO-OP, matching WithServiceType and WithHTTPClient,
+// which also ignore their zero values. Honouring it would mean "withhold
+// nothing" — every field of every request, payload included, sent to the router
+// — which is not a configuration anyone wants and is worse than the default it
+// would be replacing. A caller that means "withhold nothing" has no business
+// using this package.
 func WithSensitiveFields(fields []string) Option {
 	return func(r *Router) {
+		if len(fields) == 0 {
+			return
+		}
 		set := make(map[string]struct{}, len(fields))
 		for _, f := range fields {
 			set[f] = struct{}{}

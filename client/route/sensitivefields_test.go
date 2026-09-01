@@ -151,3 +151,28 @@ func TestDefaultRouterKeepsTheChatSensitiveSet(t *testing.T) {
 		}
 	}
 }
+
+// A nil or empty set is a no-op, matching the sibling options. Honouring it
+// would mean "withhold nothing" — the whole request, payload included, sent to
+// the router on every preview — which is strictly worse than the default it
+// would be replacing, and is what setting sensitiveFieldsSet unconditionally
+// used to produce.
+func TestWithSensitiveFieldsIgnoresAnEmptySet(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		fields []string
+	}{
+		{"nil", nil},
+		{"empty", []string{}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			r := New("http://x", WithServiceType(ServiceTypeTextToImage), WithSensitiveFields(tt.fields))
+			if len(r.sensitiveFields) == 0 {
+				t.Fatal("an empty set must be ignored, not honoured as `withhold nothing`")
+			}
+			if _, ok := r.sensitiveFields["prompt"]; !ok {
+				t.Errorf("the service-type default must survive: %v", r.sensitiveFields)
+			}
+		})
+	}
+}

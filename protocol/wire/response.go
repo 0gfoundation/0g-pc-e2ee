@@ -83,10 +83,22 @@ var mustStayCleartextInResponse = []string{"usage", "model"}
 // justification — nothing downstream needs to rewrite it.
 var mustStayBoundInResponse = []string{"usage"}
 
-// validateResponseUnboundFields rejects an unbound set that would strip the
-// authentication from a field the §8 signature must cover. Checked once at
-// sealer construction, since the unbound set is fixed for the whole stream.
-func validateResponseUnboundFields(unbound []string) error {
+// ValidateResponseUnboundFields rejects an unbound set that would strip the
+// authentication from a field the §8 signature must cover.
+//
+// It is enforced on BOTH sides, and the receiving side is the one that matters.
+// Checking only at seal time protects a conforming enclave from misconfiguring
+// itself; it does nothing about the actual threat, which is an enclave that
+// declares `usage` unbound on purpose so a router can restate the billable count
+// with Open and the §8 verification both still passing. Only the client can
+// refuse that, so OpenFrame calls this on every frame — per frame, not once,
+// because a sealer that varies the set could otherwise declare it late in a
+// stream.
+//
+// Not profile-parameterized, unlike ValidateResponseSealedFieldsFor: WHAT a
+// profile seals differs, but which fields must stay authenticated does not, and
+// a per-profile signature would imply a latitude no profile actually has.
+func ValidateResponseUnboundFields(unbound []string) error {
 	for _, f := range unbound {
 		if slices.Contains(mustStayBoundInResponse, f) {
 			return fmt.Errorf("%q must stay bound: an unbound field is outside the seal AAD and the §8 binding, so an intermediary could rewrite it undetected", f)
@@ -166,7 +178,7 @@ func NewResponseSealer(clientEphPub crypto.PublicKey, unboundFields ...string) (
 	// Before any key material: an unbound set that frees a field the signature
 	// must cover would produce frames that verify no matter what an intermediary
 	// does to them.
-	if err := validateResponseUnboundFields(unboundFields); err != nil {
+	if err := ValidateResponseUnboundFields(unboundFields); err != nil {
 		return nil, err
 	}
 	enc, s, err := crypto.SetupSender(clientEphPub, []byte(RespInfo))
@@ -277,6 +289,14 @@ func NewResponseOpener(clientEphPriv crypto.PrivateKey, firstFrame Response) (*R
 func (ro *ResponseOpener) OpenFrame(frame Response) (Response, error) {
 	e2ee, err := frame.E2EE()
 	if err != nil {
+		return nil, err
+	}
+	// Refuse a frame that frees a field whose value must be authenticated, BEFORE
+	// opening it. This is the half of the check that defends the client: a
+	// non-conforming enclave can declare `usage` unbound on purpose, and every
+	// other verification the client runs — Open, and the §8 binding, which hashes
+	// the same AAD — would still pass over a router-rewritten count.
+	if err := ValidateResponseUnboundFields(e2ee.UnboundFields); err != nil {
 		return nil, err
 	}
 	ct, err := b64.DecodeString(e2ee.Ciphertext)

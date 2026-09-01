@@ -241,9 +241,23 @@ to the §8.2 corollary:
 | Field | May be sealed? | May be unbound? |
 |---|---|---|
 | `usage` (response) | no — the router bills on it | **no** — its value must be authenticated |
-| a pinned cleartext field (§5.1) | no — the server must read it | **no** — the pin would hold only at seal time |
+| a pinned cleartext field (§5.1) | **no** — sealing it removes it from the cleartext the server reads, which then falls back to its own default | **no** — the pin would hold only at seal time |
 | `model` | no — the router attributes on it | yes — the router rewrites the alias back; the resulting value is *not* authenticated (a known trade-off, see §9 and `DefaultUnboundFields`) |
 | `x_0g_trace` | n/a — router-injected | yes — nothing may trust it (§8.2) |
+
+**Both ends enforce this, and for the "may be unbound" column the RECEIVER is
+the end that matters.** Checking only at seal time stops a conforming
+implementation from misconfiguring itself; it does nothing about the case the
+column exists for — a counterparty that declares the field unbound *on purpose*
+so an intermediary can rewrite it while `Open` and the §8 verification both still
+pass. Concretely:
+
+- A **client** MUST reject a response frame whose `unbound_fields` names a field
+  from the "no" column above — on **every frame**, since a sealer that varies the
+  set could otherwise declare it only late in a stream.
+- An **enclave** MUST reject a request whose pinned cleartext field is missing,
+  wrong-valued, sealed, or declared unbound. It cannot delegate this to the
+  client: a third-party client is under no obligation to run the check.
 
 A request profile is **not carried on the wire and is not a version**: the
 envelope format, crypto suite, AAD rule and §8 binding are identical across

@@ -109,6 +109,61 @@ var profiles = map[Profile]profileSpec{
 	},
 }
 
+// ValidatePinnedCleartextFor enforces a profile's pinned cleartext constraints
+// (§5.1 / §7.1) on a RECEIVED envelope. It is the enclave-side counterpart of
+// the checks SealRequestFor runs before sealing, and exists because the SPEC
+// requires an enclave to reject a violating request: the client-side half stops
+// the reference library from BUILDING one, but a third-party client is under no
+// obligation to use it, so the half that does not depend on the sender has to be
+// implementable from this package rather than reimplemented per enclave.
+//
+// It checks all three ways the pin can be defeated, which is the point of
+// offering one call instead of three:
+//
+//   - the value is wrong, absent, or not a string;
+//   - the field was SEALED, so it is gone from the cleartext the server reads
+//     and the server falls back to its own default (which for the image profile
+//     is `url` — the leak);
+//   - the field was declared UNBOUND, so an intermediary could have rewritten it
+//     in transit and Open would still succeed.
+//
+// A profile with no pinned fields (chat) always passes.
+func ValidatePinnedCleartextFor(p Profile, env Request) error {
+	spec, err := p.spec()
+	if err != nil {
+		return err
+	}
+	if len(spec.pinnedCleartext) == 0 {
+		return nil
+	}
+	e2ee, err := env.E2EE()
+	if err != nil {
+		return err
+	}
+	if err := validatePinnedNotSealed(spec, e2ee.SealedFields); err != nil {
+		return err
+	}
+	if err := validatePinnedNotUnbound(spec, e2ee.UnboundFields); err != nil {
+		return err
+	}
+	return validatePinnedCleartext(spec, env)
+}
+
+// validatePinnedNotSealed rejects a sealed set that swallows a pinned cleartext
+// field. Sealing it removes it from the cleartext envelope entirely, so the
+// server reads nothing where the pin should be and falls back to its own default
+// — for the image profile, `url`. That makes this the one way to satisfy the
+// VALUE check and still leak: the value is verified against the pre-seal
+// request, and the field is then encrypted away.
+func validatePinnedNotSealed(spec profileSpec, sealed []string) error {
+	for _, f := range sealed {
+		if want, pinned := spec.pinnedCleartext[f]; pinned {
+			return fmt.Errorf("%q is pinned to %q and must stay CLEARTEXT: sealing it removes it from the envelope the server reads, which then falls back to its own default", f, want)
+		}
+	}
+	return nil
+}
+
 // validatePinnedNotUnbound rejects an unbound set that frees a pinned cleartext
 // field. An unbound field is excluded from the AAD, so an intermediary can
 // rewrite it and Open still succeeds — which would let a router flip a pinned
@@ -336,8 +391,13 @@ func SealRequestFor(profile Profile, encPub crypto.PublicKey, req Request, seale
 	}
 	// Sealing the payload is not enough on its own: a cleartext field can direct
 	// the server to publish the RESULT outside the sealed channel (§7.1). Check
-	// both the value AND that it stays authenticated — a pin an intermediary can
-	// rewrite is not a pin.
+	// the value AND that it will still be readable and authenticated when it gets
+	// there — a pin that is sealed away, or that an intermediary can rewrite, is
+	// not a pin. ValidatePinnedCleartextFor runs the same three checks on the
+	// receiving side.
+	if err := validatePinnedNotSealed(spec, sealedFields); err != nil {
+		return nil, err
+	}
 	if err := validatePinnedNotUnbound(spec, unboundFields); err != nil {
 		return nil, err
 	}
