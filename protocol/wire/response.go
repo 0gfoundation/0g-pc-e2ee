@@ -198,12 +198,26 @@ func validateResponseCleartextFor(p Profile, frame Response) error {
 		if !ok {
 			return fmt.Errorf("sealed %s response must carry cleartext %s: the sealed content cannot be billed on, and an absent count is indistinguishable from zero", p, req)
 		}
-		var n float64
+		// A POINTER, and an integer one. Decoding JSON `null` into a bare numeric
+		// leaves the variable untouched and returns no error, so `null` read as a
+		// perfectly good 0 — the one value §7.1 spells out as legitimate, which is
+		// why it slipped past a check whose whole job is telling a real count from
+		// the absence of one. A pointer is nil for `null` and only for `null`.
+		//
+		// int64 rather than float64 so this is exactly as strict as the router's
+		// own `*int` parse. The protocol package must not accept a count its
+		// consumer will reject: that would let a conforming enclave seal a response
+		// (2.5 images, 1e3) the router then refuses to bill, turning a spec
+		// question into a 502 nobody can act on.
+		var n *int64
 		if err := json.Unmarshal(v, &n); err != nil {
-			return fmt.Errorf("sealed %s response %s must be a number: %w", p, req, err)
+			return fmt.Errorf("sealed %s response %s must be a whole number: %w", p, req, err)
 		}
-		if n < 0 {
-			return fmt.Errorf("sealed %s response %s must not be negative, got %v", p, req, n)
+		if n == nil {
+			return fmt.Errorf("sealed %s response %s is null: a count must be a whole number, and null is the absence of one, not a zero", p, req)
+		}
+		if *n < 0 {
+			return fmt.Errorf("sealed %s response %s must not be negative, got %d", p, req, *n)
 		}
 	}
 	return nil

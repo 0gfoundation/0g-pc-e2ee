@@ -247,6 +247,17 @@ func TestSealedImageResponseMustCarryTheBillableCount(t *testing.T) {
 		{name: "usage without the count", usage: json.RawMessage(`{"input_tokens":10}`)},
 		{name: "count is not a number", usage: json.RawMessage(`{"output_images":"2"}`)},
 		{name: "count is negative", usage: json.RawMessage(`{"output_images":-1}`)},
+		// null is the one that reads as a perfectly good 0: decoding it into a
+		// bare numeric is a no-op that returns no error, so the check meant to
+		// tell a real count from the absence of one saw the value §7.1 spells
+		// out as legitimate.
+		{name: "count is null", usage: json.RawMessage(`{"output_images":null}`)},
+		// Fractional and exponent forms are legal JSON numbers the router's own
+		// *int parse rejects. The protocol must not seal what its consumer will
+		// refuse to bill.
+		{name: "count is fractional", usage: json.RawMessage(`{"output_images":2.5}`)},
+		{name: "count is in exponent form", usage: json.RawMessage(`{"output_images":1e3}`)},
+		{name: "usage is null", usage: json.RawMessage(`null`)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			resp := base()
@@ -528,5 +539,57 @@ func TestNonStreamingOpenRequiresTheFinalFrame(t *testing.T) {
 	}
 	if _, err := wire.OpenResponseFor(wire.ProfileImage, ephPriv, good); err != nil {
 		t.Fatalf("a conforming single-frame response must open: %v", err)
+	}
+}
+
+// The receive-side half of the same rule. A client opening a sealed image
+// response is the last party that can tell a stated count from a missing one,
+// so every spelling of "no usable count" must be refused there too — `null`
+// included, which is the spelling that survives a naive numeric decode.
+func TestClientRefusesAnUnusableBillableCount(t *testing.T) {
+	ephPriv, ephPub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	for _, tc := range []struct {
+		name  string
+		usage string
+	}{
+		{"null count", `{"output_images":null}`},
+		{"fractional count", `{"output_images":2.5}`},
+		{"exponent-form count", `{"output_images":1e3}`},
+		{"string count", `{"output_images":"2"}`},
+		{"negative count", `{"output_images":-1}`},
+		{"null usage", `null`},
+		{"usage without the count", `{"input_tokens":10}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			frame, err := wire.SealResponseNonConforming(ephPub, wire.Response{
+				"usage": json.RawMessage(tc.usage),
+				"data":  json.RawMessage(`[{"b64_json":"aW1n"}]`),
+			}, []string{"data"})
+			if err != nil {
+				t.Fatalf("the non-conforming sealer should still build this: %v", err)
+			}
+			if _, err := wire.OpenResponseFor(wire.ProfileImage, ephPriv, frame); err == nil {
+				t.Fatal("the client must refuse a response it cannot read a count from")
+			} else if !strings.Contains(err.Error(), "output_images") {
+				t.Fatalf("error should name the count, got: %v", err)
+			}
+		})
+	}
+
+	// A whole non-negative number still opens, zero included.
+	for _, ok := range []string{`{"output_images":0}`, `{"output_images":2}`} {
+		frame, err := wire.SealResponseFor(wire.ProfileImage, ephPub, wire.Response{
+			"usage": json.RawMessage(ok),
+			"data":  json.RawMessage(`[{"b64_json":"aW1n"}]`),
+		}, nil)
+		if err != nil {
+			t.Fatalf("seal %s: %v", ok, err)
+		}
+		if _, err := wire.OpenResponseFor(wire.ProfileImage, ephPriv, frame); err != nil {
+			t.Errorf("%s must open: %v", ok, err)
+		}
 	}
 }

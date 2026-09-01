@@ -418,8 +418,11 @@ Two constraints are specific to this profile:
   last frame). A sealer MUST refuse to emit a final frame that omits the count,
   and **a client MUST refuse a final frame that omits it** — the receiver half
   being the one that holds when the enclave is not running this library. The
-  value MUST be a non-negative number; an explicit `0` is a valid count and is
-  not an omission.
+  value MUST be a non-negative **whole** number. An explicit `0` is a valid count
+  and is not an omission; `null` is an omission and is not a zero. Fractional and
+  exponent forms (`2.5`, `1e3`) are legal JSON numbers but are NOT valid counts —
+  the rule is a whole number so that a producer cannot seal a value the router
+  will refuse to bill.
 
   The receiver half exists because omission has no loud failure anywhere else:
   a router parses such a frame perfectly well, counts zero images, and bills
