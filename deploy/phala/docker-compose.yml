@@ -105,7 +105,24 @@ services:
       # of delegation mode, at which point it tries to write records into the SERVED
       # domain's own zone with a token that has no access there.
       - DOMAIN=${DOMAIN:?set DOMAIN, e.g. pc-gateway.example.com}
-      - GATEWAY_DOMAIN=${GATEWAY_DOMAIN:?set GATEWAY_DOMAIN, e.g. _.<cluster>.phala.network}
+      # NOT an operator secret. DSTACK_GATEWAY_DOMAIN is exported by Phala Cloud's
+      # pre-launch script — app-compose.json `pre_launch_script`, which dstack
+      # `source`s into the very shell that then runs docker compose — so it always
+      # names the cluster this CVM actually booted in. Typing the cluster by hand is
+      # how a CVM ends up pointing at a different one, and under blue/green that
+      # mistake is SILENT: the record this value lands in there
+      # (`<DOMAIN>.<side>.<DELEGATION_ZONE>`) is in no resolution path at all. See
+      # blue-green.md, "Where GATEWAY_DOMAIN does and does not matter".
+      #
+      # The `_.` is ours: the platform exports the bare base domain, dstack-ingress
+      # wants the gateway form. The `:?` therefore guards the INNER variable, which
+      # is not a style choice — `_.${DSTACK_GATEWAY_DOMAIN}` is never the empty
+      # string, so a `:?` on the whole expression could never fire, and an absent
+      # platform value would sail through as a literal `_.` and be written to DNS as
+      # a garbage CNAME target. Absent is a real case: the pre-launch script sets
+      # this only when `default_gateway_domain` is present in /dstack/user_config or
+      # app-compose.json.
+      - GATEWAY_DOMAIN=_.${DSTACK_GATEWAY_DOMAIN:?Phala Cloud did not inject DSTACK_GATEWAY_DOMAIN - check pre_launch_script in the deployed app-compose}
       - DELEGATION_ZONE=${DELEGATION_ZONE:?set DELEGATION_ZONE, the zone this container may write}
       - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:?set CLOUDFLARE_API_TOKEN, scoped to DELEGATION_ZONE only}
       - TARGET_ENDPOINT=gateway:8443 # forward decrypted traffic to the gateway
@@ -115,8 +132,10 @@ services:
       # base zone while each side lives under its own sub-zone, so that one-hop
       # pre-check never matches and a side would block: use DNS_SETUP_MODE=print
       # there, which skips only this pre-check (issuance and routing follow the full
-      # chain). Listed here permanently and toggled by VALUE — allowed_envs is itself
-      # measured, so editing the list changes app_id.
+      # chain). Enter it on every side and toggle by VALUE — Phala Cloud builds
+      # allowed_envs from the keys you actually enter, that list is itself measured,
+      # so skipping the key changes compose_hash AND leaves the container unable to
+      # receive the var at all until a redeploy.
       - DNS_SETUP_MODE=${DNS_SETUP_MODE:-wait}
       # Least privilege: the container manages every record it needs inside the
       # delegation zone, so the token needs NO access to the served domain's own
@@ -155,8 +174,9 @@ services:
     # without editing this file. This DEFEATS the attestation story and MUST be
     # re-pinned before any attested / production deploy: compose_hash covers the
     # app-compose manifest, which embeds this file verbatim, so a floating tag keeps
-    # compose_hash — and therefore app_id and the quote — identical while the code
-    # that sees plaintext user prompts changes underneath it. Restore the digest pin
+    # compose_hash — and therefore mr_config_id and the quote — identical while the
+    # code that sees plaintext user prompts changes underneath it. (app_id would not
+    # have moved either way; see the header.) Restore the digest pin
     # (`…-gateway@sha256:<digest>`) and re-pin deliberately on every upgrade; see
     # README "Pin the image digest".
     image: ghcr.io/0gfoundation/0g-pc-e2ee-gateway:latest
@@ -336,9 +356,11 @@ services:
       # Fallback for the one case the file cannot cover: a replica whose init
       # container predates -out-app-compose, which is exactly what a rolling
       # blue/green upgrade looks like mid-flight. Only consulted when the file is
-      # unreadable. The leading "_." of a GATEWAY_DOMAIN is stripped, so this takes
-      # the same value the ingress gets.
-      - "ZG_GATEWAY_PLATFORM_BASE_DOMAIN=${GATEWAY_DOMAIN:-}"
+      # unreadable. This wants the BASE domain, which is exactly what the platform
+      # exports — so read it straight rather than re-deriving it from the ingress's
+      # `_.`-prefixed form. (appIDHost still strips a leading "_." if one appears, so
+      # either spelling works; this one just cannot disagree with the ingress.)
+      - "ZG_GATEWAY_PLATFORM_BASE_DOMAIN=${DSTACK_GATEWAY_DOMAIN:-}"
       # How many published releases the deployed compose text is compared against,
       # byte-for-byte, for matched_release — the same lookup pcverify makes, so the
       # release this panel NAMES and the one pcverify CONFIRMS cannot disagree. Left

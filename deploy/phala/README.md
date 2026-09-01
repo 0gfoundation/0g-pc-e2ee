@@ -75,19 +75,55 @@ zone alone — it needs no access to the served domain's own zone.
 | Variable | Example | Notes |
 |---|---|---|
 | `DOMAIN` | `pc-gateway.example.com` | the hostname we serve |
-| `GATEWAY_DOMAIN` | `_.<cluster>.phala.network` | dstack gateway of the target cluster |
 | `DELEGATION_ZONE` | `delegation.example.net` | zone the container writes into |
 | `CLOUDFLARE_API_TOKEN` | — | DNS edit permission, **`DELEGATION_ZONE` only** |
 
-All four are declared `${VAR:?…}` in the compose file, so a missing one fails the
+All three are declared `${VAR:?…}` in the compose file, so a missing one fails the
 deploy immediately instead of silently degrading. They must also be listed in the
 app's `allowed_envs` — dstack drops any encrypted variable that is not, and the
 only symptom is an interpolation error at boot.
 
+**`GATEWAY_DOMAIN` is deliberately not one of those three.** dstack-ingress requires it —
+the image refuses to start without a non-empty value — but the value is the target
+cluster's dstack gateway, which the platform already knows and the enclave cannot
+work out for itself: the guest agent's `Info` exposes `app_id`, `instance_id`,
+measurements and the compose, and nothing about which gateway fronts the CVM. So
+the compose takes it from **`DSTACK_GATEWAY_DOMAIN`**, which Phala Cloud's
+pre-launch script exports into the shell that runs `docker compose`, and prefixes
+the `_.` dstack-ingress expects:
+
+```yaml
+- GATEWAY_DOMAIN=_.${DSTACK_GATEWAY_DOMAIN:?…}
+```
+
+Do not set a `GATEWAY_DOMAIN` secret — it is ignored, and hand-typing the cluster
+is the one way this value can be wrong. It is also why the `:?` guards the *inner*
+variable: `_.${DSTACK_GATEWAY_DOMAIN}` is never empty, so a guard on the whole
+expression could not fire and an absent platform value would be written to DNS as a
+literal `_.`.
+
+`DSTACK_GATEWAY_DOMAIN` needs no `allowed_envs` entry — that list filters the
+*encrypted* env, and this arrives from the pre-launch script instead. The
+trade-off, stated plainly: the pre-launch script reads it from
+`/dstack/user_config` (or a `default_gateway_domain` in the app-compose), and
+`user_config` is **not measured** — no RTMR3 event covers it. A hostile host can
+therefore change which gateway this CVM's CNAME names. That is a routing/DoS
+input, not a confidentiality one: TLS terminates inside this CVM and the dstack
+gateway only passes SNI through at L4, so a wrong gateway cannot read anything —
+and a host that wants to deny service can simply not run the CVM.
+
+Verify it landed right after any deploy. The platform names the true cluster in
+the CVM's `kms_info`, and the two `<cluster>`s must match:
+
+```
+kms_info.gateway_app_url    https://gateway.dstack-pha-prod5.phala.network
+<DOMAIN>.<DELEGATION_ZONE>  CNAME → _.dstack-pha-prod5.phala.network
+```
+
 Only variables the compose file actually references reach the container. Setting
 anything else in the CVM environment does nothing; changing what the compose
-references means editing the file, which changes `app_id`. Two optional
-dstack-ingress variables are therefore handled differently from the four above.
+references means editing the file, which changes `compose_hash`. Two optional
+dstack-ingress variables are therefore handled differently from the three above.
 `ACME_EMAIL` is **not declared at all** in the compose — a variable absent from the
 env block is never passed to the container. It is optional, and it is published in
 the evidence bundle, so any address there would be world-readable at
@@ -541,7 +577,7 @@ could not do anyway, since JS cannot see its own connection's peer certificate
 |---|---|---|
 | `-out-app-compose /run/identity/app-compose.json` | cvm-identity | publishes this CVM's `app-compose.json` verbatim on the shared `identity` volume, from the same guest-agent call that yields the identity file. |
 | `ZG_GATEWAY_APP_COMPOSE_FILE=/run/identity/app-compose.json` | gateway | where the container list comes from. Spelled out here, not defaulted in the binary, because the path is a contract between containers: it appears three times in the compose, and splitting it between YAML and Go is how a renamed volume becomes a silently empty list. |
-| `ZG_GATEWAY_PLATFORM_BASE_DOMAIN=${GATEWAY_DOMAIN}` | gateway | fallback source for the same manifest, consulted only when the file is unreadable. Empty disables it. |
+| `ZG_GATEWAY_PLATFORM_BASE_DOMAIN=${DSTACK_GATEWAY_DOMAIN}` | gateway | fallback source for the same manifest, consulted only when the file is unreadable. The platform-injected base domain, same value the ingress builds its `GATEWAY_DOMAIN` from. Empty disables it. |
 
 Two more knobs are left at their built-in defaults and appear in the compose only as
 commented-out lines, per this file's convention of stating what *differs* from the
@@ -574,8 +610,9 @@ because any verifier must be able to fetch it; this route rides
 `ZG_GATEWAY_ALLOWED_ORIGINS` instead, since it is a convenience for the first-party
 panel and its values are always obtainable from the bundle regardless.
 
-`GATEWAY_DOMAIN` was already referenced by dstack-ingress, so **`allowed_envs` is
-unchanged**. Smoke-test after deploying:
+`DSTACK_GATEWAY_DOMAIN` comes from the platform's pre-launch script, not the
+encrypted env, so **`allowed_envs` is unchanged** by this route. Smoke-test after
+deploying:
 
 ```sh
 curl -s "https://<DOMAIN>/v1/gateway/identity" | jq

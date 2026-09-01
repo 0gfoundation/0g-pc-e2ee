@@ -38,24 +38,42 @@ So "blue" and "green" are two CVMs with two `app_id`s, both serving `<DOMAIN>`,
 and releasing = repointing `_dstack-app-address.<DOMAIN>` from one to the other.
 [`switch.sh`](./switch.sh) does that flip safely.
 
-> **What actually sets `app_id` — the sides must be different builds.** dstack
-> measures the compose *text*, and the only literal, side-distinguishing field in
-> it is the **gateway image digest**. `DOMAIN`, `DELEGATION_ZONE`,
-> `GATEWAY_DOMAIN`, `ZG_GATEWAY_ROUTER_URL` and friends are `${...}` placeholders
-> injected from the CVM's encrypted env at boot, so **changing them does not
-> change `app_id`** (the compose comments call this out for the router URL). Their
-> *values* are invisible to `app_id`, but the **`allowed_envs` list is part of the
-> measured app-compose** — so it must be **identical on both sides**, and the two
-> sides then differ by exactly the image digest. Keep `DNS_SETUP_MODE` and
-> `ACME_STAGING` **permanently listed** in `allowed_envs` (a fixed superset) and
-> toggle behaviour by the injected *value*, never by adding/removing the key —
-> otherwise `allowed_envs` differs and the sides diverge by more than the image.
-> The consequence that matters here: run the **same image** on both sides and they
-> share one `app_id` — dstack sees one app with two replicas, both per-side
-> records carry the same value, and the traffic switch **cannot select between
-> them**. Blue/green only isolates the two sides when they are genuinely
-> different gateway builds (the normal release case). To rehearse the flow before
-> a real release, use two different builds, not the same image twice.
+> **What actually sets `app_id` — creating the CVM, not the compose text.** Under
+> a KMS key provider (which is what Phala Cloud runs) dstack assigns an app its id
+> when the app is **created**, and keeps it for the app's life; the fallback
+> derivation `truncate(compose_hash, 20)` runs only when nothing assigned one,
+> which is the local-key-provider case, not ours. On Phala Cloud the id is the KMS
+> app's contract address — in a CVM's info dump `app_id` and `contract_address`
+> are the same value, and neither is a prefix of `compose_hash`.
+>
+> So **two separately created CVMs have two `app_id`s no matter what their compose
+> says**, and the traffic switch can always select between them. The live staging
+> pair is the proof: both sides run the *same* gateway image digest — the field
+> this note used to call the only thing distinguishing them — yet
+>
+> ```
+> side a  app_id 544ae2f3…  compose_hash e5a80e02…
+> side b  app_id 08f84bba…  compose_hash dd79782d…
+> ```
+>
+> Nothing here requires the sides to be different builds. Running the same image
+> on both is fine — for rehearsing the flow, or for sitting on a released build
+> while the standby is rebuilt — and it does **not** collapse them into one app.
+> (What `compose_hash` still governs is the *measurement*: it is what
+> `mr_config_id` commits to, so it does distinguish the two sides' quotes.)
+>
+> `DOMAIN`, `DELEGATION_ZONE`, `ZG_GATEWAY_ROUTER_URL` and friends are `${...}`
+> placeholders injected from the CVM's encrypted env at boot, so their *values*
+> never reach `compose_hash` — but the **`allowed_envs` list is part of the
+> measured app-compose**, and Phala Cloud generates that list from the keys you
+> actually enter. Two consequences worth keeping identical on both sides, now for
+> operational reasons rather than identity ones: a key you never enter is a key
+> the container can never receive, and a list that drifts makes the two sides'
+> measured config differ for no reason anyone can explain later. Enter
+> `DNS_SETUP_MODE` and `ACME_STAGING` on **both** sides always — `ACME_STAGING`
+> even when it is `false` — and toggle by *value*. Today's staging pair shows what
+> skipping that costs: side b's list has no `ACME_STAGING`, so side b cannot be
+> put on the staging CA at all without a config change and redeploy.
 
 > **No percentage canary.** If you need gradual rollout, it has to be a *replica*
 > story (same `app_id`, more instances) or a second layer you build yourself.
@@ -123,9 +141,11 @@ collide with the other side's:
      side a (DELEGATION_ZONE=a.integratenetwork.work):
        _dstack-app-address.router-api-tee.0g.ai.a.integratenetwork.work  TXT = <app_id_a>:443
        _acme-challenge.router-api-tee.0g.ai.a.integratenetwork.work      TXT = <acme token, during issuance>
+       router-api-tee.0g.ai.a.integratenetwork.work                      CNAME → <that side's GATEWAY_DOMAIN>   ← written, never read
      side b (DELEGATION_ZONE=b.integratenetwork.work):
        _dstack-app-address.router-api-tee.0g.ai.b.integratenetwork.work  TXT = <app_id_b>:443
        _acme-challenge.router-api-tee.0g.ai.b.integratenetwork.work      TXT = <acme token, during issuance>
+       router-api-tee.0g.ai.b.integratenetwork.work                      CNAME → <that side's GATEWAY_DOMAIN>   ← written, never read
 ```
 
 A client connecting to `router-api-tee.0g.ai` resolves ① → ② → ③, so the dstack
@@ -189,6 +209,54 @@ its sub-zone, issues its cert, and serves. It is injected (`${DNS_SETUP_MODE:-wa
 so `DNS_SETUP_MODE` must be in the app's `allowed_envs` — kept there **permanently
 and identically on both sides** (see the `app_id` note above), toggled by value.
 
+### Where `GATEWAY_DOMAIN` does and does not matter
+
+The last line of each side's block in ③ is the one to understand, because it is
+the only place a side's `GATEWAY_DOMAIN` value goes — and here **nothing reads
+it**.
+
+Upstream dstack-ingress's delegation mode assumes the served name is aliased to
+`<DOMAIN>.<DELEGATION_ZONE>` and that *the container owns that hop*, so it writes
+the gateway pointer there on every pass. A single-instance deployment matches that
+assumption exactly, and the pointer is load-bearing: it is the second hop of the
+serving chain, and a wrong value takes the endpoint down. Blue/green does not
+match it. Each side runs under its own sub-zone, so the hop the container writes
+becomes `<DOMAIN>.<side>.<DELEGATION_ZONE>`, while the hop that actually carries
+traffic is ②'s serving alias — hand-set, static, and never touched by either CVM.
+The per-side pointer is written every pass and read by no one. (The `accounturi`
+CAA the container publishes beside it lands on the same orphaned name, so it too
+is off the chain a CA walks from `<DOMAIN>`; the CAA that constrains issuance for
+the served name is the one on ②.)
+
+Three things therefore have to be true at once for a wrong cluster to go
+unnoticed here, and all three are:
+
+- the value reaches only a record no resolver ever queries;
+- delegation mode never validates it — `dnsguide.py` is invoked with `--include
+  delegated` or `challenge-cname`, and the record built from `--alias-target` is
+  emitted only for `--include cname`, so the flag is passed purely to satisfy a
+  required-argument check;
+- dns-01 issuance never contacts the gateway at all — the CA reads a TXT record —
+  so certificates keep renewing regardless.
+
+That combination is not hypothetical: side a was found publishing a different
+cluster than the one it runs in, with no symptom anywhere. The fix is upstream of
+the value — the compose now derives it from the platform's own
+`DSTACK_GATEWAY_DOMAIN` rather than from a hand-typed secret (README, "Serving
+domain"), so a side cannot name a cluster it is not in. Confirm after any deploy
+that the two agree:
+
+```sh
+# the platform's own answer for which cluster a CVM is in, from its info dump:
+#   kms_info.gateway_app_url = https://gateway.<cluster>.phala.network
+./switch.sh status   # "serving alias -> _.<cluster>.phala.network" must match
+```
+
+Cross-cluster blue/green remains unsupported for the separate reason in
+[Limitations](#limitations--things-to-confirm-in-your-environment): the serving
+alias is static, so a side in another cluster would be selected by the traffic
+switch and then handed to a gateway that cannot route its `app_id`.
+
 ## One-time setup
 
 You need a Cloudflare API token that can **edit DNS in `integratenetwork.work`**
@@ -208,10 +276,13 @@ Also set `PLATFORM_BASE` (e.g. `in1.phala.network`) in `switch.env` to enable th
 per-side pre-switch probe ([Health-checking the standby](#health-checking-the-standby-side)).
 
 1. **Serving alias (once).** The one record you create by hand in the delegation
-   zone: `router-api-tee.0g.ai.integratenetwork.work` CNAME → your `GATEWAY_DOMAIN`
-   (the `_.<cluster>.phala.network` value from the compose). It never changes, and
-   both sides route through the same cluster, so one static value serves both.
-   `switch.sh setup` does it for you:
+   zone: `router-api-tee.0g.ai.integratenetwork.work` CNAME → the cluster's dstack
+   gateway, `_.<cluster>.phala.network`. This is the hop that carries traffic (②
+   above), and it is the operator's to set — the CVMs no longer take a cluster
+   value from you at all, so read `<cluster>` off the CVM's
+   `kms_info.gateway_app_url` (`https://gateway.<cluster>.phala.network`) rather
+   than from memory. It never changes, and both sides route through the same
+   cluster, so one static value serves both. `switch.sh setup` does it for you:
 
    ```sh
    GATEWAY_DOMAIN=_.<cluster>.phala.network ./switch.sh setup
@@ -225,26 +296,27 @@ per-side pre-switch probe ([Health-checking the standby](#health-checking-the-st
    dstack-ingress. You never hand-edit those.
 
 2. **Deploy side a and side b.** Two CVMs from [`docker-compose.yml`](./docker-compose.yml).
-   Each side is a separately created CVM, which is what gives it its own `app_id`
-   (above); the differing **image digest** is what makes their compose hashes — and
-   so their quotes — differ, so the two sides must be pinned to **different**
-   gateway builds; `DELEGATION_ZONE`
-   differs too, but only to keep their DNS records apart:
+   Each side is a separately created CVM, and *that* is what gives it its own
+   `app_id` (above) — the image digest does not have to differ for the switch to
+   work, though in a real release it will, since releasing a new build is the
+   point. `DELEGATION_ZONE` differs to keep their DNS records apart:
 
    | | side a (blue) | side b (green) |
    |---|---|---|
-   | gateway image digest | current build | **new build** (what makes it a distinct `compose_hash`) |
+   | gateway image digest | current build | **new build** (in a release; identical is also valid) |
    | `DELEGATION_ZONE` | `a.integratenetwork.work` | `b.integratenetwork.work` |
    | `DNS_SETUP_MODE` | `print` | `print` |
    | `DOMAIN` | `router-api-tee.0g.ai` | `router-api-tee.0g.ai` |
 
-   `allowed_envs` **must be identical on both sides** and list `DNS_SETUP_MODE`
-   and `ACME_STAGING` **permanently** — dstack drops any encrypted var not listed
-   (a side would fall back to `wait` and block), and because `allowed_envs` is part
-   of `app_id`, a list that differs between sides (or that you edit to toggle
-   staging) makes the sides diverge by more than the image. Toggle those two by
-   **value**, never by adding/removing the key. Everything else (`GATEWAY_DOMAIN`,
-   `CLOUDFLARE_API_TOKEN`, gateway env) stays as in the shared compose. Each side,
+   Enter the **same set of keys** on both sides, `DNS_SETUP_MODE` and
+   `ACME_STAGING` always among them (`ACME_STAGING` even when it is `false`) —
+   Phala Cloud builds `allowed_envs` from the keys you actually enter, dstack drops
+   any encrypted var not listed, and a key you skipped is one the container can
+   never receive until you redeploy. Toggle both by **value**, never by
+   adding/removing the key. `GATEWAY_DOMAIN` is **not** among them any more: the
+   compose derives it from the platform's `DSTACK_GATEWAY_DOMAIN`, so setting it as
+   a secret does nothing. Everything else (`CLOUDFLARE_API_TOKEN`, gateway env)
+   stays as in the shared compose. Each side,
    on boot, publishes its own `_dstack-app-address.…a/b…` and tries to issue a cert
    for `router-api-tee.0g.ai` — for which it needs the issuance switch (next section).
 
@@ -536,8 +608,10 @@ Two consequences for testing it:
   This scheme flips `_dstack-app-address` (+ `_acme-challenge`) only and treats the
   serving alias as fixed. **Migrating to a new cluster** (or running the sides
   across clusters) is not supported as-is; it additionally needs the serving alias
-  to become a *switched* record (→ the target side's `GATEWAY_DOMAIN`), a per-side
-  `GATEWAY_DOMAIN`/`PLATFORM_BASE`, and Phala's SNI allowlist on both clusters.
+  to become a *switched* record (→ the target side's own gateway pointer, i.e. ③'s
+  last line, which each side already publishes correctly for its own cluster now
+  that the value comes from the platform), a per-side `PLATFORM_BASE` for the
+  standby probe, and Phala's SNI allowlist on both clusters.
   Because the client's gateway and the app-address then live in two records with
   independent DNS caches, that cutover has a brief inconsistency window (shrink it
   by lowering the TTLs first). Defer until a cluster move is actually needed.
