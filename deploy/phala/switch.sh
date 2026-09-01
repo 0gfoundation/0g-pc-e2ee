@@ -53,7 +53,8 @@
 #
 # Usage:
 #   ./switch.sh status                               # (reads switch.env if present)
-#   GATEWAY_DOMAIN=_.<cluster>.phala.network ./switch.sh setup   # one-time: static serving alias
+#   ./switch.sh setup                                # one-time: static serving alias
+#                                                    # (derived from PLATFORM_BASE)
 #   ./switch.sh switch b                             # flip traffic (+ acme) to side b
 #   ./switch.sh rollback                             # flip to the other side (live side read from DNS; stateless)
 #   ./switch.sh acme b                               # point ONLY the issuance switch at b
@@ -72,9 +73,13 @@
 #   CF_ZONE          delegation zone name           (default: integratenetwork.work)
 #   DOMAIN           served hostname                (default: router-api-tee.0g.ai)
 #   DELEGATION_ZONE  base delegation zone           (default: same as CF_ZONE)
-#   GATEWAY_DOMAIN   cluster dstack gateway         (no default; required only by `setup`)
-#   PLATFORM_BASE    dstack platform base domain    (e.g. in1.phala.network; enables the
-#                    per-side app-id probe before a switch — <app_id>-443s.<PLATFORM_BASE>)
+#   PLATFORM_BASE    dstack platform base domain    (e.g. in1.phala.network) — enables the
+#                    per-side app-id probe before a switch (<app_id>-443s.<PLATFORM_BASE>),
+#                    and `setup` derives GATEWAY_DOMAIN from it as _.<PLATFORM_BASE>
+#   GATEWAY_DOMAIN   cluster dstack gateway         (used only by `setup`; defaults to
+#                    _.<PLATFORM_BASE>. Setting both to different clusters is refused —
+#                    they are two spellings of one value and nothing else cross-checks
+#                    them. `status` warns if the live alias drifts from PLATFORM_BASE.)
 #   SIDE_A_LABEL     sub-zone label for side a      (default: a)
 #   SIDE_B_LABEL     sub-zone label for side b      (default: b)
 #   TXT_PREFIX       app-address record prefix      (default: _dstack-app-address)
@@ -343,8 +348,19 @@ cmd_status() {
   printf 'delegation zone : %s (zone id %s)\n' "$CF_ZONE" "$ZONE_ID"
   printf 'served domain   : %s\n\n' "$DOMAIN"
 
+  local alias_now; alias_now="$(current_cname "$SERVING_ALIAS" || true)"
   printf 'serving alias   : %s\n' "$SERVING_ALIAS"
-  printf '   -> %s\n' "$(current_cname "$SERVING_ALIAS" || true)"
+  printf '   -> %s\n' "${alias_now:-<unset>}"
+  # The serving alias and PLATFORM_BASE are two hand-typed spellings of one
+  # cluster, and nothing else cross-checks them: a mismatch means the standby
+  # probe health-checks a side on one cluster while traffic goes to another, so
+  # `switch` would pass its gate and then cut over to an unreachable side.
+  if [ -n "$PLATFORM_BASE" ] && [ -n "$alias_now" ] &&
+     [ "${alias_now#_.}" != "${PLATFORM_BASE#_.}" ]; then
+    warn "serving alias and PLATFORM_BASE name different clusters:"
+    warn "  alias -> ${alias_now} vs PLATFORM_BASE=${PLATFORM_BASE}"
+    warn "  the pre-switch probe would test a side the live path cannot reach."
+  fi
   printf 'traffic switch  : %s\n' "${TXT_PREFIX}.${DOMAIN}"
   printf '   -> %s  [%s]\n' "${addr_now:-<unset>}" "${addr_side:-none}"
   printf 'issuance switch : _acme-challenge.%s\n' "$DOMAIN"
@@ -614,13 +630,31 @@ cmd_acme() {
 cmd_setup() {
   resolve_zone_id
   local cur; cur="$(current_cname "$SERVING_ALIAS")"
+  # One cluster, two operator-side spellings: GATEWAY_DOMAIN for the serving
+  # alias here, and PLATFORM_BASE for the standby probe
+  # (`<app_id>-443s.<PLATFORM_BASE>`). The CVMs no longer take a hand-typed
+  # cluster at all, so these are the last two that can drift apart — and drifting
+  # is not harmless: the probe would health-check a side on one cluster while the
+  # serving alias hands traffic to another. So derive one from the other when
+  # only PLATFORM_BASE is set, and refuse when both are set and disagree.
+  # `#_.` tolerates PLATFORM_BASE having been pasted in the `_.` form; the shell
+  # can strip a prefix even though compose interpolation cannot.
+  if [ -z "$GATEWAY_DOMAIN" ] && [ -n "$PLATFORM_BASE" ]; then
+    GATEWAY_DOMAIN="_.${PLATFORM_BASE#_.}"
+    info "GATEWAY_DOMAIN unset; derived from PLATFORM_BASE -> ${GATEWAY_DOMAIN}"
+  elif [ -n "$GATEWAY_DOMAIN" ] && [ -n "$PLATFORM_BASE" ] &&
+       [ "${GATEWAY_DOMAIN#_.}" != "${PLATFORM_BASE#_.}" ]; then
+    info "GATEWAY_DOMAIN : ${GATEWAY_DOMAIN}"
+    info "PLATFORM_BASE  : ${PLATFORM_BASE}"
+    die "these name different clusters — the serving alias and the standby probe would disagree"
+  fi
   if [ -z "$GATEWAY_DOMAIN" ]; then
     # Help the operator "freeze" whatever the single-instance container wrote.
     if [ -n "$cur" ]; then
       info "serving alias ${SERVING_ALIAS} currently -> ${cur}"
       die "set GATEWAY_DOMAIN to pin it (e.g. GATEWAY_DOMAIN=${cur} $0 setup)"
     fi
-    die "set GATEWAY_DOMAIN (the cluster's dstack gateway, e.g. _.<cluster>.phala.network)"
+    die "set PLATFORM_BASE (<cluster>.phala.network) and it is derived, or set GATEWAY_DOMAIN (_.<cluster>.phala.network) directly"
   fi
   info "one-time setup: the static serving alias in the delegation zone"
   info "  ${SERVING_ALIAS}  CNAME ->  ${GATEWAY_DOMAIN}"

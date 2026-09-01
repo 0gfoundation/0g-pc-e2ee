@@ -296,23 +296,30 @@ cp deploy/phala/switch.env.example deploy/phala/switch.env
 
 Or supply it via the environment instead (`CF_API_TOKEN=... ./switch.sh …`); the
 real environment overrides `switch.env`, and `--env-file PATH` points elsewhere.
-Also set `PLATFORM_BASE` (e.g. `in1.phala.network`) in `switch.env` to enable the
-per-side pre-switch probe ([Health-checking the standby](#health-checking-the-standby-side)).
+Also set `PLATFORM_BASE` (e.g. `in1.phala.network`) in `switch.env`: it is the
+**one place the cluster is named on the operator side**. It enables the per-side
+pre-switch probe ([Health-checking the standby](#health-checking-the-standby-side)),
+and `setup` derives the serving alias from it, so the alias and the probe cannot
+name different clusters. Read `<cluster>` off a CVM's
+`kms_info.gateway_app_url` (`https://gateway.<cluster>.phala.network`) rather than
+from memory.
 
 1. **Serving alias (once).** The one record you create by hand in the delegation
    zone: `router-api-tee.0g.ai.integratenetwork.work` CNAME → the cluster's dstack
    gateway, `_.<cluster>.phala.network`. This is the hop that carries traffic (②
    above), and it is the operator's to set — the CVMs no longer take a cluster
-   value from you at all, so read `<cluster>` off the CVM's
-   `kms_info.gateway_app_url` (`https://gateway.<cluster>.phala.network`) rather
-   than from memory. It never changes, and both sides route through the same
-   cluster, so one static value serves both. `switch.sh setup` does it for you:
+   value from you at all. It never changes, and both sides route through the same
+   cluster, so one static value serves both. With `PLATFORM_BASE` set as above,
+   `switch.sh setup` derives it:
 
    ```sh
-   GATEWAY_DOMAIN=_.<cluster>.phala.network ./switch.sh setup
-   # already running a single instance? run `./switch.sh setup` with GATEWAY_DOMAIN
-   # unset and it prints the value the container currently publishes, to pin as-is.
+   ./switch.sh setup            # serving alias -> _.${PLATFORM_BASE}
    ```
+
+   Passing `GATEWAY_DOMAIN` explicitly still works and wins, but `setup` refuses
+   if the two name different clusters, and `status` warns if the live alias later
+   drifts from `PLATFORM_BASE`. With neither set, `setup` prints whatever the
+   alias currently points at so you can pin it as-is.
 
    Everything else in `integratenetwork.work` is automatic: the two switch records
    (`_dstack-app-address.…` and `_acme-challenge.…`) are created and flipped by
