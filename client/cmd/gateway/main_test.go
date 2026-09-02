@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -60,7 +62,7 @@ func mustURL(t *testing.T, raw string) *url.URL {
 }
 
 func TestGatewayHealthz(t *testing.T) {
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
+	gw := httptest.NewServer(newHandler(routeClient(), nil, mustURL(t, "http://router.unused"), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
 	defer gw.Close()
 
 	resp, err := http.Get(gw.URL + "/healthz")
@@ -80,7 +82,7 @@ func TestGatewayHealthz(t *testing.T) {
 // unreachable, so reaching the core would surface as a 502, not the 401/403 the
 // gate returns), while /healthz stays open for the container probe.
 func TestGatewayAuthGateWiring(t *testing.T) {
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
+	gw := httptest.NewServer(newHandler(routeClient(), nil, mustURL(t, "http://router.unused"), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
 	defer gw.Close()
 
 	post := func(t *testing.T, auth string) int {
@@ -125,7 +127,7 @@ func TestGatewayAuthGateWiring(t *testing.T) {
 // error against an unreachable one, and it must derive the port from the same
 // -listen value the server binds.
 func TestGatewayHealthProbe(t *testing.T) {
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, "http://router.unused"), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
+	gw := httptest.NewServer(newHandler(routeClient(), nil, mustURL(t, "http://router.unused"), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
 	defer gw.Close()
 
 	// Healthy: probe the live server's /healthz directly.
@@ -224,7 +226,7 @@ func TestGatewayRouteMode(t *testing.T) {
 	defer router.Close()
 
 	client := core.NewWithResolver(route.New(router.URL))
-	gw := httptest.NewServer(newHandler(client, mustURL(t, router.URL), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
+	gw := httptest.NewServer(newHandler(client, nil, mustURL(t, router.URL), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
 	defer gw.Close()
 
 	userReq := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`
@@ -309,7 +311,7 @@ func TestGatewayRoutesOtherRequestsToRouter(t *testing.T) {
 	router := httptest.NewServer(routerMux)
 	defer router.Close()
 
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, router.URL), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
+	gw := httptest.NewServer(newHandler(routeClient(), nil, mustURL(t, router.URL), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
 	defer gw.Close()
 
 	req, _ := http.NewRequest(http.MethodGet, gw.URL+"/v1/models?limit=1", nil)
@@ -357,7 +359,7 @@ func TestGatewayRouterPassthroughUnreachable(t *testing.T) {
 	deadURL := dead.URL
 	dead.Close()
 
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, deadURL), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
+	gw := httptest.NewServer(newHandler(routeClient(), nil, mustURL(t, deadURL), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
 	defer gw.Close()
 
 	resp, err := http.Get(gw.URL + "/v1/models")
@@ -419,7 +421,7 @@ func TestGatewayAccessLog(t *testing.T) {
 		http.Error(w, "nope", http.StatusNotImplemented)
 	}))
 	defer upstream.Close()
-	gw := httptest.NewServer(newHandler(routeClient(), mustURL(t, upstream.URL), testOrigins(), "", "", noInFlightCap, nil, nil, nil, logger))
+	gw := httptest.NewServer(newHandler(routeClient(), nil, mustURL(t, upstream.URL), testOrigins(), "", "", noInFlightCap, nil, nil, nil, logger))
 	defer gw.Close()
 
 	// A health probe must not produce a log line.
@@ -575,4 +577,142 @@ func splitLogLines(s string) []string {
 		}
 	}
 	return out
+}
+
+// TestGatewayRefusesSealedImagesWithoutAnImageClient: in direct-broker mode there
+// is no image client, and the sealed image route must answer 501 rather than be
+// left unmounted.
+//
+// Unmounted is NOT inert here, which is the whole point of the test. The catch-all
+// is a reverse proxy to the router and routerTarget is parsed in every mode, so an
+// unmounted /v1/images/generations does not 404 — it forwards the caller's PROMPT
+// to the router in cleartext, which is the one thing this gateway exists to
+// prevent. So the assertion is in two halves: the client sees a refusal, and the
+// router never saw the request at all.
+func TestGatewayRefusesSealedImagesWithoutAnImageClient(t *testing.T) {
+	var routerSaw []string
+	router := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		routerSaw = append(routerSaw, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	}))
+	defer router.Close()
+
+	gw := httptest.NewServer(newHandler(routeClient(), nil, mustURL(t, router.URL), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
+	defer gw.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, gw.URL+"/v1/images/generations",
+		strings.NewReader(`{"model":"z-image","prompt":"my secret prompt"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer sk-user-key")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post /v1/images/generations: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Errorf("status: got %d, want 501 (body %s)", resp.StatusCode, body)
+	}
+	if len(routerSaw) != 0 {
+		t.Fatalf("the prompt was forwarded to the router in cleartext: paths %v", routerSaw)
+	}
+	// The refusal uses the same JSON error envelope as every other gateway error,
+	// so a thin client parses it without a special case.
+	var env struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("refusal body is not the standard error envelope: %v (%s)", err, body)
+	}
+	if env.Error.Message == "" {
+		t.Errorf("refusal carries no message: %s", body)
+	}
+}
+
+// blockingResolver parks inside Resolve until released, so a test can hold a
+// request inside the sealed handler — and therefore inside the in-flight
+// limiter's semaphore — while it fires a second one.
+type blockingResolver struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b blockingResolver) Resolve(ctx context.Context, _ string, _ wire.Request) (core.Candidates, error) {
+	b.entered <- struct{}{}
+	select {
+	case <-b.release:
+	case <-ctx.Done():
+	}
+	// The test never gets this far caring about the outcome: the assertion is about
+	// the SLOT this request held, not the answer it produced.
+	return nil, errors.New("blocked resolver yields no candidates")
+}
+
+// TestSealedRoutesShareOneInFlightLimiter: the chat and image routes must draw
+// from ONE semaphore, so the process ceiling is maxInFlight and not 2×.
+//
+// openaiproxy.LimitInFlight builds a fresh semaphore per call, so wrapping each
+// route in its own call reads exactly like sharing one and is not: the two routes
+// each get the full budget. Nothing observable says so — the gateway serves
+// normally, and metrics.SetInFlightLimit still publishes the single configured
+// number — while peak memory can reach twice what defaultMaxInFlight sized the
+// process for, and every alert on in-flight/limit divides by the wrong ceiling.
+//
+// With a cap of 1, holding a chat request inside the handler must shed an image
+// request with 503. Two semaphores would let it straight through.
+func TestSealedRoutesShareOneInFlightLimiter(t *testing.T) {
+	blocker := blockingResolver{entered: make(chan struct{}), release: make(chan struct{})}
+
+	// Chat holds the slot; the image client is ordinary — the point is that the
+	// image ROUTE cannot find a slot, not that the image client is special.
+	gw := httptest.NewServer(newHandler(
+		core.NewWithResolver(blocker), routeClient(),
+		mustURL(t, "http://router.unused"), testOrigins(), "", "",
+		1, nil, nil, nil, discardLogger()))
+	// Release BEFORE Close: httptest's Close waits for outstanding requests, and
+	// the whole point of this fixture is that one is parked indefinitely. Deferred
+	// second so it runs first.
+	defer gw.Close()
+	defer close(blocker.release)
+
+	go func() {
+		req, _ := http.NewRequest(http.MethodPost, gw.URL+"/v1/chat/completions",
+			strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer sk-user-key")
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			resp.Body.Close()
+		}
+	}()
+	select {
+	case <-blocker.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the chat request never reached the resolver; it never took a slot")
+	}
+
+	req, _ := http.NewRequest(http.MethodPost, gw.URL+"/v1/images/generations",
+		strings.NewReader(`{"model":"z-image","prompt":"p","response_format":"b64_json"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer sk-user-key")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post /v1/images/generations: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("image request status = %d, want 503: the sole in-flight slot was held by "+
+			"the chat request, so the two routes are not sharing one limiter (body %s)", resp.StatusCode, body)
+	}
+	// A shed carries Retry-After; without it a client has nothing to back off on,
+	// and this would pass against an unrelated 503.
+	if resp.Header.Get("Retry-After") == "" {
+		t.Errorf("a shed response must carry Retry-After (body %s)", body)
+	}
 }

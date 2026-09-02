@@ -225,7 +225,7 @@ func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen string) *Flags {
 	// The PACKAGE default, kept separate from the registered default below: an
 	// operator who sets the env var HAS chosen a set, and comparing against a
 	// default that already folded that env var in could never see it.
-	sealFieldsPkgDefault := strings.Join(wire.DefaultSealedFields(), ",")
+	sealFieldsPkgDefault := strings.Join(wire.DefaultSealedFieldsFor(wire.ProfileChat), ",")
 	return &Flags{
 		Listen:    fs.String("listen", envOr(env("LISTEN"), defaultListen), fmt.Sprintf("address to listen on (env %s)", env("LISTEN"))),
 		RouterURL: fs.String("router-url", envOr(env("ROUTER_URL"), route.DefaultRouterURL), fmt.Sprintf("0G router base URL/domain (the route-preview path is appended) (env %s)", env("ROUTER_URL"))),
@@ -270,7 +270,20 @@ func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen string) *Flags {
 // provider's endpoint from chain. Callers pass the whole struct to StartWarmer;
 // only Client is needed to serve requests.
 type Built struct {
-	Client       *core.Client
+	Client *core.Client
+	// ImageClient serves POST /v1/images/generations, sealed under the image
+	// profile. It is a SECOND client rather than another route on the first
+	// because a client is bound to one service type: its profile fixes which
+	// field must be sealed, and its router asks for providers of that service
+	// type. The two routers' quote and pubkey caches hold disjoint provider sets
+	// (chatbot and text-to-image are separate registrations), so the duplication
+	// caches different things rather than the same thing twice.
+	//
+	// Nil in direct-broker mode: that mode seals to one configured broker URL
+	// whose paths route.NewDirect derives as chat, so an image client there would
+	// seal image requests to a chat endpoint. The gateway leaves the route
+	// unmounted rather than serving one that cannot work.
+	ImageClient  *core.Client
 	router       *route.Router
 	resolver     route.EndpointResolver
 	warmInterval time.Duration
@@ -313,15 +326,67 @@ func (b *Built) ProviderIdentities() route.ProviderIdentitySource {
 // so a misconfigured proxy never starts with, say, an unsealed "messages" field
 // or attestation silently off. logger is also attached as the core's debug
 // logger, so open-failure diagnostics share the binary's format and sink.
-func (f *Flags) Build(label string, logger *slog.Logger) *Built {
-	sealFields := parseCSV(*f.sealFieldsCSV)
-	if err := wire.ValidateSealedFields(sealFields); err != nil {
-		logger.Error("invalid -seal-fields", "err", err)
-		os.Exit(1)
+// validateFieldSets checks the seal/unbound flags against EVERY profile this
+// binary will seal under, returning the flag name to blame. Split out of Build so
+// it is testable: Build's own failure path is os.Exit(1).
+//
+// The image half is the part that is easy to leave out and expensive to omit. The
+// image client shares one -unbound-fields set with the chat client but seals under
+// a different profile, whose sealed set is ["prompt"] and whose "response_format"
+// is pinned cleartext. SealRequestFor re-runs both checks on every request, so
+// validating only against chat lets a binary start clean and then fail 100% of its
+// image requests at seal time — `-unbound-fields=model,prompt` and
+// `model,response_format` each do exactly that. Check what we will actually seal
+// under, at startup, where the operator can still fix the flag.
+func validateFieldSets(sealFields, unboundFields []string, servesImages bool) (string, error) {
+	if err := wire.ValidateSealedFieldsFor(wire.ProfileChat, sealFields); err != nil {
+		return "-seal-fields", err
 	}
+	if err := wire.ValidateUnboundFieldsFor(wire.ProfileChat, unboundFields, sealFields); err != nil {
+		return "-unbound-fields", err
+	}
+	if !servesImages {
+		return "", nil
+	}
+	// -seal-fields is chat's by definition, so the image client uses its profile
+	// default — validate against that, the set it will really seal with.
+	if err := wire.ValidateUnboundFieldsFor(wire.ProfileImage, unboundFields,
+		wire.DefaultSealedFieldsFor(wire.ProfileImage)); err != nil {
+		return "-unbound-fields (this binary also serves the image profile)", err
+	}
+	return "", nil
+}
+
+// BuildOption states something about the BINARY that Build cannot infer from the
+// flags — today, which sealed endpoints it actually mounts.
+type BuildOption func(*buildConfig)
+
+type buildConfig struct{ servesImages bool }
+
+// ServesImages declares that this binary mounts the sealed image endpoint. Two
+// things follow from it, and both are wrong when assumed:
+//
+//   - the background warmer enumerates the image fleet as well as the chat one.
+//     A binary that never serves an image request should not pay for that
+//     enumeration, nor take on its failure modes.
+//   - startup validates -unbound-fields against the IMAGE profile too. Without
+//     that, an image-serving binary can pass startup clean and then fail every
+//     image request at seal time (see Build).
+//
+// The sidecar mounts chat only, so it does not pass this.
+func ServesImages() BuildOption {
+	return func(c *buildConfig) { c.servesImages = true }
+}
+
+func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *Built {
+	var bc buildConfig
+	for _, o := range opts {
+		o(&bc)
+	}
+	sealFields := parseCSV(*f.sealFieldsCSV)
 	unboundFields := parseCSV(*f.unboundFieldsCSV)
-	if err := wire.ValidateUnboundFields(unboundFields, sealFields); err != nil {
-		logger.Error("invalid -unbound-fields", "err", err)
+	if flag, err := validateFieldSets(sealFields, unboundFields, bc.servesImages); err != nil {
+		logger.Error("invalid "+flag, "err", err)
 		os.Exit(1)
 	}
 	// Direct-broker mode (-provider-url set) skips the router and seals straight to
@@ -398,8 +463,15 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 	// the payload. Leaving the option off keeps the withheld set tied to the
 	// service type by construction.
 	var routeOpts []route.Option
+	// chatRouteOpts carries the operator's -seal-fields override. It is a CHAT set
+	// by definition (the flag's default and its validation are chat's), and
+	// route.WithSensitiveFields now ADDS to whatever the request's service type
+	// already withholds rather than replacing it — so applying it to the single
+	// shared router withholds the chat payload fields from image previews too,
+	// which is harmless over-stripping, never the under-stripping that leaks.
+	var chatRouteOpts []route.Option
 	if *f.sealFieldsCSV != f.sealFieldsDefault {
-		routeOpts = append(routeOpts, route.WithSensitiveFields(sealFields))
+		chatRouteOpts = append(chatRouteOpts, route.WithSensitiveFields(sealFields))
 	}
 	if *f.attestOn {
 		routeOpts = append(routeOpts, route.WithQuoteVerification(
@@ -423,8 +495,11 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 			"enforce", *f.onchainEnforce,
 			"contract", *f.servingContract, "cache_ttl", onchainCacheTTL, "cache_grace", onchainCacheGrace)
 	}
+	// Shared by both clients. The chat-only -seal-fields override is NOT here:
+	// it is appended to the chat client alone, so the image client falls back to
+	// its profile's default set ("prompt") instead of being handed chat's
+	// ("messages", "tools"), which would fail its profile check on every request.
 	coreOpts := []core.Option{
-		core.WithSealFields(sealFields),
 		core.WithUnboundFields(unboundFields),
 		core.WithDebugLogger(logger),
 		// Meter response-open failures. The counter lives in client/metrics and is
@@ -448,18 +523,52 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 	// preview. The warmer stays off (no provider list to enumerate), so Built holds
 	// only the client.
 	if directMode {
-		directRes, err := route.NewDirect(*f.providerURL, routeOpts...)
+		directRes, err := route.NewDirect(*f.providerURL, append(routeOpts, chatRouteOpts...)...)
 		if err != nil {
 			logger.Error("invalid -provider-url", "url", *f.providerURL, "err", err)
 			os.Exit(1)
 		}
 		logger.Info("direct-broker mode enabled (no router)", "label", label, "provider_url", *f.providerURL, "attest", *f.attestOn)
-		return &Built{Client: core.NewWithResolver(directRes, coreOpts...)}
+		return &Built{Client: core.NewWithResolver(directRes, append(append([]core.Option{}, coreOpts...),
+			core.WithSealFields(sealFields), core.WithServiceType(core.ServiceTypeChatbot))...)}
 	}
 
-	router := route.New(*f.RouterURL, routeOpts...)
-	client := core.NewWithResolver(router, coreOpts...)
-	b := &Built{Client: client, router: router, verifiesQuotes: *f.attestOn}
+	// ONE router. It is one 0G Router, at one URL, serving every endpoint — so
+	// one connection pool, one pubkey cache, one quote cache, one verifier, one
+	// warmer. What differs per endpoint (which providers to rank, which fields to
+	// withhold from the preview, which upstream path to POST to) travels with
+	// each Resolve instead, because it describes the request rather than this
+	// connection.
+	//
+	// The warmer is told which service types this BINARY serves, not every type the
+	// router knows: warming a fleet we will never seal to buys nothing and takes on
+	// that enumeration's failure modes for free. When images are served it warms
+	// them too, so the image providers' quotes are verified ahead of the first image
+	// request rather than on it; it de-duplicates by address, so a provider serving
+	// both is verified once.
+	warmTypes := []string{core.ServiceTypeChatbot}
+	if bc.servesImages {
+		warmTypes = append(warmTypes, core.ServiceTypeTextToImage)
+	}
+	router := route.New(*f.RouterURL, append(append([]route.Option{}, routeOpts...),
+		append(chatRouteOpts, route.WithWarmServiceTypes(warmTypes...))...)...)
+
+	// Two clients, one router. A client is a SEALING CONTEXT bound to one request
+	// shape — its profile fixes which field must be sealed and which the response
+	// must seal — which is a real per-endpoint property, unlike the router's
+	// caches. They are cheap: no transport, no cache, no verifier of their own.
+	client := core.NewWithResolver(router, append(append([]core.Option{}, coreOpts...),
+		core.WithSealFields(sealFields), core.WithServiceType(core.ServiceTypeChatbot))...)
+	// -seal-fields is chat's set by definition, so the image client takes its
+	// profile default instead of inheriting it. Built only for a binary that mounts
+	// the endpoint; nil leaves the gateway's image route as its explicit refusal.
+	var imageClient *core.Client
+	if bc.servesImages {
+		imageClient = core.NewWithResolver(router,
+			append(append([]core.Option{}, coreOpts...), core.WithServiceType(core.ServiceTypeTextToImage))...)
+	}
+
+	b := &Built{Client: client, ImageClient: imageClient, router: router, verifiesQuotes: *f.attestOn}
 	if *f.warmOn {
 		b.resolver = resolver
 		b.warmInterval = *f.warmInterval

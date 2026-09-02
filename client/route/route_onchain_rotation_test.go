@@ -94,7 +94,7 @@ func TestProvider_MismatchAgainstCachedQuote_ReverifiesAndPasses(t *testing.T) {
 	}
 	r.quoteCache.put(quoteURL, quoteResult{encPub: mustHex(t, qvEncPubHex), signer: qvSignerStr})
 
-	cands, err := r.Resolve(context.Background(), wire.Request{})
+	cands, err := r.Resolve(context.Background(), DefaultServiceType, wire.Request{})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -134,7 +134,7 @@ func TestProvider_MismatchSurvivesReverification(t *testing.T) {
 	}
 	r.quoteCache.put(quoteURL, quoteResult{encPub: mustHex(t, qvEncPubHex), signer: qvSignerStr})
 
-	cands, err := r.Resolve(context.Background(), wire.Request{})
+	cands, err := r.Resolve(context.Background(), DefaultServiceType, wire.Request{})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestProvider_MismatchAgainstFreshQuote_DoesNotReverify(t *testing.T) {
 		WithQuoteVerification(rotatingVerifier(t, m, &rd), discardLogger()),
 		WithOnChainVerification(reg, true, discardLogger()))
 
-	cands, err := r.Resolve(context.Background(), wire.Request{})
+	cands, err := r.Resolve(context.Background(), DefaultServiceType, wire.Request{})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -200,7 +200,7 @@ func TestProvider_ReverificationIsRateLimited(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		// Seed a cached quote each round, as a live gateway's cache would hold one.
 		r.quoteCache.put(quoteURL, quoteResult{encPub: mustHex(t, qvEncPubHex), signer: qvSignerStr})
-		cands, err := r.Resolve(context.Background(), wire.Request{})
+		cands, err := r.Resolve(context.Background(), DefaultServiceType, wire.Request{})
 		if err != nil {
 			t.Fatalf("round %d: Resolve: %v", i, err)
 		}
@@ -238,7 +238,7 @@ func TestProvider_RotationRecoveryRunsInWarnMode(t *testing.T) {
 	}
 	r.quoteCache.put(quoteURL, quoteResult{encPub: mustHex(t, qvEncPubHex), signer: qvSignerStr}) // pre-rotation
 
-	cands, err := r.Resolve(context.Background(), wire.Request{})
+	cands, err := r.Resolve(context.Background(), DefaultServiceType, wire.Request{})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}

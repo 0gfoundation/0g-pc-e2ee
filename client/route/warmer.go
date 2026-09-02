@@ -3,6 +3,7 @@ package route
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -43,7 +44,61 @@ type providerListResponse struct {
 // verifying the same provider once per model. First-seen order and casing are
 // preserved so downstream on-chain lookups get the address as the router sent it.
 func (r *Router) listProviderAddrs(ctx context.Context) ([]string, error) {
-	u := r.providersURL + "?service_type=" + url.QueryEscape(r.serviceType)
+	// Enumerate every service type this router warms, de-duplicating across them:
+	// the catalog is per-(provider, model) and a quote is per-ENCLAVE, so an
+	// address serving both chat and image models must be verified once, not once
+	// per service type.
+	//
+	// One service type failing is logged and skipped, NOT fatal to the sweep —
+	// the same rule WarmOnce applies to an individual provider, and for the same
+	// reason. Failing the whole enumeration hands a much bigger outcome to a much
+	// smaller cause: WarmOnce turns an enumeration error into finishSweep(0, 0),
+	// which makes /readyz report not-ready and stops the blue/green cutover at
+	// gate 2. So a router that does not serve text-to-image, or that 5xxs that one
+	// catalog query for a second, would take a completely healthy chat gateway
+	// out of rotation. Only when NO service type could be enumerated is there
+	// nothing to say but "the catalog is unreachable".
+	var (
+		addrs    []string
+		failures []error
+		ok       int
+	)
+	seen := make(map[string]struct{})
+	for _, st := range r.warmServiceTypes {
+		got, err := r.listProviderAddrsFor(ctx, st)
+		if err != nil {
+			// A cancelled context is our own shutdown, not a catalog fault: stop
+			// immediately and let WarmOnce's ctx.Err() branch leave the counters alone,
+			// rather than spending the remaining types on a doomed sweep and reporting
+			// their failures as if the router were down.
+			if ctx.Err() != nil {
+				return nil, err
+			}
+			failures = append(failures, fmt.Errorf("service type %q: %w", st, err))
+			continue
+		}
+		ok++
+		for _, a := range got {
+			k := strings.ToLower(a)
+			if _, dup := seen[k]; dup {
+				continue
+			}
+			seen[k] = struct{}{}
+			addrs = append(addrs, a)
+		}
+	}
+	if ok == 0 {
+		return nil, fmt.Errorf("no service type could be enumerated: %w", errors.Join(failures...))
+	}
+	if len(failures) > 0 {
+		r.logger.Warn("warmer: some service types could not be enumerated; warming the rest",
+			"err", errors.Join(failures...), "enumerated", ok, "of", len(r.warmServiceTypes))
+	}
+	return addrs, nil
+}
+
+func (r *Router) listProviderAddrsFor(ctx context.Context, serviceType string) ([]string, error) {
+	u := r.providersURL + "?service_type=" + url.QueryEscape(serviceType)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err

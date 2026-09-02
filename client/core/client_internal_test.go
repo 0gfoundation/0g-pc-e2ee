@@ -495,7 +495,9 @@ func TestBudgetExhaustionKeepsTheUpstreamError(t *testing.T) {
 // fixedResolver returns a prepared Candidates, so a test can control materialization.
 type fixedResolver struct{ c Candidates }
 
-func (f fixedResolver) Resolve(context.Context, wire.Request) (Candidates, error) { return f.c, nil }
+func (f fixedResolver) Resolve(context.Context, string, wire.Request) (Candidates, error) {
+	return f.c, nil
+}
 
 // Our own provider deadline expiring during the §8 fetch is OUR timeout, not the
 // broker failing to produce a proof — and the runbook reads "unverifiable" as the

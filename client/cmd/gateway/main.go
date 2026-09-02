@@ -274,7 +274,7 @@ func main() {
 			"app_name", info.AppName, "compose_hash", info.ComposeHash)
 	}
 
-	built := f.Build("gateway", logger)
+	built := f.Build("gateway", logger, proxycli.ServesImages())
 
 	// Parse the router base URL once, up front, so a malformed -router-url fails
 	// loud at startup (like Build's other validation) instead of surfacing as a
@@ -390,7 +390,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr: *f.Listen,
-		Handler: newHandler(built.Client, routerTarget, origins, instanceID, *evidenceDir, *maxInFlight,
+		Handler: newHandler(built.Client, built.ImageClient, routerTarget, origins, instanceID, *evidenceDir, *maxInFlight,
 			identity, providerIdentities, built.Readiness(), logger),
 		ReadHeaderTimeout: 10 * time.Second,     // mitigate slow-header (Slowloris) clients
 		IdleTimeout:       proxycli.IdleTimeout, // bound idle keep-alives; unset means unbounded
@@ -603,7 +603,7 @@ func runHealthCheck(listen string) int {
 // ready backs GET /readyz: nil means there is nothing to assert (no warmer
 // configured) and the route always answers ready. See proxycli.Built.Readiness and
 // the /healthz vs /readyz split at the routes below.
-func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, instanceID, evidenceDir string,
+func newHandler(c *core.Client, imageClient *core.Client, routerTarget *url.URL, allowedOrigins []string, instanceID, evidenceDir string,
 	maxInFlight int, identity *identityCache, providerIdentities route.ProviderIdentitySource,
 	ready func() error, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
@@ -618,14 +618,44 @@ func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, 
 	//
 	// The concurrency cap sits INSIDE the credential gate: a request with no
 	// credential or a mgmt key is rejected on shape alone, and must not hold a
-	// slot a real request could have used. It covers this route only — /healthz
+	// slot a real request could have used. It covers these routes only — /healthz
 	// is the container's own probe and a 503 there would kill the CVM rather than
 	// protect it, and the catch-all below is cheap metadata the router already
 	// governs. The expensive work (seal, route preview, DCAP on a cold cache,
 	// streams held open for their whole schedule) is all on this path.
-	mux.Handle("POST /v1/chat/completions",
-		openaiproxy.RequireInferenceCredential(
-			openaiproxy.LimitInFlight(maxInFlight, openaiproxy.Handler(c))))
+	//
+	// ONE gate object, mounted on both sealed routes, dispatching through an inner
+	// mux. Every LimitInFlight call builds its OWN semaphore, so wrapping each
+	// route separately would have made the process ceiling 2 × maxInFlight while
+	// zg_gateway_inflight_limit still published one number — doubling the peak
+	// memory that ceiling is derived from (see defaultMaxInFlight) and putting the
+	// wrong denominator under every in-flight/limit alert.
+	sealed := http.NewServeMux()
+	sealed.Handle("POST /v1/chat/completions", openaiproxy.Handler(c))
+	if imageClient != nil {
+		openaiproxy.RegisterImages(sealed, imageClient)
+	}
+	sealedGate := openaiproxy.RequireInferenceCredential(
+		openaiproxy.LimitInFlight(maxInFlight, sealed))
+	mux.Handle("POST /v1/chat/completions", sealedGate)
+	// The sealed image endpoint shares that gate — it does the same expensive work
+	// and must not have its own separate budget.
+	//
+	// When there is no image client (direct-broker mode, whose single configured
+	// broker URL is chat-shaped), the route is mounted as an explicit refusal
+	// rather than left unmounted. Leaving it off is NOT inert: the catch-all is a
+	// reverse proxy to the router, and routerTarget is parsed in every mode, so an
+	// unmounted sealed endpoint forwards the caller's PROMPT to the router in
+	// cleartext — the one thing this gateway exists to prevent. Fail closed.
+	if imageClient != nil {
+		mux.Handle("POST /v1/images/generations", sealedGate)
+	} else {
+		mux.Handle("POST /v1/images/generations", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotImplemented)
+			_, _ = w.Write([]byte(`{"error":{"message":"sealed image generation is not available in direct-broker mode","type":"invalid_request_error"}}` + "\n"))
+		}))
+	}
 	// /healthz answers "is this process serving?" and nothing more. It is the
 	// container healthcheck, and compose gates dstack-ingress's STARTUP on it
 	// (depends_on: service_healthy), so widening it to cover provider reachability

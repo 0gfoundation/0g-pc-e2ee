@@ -481,3 +481,69 @@ func TestWarmer_NoQuoteSignerCountsAsUnchecked(t *testing.T) {
 		t.Errorf("mismatch counter moved by %v, want 0: nothing disagreed", got-mmBefore)
 	}
 }
+
+// perServiceTypeCatalog serves GET /v1/providers with a different answer per
+// service_type, so a test can fail exactly one of them.
+func perServiceTypeCatalog(t *testing.T, byType map[string][]string, failing map[string]int) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/providers", func(w http.ResponseWriter, r *http.Request) {
+		st := r.URL.Query().Get("service_type")
+		if code, bad := failing[st]; bad {
+			http.Error(w, "boom", code)
+			return
+		}
+		type entry struct {
+			Address string `json:"address"`
+		}
+		data := make([]entry, 0)
+		for _, a := range byType[st] {
+			data = append(data, entry{Address: a})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": data})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// One service type failing must not fail the whole enumeration.
+//
+// WarmOnce turns an enumeration error into finishSweep(0, 0), which makes
+// /readyz report not-ready and stops the blue/green cutover at gate 2. So an
+// all-or-nothing enumeration hands that outcome to a much smaller cause: a
+// router that does not serve text-to-image at all, or that 5xxs that one catalog
+// query for a second, would take a completely healthy chat gateway out of
+// rotation. It also contradicted WarmOnce's own documented rule that individual
+// failures are logged and skipped, never fatal to the sweep.
+func TestWarmer_OneFailingServiceTypeDoesNotFailTheSweep(t *testing.T) {
+	srv := perServiceTypeCatalog(t,
+		map[string][]string{DefaultServiceType: {"0xa", "0xb"}},
+		map[string]int{ServiceTypeTextToImage: http.StatusInternalServerError})
+
+	r := New(srv.URL, WithWarmServiceTypes(DefaultServiceType, ServiceTypeTextToImage))
+	r.logger = discardLogger()
+	addrs, err := r.listProviderAddrs(context.Background())
+	if err != nil {
+		t.Fatalf("one failing service type must not fail enumeration: %v", err)
+	}
+	if len(addrs) != 2 || addrs[0] != "0xa" || addrs[1] != "0xb" {
+		t.Errorf("addrs = %v, want the healthy service type's [0xa 0xb]", addrs)
+	}
+}
+
+// ...but when NO service type can be enumerated there is nothing to report but a
+// failure: the catalog is unreachable, and calling that a ready sweep would be
+// worse than the over-strict behavior this replaces.
+func TestWarmer_AllServiceTypesFailingIsStillAnError(t *testing.T) {
+	srv := perServiceTypeCatalog(t, nil, map[string]int{
+		DefaultServiceType:     http.StatusInternalServerError,
+		ServiceTypeTextToImage: http.StatusInternalServerError,
+	})
+
+	r := New(srv.URL, WithWarmServiceTypes(DefaultServiceType, ServiceTypeTextToImage))
+	r.logger = discardLogger()
+	if _, err := r.listProviderAddrs(context.Background()); err == nil {
+		t.Fatal("no service type could be enumerated; that must be an error")
+	}
+}

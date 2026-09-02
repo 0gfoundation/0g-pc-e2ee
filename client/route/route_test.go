@@ -294,7 +294,7 @@ func chatReq() wire.Request {
 // fetch the chosen provider's pubkey" the resolver's single Resolve used to do
 // before per-candidate materialization was deferred for fallback.
 func resolveHead(ctx context.Context, r *Router, req wire.Request) (core.Provider, error) {
-	cands, err := r.Resolve(ctx, req)
+	cands, err := r.Resolve(ctx, DefaultServiceType, req)
 	if err != nil {
 		return core.Provider{}, err
 	}
@@ -362,7 +362,7 @@ func TestPreviewForwardsRoutingHeaders(t *testing.T) {
 
 	pin := http.Header{"X-0g-Provider-Address": []string{testProviderAddr}}
 	ctx := core.WithForwardedHeaders(context.Background(), pin)
-	if _, err := New(router.srv.URL).Resolve(ctx, chatReq()); err != nil {
+	if _, err := New(router.srv.URL).Resolve(ctx, DefaultServiceType, chatReq()); err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
 	if got := router.lastHeaders.Get("X-0g-Provider-Address"); got != testProviderAddr {
@@ -514,7 +514,7 @@ func TestCompleteFallsBackOnBodyReadFailure(t *testing.T) {
 func TestResolveRejectsMissingCanonicalID(t *testing.T) {
 	broker := newMockBroker(t)
 	router := newMockRouter(t, broker)
-	cands, err := New(router.srv.URL).Resolve(context.Background(), chatReq())
+	cands, err := New(router.srv.URL).Resolve(context.Background(), DefaultServiceType, chatReq())
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -577,7 +577,7 @@ func TestWithSensitiveFieldsStripsFromPreview(t *testing.T) {
 		"secret_field": json.RawMessage(`"top secret"`),
 		"temperature":  json.RawMessage(`0.5`),
 	}
-	if _, err := r.Resolve(context.Background(), req); err != nil {
+	if _, err := r.Resolve(context.Background(), DefaultServiceType, req); err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
 	if _, leaked := router.lastPreview["messages"]; leaked {
@@ -692,7 +692,7 @@ func TestResolveSurfacesPreviewStatus(t *testing.T) {
 	router := newMockRouter(t, broker)
 	router.status = http.StatusUnauthorized
 
-	_, err := New(router.srv.URL).Resolve(context.Background(), chatReq())
+	_, err := New(router.srv.URL).Resolve(context.Background(), DefaultServiceType, chatReq())
 	assertStageStatus(t, err, core.StageUpstream, http.StatusUnauthorized)
 }
 
@@ -701,7 +701,7 @@ func TestResolveNoProvidersIs503(t *testing.T) {
 	router := newMockRouter(t, broker)
 	router.noProviders = true
 
-	_, err := New(router.srv.URL).Resolve(context.Background(), chatReq())
+	_, err := New(router.srv.URL).Resolve(context.Background(), DefaultServiceType, chatReq())
 	assertStageStatus(t, err, core.StageUpstream, http.StatusServiceUnavailable)
 }
 
@@ -741,7 +741,7 @@ func TestPreviewGivesUpAfterAttempts(t *testing.T) {
 	router := newMockRouter(t, broker)
 	router.previewFailN = previewAttempts + 5 // never recovers
 
-	_, err := New(router.srv.URL).Resolve(context.Background(), chatReq())
+	_, err := New(router.srv.URL).Resolve(context.Background(), DefaultServiceType, chatReq())
 	assertStageStatus(t, err, core.StageUpstream, http.StatusServiceUnavailable)
 	if got := atomic.LoadInt32(&router.previewHits); got != previewAttempts {
 		t.Errorf("preview attempts = %d, want %d", got, previewAttempts)
@@ -764,7 +764,7 @@ func TestPreviewDoesNotRetryDefinitiveFailures(t *testing.T) {
 			router.previewFailN = previewAttempts + 5
 			router.previewFailCode = status
 
-			_, err := New(router.srv.URL).Resolve(context.Background(), chatReq())
+			_, err := New(router.srv.URL).Resolve(context.Background(), DefaultServiceType, chatReq())
 			assertStageStatus(t, err, core.StageUpstream, status)
 			if got := atomic.LoadInt32(&router.previewHits); got != 1 {
 				t.Errorf("preview attempts = %d, want 1 (a %d must not be retried)", got, status)
@@ -781,7 +781,7 @@ func TestPreviewDoesNotRetryEmptyCandidateList(t *testing.T) {
 	router := newMockRouter(t, broker)
 	router.noProviders = true
 
-	_, err := New(router.srv.URL).Resolve(context.Background(), chatReq())
+	_, err := New(router.srv.URL).Resolve(context.Background(), DefaultServiceType, chatReq())
 	assertStageStatus(t, err, core.StageUpstream, http.StatusServiceUnavailable)
 	if got := atomic.LoadInt32(&router.previewHits); got != 1 {
 		t.Errorf("preview attempts = %d, want 1", got)
@@ -805,7 +805,7 @@ func TestPreviewStopsRetryingOnCancelledContext(t *testing.T) {
 		cancel()
 	}()
 
-	_, err := New(router.srv.URL).Resolve(ctx, chatReq())
+	_, err := New(router.srv.URL).Resolve(ctx, DefaultServiceType, chatReq())
 	if err == nil {
 		t.Fatal("Resolve with a cancelled context: want error, got nil")
 	}
@@ -839,7 +839,7 @@ func TestPreviewMetricsSeparateAbsorbedFailuresFromCleanCalls(t *testing.T) {
 	newRouter := func() *mockRouter { return newMockRouter(t, newMockBroker(t)) }
 
 	// A clean call: one ok attempt, outcome ok.
-	if _, err := New(newRouter().srv.URL).Resolve(context.Background(), chatReq()); err != nil {
+	if _, err := New(newRouter().srv.URL).Resolve(context.Background(), DefaultServiceType, chatReq()); err != nil {
 		t.Fatalf("clean Resolve: %v", err)
 	}
 	if got := delta(callsOK); got != 1 {
@@ -853,7 +853,7 @@ func TestPreviewMetricsSeparateAbsorbedFailuresFromCleanCalls(t *testing.T) {
 	// degradation is on the record as ok_retried plus a retryable attempt.
 	blip := newRouter()
 	blip.previewFailN = 1
-	if _, err := New(blip.srv.URL).Resolve(context.Background(), chatReq()); err != nil {
+	if _, err := New(blip.srv.URL).Resolve(context.Background(), DefaultServiceType, chatReq()); err != nil {
 		t.Fatalf("Resolve across a transient failure: %v", err)
 	}
 	if got := delta(callsRetried); got != 1 {
@@ -876,7 +876,7 @@ func TestPreviewMetricsSeparateAbsorbedFailuresFromCleanCalls(t *testing.T) {
 	dead := newRouter()
 	dead.previewFailN = previewAttempts + 5
 	dead.previewFailCode = http.StatusUnauthorized
-	if _, err := New(dead.srv.URL).Resolve(context.Background(), chatReq()); err == nil {
+	if _, err := New(dead.srv.URL).Resolve(context.Background(), DefaultServiceType, chatReq()); err == nil {
 		t.Fatal("Resolve against a 401 router: want error, got nil")
 	}
 	if got := delta(attemptsRejected); got != 1 {
@@ -895,7 +895,7 @@ func TestPreviewMetricsSeparateAbsorbedFailuresFromCleanCalls(t *testing.T) {
 	// A router that only ever 5xxes IS the router being unwell: that one is failed.
 	broken := newRouter()
 	broken.previewFailN = previewAttempts + 5
-	if _, err := New(broken.srv.URL).Resolve(context.Background(), chatReq()); err == nil {
+	if _, err := New(broken.srv.URL).Resolve(context.Background(), DefaultServiceType, chatReq()); err == nil {
 		t.Fatal("Resolve against a 503 router: want error, got nil")
 	}
 	if got := delta(callsFailed); got != 1 {
@@ -914,7 +914,7 @@ func TestPreviewEmptyCandidateListIsRejectedNotFailed(t *testing.T) {
 
 	router := newMockRouter(t, newMockBroker(t))
 	router.noProviders = true
-	if _, err := New(router.srv.URL).Resolve(context.Background(), chatReq()); err == nil {
+	if _, err := New(router.srv.URL).Resolve(context.Background(), DefaultServiceType, chatReq()); err == nil {
 		t.Fatal("want a 503 error")
 	}
 	if got := metricValue(t, callsRejected) - before[callsRejected]; got != 1 {
@@ -932,7 +932,7 @@ func TestPreviewDurationObservedOnEveryCall(t *testing.T) {
 	before := metricValue(t, series)
 
 	ok := newMockRouter(t, newMockBroker(t))
-	if _, err := New(ok.srv.URL).Resolve(context.Background(), chatReq()); err != nil {
+	if _, err := New(ok.srv.URL).Resolve(context.Background(), DefaultServiceType, chatReq()); err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
 	// Its own router: previewFailN counts over the mock's whole life, so reusing the
@@ -940,7 +940,7 @@ func TestPreviewDurationObservedOnEveryCall(t *testing.T) {
 	dead := newMockRouter(t, newMockBroker(t))
 	dead.previewFailN = previewAttempts + 5
 	dead.previewFailCode = http.StatusUnauthorized
-	if _, err := New(dead.srv.URL).Resolve(context.Background(), chatReq()); err == nil {
+	if _, err := New(dead.srv.URL).Resolve(context.Background(), DefaultServiceType, chatReq()); err == nil {
 		t.Fatal("want an error from a 401 router")
 	}
 
@@ -1024,7 +1024,7 @@ func TestResolveReturnsFullCandidateChain(t *testing.T) {
 		ModelID:     "gpt-4o@v2",
 	}}
 
-	cands, err := New(router.srv.URL).Resolve(context.Background(), chatReq())
+	cands, err := New(router.srv.URL).Resolve(context.Background(), DefaultServiceType, chatReq())
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -1372,7 +1372,7 @@ func TestPreviewAttemptIsBounded(t *testing.T) {
 	router.previewAttemptTO = attempt
 
 	start := time.Now()
-	if _, err := router.Resolve(context.Background(), chatReq()); err == nil {
+	if _, err := router.Resolve(context.Background(), DefaultServiceType, chatReq()); err == nil {
 		t.Fatal("want an error from a router that never finishes a body")
 	}
 	elapsed := time.Since(start)
@@ -1411,7 +1411,7 @@ func TestPreviewAttemptHonoursAShorterCallerDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	if _, err := router.Resolve(ctx, chatReq()); err == nil {
+	if _, err := router.Resolve(ctx, DefaultServiceType, chatReq()); err == nil {
 		t.Fatal("want an error once the caller's deadline passes")
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
@@ -1448,7 +1448,7 @@ func TestPreviewCeilingIsBudgetPlusOneAttempt(t *testing.T) {
 	router.previewAttemptTO, router.previewBudgetTO = attemptTO, budgetTO
 
 	start := time.Now()
-	if _, err := router.Resolve(context.Background(), chatReq()); err == nil {
+	if _, err := router.Resolve(context.Background(), DefaultServiceType, chatReq()); err == nil {
 		t.Fatal("want an error from a router that always 503s")
 	}
 	elapsed := time.Since(start)
@@ -1485,7 +1485,7 @@ func TestPreviewRetriesSuppressedWhileRouterIsDown(t *testing.T) {
 
 	// Trip the gate: each call burns its full attempt allowance.
 	for i := 0; i < previewRetryTripAfter; i++ {
-		if _, err := r.Resolve(context.Background(), chatReq()); err == nil {
+		if _, err := r.Resolve(context.Background(), DefaultServiceType, chatReq()); err == nil {
 			t.Fatal("want an error from a dead router")
 		}
 	}
@@ -1495,7 +1495,7 @@ func TestPreviewRetriesSuppressedWhileRouterIsDown(t *testing.T) {
 	}
 
 	// From here each call costs ONE attempt, not previewAttempts.
-	if _, err := r.Resolve(context.Background(), chatReq()); err == nil {
+	if _, err := r.Resolve(context.Background(), DefaultServiceType, chatReq()); err == nil {
 		t.Fatal("want an error from a dead router")
 	}
 	if got := atomic.LoadInt32(&router.previewHits) - tripped; got != 1 {
@@ -1513,19 +1513,19 @@ func TestPreviewRetryGateReopensOnAnAnswer(t *testing.T) {
 	router.previewFailN = 1 << 20
 	r := New(router.srv.URL)
 	for i := 0; i < previewRetryTripAfter; i++ {
-		_, _ = r.Resolve(context.Background(), chatReq())
+		_, _ = r.Resolve(context.Background(), DefaultServiceType, chatReq())
 	}
 
 	// The router recovers; the one attempt the gate still allows finds it.
 	router.previewFailN = 0
-	if _, err := r.Resolve(context.Background(), chatReq()); err != nil {
+	if _, err := r.Resolve(context.Background(), DefaultServiceType, chatReq()); err != nil {
 		t.Fatalf("Resolve after recovery: %v", err)
 	}
 
 	// Retries are back: a fresh transient blip is absorbed again.
 	base := atomic.LoadInt32(&router.previewHits)
 	router.previewFailN = base + 1 // fail exactly the next attempt
-	if _, err := r.Resolve(context.Background(), chatReq()); err != nil {
+	if _, err := r.Resolve(context.Background(), DefaultServiceType, chatReq()); err != nil {
 		t.Fatalf("Resolve across a blip after recovery: %v", err)
 	}
 	if got := atomic.LoadInt32(&router.previewHits) - base; got != 2 {
@@ -1579,7 +1579,7 @@ func TestPreviewSuccessNotReattributedToLateCancellation(t *testing.T) {
 
 	// The preview succeeds, and the caller is gone by the time the loop looks.
 	r := New(router.srv.URL)
-	providers, err := r.preview(ctx, chatReq())
+	providers, err := r.preview(ctx, DefaultServiceType, chatReq())
 	canceled.Store(true)
 	if err != nil {
 		t.Fatalf("preview: %v", err)
@@ -1588,7 +1588,7 @@ func TestPreviewSuccessNotReattributedToLateCancellation(t *testing.T) {
 		t.Fatal("preview returned no candidates")
 	}
 	// Re-run with the flag already set: this is the ordering under test.
-	if _, err := r.preview(ctx, chatReq()); err != nil {
+	if _, err := r.preview(ctx, DefaultServiceType, chatReq()); err != nil {
 		t.Fatalf("preview with an already-done caller: %v", err)
 	}
 
@@ -1618,13 +1618,13 @@ func TestPreviewSuppressionCountsAttemptsNotCalls(t *testing.T) {
 	router.previewFailN = 1 << 20
 	r := New(router.srv.URL)
 	for i := 0; i < previewRetryTripAfter; i++ {
-		_, _ = r.Resolve(context.Background(), chatReq())
+		_, _ = r.Resolve(context.Background(), DefaultServiceType, chatReq())
 	}
 
 	// One more call, now with the gate shut: it makes attempt 0 and is turned away
 	// at attempt 1, so previewAttempts-1 retries were shed.
 	before := metricValue(t, suppressed)
-	_, _ = r.Resolve(context.Background(), chatReq())
+	_, _ = r.Resolve(context.Background(), DefaultServiceType, chatReq())
 	if got, want := metricValue(t, suppressed)-before, float64(previewAttempts-1); got != want {
 		t.Errorf("%s delta = %v, want %v (the attempts not made, not one per call)", suppressed, got, want)
 	}
@@ -1646,7 +1646,7 @@ func TestPreviewCapsTheCandidateList(t *testing.T) {
 		})
 	}
 
-	cands, err := New(router.srv.URL).Resolve(context.Background(), chatReq())
+	cands, err := New(router.srv.URL).Resolve(context.Background(), DefaultServiceType, chatReq())
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -1687,7 +1687,7 @@ func TestPreviewBrokenSurvivesALateCancellation(t *testing.T) {
 	canceled.Store(true)
 	ctx := lateCancelCtx{Context: context.Background(), done: make(chan struct{}), canceled: &canceled}
 
-	if _, err := New(srv.URL).preview(ctx, chatReq()); err == nil {
+	if _, err := New(srv.URL).preview(ctx, DefaultServiceType, chatReq()); err == nil {
 		t.Fatal("want an error from an undecodable preview body")
 	}
 
@@ -1717,7 +1717,7 @@ func TestRetryGateNotReopenedByARejection(t *testing.T) {
 	router.previewFailN = 1 << 20 // 503s forever
 	r := New(router.srv.URL)
 	for i := 0; i < previewRetryTripAfter; i++ {
-		_, _ = r.Resolve(context.Background(), chatReq())
+		_, _ = r.Resolve(context.Background(), DefaultServiceType, chatReq())
 	}
 	if r.previewRetries.allow() {
 		t.Fatal("the gate should be shut after consecutive answerless calls")
@@ -1725,7 +1725,7 @@ func TestRetryGateNotReopenedByARejection(t *testing.T) {
 
 	// The LB now answers some requests definitively (a 401). This must not reopen it.
 	router.previewFailCode = http.StatusUnauthorized
-	if _, err := r.Resolve(context.Background(), chatReq()); err == nil {
+	if _, err := r.Resolve(context.Background(), DefaultServiceType, chatReq()); err == nil {
 		t.Fatal("want an error from a 401 router")
 	}
 	if r.previewRetries.allow() {
@@ -1734,7 +1734,7 @@ func TestRetryGateNotReopenedByARejection(t *testing.T) {
 
 	// A success does reopen it — that is the one signal that retries are useful.
 	router.previewFailN = 0
-	if _, err := r.Resolve(context.Background(), chatReq()); err != nil {
+	if _, err := r.Resolve(context.Background(), DefaultServiceType, chatReq()); err != nil {
 		t.Fatalf("Resolve after recovery: %v", err)
 	}
 	if !r.previewRetries.allow() {

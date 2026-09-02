@@ -38,7 +38,7 @@ func TestDirect_ResolveSealsStraightToBroker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDirect: %v", err)
 	}
-	cands, err := res.Resolve(context.Background(), wire.Request{})
+	cands, err := res.Resolve(context.Background(), DefaultServiceType, wire.Request{})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -122,7 +122,7 @@ func TestDirect_PubkeyFetchFailurePropagates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDirect: %v", err)
 	}
-	cands, err := res.Resolve(context.Background(), wire.Request{})
+	cands, err := res.Resolve(context.Background(), DefaultServiceType, wire.Request{})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
