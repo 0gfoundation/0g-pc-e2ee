@@ -266,7 +266,7 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 		}
 		if opener == nil {
 			// The first frame carries enc; it sets up the shared HPKE context.
-			opener, err = wire.NewResponseOpener(ephPriv, frame)
+			opener, err = wire.NewResponseOpenerFor(c.profile, ephPriv, frame)
 			if err != nil {
 				c.logOpenFailure(frameIdx, frame, err)
 				outcome = UpstreamUndecodable

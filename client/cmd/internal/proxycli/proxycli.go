@@ -225,7 +225,7 @@ func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen string) *Flags {
 	// The PACKAGE default, kept separate from the registered default below: an
 	// operator who sets the env var HAS chosen a set, and comparing against a
 	// default that already folded that env var in could never see it.
-	sealFieldsPkgDefault := strings.Join(wire.DefaultSealedFields(), ",")
+	sealFieldsPkgDefault := strings.Join(wire.DefaultSealedFieldsFor(wire.ProfileChat), ",")
 	return &Flags{
 		Listen:    fs.String("listen", envOr(env("LISTEN"), defaultListen), fmt.Sprintf("address to listen on (env %s)", env("LISTEN"))),
 		RouterURL: fs.String("router-url", envOr(env("ROUTER_URL"), route.DefaultRouterURL), fmt.Sprintf("0G router base URL/domain (the route-preview path is appended) (env %s)", env("ROUTER_URL"))),
@@ -270,7 +270,20 @@ func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen string) *Flags {
 // provider's endpoint from chain. Callers pass the whole struct to StartWarmer;
 // only Client is needed to serve requests.
 type Built struct {
-	Client       *core.Client
+	Client *core.Client
+	// ImageClient serves POST /v1/images/generations, sealed under the image
+	// profile. It is a SECOND client rather than another route on the first
+	// because a client is bound to one service type: its profile fixes which
+	// field must be sealed, and its router asks for providers of that service
+	// type. The two routers' quote and pubkey caches hold disjoint provider sets
+	// (chatbot and text-to-image are separate registrations), so the duplication
+	// caches different things rather than the same thing twice.
+	//
+	// Nil in direct-broker mode: that mode seals to one configured broker URL
+	// whose paths route.NewDirect derives as chat, so an image client there would
+	// seal image requests to a chat endpoint. The gateway leaves the route
+	// unmounted rather than serving one that cannot work.
+	ImageClient  *core.Client
 	router       *route.Router
 	resolver     route.EndpointResolver
 	warmInterval time.Duration
@@ -315,7 +328,7 @@ func (b *Built) ProviderIdentities() route.ProviderIdentitySource {
 // logger, so open-failure diagnostics share the binary's format and sink.
 func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 	sealFields := parseCSV(*f.sealFieldsCSV)
-	if err := wire.ValidateSealedFields(sealFields); err != nil {
+	if err := wire.ValidateSealedFieldsFor(wire.ProfileChat, sealFields); err != nil {
 		logger.Error("invalid -seal-fields", "err", err)
 		os.Exit(1)
 	}
@@ -398,8 +411,16 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 	// the payload. Leaving the option off keeps the withheld set tied to the
 	// service type by construction.
 	var routeOpts []route.Option
+	// chatRouteOpts carries the operator's -seal-fields override, which is a CHAT
+	// set by definition (the flag's default and its validation are chat's). It is
+	// deliberately NOT applied to the image router: passing it there would pin the
+	// withheld set to the chat fields and override route.New's derivation from the
+	// service type, and since the preview body is everything NOT withheld, a stale
+	// set does not fail — it uploads the prompt. That is the leak the comment
+	// below has warned about since before an image profile existed.
+	var chatRouteOpts []route.Option
 	if *f.sealFieldsCSV != f.sealFieldsDefault {
-		routeOpts = append(routeOpts, route.WithSensitiveFields(sealFields))
+		chatRouteOpts = append(chatRouteOpts, route.WithSensitiveFields(sealFields))
 	}
 	if *f.attestOn {
 		routeOpts = append(routeOpts, route.WithQuoteVerification(
@@ -423,8 +444,11 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 			"enforce", *f.onchainEnforce,
 			"contract", *f.servingContract, "cache_ttl", onchainCacheTTL, "cache_grace", onchainCacheGrace)
 	}
+	// Shared by both clients. The chat-only -seal-fields override is NOT here:
+	// it is appended to the chat client alone, so the image client falls back to
+	// its profile's default set ("prompt") instead of being handed chat's
+	// ("messages", "tools"), which would fail its profile check on every request.
 	coreOpts := []core.Option{
-		core.WithSealFields(sealFields),
 		core.WithUnboundFields(unboundFields),
 		core.WithDebugLogger(logger),
 		// Meter response-open failures. The counter lives in client/metrics and is
@@ -448,18 +472,32 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 	// preview. The warmer stays off (no provider list to enumerate), so Built holds
 	// only the client.
 	if directMode {
-		directRes, err := route.NewDirect(*f.providerURL, routeOpts...)
+		directRes, err := route.NewDirect(*f.providerURL, append(routeOpts, chatRouteOpts...)...)
 		if err != nil {
 			logger.Error("invalid -provider-url", "url", *f.providerURL, "err", err)
 			os.Exit(1)
 		}
 		logger.Info("direct-broker mode enabled (no router)", "label", label, "provider_url", *f.providerURL, "attest", *f.attestOn)
-		return &Built{Client: core.NewWithResolver(directRes, coreOpts...)}
+		return &Built{Client: core.NewWithResolver(directRes, append(append([]core.Option{}, coreOpts...),
+			core.WithSealFields(sealFields), core.WithServiceType(core.ServiceTypeChatbot))...)}
 	}
 
-	router := route.New(*f.RouterURL, routeOpts...)
-	client := core.NewWithResolver(router, coreOpts...)
-	b := &Built{Client: client, router: router, verifiesQuotes: *f.attestOn}
+	router := route.New(*f.RouterURL, append(append([]route.Option{}, routeOpts...),
+		append(chatRouteOpts, route.WithServiceType(core.ServiceTypeChatbot))...)...)
+	client := core.NewWithResolver(router, append(append([]core.Option{}, coreOpts...),
+		core.WithSealFields(sealFields), core.WithServiceType(core.ServiceTypeChatbot))...)
+
+	// The image client shares every attestation and grounding option — same
+	// verifier, same on-chain registry — and differs only in service type, which
+	// selects both the providers its router previews and the profile it seals
+	// under. Its sealed set comes from the profile: -seal-fields is chat's, and
+	// core.NewWithResolver derives the image default when it is not overridden.
+	imageRouter := route.New(*f.RouterURL, append(append([]route.Option{}, routeOpts...),
+		route.WithServiceType(core.ServiceTypeTextToImage))...)
+	imageClient := core.NewWithResolver(imageRouter,
+		append(append([]core.Option{}, coreOpts...), core.WithServiceType(core.ServiceTypeTextToImage))...)
+
+	b := &Built{Client: client, ImageClient: imageClient, router: router, verifiesQuotes: *f.attestOn}
 	if *f.warmOn {
 		b.resolver = resolver
 		b.warmInterval = *f.warmInterval

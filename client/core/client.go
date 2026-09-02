@@ -190,6 +190,16 @@ type Client struct {
 	resolver      Resolver
 	sealFields    []string
 	unboundFields []string
+	// profile is the wire profile whose rules this client seals and opens under
+	// (SPEC §5.1). It fixes which field carries the payload and which the
+	// response must seal, so a chat client cannot silently accept an
+	// image-shaped response or vice versa. Set from the service type; see
+	// WithServiceType.
+	profile wire.Profile
+	// sealFieldsSet records that WithSealFields was passed, so NewWithResolver
+	// can derive the default set from the profile without overriding an explicit
+	// choice — the same reason route.Router tracks sensitiveFieldsSet.
+	sealFieldsSet bool
 	http          *http.Client
 	debug         *slog.Logger // nil = off; see WithDebugLogger
 	metrics       MetricsHook  // nil = off; see WithMetrics
@@ -443,8 +453,55 @@ type Option func(*Client)
 // (New returning an error) so a misconfig fails once, not on every request.
 func WithSealFields(fields []string) Option {
 	// Clone so a later mutation of the caller's slice cannot alter this config.
-	return func(c *Client) { c.sealFields = slices.Clone(fields) }
+	return func(c *Client) {
+		c.sealFields = slices.Clone(fields)
+		c.sealFieldsSet = true
+	}
 }
+
+// WithServiceType binds the client to the endpoint it serves — "chatbot" (the
+// default) or "text-to-image" — which selects the wire profile it seals and
+// opens under, and, unless WithSealFields overrides it, the default sealed set
+// for that profile ("messages"/"tools" vs "prompt").
+//
+// The profile is what stops a chat client accepting an image-shaped response
+// and vice versa: OpenResponseFor refuses a frame whose sealed set does not
+// cover the profile's content field, which is the client's only way to notice
+// that its response was never actually sealed (SPEC §12). A client left on the
+// default keeps behaving exactly as before.
+//
+// An unrecognised service type leaves the profile empty, which makes every seal
+// and open fail closed with "unknown profile" rather than silently applying the
+// chat rules to a request shape nobody analysed.
+func WithServiceType(serviceType string) Option {
+	return func(c *Client) { c.profile = profileForServiceType(serviceType) }
+}
+
+// profileForServiceType maps the endpoint a client serves to its wire profile.
+// An allowlist, deliberately: SPEC §1 covers exactly two profiles, and anything
+// else — the multipart service types, video generation, whatever is added next —
+// has no envelope format defined. Returning the empty profile makes the wire
+// package reject it, which is the honest answer; guessing ProfileChat would
+// apply the wrong rules to an unanalysed request shape, silently. The broker
+// resolves the same mapping on its side for the same reason.
+func profileForServiceType(serviceType string) wire.Profile {
+	switch serviceType {
+	case ServiceTypeChatbot:
+		return wire.ProfileChat
+	case ServiceTypeTextToImage:
+		return wire.ProfileImage
+	default:
+		return ""
+	}
+}
+
+// Service types a client can be bound to with WithServiceType. They match the
+// router's own service_type values, so one string flows from the operator's
+// flag through route.WithServiceType and core.WithServiceType alike.
+const (
+	ServiceTypeChatbot     = "chatbot"
+	ServiceTypeTextToImage = "text-to-image"
+)
 
 // WithUnboundFields overrides the set of cleartext request fields excluded from
 // the AAD (SPEC §5.2) — the fields an intermediary may add, modify, or remove in
@@ -547,7 +604,7 @@ func NewWithResolver(r Resolver, opts ...Option) *Client {
 	tr.ResponseHeaderTimeout = providerTimeout
 	c := &Client{
 		resolver:      r,
-		sealFields:    wire.DefaultSealedFields(),
+		profile:       wire.ProfileChat,
 		unboundFields: wire.DefaultUnboundFields(),
 		http:          &http.Client{Transport: tr},
 
@@ -555,6 +612,12 @@ func NewWithResolver(r Resolver, opts ...Option) *Client {
 	}
 	for _, o := range opts {
 		o(c)
+	}
+	// Resolved AFTER the options, not as a struct default, so it tracks whichever
+	// profile they settled on regardless of the order WithServiceType and
+	// WithSealFields were passed in. An explicit WithSealFields still wins.
+	if !c.sealFieldsSet {
+		c.sealFields = wire.DefaultSealedFieldsFor(c.profile)
 	}
 	return c
 }
@@ -730,7 +793,7 @@ func (c *Client) completeOnce(parent context.Context, provider Provider, req wir
 		outcome = UpstreamUndecodable
 		return nil, true, stageErr(StageUpstream, fmt.Errorf("decode sealed response: %w", err))
 	}
-	out, err := wire.OpenResponse(ephPriv, sealedResp)
+	out, err := wire.OpenResponseFor(c.profile, ephPriv, sealedResp)
 	if err != nil {
 		c.logOpenFailure(0, sealedResp, err)
 		outcome = UpstreamUndecodable
@@ -830,7 +893,7 @@ func (c *Client) doRequest(ctx context.Context, provider Provider, env wire.Requ
 func (c *Client) seal(provider Provider, req wire.Request, ephPub []byte) (wire.Request, error) {
 	req = withModel(req, provider.Model)
 	req = withStreamUsage(req)
-	return wire.SealRequest(provider.EncPubKey, req, c.sealedFieldsFor(req), provider.SignerAddr, ephPub, c.unboundFields...)
+	return wire.SealRequestFor(c.profile, provider.EncPubKey, req, c.sealedFieldsFor(req), provider.SignerAddr, ephPub, c.unboundFields...)
 }
 
 // withStreamUsage forces "stream_options":{"include_usage":true} on a streaming

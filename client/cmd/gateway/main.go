@@ -390,7 +390,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr: *f.Listen,
-		Handler: newHandler(built.Client, routerTarget, origins, instanceID, *evidenceDir, *maxInFlight,
+		Handler: newHandler(built.Client, built.ImageClient, routerTarget, origins, instanceID, *evidenceDir, *maxInFlight,
 			identity, providerIdentities, built.Readiness(), logger),
 		ReadHeaderTimeout: 10 * time.Second,     // mitigate slow-header (Slowloris) clients
 		IdleTimeout:       proxycli.IdleTimeout, // bound idle keep-alives; unset means unbounded
@@ -603,7 +603,7 @@ func runHealthCheck(listen string) int {
 // ready backs GET /readyz: nil means there is nothing to assert (no warmer
 // configured) and the route always answers ready. See proxycli.Built.Readiness and
 // the /healthz vs /readyz split at the routes below.
-func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, instanceID, evidenceDir string,
+func newHandler(c *core.Client, imageClient *core.Client, routerTarget *url.URL, allowedOrigins []string, instanceID, evidenceDir string,
 	maxInFlight int, identity *identityCache, providerIdentities route.ProviderIdentitySource,
 	ready func() error, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
@@ -626,6 +626,21 @@ func newHandler(c *core.Client, routerTarget *url.URL, allowedOrigins []string, 
 	mux.Handle("POST /v1/chat/completions",
 		openaiproxy.RequireInferenceCredential(
 			openaiproxy.LimitInFlight(maxInFlight, openaiproxy.Handler(c))))
+	// The sealed image endpoint, behind the same credential gate and the same
+	// in-flight cap — it does the same expensive work (seal, route preview, DCAP
+	// on a cold cache) and must not have its own separate budget.
+	//
+	// Left unmounted when there is no image client (direct-broker mode, whose
+	// single configured broker URL is chat-shaped), so the path falls through to
+	// the catch-all like any other unknown route rather than serving one that
+	// cannot work.
+	if imageClient != nil {
+		imageMux := http.NewServeMux()
+		openaiproxy.RegisterImages(imageMux, imageClient)
+		mux.Handle("POST /v1/images/generations",
+			openaiproxy.RequireInferenceCredential(
+				openaiproxy.LimitInFlight(maxInFlight, imageMux)))
+	}
 	// /healthz answers "is this process serving?" and nothing more. It is the
 	// container healthcheck, and compose gates dstack-ingress's STARTUP on it
 	// (depends_on: service_healthy), so widening it to cover provider reachability

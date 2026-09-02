@@ -204,6 +204,7 @@ func (s *server) handler() http.Handler {
 	// Router surface.
 	mux.HandleFunc("POST /v1/routing/preview", s.handlePreview)
 	mux.HandleFunc("POST /v1/chat/completions", s.handleCompletions)
+	mux.HandleFunc("POST /v1/images/generations", s.handleImages)
 	mux.HandleFunc("GET /v1/providers", s.handleProviders)
 	// Provider-broker surface (reached at the endpoint the preview advertises).
 	mux.HandleFunc("GET /v1/e2ee/pubkey", s.handlePubkey)
@@ -216,6 +217,7 @@ func (s *server) handler() http.Handler {
 	// to come from a verified quote. Same handler: the two modes differ in how the
 	// gateway got here, not in what it sends.
 	mux.HandleFunc("POST /v1/proxy/chat/completions", s.handleCompletions)
+	mux.HandleFunc("POST /v1/proxy/images/generations", s.handleImages)
 	// There is deliberately no GET /v1/quote: the fixture cannot produce a genuine
 	// TDX quote, so a gateway pointed at it must run with -attest=false. Leaving
 	// the route absent makes that a loud 404 at startup rather than a confusing
@@ -295,7 +297,7 @@ func (s *server) handleCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "request carries no readable _e2ee metadata")
 		return
 	}
-	if _, err := wire.OpenRequest(s.encPriv, env); err != nil {
+	if _, err := wire.OpenRequestFor(wire.ProfileChat, s.encPriv, env); err != nil {
 		// A real enclave fails closed here too. Under load this is the check that
 		// catches a gateway change that breaks sealing, instead of the load test
 		// happily measuring a path that produces garbage.
@@ -355,7 +357,7 @@ func (s *server) serveBuffered(w http.ResponseWriter, r *http.Request, ephPub []
 		"usage":   s.usageRaw,
 		"choices": s.fullChoices,
 	}
-	sealed, err := wire.SealResponse(crypto.PublicKey(ephPub), frame, nil)
+	sealed, err := wire.SealResponseFor(wire.ProfileChat, crypto.PublicKey(ephPub), frame, nil)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "seal response")
 		return
@@ -385,7 +387,7 @@ func (s *server) serveStream(w http.ResponseWriter, r *http.Request, ephPub []by
 		writeError(w, http.StatusInternalServerError, "streaming unsupported")
 		return
 	}
-	sealer, err := wire.NewResponseSealer(crypto.PublicKey(ephPub))
+	sealer, err := wire.NewResponseSealerFor(wire.ProfileChat, crypto.PublicKey(ephPub))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "set up response sealing")
 		return

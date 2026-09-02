@@ -544,3 +544,117 @@ func (o options) writeError(w http.ResponseWriter, err error) {
 	setPassthrough(w, upstreamHeader(err))
 	writeErrorObject(w, statusFor(err), o.errorEnvelope(err))
 }
+
+// RegisterImages mounts POST /v1/images/generations on mux, sealed to c.
+//
+// It is a separate entry point from Register rather than another route inside
+// it because a Client is bound to ONE service type (core.WithServiceType): its
+// profile decides which request field must be sealed and which the response
+// must seal, and its resolver asks the router for providers of that service
+// type. A caller serving both endpoints builds two Clients and calls both
+// Register and RegisterImages; the sidecar, which serves only chat, keeps
+// mounting Register alone and is untouched by this.
+//
+// There is no streaming variant: image generation returns one JSON object.
+func RegisterImages(mux *http.ServeMux, c *core.Client, opts ...Option) {
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
+	mux.HandleFunc("POST /v1/images/generations", func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxRequestBytes))
+		if err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				writeGatewayError(w, http.StatusRequestEntityTooLarge, "request body too large")
+				return
+			}
+			writeGatewayError(w, http.StatusBadRequest, "read request body")
+			return
+		}
+		var req wire.Request
+		if err := json.Unmarshal(body, &req); err != nil {
+			writeGatewayError(w, http.StatusBadRequest, "request body is not a JSON object")
+			return
+		}
+		req, err = withB64ResponseFormat(req)
+		if err != nil {
+			writeGatewayError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		ctx := core.WithCredential(r.Context(), credential(r))
+		ctx = core.WithForwardedHeaders(ctx, routingHeaders(r.Header))
+		meta := &core.ResponseMeta{}
+		ctx = core.WithResponseMeta(ctx, meta)
+
+		resp, err := c.Complete(ctx, req)
+		recordCompletion(err)
+		if err != nil {
+			o.writeError(w, err)
+			return
+		}
+		out, err := json.Marshal(resp)
+		if err != nil {
+			writeGatewayError(w, http.StatusInternalServerError, "encode response")
+			return
+		}
+		setPassthrough(w, meta.Header)
+		setResKey(w, meta)
+		setProvider(w, meta)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(out)
+	})
+}
+
+// withB64ResponseFormat fills in the image profile's pinned cleartext
+// `response_format: "b64_json"` when the caller omitted it, and rejects an
+// explicit conflicting value.
+//
+// The pin exists because url mode has the provider persist the images and serve
+// them from a plain URL — outside the sealed channel, which is a worse leak than
+// the prompt since it is the generated content itself (SPEC §7.1). The field is
+// REQUIRED rather than defaulted at the protocol layer precisely because
+// OpenAI's own default for the DALL·E family is `url`, so an omitted field is a
+// request to publish in the clear, spelled as silence.
+//
+// Defaulting it HERE rather than in wire is the difference between a gateway
+// being convenient and a protocol being safe: this gateway knows its callers
+// reached a sealed endpoint on purpose, so filling the field in is honouring an
+// intent they already expressed. The protocol layer knows nothing about the
+// caller and must keep failing closed for every other client. An explicit `url`
+// is refused rather than silently rewritten: the caller asked for a format this
+// mode cannot honour and has to learn that, which is the same reasoning the
+// broker applies to the same value.
+//
+// The request map is shallow-copied so the caller's body is never mutated.
+func withB64ResponseFormat(req wire.Request) (wire.Request, error) {
+	const want = "b64_json"
+	// A JSON `null` is the absence of a value, not a value — treat it as omitted
+	// and fill it in, the same reading wire.IsE2EESealed gives `_e2ee: null`.
+	// Spelled out because it is otherwise an accident: decoding `null` into a
+	// string is a no-op that returns NO error, so it would fall through to the
+	// value comparison and be rejected as `response_format=""`, which is a
+	// confusing message for a field the caller never set.
+	if raw, ok := req[fieldResponseFormat]; ok && string(raw) != "null" {
+		var got string
+		if err := json.Unmarshal(raw, &got); err != nil {
+			return nil, fmt.Errorf("%s must be the JSON string %q", fieldResponseFormat, want)
+		}
+		if got != want {
+			return nil, fmt.Errorf(
+				"%s=%q is not supported for a sealed image request (the images would be served outside the sealed channel); use %q",
+				fieldResponseFormat, got, want)
+		}
+		return req, nil
+	}
+	out := make(wire.Request, len(req)+1)
+	for k, v := range req {
+		out[k] = v
+	}
+	out[fieldResponseFormat] = json.RawMessage(`"` + want + `"`)
+	return out, nil
+}
+
+// fieldResponseFormat is the image profile's pinned cleartext field (SPEC §7.1).
+const fieldResponseFormat = "response_format"
