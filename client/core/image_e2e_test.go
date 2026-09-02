@@ -129,6 +129,50 @@ func TestE2E_Image_SealsPromptAndOpensImages(t *testing.T) {
 	}
 }
 
+// A chat-only field must not be grafted onto an image request by this client.
+//
+// `stream_options` is OpenAI's CHAT convention for asking a streamed completion
+// to report token usage; /v1/images/generations returns one JSON object and has
+// no stream at all. withStreamUsage keyed off `req["stream"]` alone, with no
+// profile guard, and the image handler never inspects `stream` (it has no
+// streaming branch to route into) — so an image request carrying
+// `"stream": true` reached the provider with a `stream_options` this client
+// invented for it.
+//
+// Not a confidentiality failure: both fields are cleartext metadata either way.
+// It is this client fabricating a field the profile gives no meaning to, on a
+// request the caller is entitled to have forwarded as written — and the provider
+// is entitled to reject it.
+func TestE2E_Image_NoStreamOptionsGrafted(t *testing.T) {
+	encPriv, encPub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatalf("enc key: %v", err)
+	}
+	prov := &imageProvider{encPriv: encPriv}
+	srv := httptest.NewServer(prov.handler())
+	defer srv.Close()
+
+	// `stream` on an image request is a caller error the HTTP layer refuses
+	// (openaiproxy rejects it before it reaches a client). It is set HERE anyway:
+	// this asserts the client core does not fabricate the field regardless of how
+	// the request reached it, so the two halves of the fix hold independently.
+	req := imageReq()
+	req["stream"] = json.RawMessage(`true`)
+
+	if _, err := newImageClient(t, srv, encPub).Complete(context.Background(), req); err != nil {
+		t.Fatalf("Complete: %v (provider open error: %s)", err, prov.openErr)
+	}
+	if raw, grafted := prov.lastOpened["stream_options"]; grafted {
+		t.Errorf("provider received stream_options = %s on an image request; "+
+			"this client must not add a chat-profile field to a profile that has no stream", raw)
+	}
+	// The caller's own `stream` is forwarded as written — the client neither
+	// invents fields nor silently drops the caller's.
+	if got := string(prov.lastOpened["stream"]); got != "true" {
+		t.Errorf("provider received stream = %q, want the caller's own value forwarded verbatim", got)
+	}
+}
+
 // A chat-profile client must not be able to serve the image endpoint: its
 // sealed set is chat's, so the image provider's OpenRequestFor refuses the
 // envelope. This is the profile binding doing its job — before core knew about

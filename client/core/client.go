@@ -904,7 +904,7 @@ func (c *Client) doRequest(ctx context.Context, provider Provider, env wire.Requ
 // model and enc key differ per candidate.
 func (c *Client) seal(provider Provider, req wire.Request, ephPub []byte) (wire.Request, error) {
 	req = withModel(req, provider.Model)
-	req = withStreamUsage(req)
+	req = withStreamUsage(c.profile, req)
 	return wire.SealRequestFor(c.profile, provider.EncPubKey, req, c.sealedFieldsFor(req), provider.SignerAddr, ephPub, c.unboundFields...)
 }
 
@@ -918,7 +918,20 @@ func (c *Client) seal(provider Provider, req wire.Request, ephPub []byte) (wire.
 // keys the caller put in "stream_options" are preserved; only include_usage is
 // overridden. The map is shallow-copied (like withModel) so the caller's request
 // is never mutated across fallback attempts.
-func withStreamUsage(req wire.Request) wire.Request {
+//
+// It applies to ProfileChat ONLY, which is why it takes the profile rather than
+// reading "stream" alone. "stream_options" is OpenAI's CHAT convention: the image
+// profile has no stream at all (one JSON object), and the Anthropic profile
+// streams but reports usage on its own frames with no such field. Ungated, this
+// grafted a fabricated chat field onto every other profile's requests whenever
+// the caller's body happened to carry "stream" — see
+// TestE2E_Image_NoStreamOptionsGrafted. The HTTP layer refuses "stream" on the
+// image endpoint too (openaiproxy.RegisterImages); this is the half that holds
+// however the request reached the core.
+func withStreamUsage(profile wire.Profile, req wire.Request) wire.Request {
+	if profile != wire.ProfileChat {
+		return req
+	}
 	// Only act on a streaming request. A present-but-non-boolean "stream" is left
 	// for the proxy/provider to reject; treat it as non-streaming here so a
 	// malformed value never gets usage options grafted onto it.

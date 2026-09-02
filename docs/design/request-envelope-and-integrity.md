@@ -348,7 +348,7 @@ checklist for the D0 follow-up (router repo, not this module).
 | Strip `attachments` + inject file text | Move off router → client or a dedicated attested TEE | Content transform on `messages` — forbidden by D0 |
 | Strip `verify_tee` | Header / client-side directive | Router directive, not a provider input |
 | Rewrite `model` (alias → provider ModelID) | Resolve at an endpoint (D2): client pre-seal, or enclave post-`Open` | `model` stays bound; no router mutation |
-| Force `stream_options.include_usage=true` | Client sets it up front (preferred), else list in `unbound_fields` | Avoid a router mutation of a bound field |
+| Force `stream_options.include_usage=true` | Client sets it up front (preferred), else list in `unbound_fields` | Avoid a router mutation of a bound field. Chat only: `stream_options` is an OpenAI chat convention, so the image profile (no stream) and the Anthropic one (usage on its own frames) never carry it — and because it is bound-but-unsealed, a router that added one there would break `Open` rather than pass unnoticed |
 | Replace auth header | Header layer — unchanged | Not in body AAD |
 
 **Response side (before the client):**
