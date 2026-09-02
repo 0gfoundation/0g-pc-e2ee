@@ -9,7 +9,8 @@ MUST agree on it. Keywords MUST / SHOULD / MAY per RFC 2119.
 > Status: draft. This cut covers the **router path**: provider discovery +
 > attestation binding, **field-level request sealing (E2E confidentiality of the
 > sensitive fields)**, **response sealing**, and **response-signature
-> verification**, for the **chat** and **image** request profiles (§5.1).
+> verification**, for the **chat**, **image** and **anthropic** request profiles
+> (§5.1).
 > Candidate scoring is the router's own internal concern
 > (surfaced through its candidate API), not part of this protocol.
 >
@@ -215,12 +216,26 @@ signed-text format.)
 |---|---|---|---|---|---|
 | `chat`  | `/v1/chat/completions` | `messages` | — | `messages`, `tools` | `choices` |
 | `image` | `/v1/images/generations` | `prompt` | `response_format` = `b64_json` (§7.1) | `prompt` | `data` |
+| `anthropic` | `/v1/messages` | `messages`, **and `system` whenever present** | — | `messages`, `system`, `tools` | per frame shape (§7.2) |
 
 A **pinned cleartext field** is one that stays readable but may hold only one
 value in a sealed request, because the other values direct the server to publish
 the *result* outside the sealed channel. Sealing the payload does not cover this
 — see §7.1 for the image case and why the field is required rather than
 defaulted.
+
+A **conditionally required payload field** is one that need not exist, but MUST
+be sealed whenever the request carries it. `system` on `/v1/messages` is the
+case: Anthropic puts the system prompt at the **top level** rather than as a
+message with `role: "system"`, so it is payload of exactly the same kind as
+`messages` while being optional. Neither of the other two categories covers it —
+required-always rejects the (common) request that omits it, and a mere default is
+droppable — and getting it wrong is silent: the request seals the conversation,
+passes every unconditional check, and hands the system prompt to the router in
+the clear. Because the requirement depends on the request rather than on the set
+of field names, it is checked where the request is in hand: by the sender before
+sealing, and by the enclave on the received envelope, where a field that was
+sealed is already gone and one still present therefore arrived in the clear.
 
 Whatever a profile seals, a response frame MUST leave `usage` and `model`
 cleartext: the router reads them without a key to bill and attribute, so sealing
@@ -242,8 +257,19 @@ to the §8.2 corollary:
 |---|---|---|
 | `usage` (response) | no — the router bills on it | **no** — its value must be authenticated |
 | a pinned cleartext field (§5.1) | **no** — sealing it removes it from the cleartext the server reads, which then falls back to its own default | **no** — the pin would hold only at seal time |
+| the top-level field CONTAINING a billable value, when a profile nests one — Anthropic's `message` (§7.2 rule 4) | no — the router bills on what is inside it | **no** — same reason as `usage`, one level down |
 | `model` | no — the router attributes on it | yes — the router rewrites the alias back; the resulting value is *not* authenticated (a known trade-off, see §9 and `DefaultUnboundFields`) |
 | `x_0g_trace` | n/a — router-injected | yes — nothing may trust it (§8.2) |
+
+**The rows above are field NAMES, and that is a trap for a profile that nests.**
+`unbound_fields` names top-level fields, so a rule written as "`usage` must stay
+bound" protects a top-level `usage` and nothing else: a profile carrying its
+billable value at `message.usage.input_tokens` satisfies that rule while leaving
+the value rewritable, because the name in the denylist and the name on the wire
+are different. A profile that nests a value whose *value* must be trusted MUST
+therefore name the top-level field that contains it (§7.2 rule 4 does), and any
+new profile MUST answer this question explicitly rather than inheriting the
+general rule and assuming it reaches.
 
 **Both ends enforce this, and for the "may be unbound" column the RECEIVER is
 the end that matters.** Checking only at seal time stops a conforming
@@ -336,7 +362,8 @@ enclave MUST reject (no plaintext fallback).
 The response is **field-level, symmetric with the request**: the enclave seals
 only the sensitive fields (chat profile: **`choices`** — the generated content
 and per-choice `finish_reason`; image profile: **`data`** — the generated
-images), and leaves the rest cleartext so the router can bill
+images; anthropic profile: **a field per event shape** — §7.2), and leaves the
+rest cleartext so the router can bill
 on them. Cleartext response fields (`usage`, `model`, `id`, `created`,
 `system_fingerprint`) are:
 - **readable** by the router (no decryption needed),
@@ -463,6 +490,130 @@ Two constraints are specific to this profile:
   to publish the RESULT outside the sealed channel is part of the profile's
   contract**, and sealing the payload is not sufficient on its own. A future
   profile that gains such a field must pin it the same way.
+
+### 7.2 Anthropic responses (frame-typed profiles)
+
+The `chat` and `image` profiles repeat **one frame shape**: every frame seals the
+same field. An Anthropic response does not. Its events are structurally
+different from one another — some carry generated content, some are pure
+sequencing — so *what a frame must seal is a property of the frame, not of the
+profile*. Such a profile is **frame-typed**: it names a cleartext
+**discriminator** field and maps each of its values to a shape.
+
+For `/v1/messages` the discriminator is `type`, which Anthropic already puts in
+every event payload:
+
+| `type` | Seals | Cleartext | Ends the stream |
+|---|---|---|---|
+| `message` (non-streaming) | `content`, **`stop_sequence` when present** | `id`, `type`, `role`, `stop_reason`, `usage`; `model` (unbound †) | n/a — one frame, `final` by definition |
+| `message_start` | — | `type`, `message` ‡ | |
+| `content_block_start` | `content_block` | `type`, `index` | |
+| `content_block_delta` | `delta` | `type`, `index` | |
+| `content_block_stop` | — | `type`, `index` | |
+| `message_delta` | `delta` (`stop_reason`, `stop_sequence`) | `type`, `usage` (`output_tokens`) | |
+| `message_stop` | — | `type` | **yes** |
+| `ping` | — | `type` | |
+| `error` | `error` | `type` | **yes** |
+
+† `model` is cleartext but **`unbound`**, like every other profile — the router
+rewrites the served model back to the alias the caller asked for, and the
+resulting value is not authenticated (§5.2, `DefaultUnboundFields`). Do not bind
+it: a broker that did would fail the client's `Open` on every response the router
+touched. Everything else in the cleartext column is **bound**.
+
+‡ `message` is a **protected cleartext field** — see rule 4. On a streaming
+response the billable input count lives inside it, at
+`message.usage.input_tokens`.
+
+**Two shapes end the stream.** `message_stop` closes a completed turn and `error`
+closes one that failed partway — a turn that fails sends `error` and **no**
+`message_stop`. So `final: true` belongs on whichever of the two actually
+arrives; an enclave that recognized only `message_stop` would emit an error
+stream with no final frame at all, which §7 requires the client to reject as a
+truncation. (The reference implementation answers this through
+`wire.IsTerminalResponseFrame` rather than leaving each enclave to hardcode it.)
+
+Six rules make that table safe. The first two are the shape contract; the rest
+exist because each is a way to satisfy the table and still leak. Rules 4 and 5
+are also the two whose SCOPE matters as much as their content: a rule attached to
+the shape where a field is expected, or to a field name a nested value does not
+share, holds in exactly the case nobody was attacking.
+
+1. **A shape with a content field MUST seal it.** As §7 elsewhere.
+2. **A shape with no content field MUST seal nothing** — an empty
+   `sealed_fields`. It is still a sealed frame: the ciphertext is over an empty
+   object, so the frame still carries `_e2ee`, its cleartext is still bound in
+   the AAD, and §8 still covers it. "Anything goes" is not the alternative:
+   `message_start`'s `message` holds the input token count the router bills on,
+   so a sealer free to seal extra on a sequencing frame could make the response
+   unbillable.
+3. **No frame may carry ANY shape's content field in cleartext without sealing
+   it.** Rules 1–2 key off the frame's own `type`, so a frame that claims
+   `message_stop` and puts the answer in a cleartext `delta` satisfies "seals
+   nothing" exactly, opens cleanly, and reads to an SDK as a stray field on a
+   stop event — while every intermediary has the delta. Keying this rule off the
+   field *names* is what makes a mislabeled frame detectable whatever it calls
+   itself.
+4. **`message` is a PROTECTED cleartext field: it may not be sealed, may not be
+   `unbound`, and `message.content` must be empty or absent — on EVERY frame that
+   carries it, whatever the frame's shape.** All three follow from one fact: the
+   billable input count is inside it, so the router must be able to read a value
+   it cannot decrypt and an intermediary cannot rewrite. Sealing the field is
+   worse than rewriting the count — the router then finds it on no frame at all
+   and bills zero — and a legal *superset* is what makes that reachable from a
+   content frame, so "seal nothing extra" (rule 2) does not cover it. The
+   emptiness half exists because a cleartext container can smuggle: Anthropic's
+   schema fixes `message.content` to `[]`, and an enclave that disagreed would
+   ship the answer in the clear in a field an SDK actually renders.
+
+   **The scope is the field, not the shape.** Anchored to `message_start` — the
+   only shape where `message` legitimately appears — the emptiness rule held on
+   exactly one shape, and a `ping` or `message_stop` frame could carry
+   `message: {"content": [...]}` untouched: rule 3 does not name `message`, and
+   "seals nothing" was satisfied. A profile that nests a value the router needs
+   MUST declare the field once and derive every rule from it, rather than
+   attaching each rule to the shape where the field is expected.
+5. **The discriminator MUST stay cleartext and MUST NOT be `unbound`.** Every
+   rule above keys off it, so a sealed one makes the shape unknowable and an
+   unbound one lets an intermediary relabel a content frame as a sequencing frame
+   — after which the receiver applies the wrong shape's rules and passes. This is
+   the §12 row about a receive-side check gated on a sender-controlled value.
+6. **A shape MUST seal `stop_sequence` whenever the frame carries it.** It is the
+   custom stop string the CLIENT supplied in `stop_sequences`, echoed back — the
+   caller's own input, not model output. The streaming path seals it already (it
+   lives inside `message_delta`'s `delta`); the non-streaming shape carries it as
+   a top-level field of its own and so has to name it, or the same value would go
+   one way in one mode and the other way in the other. It matters exactly when a
+   client adds `stop_sequences` to its request's sealed set — which §5.1's
+   defaults explicitly invite — because the response would then hand back in the
+   clear a value the request deliberately sealed. **`stop_reason` is deliberately
+   NOT covered**: it is a model-produced enum (`end_turn`, `max_tokens`, …) with
+   no caller input in it, and the router reads it; streaming seals it only
+   because it shares the `delta` object with the stop string.
+
+Rule 6 is "sensitive but optional" — the response-side twin of §5.1's
+conditionally required payload field — and is checked the same way from both
+ends: a field still present in the received frame's cleartext was never sealed.
+
+An **unrecognized** discriminator value is REJECTED, not passed through: an
+unknown shape may carry content and nothing about it says otherwise. Adding a
+shape is additive (§9) and needs no version bump, but until a shape is added,
+frames bearing it cannot be served.
+
+**The SSE `event:` line is not the discriminator and MUST NOT be trusted.** It
+sits outside the frame JSON and therefore outside the AAD, so an intermediary can
+rewrite it undetected. A receiver MUST read the shape from the bound `type` field
+and **rebuild** the `event:` line from it.
+
+Two notes on the token counts. They are cleartext and bound — rule 4 is what
+makes the second half of that true for `input_tokens`, whose nesting puts it out
+of reach of the general rule — but they arrive on **non-final** frames and one of
+them is two levels inside `message`, so unlike the image profile's
+`usage.output_images` (§7.1) they are not *required* by this spec to be
+**present**. Their being unforgeable and their being present are separate
+properties: rule 4 settles the first, and the second is a tracked follow-up. The
+failure mode if an enclave omits them is the §7.1 one exactly — a router reads
+zero, cannot tell that from a genuine zero, and bills nothing.
 
 **Client open:** `SetupBaseR(resp_enc, eph_priv, info="0g-pc/v1/resp")`, then
 `Open` each frame **in order** (fail-closed), merge the decrypted `choices` back
@@ -622,6 +773,15 @@ other, that party's column is the load-bearing one.
 | Invariant | Sender must refuse to build | Receiver must refuse to accept |
 |---|---|---|
 | sealed set covers the request payload field (§5.1) | yes | **yes — enclave** (a third-party client is not obliged to check) |
+| a conditionally required payload field present in the request is sealed — Anthropic's top-level `system` (§5.1) | yes | **yes — enclave** (it is the half that sees a third-party client's envelope, and the field's presence in the cleartext half IS the violation) |
+| a frame seals its shape's content field, and a shape with none seals nothing (§7.2) | yes | **yes — client** (otherwise the content rides in the clear and Open still succeeds) |
+| no frame carries another shape's content field in cleartext (§7.2) | yes | **yes — client** (this is what detects a mislabeled frame; the shape rules alone trust the sender's own label) |
+| `message_start.message.content` is empty (§7.2) | yes | **yes — client** (`message` must stay cleartext for the token count, so nothing else would notice content placed there) |
+| the frame discriminator is neither sealed nor unbound (§7.2) | yes | **yes — client** (an unbound discriminator makes every other shape check sender-controlled) |
+| a protected cleartext field is neither sealed nor unbound, and smuggles no content — Anthropic's `message` (§7.2 rule 4) | yes | **yes — client**. Three failures, one field: a rewritten `input_tokens` verifies (as a rewritten top-level `usage` would), a SEALED `message` leaves the router billing zero, and content inside `message.content` rides in the clear. Only the client can refuse any of them, and only if the rule is anchored to the field rather than to one shape. |
+| a shape's conditionally-sealed field is sealed when present — Anthropic's `stop_sequence` (§7.2 rule 6) | yes | **yes — client** (a field still in the received cleartext was never sealed, and no one else can tell) |
+| a stream ends with a frame marked `final` — for Anthropic, `message_stop` OR `error` (§7.2) | sealer marks it | **yes — client** (§7 already: a missing final frame is a truncation). An enclave that treats only `message_stop` as terminal emits an error stream the client must then reject. |
+| an unrecognized frame shape is refused (§7.2) | yes | **yes — both** (an unknown shape may carry content) |
 | pinned cleartext field: correct value, not sealed, not unbound (§5.1/§7.1) | yes | **yes — enclave** |
 | response sealed set covers the generated content (§7) | yes | **yes — client** (otherwise the content rides in the clear and Open still succeeds) |
 | `usage` not sealed (§7) | yes | client (loud either way: the router cannot bill) |
