@@ -243,3 +243,82 @@ func sameJSONObject(t *testing.T, a, b wire.Request) bool {
 	}
 	return reflect.DeepEqual(norm(a), norm(b))
 }
+
+// ValidateUnboundFieldsFor must reject a set that unbinds a field the profile
+// pins in cleartext, and must agree with what SealRequestFor enforces per
+// request — the whole point of exposing it is that a caller can run the request
+// path's check once at startup instead of discovering it on every request.
+func TestValidateUnboundFieldsForMatchesWhatSealEnforces(t *testing.T) {
+	_, pub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	_, ephPub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatalf("eph keygen: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		profile wire.Profile
+		unbound []string
+		wantErr bool
+	}{
+		{
+			// The pair that motivated this: valid for chat, unsealable for image.
+			name:    "response_format unbound is fine for chat",
+			profile: wire.ProfileChat,
+			unbound: []string{"model", "response_format"},
+		},
+		{
+			name:    "response_format unbound is refused for image (pinned cleartext)",
+			profile: wire.ProfileImage,
+			unbound: []string{"model", "response_format"},
+			wantErr: true,
+		},
+		{
+			name:    "a field cannot be both sealed and unbound",
+			profile: wire.ProfileImage,
+			unbound: []string{"prompt"},
+			wantErr: true,
+		},
+		{
+			name:    "an ordinary unbound field is fine",
+			profile: wire.ProfileImage,
+			unbound: []string{"model", "user"},
+		},
+		{
+			name:    "an empty set binds everything",
+			profile: wire.ProfileImage,
+		},
+		{
+			name:    "an unknown profile fails closed",
+			profile: wire.Profile("speech-to-text"),
+			unbound: []string{"model"},
+			wantErr: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sealed := wire.DefaultSealedFieldsFor(tc.profile)
+			gotErr := wire.ValidateUnboundFieldsFor(tc.profile, tc.unbound, sealed) != nil
+			if gotErr != tc.wantErr {
+				t.Fatalf("ValidateUnboundFieldsFor error = %v, want %v", gotErr, tc.wantErr)
+			}
+			// The startup check is only worth something if it agrees with the
+			// per-request one. Seal the same combination and require both verdicts to
+			// match: a startup check that is more lenient is the 100%-failure bug this
+			// function exists to prevent, and one that is stricter refuses a
+			// configuration that would have worked.
+			body := sampleImageReq
+			if tc.profile == wire.ProfileChat {
+				body = sampleReq
+			}
+			_, sealErr := wire.SealRequestFor(tc.profile, pub, mustReq(t, body),
+				sealed, testProvider, ephPub, tc.unbound...)
+			if got := sealErr != nil; got != tc.wantErr {
+				t.Errorf("SealRequestFor error = %v (%v), but startup validation said %v",
+					got, sealErr, tc.wantErr)
+			}
+		})
+	}
+}

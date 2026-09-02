@@ -364,10 +364,35 @@ func ValidateSealedFieldsFor(p Profile, fields []string) error {
 	return nil
 }
 
+// ValidateUnboundFieldsFor is ValidateUnboundFields plus the profile-specific
+// half: a field the profile PINS in cleartext (§7.1) may not be unbound, because
+// an unbound field sits outside the AAD and an intermediary could rewrite it in
+// transit with the enclave still accepting the result.
+//
+// It is the exact pair of checks SealRequestFor runs on every request, exposed so
+// a caller can run them once at startup for each profile it will seal under.
+// Validating only the profile whose sealed set the operator configured is how a
+// binary passes startup clean and then fails 100% of the requests it makes under
+// another profile — `-unbound-fields=model,response_format` is valid for chat and
+// unsealable for image.
+func ValidateUnboundFieldsFor(p Profile, unbound, sealed []string) error {
+	spec, err := p.spec()
+	if err != nil {
+		return err
+	}
+	if err := validatePinnedNotUnbound(spec, unbound); err != nil {
+		return err
+	}
+	return ValidateUnboundFields(unbound, sealed)
+}
+
 // ValidateUnboundFields enforces the invariants on the unbound (AAD-excluded)
 // set (SPEC §5.2): no empty names, no duplicates, the reserved `_e2ee` key is
 // disallowed, and no overlap with the sealed set — a field cannot be both
 // encrypted and intermediary-mutable.
+//
+// It is profile-agnostic; ValidateUnboundFieldsFor adds the pinned-cleartext
+// check a given profile imposes.
 //
 // Unlike sealed fields, an unbound field need NOT be present in the message: it
 // may name a slot an intermediary will only fill in later (e.g. a router-injected

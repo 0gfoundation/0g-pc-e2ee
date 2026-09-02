@@ -326,15 +326,67 @@ func (b *Built) ProviderIdentities() route.ProviderIdentitySource {
 // so a misconfigured proxy never starts with, say, an unsealed "messages" field
 // or attestation silently off. logger is also attached as the core's debug
 // logger, so open-failure diagnostics share the binary's format and sink.
-func (f *Flags) Build(label string, logger *slog.Logger) *Built {
-	sealFields := parseCSV(*f.sealFieldsCSV)
+// validateFieldSets checks the seal/unbound flags against EVERY profile this
+// binary will seal under, returning the flag name to blame. Split out of Build so
+// it is testable: Build's own failure path is os.Exit(1).
+//
+// The image half is the part that is easy to leave out and expensive to omit. The
+// image client shares one -unbound-fields set with the chat client but seals under
+// a different profile, whose sealed set is ["prompt"] and whose "response_format"
+// is pinned cleartext. SealRequestFor re-runs both checks on every request, so
+// validating only against chat lets a binary start clean and then fail 100% of its
+// image requests at seal time — `-unbound-fields=model,prompt` and
+// `model,response_format` each do exactly that. Check what we will actually seal
+// under, at startup, where the operator can still fix the flag.
+func validateFieldSets(sealFields, unboundFields []string, servesImages bool) (string, error) {
 	if err := wire.ValidateSealedFieldsFor(wire.ProfileChat, sealFields); err != nil {
-		logger.Error("invalid -seal-fields", "err", err)
-		os.Exit(1)
+		return "-seal-fields", err
 	}
+	if err := wire.ValidateUnboundFieldsFor(wire.ProfileChat, unboundFields, sealFields); err != nil {
+		return "-unbound-fields", err
+	}
+	if !servesImages {
+		return "", nil
+	}
+	// -seal-fields is chat's by definition, so the image client uses its profile
+	// default — validate against that, the set it will really seal with.
+	if err := wire.ValidateUnboundFieldsFor(wire.ProfileImage, unboundFields,
+		wire.DefaultSealedFieldsFor(wire.ProfileImage)); err != nil {
+		return "-unbound-fields (this binary also serves the image profile)", err
+	}
+	return "", nil
+}
+
+// BuildOption states something about the BINARY that Build cannot infer from the
+// flags — today, which sealed endpoints it actually mounts.
+type BuildOption func(*buildConfig)
+
+type buildConfig struct{ servesImages bool }
+
+// ServesImages declares that this binary mounts the sealed image endpoint. Two
+// things follow from it, and both are wrong when assumed:
+//
+//   - the background warmer enumerates the image fleet as well as the chat one.
+//     A binary that never serves an image request should not pay for that
+//     enumeration, nor take on its failure modes.
+//   - startup validates -unbound-fields against the IMAGE profile too. Without
+//     that, an image-serving binary can pass startup clean and then fail every
+//     image request at seal time (see Build).
+//
+// The sidecar mounts chat only, so it does not pass this.
+func ServesImages() BuildOption {
+	return func(c *buildConfig) { c.servesImages = true }
+}
+
+func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *Built {
+	var bc buildConfig
+	for _, o := range opts {
+		o(&bc)
+	}
+	sealFields := parseCSV(*f.sealFieldsCSV)
 	unboundFields := parseCSV(*f.unboundFieldsCSV)
-	if err := wire.ValidateUnboundFields(unboundFields, sealFields); err != nil {
-		logger.Error("invalid -unbound-fields", "err", err)
+	if flag, err := validateFieldSets(sealFields, unboundFields, bc.servesImages); err != nil {
+		logger.Error("invalid "+flag, "err", err)
 		os.Exit(1)
 	}
 	// Direct-broker mode (-provider-url set) skips the router and seals straight to
@@ -488,11 +540,18 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 	// each Resolve instead, because it describes the request rather than this
 	// connection.
 	//
-	// The warmer is told both service types so the image providers' quotes are
-	// verified ahead of the first image request rather than on it; it
-	// de-duplicates by address, so a provider serving both is verified once.
+	// The warmer is told which service types this BINARY serves, not every type the
+	// router knows: warming a fleet we will never seal to buys nothing and takes on
+	// that enumeration's failure modes for free. When images are served it warms
+	// them too, so the image providers' quotes are verified ahead of the first image
+	// request rather than on it; it de-duplicates by address, so a provider serving
+	// both is verified once.
+	warmTypes := []string{core.ServiceTypeChatbot}
+	if bc.servesImages {
+		warmTypes = append(warmTypes, core.ServiceTypeTextToImage)
+	}
 	router := route.New(*f.RouterURL, append(append([]route.Option{}, routeOpts...),
-		append(chatRouteOpts, route.WithWarmServiceTypes(core.ServiceTypeChatbot, core.ServiceTypeTextToImage))...)...)
+		append(chatRouteOpts, route.WithWarmServiceTypes(warmTypes...))...)...)
 
 	// Two clients, one router. A client is a SEALING CONTEXT bound to one request
 	// shape — its profile fixes which field must be sealed and which the response
@@ -501,9 +560,13 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 	client := core.NewWithResolver(router, append(append([]core.Option{}, coreOpts...),
 		core.WithSealFields(sealFields), core.WithServiceType(core.ServiceTypeChatbot))...)
 	// -seal-fields is chat's set by definition, so the image client takes its
-	// profile default instead of inheriting it.
-	imageClient := core.NewWithResolver(router,
-		append(append([]core.Option{}, coreOpts...), core.WithServiceType(core.ServiceTypeTextToImage))...)
+	// profile default instead of inheriting it. Built only for a binary that mounts
+	// the endpoint; nil leaves the gateway's image route as its explicit refusal.
+	var imageClient *core.Client
+	if bc.servesImages {
+		imageClient = core.NewWithResolver(router,
+			append(append([]core.Option{}, coreOpts...), core.WithServiceType(core.ServiceTypeTextToImage))...)
+	}
 
 	b := &Built{Client: client, ImageClient: imageClient, router: router, verifiesQuotes: *f.attestOn}
 	if *f.warmOn {

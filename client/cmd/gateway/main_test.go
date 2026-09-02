@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -629,5 +631,88 @@ func TestGatewayRefusesSealedImagesWithoutAnImageClient(t *testing.T) {
 	}
 	if env.Error.Message == "" {
 		t.Errorf("refusal carries no message: %s", body)
+	}
+}
+
+// blockingResolver parks inside Resolve until released, so a test can hold a
+// request inside the sealed handler — and therefore inside the in-flight
+// limiter's semaphore — while it fires a second one.
+type blockingResolver struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b blockingResolver) Resolve(ctx context.Context, _ string, _ wire.Request) (core.Candidates, error) {
+	b.entered <- struct{}{}
+	select {
+	case <-b.release:
+	case <-ctx.Done():
+	}
+	// The test never gets this far caring about the outcome: the assertion is about
+	// the SLOT this request held, not the answer it produced.
+	return nil, errors.New("blocked resolver yields no candidates")
+}
+
+// TestSealedRoutesShareOneInFlightLimiter: the chat and image routes must draw
+// from ONE semaphore, so the process ceiling is maxInFlight and not 2×.
+//
+// openaiproxy.LimitInFlight builds a fresh semaphore per call, so wrapping each
+// route in its own call reads exactly like sharing one and is not: the two routes
+// each get the full budget. Nothing observable says so — the gateway serves
+// normally, and metrics.SetInFlightLimit still publishes the single configured
+// number — while peak memory can reach twice what defaultMaxInFlight sized the
+// process for, and every alert on in-flight/limit divides by the wrong ceiling.
+//
+// With a cap of 1, holding a chat request inside the handler must shed an image
+// request with 503. Two semaphores would let it straight through.
+func TestSealedRoutesShareOneInFlightLimiter(t *testing.T) {
+	blocker := blockingResolver{entered: make(chan struct{}), release: make(chan struct{})}
+
+	// Chat holds the slot; the image client is ordinary — the point is that the
+	// image ROUTE cannot find a slot, not that the image client is special.
+	gw := httptest.NewServer(newHandler(
+		core.NewWithResolver(blocker), routeClient(),
+		mustURL(t, "http://router.unused"), testOrigins(), "", "",
+		1, nil, nil, nil, discardLogger()))
+	// Release BEFORE Close: httptest's Close waits for outstanding requests, and
+	// the whole point of this fixture is that one is parked indefinitely. Deferred
+	// second so it runs first.
+	defer gw.Close()
+	defer close(blocker.release)
+
+	go func() {
+		req, _ := http.NewRequest(http.MethodPost, gw.URL+"/v1/chat/completions",
+			strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer sk-user-key")
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			resp.Body.Close()
+		}
+	}()
+	select {
+	case <-blocker.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the chat request never reached the resolver; it never took a slot")
+	}
+
+	req, _ := http.NewRequest(http.MethodPost, gw.URL+"/v1/images/generations",
+		strings.NewReader(`{"model":"z-image","prompt":"p","response_format":"b64_json"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer sk-user-key")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post /v1/images/generations: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("image request status = %d, want 503: the sole in-flight slot was held by "+
+			"the chat request, so the two routes are not sharing one limiter (body %s)", resp.StatusCode, body)
+	}
+	// A shed carries Retry-After; without it a client has nothing to back off on,
+	// and this would pass against an unrelated 503.
+	if resp.Header.Get("Retry-After") == "" {
+		t.Errorf("a shed response must carry Retry-After (body %s)", body)
 	}
 }

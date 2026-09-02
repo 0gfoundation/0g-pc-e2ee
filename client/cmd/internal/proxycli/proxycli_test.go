@@ -344,3 +344,96 @@ func TestSealFieldsExplicitnessDrivesTheRouteOption(t *testing.T) {
 		})
 	}
 }
+
+// A binary that also serves the image profile must validate -unbound-fields
+// against THAT profile too, at startup.
+//
+// The two clients share one -unbound-fields set but seal under different
+// profiles, and SealRequestFor re-runs the check per request. So a chat-only
+// validation accepts sets that make every image request fail at seal time — the
+// exact failure mode ValidateSealedFieldsFor's own doc calls out: "passed startup
+// validation clean and then failed 100% of requests." A startup error is the
+// operator's chance to fix a flag; a per-request seal error is an outage.
+func TestValidateFieldSetsCoversTheImageProfile(t *testing.T) {
+	chatSeal := wire.DefaultSealedFieldsFor(wire.ProfileChat)
+	for _, tc := range []struct {
+		name         string
+		unbound      []string
+		servesImages bool
+		wantErr      bool
+	}{
+		{
+			name:    "unbinding the image prompt is fine for a chat-only binary",
+			unbound: []string{"model", "prompt"},
+		},
+		{
+			// "prompt" is the image profile's whole sealed payload: unbound and sealed
+			// at once is a contradiction, and every image seal would reject it.
+			name:         "...and refused once the binary also serves images",
+			unbound:      []string{"model", "prompt"},
+			servesImages: true,
+			wantErr:      true,
+		},
+		{
+			name:    "unbinding response_format is fine for a chat-only binary",
+			unbound: []string{"model", "response_format"},
+		},
+		{
+			// Pinned cleartext: unbound puts it outside the AAD, where an intermediary
+			// could rewrite "b64_json" to "url" and have the enclave accept it.
+			name:         "...and refused once the binary also serves images",
+			unbound:      []string{"model", "response_format"},
+			servesImages: true,
+			wantErr:      true,
+		},
+		{
+			name:         "an ordinary unbound field passes both profiles",
+			unbound:      []string{"model", "user"},
+			servesImages: true,
+		},
+		{
+			name:         "the shipped default passes both profiles",
+			unbound:      wire.DefaultUnboundFields(),
+			servesImages: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			which, err := validateFieldSets(chatSeal, tc.unbound, tc.servesImages)
+			if got := err != nil; got != tc.wantErr {
+				t.Fatalf("validateFieldSets error = %v (%v), want %v", got, err, tc.wantErr)
+			}
+			if tc.wantErr && which == "" {
+				t.Error("a rejection must name the flag to blame")
+			}
+		})
+	}
+}
+
+// The gateway serves images and the sidecar does not, so only the gateway builds
+// an image client. The same flag also picks the router's warm service types —
+// warming a fleet the binary will never seal to buys nothing and takes on that
+// enumeration's failure modes for free — but that list is not observable from
+// outside route, so this asserts only the client. What WithWarmServiceTypes then
+// does with the list is covered in route (TestWarmer_OneFailingServiceType...).
+func TestBuildImageClientFollowsWhatTheBinaryServes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts []BuildOption
+		want bool
+	}{
+		{"sidecar-shaped: chat only", nil, false},
+		{"gateway-shaped: also images", []BuildOption{ServesImages()}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := flag.NewFlagSet("t", flag.ContinueOnError)
+			f := RegisterFlags(fs, "ZG_TEST", ":0")
+			if err := fs.Parse(nil); err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			built := f.Build("test", testLogger(), tc.opts...)
+			if got := built.ImageClient != nil; got != tc.want {
+				t.Errorf("ImageClient non-nil = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
