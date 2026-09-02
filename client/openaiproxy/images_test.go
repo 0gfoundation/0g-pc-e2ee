@@ -99,22 +99,9 @@ func TestImagesRejectStreaming(t *testing.T) {
 				t.Errorf("upstream was hit %d times, want %d: a refusal must happen "+
 					"before the request is sealed and sent", got, tc.wantHits)
 			}
-			if tc.wantStatus == http.StatusBadRequest && !contains(string(body), "stream") {
+			if tc.wantStatus == http.StatusBadRequest && !strings.Contains(string(body), "stream") {
 				t.Errorf("the error must name the field it is about, got %s", body)
 			}
 		})
 	}
-}
-
-func contains(s, sub string) bool {
-	return len(sub) == 0 || (len(s) >= len(sub) && indexOf(s, sub) >= 0)
-}
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
 }

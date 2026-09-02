@@ -60,6 +60,7 @@ func TestWithB64ResponseFormat(t *testing.T) {
 			if err := json.Unmarshal([]byte(tc.in), &req); err != nil {
 				t.Fatalf("bad fixture: %v", err)
 			}
+			_, hadBefore := req[fieldResponseFormat]
 			out, err := imagePreSeal(req)
 			if tc.wantErr != "" {
 				if err == nil {
@@ -77,11 +78,16 @@ func TestWithB64ResponseFormat(t *testing.T) {
 				t.Errorf("response_format = %s, want %s", got, tc.want)
 			}
 			// The caller's map must never be mutated: the same request is
-			// re-sealed to each fallback candidate.
-			if _, mutated := req[fieldResponseFormat]; !mutated && len(req) != 0 {
-				if _, had := req[fieldResponseFormat]; had {
-					t.Error("the caller's request was mutated")
-				}
+			// re-sealed to each fallback candidate, so an in-place write would
+			// leak one attempt's normalisation into the next.
+			//
+			// The previous form of this check could not fail — its outer guard
+			// required the field to be ABSENT and its inner one required it to be
+			// PRESENT — so it passed against a version of imagePreSeal that wrote
+			// through. Compare presence across the call instead.
+			if _, hasAfter := req[fieldResponseFormat]; hasAfter != hadBefore {
+				t.Errorf("the caller's request was mutated: %s presence went %v -> %v",
+					fieldResponseFormat, hadBefore, hasAfter)
 			}
 		})
 	}

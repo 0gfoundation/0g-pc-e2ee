@@ -1,15 +1,19 @@
 // Package endpoint is the one place the sealed inference surfaces differ from
 // each other.
 //
-// Chat and image generation diverge on five axes — which router service type
+// Chat and image generation diverge on several axes — which router service type
 // ranks their providers, which wire profile fixes what must be sealed, which
 // path this gateway serves, which path the sealed envelope is POSTed to on the
-// router, and whether the surface streams at all. Before this package each axis
-// was re-derived independently: a switch in core mapped service type to profile,
-// two more in route mapped it to the withheld field set and the upstream path,
-// openaiproxy carried a hand-copied handler per surface, and proxycli and the
-// gateway keyed off a bool and a nil check. Five spellings of one split, in four
-// packages, and adding a sixth surface meant finding all of them.
+// router, and whether the surface streams at all. Each was re-derived
+// independently: a switch in core mapped service type to profile, two more in
+// route mapped it to the withheld field set and the upstream path, openaiproxy
+// carried a hand-copied handler per surface, and proxycli and the gateway keyed
+// off a bool and a nil check. Five spellings of one split, in four packages, and
+// adding a surface meant finding all of them.
+//
+// This package carries the rows that core and openaiproxy read today. route's
+// two switches and the hand-written enumerations in proxycli and the gateway are
+// still outstanding — see All.
 //
 // The cost of that was not hypothetical. route.upstreamURL records one instance
 // (every sealed image request POSTed to /v1/chat/completions, because the
@@ -42,11 +46,14 @@ type Endpoint struct {
 	// request field carries the payload, which the response must seal, and which
 	// cleartext fields are pinned or required (SPEC §5.1).
 	Profile wire.Profile
-	// Path is where this gateway serves the surface. UpstreamPath is where the
-	// sealed envelope is POSTed on the router. They agree for every surface today
-	// — the point of keeping them separate is that nothing makes them agree, and
-	// assuming they did is what sent sealed image requests to the chat handler.
-	Path, UpstreamPath string
+	// Path is where this gateway serves the surface.
+	//
+	// It is NOT the path the sealed envelope is POSTed to on the router. Those
+	// agree for every surface today, and assuming they always would is what sent
+	// sealed image requests to the chat handler — but the router-side path is
+	// still derived by route.upstreamURL's own switch, so it does not live here
+	// yet. It moves in with the rest of route's enumeration.
+	Path string
 	// Streams is whether this surface has a streaming (SSE) shape at all. Image
 	// generation returns one JSON object, so `"stream": true` on it is a caller
 	// error rather than a mode to select.
@@ -67,28 +74,31 @@ type Endpoint struct {
 
 // Chat is POST /v1/chat/completions: the OpenAI chat-completions surface.
 var Chat = Endpoint{
-	ServiceType:  "chatbot",
-	Profile:      wire.ProfileChat,
-	Path:         "/v1/chat/completions",
-	UpstreamPath: "/v1/chat/completions",
-	Streams:      true,
+	ServiceType: "chatbot",
+	Profile:     wire.ProfileChat,
+	Path:        "/v1/chat/completions",
+	Streams:     true,
 }
 
 // Image is POST /v1/images/generations: the OpenAI image-generation surface.
 var Image = Endpoint{
-	ServiceType:  "text-to-image",
-	Profile:      wire.ProfileImage,
-	Path:         "/v1/images/generations",
-	UpstreamPath: "/v1/images/generations",
-	Streams:      false,
-	PreSeal:      imagePreSeal,
+	ServiceType: "text-to-image",
+	Profile:     wire.ProfileImage,
+	Path:        "/v1/images/generations",
+	Streams:     false,
+	PreSeal:     imagePreSeal,
 }
 
-// All is every surface this module knows how to seal. Adding a row here is what
-// makes a surface exist: the gateway mounts what is in this list (and an
-// explicit refusal for what a given build does not serve), proxycli builds a
-// client per row and validates the operator's field flags against each row's
-// profile, and the warmer enumerates each row's service type.
+// All is every surface this module knows how to seal, and the registry
+// ByServiceType resolves against.
+//
+// It is NOT yet the thing that mounts them. The gateway and proxycli still name
+// Chat and Image one at a time, so adding a row here does not by itself serve a
+// surface — replacing those hand-written enumerations is the next step, and
+// until it lands a new row needs its mount and its client added by hand too.
+// What a row DOES already decide, everywhere, is how the surface behaves once
+// mounted: its profile, its sealed set, its service type, whether it streams,
+// and its pre-seal normalisation.
 //
 // The Anthropic profile is deliberately ABSENT even though protocol/wire
 // carries a complete ProfileAnthropic and route already knows the

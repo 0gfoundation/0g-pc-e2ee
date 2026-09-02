@@ -905,8 +905,7 @@ func (c *Client) seal(provider Provider, req wire.Request, ephPub []byte) (wire.
 // the caller's body happened to carry "stream" — see
 // TestE2E_Image_NoStreamOptionsGrafted. The HTTP layer refuses "stream" on the
 // image endpoint too (endpoint.Image.Streams, acted on by openaiproxy.Register);
-// this is the half that holds
-// however the request reached the core.
+// this is the half that holds however the request reached the core.
 func withStreamUsage(profile wire.Profile, req wire.Request) wire.Request {
 	if profile != wire.ProfileChat {
 		return req
