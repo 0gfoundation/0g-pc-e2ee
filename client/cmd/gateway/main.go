@@ -78,6 +78,7 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/client/cmd/internal/proxycli"
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/dstack"
+	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/client/evidence"
 	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
@@ -631,9 +632,9 @@ func newHandler(c *core.Client, imageClient *core.Client, routerTarget *url.URL,
 	// memory that ceiling is derived from (see defaultMaxInFlight) and putting the
 	// wrong denominator under every in-flight/limit alert.
 	sealed := http.NewServeMux()
-	sealed.Handle("POST /v1/chat/completions", openaiproxy.Handler(c))
+	openaiproxy.Register(sealed, endpoint.Chat, c)
 	if imageClient != nil {
-		openaiproxy.RegisterImages(sealed, imageClient)
+		openaiproxy.Register(sealed, endpoint.Image, imageClient)
 	}
 	sealedGate := openaiproxy.RequireInferenceCredential(
 		openaiproxy.LimitInFlight(maxInFlight, sealed))

@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
@@ -89,7 +90,7 @@ func newImageClient(t *testing.T, srv *httptest.Server, encPub crypto.PublicKey)
 		Endpoint:   srv.URL,
 		EncPubKey:  encPub,
 		SignerAddr: "0x000000000000000000000000000000000000dEaD",
-	}, core.WithServiceType(core.ServiceTypeTextToImage))
+	}, core.WithEndpoint(endpoint.Image))
 }
 
 func imageReq() wire.Request {
@@ -186,7 +187,7 @@ func TestE2E_Image_ChatProfileClientIsRefused(t *testing.T) {
 	srv := httptest.NewServer(prov.handler())
 	defer srv.Close()
 
-	// No WithServiceType → the chat default, exactly as before this change.
+	// No WithEndpoint → the chat default, exactly as before this change.
 	chatClient := core.New(core.Provider{
 		URL:        srv.URL + "/v1/images/generations",
 		Endpoint:   srv.URL,
