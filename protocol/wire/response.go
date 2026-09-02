@@ -97,6 +97,15 @@ func ResponseSealedFieldsForFrame(p Profile, frame Response) ([]string, error) {
 // whichever one the sealer marks, and for a stream that is a synthesized
 // placeholder. Those profiles therefore answer false for every frame, with no
 // error — "no terminal shape" is an answer, not a failure.
+//
+// This answers "which STREAM frame ends the stream", not "is this frame final",
+// and the two differ on one shape: a NON-STREAMING frame (Anthropic's `message`)
+// answers false, because it does not end a stream — it is the whole response,
+// `final` by definition, and `SealResponseFor` marks it directly. So do not wire
+// a sealer's `final` argument to this function unconditionally: on the
+// non-streaming path that would emit `final: false`, which §7 requires the
+// client to reject as a truncation. Use it only where a stream is being sealed
+// frame by frame.
 func IsTerminalResponseFrame(p Profile, frame Response) (bool, error) {
 	spec, err := p.spec()
 	if err != nil {

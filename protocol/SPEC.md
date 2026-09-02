@@ -257,7 +257,7 @@ to the §8.2 corollary:
 |---|---|---|
 | `usage` (response) | no — the router bills on it | **no** — its value must be authenticated |
 | a pinned cleartext field (§5.1) | **no** — sealing it removes it from the cleartext the server reads, which then falls back to its own default | **no** — the pin would hold only at seal time |
-| the top-level field CONTAINING a billable value, when a profile nests one — Anthropic's `message` (§7.2 rule 6) | no — the router bills on what is inside it | **no** — same reason as `usage`, one level down |
+| the top-level field CONTAINING a billable value, when a profile nests one — Anthropic's `message` (§7.2 rule 4) | no — the router bills on what is inside it | **no** — same reason as `usage`, one level down |
 | `model` | no — the router attributes on it | yes — the router rewrites the alias back; the resulting value is *not* authenticated (a known trade-off, see §9 and `DefaultUnboundFields`) |
 | `x_0g_trace` | n/a — router-injected | yes — nothing may trust it (§8.2) |
 
@@ -267,7 +267,7 @@ bound" protects a top-level `usage` and nothing else: a profile carrying its
 billable value at `message.usage.input_tokens` satisfies that rule while leaving
 the value rewritable, because the name in the denylist and the name on the wire
 are different. A profile that nests a value whose *value* must be trusted MUST
-therefore name the top-level field that contains it (§7.2 rule 6 does), and any
+therefore name the top-level field that contains it (§7.2 rule 4 does), and any
 new profile MUST answer this question explicitly rather than inheriting the
 general rule and assuming it reaches.
 
@@ -605,17 +605,15 @@ sits outside the frame JSON and therefore outside the AAD, so an intermediary ca
 rewrite it undetected. A receiver MUST read the shape from the bound `type` field
 and **rebuild** the `event:` line from it.
 
-Two notes on the token counts. They are cleartext and bound — rule 6 is what
+Two notes on the token counts. They are cleartext and bound — rule 4 is what
 makes the second half of that true for `input_tokens`, whose nesting puts it out
 of reach of the general rule — but they arrive on **non-final** frames and one of
 them is two levels inside `message`, so unlike the image profile's
 `usage.output_images` (§7.1) they are not *required* by this spec to be
 **present**. Their being unforgeable and their being present are separate
-properties: rule 6 settles the first, and the second is a tracked follow-up. The
+properties: rule 4 settles the first, and the second is a tracked follow-up. The
 failure mode if an enclave omits them is the §7.1 one exactly — a router reads
-zero, cannot tell that from a genuine zero, and bills nothing. The terminal frame is `message_stop`, not a
-`[DONE]` sentinel, and `final: true` belongs on it: it is guaranteed last, so
-unlike the chat profile no synthetic final frame is needed.
+zero, cannot tell that from a genuine zero, and bills nothing.
 
 **Client open:** `SetupBaseR(resp_enc, eph_priv, info="0g-pc/v1/resp")`, then
 `Open` each frame **in order** (fail-closed), merge the decrypted `choices` back
