@@ -336,10 +336,14 @@ func TestAnthropicRefusesAMislabeledContentFrame(t *testing.T) {
 	}
 }
 
-// message_start keeps `message` cleartext because the router's input token count
-// is inside it, which leaves `message.content` as the one part of it that could
-// carry the answer. Anthropic's schema fixes it to []; nothing but this check
-// would notice if an enclave disagreed.
+// `message` stays cleartext because the router's input token count is inside it,
+// which leaves `message.content` as the one part of it that could carry the
+// answer. Anthropic's schema fixes it to []; nothing but this check would notice
+// if an enclave disagreed.
+//
+// The rule is anchored to the FIELD, not to message_start — see
+// TestAnthropicRefusesSmuggledContentOnAnyShape for why that distinction is the
+// whole point.
 func TestAnthropicRefusesContentInsideMessageStart(t *testing.T) {
 	_, _, ephPriv, ephPub := anthropicKeys(t)
 
@@ -737,5 +741,161 @@ func TestAnthropicRefusesACleartextStopSequence(t *testing.T) {
 	}
 	if _, err := opener.OpenFrame(frame); err == nil {
 		t.Fatal("opening a frame with the client's stop sequence in cleartext must be refused")
+	}
+}
+
+// A protected field's rules are anchored to the FIELD, so they hold on every
+// shape. Declared per shape (on message_start, where `message` legitimately
+// appears) they held on exactly one, and any sequencing frame could carry a
+// cleartext `message: {"content": [...]}` — the top-level content rule does not
+// name `message`, and "seal nothing" was satisfied. It is the same mislabeling
+// leak the top-level rule closes, one level down, in a field an Anthropic SDK
+// actually reads.
+func TestAnthropicRefusesSmuggledContentOnAnyShape(t *testing.T) {
+	_, _, ephPriv, ephPub := anthropicKeys(t)
+
+	for _, kind := range []string{"ping", "message_stop", "content_block_stop", "content_block_delta"} {
+		t.Run(kind, func(t *testing.T) {
+			sealer, err := wire.NewResponseSealerFor(wire.ProfileAnthropic, ephPub)
+			if err != nil {
+				t.Fatalf("sealer: %v", err)
+			}
+			frame := wire.Response{
+				"type":    json.RawMessage(`"` + kind + `"`),
+				"message": json.RawMessage(`{"usage":{"input_tokens":11},"content":[{"type":"text","text":"SMUGGLED"}]}`),
+			}
+			if kind == "content_block_delta" {
+				frame["delta"] = json.RawMessage(`{"type":"text_delta","text":"x"}`)
+			}
+			// Sender half.
+			if _, err := sealer.SealFrame(cloneFrame(frame), nil, false); err == nil {
+				t.Fatalf("sealing a %s frame that smuggles content in message.content must be refused", kind)
+			}
+
+			// Receiver half: the frame as a non-conforming enclave would emit it.
+			clean := wire.Response{"type": json.RawMessage(`"` + kind + `"`)}
+			if kind == "content_block_delta" {
+				clean["delta"] = json.RawMessage(`{"type":"text_delta","text":"x"}`)
+			}
+			sealed, err := sealer.SealFrame(cloneFrame(clean), nil, true)
+			if err != nil {
+				t.Fatalf("seal: %v", err)
+			}
+			sealed["message"] = json.RawMessage(`{"usage":{"input_tokens":11},"content":[{"type":"text","text":"SMUGGLED"}]}`)
+
+			opener, err := wire.NewResponseOpenerFor(wire.ProfileAnthropic, ephPriv, sealed)
+			if err != nil {
+				t.Fatalf("opener: %v", err)
+			}
+			if _, err := opener.OpenFrame(sealed); err == nil {
+				t.Fatalf("opening a %s frame that smuggles content must be refused", kind)
+			} else if !strings.Contains(err.Error(), "message.content") {
+				t.Errorf("the refusal should name message.content, got %v", err)
+			}
+		})
+	}
+}
+
+// The other half of the same anchoring. Keeping `message` out of `unbound_fields`
+// stops it being REWRITTEN; keeping it out of `sealed_fields` stops it being
+// removed. A superset is otherwise legal, so a CONTENT frame could seal `message`
+// as an extra — and then the router finds it on no frame at all and bills zero
+// input tokens, which is worse than a rewritten count.
+func TestAnthropicMessageMustStayCleartext(t *testing.T) {
+	_, _, ephPriv, ephPub := anthropicKeys(t)
+
+	sealer, err := wire.NewResponseSealerFor(wire.ProfileAnthropic, ephPub)
+	if err != nil {
+		t.Fatalf("sealer: %v", err)
+	}
+	content := wire.Response{
+		"type":    json.RawMessage(`"content_block_delta"`),
+		"index":   json.RawMessage(`0`),
+		"delta":   json.RawMessage(`{"type":"text_delta","text":"x"}`),
+		"message": json.RawMessage(`{"usage":{"input_tokens":11}}`),
+	}
+	// Sender half: sealing it as an EXTRA alongside the shape's legitimate
+	// content field must be refused, even though supersets are otherwise fine.
+	if _, err := sealer.SealFrame(cloneFrame(content), []string{"delta", "message"}, false); err == nil {
+		t.Fatal("sealing `message` away must be refused: the router would bill zero input tokens")
+	}
+	// And on a sequencing frame, where the old rule did fire.
+	if _, err := sealer.SealFrame(
+		wire.Response{"type": json.RawMessage(`"message_stop"`), "message": json.RawMessage(`{"usage":{"input_tokens":11}}`)},
+		[]string{"message"}, true); err == nil {
+		t.Error("sealing `message` on a sequencing frame must be refused too")
+	}
+
+	// Receiver half: a frame a non-conforming enclave emitted, declaring `message`
+	// sealed. Refused before decrypting, so the client never has to reason about
+	// what came back.
+	frame, err := sealer.SealFrame(cloneFrame(content), []string{"delta"}, true)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	var e2ee map[string]json.RawMessage
+	if err := json.Unmarshal(frame[e2eeKeyForTest], &e2ee); err != nil {
+		t.Fatalf("read _e2ee: %v", err)
+	}
+	e2ee["sealed_fields"] = json.RawMessage(`["delta","message"]`)
+	rewritten, err := json.Marshal(e2ee)
+	if err != nil {
+		t.Fatalf("marshal _e2ee: %v", err)
+	}
+	frame[e2eeKeyForTest] = rewritten
+	delete(frame, "message")
+
+	opener, err := wire.NewResponseOpenerFor(wire.ProfileAnthropic, ephPriv, frame)
+	if err != nil {
+		t.Fatalf("opener: %v", err)
+	}
+	if _, err := opener.OpenFrame(frame); err == nil {
+		t.Fatal("opening a frame that sealed `message` away must be refused")
+	} else if !strings.Contains(err.Error(), "CLEARTEXT") {
+		t.Errorf("the refusal should say `message` must stay cleartext, got %v", err)
+	}
+}
+
+// An Anthropic turn that fails partway ends with `error` and NO `message_stop`,
+// so both shapes are terminal. An enclave that recognized only message_stop would
+// emit an error stream with no final frame, which §7 requires the client to
+// reject as a truncation — so the taxonomy answers the question instead of each
+// enclave hardcoding it.
+func TestIsTerminalResponseFrame(t *testing.T) {
+	for _, tt := range []struct {
+		kind string
+		want bool
+	}{
+		{"message_stop", true},
+		{"error", true},
+		{"message_start", false},
+		{"content_block_delta", false},
+		{"content_block_stop", false},
+		{"message_delta", false},
+		{"ping", false},
+		{"message", false}, // non-streaming: one frame, final by definition, not an EVENT
+	} {
+		t.Run(tt.kind, func(t *testing.T) {
+			got, err := wire.IsTerminalResponseFrame(wire.ProfileAnthropic,
+				wire.Response{"type": json.RawMessage(`"` + tt.kind + `"`)})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("terminal = %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	// A single-shape profile has no terminal event, and that is an answer rather
+	// than a failure: its final frame is whichever one the sealer marks.
+	got, err := wire.IsTerminalResponseFrame(wire.ProfileChat, wire.Response{"choices": json.RawMessage(`[]`)})
+	if err != nil || got {
+		t.Errorf("chat = (%v, %v), want (false, nil)", got, err)
+	}
+	// An unknown shape is still refused rather than guessed.
+	if _, err := wire.IsTerminalResponseFrame(wire.ProfileAnthropic,
+		wire.Response{"type": json.RawMessage(`"thinking_stop"`)}); err == nil {
+		t.Error("an unknown shape must be refused, not reported non-terminal")
 	}
 }

@@ -83,6 +83,35 @@ func ResponseSealedFieldsForFrame(p Profile, frame Response) ([]string, error) {
 	return shape.sealedFieldsFor(frame), nil
 }
 
+// IsTerminalResponseFrame reports whether this frame is one that ENDS a stream
+// of this profile, and so is the frame `final` belongs on (§7).
+//
+// A frame-typed profile can have more than one: Anthropic ends a completed turn
+// with `message_stop` and a failed one with `error`, and a stream that ends with
+// `error` sends no `message_stop` at all. An enclave that recognized only the
+// former would emit a stream with no final frame — which §7 requires the client
+// to reject as a truncation — so this is exported rather than left for each
+// enclave to hardcode, which is the drift the taxonomy exists to prevent.
+//
+// A single-shape profile (chat, image) has no terminal EVENT: its final frame is
+// whichever one the sealer marks, and for a stream that is a synthesized
+// placeholder. Those profiles therefore answer false for every frame, with no
+// error — "no terminal shape" is an answer, not a failure.
+func IsTerminalResponseFrame(p Profile, frame Response) (bool, error) {
+	spec, err := p.spec()
+	if err != nil {
+		return false, err
+	}
+	if spec.responseFrames == nil {
+		return false, nil
+	}
+	_, shape, err := spec.responseFrames.shapeOf(frame)
+	if err != nil {
+		return false, fmt.Errorf("%s-profile: %w", p, err)
+	}
+	return shape.terminal, nil
+}
+
 // shapeOf reads a frame's cleartext discriminator and returns its shape. An
 // absent, non-string or unrecognized value is an error: a frame whose shape is
 // unknown may carry content, and nothing about it says it does not, so it is
@@ -177,14 +206,59 @@ func validateResponseUnboundFieldsFor(p Profile, unbound []string) error {
 	if spec.responseFrames != nil && slices.Contains(unbound, spec.responseFrames.discriminator) {
 		return fmt.Errorf("%q must stay bound for the %s profile: it names the frame's shape, so an unbound one lets an intermediary relabel a content frame as a sequencing frame and every shape check then passes", spec.responseFrames.discriminator, p)
 	}
-	// The profile's own must-stay-bound fields. The floor above is name-based on
-	// TOP-LEVEL fields, so it cannot reach a value that must be authenticated one
-	// level down — Anthropic's billable input count at `message.usage.input_tokens`
-	// is the case, and unbinding `message` would let a router restate it with the
+	// The profile's protected fields. The floor above is name-based on TOP-LEVEL
+	// fields, so it cannot reach a value that must be authenticated one level down
+	// — Anthropic's billable input count at `message.usage.input_tokens` is the
+	// case, and unbinding `message` would let a router restate it with the
 	// client's Open and the §8 verification both still passing.
-	for _, f := range spec.mustStayBoundResponse {
-		if slices.Contains(unbound, f) {
-			return fmt.Errorf("%q must stay bound for the %s profile: it carries a value the router bills on (or a value another check reads), one level down where the profile-independent rule cannot see it, so an unbound one could be rewritten in transit and still verify", f, p)
+	for _, pc := range spec.protected {
+		if slices.Contains(unbound, pc.field) {
+			return fmt.Errorf("%q must stay bound for the %s profile: it carries %s, one level down where the profile-independent rule cannot see it, so an unbound one could be rewritten in transit and still verify", pc.field, p, pc.reads)
+		}
+	}
+	return nil
+}
+
+// validateProtectedCleartextFor enforces a profile's protected fields (see
+// protectedCleartext) on ONE frame: not sealed away, and carrying no content in
+// the nested arrays that must stay empty.
+//
+// Per profile and per FRAME, deliberately — not per shape. Both bugs this
+// replaced were scope mismatches: the emptiness rule was declared on
+// message_start, so any other shape could carry a cleartext
+// `message: {"content": [...]}` and smuggle the answer past a check that only
+// looked at one shape; and the "seal nothing extra" rule only fired on shapes
+// with no content of their own, so a content frame could seal `message` away and
+// leave the router billing zero input tokens. Anchoring both to the field rather
+// than to a shape is what makes them hold everywhere.
+//
+// The unbound half of the same declaration lives in
+// validateResponseUnboundFieldsFor, which already runs per profile.
+func validateProtectedCleartextFor(p Profile, spec profileSpec, frame Response, fields []string) error {
+	for _, pc := range spec.protected {
+		if slices.Contains(fields, pc.field) {
+			return fmt.Errorf("%q must stay CLEARTEXT for the %s profile: it carries %s, so sealing it — even as an extra alongside a legitimate sealed field — leaves the router nothing to bill on", pc.field, p, pc.reads)
+		}
+		raw, ok := frame[pc.field]
+		if !ok {
+			continue
+		}
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			return fmt.Errorf("%s-profile frame field %q must be a JSON object: %w", p, pc.field, err)
+		}
+		for _, key := range pc.emptyArrays {
+			v, present := obj[key]
+			if !present {
+				continue
+			}
+			var arr []json.RawMessage
+			if err := json.Unmarshal(v, &arr); err != nil {
+				return fmt.Errorf("%s-profile frame %s.%s must be a JSON array: %w", p, pc.field, key, err)
+			}
+			if len(arr) > 0 {
+				return fmt.Errorf("%s-profile frame carries %d element(s) in cleartext %s.%s: that field stays cleartext so the router can read %s, which is exactly why content may not ride inside it — an enclave with content to send MUST use a shape that seals it", p, len(arr), pc.field, key, pc.reads)
+			}
 		}
 	}
 	return nil
@@ -289,6 +363,12 @@ func validateResponseSealedFieldsForFrame(p Profile, frame Response, fields []st
 	if err != nil {
 		return err
 	}
+	// The profile's protected fields, first and for every profile: they are a
+	// property of the field, not of the shape or of whether the profile is
+	// frame-typed at all.
+	if err := validateProtectedCleartextFor(p, spec, frame, fields); err != nil {
+		return err
+	}
 	rule := spec.responseFrames
 	if rule == nil {
 		return validateResponseSealedFieldsFor(p, fields)
@@ -307,23 +387,19 @@ func validateResponseSealedFieldsForFrame(p Profile, frame Response, fields []st
 	// conditionally-sealed field the frame actually carries (see
 	// frameShape.sealedFieldsFor for why one function serves both ends).
 	required := shape.sealedFieldsFor(frame)
-	if len(required) == 0 {
-		// Not merely unnecessary: `message` on a message_start holds the input
-		// token count the router bills on, so a sealer permitted to seal "extra"
-		// on a sequencing frame could make the response unbillable.
-		if len(fields) != 0 {
-			return fmt.Errorf("%s-profile %q frame carries no sensitive payload and must seal nothing, got %v", p, kind, fields)
-		}
+	if len(required) == 0 && len(fields) != 0 {
+		// A shape with nothing sensitive of its own must seal nothing at all. Note
+		// this is NOT what keeps a protected field out of the sealed set — that
+		// rule fires for every shape, above, because a CONTENT frame may otherwise
+		// seal a legal superset and swallow it.
+		return fmt.Errorf("%s-profile %q frame carries no sensitive payload and must seal nothing, got %v", p, kind, fields)
 	}
 	for _, f := range required {
 		if !slices.Contains(fields, f) {
 			return fmt.Errorf("%s-profile %q frame must seal %q", p, kind, f)
 		}
 	}
-	if err := validateNoCleartextContent(p, kind, *rule, frame, fields); err != nil {
-		return err
-	}
-	return validateNestedEmpty(p, kind, shape, frame)
+	return validateNoCleartextContent(p, kind, *rule, frame, fields)
 }
 
 // validateNoCleartextContent rejects a frame that carries any shape's content
@@ -357,39 +433,6 @@ func validateNoCleartextContent(p Profile, kind string, rule responseFrameRule, 
 			continue
 		}
 		return fmt.Errorf("%s-profile %q frame carries %q in cleartext: it is generated content under some frame shape, so a frame may carry it only by sealing it", p, kind, f)
-	}
-	return nil
-}
-
-// validateNestedEmpty enforces a shape's nestedMustBeEmpty arrays — today only
-// message_start's `message.content`, which Anthropic's own spec fixes to [].
-// See frameShape.nestedMustBeEmpty for why a promise from the schema is checked
-// rather than assumed.
-//
-// An absent field or absent key passes: this says "not content here", not "this
-// must exist". A present non-array is rejected, because a non-array where the
-// schema says array is not something to reason about further.
-func validateNestedEmpty(p Profile, kind string, shape frameShape, frame Response) error {
-	for _, n := range shape.nestedMustBeEmpty {
-		raw, ok := frame[n.field]
-		if !ok {
-			continue
-		}
-		var obj map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &obj); err != nil {
-			return fmt.Errorf("%s-profile %q frame field %q must be a JSON object: %w", p, kind, n.field, err)
-		}
-		v, ok := obj[n.key]
-		if !ok {
-			continue
-		}
-		var arr []json.RawMessage
-		if err := json.Unmarshal(v, &arr); err != nil {
-			return fmt.Errorf("%s-profile %q frame %s must be a JSON array: %w", p, kind, n, err)
-		}
-		if len(arr) > 0 {
-			return fmt.Errorf("%s-profile %q frame carries %d element(s) in cleartext %s: this shape does not seal it, so content there would be in the clear — an enclave with content to send MUST use a shape that seals it", p, kind, len(arr), n)
-		}
 	}
 	return nil
 }

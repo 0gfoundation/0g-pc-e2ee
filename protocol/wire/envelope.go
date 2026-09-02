@@ -150,22 +150,52 @@ type profileSpec struct {
 	// and cannot recover them from the sealed content (§7.1). Empty for profiles
 	// with no such requirement.
 	requiredResponseCleartext []cleartextNumber
-	// mustStayBoundResponse are cleartext response fields this profile may never
-	// declare unbound, ON TOP of the profile-independent floor
-	// (mustStayBoundInResponse).
-	//
-	// It exists because that floor is name-based on TOP-LEVEL fields, and a
-	// profile can carry a value that must be authenticated one level down.
-	// Anthropic's billable INPUT token count is at `message.usage.input_tokens`,
-	// whose top-level name is `message` — so "usage must stay bound" does not
-	// reach it, and an enclave could declare `message` unbound, put the count
-	// outside the AAD, and let a router restate it with the client's Open AND the
-	// §8 verification both still passing. That is the §7.1/§12 attack the `usage`
-	// rule exists to stop, on the input side.
-	//
-	// Unbinding `message` would also void the §7.2 `message.content` emptiness
-	// check, since that check reads a field an intermediary could then rewrite.
-	mustStayBoundResponse []string
+	// protected are top-level response fields this profile must keep READABLE and
+	// AUTHENTICATED — see protectedCleartext. Empty for a profile whose router
+	// inputs are all covered by the profile-independent floor.
+	protected []protectedCleartext
+}
+
+// protectedCleartext is a top-level response field that must reach the router
+// unsealed and unrewritten, on EVERY frame that carries it, plus the nested
+// arrays inside it that must stay empty because the field itself cannot be
+// sealed away.
+//
+// One declaration, three enforcement points, ONE scope. That shape is the whole
+// point: the two bugs this replaced were both scope mismatches, in opposite
+// directions, on rules that each covered part of the same field.
+//
+//   - "usage must stay bound" is name-based on TOP-LEVEL fields, so it never
+//     reached Anthropic's billable input count at `message.usage.input_tokens`:
+//     an enclave could unbind `message`, put the count outside the AAD, and let
+//     a router restate it with `Open` AND the §8 verification both still passing
+//     (§8 hashes the same AAD).
+//   - "a sequencing shape must seal nothing" only fired on shapes with no
+//     content of their own, so a CONTENT frame could seal `message` away as an
+//     extra: legal supersets are otherwise fine, and the router then finds no
+//     `message` on any frame and bills zero input tokens.
+//   - the emptiness rule for `message.content` was declared per SHAPE, on
+//     message_start, so a `ping` / `message_stop` / `content_block_stop` frame
+//     could carry a cleartext `message: {"content": [...]}` — the same
+//     mislabeling leak the top-level content rule closes, one level down, in a
+//     field an Anthropic SDK actually reads.
+//
+// So the field is declared once, per profile, and every rule derived from it
+// applies to every frame regardless of shape. A profile that nests a value the
+// router needs declares it here rather than adding a fourth partially-scoped
+// list.
+type protectedCleartext struct {
+	// field is the top-level field name, e.g. "message".
+	field string
+	// emptyArrays are keys directly inside it whose arrays MUST be empty or
+	// absent, because the field stays cleartext and could otherwise smuggle
+	// content — `message.content`, and so far only that. Deliberately the same
+	// two-level literal as cleartextNumber, for the same reason: a path parser
+	// would be more machinery than the rule it enforces.
+	emptyArrays []string
+	// reads names what depends on this field staying readable, for the error
+	// message — the operator needs to know WHY their frame was refused.
+	reads string
 }
 
 // cleartextNumber locates a required cleartext number one level inside a
@@ -209,6 +239,20 @@ type frameShape struct {
 	// permitting a superset would let a sealer swallow a field the router reads
 	// (Anthropic's input token count rides inside message_start's `message`).
 	content string
+	// terminal marks a shape that ENDS the stream, so it is the frame `final`
+	// belongs on. Anthropic has two: `message_stop` for a completed turn and
+	// `error` for one that failed partway — a stream that ends with `error` sends
+	// no `message_stop` at all, so a sealer that recognized only the latter would
+	// emit a stream with no final frame, which §7 requires the client to reject as
+	// a truncation.
+	//
+	// Exposed through IsTerminalResponseFrame rather than enforced here: an
+	// enclave needs to know which frame to mark, and hardcoding the answer on its
+	// side is the drift this taxonomy exists to prevent. Not enforced because
+	// `final` is legitimately set on a SYNTHESIZED terminal frame too, and pinning
+	// "final iff terminal shape" would constrain streams this spec has not
+	// characterized.
+	terminal bool
 	// sealIfPresent are fields this shape must seal WHENEVER THE FRAME CARRIES
 	// them — the response-side twin of the request's requiredIfPresent, and for
 	// the same reason: a field that is sensitive but optional cannot be expressed
@@ -227,30 +271,7 @@ type frameShape struct {
 	// ("end_turn", "max_tokens", …) with no client input in it. Streaming seals it
 	// only because it shares the `delta` object with `stop_sequence`.
 	sealIfPresent []string
-	// nestedMustBeEmpty are arrays one level inside a cleartext field that this
-	// shape MUST NOT carry content in.
-	//
-	// It exists for message_start, whose `message` must stay cleartext (the
-	// router's input token count is inside it) while `message.content` is, per
-	// Anthropic's own spec, always []. Nothing else would notice if it were not:
-	// an enclave that put the whole answer there would ship it in the clear, the
-	// client would open the frame happily, and an SDK reading message_start's
-	// message skeleton would even render it. So the emptiness Anthropic promises
-	// is checked rather than assumed — on both sides, since the side that can
-	// only detect it is the client (SPEC §12).
-	nestedMustBeEmpty []nestedArray
 }
-
-// nestedArray locates an array one level inside a top-level frame field —
-// `message.content`, and so far only that. Deliberately the same two-level
-// literal as cleartextNumber rather than general path resolution, for the same
-// reason: a path parser would be more machinery than the rule it enforces.
-type nestedArray struct {
-	field string // top-level cleartext frame field, e.g. "message"
-	key   string // key within that object, e.g. "content"
-}
-
-func (n nestedArray) String() string { return n.field + "." + n.key }
 
 // anthropicFrames is the /v1/messages event taxonomy (SPEC §7.2). The shapes
 // with content are the ones that carry generated text, a tool call, or an
@@ -268,10 +289,12 @@ var anthropicFrames = responseFrameRule{
 		// Non-streaming: one frame holding the whole content array, plus the
 		// client's own stop string when that is what ended the turn.
 		"message": {content: fieldContent, sealIfPresent: []string{fieldStopSequence}},
-		// Streaming. message_start's `message` holds the input token counts the
-		// router bills on, so it stays cleartext — with its content array checked
-		// empty, since that is the one part of it that could carry the answer.
-		"message_start":       {nestedMustBeEmpty: []nestedArray{{field: fieldMessage, key: fieldContent}}},
+		// Streaming. message_start carries nothing sensitive of its own: its
+		// `message` holds the input token counts the router bills on and is
+		// protected at the PROFILE level (see protectedCleartext), which is also
+		// where its content array is checked empty — on every frame, not just this
+		// one, since any shape could smuggle it.
+		"message_start":       {},
 		"content_block_start": {content: fieldContentBlock},
 		"content_block_delta": {content: fieldDelta},
 		"content_block_stop":  {},
@@ -281,12 +304,14 @@ var anthropicFrames = responseFrameRule{
 		// echoed back — on this path; the non-streaming shape has to name it
 		// explicitly because there it is a top-level field of its own.
 		"message_delta": {content: fieldDelta},
-		"message_stop":  {},
+		"message_stop":  {terminal: true},
 		"ping":          {},
 		// An upstream error message can quote the request that produced it. The
 		// router still sees `type: "error"`, which is all it needs to classify the
-		// failure.
-		"error": {content: fieldErr},
+		// failure. It is TERMINAL: a turn that fails partway sends this and no
+		// message_stop, so a sealer that treated only message_stop as the end
+		// would emit a stream with no final frame.
+		"error": {content: fieldErr, terminal: true},
 	},
 }
 
@@ -386,11 +411,16 @@ var profiles = map[Profile]profileSpec{
 		// profile's response_format — nothing in it directs the server to publish
 		// the result outside the sealed channel.
 		//
-		// `message` may never be declared unbound: message_start's
-		// `message.usage.input_tokens` is the billable input count, and the
-		// profile-independent "usage must stay bound" floor is name-based on
-		// top-level fields, so it does not reach one nested a level down.
-		mustStayBoundResponse: []string{fieldMessage},
+		// `message` carries the billable INPUT count at
+		// `message.usage.input_tokens`, one level below where the
+		// profile-independent floor can see it. Declaring it protected is what
+		// keeps it unsealed, unbindable and unable to smuggle content, on every
+		// frame — see protectedCleartext for the three scope bugs that fixes.
+		protected: []protectedCleartext{{
+			field:       fieldMessage,
+			emptyArrays: []string{fieldContent},
+			reads:       "the billable input token count at message.usage.input_tokens",
+		}},
 		// No requiredResponseCleartext either, for chat's reason plus one of its
 		// own: the billable counts are tokens, and they arrive in TWO places
 		// (message_start's message.usage.input_tokens, message_delta's
