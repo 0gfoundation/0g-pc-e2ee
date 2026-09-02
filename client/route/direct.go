@@ -75,7 +75,15 @@ func NewDirect(providerURL string, opts ...Option) (core.Resolver, error) {
 // Resolve implements core.Resolver: a single fixed candidate, the configured
 // provider. Materialization (its key fetch) is deferred to Candidates.Provider,
 // mirroring the routed path.
-func (d *directResolver) Resolve(context.Context, wire.Request) (core.Candidates, error) {
+//
+// It ignores the request body but NOT the service type: direct mode seals to one
+// configured broker URL whose paths are derived as chat (see deriveV1Base), so a
+// request of any other service type has nowhere to go and is refused here rather
+// than POSTed to the chat endpoint.
+func (d *directResolver) Resolve(_ context.Context, serviceType string, _ wire.Request) (core.Candidates, error) {
+	if serviceType != DefaultServiceType && serviceType != serviceTypeAnthropicChat {
+		return nil, fmt.Errorf("direct-broker mode serves only chat; no endpoint for service type %q", serviceType)
+	}
 	return directCandidates{d}, nil
 }
 

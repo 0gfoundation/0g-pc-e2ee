@@ -630,16 +630,24 @@ func newHandler(c *core.Client, imageClient *core.Client, routerTarget *url.URL,
 	// in-flight cap — it does the same expensive work (seal, route preview, DCAP
 	// on a cold cache) and must not have its own separate budget.
 	//
-	// Left unmounted when there is no image client (direct-broker mode, whose
-	// single configured broker URL is chat-shaped), so the path falls through to
-	// the catch-all like any other unknown route rather than serving one that
-	// cannot work.
+	// When there is no image client (direct-broker mode, whose single configured
+	// broker URL is chat-shaped), the route is mounted as an explicit refusal
+	// rather than left unmounted. Leaving it off is NOT inert: the catch-all is a
+	// reverse proxy to the router, and routerTarget is parsed in every mode, so an
+	// unmounted sealed endpoint forwards the caller's PROMPT to the router in
+	// cleartext — the one thing this gateway exists to prevent. Fail closed.
 	if imageClient != nil {
 		imageMux := http.NewServeMux()
 		openaiproxy.RegisterImages(imageMux, imageClient)
 		mux.Handle("POST /v1/images/generations",
 			openaiproxy.RequireInferenceCredential(
 				openaiproxy.LimitInFlight(maxInFlight, imageMux)))
+	} else {
+		mux.Handle("POST /v1/images/generations", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotImplemented)
+			_, _ = w.Write([]byte(`{"error":{"message":"sealed image generation is not available in direct-broker mode","type":"invalid_request_error"}}` + "\n"))
+		}))
 	}
 	// /healthz answers "is this process serving?" and nothing more. It is the
 	// container healthcheck, and compose gates dstack-ingress's STARTUP on it

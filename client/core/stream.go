@@ -41,7 +41,7 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 	// Pick the candidates to seal to, best first (a static resolver returns one
 	// fixed provider; the route resolver consults the router/broker — a network
 	// call bounded by ctx).
-	cands, err := c.resolver.Resolve(ctx, req)
+	cands, err := c.resolver.Resolve(ctx, c.serviceType, req)
 	if err != nil {
 		return resolveErr(err)
 	}

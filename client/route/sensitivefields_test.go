@@ -89,10 +89,11 @@ func TestImagePreviewDoesNotSendThePromptToTheRouter(t *testing.T) {
 		"response_format": json.RawMessage(`"b64_json"`),
 		"prompt":          json.RawMessage(`"my secret prompt"`),
 	}
-	// Deliberately ONLY WithServiceType — no WithSensitiveFields. That is the
-	// configuration a caller would naturally write, and the one that used to leak.
-	r := New(srv.URL, WithServiceType(ServiceTypeTextToImage))
-	_, _ = r.Resolve(context.Background(), req)
+	// No WithSensitiveFields: the withheld set follows the service type of the
+	// REQUEST, which is what a caller passes to Resolve. That is the natural
+	// configuration and the one that used to leak.
+	r := New(srv.URL)
+	_, _ = r.Resolve(context.Background(), ServiceTypeTextToImage, req)
 
 	if body == nil {
 		t.Fatal("preview was never called")
@@ -114,49 +115,63 @@ func TestImagePreviewDoesNotSendThePromptToTheRouter(t *testing.T) {
 	}
 }
 
-// An explicit WithSensitiveFields still wins, in either option order, so an
-// operator who seals extra fields can withhold those too.
-func TestExplicitSensitiveFieldsOverrideTheServiceTypeDefault(t *testing.T) {
-	custom := []string{"prompt", "user"}
+// WithSensitiveFields ADDS to whatever the request's service type withholds. It
+// used to replace, which read as "withhold exactly these" — and with one router
+// now serving every endpoint, a chat-shaped override would then have become the
+// withheld set for image requests too. Since the preview body is everything NOT
+// withheld, that does not fail; it uploads the prompt. Adding cannot.
+func TestExplicitSensitiveFieldsAddToTheServiceTypeDefault(t *testing.T) {
+	r := New("http://x", WithSensitiveFields([]string{"user", "metadata"}))
 
-	for _, name := range []string{"sensitive first", "service type first"} {
-		t.Run(name, func(t *testing.T) {
-			var r *Router
-			if name == "sensitive first" {
-				r = New("http://x", WithSensitiveFields(custom), WithServiceType(ServiceTypeTextToImage))
-			} else {
-				r = New("http://x", WithServiceType(ServiceTypeTextToImage), WithSensitiveFields(custom))
+	// The operator's extra fields are withheld for every service type...
+	for _, st := range []string{DefaultServiceType, ServiceTypeTextToImage} {
+		got := r.withheldForServiceType(st)
+		for _, f := range []string{"user", "metadata"} {
+			if _, ok := got[f]; !ok {
+				t.Errorf("%q must be withheld for service type %q", f, st)
 			}
-			if _, ok := r.sensitiveFields["user"]; !ok {
-				t.Error("an explicit sensitive-field set must survive New's service-type default")
-			}
-			if len(r.sensitiveFields) != len(custom) {
-				t.Errorf("sensitiveFields = %v, want exactly the explicit set", r.sensitiveFields)
-			}
-		})
+		}
+	}
+	// ...and the service type's own payload survives alongside them, which is
+	// exactly what replacing destroyed.
+	if _, ok := r.withheldForServiceType(ServiceTypeTextToImage)["prompt"]; !ok {
+		t.Error("an image request must still withhold its prompt")
+	}
+	if _, ok := r.withheldForServiceType(DefaultServiceType)["messages"]; !ok {
+		t.Error("a chat request must still withhold its messages")
 	}
 }
 
-// The default with no options at all stays the chat set — existing callers
-// (the gateway, the sidecar) must be unaffected.
+// A chat-shaped override — which is what -seal-fields is — must not be able to
+// strip the image payload out of the withheld set. This is the concrete leak the
+// additive semantics prevent, stated as its own case because it is the one that
+// motivated the change.
+func TestAChatOverrideCannotUnwithholdTheImagePrompt(t *testing.T) {
+	r := New("http://x", WithSensitiveFields(wire.DefaultSealedFieldsFor(wire.ProfileChat)))
+	if _, ok := r.withheldForServiceType(ServiceTypeTextToImage)["prompt"]; !ok {
+		t.Fatal("a chat-shaped override must not expose the image prompt to the preview")
+	}
+}
+
+// A router with no options withholds the chat payload for a chat request —
+// existing callers (the gateway, the sidecar) must be unaffected.
 func TestDefaultRouterKeepsTheChatSensitiveSet(t *testing.T) {
-	r := New("http://x")
+	got := New("http://x").withheldForServiceType(DefaultServiceType)
 	want := sliceToSet(wire.DefaultSealedFieldsFor(wire.ProfileChat))
-	if len(r.sensitiveFields) != len(want) {
-		t.Fatalf("sensitiveFields = %v, want the chat set %v", r.sensitiveFields, want)
+	if len(got) != len(want) {
+		t.Fatalf("withheld = %v, want the chat set %v", got, want)
 	}
 	for f := range want {
-		if _, ok := r.sensitiveFields[f]; !ok {
+		if _, ok := got[f]; !ok {
 			t.Errorf("chat sealed field %q must still be withheld by default", f)
 		}
 	}
 }
 
-// A nil or empty set is a no-op, matching the sibling options. Honouring it
-// would mean "withhold nothing" — the whole request, payload included, sent to
-// the router on every preview — which is strictly worse than the default it
-// would be replacing, and is what setting sensitiveFieldsSet unconditionally
-// used to produce.
+// A nil or empty set is a no-op. It was never able to mean "withhold nothing"
+// under the additive semantics, but the option still ignores it explicitly so a
+// caller that computes an empty list gets the profile default rather than a
+// silently unchanged router it might read as configured.
 func TestWithSensitiveFieldsIgnoresAnEmptySet(t *testing.T) {
 	for _, tt := range []struct {
 		name   string
@@ -166,13 +181,93 @@ func TestWithSensitiveFieldsIgnoresAnEmptySet(t *testing.T) {
 		{"empty", []string{}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			r := New("http://x", WithServiceType(ServiceTypeTextToImage), WithSensitiveFields(tt.fields))
-			if len(r.sensitiveFields) == 0 {
-				t.Fatal("an empty set must be ignored, not honoured as `withhold nothing`")
-			}
-			if _, ok := r.sensitiveFields["prompt"]; !ok {
-				t.Errorf("the service-type default must survive: %v", r.sensitiveFields)
+			got := New("http://x", WithSensitiveFields(tt.fields)).withheldForServiceType(ServiceTypeTextToImage)
+			if _, ok := got["prompt"]; !ok {
+				t.Errorf("the service-type default must survive: %v", got)
 			}
 		})
+	}
+}
+
+// The upstream path is derived from the request's service type, not fixed at
+// construction. Fixing it is how every sealed image request came to be POSTed to
+// /v1/chat/completions — where the router hands it to the chatbot handler, whose
+// pool does not contain the pinned image provider, so every real image request
+// would have failed.
+//
+// Nothing caught that: the core e2e pinned Provider.URL directly and bypassed
+// this package, and the gateway tests passed a nil image client. Neither ever
+// reached the line that builds the URL. This is that line.
+func TestUpstreamURLFollowsTheServiceType(t *testing.T) {
+	r := New("http://router.example")
+	for _, tc := range []struct {
+		serviceType string
+		want        string
+	}{
+		{DefaultServiceType, "http://router.example/v1/chat/completions"},
+		{serviceTypeAnthropicChat, "http://router.example/v1/chat/completions"},
+		{ServiceTypeTextToImage, "http://router.example/v1/images/generations"},
+	} {
+		t.Run(tc.serviceType, func(t *testing.T) {
+			got, err := r.upstreamURL(tc.serviceType)
+			if err != nil {
+				t.Fatalf("upstreamURL(%q): %v", tc.serviceType, err)
+			}
+			if got != tc.want {
+				t.Errorf("upstreamURL(%q) = %q, want %q", tc.serviceType, got, tc.want)
+			}
+		})
+	}
+}
+
+// An unknown service type has no upstream path, and there is no safe guess:
+// falling back to chat would preview the wrong pool AND send the request to the
+// chat endpoint AND withhold the chat payload fields from a body that does not
+// have them — uploading whatever it does have. Refuse before any of that.
+func TestUnknownServiceTypeHasNoUpstreamURL(t *testing.T) {
+	r := New("http://router.example")
+	for _, st := range []string{"speech-to-text", "image-editing", "video-generation", ""} {
+		if _, err := r.upstreamURL(st); err == nil {
+			t.Errorf("service type %q must have no upstream path", st)
+		}
+	}
+	// And Resolve refuses before it previews anything, so the router never even
+	// learns the request exists.
+	if _, err := r.Resolve(context.Background(), "speech-to-text", wire.Request{}); err == nil {
+		t.Error("Resolve must refuse an unknown service type")
+	}
+}
+
+// The end-to-end shape of the fix: a candidate materialized for an image request
+// carries the image endpoint as its upstream URL.
+func TestResolvedProviderURLMatchesTheRequestsServiceType(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case previewPath:
+			_ = json.NewEncoder(w).Encode(map[string]any{"providers": []map[string]any{{
+				"address":      "0x1111111111111111111111111111111111111111",
+				"endpoint":     "http://provider.example",
+				"canonical_id": "z-image",
+			}}})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	cands, err := New(srv.URL).Resolve(context.Background(), ServiceTypeTextToImage, wire.Request{
+		"model":  json.RawMessage(`"z-image"`),
+		"prompt": json.RawMessage(`"secret"`),
+	})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	rc, ok := cands.(*routeCandidates)
+	if !ok {
+		t.Fatalf("candidates type = %T", cands)
+	}
+	want := srv.URL + imagesPath
+	if rc.upstreamURL != want {
+		t.Errorf("candidate upstream URL = %q, want %q", rc.upstreamURL, want)
 	}
 }

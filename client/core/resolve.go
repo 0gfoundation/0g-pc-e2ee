@@ -26,7 +26,12 @@ import (
 // returned as a staged *Error so the proxy maps it to a sensible HTTP status; a
 // plain error is treated as an upstream (502) failure.
 type Resolver interface {
-	Resolve(ctx context.Context, req wire.Request) (Candidates, error)
+	// Resolve picks the candidates for one request. serviceType describes the
+	// request ("chatbot", "text-to-image"), not the resolver: a resolver that
+	// fronts the 0G Router talks to one host serving every endpoint, so which
+	// providers to rank, which fields to withhold from the control plane, and
+	// which upstream path to use are all per request.
+	Resolve(ctx context.Context, serviceType string, req wire.Request) (Candidates, error)
 }
 
 // Candidates is an ordered list of provider candidates to seal to, best first.
@@ -153,7 +158,7 @@ func (w *candidateWalk) exhausted() bool { return w.spent >= w.limit() }
 // provider caller; the shipped server forms route instead (client/route).
 type staticResolver struct{ provider Provider }
 
-func (s staticResolver) Resolve(context.Context, wire.Request) (Candidates, error) {
+func (s staticResolver) Resolve(context.Context, string, wire.Request) (Candidates, error) {
 	return staticCandidates{s.provider}, nil
 }
 

@@ -43,7 +43,31 @@ type providerListResponse struct {
 // verifying the same provider once per model. First-seen order and casing are
 // preserved so downstream on-chain lookups get the address as the router sent it.
 func (r *Router) listProviderAddrs(ctx context.Context) ([]string, error) {
-	u := r.providersURL + "?service_type=" + url.QueryEscape(r.serviceType)
+	// Enumerate every service type this router warms, de-duplicating across them:
+	// the catalog is per-(provider, model) and a quote is per-ENCLAVE, so an
+	// address serving both chat and image models must be verified once, not once
+	// per service type.
+	var addrs []string
+	seen := make(map[string]struct{})
+	for _, st := range r.warmServiceTypes {
+		got, err := r.listProviderAddrsFor(ctx, st)
+		if err != nil {
+			return nil, err
+		}
+		for _, a := range got {
+			k := strings.ToLower(a)
+			if _, dup := seen[k]; dup {
+				continue
+			}
+			seen[k] = struct{}{}
+			addrs = append(addrs, a)
+		}
+	}
+	return addrs, nil
+}
+
+func (r *Router) listProviderAddrsFor(ctx context.Context, serviceType string) ([]string, error) {
+	u := r.providersURL + "?service_type=" + url.QueryEscape(serviceType)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err

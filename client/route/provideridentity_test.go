@@ -162,7 +162,7 @@ func pidAllowAll() attest.BootChainPolicy {
 // request runs before sealing.
 func pidResolve(t *testing.T, r *Router) {
 	t.Helper()
-	cands, err := r.Resolve(context.Background(), wire.Request{})
+	cands, err := r.Resolve(context.Background(), DefaultServiceType, wire.Request{})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -378,7 +378,7 @@ func TestProviderIdentity_RecordedEvenWhenTheVerdictRejects(t *testing.T) {
 		WithQuoteVerification(v, discardLogger()),
 		WithOnChainVerification(&stubRegistry{signer: ocOther, ack: true}, true, discardLogger()))
 
-	cands, err := r.Resolve(context.Background(), wire.Request{})
+	cands, err := r.Resolve(context.Background(), DefaultServiceType, wire.Request{})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}

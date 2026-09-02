@@ -576,3 +576,58 @@ func splitLogLines(s string) []string {
 	}
 	return out
 }
+
+// TestGatewayRefusesSealedImagesWithoutAnImageClient: in direct-broker mode there
+// is no image client, and the sealed image route must answer 501 rather than be
+// left unmounted.
+//
+// Unmounted is NOT inert here, which is the whole point of the test. The catch-all
+// is a reverse proxy to the router and routerTarget is parsed in every mode, so an
+// unmounted /v1/images/generations does not 404 — it forwards the caller's PROMPT
+// to the router in cleartext, which is the one thing this gateway exists to
+// prevent. So the assertion is in two halves: the client sees a refusal, and the
+// router never saw the request at all.
+func TestGatewayRefusesSealedImagesWithoutAnImageClient(t *testing.T) {
+	var routerSaw []string
+	router := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		routerSaw = append(routerSaw, r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	}))
+	defer router.Close()
+
+	gw := httptest.NewServer(newHandler(routeClient(), nil, mustURL(t, router.URL), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
+	defer gw.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, gw.URL+"/v1/images/generations",
+		strings.NewReader(`{"model":"z-image","prompt":"my secret prompt"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer sk-user-key")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post /v1/images/generations: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusNotImplemented {
+		t.Errorf("status: got %d, want 501 (body %s)", resp.StatusCode, body)
+	}
+	if len(routerSaw) != 0 {
+		t.Fatalf("the prompt was forwarded to the router in cleartext: paths %v", routerSaw)
+	}
+	// The refusal uses the same JSON error envelope as every other gateway error,
+	// so a thin client parses it without a special case.
+	var env struct {
+		Error struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("refusal body is not the standard error envelope: %v (%s)", err, body)
+	}
+	if env.Error.Message == "" {
+		t.Errorf("refusal carries no message: %s", body)
+	}
+}

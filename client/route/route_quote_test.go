@@ -95,7 +95,7 @@ func TestProvider_QuoteVerification_EnforceSuccess(t *testing.T) {
 		attest.WithQuoteParser(qvParser(m, qvReportData(t))))
 	r := New(srv.URL, WithQuoteVerification(v, slog.New(slog.NewTextHandler(bytes.NewBuffer(nil), nil))))
 
-	cands, err := r.Resolve(context.Background(), wire.Request{})
+	cands, err := r.Resolve(context.Background(), DefaultServiceType, wire.Request{})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -112,8 +112,9 @@ func TestProvider_QuoteVerification_EnforceSuccess(t *testing.T) {
 	if prov.Address != testProviderAddr || prov.Model != "canon-1" {
 		t.Errorf("Address/Model = %s/%s", prov.Address, prov.Model)
 	}
-	if prov.URL != r.completionsURL {
-		t.Errorf("URL = %s, want completions %s", prov.URL, r.completionsURL)
+	want, _ := r.upstreamURL(DefaultServiceType)
+	if prov.URL != want {
+		t.Errorf("URL = %s, want completions %s", prov.URL, want)
 	}
 }
 
@@ -125,7 +126,7 @@ func TestProvider_QuoteVerification_EnforceRejectsUntrusted(t *testing.T) {
 		attest.WithQuoteParser(qvParser(served, qvReportData(t)))) // ModeEnforce (default)
 	r := New(srv.URL, WithQuoteVerification(v, nil))
 
-	cands, err := r.Resolve(context.Background(), wire.Request{})
+	cands, err := r.Resolve(context.Background(), DefaultServiceType, wire.Request{})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -144,7 +145,7 @@ func TestProvider_QuoteVerification_WarnAcceptsAndLogs(t *testing.T) {
 		attest.WithMeasurementMode(attest.ModeWarn))
 	r := New(srv.URL, WithQuoteVerification(v, logger))
 
-	cands, _ := r.Resolve(context.Background(), wire.Request{})
+	cands, _ := r.Resolve(context.Background(), DefaultServiceType, wire.Request{})
 	prov, err := cands.Provider(context.Background(), 0)
 	if err != nil {
 		t.Fatalf("warn mode should accept: %v", err)
@@ -164,7 +165,7 @@ func TestProvider_QuoteVerification_QuoteEndpointError(t *testing.T) {
 		attest.WithQuoteParser(qvParser(m, qvReportData(t))))
 	r := New(srv.URL, WithQuoteVerification(v, nil))
 
-	cands, _ := r.Resolve(context.Background(), wire.Request{})
+	cands, _ := r.Resolve(context.Background(), DefaultServiceType, wire.Request{})
 	if _, err := cands.Provider(context.Background(), 0); err == nil {
 		t.Fatal("expected error when the quote endpoint fails, got nil")
 	}

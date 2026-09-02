@@ -411,13 +411,12 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 	// the payload. Leaving the option off keeps the withheld set tied to the
 	// service type by construction.
 	var routeOpts []route.Option
-	// chatRouteOpts carries the operator's -seal-fields override, which is a CHAT
-	// set by definition (the flag's default and its validation are chat's). It is
-	// deliberately NOT applied to the image router: passing it there would pin the
-	// withheld set to the chat fields and override route.New's derivation from the
-	// service type, and since the preview body is everything NOT withheld, a stale
-	// set does not fail — it uploads the prompt. That is the leak the comment
-	// below has warned about since before an image profile existed.
+	// chatRouteOpts carries the operator's -seal-fields override. It is a CHAT set
+	// by definition (the flag's default and its validation are chat's), and
+	// route.WithSensitiveFields now ADDS to whatever the request's service type
+	// already withholds rather than replacing it — so applying it to the single
+	// shared router withholds the chat payload fields from image previews too,
+	// which is harmless over-stripping, never the under-stripping that leaks.
 	var chatRouteOpts []route.Option
 	if *f.sealFieldsCSV != f.sealFieldsDefault {
 		chatRouteOpts = append(chatRouteOpts, route.WithSensitiveFields(sealFields))
@@ -482,19 +481,28 @@ func (f *Flags) Build(label string, logger *slog.Logger) *Built {
 			core.WithSealFields(sealFields), core.WithServiceType(core.ServiceTypeChatbot))...)}
 	}
 
+	// ONE router. It is one 0G Router, at one URL, serving every endpoint — so
+	// one connection pool, one pubkey cache, one quote cache, one verifier, one
+	// warmer. What differs per endpoint (which providers to rank, which fields to
+	// withhold from the preview, which upstream path to POST to) travels with
+	// each Resolve instead, because it describes the request rather than this
+	// connection.
+	//
+	// The warmer is told both service types so the image providers' quotes are
+	// verified ahead of the first image request rather than on it; it
+	// de-duplicates by address, so a provider serving both is verified once.
 	router := route.New(*f.RouterURL, append(append([]route.Option{}, routeOpts...),
-		append(chatRouteOpts, route.WithServiceType(core.ServiceTypeChatbot))...)...)
+		append(chatRouteOpts, route.WithWarmServiceTypes(core.ServiceTypeChatbot, core.ServiceTypeTextToImage))...)...)
+
+	// Two clients, one router. A client is a SEALING CONTEXT bound to one request
+	// shape — its profile fixes which field must be sealed and which the response
+	// must seal — which is a real per-endpoint property, unlike the router's
+	// caches. They are cheap: no transport, no cache, no verifier of their own.
 	client := core.NewWithResolver(router, append(append([]core.Option{}, coreOpts...),
 		core.WithSealFields(sealFields), core.WithServiceType(core.ServiceTypeChatbot))...)
-
-	// The image client shares every attestation and grounding option — same
-	// verifier, same on-chain registry — and differs only in service type, which
-	// selects both the providers its router previews and the profile it seals
-	// under. Its sealed set comes from the profile: -seal-fields is chat's, and
-	// core.NewWithResolver derives the image default when it is not overridden.
-	imageRouter := route.New(*f.RouterURL, append(append([]route.Option{}, routeOpts...),
-		route.WithServiceType(core.ServiceTypeTextToImage))...)
-	imageClient := core.NewWithResolver(imageRouter,
+	// -seal-fields is chat's set by definition, so the image client takes its
+	// profile default instead of inheriting it.
+	imageClient := core.NewWithResolver(router,
 		append(append([]core.Option{}, coreOpts...), core.WithServiceType(core.ServiceTypeTextToImage))...)
 
 	b := &Built{Client: client, ImageClient: imageClient, router: router, verifiesQuotes: *f.attestOn}

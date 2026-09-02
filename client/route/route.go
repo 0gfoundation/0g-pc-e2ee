@@ -78,6 +78,10 @@ const (
 	// the router is the centralized auth/billing point; it authenticates, then
 	// forwards to the pinned provider (SPEC §4.4).
 	completionsPath = "/v1/chat/completions"
+	// imagesPath is where a sealed image request goes. Its existence next to
+	// completionsPath is the point: the upstream path is per service type, and
+	// deriving it is what upstreamURL does.
+	imagesPath = "/v1/images/generations"
 	// DefaultServiceType is the service type sent to the preview API for a chat
 	// completion. It is the router's internal service-type vocabulary — the same
 	// strings GET /v1/service-types returns and GET /v1/providers?service_type=
@@ -85,9 +89,9 @@ const (
 	// always previews "chatbot".
 	DefaultServiceType = "chatbot"
 	// ServiceTypeTextToImage is the preview service type for
-	// /v1/images/generations. Named here so a caller setting WithServiceType gets
-	// the string the router expects and, with it, the right sensitive-field set
-	// (see sensitiveFieldsForServiceType).
+	// /v1/images/generations. Named here so a caller passing a service type to
+	// Resolve (or WithWarmServiceTypes) uses the string the router expects and,
+	// with it, gets the right sensitive-field set and upstream path.
 	ServiceTypeTextToImage = "text-to-image"
 	// serviceTypeAnthropicChat is the router's service type for /v1/messages. It
 	// has no sealed path yet (the preview API rejects it), but it maps to the chat
@@ -179,16 +183,23 @@ const (
 // Router resolves the provider for each request via the route-preview + pubkey
 // APIs. It is safe for concurrent use.
 type Router struct {
-	previewURL      string
-	completionsURL  string
-	providersURL    string
-	serviceType     string
-	sensitiveFields map[string]struct{}
-	// sensitiveFieldsSet records that WithSensitiveFields was passed, so New does
-	// not overwrite an explicit set with the service type's default.
-	sensitiveFieldsSet bool
-	http               *http.Client
-	cache              *pubkeyCache
+	previewURL   string
+	base         string
+	providersURL string
+	// warmServiceTypes is the only service-type state left on the Router, and it
+	// is genuinely the router's: which slice of the fleet the background warmer
+	// keeps hot. The service type of a REQUEST arrives with Resolve instead — it
+	// describes the request, not this connection. One 0G Router serves every
+	// endpoint at one URL, so a per-endpoint Router would have duplicated this
+	// object's caches, transport and verifier against one host while still
+	// getting the upstream path wrong, which is exactly what it did.
+	warmServiceTypes []string
+	// extraSensitiveFields are fields the operator adds to the withheld set, on
+	// top of whatever the request's service type already withholds. See
+	// WithSensitiveFields for why it adds rather than replaces.
+	extraSensitiveFields map[string]struct{}
+	http                 *http.Client
+	cache                *pubkeyCache
 	// verifier, when non-nil, switches candidate materialization from trusting
 	// the router-supplied pubkey endpoint to fetching and DCAP-verifying the
 	// provider's attestation quote, sourcing enc_pub/signer from the verified
@@ -246,14 +257,25 @@ type Router struct {
 // Option customizes a Router.
 type Option func(*Router)
 
-// WithServiceType sets the service type sent as the preview request's
-// "service_type" (default DefaultServiceType, "chatbot"). It is bound to the
-// endpoint the caller serves — a chat proxy previews "chatbot" — so callers set
-// it once, not per request.
-func WithServiceType(t string) Option {
+// WithWarmServiceTypes sets which service types the background quote warmer
+// enumerates providers for (default DefaultServiceType alone). Unlike the
+// service type of a REQUEST — which travels with Resolve, because it describes
+// the request, not this router — this is a property of the router: it says which
+// slice of the fleet to keep hot.
+//
+// A caller serving both endpoints passes both, so the image providers' quotes
+// are verified ahead of the first image request rather than on it. Empty values
+// are ignored; passing none leaves the default.
+func WithWarmServiceTypes(types ...string) Option {
 	return func(r *Router) {
-		if t != "" {
-			r.serviceType = t
+		var out []string
+		for _, t := range types {
+			if t != "" {
+				out = append(out, t)
+			}
+		}
+		if len(out) > 0 {
+			r.warmServiceTypes = out
 		}
 	}
 }
@@ -268,44 +290,56 @@ func WithHTTPClient(h *http.Client) Option {
 	}
 }
 
-// WithSensitiveFields overrides the request fields stripped before the preview
+// WithSensitiveFields adds request fields to those stripped before the preview
 // call, so they never reach the (untrusted) router in cleartext.
 //
-// It is rarely needed: the default is derived from the service type (see
-// sensitiveFieldsForServiceType), so setting WithServiceType alone already
-// withholds the right payload. Use this only to withhold MORE than the profile's
-// sealed set — e.g. an operator who also seals "user" or "metadata". Passing a
-// set that omits a payload field re-opens the leak this default exists to close,
-// so keep it a superset of the client's own seal set.
-// An empty or nil set is a NO-OP, matching WithServiceType and WithHTTPClient,
-// which also ignore their zero values. Honouring it would mean "withhold
-// nothing" — every field of every request, payload included, sent to the router
-// — which is not a configuration anyone wants and is worse than the default it
-// would be replacing. A caller that means "withhold nothing" has no business
-// using this package.
+// ADDITIVE, not a replacement. Its documented purpose has always been "withhold
+// MORE than the profile's sealed set" — an operator who also seals "user" or
+// "metadata" — but it used to REPLACE the derived set, which made the two
+// readings differ exactly where it mattered. With the request's service type now
+// arriving per call, replacing would be worse than untidy: one router serves
+// both endpoints, so a chat-shaped override would become the withheld set for
+// image requests too, and since the preview body is everything NOT withheld, a
+// wrong set does not fail — it uploads the prompt. Adding cannot do that.
+//
+// An empty or nil set is a no-op.
 func WithSensitiveFields(fields []string) Option {
 	return func(r *Router) {
 		if len(fields) == 0 {
 			return
 		}
-		set := make(map[string]struct{}, len(fields))
-		for _, f := range fields {
-			set[f] = struct{}{}
+		if r.extraSensitiveFields == nil {
+			r.extraSensitiveFields = make(map[string]struct{}, len(fields))
 		}
-		r.sensitiveFields = set
-		r.sensitiveFieldsSet = true
+		for _, f := range fields {
+			r.extraSensitiveFields[f] = struct{}{}
+		}
 	}
+}
+
+// withheldForServiceType is the set of fields kept out of the preview body for
+// one request: the service type's own payload fields plus any the operator
+// added. Computed per call because the service type is per call.
+func (r *Router) withheldForServiceType(serviceType string) map[string]struct{} {
+	base := sensitiveFieldsForServiceType(serviceType)
+	out := make(map[string]struct{}, len(base)+len(r.extraSensitiveFields))
+	for _, f := range base {
+		out[f] = struct{}{}
+	}
+	for f := range r.extraSensitiveFields {
+		out[f] = struct{}{}
+	}
+	return out
 }
 
 // sensitiveFieldsForServiceType returns the fields to withhold from the preview
 // for a service type, derived from the wire profile that service type belongs to
-// — so a caller who sets only WithServiceType cannot end up previewing an image
-// request with its `prompt` in the clear.
+// — so an image request cannot be previewed with its `prompt` in the clear.
 //
-// The two used to be independent options that had to be kept in sync by hand,
-// with the chat set hardcoded as the default. That is a leak waiting to happen:
-// the preview body is everything NOT in this set, so a stale set does not fail,
-// it silently ships the payload to the router.
+// The set used to be an independent option kept in sync with the service type by
+// hand, with the chat set hardcoded as the default. That is a leak waiting to
+// happen: the preview body is everything NOT in this set, so a stale set does not
+// fail, it silently ships the payload to the router.
 //
 // An UNRECOGNIZED service type gets the union of every profile's sealed set.
 // Over-stripping is the safe direction — it can only cost routing fidelity (the
@@ -425,9 +459,9 @@ func New(routerURL string, opts ...Option) *Router {
 	tr.ResponseHeaderTimeout = controlPlaneHeaderTimeout
 	r := &Router{
 		previewURL:       base + previewPath,
-		completionsURL:   base + completionsPath,
+		base:             base,
 		providersURL:     base + providersPath,
-		serviceType:      DefaultServiceType,
+		warmServiceTypes: []string{DefaultServiceType},
 		http:             &http.Client{Transport: tr},
 		previewAttemptTO: previewAttemptTimeout,
 		previewBudgetTO:  previewRetryBudget,
@@ -438,12 +472,10 @@ func New(routerURL string, opts ...Option) *Router {
 	for _, o := range opts {
 		o(r)
 	}
-	// Resolved AFTER the options, not as a struct default, so it tracks whatever
-	// service type they settled on regardless of the order they were passed in.
-	// An explicit WithSensitiveFields still wins.
-	if !r.sensitiveFieldsSet {
-		r.sensitiveFields = sliceToSet(sensitiveFieldsForServiceType(r.serviceType))
-	}
+	// No post-loop derivation of the withheld set any more: it depends on the
+	// request's service type, which arrives at Resolve. Option order therefore
+	// cannot decide it, which is the failure the old sensitiveFieldsSet flag
+	// existed to prevent.
 	return r
 }
 
@@ -451,12 +483,43 @@ func New(routerURL string, opts ...Option) *Router {
 // the ranked candidate list as core.Candidates. Materializing a candidate (its
 // pubkey fetch) is deferred to Candidates.Provider, so the happy path fetches
 // only the head's key; core walks the rest only on fallback.
-func (r *Router) Resolve(ctx context.Context, req wire.Request) (core.Candidates, error) {
-	providers, err := r.preview(ctx, req)
+// Resolve previews the fleet for one request. serviceType describes the REQUEST
+// — "chatbot", "text-to-image" — and so travels with it rather than being fixed
+// on the Router: one 0G Router serves every endpoint at one URL, and everything
+// that differs between endpoints (which providers to rank, which fields to
+// withhold from the preview body, which upstream path to POST to) is a property
+// of the request shape.
+//
+// An unknown service type is refused rather than defaulted. There is no safe
+// guess: falling back to chat would preview the wrong pool AND send the request
+// to the chat endpoint, and withhold the chat payload fields from a body that
+// does not have them — uploading whatever it does have.
+func (r *Router) Resolve(ctx context.Context, serviceType string, req wire.Request) (core.Candidates, error) {
+	upstream, err := r.upstreamURL(serviceType)
 	if err != nil {
 		return nil, err
 	}
-	return &routeCandidates{router: r, providers: providers}, nil
+	providers, err := r.preview(ctx, serviceType, req)
+	if err != nil {
+		return nil, err
+	}
+	return &routeCandidates{router: r, providers: providers, upstreamURL: upstream}, nil
+}
+
+// upstreamURL is the router endpoint a sealed request of this service type is
+// POSTed to. Derived from the service type rather than fixed at construction:
+// fixing it is how every sealed image request came to be POSTed to
+// /v1/chat/completions, where the router hands it to the chatbot handler and the
+// pinned image provider is not in the pool.
+func (r *Router) upstreamURL(serviceType string) (string, error) {
+	switch serviceType {
+	case DefaultServiceType, serviceTypeAnthropicChat:
+		return r.base + completionsPath, nil
+	case ServiceTypeTextToImage:
+		return r.base + imagesPath, nil
+	default:
+		return "", fmt.Errorf("no sealed upstream path for service type %q", serviceType)
+	}
 }
 
 // routeCandidates is the ranked preview list as a core.Candidates. It holds the
@@ -465,6 +528,10 @@ func (r *Router) Resolve(ctx context.Context, req wire.Request) (core.Candidates
 type routeCandidates struct {
 	router    *Router
 	providers []previewProvider
+	// upstreamURL is resolved once per Resolve from the request's service type,
+	// so every candidate materialized from this list agrees on where the sealed
+	// request goes.
+	upstreamURL string
 }
 
 func (c *routeCandidates) Len() int { return len(c.providers) }
@@ -630,7 +697,7 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 	// completions endpoint, NOT the provider's: the sealed request goes through the
 	// router for auth/billing.
 	return core.Provider{
-		URL:        c.router.completionsURL,
+		URL:        c.upstreamURL,
 		EncPubKey:  encPub,
 		SignerAddr: signer,
 		Address:    prov.Address,
@@ -1272,17 +1339,18 @@ type previewResponse struct {
 // A transient failure is retried (see previewAttempts and previewRetryBudget for
 // the policy and its sizing); a definitive one is returned on the first attempt,
 // so a caller's 401 or 404 is never delayed by a retry that cannot change it.
-func (r *Router) preview(ctx context.Context, req wire.Request) ([]previewProvider, error) {
+func (r *Router) preview(ctx context.Context, serviceType string, req wire.Request) ([]previewProvider, error) {
+	withheld := r.withheldForServiceType(serviceType)
 	payload := make(map[string]json.RawMessage, len(req)+1)
 	for k, v := range req {
-		if _, sensitive := r.sensitiveFields[k]; sensitive {
+		if _, sensitive := withheld[k]; sensitive {
 			continue
 		}
 		payload[k] = v
 	}
-	// Force the service type the gateway is configured for; a chat body carries no
-	// service_type of its own, and the router needs it to route.
-	serviceTypeJSON, _ := json.Marshal(r.serviceType)
+	// Force the service type of THIS request; a chat body carries no service_type
+	// of its own, and the router needs it to route.
+	serviceTypeJSON, _ := json.Marshal(serviceType)
 	payload["service_type"] = serviceTypeJSON
 
 	// One call-level observation on EVERY exit path, recorded by a defer rather than

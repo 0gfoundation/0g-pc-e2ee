@@ -57,7 +57,7 @@ func countingQVServer(t *testing.T, hits *int32, entered chan<- struct{}, block 
 
 func qvResolveHead(t *testing.T, r *Router) error {
 	t.Helper()
-	cands, err := r.Resolve(context.Background(), wire.Request{})
+	cands, err := r.Resolve(context.Background(), DefaultServiceType, wire.Request{})
 	if err != nil {
 		return err
 	}

@@ -196,9 +196,16 @@ type Client struct {
 	// image-shaped response or vice versa. Set from the service type; see
 	// WithServiceType.
 	profile wire.Profile
+	// serviceType is the request family this client serves, passed to the
+	// resolver on every request. Held here rather than on the resolver because
+	// one resolver (one 0G Router) serves every endpoint; the client is the thing
+	// that is bound to one request shape.
+	serviceType string
 	// sealFieldsSet records that WithSealFields was passed, so NewWithResolver
 	// can derive the default set from the profile without overriding an explicit
-	// choice — the same reason route.Router tracks sensitiveFieldsSet.
+	// choice. Needed because the derivation must happen AFTER the options loop:
+	// the profile is itself set by an option, so option order would otherwise
+	// decide the sealed set.
 	sealFieldsSet bool
 	http          *http.Client
 	debug         *slog.Logger // nil = off; see WithDebugLogger
@@ -474,7 +481,10 @@ func WithSealFields(fields []string) Option {
 // and open fail closed with "unknown profile" rather than silently applying the
 // chat rules to a request shape nobody analysed.
 func WithServiceType(serviceType string) Option {
-	return func(c *Client) { c.profile = profileForServiceType(serviceType) }
+	return func(c *Client) {
+		c.serviceType = serviceType
+		c.profile = profileForServiceType(serviceType)
+	}
 }
 
 // profileForServiceType maps the endpoint a client serves to its wire profile.
@@ -496,8 +506,9 @@ func profileForServiceType(serviceType string) wire.Profile {
 }
 
 // Service types a client can be bound to with WithServiceType. They match the
-// router's own service_type values, so one string flows from the operator's
-// flag through route.WithServiceType and core.WithServiceType alike.
+// router's own service_type values, so the same string this client seals under
+// is the one the resolver receives per request and the one the router's catalog
+// and preview APIs speak.
 const (
 	ServiceTypeChatbot     = "chatbot"
 	ServiceTypeTextToImage = "text-to-image"
@@ -605,6 +616,7 @@ func NewWithResolver(r Resolver, opts ...Option) *Client {
 	c := &Client{
 		resolver:      r,
 		profile:       wire.ProfileChat,
+		serviceType:   ServiceTypeChatbot,
 		unboundFields: wire.DefaultUnboundFields(),
 		http:          &http.Client{Transport: tr},
 
@@ -640,7 +652,7 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 	// fallback chain — a control-plane call bounded by the resolver's own HTTP
 	// client (route.New sets ResponseHeaderTimeout), not by a request deadline
 	// here; the per-attempt data-plane deadline is applied inside completeOnce.
-	cands, err := c.resolver.Resolve(ctx, req)
+	cands, err := c.resolver.Resolve(ctx, c.serviceType, req)
 	if err != nil {
 		return nil, resolveErr(err)
 	}
