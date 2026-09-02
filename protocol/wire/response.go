@@ -325,6 +325,13 @@ func validateResponseSealedFieldsForFrame(p Profile, frame Response, fields []st
 // removed what it is about to seal, so the "unless it is sealed" clause is what
 // makes the seal-time reading ("you are shipping content you did not seal") and
 // the open-time one ("content arrived in the clear") the same code.
+//
+// That clause is not a way through, either. A hostile frame that declares `delta`
+// sealed AND carries a cleartext `delta` is skipped here, but OpenFrame's
+// collision check refuses it after decrypting ("sealed field %q collides with a
+// cleartext field") — profile-independently, and for every field, not just these.
+// So the two checks compose: this one catches content in a frame that does not
+// claim to seal it, that one catches content in a frame that does.
 func validateNoCleartextContent(p Profile, kind string, rule responseFrameRule, frame Response, fields []string) error {
 	sealed := toSet(fields)
 	for _, f := range rule.contentFields() {

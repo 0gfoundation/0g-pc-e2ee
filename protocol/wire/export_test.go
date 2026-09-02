@@ -41,3 +41,12 @@ func SealResponseNonConforming(clientEphPub crypto.PublicKey, resp Response, sea
 func NewResponseSealerNonConforming(clientEphPub crypto.PublicKey, unboundFields ...string) (*ResponseSealer, error) {
 	return newNonConformingResponseSealer(clientEphPub, unboundFields...)
 }
+
+// ValidateResponseSealedFieldsForTest exposes the PROFILE-WIDE response
+// validator, which no production path calls directly any more (SealFrame and
+// OpenFrame go through the frame-aware one). A test still needs to reach it, to
+// pin that it refuses a frame-typed profile outright instead of resolving
+// spec.responseRequired to "" and rejecting every frame with a nonsense message.
+func ValidateResponseSealedFieldsForTest(p Profile, fields []string) error {
+	return validateResponseSealedFieldsFor(p, fields)
+}

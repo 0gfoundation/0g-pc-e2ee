@@ -469,6 +469,55 @@ func TestAnthropicProfileDefaults(t *testing.T) {
 	}
 }
 
+// A hostile frame that declares the content field sealed AND ships it in
+// cleartext gets past the shape rules (they skip a field the frame claims to
+// seal) and is refused by OpenFrame's own collision check instead. Asserted so
+// the "unless it is sealed" clause in validateNoCleartextContent stays provably
+// not a way through.
+func TestAnthropicRefusesAContentFieldThatIsBothSealedAndCleartext(t *testing.T) {
+	_, _, ephPriv, ephPub := anthropicKeys(t)
+
+	sealer, err := wire.NewResponseSealerFor(wire.ProfileAnthropic, ephPub)
+	if err != nil {
+		t.Fatalf("sealer: %v", err)
+	}
+	frame, err := sealer.SealFrame(wire.Response{
+		"type":  json.RawMessage(`"content_block_delta"`),
+		"delta": json.RawMessage(`{"type":"text_delta","text":"decoy"}`),
+	}, nil, true)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	// Graft the real content back into the cleartext half, alongside the sealed
+	// decoy — what a non-conforming enclave would emit to leak it.
+	frame["delta"] = json.RawMessage(`{"type":"text_delta","text":"the secret answer"}`)
+
+	opener, err := wire.NewResponseOpenerFor(wire.ProfileAnthropic, ephPriv, frame)
+	if err != nil {
+		t.Fatalf("opener: %v", err)
+	}
+	if _, err := opener.OpenFrame(frame); err == nil {
+		t.Fatal("a frame carrying its content in both halves must be refused")
+	}
+}
+
+// The profile-wide validator has no answer for a frame-typed profile and must
+// say so, rather than resolving to spec.responseRequired — which is "" for such a
+// profile, and would reject every frame for not sealing a field named "".
+func TestFrameTypedProfileRefusesTheProfileWideValidator(t *testing.T) {
+	err := wire.ValidateResponseSealedFieldsForTest(wire.ProfileAnthropic, []string{"delta"})
+	if err == nil {
+		t.Fatal("the profile-wide response validator must refuse a frame-typed profile")
+	}
+	if !strings.Contains(err.Error(), "typed") {
+		t.Errorf("the error should say the frames are typed, got %v", err)
+	}
+	// The single-shape profiles still answer it.
+	if err := wire.ValidateResponseSealedFieldsForTest(wire.ProfileChat, []string{"choices"}); err != nil {
+		t.Errorf("chat must still validate profile-wide: %v", err)
+	}
+}
+
 // ResponseSealedFieldsForFrame is the exported resolver, so an enclave streaming
 // this profile names the taxonomy in one place rather than restating it.
 func TestResponseSealedFieldsForFrame(t *testing.T) {
