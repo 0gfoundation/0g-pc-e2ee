@@ -262,6 +262,9 @@ func TestValidateUnboundFieldsForMatchesWhatSealEnforces(t *testing.T) {
 		name    string
 		profile wire.Profile
 		unbound []string
+		// sealed overrides the profile default, for a fixture that does not carry
+		// every field that default names (the Anthropic sample has no "tools").
+		sealed  []string
 		wantErr bool
 	}{
 		{
@@ -288,6 +291,23 @@ func TestValidateUnboundFieldsForMatchesWhatSealEnforces(t *testing.T) {
 			unbound: []string{"model", "user"},
 		},
 		{
+			// The Anthropic profile pins no cleartext field, so response_format is
+			// ordinary there. Its row is here so the table covers every profile that
+			// exists: the check follows the PROFILE, and a new profile that pins
+			// something must not quietly inherit another's answer.
+			name:    "anthropic pins nothing, so response_format is ordinary there",
+			profile: wire.ProfileAnthropic,
+			unbound: []string{"model", "response_format"},
+			sealed:  []string{"messages", "system"},
+		},
+		{
+			name:    "anthropic still refuses unbinding its own sealed system prompt",
+			profile: wire.ProfileAnthropic,
+			unbound: []string{"system"},
+			sealed:  []string{"messages", "system"},
+			wantErr: true,
+		},
+		{
 			name:    "an empty set binds everything",
 			profile: wire.ProfileImage,
 		},
@@ -299,7 +319,10 @@ func TestValidateUnboundFieldsForMatchesWhatSealEnforces(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			sealed := wire.DefaultSealedFieldsFor(tc.profile)
+			sealed := tc.sealed
+			if sealed == nil {
+				sealed = wire.DefaultSealedFieldsFor(tc.profile)
+			}
 			gotErr := wire.ValidateUnboundFieldsFor(tc.profile, tc.unbound, sealed) != nil
 			if gotErr != tc.wantErr {
 				t.Fatalf("ValidateUnboundFieldsFor error = %v, want %v", gotErr, tc.wantErr)
@@ -310,8 +333,11 @@ func TestValidateUnboundFieldsForMatchesWhatSealEnforces(t *testing.T) {
 			// function exists to prevent, and one that is stricter refuses a
 			// configuration that would have worked.
 			body := sampleImageReq
-			if tc.profile == wire.ProfileChat {
+			switch tc.profile {
+			case wire.ProfileChat:
 				body = sampleReq
+			case wire.ProfileAnthropic:
+				body = sampleAnthropicReq
 			}
 			_, sealErr := wire.SealRequestFor(tc.profile, pub, mustReq(t, body),
 				sealed, testProvider, ephPub, tc.unbound...)

@@ -29,10 +29,13 @@ func TestSensitiveFieldsFollowTheServiceType(t *testing.T) {
 			mustPassThrough: []string{"model"},
 		},
 		{
-			name:            "anthropic chat maps to the chat profile",
+			// /v1/messages puts the system prompt in a TOP-LEVEL "system" field, so
+			// the chat set does not cover it and previewing under the chat set used to
+			// upload it to the router in the clear.
+			name:            "anthropic chat withholds the top-level system prompt",
 			serviceType:     serviceTypeAnthropicChat,
-			mustWithhold:    []string{"messages"},
-			mustPassThrough: []string{"model"},
+			mustWithhold:    []string{"messages", "tools", "system"},
+			mustPassThrough: []string{"model", "max_tokens"},
 		},
 		{
 			name:            "image withholds the prompt",
@@ -42,9 +45,9 @@ func TestSensitiveFieldsFollowTheServiceType(t *testing.T) {
 		},
 		{
 			// Over-stripping only costs routing fidelity; under-stripping leaks.
-			name:            "an unknown service type withholds every profile's payload",
+			name:            "an unknown service type withholds every payload field",
 			serviceType:     "speech-to-text",
-			mustWithhold:    []string{"messages", "tools", "prompt"},
+			mustWithhold:    []string{"messages", "tools", "prompt", "system"},
 			mustPassThrough: []string{"model"},
 		},
 	}
@@ -115,16 +118,60 @@ func TestImagePreviewDoesNotSendThePromptToTheRouter(t *testing.T) {
 	}
 }
 
+// The same end to end for /v1/messages: the Anthropic system prompt is a
+// top-level field, so the chat withheld set let it through. Nothing about the
+// leak is loud — the preview succeeds and routes correctly, it just carries the
+// prompt.
+func TestAnthropicPreviewDoesNotSendTheSystemPromptToTheRouter(t *testing.T) {
+	var body map[string]json.RawMessage
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != previewPath {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"providers":[]}`))
+	}))
+	defer srv.Close()
+
+	req := wire.Request{
+		"model":      json.RawMessage(`"claude-x"`),
+		"max_tokens": json.RawMessage(`1024`),
+		"system":     json.RawMessage(`"my secret system prompt"`),
+		"messages":   json.RawMessage(`[{"role":"user","content":"hi"}]`),
+	}
+	// The service type travels with the REQUEST now, so this is what a caller
+	// serving /v1/messages passes; it is no longer fixed on the Router.
+	r := New(srv.URL)
+	_, _ = r.Resolve(context.Background(), serviceTypeAnthropicChat, req)
+
+	if body == nil {
+		t.Fatal("preview was never called")
+	}
+	for _, f := range []string{"system", "messages"} {
+		if _, leaked := body[f]; leaked {
+			t.Errorf("%q was sent to the router in the preview body: %v", f, body)
+		}
+	}
+	for _, f := range []string{"model", "max_tokens"} {
+		if _, ok := body[f]; !ok {
+			t.Errorf("routing field %q must still reach the preview", f)
+		}
+	}
+}
+
 // WithSensitiveFields ADDS to whatever the request's service type withholds. It
 // used to replace, which read as "withhold exactly these" — and with one router
 // now serving every endpoint, a chat-shaped override would then have become the
-// withheld set for image requests too. Since the preview body is everything NOT
-// withheld, that does not fail; it uploads the prompt. Adding cannot.
+// withheld set for image and Anthropic requests too. Since the preview body is
+// everything NOT withheld, that does not fail; it uploads the payload. Adding
+// cannot.
 func TestExplicitSensitiveFieldsAddToTheServiceTypeDefault(t *testing.T) {
 	r := New("http://x", WithSensitiveFields([]string{"user", "metadata"}))
 
 	// The operator's extra fields are withheld for every service type...
-	for _, st := range []string{DefaultServiceType, ServiceTypeTextToImage} {
+	for _, st := range []string{DefaultServiceType, ServiceTypeTextToImage, serviceTypeAnthropicChat} {
 		got := r.withheldForServiceType(st)
 		for _, f := range []string{"user", "metadata"} {
 			if _, ok := got[f]; !ok {
@@ -139,6 +186,9 @@ func TestExplicitSensitiveFieldsAddToTheServiceTypeDefault(t *testing.T) {
 	}
 	if _, ok := r.withheldForServiceType(DefaultServiceType)["messages"]; !ok {
 		t.Error("a chat request must still withhold its messages")
+	}
+	if _, ok := r.withheldForServiceType(serviceTypeAnthropicChat)["system"]; !ok {
+		t.Error("an Anthropic request must still withhold its top-level system prompt")
 	}
 }
 
@@ -205,7 +255,9 @@ func TestUpstreamURLFollowsTheServiceType(t *testing.T) {
 		want        string
 	}{
 		{DefaultServiceType, "http://router.example/v1/chat/completions"},
-		{serviceTypeAnthropicChat, "http://router.example/v1/chat/completions"},
+		// NOT /v1/chat/completions: /v1/messages is a separate router endpoint. Its
+		// own row here is the point — one profile per row, none of them defaulted.
+		{serviceTypeAnthropicChat, "http://router.example/v1/messages"},
 		{ServiceTypeTextToImage, "http://router.example/v1/images/generations"},
 	} {
 		t.Run(tc.serviceType, func(t *testing.T) {
