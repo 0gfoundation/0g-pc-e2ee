@@ -114,7 +114,7 @@ func TestWithStreamUsage(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			out := withStreamUsage(tc.req)
+			out := withStreamUsage(wire.ProfileChat, tc.req)
 			got, present := out["stream_options"]
 			if tc.want == "" {
 				if present {
@@ -134,9 +134,37 @@ func TestWithStreamUsage(t *testing.T) {
 
 func TestWithStreamUsageDoesNotMutateCaller(t *testing.T) {
 	req := wire.Request{"stream": json.RawMessage(`true`)}
-	_ = withStreamUsage(req)
+	_ = withStreamUsage(wire.ProfileChat, req)
 	if _, present := req["stream_options"]; present {
 		t.Fatal("withStreamUsage mutated the caller's request")
+	}
+}
+
+// "stream_options" is OpenAI's CHAT convention, so a profile that is not chat
+// must never have it invented for it — however its body reached the core, and
+// whatever the body happens to carry. The image profile has no stream at all;
+// the Anthropic profile streams but reports usage on its own frames and has no
+// such field, so grafting one would put a field /v1/messages does not define
+// into a request the provider is entitled to reject.
+func TestWithStreamUsageIsChatOnly(t *testing.T) {
+	for _, profile := range []wire.Profile{wire.ProfileImage, wire.ProfileAnthropic} {
+		t.Run(string(profile), func(t *testing.T) {
+			// The most demanding shape: streaming asked for AND stream_options
+			// already present. Chat would force include_usage here.
+			req := wire.Request{
+				"stream":         json.RawMessage(`true`),
+				"stream_options": json.RawMessage(`{"include_usage":false}`),
+			}
+			out := withStreamUsage(profile, req)
+			if got := string(out["stream_options"]); got != `{"include_usage":false}` {
+				t.Errorf("stream_options = %s, want the caller's own value untouched", got)
+			}
+			// And nothing is added to a body that never named the field.
+			bare := withStreamUsage(profile, wire.Request{"stream": json.RawMessage(`true`)})
+			if got, present := bare["stream_options"]; present {
+				t.Errorf("stream_options = %s was invented for profile %q", got, profile)
+			}
+		})
 	}
 }
 

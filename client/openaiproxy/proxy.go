@@ -577,6 +577,23 @@ func RegisterImages(mux *http.ServeMux, c *core.Client, opts ...Option) {
 			writeGatewayError(w, http.StatusBadRequest, "request body is not a JSON object")
 			return
 		}
+		// Image generation returns one JSON object; there is no stream to ask for.
+		// The chat handler branches on this field, so a `"stream": true` there
+		// selects a mode; here there is no branch to select, and without this check
+		// the field was neither honoured nor refused — it went to the provider as an
+		// ordinary cleartext field, and the client core added a chat-profile
+		// `stream_options` next to it (core.withStreamUsage, now profile-guarded).
+		// Refuse it for the same reason an explicit `response_format: "url"` is
+		// refused just below: the caller named a mode this endpoint cannot serve and
+		// has to learn that, rather than getting something else silently.
+		if stream, err := streamRequested(req); err != nil {
+			writeGatewayError(w, http.StatusBadRequest, err.Error())
+			return
+		} else if stream {
+			writeGatewayError(w, http.StatusBadRequest,
+				`field "stream" is not supported for image generation: the response is a single JSON object`)
+			return
+		}
 		req, err = withB64ResponseFormat(req)
 		if err != nil {
 			writeGatewayError(w, http.StatusBadRequest, err.Error())
