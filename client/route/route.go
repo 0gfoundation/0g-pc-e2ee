@@ -90,14 +90,10 @@ const (
 	// (see sensitiveFieldsForServiceType).
 	ServiceTypeTextToImage = "text-to-image"
 	// serviceTypeAnthropicChat is the router's service type for /v1/messages. It
-	// has no sealed path yet (the preview API rejects it), but its withheld set is
-	// already the Anthropic one so the preview is right if one lands — the chat
-	// set is NOT, see sensitiveFieldsForServiceType.
+	// has no sealed path yet (the preview API rejects it), but it maps to
+	// wire.ProfileAnthropic here so the withheld set is already right if one
+	// lands — the chat set is NOT, see sensitiveFieldsForServiceType.
 	serviceTypeAnthropicChat = "anthropic-chat"
-	// fieldSystem is Anthropic's TOP-LEVEL system prompt (/v1/messages), as
-	// opposed to OpenAI's system message inside "messages". Being its own
-	// top-level field is exactly why the chat payload set does not cover it.
-	fieldSystem = "system"
 	// defaultPubkeyTTL bounds how long a fetched provider enc key is reused
 	// before re-fetching, amortizing the extra round trip the route path adds
 	// (docs/design/router-e2e.md "extra round trip"). Providers rotate keys
@@ -322,26 +318,17 @@ func sensitiveFieldsForServiceType(t string) []string {
 	case DefaultServiceType:
 		return wire.DefaultSealedFieldsFor(wire.ProfileChat)
 	case serviceTypeAnthropicChat:
-		// The chat set alone is NOT enough here: /v1/messages carries its system
-		// prompt in a top-level "system" field rather than as a message, so a
-		// preview run under the chat set uploads the system prompt to the router in
-		// the clear. It is the same class of payload as "messages" and is withheld
-		// with it.
-		//
-		// Not derived from a wire.Profile because there is no Anthropic profile
-		// yet: one needs a multi-field payload requirement ("messages" always,
-		// "system" whenever present) and a per-frame-type response rule, neither of
-		// which profileSpec can express today — and registering a half-specified
-		// profile would let the seal machinery select it. This set is only ever
-		// read (never sealed against), so it can lead. An operator who seals more
-		// than the payload (e.g. "metadata", "stop_sequences") withholds those via
-		// WithSensitiveFields, which is what that option is for.
-		return append(wire.DefaultSealedFieldsFor(wire.ProfileChat), fieldSystem)
+		// NOT the chat set, which is what this used to return: /v1/messages carries
+		// its system prompt in a top-level "system" field rather than as a message,
+		// so a preview run under the chat set uploaded the system prompt to the
+		// router in the clear. The Anthropic profile covers it.
+		return wire.DefaultSealedFieldsFor(wire.ProfileAnthropic)
 	case ServiceTypeTextToImage:
 		return wire.DefaultSealedFieldsFor(wire.ProfileImage)
 	default:
 		return append(append(wire.DefaultSealedFieldsFor(wire.ProfileChat),
-			wire.DefaultSealedFieldsFor(wire.ProfileImage)...), fieldSystem)
+			wire.DefaultSealedFieldsFor(wire.ProfileImage)...),
+			wire.DefaultSealedFieldsFor(wire.ProfileAnthropic)...)
 	}
 }
 

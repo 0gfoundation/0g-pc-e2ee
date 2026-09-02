@@ -5,10 +5,12 @@
 // associated data, so an intermediary can read but not tamper.
 //
 //   - Request (§5–§6): client seals the payload fields to the provider enc key —
-//     messages/tools for chat, prompt for image (see Profile).
+//     messages/tools for chat, prompt for image, messages/system for Anthropic
+//     (see Profile).
 //   - Response (§7): the enclave seals the generated content to the client's
-//     ephemeral key — choices for chat, data for image — one frame for
-//     non-streaming or a sequence of frames for streaming.
+//     ephemeral key — choices for chat, data for image, a field per event shape
+//     for Anthropic (§7.2) — one frame for non-streaming or a sequence of frames
+//     for streaming.
 //
 // Contract: broker <-> client (byte-for-byte, per SPEC.md). All AAD is taken
 // over JCS (RFC 8785) canonical JSON so Go/TS/Rust agree byte-for-byte.
@@ -38,6 +40,12 @@ const (
 	fieldMessages = "messages"
 	// fieldPrompt is the sensitive field an image request MUST always seal.
 	fieldPrompt = "prompt"
+	// fieldSystem is Anthropic's TOP-LEVEL system prompt (/v1/messages), as
+	// opposed to OpenAI's system message inside "messages". Being its own
+	// top-level field is why it needs naming at all: it is payload the chat
+	// profile's rules do not reach. Conditionally required — see
+	// profileSpec.requiredIfPresent.
+	fieldSystem = "system"
 	// fieldResponseFormat is the cleartext image field pinned to "b64_json"
 	// (SPEC §7.1) — see profileSpec.pinnedCleartext.
 	fieldResponseFormat = "response_format"
@@ -45,6 +53,16 @@ const (
 	// MUST cover, per profile (SPEC §7).
 	fieldChoices = "choices"
 	fieldData    = "data"
+	// The Anthropic response carries its generated content in a different field
+	// per event shape (SPEC §7.2) — see anthropicFrames.
+	fieldContent      = "content"       // the whole content array (non-streaming, and message.content)
+	fieldContentBlock = "content_block" // a block's opening value
+	fieldDelta        = "delta"         // an incremental block/message update
+	fieldErr          = "error"         // an upstream error object, which may quote the input
+	// fieldType is the cleartext field an Anthropic frame names its own shape in,
+	// and fieldMessage the envelope message_start wraps the message skeleton in.
+	fieldType    = "type"
+	fieldMessage = "message"
 	// fieldUsage / fieldOutputImages locate the billable image count a sealed
 	// image response MUST carry in cleartext (SPEC §7.1) — see
 	// profileSpec.requiredResponseCleartext.
@@ -59,9 +77,11 @@ const (
 var b64 = base64.RawURLEncoding
 
 // Profile names a request family (SPEC §5.1). The envelope format, crypto suite
-// and AAD rule are identical across profiles — a profile only fixes WHICH field
-// carries the sensitive payload, so the "you cannot accidentally ship the
-// payload in cleartext" check knows what to require.
+// and AAD rule are identical across profiles — a profile only fixes WHERE the
+// sensitive payload lives, so the "you cannot accidentally ship the payload in
+// cleartext" check knows what to require. For most profiles that is one request
+// field and one response field; for a frame-typed one it is a field per response
+// event shape (§7.2).
 //
 // It is deliberately NOT carried on the wire: `sealed_fields` is already
 // self-describing, and the enclave's Open check (decrypted keys == declared
@@ -76,6 +96,11 @@ const (
 	ProfileChat Profile = "chat"
 	// ProfileImage is /v1/images/generations: the payload is "prompt".
 	ProfileImage Profile = "image"
+	// ProfileAnthropic is /v1/messages: the payload is "messages" plus the
+	// top-level "system" prompt whenever the request carries one, and the response
+	// is a sequence of DIFFERENTLY SHAPED frames rather than one shape repeated
+	// (SPEC §7.2).
+	ProfileAnthropic Profile = "anthropic"
 )
 
 // profileSpec fixes, per profile, the field that MUST be sealed, any CLEARTEXT
@@ -93,6 +118,23 @@ type profileSpec struct {
 	request          []string // v1 default request sealed set (§5.1)
 	responseRequired string   // the response field a sealed frame MUST cover (§7)
 	response         []string // v1 default response sealed set (§7)
+	// requiredIfPresent are request fields that need not EXIST, but MUST be
+	// sealed whenever the request carries one. `required` cannot express that: it
+	// is checked from (profile, field names) alone, so a field that is only
+	// sometimes there would either reject every request that omits it or, listed
+	// as a mere default, be silently droppable.
+	//
+	// Anthropic's `system` is the case the distinction exists for. It is prompt
+	// content — the same class as `messages` — but it is optional, and it sits at
+	// the TOP LEVEL rather than inside `messages`, so nothing about sealing
+	// `messages` covers it. Left out, a request seals the conversation and hands
+	// the system prompt to the router in the clear, passing every other check.
+	requiredIfPresent []string
+	// responseFrames is set for a profile whose response frames do not all have
+	// the same shape, so "the field a frame must seal" is a property of the FRAME
+	// rather than of the profile. nil means single-shape (chat, image), where
+	// responseRequired/response answer for every frame.
+	responseFrames *responseFrameRule
 	// pinnedCleartext maps a cleartext field to the ONLY value a sealed request
 	// of this profile may carry. The field must be present — an absent one is
 	// rejected, never defaulted — because a server-side default is exactly what
@@ -116,6 +158,112 @@ type cleartextNumber struct {
 }
 
 func (c cleartextNumber) String() string { return c.field + "." + c.key }
+
+// responseFrameRule describes a profile whose response is a sequence of
+// differently shaped frames (SPEC §7.2). Each frame names its own shape in a
+// cleartext field, and the shape fixes what that frame must seal.
+//
+// The single-shape rule cannot be stretched to cover this. Requiring one field
+// on every frame rejects the shapes that legitimately have no sensitive payload
+// (Anthropic's message_start / content_block_stop / message_stop / ping), and
+// relaxing it to "seal whatever you like" is the leak the requirement exists to
+// stop. Only the frame itself says which of the two a given frame is.
+type responseFrameRule struct {
+	// discriminator is the cleartext frame field naming the shape. It MUST stay
+	// cleartext and bound: every check below keys off it, so a sealed or unbound
+	// discriminator is a check the sender can decline (SPEC §12).
+	discriminator string
+	// shapes maps a discriminator value to its shape. A value that is not here is
+	// REJECTED rather than waved through: an unrecognized frame may carry content,
+	// and nothing about it says it does not.
+	shapes map[string]frameShape
+}
+
+// frameShape is what one frame shape must seal, and what it must not carry.
+type frameShape struct {
+	// content is the field this shape MUST seal, or "" for a shape with no
+	// sensitive payload at all — for which the sealed set must be EXACTLY empty.
+	// Not "anything goes": an empty seal still binds the frame's cleartext in the
+	// AAD and still carries `_e2ee`, so the stream stays uniform and signed, while
+	// permitting a superset would let a sealer swallow a field the router reads
+	// (Anthropic's input token count rides inside message_start's `message`).
+	content string
+	// nestedMustBeEmpty are arrays one level inside a cleartext field that this
+	// shape MUST NOT carry content in.
+	//
+	// It exists for message_start, whose `message` must stay cleartext (the
+	// router's input token count is inside it) while `message.content` is, per
+	// Anthropic's own spec, always []. Nothing else would notice if it were not:
+	// an enclave that put the whole answer there would ship it in the clear, the
+	// client would open the frame happily, and an SDK reading message_start's
+	// message skeleton would even render it. So the emptiness Anthropic promises
+	// is checked rather than assumed — on both sides, since the side that can
+	// only detect it is the client (SPEC §12).
+	nestedMustBeEmpty []nestedArray
+}
+
+// nestedArray locates an array one level inside a top-level frame field —
+// `message.content`, and so far only that. Deliberately the same two-level
+// literal as cleartextNumber rather than general path resolution, for the same
+// reason: a path parser would be more machinery than the rule it enforces.
+type nestedArray struct {
+	field string // top-level cleartext frame field, e.g. "message"
+	key   string // key within that object, e.g. "content"
+}
+
+func (n nestedArray) String() string { return n.field + "." + n.key }
+
+// anthropicFrames is the /v1/messages event taxonomy (SPEC §7.2). The shapes
+// with content are the ones that carry generated text, a tool call, or an
+// upstream error message; the rest are sequencing metadata, and `usage` /
+// `message` stay cleartext on them so the router can bill without a key.
+//
+// `type` is the discriminator because Anthropic already puts it in every event's
+// payload, so nothing new goes on the wire. Note that the SSE `event:` LINE is
+// not usable for this: it sits outside the JSON and therefore outside the AAD,
+// so an intermediary can rewrite it undetected. A receiver MUST key off this
+// bound field and rebuild the `event:` line from it.
+var anthropicFrames = responseFrameRule{
+	discriminator: fieldType,
+	shapes: map[string]frameShape{
+		// Non-streaming: one frame holding the whole content array.
+		"message": {content: fieldContent},
+		// Streaming. message_start's `message` holds the input token counts the
+		// router bills on, so it stays cleartext — with its content array checked
+		// empty, since that is the one part of it that could carry the answer.
+		"message_start":       {nestedMustBeEmpty: []nestedArray{{field: fieldMessage, key: fieldContent}}},
+		"content_block_start": {content: fieldContentBlock},
+		"content_block_delta": {content: fieldDelta},
+		"content_block_stop":  {},
+		// message_delta carries the output token count in a TOP-LEVEL `usage`
+		// (cleartext, and bound), and stop_reason/stop_sequence in `delta` — the
+		// stop sequence can echo the client's own input, so it is sealed.
+		"message_delta": {content: fieldDelta},
+		"message_stop":  {},
+		"ping":          {},
+		// An upstream error message can quote the request that produced it. The
+		// router still sees `type: "error"`, which is all it needs to classify the
+		// failure.
+		"error": {content: fieldErr},
+	},
+}
+
+// contentFields is every field any shape of this rule seals, deduplicated. It is
+// what makes a MISLABELED frame detectable: a frame that claims a metadata shape
+// and carries `delta` in its cleartext half would otherwise satisfy "the sealed
+// set is empty, as this shape requires" and leak the delta to every
+// intermediary. Checking the union means a frame may carry a content field only
+// if it seals it, whatever it calls itself.
+func (r responseFrameRule) contentFields() []string {
+	out := make([]string, 0, len(r.shapes))
+	for _, s := range r.shapes {
+		if s.content != "" && !slices.Contains(out, s.content) {
+			out = append(out, s.content)
+		}
+	}
+	slices.Sort(out) // stable error messages
+	return out
+}
 
 var profiles = map[Profile]profileSpec{
 	ProfileChat: {
@@ -147,6 +295,34 @@ var profiles = map[Profile]profileSpec{
 		// in cleartext; without this the router's own parse of a sealed frame
 		// yields zero images and bills nothing, silently, forever.
 		requiredResponseCleartext: []cleartextNumber{{field: fieldUsage, key: fieldOutputImages}},
+	},
+	ProfileAnthropic: {
+		// "messages" is the conversation and is always there; "system" is the
+		// top-level system prompt, the same class of payload but optional — hence
+		// requiredIfPresent rather than a second `required`. "tools" follows chat:
+		// a default, not mandatory.
+		required:          fieldMessages,
+		requiredIfPresent: []string{fieldSystem},
+		request:           []string{"messages", "system", "tools"},
+		// The response is frame-typed, so there is no single field a frame must
+		// seal and no meaningful profile-wide default set: both are properties of
+		// the frame (see anthropicFrames). responseRequired/response stay zero so
+		// the single-shape helpers refuse this profile outright rather than
+		// resolving to something plausible and wrong.
+		responseFrames: &anthropicFrames,
+		// No pinned cleartext field: /v1/messages has no equivalent of the image
+		// profile's response_format — nothing in it directs the server to publish
+		// the result outside the sealed channel.
+		//
+		// No requiredResponseCleartext either, for chat's reason plus one of its
+		// own: the billable counts are tokens, and they arrive in TWO places
+		// (message_start's message.usage.input_tokens, message_delta's
+		// usage.output_tokens) on non-final frames. cleartextNumber addresses two
+		// levels and this check runs on the final frame only, so neither fits.
+		// TODO(anthropic-usage): an omitted count is under-billing, not a leak
+		// (the router reads zero and cannot tell that from a genuine zero — the
+		// §7.1 failure mode), so it wants the same treatment once the locator
+		// handles three levels and per-shape required cleartext.
 	},
 }
 
@@ -247,6 +423,50 @@ func validatePinnedCleartext(spec profileSpec, req Request) error {
 	return nil
 }
 
+// validatePayloadIfPresentFor enforces a profile's CONDITIONAL payload fields
+// (§5.1): a field that need not exist, but MUST be sealed whenever the message
+// carries it. Anthropic's `system` is the case — see profileSpec.requiredIfPresent.
+//
+// It cannot live in ValidateSealedFieldsFor, which answers "is this set of field
+// names valid for this profile?" from (profile, fields) alone. That is what lets
+// an operator validate `-seal-fields` at startup, before any request exists, and
+// this rule needs the request. So it is called from both ends instead:
+//
+//   - SealRequestFor, on the pre-seal request, where the field is present
+//     whether or not it is about to be sealed: "you have a system prompt and are
+//     not sealing it";
+//   - OpenRequestFor, on the received envelope, where a sealed field is already
+//     gone: "a system prompt arrived in the clear".
+//
+// One predicate serves both — present as a top-level field AND absent from the
+// sealed set — because the sealer removes what it seals. The receiving half is
+// the load-bearing one (SPEC §12): a third-party client runs no seal-time check.
+//
+// Presence is literal, so an explicit `"system": null` counts as present and
+// must be sealed like any other value. That errs toward sealing, which is the
+// safe direction, and keeps the rule "if the field is in the object, it is
+// payload" rather than a JSON-value special case a sender could aim at.
+func validatePayloadIfPresentFor(p Profile, fields []string, msg Request) error {
+	spec, err := p.spec()
+	if err != nil {
+		return err
+	}
+	if len(spec.requiredIfPresent) == 0 {
+		return nil
+	}
+	sealed := toSet(fields)
+	for _, f := range spec.requiredIfPresent {
+		if _, present := msg[f]; !present {
+			continue
+		}
+		if _, isSealed := sealed[f]; isSealed {
+			continue
+		}
+		return fmt.Errorf("%s-profile request carries %q in cleartext: it is payload and MUST be sealed whenever present", p, f)
+	}
+	return nil
+}
+
 func (p Profile) spec() (profileSpec, error) {
 	s, ok := profiles[p]
 	if !ok {
@@ -330,6 +550,12 @@ func ValidateSealedFields(fields []string) error {
 // the pinned half elsewhere, `prompt,response_format` passed startup validation
 // clean and then failed 100% of requests: the exact failure mode the fail-fast
 // call exists to prevent.
+//
+// By the same rule, what it does NOT check is a profile's CONDITIONAL payload
+// fields (requiredIfPresent, e.g. Anthropic's `system`): whether those are
+// required depends on the request, not on the field names, so they cannot be
+// answered here. SealRequestFor and OpenRequestFor run that half — see
+// validatePayloadIfPresentFor.
 func ValidateSealedFieldsFor(p Profile, fields []string) error {
 	spec, err := p.spec()
 	if err != nil {
@@ -448,6 +674,11 @@ func SealRequestFor(profile Profile, encPub crypto.PublicKey, req Request, seale
 	if err := ValidateSealedFieldsFor(profile, sealedFields); err != nil {
 		return nil, err
 	}
+	// The conditional half of the payload requirement, which needs the request:
+	// a field the profile only demands when it is there (Anthropic's `system`).
+	if err := validatePayloadIfPresentFor(profile, sealedFields, req); err != nil {
+		return nil, err
+	}
 	// Sealing the payload is not enough on its own: a cleartext field can direct
 	// the server to publish the RESULT outside the sealed channel (§7.1). Check
 	// the value AND that it will still be readable and authenticated when it gets
@@ -560,6 +791,8 @@ func SealRequestFor(profile Profile, encPub crypto.PublicKey, req Request, seale
 //
 //   - ValidateSealedFieldsFor — the sealed set covers this profile's payload
 //     field, so the request did not arrive with its prompt in the clear;
+//   - validatePayloadIfPresentFor — no conditional payload field (Anthropic's
+//     top-level `system`) arrived in the cleartext half;
 //   - validatePinnedCleartextFor — the pinned cleartext field is present, has
 //     the required value, and was neither sealed away nor declared unbound.
 //
@@ -574,6 +807,11 @@ func OpenRequestFor(profile Profile, priv crypto.PrivateKey, env Request) (Reque
 		return nil, err
 	}
 	if err := ValidateSealedFieldsFor(profile, e2ee.SealedFields); err != nil {
+		return nil, err
+	}
+	// Read on the ENVELOPE, where a sealed field is already gone: a conditional
+	// payload field still present here arrived in the clear.
+	if err := validatePayloadIfPresentFor(profile, e2ee.SealedFields, env); err != nil {
 		return nil, err
 	}
 	if err := validatePinnedCleartextFor(profile, env); err != nil {

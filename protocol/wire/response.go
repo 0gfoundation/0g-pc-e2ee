@@ -44,12 +44,66 @@ type ResponseE2EE struct {
 //
 // The enclave passes this explicitly per service type; it is exported so the
 // broker names the field in one place rather than re-listing it.
+//
+// A FRAME-TYPED profile (Anthropic, §7.2) has no profile-wide answer — what a
+// frame must seal depends on the frame — and yields the same empty non-nil
+// slice as an unknown profile. Callers serving such a profile MUST use
+// ResponseSealedFieldsForFrame, or pass nil to SealFrame and let it resolve per
+// frame; an empty set held for a whole stream would seal nothing on every
+// content frame. SealFrame refuses that (the frame's shape requires its content
+// field), so the mistake fails loudly rather than shipping cleartext.
 func DefaultResponseSealedFieldsFor(p Profile) []string {
 	s, err := p.spec()
-	if err != nil {
+	if err != nil || s.responseFrames != nil {
 		return []string{}
 	}
 	return slices.Clone(s.response)
+}
+
+// ResponseSealedFieldsForFrame resolves what THIS frame must seal under a
+// profile: the profile default for a single-shape profile (chat, image),
+// whatever the frame; the shape's own content field for a frame-typed one
+// (§7.2), which may legitimately be nothing at all for a sequencing frame.
+//
+// Exported so an enclave streaming a frame-typed profile can name the set it is
+// about to seal — for a signature, a log, or its own guard — rather than
+// duplicating the taxonomy. SealFrame calls it for a nil sealedFields.
+func ResponseSealedFieldsForFrame(p Profile, frame Response) ([]string, error) {
+	spec, err := p.spec()
+	if err != nil {
+		return nil, err
+	}
+	if spec.responseFrames == nil {
+		return slices.Clone(spec.response), nil
+	}
+	_, shape, err := spec.responseFrames.shapeOf(frame)
+	if err != nil {
+		return nil, fmt.Errorf("%s-profile: %w", p, err)
+	}
+	if shape.content == "" {
+		return []string{}, nil
+	}
+	return []string{shape.content}, nil
+}
+
+// shapeOf reads a frame's cleartext discriminator and returns its shape. An
+// absent, non-string or unrecognized value is an error: a frame whose shape is
+// unknown may carry content, and nothing about it says it does not, so it is
+// refused rather than sealed (or opened) under a guess.
+func (r responseFrameRule) shapeOf(frame Response) (string, frameShape, error) {
+	raw, ok := frame[r.discriminator]
+	if !ok {
+		return "", frameShape{}, fmt.Errorf("frame has no cleartext %q, so its shape — and what it must seal — cannot be determined", r.discriminator)
+	}
+	var kind string
+	if err := json.Unmarshal(raw, &kind); err != nil {
+		return "", frameShape{}, fmt.Errorf("frame %q must be a JSON string: %w", r.discriminator, err)
+	}
+	shape, known := r.shapes[kind]
+	if !known {
+		return kind, frameShape{}, fmt.Errorf("unknown frame %s %q: an unrecognized shape may carry content, so it is refused rather than passed through", r.discriminator, kind)
+	}
+	return kind, shape, nil
 }
 
 // mustStayCleartextInResponse are response fields a sealed frame MUST NOT seal,
@@ -103,6 +157,32 @@ func validateResponseUnboundFields(unbound []string) error {
 	return nil
 }
 
+// validateResponseUnboundFieldsFor is the floor above plus the one field a
+// profile adds to it: a frame-typed profile's discriminator (§7.2).
+//
+// It has to stay bound for the reason §12 states as its own row — a
+// receive-side check must not be gated on a sender-controlled value. Every
+// frame-shape rule keys off the discriminator, so freeing it would let an
+// intermediary relabel a content frame as a sequencing one after the fact, and
+// the client's checks would then apply the wrong shape's rules and pass.
+//
+// This is the ONE profile-specific narrowing of an otherwise profile-independent
+// list, and it narrows rather than widens: no profile gets latitude here, one
+// just has an extra field whose value must be trusted.
+func validateResponseUnboundFieldsFor(p Profile, unbound []string) error {
+	if err := validateResponseUnboundFields(unbound); err != nil {
+		return err
+	}
+	spec, err := p.spec()
+	if err != nil {
+		return err
+	}
+	if spec.responseFrames != nil && slices.Contains(unbound, spec.responseFrames.discriminator) {
+		return fmt.Errorf("%q must stay bound for the %s profile: it names the frame's shape, so an unbound one lets an intermediary relabel a content frame as a sequencing frame and every shape check then passes", spec.responseFrames.discriminator, p)
+	}
+	return nil
+}
+
 // validateResponseSealedFields requires a non-empty set with no duplicates, and
 // no field the router must be able to read. Unlike the request there is no
 // single mandatory field pinned in v1 — profiles differ in WHAT they seal, but
@@ -111,6 +191,19 @@ func validateResponseSealedFields(fields []string) error {
 	if len(fields) == 0 {
 		return fmt.Errorf("no sealed fields")
 	}
+	return validateResponseSealedFieldNames(fields)
+}
+
+// validateResponseSealedFieldNames is validateResponseSealedFields minus the
+// non-empty requirement — every rule that is about the NAMES in the set rather
+// than about there being any.
+//
+// The split exists for the one case where an empty set is correct: a frame-typed
+// profile's sequencing frames (Anthropic's message_stop and friends) carry no
+// sensitive payload, and their sealed set must be exactly empty. Everywhere else
+// an empty set means the content is riding in the clear, so the wrapper above
+// keeps rejecting it.
+func validateResponseSealedFieldNames(fields []string) error {
 	seen := make(map[string]struct{}, len(fields))
 	for _, f := range fields {
 		if f == "" {
@@ -147,6 +240,14 @@ func validateResponseSealedFieldsFor(p Profile, fields []string) error {
 	if err != nil {
 		return err
 	}
+	if spec.responseFrames != nil {
+		// A frame-typed profile has no profile-wide answer, and guessing one here
+		// would be the wrong kind of wrong: spec.responseRequired is "" for such a
+		// profile, so the check below would demand that every frame seal a field
+		// named "" and reject the entire stream with a nonsense message. Refuse the
+		// entry point instead — the frame-aware one is the only correct caller.
+		return fmt.Errorf("%s-profile response frames are typed: validate against the frame, not the profile alone", p)
+	}
 	if err := validateResponseSealedFields(fields); err != nil {
 		return err
 	}
@@ -156,6 +257,117 @@ func validateResponseSealedFieldsFor(p Profile, fields []string) error {
 	// that extra field's absence a hard failure.
 	if !slices.Contains(fields, spec.responseRequired) {
 		return fmt.Errorf("%s-profile response sealed fields must include %q", p, spec.responseRequired)
+	}
+	return nil
+}
+
+// validateResponseSealedFieldsForFrame is the frame-typed counterpart of
+// validateResponseSealedFieldsFor (§7.2): it checks a sealed set against the
+// shape the FRAME declares, and delegates to the profile-wide rule for a
+// single-shape profile.
+//
+// Both ends call it, for the reason the profile-wide one does: SealFrame so a
+// conforming enclave cannot emit a frame that leaks, OpenFrame on every frame so
+// a client can refuse one that was emitted anyway. The three rules are
+//
+//   - the discriminator is neither sealed nor (checked in
+//     validateResponseUnboundFieldsFor) unbound, so the shape is knowable and
+//     not sender-rewritable;
+//   - the shape's content field is sealed if it has one, and the set is EXACTLY
+//     empty if it does not;
+//   - no content field of ANY shape rides in the frame's cleartext half, which
+//     is what makes a mislabeled frame detectable — see contentFields.
+func validateResponseSealedFieldsForFrame(p Profile, frame Response, fields []string) error {
+	spec, err := p.spec()
+	if err != nil {
+		return err
+	}
+	rule := spec.responseFrames
+	if rule == nil {
+		return validateResponseSealedFieldsFor(p, fields)
+	}
+	if slices.Contains(fields, rule.discriminator) {
+		return fmt.Errorf("%s-profile frames must keep %q cleartext: it names the frame's shape, and every check on the frame keys off it", p, rule.discriminator)
+	}
+	if err := validateResponseSealedFieldNames(fields); err != nil {
+		return err
+	}
+	kind, shape, err := rule.shapeOf(frame)
+	if err != nil {
+		return fmt.Errorf("%s-profile: %w", p, err)
+	}
+	switch {
+	case shape.content == "" && len(fields) != 0:
+		// Not merely unnecessary: `message` on a message_start holds the input
+		// token count the router bills on, so a sealer permitted to seal "extra"
+		// on a sequencing frame could make the response unbillable.
+		return fmt.Errorf("%s-profile %q frame carries no sensitive payload and must seal nothing, got %v", p, kind, fields)
+	case shape.content != "" && !slices.Contains(fields, shape.content):
+		return fmt.Errorf("%s-profile %q frame must seal %q", p, kind, shape.content)
+	}
+	if err := validateNoCleartextContent(p, kind, *rule, frame, fields); err != nil {
+		return err
+	}
+	return validateNestedEmpty(p, kind, shape, frame)
+}
+
+// validateNoCleartextContent rejects a frame that carries any shape's content
+// field in its cleartext half without sealing it.
+//
+// This is what closes mislabeling. Every other check trusts the frame's own
+// `type`: a frame that claims `message_stop` and puts the answer in a cleartext
+// `delta` satisfies "seal nothing, as this shape requires" exactly, opens
+// cleanly, and reads to an SDK as a stray field on a stop event — while every
+// intermediary has the delta. Keying the rule off the field NAMES rather than
+// off the declared shape is the point: it holds whatever the frame calls itself.
+//
+// One predicate serves both ends, as on the request side: the sealer has not yet
+// removed what it is about to seal, so the "unless it is sealed" clause is what
+// makes the seal-time reading ("you are shipping content you did not seal") and
+// the open-time one ("content arrived in the clear") the same code.
+func validateNoCleartextContent(p Profile, kind string, rule responseFrameRule, frame Response, fields []string) error {
+	sealed := toSet(fields)
+	for _, f := range rule.contentFields() {
+		if _, present := frame[f]; !present {
+			continue
+		}
+		if _, isSealed := sealed[f]; isSealed {
+			continue
+		}
+		return fmt.Errorf("%s-profile %q frame carries %q in cleartext: it is generated content under some frame shape, so a frame may carry it only by sealing it", p, kind, f)
+	}
+	return nil
+}
+
+// validateNestedEmpty enforces a shape's nestedMustBeEmpty arrays — today only
+// message_start's `message.content`, which Anthropic's own spec fixes to [].
+// See frameShape.nestedMustBeEmpty for why a promise from the schema is checked
+// rather than assumed.
+//
+// An absent field or absent key passes: this says "not content here", not "this
+// must exist". A present non-array is rejected, because a non-array where the
+// schema says array is not something to reason about further.
+func validateNestedEmpty(p Profile, kind string, shape frameShape, frame Response) error {
+	for _, n := range shape.nestedMustBeEmpty {
+		raw, ok := frame[n.field]
+		if !ok {
+			continue
+		}
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &obj); err != nil {
+			return fmt.Errorf("%s-profile %q frame field %q must be a JSON object: %w", p, kind, n.field, err)
+		}
+		v, ok := obj[n.key]
+		if !ok {
+			continue
+		}
+		var arr []json.RawMessage
+		if err := json.Unmarshal(v, &arr); err != nil {
+			return fmt.Errorf("%s-profile %q frame %s must be a JSON array: %w", p, kind, n, err)
+		}
+		if len(arr) > 0 {
+			return fmt.Errorf("%s-profile %q frame carries %d element(s) in cleartext %s: this shape does not seal it, so content there would be in the clear — an enclave with content to send MUST use a shape that seals it", p, kind, len(arr), n)
+		}
 	}
 	return nil
 }
@@ -241,13 +453,14 @@ type ResponseSealer struct {
 	nonConforming bool
 }
 
-// validateSealedFields applies the profile's response sealed-set rule, or only
-// the profile-independent floor for a deliberately non-conforming test sealer.
-func (rs *ResponseSealer) validateSealedFields(sealedFields []string) error {
+// validateSealedFields applies the profile's response sealed-set rule for this
+// frame, or only the profile-independent floor for a deliberately non-conforming
+// test sealer.
+func (rs *ResponseSealer) validateSealedFields(frame Response, sealedFields []string) error {
 	if rs.nonConforming {
 		return validateResponseSealedFields(sealedFields)
 	}
-	return validateResponseSealedFieldsFor(rs.profile, sealedFields)
+	return validateResponseSealedFieldsForFrame(rs.profile, frame, sealedFields)
 }
 
 // NewResponseSealer sets up chat-profile response sealing — shorthand for
@@ -272,7 +485,7 @@ func NewResponseSealerFor(profile Profile, clientEphPub crypto.PublicKey, unboun
 	// Before any key material: an unbound set that frees a field the signature
 	// must cover would produce frames that verify no matter what an intermediary
 	// does to them.
-	if err := validateResponseUnboundFields(unboundFields); err != nil {
+	if err := validateResponseUnboundFieldsFor(profile, unboundFields); err != nil {
 		return nil, err
 	}
 	enc, s, err := crypto.SetupSender(clientEphPub, []byte(RespInfo))
@@ -287,12 +500,18 @@ func NewResponseSealerFor(profile Profile, clientEphPub crypto.PublicKey, unboun
 // carrying `_e2ee`. final marks the last frame.
 func (rs *ResponseSealer) SealFrame(frame Response, sealedFields []string, final bool) (Response, error) {
 	if sealedFields == nil {
-		// THIS sealer's profile, not chat's. Reading the default from a fixed
-		// profile is what DefaultResponseSealedFieldsFor's own comment warns about,
-		// and it does not take an unknown profile to go wrong: it made nil mean
-		// "seal choices" for every profile, so the documented "nil → the profile's
-		// default" held only for chat.
-		sealedFields = DefaultResponseSealedFieldsFor(rs.profile)
+		// THIS sealer's profile, not chat's, and resolved against THIS frame.
+		// Reading the default from a fixed profile is what
+		// DefaultResponseSealedFieldsFor's own comment warns about, and it does not
+		// take an unknown profile to go wrong: it made nil mean "seal choices" for
+		// every profile, so the documented "nil → the profile's default" held only
+		// for chat. Resolving per frame is then what a frame-typed profile needs —
+		// its answer is a property of the frame, not of the profile (§7.2).
+		fields, err := ResponseSealedFieldsForFrame(rs.profile, frame)
+		if err != nil {
+			return nil, err
+		}
+		sealedFields = fields
 	}
 	// The profile's own requirement, not just the profile-independent floor: a
 	// set that seals something incidental instead of the generated content puts
@@ -300,7 +519,7 @@ func (rs *ResponseSealer) SealFrame(frame Response, sealedFields []string, final
 	// but by then it has been on the wire and every intermediary has read it —
 	// refusing to build it is the only place the leak is prevented rather than
 	// detected (SPEC §12).
-	if err := rs.validateSealedFields(sealedFields); err != nil {
+	if err := rs.validateSealedFields(frame, sealedFields); err != nil {
 		return nil, err
 	}
 	if err := ValidateUnboundFields(rs.unbound, sealedFields); err != nil {
@@ -431,7 +650,7 @@ func (ro *ResponseOpener) OpenFrame(frame Response) (Response, error) {
 	// non-conforming enclave can declare `usage` unbound on purpose, and every
 	// other verification the client runs — Open, and the §8 binding, which hashes
 	// the same AAD — would still pass over a router-rewritten count.
-	if err := validateResponseUnboundFields(e2ee.UnboundFields); err != nil {
+	if err := validateResponseUnboundFieldsFor(ro.profile, e2ee.UnboundFields); err != nil {
 		return nil, err
 	}
 	// And refuse a frame whose sealed set does not actually cover this profile's
@@ -439,7 +658,7 @@ func (ro *ResponseOpener) OpenFrame(frame Response) (Response, error) {
 	// opening succeeds anyway. Per frame, not once on the first: sealed_fields is
 	// carried on every frame, so a stream could seal the content for a while and
 	// then stop.
-	if err := validateResponseSealedFieldsFor(ro.profile, e2ee.SealedFields); err != nil {
+	if err := validateResponseSealedFieldsForFrame(ro.profile, frame, e2ee.SealedFields); err != nil {
 		return nil, err
 	}
 	// And, on the frame that closes the response, refuse one that omits the
