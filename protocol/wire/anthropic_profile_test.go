@@ -571,3 +571,171 @@ func cloneFrame(f wire.Response) wire.Response {
 	}
 	return out
 }
+
+// The profile-independent "usage must stay bound" floor is name-based on
+// TOP-LEVEL fields, so it does not reach Anthropic's billable INPUT count, which
+// sits at `message.usage.input_tokens` — top-level name `message`. Unbinding
+// `message` puts that count outside the seal AAD, and since the §8 binding hashes
+// the same AAD, a router could restate it with Open AND verification both still
+// passing. That is the §7.1/§12 attack the `usage` rule exists to stop, on the
+// input side, which is why the profile names `message` itself.
+func TestAnthropicMessageMustStayBound(t *testing.T) {
+	_, _, ephPriv, ephPub := anthropicKeys(t)
+
+	// Sender half: refuse to build such a stream at all.
+	if _, err := wire.NewResponseSealerFor(wire.ProfileAnthropic, ephPub, "message"); err == nil {
+		t.Fatal("declaring `message` unbound must be refused at sealer setup")
+	}
+	// The floor's own field is still refused too, and `model` — the one field the
+	// router legitimately rewrites — is still allowed.
+	if _, err := wire.NewResponseSealerFor(wire.ProfileAnthropic, ephPub, "usage"); err == nil {
+		t.Error("declaring `usage` unbound must still be refused")
+	}
+	if _, err := wire.NewResponseSealerFor(wire.ProfileAnthropic, ephPub, "model", "x_0g_trace"); err != nil {
+		t.Errorf("the router's own unbound set must stay valid: %v", err)
+	}
+
+	// Receiver half, the load-bearing one: a frame a non-conforming enclave
+	// emitted, declaring it after the fact.
+	sealer, err := wire.NewResponseSealerFor(wire.ProfileAnthropic, ephPub)
+	if err != nil {
+		t.Fatalf("sealer: %v", err)
+	}
+	frame, err := sealer.SealFrame(cloneFrame(anthropicStream[0]), nil, true)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	var e2ee map[string]json.RawMessage
+	if err := json.Unmarshal(frame[e2eeKeyForTest], &e2ee); err != nil {
+		t.Fatalf("read _e2ee: %v", err)
+	}
+	e2ee["unbound_fields"] = json.RawMessage(`["message"]`)
+	rewritten, err := json.Marshal(e2ee)
+	if err != nil {
+		t.Fatalf("marshal _e2ee: %v", err)
+	}
+	frame[e2eeKeyForTest] = rewritten
+	// And the rewrite an unbound `message` would have permitted.
+	frame["message"] = json.RawMessage(`{"id":"msg_1","content":[],"usage":{"input_tokens":999999}}`)
+
+	opener, err := wire.NewResponseOpenerFor(wire.ProfileAnthropic, ephPriv, frame)
+	if err != nil {
+		t.Fatalf("opener: %v", err)
+	}
+	if _, err := opener.OpenFrame(frame); err == nil {
+		t.Fatal("a frame that frees `message` must be refused: the billable input count would be rewritable undetected")
+	} else if !strings.Contains(err.Error(), "bound") {
+		t.Errorf("the refusal should say `message` must stay bound, got %v", err)
+	}
+}
+
+// `stop_sequence` is the client's OWN stop string echoed back — client input, not
+// model output. The streaming path already seals it inside `message_delta`'s
+// `delta`, so leaving it cleartext on the non-streaming shape would send the same
+// value one way in one mode and the other way in the other. It matters exactly
+// when a client seals `stop_sequences` on the way in (which DefaultSealedFieldsFor
+// invites): the response would hand back in the clear what the request sealed.
+func TestAnthropicNonStreamSealsTheClientsStopSequence(t *testing.T) {
+	_, _, ephPriv, ephPub := anthropicKeys(t)
+	const marker = "CLIENT-SECRET-MARKER"
+
+	resp := wire.Response{
+		"id":            json.RawMessage(`"msg_1"`),
+		"type":          json.RawMessage(`"message"`),
+		"model":         json.RawMessage(`"claude-x"`),
+		"usage":         json.RawMessage(`{"input_tokens":11,"output_tokens":20}`),
+		"stop_reason":   json.RawMessage(`"stop_sequence"`),
+		"stop_sequence": json.RawMessage(`"` + marker + `"`),
+		"content":       json.RawMessage(`[{"type":"text","text":"answer"}]`),
+	}
+	frame, err := wire.SealResponseFor(wire.ProfileAnthropic, ephPub, resp, nil, "model", "x_0g_trace")
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	if raw, mErr := json.Marshal(frame); mErr == nil && strings.Contains(string(raw), marker) {
+		t.Errorf("the client's stop sequence rode in cleartext: %s", raw)
+	}
+	e2ee, err := frame.E2EE()
+	if err != nil {
+		t.Fatalf("read _e2ee: %v", err)
+	}
+	if !equalStrings(e2ee.SealedFields, []string{"content", "stop_sequence"}) {
+		t.Errorf("sealed_fields = %v, want [content stop_sequence]", e2ee.SealedFields)
+	}
+	// `stop_reason` stays cleartext deliberately: a model-produced enum with no
+	// client input in it. Only the stop STRING is the client's.
+	if _, ok := frame["stop_reason"]; !ok {
+		t.Error("stop_reason is model output and must stay cleartext")
+	}
+
+	got, err := wire.OpenResponseFor(wire.ProfileAnthropic, ephPriv, frame)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if !strings.Contains(string(got["stop_sequence"]), marker) {
+		t.Errorf("stop_sequence did not survive the round trip: %s", got["stop_sequence"])
+	}
+
+	// A response that ended for any other reason carries no stop_sequence, and
+	// must not be required to seal one.
+	plain := wire.Response{
+		"type":        json.RawMessage(`"message"`),
+		"model":       json.RawMessage(`"claude-x"`),
+		"usage":       json.RawMessage(`{"input_tokens":11,"output_tokens":20}`),
+		"stop_reason": json.RawMessage(`"end_turn"`),
+		"content":     json.RawMessage(`[{"type":"text","text":"answer"}]`),
+	}
+	pf, err := wire.SealResponseFor(wire.ProfileAnthropic, ephPub, plain, nil)
+	if err != nil {
+		t.Fatalf("seal without a stop sequence: %v", err)
+	}
+	pe, err := pf.E2EE()
+	if err != nil {
+		t.Fatalf("read _e2ee: %v", err)
+	}
+	if !equalStrings(pe.SealedFields, []string{"content"}) {
+		t.Errorf("sealed_fields = %v, want [content] when no stop_sequence is present", pe.SealedFields)
+	}
+}
+
+// Receiver half of the same rule: a frame that ships the client's stop string in
+// cleartext without sealing it is refused, whether it declares the honest sealed
+// set or claims a shape that seals nothing.
+func TestAnthropicRefusesACleartextStopSequence(t *testing.T) {
+	_, _, ephPriv, ephPub := anthropicKeys(t)
+
+	sealer, err := wire.NewResponseSealerFor(wire.ProfileAnthropic, ephPub)
+	if err != nil {
+		t.Fatalf("sealer: %v", err)
+	}
+	// Sender half: sealing only `content` is now refused when the frame carries
+	// the stop string.
+	leaky := wire.Response{
+		"type":          json.RawMessage(`"message"`),
+		"usage":         json.RawMessage(`{"input_tokens":1,"output_tokens":2}`),
+		"stop_sequence": json.RawMessage(`"CLIENT-SECRET-MARKER"`),
+		"content":       json.RawMessage(`[{"type":"text","text":"x"}]`),
+	}
+	if _, err := sealer.SealFrame(cloneFrame(leaky), []string{"content"}, true); err == nil {
+		t.Fatal("sealing a non-stream frame that leaves the client's stop sequence cleartext must be refused")
+	}
+
+	// Receiver half: the frame as a non-conforming enclave would emit it.
+	frame, err := sealer.SealFrame(wire.Response{
+		"type":    json.RawMessage(`"message"`),
+		"usage":   json.RawMessage(`{"input_tokens":1,"output_tokens":2}`),
+		"content": json.RawMessage(`[{"type":"text","text":"x"}]`),
+	}, nil, true)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	frame["stop_sequence"] = json.RawMessage(`"CLIENT-SECRET-MARKER"`)
+
+	opener, err := wire.NewResponseOpenerFor(wire.ProfileAnthropic, ephPriv, frame)
+	if err != nil {
+		t.Fatalf("opener: %v", err)
+	}
+	if _, err := opener.OpenFrame(frame); err == nil {
+		t.Fatal("opening a frame with the client's stop sequence in cleartext must be refused")
+	}
+}

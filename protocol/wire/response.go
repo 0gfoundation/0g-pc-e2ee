@@ -80,10 +80,7 @@ func ResponseSealedFieldsForFrame(p Profile, frame Response) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%s-profile: %w", p, err)
 	}
-	if shape.content == "" {
-		return []string{}, nil
-	}
-	return []string{shape.content}, nil
+	return shape.sealedFieldsFor(frame), nil
 }
 
 // shapeOf reads a frame's cleartext discriminator and returns its shape. An
@@ -179,6 +176,16 @@ func validateResponseUnboundFieldsFor(p Profile, unbound []string) error {
 	}
 	if spec.responseFrames != nil && slices.Contains(unbound, spec.responseFrames.discriminator) {
 		return fmt.Errorf("%q must stay bound for the %s profile: it names the frame's shape, so an unbound one lets an intermediary relabel a content frame as a sequencing frame and every shape check then passes", spec.responseFrames.discriminator, p)
+	}
+	// The profile's own must-stay-bound fields. The floor above is name-based on
+	// TOP-LEVEL fields, so it cannot reach a value that must be authenticated one
+	// level down — Anthropic's billable input count at `message.usage.input_tokens`
+	// is the case, and unbinding `message` would let a router restate it with the
+	// client's Open and the §8 verification both still passing.
+	for _, f := range spec.mustStayBoundResponse {
+		if slices.Contains(unbound, f) {
+			return fmt.Errorf("%q must stay bound for the %s profile: it carries a value the router bills on (or a value another check reads), one level down where the profile-independent rule cannot see it, so an unbound one could be rewritten in transit and still verify", f, p)
+		}
 	}
 	return nil
 }
@@ -296,14 +303,22 @@ func validateResponseSealedFieldsForFrame(p Profile, frame Response, fields []st
 	if err != nil {
 		return fmt.Errorf("%s-profile: %w", p, err)
 	}
-	switch {
-	case shape.content == "" && len(fields) != 0:
+	// What this frame must seal: the shape's content field, plus any
+	// conditionally-sealed field the frame actually carries (see
+	// frameShape.sealedFieldsFor for why one function serves both ends).
+	required := shape.sealedFieldsFor(frame)
+	if len(required) == 0 {
 		// Not merely unnecessary: `message` on a message_start holds the input
 		// token count the router bills on, so a sealer permitted to seal "extra"
 		// on a sequencing frame could make the response unbillable.
-		return fmt.Errorf("%s-profile %q frame carries no sensitive payload and must seal nothing, got %v", p, kind, fields)
-	case shape.content != "" && !slices.Contains(fields, shape.content):
-		return fmt.Errorf("%s-profile %q frame must seal %q", p, kind, shape.content)
+		if len(fields) != 0 {
+			return fmt.Errorf("%s-profile %q frame carries no sensitive payload and must seal nothing, got %v", p, kind, fields)
+		}
+	}
+	for _, f := range required {
+		if !slices.Contains(fields, f) {
+			return fmt.Errorf("%s-profile %q frame must seal %q", p, kind, f)
+		}
 	}
 	if err := validateNoCleartextContent(p, kind, *rule, frame, fields); err != nil {
 		return err

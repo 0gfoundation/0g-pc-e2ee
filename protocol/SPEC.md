@@ -257,8 +257,19 @@ to the §8.2 corollary:
 |---|---|---|
 | `usage` (response) | no — the router bills on it | **no** — its value must be authenticated |
 | a pinned cleartext field (§5.1) | **no** — sealing it removes it from the cleartext the server reads, which then falls back to its own default | **no** — the pin would hold only at seal time |
+| the top-level field CONTAINING a billable value, when a profile nests one — Anthropic's `message` (§7.2 rule 6) | no — the router bills on what is inside it | **no** — same reason as `usage`, one level down |
 | `model` | no — the router attributes on it | yes — the router rewrites the alias back; the resulting value is *not* authenticated (a known trade-off, see §9 and `DefaultUnboundFields`) |
 | `x_0g_trace` | n/a — router-injected | yes — nothing may trust it (§8.2) |
+
+**The rows above are field NAMES, and that is a trap for a profile that nests.**
+`unbound_fields` names top-level fields, so a rule written as "`usage` must stay
+bound" protects a top-level `usage` and nothing else: a profile carrying its
+billable value at `message.usage.input_tokens` satisfies that rule while leaving
+the value rewritable, because the name in the denylist and the name on the wire
+are different. A profile that nests a value whose *value* must be trusted MUST
+therefore name the top-level field that contains it (§7.2 rule 6 does), and any
+new profile MUST answer this question explicitly rather than inheriting the
+general rule and assuming it reaches.
 
 **Both ends enforce this, and for the "may be unbound" column the RECEIVER is
 the end that matters.** Checking only at seal time stops a conforming
@@ -494,7 +505,7 @@ every event payload:
 
 | `type` | Seals | Cleartext (bound) |
 |---|---|---|
-| `message` (non-streaming) | `content` | `id`, `type`, `role`, `model`, `stop_reason`, `usage` |
+| `message` (non-streaming) | `content`, **`stop_sequence` when present** | `id`, `type`, `role`, `model`, `stop_reason`, `usage` |
 | `message_start` | — | `type`, `message` (carries `message.usage.input_tokens`) |
 | `content_block_start` | `content_block` | `type`, `index` |
 | `content_block_delta` | `delta` | `type`, `index` |
@@ -504,8 +515,8 @@ every event payload:
 | `ping` | — | `type` |
 | `error` | `error` | `type` |
 
-Five rules make that table safe. The first two are the shape contract; the last
-three exist because each is a way to satisfy the table and still leak.
+Seven rules make that table safe. The first two are the shape contract; the rest
+exist because each is a way to satisfy the table and still leak.
 
 1. **A shape with a content field MUST seal it.** As §7 elsewhere.
 2. **A shape with no content field MUST seal nothing** — an empty
@@ -534,6 +545,32 @@ three exist because each is a way to satisfy the table and still leak.
    unbound one lets an intermediary relabel a content frame as a sequencing frame
    — after which the receiver applies the wrong shape's rules and passes. This is
    the §12 row about a receive-side check gated on a sender-controlled value.
+6. **`message` MUST NOT be `unbound`.** §5.2's "`usage` must stay bound" is
+   name-based on TOP-LEVEL fields, and this profile's billable input count is one
+   level down at `message.usage.input_tokens` — top-level name `message`. So the
+   general rule does not reach it: an enclave could declare `message` unbound, put
+   the count outside the AAD, and let a router restate it with the client's `Open`
+   **and** the §8 verification both still passing (§8 hashes that same AAD). That
+   is exactly the attack §7.1 relies on `usage` being bound to prevent, on the
+   input side, so a profile whose billable value is nested MUST name the field
+   that carries it. Unbinding `message` would also void rule 4, whose input is
+   then intermediary-mutable.
+7. **A shape MUST seal `stop_sequence` whenever the frame carries it.** It is the
+   custom stop string the CLIENT supplied in `stop_sequences`, echoed back — the
+   caller's own input, not model output. The streaming path seals it already (it
+   lives inside `message_delta`'s `delta`); the non-streaming shape carries it as
+   a top-level field of its own and so has to name it, or the same value would go
+   one way in one mode and the other way in the other. It matters exactly when a
+   client adds `stop_sequences` to its request's sealed set — which §5.1's
+   defaults explicitly invite — because the response would then hand back in the
+   clear a value the request deliberately sealed. **`stop_reason` is deliberately
+   NOT covered**: it is a model-produced enum (`end_turn`, `max_tokens`, …) with
+   no caller input in it, and the router reads it; streaming seals it only
+   because it shares the `delta` object with the stop string.
+
+Rules 4 and 7 are both "sensitive but optional", the response-side twin of §5.1's
+conditionally required payload field, and are checked the same way from both
+ends: a field still present in the received frame's cleartext was never sealed.
 
 An **unrecognized** discriminator value is REJECTED, not passed through: an
 unknown shape may carry content and nothing about it says otherwise. Adding a
@@ -545,13 +582,15 @@ sits outside the frame JSON and therefore outside the AAD, so an intermediary ca
 rewrite it undetected. A receiver MUST read the shape from the bound `type` field
 and **rebuild** the `event:` line from it.
 
-Two notes on the token counts. They are cleartext and bound, as §5.1 requires,
-but they arrive on **non-final** frames and one of them (`input_tokens`) is two
-levels inside `message` — so unlike the image profile's `usage.output_images`
-(§7.1) they are not *required* by this spec to be present. The failure mode if an
-enclave omits them is the §7.1 one exactly (a router reads zero, cannot tell that
-from a genuine zero, and bills nothing), so requiring them per shape is a tracked
-follow-up rather than a settled rule. The terminal frame is `message_stop`, not a
+Two notes on the token counts. They are cleartext and bound — rule 6 is what
+makes the second half of that true for `input_tokens`, whose nesting puts it out
+of reach of the general rule — but they arrive on **non-final** frames and one of
+them is two levels inside `message`, so unlike the image profile's
+`usage.output_images` (§7.1) they are not *required* by this spec to be
+**present**. Their being unforgeable and their being present are separate
+properties: rule 6 settles the first, and the second is a tracked follow-up. The
+failure mode if an enclave omits them is the §7.1 one exactly — a router reads
+zero, cannot tell that from a genuine zero, and bills nothing. The terminal frame is `message_stop`, not a
 `[DONE]` sentinel, and `final: true` belongs on it: it is guaranteed last, so
 unlike the chat profile no synthetic final frame is needed.
 
@@ -718,6 +757,8 @@ other, that party's column is the load-bearing one.
 | no frame carries another shape's content field in cleartext (§7.2) | yes | **yes — client** (this is what detects a mislabeled frame; the shape rules alone trust the sender's own label) |
 | `message_start.message.content` is empty (§7.2) | yes | **yes — client** (`message` must stay cleartext for the token count, so nothing else would notice content placed there) |
 | the frame discriminator is neither sealed nor unbound (§7.2) | yes | **yes — client** (an unbound discriminator makes every other shape check sender-controlled) |
+| a field carrying a nested billable value is not unbound — Anthropic's `message` (§7.2 rule 6) | yes | **yes — client** (otherwise a rewritten `input_tokens` verifies, exactly as a rewritten top-level `usage` would) |
+| a shape's conditionally-sealed field is sealed when present — Anthropic's `stop_sequence` (§7.2 rule 7) | yes | **yes — client** (a field still in the received cleartext was never sealed, and no one else can tell) |
 | an unrecognized frame shape is refused (§7.2) | yes | **yes — both** (an unknown shape may carry content) |
 | pinned cleartext field: correct value, not sealed, not unbound (§5.1/§7.1) | yes | **yes — enclave** |
 | response sealed set covers the generated content (§7) | yes | **yes — client** (otherwise the content rides in the clear and Open still succeeds) |

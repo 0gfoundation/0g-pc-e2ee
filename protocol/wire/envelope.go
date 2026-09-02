@@ -63,6 +63,11 @@ const (
 	// and fieldMessage the envelope message_start wraps the message skeleton in.
 	fieldType    = "type"
 	fieldMessage = "message"
+	// fieldStopSequence is the custom stop string the CLIENT supplied in the
+	// request's `stop_sequences`, echoed back when it is what ended the turn. It
+	// is client input, not model output, so it is sealed wherever it appears — see
+	// frameShape.sealIfPresent.
+	fieldStopSequence = "stop_sequence"
 	// fieldUsage / fieldOutputImages locate the billable image count a sealed
 	// image response MUST carry in cleartext (SPEC §7.1) — see
 	// profileSpec.requiredResponseCleartext.
@@ -145,6 +150,22 @@ type profileSpec struct {
 	// and cannot recover them from the sealed content (§7.1). Empty for profiles
 	// with no such requirement.
 	requiredResponseCleartext []cleartextNumber
+	// mustStayBoundResponse are cleartext response fields this profile may never
+	// declare unbound, ON TOP of the profile-independent floor
+	// (mustStayBoundInResponse).
+	//
+	// It exists because that floor is name-based on TOP-LEVEL fields, and a
+	// profile can carry a value that must be authenticated one level down.
+	// Anthropic's billable INPUT token count is at `message.usage.input_tokens`,
+	// whose top-level name is `message` — so "usage must stay bound" does not
+	// reach it, and an enclave could declare `message` unbound, put the count
+	// outside the AAD, and let a router restate it with the client's Open AND the
+	// §8 verification both still passing. That is the §7.1/§12 attack the `usage`
+	// rule exists to stop, on the input side.
+	//
+	// Unbinding `message` would also void the §7.2 `message.content` emptiness
+	// check, since that check reads a field an intermediary could then rewrite.
+	mustStayBoundResponse []string
 }
 
 // cleartextNumber locates a required cleartext number one level inside a
@@ -188,6 +209,24 @@ type frameShape struct {
 	// permitting a superset would let a sealer swallow a field the router reads
 	// (Anthropic's input token count rides inside message_start's `message`).
 	content string
+	// sealIfPresent are fields this shape must seal WHENEVER THE FRAME CARRIES
+	// them — the response-side twin of the request's requiredIfPresent, and for
+	// the same reason: a field that is sensitive but optional cannot be expressed
+	// by `content` (required-always would reject every frame that omits it).
+	//
+	// `stop_sequence` on the non-streaming shape is the case. It is the custom
+	// stop string the CLIENT supplied, echoed back — client input, not model
+	// output. The streaming path already seals it (it lives inside
+	// `message_delta`'s `delta`), so leaving it cleartext here would send the SAME
+	// value one way in one mode and the other way in the other. That matters
+	// exactly when a client seals `stop_sequences` in its request, which
+	// DefaultSealedFieldsFor invites: the response would then hand back in the
+	// clear a value the client deliberately sealed on the way in.
+	//
+	// `stop_reason` is deliberately NOT here: it is a model-produced enum
+	// ("end_turn", "max_tokens", …) with no client input in it. Streaming seals it
+	// only because it shares the `delta` object with `stop_sequence`.
+	sealIfPresent []string
 	// nestedMustBeEmpty are arrays one level inside a cleartext field that this
 	// shape MUST NOT carry content in.
 	//
@@ -226,8 +265,9 @@ func (n nestedArray) String() string { return n.field + "." + n.key }
 var anthropicFrames = responseFrameRule{
 	discriminator: fieldType,
 	shapes: map[string]frameShape{
-		// Non-streaming: one frame holding the whole content array.
-		"message": {content: fieldContent},
+		// Non-streaming: one frame holding the whole content array, plus the
+		// client's own stop string when that is what ended the turn.
+		"message": {content: fieldContent, sealIfPresent: []string{fieldStopSequence}},
 		// Streaming. message_start's `message` holds the input token counts the
 		// router bills on, so it stays cleartext — with its content array checked
 		// empty, since that is the one part of it that could carry the answer.
@@ -236,8 +276,10 @@ var anthropicFrames = responseFrameRule{
 		"content_block_delta": {content: fieldDelta},
 		"content_block_stop":  {},
 		// message_delta carries the output token count in a TOP-LEVEL `usage`
-		// (cleartext, and bound), and stop_reason/stop_sequence in `delta` — the
-		// stop sequence can echo the client's own input, so it is sealed.
+		// (cleartext, and bound), and stop_reason/stop_sequence in `delta`. Sealing
+		// `delta` is what covers `stop_sequence` — the client's own stop string
+		// echoed back — on this path; the non-streaming shape has to name it
+		// explicitly because there it is a top-level field of its own.
 		"message_delta": {content: fieldDelta},
 		"message_stop":  {},
 		"ping":          {},
@@ -248,20 +290,50 @@ var anthropicFrames = responseFrameRule{
 	},
 }
 
-// contentFields is every field any shape of this rule seals, deduplicated. It is
-// what makes a MISLABELED frame detectable: a frame that claims a metadata shape
-// and carries `delta` in its cleartext half would otherwise satisfy "the sealed
-// set is empty, as this shape requires" and leak the delta to every
-// intermediary. Checking the union means a frame may carry a content field only
-// if it seals it, whatever it calls itself.
+// contentFields is every field ANY shape of this rule is required to seal —
+// `content` values and `sealIfPresent` values alike — deduplicated. It is what
+// makes a MISLABELED frame detectable: a frame that claims a metadata shape and
+// carries `delta` in its cleartext half would otherwise satisfy "the sealed set
+// is empty, as this shape requires" and leak the delta to every intermediary.
+// Checking the union means a frame may carry one of these fields only if it
+// seals it, whatever the frame calls itself.
 func (r responseFrameRule) contentFields() []string {
 	out := make([]string, 0, len(r.shapes))
+	add := func(f string) {
+		if f != "" && !slices.Contains(out, f) {
+			out = append(out, f)
+		}
+	}
 	for _, s := range r.shapes {
-		if s.content != "" && !slices.Contains(out, s.content) {
-			out = append(out, s.content)
+		add(s.content)
+		for _, f := range s.sealIfPresent {
+			add(f)
 		}
 	}
 	slices.Sort(out) // stable error messages
+	return out
+}
+
+// sealedFieldsFor is what a frame of this shape MUST seal: the shape's content
+// field, plus each sealIfPresent field the frame actually carries. Empty for a
+// sequencing shape, whose sealed set must then be exactly empty.
+//
+// One function serves both ends, like the request side's conditional payload
+// check. At seal time the frame still holds what it is about to seal, so a
+// present `stop_sequence` is required; at open time a sealed one is already gone
+// from the cleartext, so it is not required — but one that is STILL there was
+// never sealed, and is required, which is exactly the rejection the receiver
+// half owes (SPEC §12).
+func (s frameShape) sealedFieldsFor(frame Response) []string {
+	out := make([]string, 0, 1+len(s.sealIfPresent))
+	if s.content != "" {
+		out = append(out, s.content)
+	}
+	for _, f := range s.sealIfPresent {
+		if _, present := frame[f]; present {
+			out = append(out, f)
+		}
+	}
 	return out
 }
 
@@ -314,6 +386,11 @@ var profiles = map[Profile]profileSpec{
 		// profile's response_format — nothing in it directs the server to publish
 		// the result outside the sealed channel.
 		//
+		// `message` may never be declared unbound: message_start's
+		// `message.usage.input_tokens` is the billable input count, and the
+		// profile-independent "usage must stay bound" floor is name-based on
+		// top-level fields, so it does not reach one nested a level down.
+		mustStayBoundResponse: []string{fieldMessage},
 		// No requiredResponseCleartext either, for chat's reason plus one of its
 		// own: the billable counts are tokens, and they arrive in TWO places
 		// (message_start's message.usage.input_tokens, message_delta's
