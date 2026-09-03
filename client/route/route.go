@@ -49,12 +49,36 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
 	"github.com/0gfoundation/0g-pc-e2ee/client/compose"
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/client/evidence"
 	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 	"golang.org/x/sync/singleflight"
+)
+
+// The service types this package speaks, taken from client/endpoint rather than
+// spelled again here.
+//
+// They are vars, not consts, because a row's field is not a constant expression
+// — and that is the point. Held as their own literals they were a second
+// spelling of "chatbot" and "text-to-image" with nothing tying it to the first:
+// editing either side compiled, passed every test, and took the surface down at
+// runtime with "no sealed upstream path for service type". Deriving them removes
+// the second spelling instead of documenting it.
+//
+// Exported for the same reason as before: a caller passing a service type to
+// Resolve or WithWarmServiceTypes should name it rather than retype it.
+var (
+	// DefaultServiceType is the service type sent to the preview API for a chat
+	// completion. It is the router's internal service-type vocabulary — the same
+	// strings GET /v1/service-types returns and GET /v1/providers?service_type=
+	// accepts — not the model modality on /v1/models.
+	DefaultServiceType = endpoint.Chat.ServiceType
+	// ServiceTypeTextToImage is the preview service type for
+	// /v1/images/generations.
+	ServiceTypeTextToImage = endpoint.Image.ServiceType
 )
 
 // b64 is base64url without padding — the enc_pub encoding on the wire (SPEC §3),
@@ -88,17 +112,6 @@ const (
 	// an Anthropic request to the chat one would repeat, for a third profile, the
 	// mistake upstreamURL exists to prevent.
 	messagesPath = "/v1/messages"
-	// DefaultServiceType is the service type sent to the preview API for a chat
-	// completion. It is the router's internal service-type vocabulary — the same
-	// strings GET /v1/service-types returns and GET /v1/providers?service_type=
-	// accepts — not the model modality on /v1/models. A chat-completions proxy
-	// always previews "chatbot".
-	DefaultServiceType = "chatbot"
-	// ServiceTypeTextToImage is the preview service type for
-	// /v1/images/generations. Named here so a caller passing a service type to
-	// Resolve (or WithWarmServiceTypes) uses the string the router expects and,
-	// with it, gets the right sensitive-field set and upstream path.
-	ServiceTypeTextToImage = "text-to-image"
 	// serviceTypeAnthropicChat is the router's service type for /v1/messages. It
 	// has no sealed path yet (the preview API rejects it), but it maps to
 	// wire.ProfileAnthropic here so the withheld set is already right if one

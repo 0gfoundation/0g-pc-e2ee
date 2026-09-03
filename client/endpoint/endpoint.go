@@ -89,8 +89,7 @@ var Image = Endpoint{
 	PreSeal:     imagePreSeal,
 }
 
-// All is every surface this module knows how to seal, and the registry
-// ByServiceType resolves against.
+// All is every surface this module knows how to seal.
 //
 // It is NOT yet the thing that mounts them. The gateway and proxycli still name
 // Chat and Image one at a time, so adding a row here does not by itself serve a
@@ -100,6 +99,11 @@ var Image = Endpoint{
 // mounted: its profile, its sealed set, its service type, whether it streams,
 // and its pre-seal normalisation.
 //
+// There is deliberately no lookup-by-service-type here yet. route is the layer
+// that would need one — its Resolve signature carries the string across the core
+// boundary — and it still switches on its own cases, so shipping the function
+// now would be exported API that only its own test calls.
+//
 // The Anthropic profile is deliberately ABSENT even though protocol/wire
 // carries a complete ProfileAnthropic and route already knows the
 // "anthropic-chat" service type and its /v1/messages upstream path. The
@@ -108,23 +112,6 @@ var Image = Endpoint{
 // spec keeps until preview accepts it, at which point this is one struct
 // literal.
 var All = []Endpoint{Chat, Image}
-
-// ByServiceType looks a surface up by the router's service-type string, for a
-// layer that is handed one rather than an Endpoint (route, whose Resolve
-// signature carries the service type across the core boundary).
-//
-// A miss returns the ZERO Endpoint and false. The zero value fails closed by
-// construction: its Profile is the empty profile, which wire rejects on every
-// seal and open, so a caller that ignores ok cannot silently get chat's rules
-// applied to a surface nobody analysed.
-func ByServiceType(t string) (Endpoint, bool) {
-	for _, ep := range All {
-		if ep.ServiceType == t {
-			return ep, true
-		}
-	}
-	return Endpoint{}, false
-}
 
 // fieldResponseFormat is the image profile's pinned cleartext field (SPEC §7.1).
 const fieldResponseFormat = "response_format"

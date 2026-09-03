@@ -56,34 +56,29 @@ func TestWithEndpointSelectsProfileAndDefaults(t *testing.T) {
 // A surface the table does not carry must fail closed rather than fall back to
 // chat. SPEC §1 covers two profiles; guessing chat for anything else would apply
 // the wrong rules to a request shape nobody analysed — and would do it silently,
-// for a service type that may not exist yet. The empty profile makes wire reject
-// every seal and open.
+// for a service type that may not exist yet.
 //
-// The route to this state is endpoint.ByServiceType returning its zero Endpoint
-// on a miss: a caller that ignores the ok and passes it here must land on the
-// closed door rather than on chat's rules. That is why this drives the zero value
-// through ByServiceType instead of constructing one directly — the miss path is
-// the thing being tested.
-func TestUnknownServiceTypeFailsClosedRatherThanDefaultingToChat(t *testing.T) {
-	for _, st := range []string{"speech-to-text", "image-editing", "video-generation", "not-a-service", "anthropic-chat"} {
-		t.Run(st, func(t *testing.T) {
-			ep, ok := endpoint.ByServiceType(st)
-			if ok {
-				t.Fatalf("endpoint.ByServiceType(%q) reported a hit; this test is about the miss path", st)
-			}
-			c := NewWithResolver(staticResolver{Provider{URL: DefaultProviderURL}}, WithEndpoint(ep))
-			if c.profile == wire.ProfileChat {
-				t.Fatalf("service type %q must not resolve to the chat profile", st)
-			}
-			if len(c.sealFields) != 0 {
-				t.Errorf("sealFields = %v, want empty so sealing fails closed", c.sealFields)
-			}
-			// wire must refuse it, which is what makes the empty profile safe
-			// rather than merely undefined.
-			if err := wire.ValidateSealedFieldsFor(c.profile, []string{"messages"}); err == nil {
-				t.Error("wire must reject an unknown profile")
-			}
-		})
+// With the string door gone this is a property of the ZERO Endpoint, which is
+// what a table lookup will yield on a miss (and what a caller gets from an
+// uninitialised value either way). Its empty profile is what wire rejects, and
+// asserting that here is what keeps the old unknown-service-type guarantee
+// standing now that no unknown STRING can reach this package.
+//
+// One case, not one per unrecognised name: every such name collapses to this
+// same value before a client is built, so a loop over them would run the
+// identical assertion five times and imply a coverage it does not have.
+func TestUnknownSurfaceFailsClosedRatherThanDefaultingToChat(t *testing.T) {
+	c := NewWithResolver(staticResolver{Provider{URL: DefaultProviderURL}}, WithEndpoint(endpoint.Endpoint{}))
+	if c.profile == wire.ProfileChat {
+		t.Fatalf("the zero Endpoint must not resolve to the chat profile")
+	}
+	if len(c.sealFields) != 0 {
+		t.Errorf("sealFields = %v, want empty so sealing fails closed", c.sealFields)
+	}
+	// wire must refuse it, which is what makes the empty profile safe rather than
+	// merely undefined.
+	if err := wire.ValidateSealedFieldsFor(c.profile, []string{"messages"}); err == nil {
+		t.Error("wire must reject an unknown profile")
 	}
 }
 
