@@ -47,7 +47,7 @@ func blockedGatewayWith(t *testing.T, maxInFlight int, identity *identityCache, 
 	router := httptest.NewServer(routerMux)
 
 	client := core.NewWithResolver(route.New(router.URL))
-	gw = httptest.NewServer(newHandler(client, nil, mustURL(t, router.URL), testOrigins(), "", "",
+	gw = httptest.NewServer(newHandler(sealedClients(client, nil), mustURL(t, router.URL), testOrigins(), "", "",
 		maxInFlight, identity, providerIdentities, nil, discardLogger()))
 
 	// Cleanup runs LIFO, and Close blocks on in-flight requests — so the parked

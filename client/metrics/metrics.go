@@ -38,6 +38,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 )
 
 // namespace/subsystem prefix every metric with zg_gateway_ (the scraped form is
@@ -375,10 +377,21 @@ func Handler() http.Handler {
 // content on an unexpected route) never becomes a label value. Only the routes
 // the gateway serves itself get their own label; everything else — including the
 // paths the gateway reverse-proxies to the router — collapses to "other".
+//
+// The sealed surfaces come from endpoint.All rather than being listed here. They
+// used to be: the list named /v1/chat/completions and not /v1/images/generations,
+// so every sealed image request was labelled "other" — indistinguishable on a
+// dashboard from router passthrough — from the day that surface shipped. A row
+// added to the table now gets its label the same day.
 func RouteLabel(path string) string {
 	switch path {
-	case "/v1/chat/completions", "/healthz", "/readyz":
+	case "/healthz", "/readyz":
 		return path
+	}
+	for _, ep := range endpoint.All {
+		if path == ep.Path {
+			return path
+		}
 	}
 	// The public evidence bundle, collapsed to ONE label rather than one per file:
 	// it is a template, and the filenames are attacker-suppliable (a 404 for any

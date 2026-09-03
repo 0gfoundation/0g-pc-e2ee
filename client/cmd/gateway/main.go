@@ -275,7 +275,7 @@ func main() {
 			"app_name", info.AppName, "compose_hash", info.ComposeHash)
 	}
 
-	built := f.Build("gateway", logger, proxycli.ServesImages())
+	built := f.Build("gateway", logger, proxycli.Serves(endpoint.All...))
 
 	// Parse the router base URL once, up front, so a malformed -router-url fails
 	// loud at startup (like Build's other validation) instead of surfacing as a
@@ -391,7 +391,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr: *f.Listen,
-		Handler: newHandler(built.Client, built.ImageClient, routerTarget, origins, instanceID, *evidenceDir, *maxInFlight,
+		Handler: newHandler(built.Clients, routerTarget, origins, instanceID, *evidenceDir, *maxInFlight,
 			identity, providerIdentities, built.Readiness(), logger),
 		ReadHeaderTimeout: 10 * time.Second,     // mitigate slow-header (Slowloris) clients
 		IdleTimeout:       proxycli.IdleTimeout, // bound idle keep-alives; unset means unbounded
@@ -604,7 +604,7 @@ func runHealthCheck(listen string) int {
 // ready backs GET /readyz: nil means there is nothing to assert (no warmer
 // configured) and the route always answers ready. See proxycli.Built.Readiness and
 // the /healthz vs /readyz split at the routes below.
-func newHandler(c *core.Client, imageClient *core.Client, routerTarget *url.URL, allowedOrigins []string, instanceID, evidenceDir string,
+func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedOrigins []string, instanceID, evidenceDir string,
 	maxInFlight int, identity *identityCache, providerIdentities route.ProviderIdentitySource,
 	ready func() error, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
@@ -632,36 +632,36 @@ func newHandler(c *core.Client, imageClient *core.Client, routerTarget *url.URL,
 	// memory that ceiling is derived from (see defaultMaxInFlight) and putting the
 	// wrong denominator under every in-flight/limit alert.
 	sealed := http.NewServeMux()
-	openaiproxy.Register(sealed, endpoint.Chat, c)
-	if imageClient != nil {
-		openaiproxy.Register(sealed, endpoint.Image, imageClient)
-	}
 	sealedGate := openaiproxy.RequireInferenceCredential(
 		openaiproxy.LimitInFlight(maxInFlight, sealed))
-	mux.Handle("POST "+endpoint.Chat.Path, sealedGate)
-	// The sealed image endpoint shares that gate — it does the same expensive work
-	// and must not have its own separate budget.
+	// Every row of endpoint.All is mounted, as one of two things: the sealed
+	// handler behind the shared gate when this build holds a client for it, or
+	// an explicit refusal when it does not (direct-broker mode, whose single
+	// configured broker URL is chat-shaped).
 	//
-	// When there is no image client (direct-broker mode, whose single configured
-	// broker URL is chat-shaped), the route is mounted as an explicit refusal
-	// rather than left unmounted. Leaving it off is NOT inert: the catch-all is a
-	// reverse proxy to the router, and routerTarget is parsed in every mode, so an
-	// unmounted sealed endpoint forwards the caller's PROMPT to the router in
-	// cleartext — the one thing this gateway exists to prevent. Fail closed.
+	// The refusal is NOT optional. Leaving an unserved row unmounted is not inert:
+	// the catch-all below is a reverse proxy to the router, and routerTarget is
+	// parsed in every mode, so an unmounted sealed path forwards the caller's
+	// PROMPT to the router in cleartext — the one thing this gateway exists to
+	// prevent. Fail closed.
 	//
-	// Both mounts name endpoint.*.Path rather than repeating the literal the inner
-	// mux already uses. A divergence between the two is not a 404: the outer mux is
-	// what stands between a path and the cleartext catch-all below, so a route the
-	// inner mux serves and the outer one does not is exactly the leak this comment
-	// describes. Enumerating endpoint.All here is the next step; naming the rows is
-	// what keeps the two ends together until then.
-	if imageClient != nil {
-		mux.Handle("POST "+endpoint.Image.Path, sealedGate)
-	} else {
-		mux.Handle("POST "+endpoint.Image.Path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Enumerating the table is what makes that hold by construction rather than
+	// by someone remembering: a row added to endpoint.All is either served or
+	// refused here, and cannot fall through. Before this loop the two ends — the
+	// inner mux that serves and the outer mux that stands between a path and the
+	// catch-all — each named the rows by hand, and a divergence between them was
+	// exactly the leak described above.
+	for _, ep := range endpoint.All {
+		if c := clients[ep.Path]; c != nil {
+			openaiproxy.Register(sealed, ep, c)
+			mux.Handle("POST "+ep.Path, sealedGate)
+			continue
+		}
+		path := ep.Path
+		mux.Handle("POST "+path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotImplemented)
-			_, _ = w.Write([]byte(`{"error":{"message":"sealed image generation is not available in direct-broker mode","type":"invalid_request_error"}}` + "\n"))
+			_, _ = fmt.Fprintf(w, `{"error":{"message":"sealed POST %s is not served by this gateway build","type":"invalid_request_error"}}`+"\n", path)
 		}))
 	}
 	// /healthz answers "is this process serving?" and nothing more. It is the
