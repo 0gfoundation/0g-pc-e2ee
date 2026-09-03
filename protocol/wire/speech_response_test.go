@@ -122,6 +122,58 @@ func TestSpeechVerboseResponseSealsSegmentsAndInferredLanguage(t *testing.T) {
 	}
 }
 
+// The frameless accessor MUST answer with the empty set for this profile
+// (SPEC §7.3), and this is the behavioural half: the answer has to make a caller
+// that uses it FAIL, on the first request, rather than work by accident.
+//
+// The property is worth stating precisely, because the plausible answer is
+// dangerous in a way an incomplete one is not. `["text"]` is valid for every
+// `json` transcription and invalid for every `verbose_json` one, so a broker
+// holding it passes all of its own testing and then fails 100% of verbose
+// responses the first time a client asks for timestamps — after the upstream
+// call, which is already paid for. The empty set fails on request one.
+//
+// TestProfileDefaults pins the accessor's value; this pins what the value buys.
+func TestSpeechFramelessDefaultFailsClosedOnBothShapes(t *testing.T) {
+	_, ephPub := ephKeys(t)
+
+	defaults := wire.DefaultResponseSealedFieldsFor(wire.ProfileSpeech)
+	if len(defaults) != 0 {
+		t.Fatalf("frameless response defaults for speech = %v, want empty: there is no profile-wide answer, and a plausible-looking one is latent (see the doc comment)", defaults)
+	}
+
+	// Both shapes, because the failure has to be immediate on the SHAPE THAT
+	// WOULD OTHERWISE WORK too. A guard that only rejected verbose frames would
+	// leave the latent bug exactly where it was.
+	for name, frame := range map[string]string{
+		"json":         speechJSONFrame,
+		"verbose_json": speechVerboseFrame,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := wire.SealResponseFor(wire.ProfileSpeech, ephPub, mustResp(t, frame), defaults); err == nil {
+				t.Fatal("sealing with the frameless defaults must fail closed; a caller must be pushed to ResponseSealedFieldsForFrame")
+			}
+		})
+	}
+
+	// And the correct route works for both shapes, so the refusal above is a
+	// signpost rather than a dead end.
+	for name, frame := range map[string]string{
+		"json":         speechJSONFrame,
+		"verbose_json": speechVerboseFrame,
+	} {
+		t.Run("resolved/"+name, func(t *testing.T) {
+			resolved, err := wire.ResponseSealedFieldsForFrame(wire.ProfileSpeech, mustResp(t, frame))
+			if err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+			if _, err := wire.SealResponseFor(wire.ProfileSpeech, ephPub, mustResp(t, frame), resolved); err != nil {
+				t.Fatalf("the frame-resolved set must seal: %v", err)
+			}
+		})
+	}
+}
+
 // `words` is present only when word granularity was requested, which is exactly
 // why the set cannot be a constant.
 func TestSpeechResponseSealsWordsWhenPresent(t *testing.T) {

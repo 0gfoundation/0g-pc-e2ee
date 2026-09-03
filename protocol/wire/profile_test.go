@@ -223,22 +223,64 @@ func TestProfilesDoNotAcceptEachOthersSealedSets(t *testing.T) {
 	}
 }
 
+// TestProfileDefaults pins the frameless default accessors for EVERY profile,
+// and the enumeration is the point rather than the coverage: the loop walks
+// wire.Profiles() and fails on any profile this table does not mention, so
+// adding a profile forces a decision about its frameless answer instead of
+// letting it inherit an untested one.
+//
+// That is what was missing. The table listed chat and image only, so
+// ProfileSpeech's response default — which §7.3 makes a MUST, because the
+// plausible answer `["text"]` is valid for every `json` transcription and
+// invalid for every `verbose_json` one — was enforced by code that no test
+// touched. Reverting the guard left the whole suite green.
 func TestProfileDefaults(t *testing.T) {
-	tests := []struct {
-		profile  wire.Profile
+	tests := map[wire.Profile]struct {
 		request  []string
 		response []string
+		// why documents a profile whose frameless response default is EMPTY. An
+		// empty answer is the interesting one: it means "there is no profile-wide
+		// answer, resolve against the frame", and a reader needs to know which
+		// reason applies.
+		why string
 	}{
-		{wire.ProfileChat, []string{"messages", "tools"}, []string{"choices"}},
-		{wire.ProfileImage, []string{"prompt"}, []string{"data"}},
+		wire.ProfileChat:  {request: []string{"messages", "tools"}, response: []string{"choices"}},
+		wire.ProfileImage: {request: []string{"prompt"}, response: []string{"data"}},
+		wire.ProfileAnthropic: {
+			request:  []string{"messages", "system", "tools"},
+			response: []string{},
+			why:      "frame-typed (§7.2): what a frame seals is a property of the frame",
+		},
+		wire.ProfileSpeech: {
+			request:  []string{"file_base64", "filename", "language", "prompt"},
+			response: []string{},
+			why:      "conditionally sealed response fields (§7.3): `[\"text\"]` would be valid for json and invalid for verbose_json, so a broker holding it fails 100% of verbose responses after the billed upstream call",
+		},
 	}
-	for _, tt := range tests {
-		t.Run(string(tt.profile), func(t *testing.T) {
-			if got := wire.DefaultSealedFieldsFor(tt.profile); !equalStrings(got, tt.request) {
+
+	profiles := wire.Profiles()
+	if len(profiles) == 0 {
+		t.Fatal("Profiles() is empty; this test would assert nothing")
+	}
+	for _, p := range profiles {
+		tt, ok := tests[p]
+		if !ok {
+			t.Errorf("profile %q has no row here: state its frameless defaults (and, if the response default is empty, why) rather than leaving them unasserted", p)
+			continue
+		}
+		t.Run(string(p), func(t *testing.T) {
+			if got := wire.DefaultSealedFieldsFor(p); !equalStrings(got, tt.request) {
 				t.Errorf("request defaults = %v, want %v", got, tt.request)
 			}
-			if got := wire.DefaultResponseSealedFieldsFor(tt.profile); !equalStrings(got, tt.response) {
-				t.Errorf("response defaults = %v, want %v", got, tt.response)
+			got := wire.DefaultResponseSealedFieldsFor(p)
+			if !equalStrings(got, tt.response) {
+				t.Errorf("response defaults = %v, want %v (%s)", got, tt.response, tt.why)
+			}
+			// Empty must be empty-NON-NIL: both Seal entry points read nil as "use
+			// the default", which would send them back here and loop, or worse
+			// resolve to another profile's set.
+			if len(tt.response) == 0 && got == nil {
+				t.Errorf("response defaults for %q are nil; want an empty non-nil slice so a caller fails closed", p)
 			}
 		})
 	}
