@@ -814,3 +814,194 @@ func TestGatewayMountsAServedAnthropicSurface(t *testing.T) {
 		t.Errorf("the prompt was echoed back in the error body: %s", body)
 	}
 }
+
+// A sealed surface claims its SUBTREE, not just its exact path.
+//
+// Mounting the exact path alone left every sub-resource of a sealed surface
+// falling through to the catch-all, which is a cleartext reverse proxy to the
+// router. An Anthropic SDK's messages.count_tokens() POSTs the whole
+// conversation and system prompt to /v1/messages/count_tokens; Message Batches
+// POSTs the same payload to /v1/messages/batches. Neither matched a pattern, so
+// both went to the untrusted router in the clear — and came back 200, so nothing
+// about the exchange looked wrong.
+//
+// The assertion is on what the ROUTER RECEIVED, not on the status code: a 501
+// with the payload already forwarded would be the same failure wearing a better
+// answer.
+//
+// Driven off endpoint.All so a row added later is covered the day it lands, and
+// with a client for every row, since whether this build seals a surface has no
+// bearing on whether its sub-resources may leak.
+func TestGatewayRefusesSubResourcesOfASealedSurface(t *testing.T) {
+	var (
+		mu        sync.Mutex
+		routerSaw []string
+		bodies    []string
+	)
+	router := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		routerSaw = append(routerSaw, r.Method+" "+r.URL.Path)
+		bodies = append(bodies, string(body))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	}))
+	defer router.Close()
+
+	clients := map[string]*core.Client{}
+	for _, ep := range endpoint.All {
+		clients[ep.Path] = routeClient()
+	}
+	gw := httptest.NewServer(newHandler(clients, mustURL(t, router.URL), testOrigins(), "", "",
+		noInFlightCap, nil, nil, nil, discardLogger()))
+	defer gw.Close()
+
+	const secret = "my secret prompt"
+	for _, ep := range endpoint.All {
+		for _, suffix := range []string{"count_tokens", "batches", "some/deeper/path"} {
+			path := ep.Path + "/" + suffix
+			t.Run(path, func(t *testing.T) {
+				req, _ := http.NewRequest(http.MethodPost, gw.URL+path, strings.NewReader(
+					`{"model":"m","system":"`+secret+`","messages":[{"role":"user","content":"`+secret+`"}]}`))
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("Authorization", "Bearer sk-user-key")
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					t.Fatalf("post %s: %v", path, err)
+				}
+				defer resp.Body.Close()
+				body, _ := io.ReadAll(resp.Body)
+				if resp.StatusCode != http.StatusNotImplemented {
+					t.Errorf("status = %d, want 501 (body %s)", resp.StatusCode, body)
+				}
+			})
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(routerSaw) != 0 {
+		t.Fatalf("a sub-resource of a sealed surface was forwarded to the router: %v", routerSaw)
+	}
+	for i, b := range bodies {
+		if strings.Contains(b, secret) {
+			t.Errorf("the prompt reached the router in the clear at %s: %s", routerSaw[i], b)
+		}
+	}
+}
+
+// The exact path on a method this gateway does not seal is refused too, rather
+// than proxied or bounced.
+//
+// Two things this pins. A GET on the surface's own path used to reach the
+// cleartext proxy — harmless in itself (no body, so no prompt) but the surface's
+// path is this gateway's to answer. And registering the subtree alone made Go's
+// ServeMux answer the slash-less form with an implicit 307 INTO the subtree,
+// since the only pattern for the exact path was method-specific; the method-less
+// exact registration removes that redirect while still losing to `POST <path>`
+// for the sealed method.
+func TestGatewayRefusesUnsealedMethodsOnASealedPath(t *testing.T) {
+	router := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("the router must not see %s %s", r.Method, r.URL.Path)
+	}))
+	defer router.Close()
+
+	clients := map[string]*core.Client{endpoint.Anthropic.Path: routeClient()}
+	gw := httptest.NewServer(newHandler(clients, mustURL(t, router.URL), testOrigins(), "", "",
+		noInFlightCap, nil, nil, nil, discardLogger()))
+	defer gw.Close()
+
+	// No redirect following, so a 307 shows up as itself instead of resolving.
+	c := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	req, _ := http.NewRequest(http.MethodGet, gw.URL+endpoint.Anthropic.Path, nil)
+	req.Header.Set("Authorization", "Bearer sk-user-key")
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatalf("get %s: %v", endpoint.Anthropic.Path, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotImplemented {
+		body, _ := io.ReadAll(resp.Body)
+		t.Errorf("status = %d (Location %q), want 501: %s", resp.StatusCode, resp.Header.Get("Location"), body)
+	}
+}
+
+// The catch-all must still reverse-proxy everything that is NOT part of a sealed
+// surface — the router's cleartext metadata APIs a thin client needs. Asserted
+// alongside the refusals because they are one decision: a subtree claim that
+// swallowed the model catalog would pass both tests above.
+func TestGatewayStillProxiesNonSealedPaths(t *testing.T) {
+	var (
+		mu        sync.Mutex
+		routerSaw []string
+	)
+	router := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		routerSaw = append(routerSaw, r.URL.Path)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[]}`))
+	}))
+	defer router.Close()
+
+	clients := map[string]*core.Client{}
+	for _, ep := range endpoint.All {
+		clients[ep.Path] = routeClient()
+	}
+	gw := httptest.NewServer(newHandler(clients, mustURL(t, router.URL), testOrigins(), "", "",
+		noInFlightCap, nil, nil, nil, discardLogger()))
+	defer gw.Close()
+
+	for _, path := range []string{"/v1/models", "/v1/providers", "/v1/service-types"} {
+		req, _ := http.NewRequest(http.MethodGet, gw.URL+path, nil)
+		req.Header.Set("Authorization", "Bearer sk-user-key")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("get %s: %v", path, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("%s = %d, want it proxied (body %s)", path, resp.StatusCode, body)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(routerSaw) != 3 {
+		t.Errorf("the router saw %v, want all three metadata paths proxied", routerSaw)
+	}
+}
+
+// A CORS preflight is answered by the middleware ABOVE the mux, so the refusals
+// must not intercept one: a browser sends no credentials on a preflight, and a
+// 501 there would break every browser client of the sealed surface before it
+// ever sent the real request.
+func TestGatewayAnswersPreflightOnRefusedPaths(t *testing.T) {
+	router := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer router.Close()
+	clients := map[string]*core.Client{endpoint.Anthropic.Path: routeClient()}
+	const origin = "https://app.example"
+	gw := httptest.NewServer(newHandler(clients, mustURL(t, router.URL), []string{origin}, "", "",
+		noInFlightCap, nil, nil, nil, discardLogger()))
+	defer gw.Close()
+
+	for _, path := range []string{endpoint.Anthropic.Path, endpoint.Anthropic.Path + "/count_tokens"} {
+		req, _ := http.NewRequest(http.MethodOptions, gw.URL+path, nil)
+		req.Header.Set("Origin", origin)
+		req.Header.Set("Access-Control-Request-Method", "POST")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("preflight %s: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNoContent {
+			t.Errorf("preflight %s = %d, want 204", path, resp.StatusCode)
+		}
+		if got := resp.Header.Get("Access-Control-Allow-Origin"); got != origin {
+			t.Errorf("preflight %s allow-origin = %q, want %q", path, got, origin)
+		}
+	}
+}
