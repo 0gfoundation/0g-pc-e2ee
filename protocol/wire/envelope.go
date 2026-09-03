@@ -609,6 +609,31 @@ func DefaultSealedFieldsFor(p Profile) []string {
 	return slices.Clone(s.request)
 }
 
+// Profiles returns every profile this package defines, sorted for determinism.
+//
+// It exists for the one question a caller cannot answer from a profile it holds:
+// "what could a request shape I do NOT recognise be?" A client that must fail
+// safe on an unknown service type — the router resolver, which strips a
+// request's payload fields before previewing it to the untrusted router — has to
+// withhold the union of every payload field ANY profile has, and deriving that
+// union from the profiles a caller happens to serve is the wrong set. Those two
+// diverge exactly where it matters: ProfileAnthropic seals a top-level `system`
+// that neither chat nor image has, so a union taken over a chat-and-image
+// deployment would upload an Anthropic system prompt in the clear — the leak
+// route.sensitiveFieldsForServiceType already records having fixed once.
+//
+// So the union is taken over what the PROTOCOL defines, from here, and a fourth
+// profile joins it by being added to the table rather than by every caller
+// remembering to widen a hand-written list.
+func Profiles() []Profile {
+	out := make([]Profile, 0, len(profiles))
+	for p := range profiles {
+		out = append(out, p)
+	}
+	slices.Sort(out)
+	return out
+}
+
 // DefaultUnboundFields is the v1 default set of cleartext request fields excluded
 // from the AAD (SPEC §5.2) — the "unbound" denylist a client applies when the
 // caller does not override it. Like DefaultSealedFields it returns a fresh slice,

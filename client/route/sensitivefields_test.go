@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
@@ -29,11 +31,17 @@ func TestSensitiveFieldsFollowTheServiceType(t *testing.T) {
 			mustPassThrough: []string{"model"},
 		},
 		{
-			// /v1/messages puts the system prompt in a TOP-LEVEL "system" field, so
-			// the chat set does not cover it and previewing under the chat set used to
-			// upload it to the router in the clear.
-			name:            "anthropic chat withholds the top-level system prompt",
-			serviceType:     serviceTypeAnthropicChat,
+			// endpoint.All does not carry Anthropic, so this now exercises the
+			// unrecognised-type branch rather than a case of its own — and must still
+			// withhold the TOP-LEVEL "system" field the chat set does not cover.
+			//
+			// That is the whole reason the union is taken over wire.Profiles() and not
+			// over endpoint.All: `system` belongs to a profile the protocol defines and
+			// this gateway does not mount, so a union over mounted surfaces would drop
+			// it. Since the preview body is the COMPLEMENT of this set, dropping a
+			// field here does not fail — it uploads it.
+			name:            "a profile the table does not carry still withholds its payload",
+			serviceType:     "anthropic-chat",
 			mustWithhold:    []string{"messages", "tools", "system"},
 			mustPassThrough: []string{"model", "max_tokens"},
 		},
@@ -118,11 +126,20 @@ func TestImagePreviewDoesNotSendThePromptToTheRouter(t *testing.T) {
 	}
 }
 
-// The same end to end for /v1/messages: the Anthropic system prompt is a
-// top-level field, so the chat withheld set let it through. Nothing about the
-// leak is loud — the preview succeeds and routes correctly, it just carries the
-// prompt.
-func TestAnthropicPreviewDoesNotSendTheSystemPromptToTheRouter(t *testing.T) {
+// A service type endpoint.All does not carry is refused BEFORE anything reaches
+// the router: Resolve resolves the upstream path first, so an unmounted surface
+// never previews at all.
+//
+// This is what replaced the end-to-end leak test for /v1/messages. That test
+// drove a real preview because upstreamURL had an "anthropic-chat" case; with
+// the surface out of the table there is no path to preview, so the assertion
+// worth making is the refusal — and that the router heard nothing.
+//
+// The withheld set is still asserted, directly, in the table above: it is the
+// defence that would matter if a future caller ever reached preview without this
+// gate, which is exactly why it must be correct on its own terms rather than
+// because of the ordering here.
+func TestUnmountedServiceTypeIsRefusedBeforePreview(t *testing.T) {
 	var body map[string]json.RawMessage
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != previewPath {
@@ -141,23 +158,18 @@ func TestAnthropicPreviewDoesNotSendTheSystemPromptToTheRouter(t *testing.T) {
 		"system":     json.RawMessage(`"my secret system prompt"`),
 		"messages":   json.RawMessage(`[{"role":"user","content":"hi"}]`),
 	}
-	// The service type travels with the REQUEST now, so this is what a caller
-	// serving /v1/messages passes; it is no longer fixed on the Router.
 	r := New(srv.URL)
-	_, _ = r.Resolve(context.Background(), serviceTypeAnthropicChat, req)
-
-	if body == nil {
-		t.Fatal("preview was never called")
+	_, err := r.Resolve(context.Background(), "anthropic-chat", req)
+	if err == nil {
+		t.Fatal("Resolve must refuse a service type the endpoint table does not carry")
 	}
-	for _, f := range []string{"system", "messages"} {
-		if _, leaked := body[f]; leaked {
-			t.Errorf("%q was sent to the router in the preview body: %v", f, body)
-		}
+	if !strings.Contains(err.Error(), "anthropic-chat") {
+		t.Errorf("the refusal must name the service type, got %v", err)
 	}
-	for _, f := range []string{"model", "max_tokens"} {
-		if _, ok := body[f]; !ok {
-			t.Errorf("routing field %q must still reach the preview", f)
-		}
+	// The point of refusing early: the untrusted router was never spoken to, so
+	// the system prompt could not have reached it whatever the withheld set says.
+	if body != nil {
+		t.Errorf("preview was called for an unmounted service type; the router saw %v", body)
 	}
 }
 
@@ -171,7 +183,7 @@ func TestExplicitSensitiveFieldsAddToTheServiceTypeDefault(t *testing.T) {
 	r := New("http://x", WithSensitiveFields([]string{"user", "metadata"}))
 
 	// The operator's extra fields are withheld for every service type...
-	for _, st := range []string{DefaultServiceType, ServiceTypeTextToImage, serviceTypeAnthropicChat} {
+	for _, st := range []string{DefaultServiceType, ServiceTypeTextToImage, "anthropic-chat"} {
 		got := r.withheldForServiceType(st)
 		for _, f := range []string{"user", "metadata"} {
 			if _, ok := got[f]; !ok {
@@ -187,7 +199,7 @@ func TestExplicitSensitiveFieldsAddToTheServiceTypeDefault(t *testing.T) {
 	if _, ok := r.withheldForServiceType(DefaultServiceType)["messages"]; !ok {
 		t.Error("a chat request must still withhold its messages")
 	}
-	if _, ok := r.withheldForServiceType(serviceTypeAnthropicChat)["system"]; !ok {
+	if _, ok := r.withheldForServiceType("anthropic-chat")["system"]; !ok {
 		t.Error("an Anthropic request must still withhold its top-level system prompt")
 	}
 }
@@ -255,9 +267,6 @@ func TestUpstreamURLFollowsTheServiceType(t *testing.T) {
 		want        string
 	}{
 		{DefaultServiceType, "http://router.example/v1/chat/completions"},
-		// NOT /v1/chat/completions: /v1/messages is a separate router endpoint. Its
-		// own row here is the point — one profile per row, none of them defaulted.
-		{serviceTypeAnthropicChat, "http://router.example/v1/messages"},
 		{ServiceTypeTextToImage, "http://router.example/v1/images/generations"},
 	} {
 		t.Run(tc.serviceType, func(t *testing.T) {
@@ -318,7 +327,7 @@ func TestResolvedProviderURLMatchesTheRequestsServiceType(t *testing.T) {
 	if !ok {
 		t.Fatalf("candidates type = %T", cands)
 	}
-	want := srv.URL + imagesPath
+	want := srv.URL + endpoint.Image.UpstreamPath
 	if rc.upstreamURL != want {
 		t.Errorf("candidate upstream URL = %q, want %q", rc.upstreamURL, want)
 	}

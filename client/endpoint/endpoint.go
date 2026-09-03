@@ -46,14 +46,17 @@ type Endpoint struct {
 	// request field carries the payload, which the response must seal, and which
 	// cleartext fields are pinned or required (SPEC §5.1).
 	Profile wire.Profile
-	// Path is where this gateway serves the surface.
+	// Path is where this gateway serves the surface. UpstreamPath is where the
+	// sealed envelope is POSTed on the router.
 	//
-	// It is NOT the path the sealed envelope is POSTed to on the router. Those
-	// agree for every surface today, and assuming they always would is what sent
-	// sealed image requests to the chat handler — but the router-side path is
-	// still derived by route.upstreamURL's own switch, so it does not live here
-	// yet. It moves in with the rest of route's enumeration.
-	Path string
+	// They agree for every surface today, and keeping them separate is the point:
+	// nothing makes them agree, and assuming they did is what sent every sealed
+	// image request to /v1/chat/completions, where the router handed it to the
+	// chatbot handler and the pinned image provider was not in the pool. That bug
+	// was possible because the upstream path was fixed on the Router at
+	// construction while the profile was fixed on the Client — two halves of one
+	// row, held by two objects.
+	Path, UpstreamPath string
 	// Streams is whether this surface has a streaming (SSE) shape at all. Image
 	// generation returns one JSON object, so `"stream": true` on it is a caller
 	// error rather than a mode to select.
@@ -74,44 +77,67 @@ type Endpoint struct {
 
 // Chat is POST /v1/chat/completions: the OpenAI chat-completions surface.
 var Chat = Endpoint{
-	ServiceType: "chatbot",
-	Profile:     wire.ProfileChat,
-	Path:        "/v1/chat/completions",
-	Streams:     true,
+	ServiceType:  "chatbot",
+	Profile:      wire.ProfileChat,
+	Path:         "/v1/chat/completions",
+	UpstreamPath: "/v1/chat/completions",
+	Streams:      true,
 }
 
 // Image is POST /v1/images/generations: the OpenAI image-generation surface.
 var Image = Endpoint{
-	ServiceType: "text-to-image",
-	Profile:     wire.ProfileImage,
-	Path:        "/v1/images/generations",
-	Streams:     false,
-	PreSeal:     imagePreSeal,
+	ServiceType:  "text-to-image",
+	Profile:      wire.ProfileImage,
+	Path:         "/v1/images/generations",
+	UpstreamPath: "/v1/images/generations",
+	Streams:      false,
+	PreSeal:      imagePreSeal,
 }
 
 // All is every surface this module knows how to seal.
 //
 // It is NOT yet the thing that mounts them. The gateway and proxycli still name
 // Chat and Image one at a time, so adding a row here does not by itself serve a
-// surface — replacing those hand-written enumerations is the next step, and
-// until it lands a new row needs its mount and its client added by hand too.
-// What a row DOES already decide, everywhere, is how the surface behaves once
-// mounted: its profile, its sealed set, its service type, whether it streams,
-// and its pre-seal normalisation.
+// surface — replacing those hand-written enumerations is the last step. What a
+// row DOES already decide is everything about how the surface behaves once
+// mounted: its profile, its sealed set, its service type, its upstream path,
+// whether it streams, and its pre-seal normalisation.
 //
-// There is deliberately no lookup-by-service-type here yet. route is the layer
-// that would need one — its Resolve signature carries the string across the core
-// boundary — and it still switches on its own cases, so shipping the function
-// now would be exported API that only its own test calls.
+// The Anthropic profile is deliberately ABSENT even though protocol/wire carries
+// a complete ProfileAnthropic. The router's route-preview API rejects that
+// service type today, so a row here would mount a surface that resolves to
+// nothing on every request. When preview accepts it this is one struct literal —
+// its service type is "anthropic-chat" and its router path /v1/messages, which
+// is NOT /v1/chat/completions: a separate router endpoint with its own handler
+// and request shape. (route used to carry those two facts in switch cases that
+// nothing could reach; they are recorded here instead, next to the row they
+// belong to.)
 //
-// The Anthropic profile is deliberately ABSENT even though protocol/wire
-// carries a complete ProfileAnthropic and route already knows the
-// "anthropic-chat" service type and its /v1/messages upstream path. The
-// router's route-preview API rejects that service type today, so a row here
-// would mount a surface that resolves to nothing on every request. Its wire
-// spec keeps until preview accepts it, at which point this is one struct
-// literal.
+// Its absence does NOT make it unknown to the seal path. What a surface must
+// withhold when this table does not carry it is derived from wire.Profiles(),
+// the PROTOCOL's list — see route.sensitiveFieldsForServiceType. Deriving that
+// from All instead would drop ProfileAnthropic's top-level `system` and upload
+// it in the clear.
 var All = []Endpoint{Chat, Image}
+
+// ByServiceType looks a surface up by the router's service-type string, for a
+// layer that is handed one rather than an Endpoint: route, whose Resolve
+// signature carries the service type across the core boundary.
+//
+// A miss returns the ZERO Endpoint and false. The zero value fails closed by
+// construction — its Profile is the empty profile, which wire rejects on every
+// seal and open — so a caller that ignores ok cannot silently get chat's rules
+// applied to a surface nobody analysed. A caller that does honour ok must still
+// decide what a miss means for it; route treats it as "withhold everything any
+// profile could carry", which is the safe direction.
+func ByServiceType(t string) (Endpoint, bool) {
+	for _, ep := range All {
+		if ep.ServiceType == t {
+			return ep, true
+		}
+	}
+	return Endpoint{}, false
+}
 
 // fieldResponseFormat is the image profile's pinned cleartext field (SPEC §7.1).
 const fieldResponseFormat = "response_format"
