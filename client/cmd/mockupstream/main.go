@@ -1,7 +1,9 @@
 // Command mockupstream is the load-test fixture for the gateway: one process
 // that impersonates EVERYTHING the gateway talks to upstream — the 0G router's
-// route-preview and chat-completions endpoints, a provider broker's e2ee pubkey
-// endpoint, the sealed inference itself, and the §8 signature endpoint.
+// route-preview endpoint and every sealed inference surface it serves
+// (/v1/chat/completions, /v1/messages, /v1/images/generations), a provider
+// broker's e2ee pubkey endpoint, the sealed inference itself, and the §8
+// signature endpoint.
 //
 // It exists because a load test against the real router and real providers
 // measures the PROVIDER's capacity (inference dominates every other cost) and

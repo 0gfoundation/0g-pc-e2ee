@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
@@ -76,15 +77,23 @@ func NewDirect(providerURL string, opts ...Option) (core.Resolver, error) {
 // provider. Materialization (its key fetch) is deferred to Candidates.Provider,
 // mirroring the routed path.
 //
-// It ignores the request body but NOT the service type: direct mode derives ONE
-// path from the configured broker URL, the chat one (see NewDirect), so a request
-// of any other service type has nowhere to go and is refused here rather than
-// POSTed to the chat endpoint. That includes anthropic-chat, which the router
-// serves at its own /v1/messages — this resolver has no /v1/proxy/messages
-// equivalent to send it to.
-func (d *directResolver) Resolve(_ context.Context, serviceType string, _ wire.Request) (core.Candidates, error) {
-	if serviceType != DefaultServiceType {
-		return nil, fmt.Errorf("direct-broker mode serves only chat; no endpoint for service type %q", serviceType)
+// It ignores the request body but NOT the surface: direct mode derives ONE path
+// from the configured broker URL, the chat one (see NewDirect), so a request on
+// any other surface has nowhere to go and is refused here rather than POSTed to
+// the chat endpoint. That includes the Anthropic surface, which the router serves
+// at its own /v1/messages — this resolver has no /v1/proxy/messages equivalent to
+// send it to.
+//
+// The comparison is on the row (its Path), NOT on the service type. Those were
+// the same test until /v1/messages landed: it is a "chatbot" row too, so a
+// service-type check now ADMITS it and would seal an Anthropic request under the
+// Anthropic profile and POST it to /v1/proxy/chat/completions — the broker's
+// chat surface, which validates the sealed set against the surface it was reached
+// on and would refuse it, after the request left this process.
+func (d *directResolver) Resolve(_ context.Context, ep endpoint.Endpoint, _ wire.Request) (core.Candidates, error) {
+	if ep.Path != endpoint.Chat.Path {
+		return nil, fmt.Errorf("direct-broker mode serves only %s; no endpoint for %s",
+			endpoint.Chat.Path, ep.Path)
 	}
 	return directCandidates{d}, nil
 }

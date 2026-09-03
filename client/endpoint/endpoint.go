@@ -1,15 +1,15 @@
 // Package endpoint is the one place the sealed inference surfaces differ from
 // each other.
 //
-// Chat and image generation diverge on several axes — which router service type
-// ranks their providers, which wire profile fixes what must be sealed, which
-// path this gateway serves, which path the sealed envelope is POSTed to on the
-// router, and whether the surface streams at all. Each was re-derived
-// independently: a switch in core mapped service type to profile, two more in
-// route mapped it to the withheld field set and the upstream path, openaiproxy
-// carried a hand-copied handler per surface, and proxycli and the gateway keyed
-// off a bool and a nil check. Five spellings of one split, in four packages, and
-// adding a surface meant finding all of them.
+// The surfaces diverge on several axes — which router service type ranks their
+// providers, which API surface within that service type, which wire profile
+// fixes what must be sealed, which path this gateway serves, which path the
+// sealed envelope is POSTed to on the router, and whether the surface streams at
+// all. Each was re-derived independently: a switch in core mapped service type to
+// profile, two more in route mapped it to the withheld field set and the upstream
+// path, openaiproxy carried a hand-copied handler per surface, and proxycli and
+// the gateway keyed off a bool and a nil check. Five spellings of one split, in
+// four packages, and adding a surface meant finding all of them.
 //
 // Every layer reads the rows: core seals under a row's profile, openaiproxy
 // serves a row, route resolves a row's upstream and withheld set, proxycli builds
@@ -42,7 +42,30 @@ type Endpoint struct {
 	// ServiceType is the ROUTER's vocabulary: the value sent to the route-preview
 	// API, accepted by GET /v1/providers?service_type=, and warmed by the
 	// background sweeper. It is not the model modality on /v1/models.
+	//
+	// It does NOT identify a row. Two surfaces share "chatbot" — the OpenAI
+	// chat-completions one and the Anthropic messages one — because they are one
+	// pool of providers answering two request shapes. Path is the unique key.
 	ServiceType string
+	// APIFormat is the API SURFACE within a service type, for the one service type
+	// that has more than one: `chatbot` answers both /v1/chat/completions
+	// (`openai`) and /v1/messages (`anthropic`). Sent as the preview request's
+	// `api_format` when non-empty; empty means "this service type has one surface,
+	// do not narrow".
+	//
+	// It is a separate field rather than a fancier ServiceType because the router
+	// draws the line in exactly the same place: its previewServiceType REFUSES
+	// "anthropic-chat" as a service_type ("it is a (service type, surface) PAIR
+	// wearing one string, and the surface is a separate axis with its own field"),
+	// and previewAPIFormat is where /v1/messages is asked for. A row spelling the
+	// pair as one string would 400 on every request.
+	//
+	// Empty and "openai" are the same request to the router — it applies no format
+	// filter for either, because OpenAI is the default surface every chat provider
+	// answers and many do not enumerate it in `api_formats` at all. So the chat row
+	// leaves this empty rather than saying "openai": the two are equivalent
+	// upstream, and empty is the honest spelling of "not an axis I am selecting on".
+	APIFormat string
 	// Profile is the PROTOCOL's vocabulary: wire's profile table fixes which
 	// request field carries the payload, which the response must seal, and which
 	// cleartext fields are pinned or required (SPEC §5.1).
@@ -66,8 +89,8 @@ type Endpoint struct {
 	// stream_options is an OpenAI CHAT convention, so the chat profile wants it
 	// and the Anthropic profile — which streams, and reports usage on its own
 	// frames — does not. core.withStreamUsage therefore keys off the profile, not
-	// off this field. Collapsing the two would put an undefined field into every
-	// /v1/messages request the day that surface lands.
+	// off this field. Both of those rows have Streams true, so collapsing the two
+	// would put an undefined field into every streaming /v1/messages request.
 	Streams bool
 	// PreSeal normalises the request body before it is sealed, for a rule that
 	// belongs to this surface rather than to the protocol. nil means there is
@@ -82,6 +105,27 @@ var Chat = Endpoint{
 	Profile:      wire.ProfileChat,
 	Path:         "/v1/chat/completions",
 	UpstreamPath: "/v1/chat/completions",
+	Streams:      true,
+}
+
+// Anthropic is POST /v1/messages: the Anthropic Messages surface.
+//
+// Its ServiceType is "chatbot", the same pool as Chat, with the surface carried
+// on APIFormat — see that field for why the pair is not one string. Its own path
+// is /v1/messages on both sides: a separate router endpoint with its own handler
+// and request shape, NOT /v1/chat/completions.
+//
+// The profile is what earns the row. ProfileAnthropic seals a top-level `system`
+// that the chat profile has no opinion about, so serving this surface under
+// ProfileChat would leave the system prompt in the clear — through the router,
+// and then refused by the broker, which validates the sealed set against the
+// surface it was reached on.
+var Anthropic = Endpoint{
+	ServiceType:  "chatbot",
+	APIFormat:    "anthropic",
+	Profile:      wire.ProfileAnthropic,
+	Path:         "/v1/messages",
+	UpstreamPath: "/v1/messages",
 	Streams:      true,
 }
 
@@ -102,47 +146,19 @@ var Image = Endpoint{
 // operator's field flags per served row, the warmer enumerates each row's fleet,
 // and metrics gives each row its own label. Nothing else enumerates them.
 //
-// The Anthropic profile is deliberately ABSENT even though protocol/wire carries
-// a complete ProfileAnthropic. The router's route-preview API rejects that
-// service type today, so a row here would mount a surface that resolves to
-// nothing on every request. When preview accepts it this is one struct literal —
-// its service type is "anthropic-chat" and its router path /v1/messages, which
-// is NOT /v1/chat/completions: a separate router endpoint with its own handler
-// and request shape. (route used to carry those two facts in switch cases that
-// nothing could reach; they are recorded here instead, next to the row they
-// belong to.)
+// The rows are keyed by Path, which is the only field unique to each. Chat and
+// Anthropic deliberately SHARE ServiceType "chatbot": one provider pool, two
+// request shapes, told apart by APIFormat. A lookup by service type therefore
+// cannot name a surface, which is why this package no longer offers one — the
+// row travels with the request instead (core.WithEndpoint holds it, and
+// core.Resolver.Resolve carries it across the boundary to route).
 //
-// Its absence does NOT make it unknown to the seal path. What a surface must
-// withhold when this table does not carry it is derived from wire.Profiles(),
-// the PROTOCOL's list — see route.sensitiveFieldsForServiceType. Deriving that
-// from All instead would drop ProfileAnthropic's top-level `system` and upload
-// it in the clear.
-var All = []Endpoint{Chat, Image}
-
-// ByServiceType looks a surface up by the router's service-type string, for a
-// layer that is handed one rather than an Endpoint: route, whose Resolve
-// signature carries the service type across the core boundary.
-//
-// A miss returns the ZERO Endpoint and false. The zero value fails closed for
-// SEALING: its Profile is the empty profile, which wire rejects on every seal
-// and open, so a caller that ignores ok cannot get chat's rules applied to a
-// surface nobody analysed.
-//
-// It does NOT fail closed for every question, and a caller must not assume it
-// does. wire.DefaultSealedFieldsFor of the empty profile is the EMPTY set, so a
-// caller deriving "what to withhold from the untrusted router" from a miss and
-// ignoring ok would withhold nothing and upload the whole payload. That caller
-// must honour ok and choose its own safe answer — route does, taking the union
-// over every profile the protocol defines — which is why ok is returned rather
-// than folded into the zero value.
-func ByServiceType(t string) (Endpoint, bool) {
-	for _, ep := range All {
-		if ep.ServiceType == t {
-			return ep, true
-		}
-	}
-	return Endpoint{}, false
-}
+// That is the same fix, one level up, as the two this package's header records:
+// a surface identified by a lossy projection of itself is a surface that can be
+// silently confused with another. A ByServiceType("chatbot") would have returned
+// whichever chat row came first in this slice and shadowed the other with no
+// error anywhere.
+var All = []Endpoint{Chat, Anthropic, Image}
 
 // fieldResponseFormat is the image profile's pinned cleartext field (SPEC §7.1).
 const fieldResponseFormat = "response_format"

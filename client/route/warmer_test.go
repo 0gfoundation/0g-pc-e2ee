@@ -8,11 +8,13 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
+	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 )
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -545,5 +547,56 @@ func TestWarmer_AllServiceTypesFailingIsStillAnError(t *testing.T) {
 	r.logger = discardLogger()
 	if _, err := r.listProviderAddrs(context.Background()); err == nil {
 		t.Fatal("no service type could be enumerated; that must be an error")
+	}
+}
+
+// A caller that derives its warm list from the rows it serves legitimately
+// passes one service type twice: /v1/chat/completions and /v1/messages are both
+// "chatbot". The option collapses that, so a sweep enumerates each fleet once.
+//
+// The waste was one extra catalog GET per sweep, not repeated verification (the
+// sweep already de-duplicates by provider address), which is why this asserts the
+// REQUEST COUNT rather than the resulting address list — a version that only
+// checked the addresses passed before the dedup existed.
+func TestWarmer_DuplicateServiceTypesAreEnumeratedOnce(t *testing.T) {
+	var mu sync.Mutex
+	hits := map[string]int{}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/providers", func(w http.ResponseWriter, r *http.Request) {
+		st := r.URL.Query().Get("service_type")
+		mu.Lock()
+		hits[st]++
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": []map[string]string{{"address": "0xa"}}})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	// Exactly what proxycli hands us for a gateway serving every row.
+	var warm []string
+	for _, ep := range endpoint.All {
+		warm = append(warm, ep.ServiceType)
+	}
+	r := New(srv.URL, WithWarmServiceTypes(warm...))
+	r.logger = discardLogger()
+	if _, err := r.listProviderAddrs(context.Background()); err != nil {
+		t.Fatalf("listProviderAddrs: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	for st, n := range hits {
+		if n != 1 {
+			t.Errorf("service type %q was enumerated %d times, want 1", st, n)
+		}
+	}
+	// And every distinct fleet still is enumerated — a dedup that dropped one
+	// would also make every count 1.
+	want := map[string]struct{}{}
+	for _, ep := range endpoint.All {
+		want[ep.ServiceType] = struct{}{}
+	}
+	if len(hits) != len(want) {
+		t.Errorf("enumerated %d distinct service types (%v), want %d (%v)", len(hits), hits, len(want), want)
 	}
 }

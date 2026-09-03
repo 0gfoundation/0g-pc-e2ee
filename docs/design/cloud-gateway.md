@@ -666,7 +666,8 @@ does not.
   broker (`GET /v1/e2ee/pubkey`) — so nothing about the provider (endpoint, enc
   key, signer) is configured up front. The sealed fields are withheld from the
   preview call, so the prompt stays confidential. The sealed request itself is
-  still POSTed to the **router** (`/v1/chat/completions`, the centralized
+  still POSTed to the **router** (at the surface's own path there — see
+  `client/endpoint`, whose row carries it; the router is the centralized
   auth/billing point), pinned to the chosen provider (`X-0G-Provider-Address`,
   fallback off) so the router forwards to exactly the provider whose key it was
   sealed to; the provider `endpoint` from preview is used only to fetch the enc

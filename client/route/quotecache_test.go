@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
@@ -57,7 +58,7 @@ func countingQVServer(t *testing.T, hits *int32, entered chan<- struct{}, block 
 
 func qvResolveHead(t *testing.T, r *Router) error {
 	t.Helper()
-	cands, err := r.Resolve(context.Background(), DefaultServiceType, wire.Request{})
+	cands, err := r.Resolve(context.Background(), endpoint.Chat, wire.Request{})
 	if err != nil {
 		return err
 	}

@@ -651,7 +651,53 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	// inner mux that serves and the outer mux that stands between a path and the
 	// catch-all — each named the rows by hand, and a divergence between them was
 	// exactly the leak described above.
+	//
+	// A row also claims its SUBTREE, and that is the same guarantee at the scope
+	// the leak actually has. Mounting the exact path alone left every sub-resource
+	// of a sealed surface falling through: an Anthropic SDK's
+	// messages.count_tokens() POSTs the whole conversation and system prompt to
+	// /v1/messages/count_tokens, which matches no pattern and so reached the
+	// catch-all — the full payload, in the clear, to the untrusted router, with a
+	// 200 back as if nothing had happened. Message Batches
+	// (/v1/messages/batches) carries the same payload the same way.
+	//
+	// Refusing the subtree rather than those two paths is deliberate: the
+	// invariant is that a sealed surface's NAMESPACE never reaches the cleartext
+	// proxy, and a list of known sub-resources is a rule narrower than the thing
+	// it guards — it would go stale the day the API grows a third one, silently
+	// and in the leaking direction. Nothing under these prefixes is sealed by this
+	// gateway, so nothing under them may be proxied; a client that wants the
+	// router's own cleartext handling of them can call the router directly, which
+	// is a choice rather than a surprise.
 	for _, ep := range endpoint.All {
+		// Registered for EVERY row, served or not, and before the branch below:
+		// whether this build seals the surface itself has no bearing on whether its
+		// sub-resources may leak.
+		surface := ep.Path
+		// ...but it does bear on what the refusal may CLAIM. In direct-broker mode
+		// this build holds a chat client only, so telling an operator debugging
+		// /v1/messages there that "this gateway seals it at POST /v1/messages" is
+		// simply false, and it contradicts the POST refusal below on the same path.
+		// One reason, two accurate wordings, decided here where the answer is known.
+		served := clients[ep.Path] != nil
+		refuse := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			reason := fmt.Sprintf("this build does not serve the sealed %s surface at all", surface)
+			if served {
+				reason = fmt.Sprintf("it is part of the sealed %s surface, which this gateway seals only at POST %s",
+					surface, surface)
+			}
+			openaiproxy.WriteError(w, http.StatusNotImplemented, "gateway",
+				fmt.Sprintf("%s %s is not served by this gateway: %s, so it is refused rather than "+
+					"forwarded in the clear", r.Method, r.URL.Path, reason))
+		})
+		// The subtree, and the exact path on every method but the sealed POST. The
+		// method-less exact pattern is the LESS specific of the two on that path, so
+		// `POST <path>` below still wins for the sealed method; without it Go's
+		// ServeMux answers a slash-less request with an implicit 307 into the subtree
+		// (a redirect nobody asked for), and before it a GET on the surface's own path
+		// went to the cleartext proxy.
+		mux.Handle(surface+"/", refuse)
+		mux.Handle(surface, refuse)
 		if c := clients[ep.Path]; c != nil {
 			openaiproxy.Register(sealed, ep, c)
 			mux.Handle("POST "+ep.Path, sealedGate)
