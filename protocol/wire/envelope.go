@@ -1197,6 +1197,77 @@ func ValidateUnboundFields(unbound, sealed []string) error {
 	return nil
 }
 
+// validateSealInputs checks everything about a seal that does NOT depend on the
+// request: the two field sets, the signer pin, and the response ephemeral key.
+// Its inputs are all fixed when a sealing context is built, which is why a
+// caller can run the exported halves once at startup (ValidateSealedFieldsFor,
+// ValidateUnboundFieldsFor) and fail fast instead of on every request.
+//
+// Grouped here rather than dropped, and the distinction is worth stating
+// because it is easy to get backwards. "The gateway's sealed set is now
+// hardcoded, so these are assertions about our own constants" is true of the
+// gateway and false of this package: sealedFields and unboundFields are
+// PARAMETERS here, core.WithSealFields still supplies them, and a caller who
+// omits the payload field from the first gets a leak rather than an error if
+// nothing checks. A startup call is an earlier verdict on the same inputs,
+// never a substitute for this one.
+func validateSealInputs(profile Profile, spec profileSpec, sealedFields, unboundFields []string, signerAddr string, clientEphPub []byte) error {
+	if err := ValidateSealedFieldsFor(profile, sealedFields); err != nil {
+		return err
+	}
+	// Sealing the payload is not enough on its own: a cleartext field can direct
+	// the server to publish the RESULT outside the sealed channel (§7.1). A pin
+	// an intermediary can rewrite is not a pin, so the pinned fields of both
+	// families must stay inside the AAD. ValidateSealedFieldsFor above already
+	// rejected a set that seals either family's pin away.
+	if err := validatePinnedNotUnbound(spec, unboundFields); err != nil {
+		return err
+	}
+	if err := ValidateUnboundFields(unboundFields, sealedFields); err != nil {
+		return err
+	}
+	if !isSignerAddr(signerAddr) {
+		return fmt.Errorf("invalid signer_addr %q (want 0x followed by 40 hex)", signerAddr)
+	}
+	// clientEphPub is stored, not used, at seal time — the enclave seals the
+	// response to it (§7). Reject a malformed key here rather than emit an
+	// envelope whose response can never be opened.
+	if len(clientEphPub) != clientEphPubLen {
+		return fmt.Errorf("client_eph_pub must be %d bytes (X25519), got %d", clientEphPubLen, len(clientEphPub))
+	}
+	return nil
+}
+
+// validateSealableRequest checks the parts of a seal that depend on the REQUEST:
+// whether it carries a conditional payload field it is not sealing, and whether
+// its pinned cleartext fields hold permitted values.
+//
+// None of these can move to a test, however fixed the configuration becomes,
+// because the values are the CALLER'S rather than ours. A user who sends
+// `response_format: "url"` to the image surface is refused right here — the
+// gateway passes the field through rather than rewriting it — and a user is also
+// who decides whether an Anthropic `system` prompt exists at all. That is the
+// line between this function and validateSealInputs, and it is the same line
+// that says which checks could ever become assertions about constants.
+//
+// The two pinned VALUE checks stay separate, which is the whole of what the two
+// pin families still differ on: validatePinnedCleartext DEMANDS its field, and
+// folding the conditional one into it would demand `stream` on every sealed
+// speech request. Neither is "a value this profile refuses rather than one it
+// demands" — expressing the conditional pin that way is what let `"true"` and
+// `1` through, on an endpoint that materializes the request back into multipart.
+func validateSealableRequest(profile Profile, spec profileSpec, sealedFields []string, req Request) error {
+	// The conditional half of the payload requirement: a field the profile only
+	// demands when it is there (Anthropic's `system`).
+	if err := validatePayloadIfPresentFor(profile, sealedFields, req); err != nil {
+		return err
+	}
+	if err := validatePinnedCleartext(spec, req); err != nil {
+		return err
+	}
+	return validatePinnedIfPresent(spec, req)
+}
+
 // E2EE is the sealing-metadata object added to the request under `_e2ee` (§5).
 type E2EE struct {
 	V            int      `json:"v"`
@@ -1238,6 +1309,13 @@ func SealRequest(encPub crypto.PublicKey, req Request, sealedFields []string, si
 //   - clientEphPub: the client's response ephemeral X25519 public key (raw bytes)
 //   - unboundFields: optional cleartext fields excluded from the AAD (§5.2), i.e.
 //     ones an intermediary may add/modify. Empty (the default) binds everything.
+//
+// It refuses to build a violating envelope, in two groups: validateSealInputs
+// for what the CALLER configured (the field sets, the signer, the ephemeral
+// key) and validateSealableRequest for what the caller's REQUEST contains. The
+// split is the line between "could be checked once at startup" and "is user
+// input on every call" — see those two functions. Everything after them is the
+// seal itself.
 func SealRequestFor(profile Profile, encPub crypto.PublicKey, req Request, sealedFields []string, signerAddr string, clientEphPub []byte, unboundFields ...string) (Request, error) {
 	spec, err := profile.spec()
 	if err != nil {
@@ -1246,49 +1324,11 @@ func SealRequestFor(profile Profile, encPub crypto.PublicKey, req Request, seale
 	if sealedFields == nil {
 		sealedFields = DefaultSealedFieldsFor(profile)
 	}
-	if err := ValidateSealedFieldsFor(profile, sealedFields); err != nil {
+	if err := validateSealInputs(profile, spec, sealedFields, unboundFields, signerAddr, clientEphPub); err != nil {
 		return nil, err
 	}
-	// The conditional half of the payload requirement, which needs the request:
-	// a field the profile only demands when it is there (Anthropic's `system`).
-	if err := validatePayloadIfPresentFor(profile, sealedFields, req); err != nil {
+	if err := validateSealableRequest(profile, spec, sealedFields, req); err != nil {
 		return nil, err
-	}
-	// Sealing the payload is not enough on its own: a cleartext field can direct
-	// the server to publish the RESULT outside the sealed channel (§7.1). Check
-	// the value AND that it will still be readable and authenticated when it gets
-	// there — a pin that is sealed away, or that an intermediary can rewrite, is
-	// not a pin. ValidateSealedFieldsFor above already rejected a set that seals
-	// either family's pin away, and this covers both families' unbound half;
-	// validatePinnedCleartextFor / validatePinnedIfPresentFor run all three
-	// checks together on the receiving side.
-	if err := validatePinnedNotUnbound(spec, unboundFields); err != nil {
-		return nil, err
-	}
-	// The two VALUE checks stay separate, which is the whole of what the two
-	// families still differ on: validatePinnedCleartext DEMANDS its field, and
-	// folding the conditional one into it would demand `stream` on every sealed
-	// speech request. Neither is "a value this profile refuses rather than one it
-	// demands" — expressing the conditional pin that way is what let `"true"` and
-	// `1` through, on an endpoint that materializes the request back into
-	// multipart.
-	if err := validatePinnedCleartext(spec, req); err != nil {
-		return nil, err
-	}
-	if err := validatePinnedIfPresent(spec, req); err != nil {
-		return nil, err
-	}
-	if err := ValidateUnboundFields(unboundFields, sealedFields); err != nil {
-		return nil, err
-	}
-	if !isSignerAddr(signerAddr) {
-		return nil, fmt.Errorf("invalid signer_addr %q (want 0x followed by 40 hex)", signerAddr)
-	}
-	// clientEphPub is stored, not used, at seal time — the enclave seals the
-	// response to it (§7). Reject a malformed key here rather than emit an
-	// envelope whose response can never be opened.
-	if len(clientEphPub) != clientEphPubLen {
-		return nil, fmt.Errorf("client_eph_pub must be %d bytes (X25519), got %d", clientEphPubLen, len(clientEphPub))
 	}
 
 	// 1. sealed_obj = { field: original value } for each sealed field.
