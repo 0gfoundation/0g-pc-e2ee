@@ -42,6 +42,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -97,26 +98,6 @@ const (
 	// (with ?service_type=) to enumerate provider on-chain addresses; the serving
 	// endpoint itself is resolved from chain, not from this list.
 	providersPath = "/v1/providers"
-	// completionsPath is the router's OpenAI chat-completions endpoint. The sealed
-	// request is POSTed here — to the router, not the provider directly — because
-	// the router is the centralized auth/billing point; it authenticates, then
-	// forwards to the pinned provider (SPEC §4.4).
-	completionsPath = "/v1/chat/completions"
-	// imagesPath is where a sealed image request goes. Its existence next to
-	// completionsPath is the point: the upstream path is per service type, and
-	// deriving it is what upstreamURL does.
-	imagesPath = "/v1/images/generations"
-	// messagesPath is the router's Anthropic Messages endpoint, where a sealed
-	// anthropic-chat request goes. It is NOT completionsPath: /v1/messages is a
-	// separate router endpoint with its own handler and request shape, so routing
-	// an Anthropic request to the chat one would repeat, for a third profile, the
-	// mistake upstreamURL exists to prevent.
-	messagesPath = "/v1/messages"
-	// serviceTypeAnthropicChat is the router's service type for /v1/messages. It
-	// has no sealed path yet (the preview API rejects it), but it maps to
-	// wire.ProfileAnthropic here so the withheld set is already right if one
-	// lands — the chat set is NOT, see sensitiveFieldsForServiceType.
-	serviceTypeAnthropicChat = "anthropic-chat"
 	// defaultPubkeyTTL bounds how long a fetched provider enc key is reused
 	// before re-fetching, amortizing the extra round trip the route path adds
 	// (docs/design/router-e2e.md "extra round trip"). Providers rotate keys
@@ -361,28 +342,40 @@ func (r *Router) withheldForServiceType(serviceType string) map[string]struct{} 
 // happen: the preview body is everything NOT in this set, so a stale set does not
 // fail, it silently ships the payload to the router.
 //
-// An UNRECOGNIZED service type gets the union of every payload field any surface
-// has. Over-stripping is the safe direction — it can only cost routing fidelity
-// (the router ranks on fewer fields), while under-stripping leaks — and a service
-// type this package does not know is exactly the case where guessing narrow
-// would be wrong.
+// A service type this package's table does not carry gets the union of every
+// payload field ANY profile has. Over-stripping is the safe direction — it can
+// only cost routing fidelity, since the router then ranks on fewer fields, while
+// under-stripping leaks — and an unrecognised service type is exactly the case
+// where guessing narrow would be wrong.
+//
+// That union is taken over wire.Profiles(), the PROTOCOL's list, and NOT over
+// endpoint.All, the surfaces this gateway mounts. The two diverge precisely
+// where it costs: ProfileAnthropic seals a top-level `system` that neither chat
+// nor image has, so a union over the mounted surfaces would stop withholding it
+// — re-opening the leak the "anthropic-chat" case was added to close, silently,
+// because the preview body is the complement of this set.
 func sensitiveFieldsForServiceType(t string) []string {
-	switch t {
-	case DefaultServiceType:
-		return wire.DefaultSealedFieldsFor(wire.ProfileChat)
-	case serviceTypeAnthropicChat:
-		// NOT the chat set, which is what this used to return: /v1/messages carries
-		// its system prompt in a top-level "system" field rather than as a message,
-		// so a preview run under the chat set uploaded the system prompt to the
-		// router in the clear. The Anthropic profile covers it.
-		return wire.DefaultSealedFieldsFor(wire.ProfileAnthropic)
-	case ServiceTypeTextToImage:
-		return wire.DefaultSealedFieldsFor(wire.ProfileImage)
-	default:
-		return append(append(wire.DefaultSealedFieldsFor(wire.ProfileChat),
-			wire.DefaultSealedFieldsFor(wire.ProfileImage)...),
-			wire.DefaultSealedFieldsFor(wire.ProfileAnthropic)...)
+	if ep, ok := endpoint.ByServiceType(t); ok {
+		return wire.DefaultSealedFieldsFor(ep.Profile)
 	}
+	return everyProfilesPayloadFields()
+}
+
+// everyProfilesPayloadFields is the union of the default sealed set of every
+// profile the protocol defines — what an unrecognised service type withholds.
+// Recomputed per call rather than cached in a package var: it is off the hot
+// path (only a service type outside the table reaches it) and a var would
+// re-introduce, as initialisation order, the staleness this exists to remove.
+func everyProfilesPayloadFields() []string {
+	var out []string
+	for _, p := range wire.Profiles() {
+		for _, f := range wire.DefaultSealedFieldsFor(p) {
+			if !slices.Contains(out, f) {
+				out = append(out, f)
+			}
+		}
+	}
+	return out
 }
 
 // WithPubkeyTTL sets how long a fetched provider enc key is cached and reused.
@@ -534,21 +527,37 @@ func (r *Router) Resolve(ctx context.Context, serviceType string, req wire.Reque
 }
 
 // upstreamURL is the router endpoint a sealed request of this service type is
-// POSTed to. Derived from the service type rather than fixed at construction:
+// POSTed to — the ROUTER, not the provider directly, because the router is the
+// centralized auth/billing point: it authenticates, then forwards to the pinned
+// provider (SPEC §4.4). Derived from the service type rather than fixed at
+// construction:
 // fixing it is how every sealed image request came to be POSTed to
 // /v1/chat/completions, where the router hands it to the chatbot handler and the
 // pinned image provider is not in the pool.
+//
+// The path now travels with the rest of the surface's row instead of being
+// re-derived here, which is the same fix one level up: that bug was possible
+// because the upstream path was a property of this Router while the profile was
+// a property of the Client, and nothing held the two together.
+//
+// A service type the table does not carry is REFUSED rather than defaulted.
+// There is no safe guess: falling back to chat would send the request to the
+// chat endpoint under the wrong pool. Note that the withheld set does not fail
+// here — sensitiveFieldsForServiceType still answers, over-strippingly, for a
+// service type this refuses, because the two questions have different safe
+// answers.
 func (r *Router) upstreamURL(serviceType string) (string, error) {
-	switch serviceType {
-	case DefaultServiceType:
-		return r.base + completionsPath, nil
-	case serviceTypeAnthropicChat:
-		return r.base + messagesPath, nil
-	case ServiceTypeTextToImage:
-		return r.base + imagesPath, nil
-	default:
+	ep, ok := endpoint.ByServiceType(serviceType)
+	if !ok {
 		return "", fmt.Errorf("no sealed upstream path for service type %q", serviceType)
 	}
+	// A row without an upstream path is a table bug, and the loud failure the old
+	// switch gave for an unknown type must survive the move: left unchecked, this
+	// would resolve to the bare router origin and POST the sealed request there.
+	if ep.UpstreamPath == "" {
+		return "", fmt.Errorf("endpoint row for service type %q has no upstream path", serviceType)
+	}
+	return r.base + ep.UpstreamPath, nil
 }
 
 // routeCandidates is the ranked preview list as a core.Candidates. It holds the
