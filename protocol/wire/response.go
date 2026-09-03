@@ -53,9 +53,19 @@ type ResponseE2EE struct {
 // frame; an empty set held for a whole stream would seal nothing on every
 // content frame. SealFrame refuses that (the frame's shape requires its content
 // field), so the mistake fails loudly rather than shipping cleartext.
+//
+// A profile with CONDITIONALLY sealed response fields (speech, §7.3) has no
+// profile-wide answer either, and yields the same empty set — for a reason worth
+// spelling out, because here the tempting answer is not merely incomplete but
+// LATENT. Returning `["text"]` would be valid for every `json` transcription and
+// invalid for every `verbose_json` one, so a broker holding it would pass all its
+// own testing and then fail 100% of verbose responses in production, the first
+// time a client asked for timestamps — after the upstream call, which is already
+// billed. An empty set fails on the very first request instead. Use
+// ResponseSealedFieldsForFrame, or pass nil to SealFrame.
 func DefaultResponseSealedFieldsFor(p Profile) []string {
 	s, err := p.spec()
-	if err != nil || s.responseFrames != nil {
+	if err != nil || s.responseFrames != nil || len(s.responseRequiredIfPresent) > 0 {
 		return []string{}
 	}
 	return slices.Clone(s.response)
@@ -75,13 +85,43 @@ func ResponseSealedFieldsForFrame(p Profile, frame Response) ([]string, error) {
 		return nil, err
 	}
 	if spec.responseFrames == nil {
-		return slices.Clone(spec.response), nil
+		return spec.responseFieldsFor(frame), nil
 	}
 	_, shape, err := spec.responseFrames.shapeOf(frame)
 	if err != nil {
 		return nil, fmt.Errorf("%s-profile: %w", p, err)
 	}
 	return shape.sealedFieldsFor(frame), nil
+}
+
+// responseFieldsFor is what a frame of a SINGLE-SHAPE profile must seal: the
+// profile's always-sealed set, plus each conditionally-sealed field this frame
+// actually carries.
+//
+// For chat and image responseRequiredIfPresent is empty and this is exactly the
+// former slices.Clone(spec.response) — the change is inert for them by
+// construction, not by a flag.
+//
+// It mirrors frameShape.sealedFieldsFor, and for the same reason: one function
+// serves both ends. At seal time the frame still holds what it is about to seal,
+// so a present `segments` is required; at open time a sealed one is already gone
+// from the cleartext, so it is not required — but one that is STILL there was
+// never sealed, and that is exactly the rejection the receiver owes (SPEC §12).
+func (s profileSpec) responseFieldsFor(frame Response) []string {
+	out := make([]string, 0, len(s.response)+len(s.responseRequiredIfPresent))
+	out = append(out, s.response...)
+	for _, f := range s.responseRequiredIfPresent {
+		if _, present := frame[f]; !present {
+			continue
+		}
+		// Defensive against a profile that lists a name in both sets: the union
+		// must not produce a duplicate, which validateResponseSealedFieldNames
+		// would then reject with a confusing message about the caller's set.
+		if !slices.Contains(out, f) {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 // IsTerminalResponseFrame reports whether this frame is one that ENDS a stream
@@ -302,6 +342,25 @@ func validateResponseUnboundFieldsFor(p Profile, unbound []string) error {
 			return fmt.Errorf("%q must stay bound for the %s profile: it carries %s, one level down where the profile-independent rule cannot see it, so an unbound one could be rewritten in transit and still verify", pc.field, p, pc.reads)
 		}
 	}
+	// And the fields a required quantity is LOCATED in, which is the same trap
+	// once more and in the direction the floor list cannot follow. That list is
+	// `usage` by name, so it protects `usage.output_images` and `usage.seconds`
+	// and nothing else: a profile whose quantity lives at a top-level `duration`
+	// satisfies every rule above while leaving the number an intermediary may
+	// rewrite — outside the AAD, so Open succeeds AND the §8 binding, which
+	// hashes that same AAD, comes out byte-identical.
+	//
+	// Derived from the locators rather than added to the floor by name, so the
+	// next profile that bills on a differently-named field is covered without
+	// anyone remembering to extend a list. This is the mechanised form of the
+	// SPEC §5.1 warning that its own table is written in field NAMES.
+	for _, q := range spec.requiredResponseCleartext {
+		for _, loc := range q.locators {
+			if slices.Contains(unbound, loc.field) {
+				return fmt.Errorf("%q must stay bound for the %s profile: it locates %s, and an unbound field is outside the AAD, so a router could restate the billed quantity with the client's Open and the §8 verification both still passing", loc.field, p, q.what)
+			}
+		}
+	}
 	return nil
 }
 
@@ -455,9 +514,32 @@ func validateResponseSealedFieldsForFrame(p Profile, frame Response, fields []st
 	if err := validateProtectedCleartextFor(p, spec, frame, fields); err != nil {
 		return err
 	}
+	// The fields a required quantity is LOCATED in, likewise for every profile
+	// and every frame. `usage` is already covered by the profile-independent
+	// floor, so only the names that floor cannot reach are checked here — a
+	// top-level `duration` being the case.
+	//
+	// This is not belt-and-braces over the §7.3 presence check, and the reason is
+	// alternation. With one locator, sealing it IS fail-closed: it disappears
+	// from the cleartext and the presence check refuses the frame. With two, a
+	// frame can seal `duration` and satisfy the requirement through a cleartext
+	// `usage.seconds` — so the presence check passes and the sealed locator is
+	// simply invisible. What that costs is the AGREEMENT rule: at seal time both
+	// values are in hand and a disagreement is caught, but at open time the
+	// sealed one is gone from the cleartext, so a client cannot compare them.
+	// Refusing the seal is what keeps both locators visible to the receiver, and
+	// therefore what makes the client's half of the agreement rule exist at all.
+	if err := validateQuantityLocatorsNotSealed(p, spec, fields); err != nil {
+		return err
+	}
 	rule := spec.responseFrames
 	if rule == nil {
-		return validateResponseSealedFieldsFor(p, fields)
+		if err := validateResponseSealedFieldsFor(p, fields); err != nil {
+			return err
+		}
+		// The conditional half, which needs the FRAME and so cannot live in the
+		// name-only validator above.
+		return validateResponseSealedIfPresent(p, spec, frame, fields)
 	}
 	if slices.Contains(fields, rule.discriminator) {
 		return fmt.Errorf("%s-profile frames must keep %q cleartext: it names the frame's shape, and every check on the frame keys off it", p, rule.discriminator)
@@ -486,6 +568,65 @@ func validateResponseSealedFieldsForFrame(p Profile, frame Response, fields []st
 		}
 	}
 	return validateNoCleartextContent(p, kind, *rule, frame, fields)
+}
+
+// validateQuantityLocatorsNotSealed rejects a sealed set that swallows a field
+// one of the profile's required quantities is located in.
+//
+// Names already on mustStayCleartextInResponse are skipped: `usage` is refused
+// by that floor with a message about the router's inputs, which is the right
+// message for it, and duplicating the rejection here would only change which
+// error a caller sees. What this adds is the names the floor cannot reach,
+// because the floor is a list of names and a locator can be any field the
+// profile declares.
+func validateQuantityLocatorsNotSealed(p Profile, spec profileSpec, fields []string) error {
+	for _, q := range spec.requiredResponseCleartext {
+		for _, loc := range q.locators {
+			if slices.Contains(mustStayCleartextInResponse, loc.field) {
+				continue
+			}
+			if slices.Contains(fields, loc.field) {
+				return fmt.Errorf("%q must stay CLEARTEXT for the %s profile: it locates %s, and sealing it hides the value from the router that bills on it — and, where a quantity has alternative locators, from the client that would otherwise check the two against each other", loc.field, p, q.what)
+			}
+		}
+	}
+	return nil
+}
+
+// validateResponseSealedIfPresent enforces a single-shape profile's
+// conditionally-sealed response fields (SPEC §7.3): a field that need not
+// exist, but MUST be sealed whenever the frame carries it.
+//
+// It is the response-side twin of validatePayloadIfPresentFor, with the
+// receiving end swapped — the client is the half that holds here, where the
+// enclave is on the request side. The predicate is the same in both: a field
+// still present in the received cleartext was never sealed, because a sealer
+// removes what it seals.
+//
+// The speech profile is the case (`segments`, `words`, the response's inferred
+// `language`). A frame-typed profile expresses the same rule per shape through
+// frameShape.sealIfPresent and does not come here.
+//
+// This is what makes conditional sealing enforceable rather than advisory: on
+// the seal side it stops a conforming enclave from shipping a transcript in the
+// clear, and on the open side it is the client's ONLY evidence that a
+// non-conforming one did — a router forwards such a frame unremarkably, and
+// nothing else in the chain has a reason to look.
+func validateResponseSealedIfPresent(p Profile, spec profileSpec, frame Response, fields []string) error {
+	if len(spec.responseRequiredIfPresent) == 0 {
+		return nil
+	}
+	sealed := toSet(fields)
+	for _, f := range spec.responseRequiredIfPresent {
+		if _, present := frame[f]; !present {
+			continue
+		}
+		if _, isSealed := sealed[f]; isSealed {
+			continue
+		}
+		return fmt.Errorf("%s-profile frame carries %q in cleartext: it is generated content and MUST be sealed whenever present", p, f)
+	}
+	return nil
 }
 
 // validateNoCleartextContent rejects a frame that carries any shape's content
@@ -548,42 +689,147 @@ func validateResponseCleartextFor(p Profile, frame Response) error {
 	if err != nil {
 		return err
 	}
-	for _, req := range spec.requiredResponseCleartext {
-		raw, ok := frame[req.field]
-		if !ok {
-			return fmt.Errorf("sealed %s response must carry cleartext %s: the sealed content cannot be billed on, and an absent count is indistinguishable from zero", p, req)
-		}
-		var obj map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &obj); err != nil {
-			return fmt.Errorf("sealed %s response field %q must be a JSON object carrying %s: %w", p, req.field, req, err)
-		}
-		v, ok := obj[req.key]
-		if !ok {
-			return fmt.Errorf("sealed %s response must carry cleartext %s: the sealed content cannot be billed on, and an absent count is indistinguishable from zero", p, req)
-		}
-		// A POINTER, and an integer one. Decoding JSON `null` into a bare numeric
-		// leaves the variable untouched and returns no error, so `null` read as a
-		// perfectly good 0 — the one value §7.1 spells out as legitimate, which is
-		// why it slipped past a check whose whole job is telling a real count from
-		// the absence of one. A pointer is nil for `null` and only for `null`.
-		//
-		// int64 rather than float64 so this is exactly as strict as the router's
-		// own `*int` parse. The protocol package must not accept a count its
-		// consumer will reject: that would let a conforming enclave seal a response
-		// (2.5 images, 1e3) the router then refuses to bill, turning a spec
-		// question into a 502 nobody can act on.
-		var n *int64
-		if err := json.Unmarshal(v, &n); err != nil {
-			return fmt.Errorf("sealed %s response %s must be a whole number: %w", p, req, err)
-		}
-		if n == nil {
-			return fmt.Errorf("sealed %s response %s is null: a count must be a whole number, and null is the absence of one, not a zero", p, req)
-		}
-		if *n < 0 {
-			return fmt.Errorf("sealed %s response %s must not be negative, got %d", p, req, *n)
+	for _, q := range spec.requiredResponseCleartext {
+		if err := validateCleartextQuantity(p, q, frame); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// validateCleartextQuantity enforces ONE required cleartext quantity: at least
+// one of its locators carries a value in the quantity's numeric domain, and any
+// others that are also present agree with it.
+//
+// "At least one" rather than "all": the locators are alternatives, because one
+// quantity has more than one place upstreams report it (§7.3 — `usage.seconds`
+// on a `json` transcription, a top-level `duration` on a `verbose_json` one that
+// carries no `usage` at all). "Any others agree" is the rule alternation brings
+// with it: a client opens one locator and a router bills another, so a frame
+// stating two different numbers is one response transacted at two prices.
+func validateCleartextQuantity(p Profile, q cleartextQuantity, frame Response) error {
+	// found records the value read from each locator that was present, so the
+	// agreement check below has something to compare and the error can name which
+	// locators disagreed.
+	//
+	// float64 for both numeric kinds, which is exact for every value either
+	// quantity can hold (a whole number up to 2^53, a duration in seconds). A
+	// future WHOLE quantity with alternative locators and values past 2^53 would
+	// need a kind-aware comparison; there is none today, and one alternative-free
+	// quantity (the image count) never reaches the comparison at all.
+	type reading struct {
+		locator cleartextNumber
+		value   float64
+	}
+	var found []reading
+
+	for _, loc := range q.locators {
+		raw, ok := frame[loc.field]
+		if !ok {
+			continue
+		}
+		// A top-level locator (empty key) IS the number; otherwise it is one level
+		// inside an object. A non-object where an object is expected is an error
+		// rather than a skip: the field is there and malformed, which is a
+		// different thing from the alternative not being used, and skipping it
+		// would let a frame satisfy the requirement through the OTHER locator while
+		// shipping garbage in this one for the router to read.
+		v := raw
+		if loc.key != "" {
+			var obj map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &obj); err != nil {
+				return fmt.Errorf("sealed %s response field %q must be a JSON object carrying %s: %w", p, loc.field, loc, err)
+			}
+			// A JSON `null` decodes into a map WITHOUT error, yielding a nil map — so
+			// it would have slipped past the line above and then read as "the key is
+			// not there", i.e. as this alternative simply being unused. That is the
+			// same `null`-reads-as-absence trap the numeric parse below documents,
+			// one level up, and it is worse here because `null` is the likeliest junk
+			// value an upstream emits for a block it did not populate: `"usage": 7`
+			// was correctly refused while `"usage": null` sealed cleanly. The field
+			// is PRESENT and is not an object, which is the error this branch exists
+			// to report.
+			if obj == nil {
+				return fmt.Errorf("sealed %s response field %q must be a JSON object carrying %s, got null: a null block is not the absence of the block, and %s cannot be read from it", p, loc.field, loc, loc)
+			}
+			inner, present := obj[loc.key]
+			if !present {
+				continue
+			}
+			v = inner
+		}
+		n, err := parseCleartextNumber(p, q, loc, v)
+		if err != nil {
+			return err
+		}
+		found = append(found, reading{locator: loc, value: n})
+	}
+
+	if len(found) == 0 {
+		return fmt.Errorf("sealed %s response must carry cleartext %s (%s): the sealed content cannot be billed on, and an absent value is indistinguishable from a genuine zero", p, q, q.what)
+	}
+	// Exact comparison, on purpose. Two JSON spellings of one number (12.5 and
+	// 12.50) decode to the same float64, so this only fires on values that really
+	// differ — and any real difference matters, since the two readers each believe
+	// their own locator.
+	for _, r := range found[1:] {
+		if r.value != found[0].value {
+			return fmt.Errorf("sealed %s response states %s twice and disagrees: %s = %v but %s = %v. One reader bills the first and another opens the second, so they must be the same number", p, q.what, found[0].locator, found[0].value, r.locator, r.value)
+		}
+	}
+	return nil
+}
+
+// parseCleartextNumber decodes one located value in a quantity's numeric domain.
+//
+// The pointer is load-bearing in both domains: decoding JSON `null` into a bare
+// numeric leaves the variable untouched and returns NO error, so `null` reads as
+// a perfectly good 0 — the one value §7.1 spells out as legitimate, which is why
+// it once slipped past a check whose whole job is telling a real value from the
+// absence of one. A pointer is nil for `null` and only for `null`.
+func parseCleartextNumber(p Profile, q cleartextQuantity, loc cleartextNumber, raw json.RawMessage) (float64, error) {
+	switch q.kind {
+	case numberWhole:
+		var n *int64
+		if err := json.Unmarshal(raw, &n); err != nil {
+			return 0, fmt.Errorf("sealed %s response %s must be a whole number: %w", p, loc, err)
+		}
+		if n == nil {
+			return 0, fmt.Errorf("sealed %s response %s is null: %s must be a whole number, and null is the absence of one, not a zero", p, loc, q.what)
+		}
+		if *n < 0 {
+			return 0, fmt.Errorf("sealed %s response %s must not be negative, got %d", p, loc, *n)
+		}
+		return float64(*n), nil
+	case numberFractional:
+		// A JSON STRING is rejected here, and that is a decision rather than a
+		// consequence of the decoder: consumers of this endpoint do tolerate
+		// `"12.5"` defensively against non-conforming providers, but a value that
+		// is sometimes a string is a value every implementation must write two
+		// parsers for, so the protocol does not bless the form. Unmarshal into
+		// *float64 refuses it, which is the behaviour we want and the reason there
+		// is no string fallback below.
+		var n *float64
+		if err := json.Unmarshal(raw, &n); err != nil {
+			return 0, fmt.Errorf("sealed %s response %s must be a JSON number (a quoted string is not accepted): %w", p, loc, err)
+		}
+		if n == nil {
+			return 0, fmt.Errorf("sealed %s response %s is null: %s must be a number, and null is the absence of one, not a zero", p, loc, q.what)
+		}
+		// No finiteness check, and that is checked rather than assumed: JSON has no
+		// Inf or NaN literal, and Go's decoder REFUSES a finite literal that
+		// overflows float64 ("cannot unmarshal number 1e400") rather than yielding
+		// +Inf. So a non-finite value cannot reach here through this decode, and a
+		// guard for it would be unreachable code claiming to defend something.
+		// Stated because "must be finite" is what §7.3 says, and the reason it
+		// needs no code is not self-evident.
+		if *n < 0 {
+			return 0, fmt.Errorf("sealed %s response %s must not be negative, got %v", p, loc, *n)
+		}
+		return *n, nil
+	default:
+		return 0, fmt.Errorf("sealed %s response %s: unknown numeric kind %d (a profile declared a quantity this package cannot check)", p, loc, q.kind)
+	}
 }
 
 // ResponseSealer seals a sequence of response frames under one HPKE context (the
