@@ -11,9 +11,10 @@
 // off a bool and a nil check. Five spellings of one split, in four packages, and
 // adding a surface meant finding all of them.
 //
-// This package carries the rows core, openaiproxy and route read. The
-// hand-written enumerations in proxycli and the gateway are still outstanding —
-// see All.
+// Every layer reads the rows: core seals under a row's profile, openaiproxy
+// serves a row, route resolves a row's upstream and withheld set, proxycli builds
+// a client per served row, the gateway mounts every row, and metrics labels by
+// row.
 //
 // The cost of that was not hypothetical. route.upstreamURL records one instance
 // (every sealed image request POSTed to /v1/chat/completions, because the
@@ -94,14 +95,12 @@ var Image = Endpoint{
 	PreSeal:      imagePreSeal,
 }
 
-// All is every surface this module knows how to seal.
-//
-// It is NOT yet the thing that mounts them. The gateway and proxycli still name
-// Chat and Image one at a time, so adding a row here does not by itself serve a
-// surface — replacing those hand-written enumerations is the last step. What a
-// row DOES already decide is everything about how the surface behaves once
-// mounted: its profile, its sealed set, its service type, its upstream path,
-// whether it streams, and its pre-seal normalisation.
+// All is every surface this module knows how to seal, and adding a row here is
+// what makes a surface exist. The gateway mounts every row — as the sealed
+// handler when its build serves it, as an explicit refusal when not, never left
+// to the cleartext catch-all — proxycli builds a client and validates the
+// operator's field flags per served row, the warmer enumerates each row's fleet,
+// and metrics gives each row its own label. Nothing else enumerates them.
 //
 // The Anthropic profile is deliberately ABSENT even though protocol/wire carries
 // a complete ProfileAnthropic. The router's route-preview API rejects that

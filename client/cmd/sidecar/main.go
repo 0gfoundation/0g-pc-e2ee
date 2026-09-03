@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/cmd/internal/proxycli"
+	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 )
 
@@ -59,7 +60,7 @@ func main() {
 	// debugging and never leaves the user's machine (localhost); the gateway
 	// deliberately does not do this. The access-log middleware is the same one the
 	// gateway runs — no reason for the local form to log differently.
-	handler := openaiproxy.LogRequests(logger, openaiproxy.Handler(built.Client, openaiproxy.WithVerboseUpstreamErrors()))
+	handler := openaiproxy.LogRequests(logger, openaiproxy.Handler(built.Clients[endpoint.Chat.Path], openaiproxy.WithVerboseUpstreamErrors()))
 	srv := &http.Server{
 		Addr:              *f.Listen,
 		Handler:           handler,

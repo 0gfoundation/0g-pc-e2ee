@@ -13,7 +13,7 @@ import (
 // with the given readiness func.
 func readyzBody(t *testing.T, ready func() error) (int, string) {
 	t.Helper()
-	gw := httptest.NewServer(newHandler(routeClient(), nil, mustURL(t, "http://router.unused"),
+	gw := httptest.NewServer(newHandler(sealedClients(routeClient(), nil), mustURL(t, "http://router.unused"),
 		testOrigins(), "", "", noInFlightCap, nil, nil, ready, discardLogger()))
 	defer gw.Close()
 
@@ -72,7 +72,7 @@ func TestReadyz_NotServedByRouterPassthrough(t *testing.T) {
 	}))
 	defer router.Close()
 
-	gw := httptest.NewServer(newHandler(routeClient(), nil, mustURL(t, router.URL),
+	gw := httptest.NewServer(newHandler(sealedClients(routeClient(), nil), mustURL(t, router.URL),
 		testOrigins(), "", "", noInFlightCap, nil, nil,
 		func() error { return errors.New("not ready") }, discardLogger()))
 	defer gw.Close()
@@ -93,7 +93,7 @@ func TestReadyz_NotServedByRouterPassthrough(t *testing.T) {
 // Widening /healthz to cover readiness would break the container healthcheck that
 // compose gates dstack-ingress startup on, so it must stay independent.
 func TestHealthz_UnaffectedByReadiness(t *testing.T) {
-	gw := httptest.NewServer(newHandler(routeClient(), nil, mustURL(t, "http://router.unused"),
+	gw := httptest.NewServer(newHandler(sealedClients(routeClient(), nil), mustURL(t, "http://router.unused"),
 		testOrigins(), "", "", noInFlightCap, nil, nil,
 		func() error { return errors.New("not ready") }, discardLogger()))
 	defer gw.Close()

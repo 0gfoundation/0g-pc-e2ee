@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
@@ -190,8 +191,11 @@ func TestBuildDirectMode(t *testing.T) {
 		t.Fatalf("parse: %v", err)
 	}
 	built := f.Build("test", testLogger())
-	if built.Client == nil {
-		t.Fatal("direct mode should build a client")
+	if built.Clients[endpoint.Chat.Path] == nil {
+		t.Fatal("direct mode should build a chat client")
+	}
+	if len(built.Clients) != 1 {
+		t.Errorf("direct mode must build chat ONLY (its broker paths are chat-shaped), got %d clients", len(built.Clients))
 	}
 	if built.router != nil {
 		t.Error("direct mode should not build a router")
@@ -357,10 +361,10 @@ func TestSealFieldsExplicitnessDrivesTheRouteOption(t *testing.T) {
 func TestValidateFieldSetsCoversTheImageProfile(t *testing.T) {
 	chatSeal := wire.DefaultSealedFieldsFor(wire.ProfileChat)
 	for _, tc := range []struct {
-		name         string
-		unbound      []string
-		servesImages bool
-		wantErr      bool
+		name    string
+		unbound []string
+		serves  []endpoint.Endpoint // nil = chat only, the sidecar's shape
+		wantErr bool
 	}{
 		{
 			name:    "unbinding the image prompt is fine for a chat-only binary",
@@ -369,10 +373,10 @@ func TestValidateFieldSetsCoversTheImageProfile(t *testing.T) {
 		{
 			// "prompt" is the image profile's whole sealed payload: unbound and sealed
 			// at once is a contradiction, and every image seal would reject it.
-			name:         "...and refused once the binary also serves images",
-			unbound:      []string{"model", "prompt"},
-			servesImages: true,
-			wantErr:      true,
+			name:    "...and refused once the binary also serves images",
+			unbound: []string{"model", "prompt"},
+			serves:  endpoint.All,
+			wantErr: true,
 		},
 		{
 			name:    "unbinding response_format is fine for a chat-only binary",
@@ -381,24 +385,28 @@ func TestValidateFieldSetsCoversTheImageProfile(t *testing.T) {
 		{
 			// Pinned cleartext: unbound puts it outside the AAD, where an intermediary
 			// could rewrite "b64_json" to "url" and have the enclave accept it.
-			name:         "...and refused once the binary also serves images",
-			unbound:      []string{"model", "response_format"},
-			servesImages: true,
-			wantErr:      true,
+			name:    "...and refused once the binary also serves images",
+			unbound: []string{"model", "response_format"},
+			serves:  endpoint.All,
+			wantErr: true,
 		},
 		{
-			name:         "an ordinary unbound field passes both profiles",
-			unbound:      []string{"model", "user"},
-			servesImages: true,
+			name:    "an ordinary unbound field passes every served profile",
+			unbound: []string{"model", "user"},
+			serves:  endpoint.All,
 		},
 		{
-			name:         "the shipped default passes both profiles",
-			unbound:      wire.DefaultUnboundFields(),
-			servesImages: true,
+			name:    "the shipped default passes every served profile",
+			unbound: wire.DefaultUnboundFields(),
+			serves:  endpoint.All,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			which, err := validateFieldSets(chatSeal, tc.unbound, tc.servesImages)
+			serves := tc.serves
+			if serves == nil {
+				serves = []endpoint.Endpoint{endpoint.Chat}
+			}
+			which, err := validateFieldSets(chatSeal, tc.unbound, serves)
 			if got := err != nil; got != tc.wantErr {
 				t.Fatalf("validateFieldSets error = %v (%v), want %v", got, err, tc.wantErr)
 			}
@@ -409,20 +417,65 @@ func TestValidateFieldSetsCoversTheImageProfile(t *testing.T) {
 	}
 }
 
-// The gateway serves images and the sidecar does not, so only the gateway builds
-// an image client. The same flag also picks the router's warm service types —
-// warming a fleet the binary will never seal to buys nothing and takes on that
+// Direct-broker mode serves chat alone whatever the binary asked for, and — the
+// part that was broken — validates the operator's flags against chat alone too.
+// The served set used to be decided twice: the Serves list drove validation
+// while the direct branch hard-coded chat, so a direct-mode gateway (which asks
+// for endpoint.All) refused to start on `-unbound-fields=model,response_format`,
+// a setting that is only invalid for the image profile it would never seal
+// under. Both halves are asserted: it starts, and it built exactly one client.
+func TestBuildDirectModeServesAndValidatesChatOnly(t *testing.T) {
+	fs := flag.NewFlagSet("t", flag.ContinueOnError)
+	f := RegisterFlags(fs, "ZG_TEST", ":0")
+	if err := fs.Parse([]string{
+		"-provider-url", "https://broker.example/v1",
+		"-unbound-fields", "model,response_format", // invalid for image, fine for chat
+	}); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	// Build exits the process on a validation failure, so reaching the assertions
+	// below IS the first half of the test.
+	built := f.Build("test", testLogger(), Serves(endpoint.All...))
+	if len(built.Clients) != 1 || built.Clients[endpoint.Chat.Path] == nil {
+		t.Errorf("direct mode must build the chat client and nothing else, got %d clients", len(built.Clients))
+	}
+}
+
+// Composing Serves more than once must not warm a fleet twice or validate a
+// profile twice: the served set is de-duplicated by Path before anything reads
+// it. Only the clients map is observable from here (the warm list is internal
+// to route), so that is what is asserted.
+func TestBuildServesDeduplicates(t *testing.T) {
+	fs := flag.NewFlagSet("t", flag.ContinueOnError)
+	f := RegisterFlags(fs, "ZG_TEST", ":0")
+	if err := fs.Parse(nil); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	built := f.Build("test", testLogger(), Serves(endpoint.All...), Serves(endpoint.Chat), Serves(endpoint.All...))
+	if len(built.Clients) != len(endpoint.All) {
+		t.Errorf("built %d clients from a triple-composed Serves, want %d", len(built.Clients), len(endpoint.All))
+	}
+	got := servedSurfaces([]endpoint.Endpoint{endpoint.Chat, endpoint.Image, endpoint.Chat}, false)
+	if len(got) != 2 || got[0].Path != endpoint.Chat.Path || got[1].Path != endpoint.Image.Path {
+		t.Errorf("servedSurfaces must de-duplicate preserving first-seen order, got %v", got)
+	}
+}
+
+// A client is built per served row and only per served row: the gateway passes
+// endpoint.All and gets one per surface, the sidecar passes nothing and gets
+// chat alone. The same list picks the router's warm service types — warming a
+// fleet the binary will never seal to buys nothing and takes on that
 // enumeration's failure modes for free — but that list is not observable from
-// outside route, so this asserts only the client. What WithWarmServiceTypes then
+// outside route, so this asserts only the clients. What WithWarmServiceTypes then
 // does with the list is covered in route (TestWarmer_OneFailingServiceType...).
-func TestBuildImageClientFollowsWhatTheBinaryServes(t *testing.T) {
+func TestBuildClientsFollowWhatTheBinaryServes(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		opts []BuildOption
-		want bool
+		want []endpoint.Endpoint
 	}{
-		{"sidecar-shaped: chat only", nil, false},
-		{"gateway-shaped: also images", []BuildOption{ServesImages()}, true},
+		{"sidecar-shaped: chat only", nil, []endpoint.Endpoint{endpoint.Chat}},
+		{"gateway-shaped: every row", []BuildOption{Serves(endpoint.All...)}, endpoint.All},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fs := flag.NewFlagSet("t", flag.ContinueOnError)
@@ -431,8 +484,13 @@ func TestBuildImageClientFollowsWhatTheBinaryServes(t *testing.T) {
 				t.Fatalf("parse: %v", err)
 			}
 			built := f.Build("test", testLogger(), tc.opts...)
-			if got := built.ImageClient != nil; got != tc.want {
-				t.Errorf("ImageClient non-nil = %v, want %v", got, tc.want)
+			if len(built.Clients) != len(tc.want) {
+				t.Errorf("built %d clients, want %d", len(built.Clients), len(tc.want))
+			}
+			for _, ep := range tc.want {
+				if built.Clients[ep.Path] == nil {
+					t.Errorf("no client for served surface %s", ep.Path)
+				}
 			}
 		})
 	}

@@ -13,6 +13,7 @@ import (
 	dto "github.com/prometheus/client_model/go"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 )
 
 // RouteLabel must map only the known served routes to themselves and collapse
@@ -21,6 +22,7 @@ import (
 func TestRouteLabel(t *testing.T) {
 	cases := map[string]string{
 		"/v1/chat/completions":       "/v1/chat/completions",
+		"/v1/images/generations":     "/v1/images/generations", // was "other" from #107 until the table drove this
 		"/healthz":                   "/healthz",
 		"/quote":                     "other", // no longer a gateway route (#59); proxied to router
 		"/v1/models":                 "other",
@@ -35,6 +37,11 @@ func TestRouteLabel(t *testing.T) {
 		"/evidences/cert-example.io.pem": "/evidences/",
 		"/evidences/../etc/passwd":       "/evidences/",
 		"/evidencesfoo":                  "other", // prefix match must not be a substring match
+	}
+	// Every sealed surface gets its own label — asserted over the table so a new
+	// row cannot ship labelled "other" the way images did.
+	for _, ep := range endpoint.All {
+		cases[ep.Path] = ep.Path
 	}
 	for path, want := range cases {
 		if got := RouteLabel(path); got != want {

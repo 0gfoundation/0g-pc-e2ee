@@ -13,10 +13,12 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 	"github.com/0gfoundation/0g-pc-e2ee/client/route"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
@@ -62,7 +64,7 @@ func mustURL(t *testing.T, raw string) *url.URL {
 }
 
 func TestGatewayHealthz(t *testing.T) {
-	gw := httptest.NewServer(newHandler(routeClient(), nil, mustURL(t, "http://router.unused"), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
+	gw := httptest.NewServer(newHandler(sealedClients(routeClient(), nil), mustURL(t, "http://router.unused"), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
 	defer gw.Close()
 
 	resp, err := http.Get(gw.URL + "/healthz")
@@ -82,7 +84,7 @@ func TestGatewayHealthz(t *testing.T) {
 // unreachable, so reaching the core would surface as a 502, not the 401/403 the
 // gate returns), while /healthz stays open for the container probe.
 func TestGatewayAuthGateWiring(t *testing.T) {
-	gw := httptest.NewServer(newHandler(routeClient(), nil, mustURL(t, "http://router.unused"), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
+	gw := httptest.NewServer(newHandler(sealedClients(routeClient(), nil), mustURL(t, "http://router.unused"), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
 	defer gw.Close()
 
 	post := func(t *testing.T, auth string) int {
@@ -127,7 +129,7 @@ func TestGatewayAuthGateWiring(t *testing.T) {
 // error against an unreachable one, and it must derive the port from the same
 // -listen value the server binds.
 func TestGatewayHealthProbe(t *testing.T) {
-	gw := httptest.NewServer(newHandler(routeClient(), nil, mustURL(t, "http://router.unused"), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
+	gw := httptest.NewServer(newHandler(sealedClients(routeClient(), nil), mustURL(t, "http://router.unused"), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
 	defer gw.Close()
 
 	// Healthy: probe the live server's /healthz directly.
@@ -226,7 +228,7 @@ func TestGatewayRouteMode(t *testing.T) {
 	defer router.Close()
 
 	client := core.NewWithResolver(route.New(router.URL))
-	gw := httptest.NewServer(newHandler(client, nil, mustURL(t, router.URL), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
+	gw := httptest.NewServer(newHandler(sealedClients(client, nil), mustURL(t, router.URL), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
 	defer gw.Close()
 
 	userReq := `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`
@@ -311,7 +313,7 @@ func TestGatewayRoutesOtherRequestsToRouter(t *testing.T) {
 	router := httptest.NewServer(routerMux)
 	defer router.Close()
 
-	gw := httptest.NewServer(newHandler(routeClient(), nil, mustURL(t, router.URL), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
+	gw := httptest.NewServer(newHandler(sealedClients(routeClient(), nil), mustURL(t, router.URL), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
 	defer gw.Close()
 
 	req, _ := http.NewRequest(http.MethodGet, gw.URL+"/v1/models?limit=1", nil)
@@ -359,7 +361,7 @@ func TestGatewayRouterPassthroughUnreachable(t *testing.T) {
 	deadURL := dead.URL
 	dead.Close()
 
-	gw := httptest.NewServer(newHandler(routeClient(), nil, mustURL(t, deadURL), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
+	gw := httptest.NewServer(newHandler(sealedClients(routeClient(), nil), mustURL(t, deadURL), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
 	defer gw.Close()
 
 	resp, err := http.Get(gw.URL + "/v1/models")
@@ -421,7 +423,7 @@ func TestGatewayAccessLog(t *testing.T) {
 		http.Error(w, "nope", http.StatusNotImplemented)
 	}))
 	defer upstream.Close()
-	gw := httptest.NewServer(newHandler(routeClient(), nil, mustURL(t, upstream.URL), testOrigins(), "", "", noInFlightCap, nil, nil, nil, logger))
+	gw := httptest.NewServer(newHandler(sealedClients(routeClient(), nil), mustURL(t, upstream.URL), testOrigins(), "", "", noInFlightCap, nil, nil, nil, logger))
 	defer gw.Close()
 
 	// A health probe must not produce a log line.
@@ -579,58 +581,77 @@ func splitLogLines(s string) []string {
 	return out
 }
 
-// TestGatewayRefusesSealedImagesWithoutAnImageClient: in direct-broker mode there
-// is no image client, and the sealed image route must answer 501 rather than be
-// left unmounted.
+// TestGatewayRefusesEveryUnservedSealedSurface: a row of endpoint.All this build
+// holds no client for (direct-broker mode serves chat alone) must answer 501
+// rather than be left unmounted — and that must hold for EVERY row, not just the
+// one someone remembered to write an else-branch for.
 //
 // Unmounted is NOT inert here, which is the whole point of the test. The catch-all
 // is a reverse proxy to the router and routerTarget is parsed in every mode, so an
-// unmounted /v1/images/generations does not 404 — it forwards the caller's PROMPT
-// to the router in cleartext, which is the one thing this gateway exists to
-// prevent. So the assertion is in two halves: the client sees a refusal, and the
+// unmounted sealed path does not 404 — it forwards the caller's PROMPT to the
+// router in cleartext, which is the one thing this gateway exists to prevent. So
+// the assertion is in two halves per row: the client sees a refusal, and the
 // router never saw the request at all.
-func TestGatewayRefusesSealedImagesWithoutAnImageClient(t *testing.T) {
-	var routerSaw []string
+//
+// Driven with NO clients so every row takes the refusal branch, and over the
+// table rather than a list here, so a row added to endpoint.All is covered the
+// day it lands. Before the mount loop this was an image-only test guarding a
+// hand-written image-only else-branch; a third surface would have had neither.
+func TestGatewayRefusesEveryUnservedSealedSurface(t *testing.T) {
+	var (
+		mu        sync.Mutex
+		routerSaw []string
+	)
 	router := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		routerSaw = append(routerSaw, r.URL.Path)
+		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"data":[]}`))
 	}))
 	defer router.Close()
 
-	gw := httptest.NewServer(newHandler(routeClient(), nil, mustURL(t, router.URL), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
+	gw := httptest.NewServer(newHandler(map[string]*core.Client{}, mustURL(t, router.URL), testOrigins(), "", "", noInFlightCap, nil, nil, nil, discardLogger()))
 	defer gw.Close()
 
-	req, _ := http.NewRequest(http.MethodPost, gw.URL+"/v1/images/generations",
-		strings.NewReader(`{"model":"z-image","prompt":"my secret prompt"}`))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer sk-user-key")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("post /v1/images/generations: %v", err)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
+	for _, ep := range endpoint.All {
+		t.Run(ep.Path, func(t *testing.T) {
+			req, _ := http.NewRequest(http.MethodPost, gw.URL+ep.Path,
+				strings.NewReader(`{"model":"m","prompt":"my secret prompt","messages":[{"role":"user","content":"my secret prompt"}]}`))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer sk-user-key")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("post %s: %v", ep.Path, err)
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
 
-	if resp.StatusCode != http.StatusNotImplemented {
-		t.Errorf("status: got %d, want 501 (body %s)", resp.StatusCode, body)
-	}
-	if len(routerSaw) != 0 {
-		t.Fatalf("the prompt was forwarded to the router in cleartext: paths %v", routerSaw)
-	}
-	// The refusal uses the same JSON error envelope as every other gateway error,
-	// so a thin client parses it without a special case.
-	var env struct {
-		Error struct {
-			Message string `json:"message"`
-			Type    string `json:"type"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(body, &env); err != nil {
-		t.Fatalf("refusal body is not the standard error envelope: %v (%s)", err, body)
-	}
-	if env.Error.Message == "" {
-		t.Errorf("refusal carries no message: %s", body)
+			if resp.StatusCode != http.StatusNotImplemented {
+				t.Errorf("status: got %d, want 501 (body %s)", resp.StatusCode, body)
+			}
+			mu.Lock()
+			saw := append([]string(nil), routerSaw...)
+			mu.Unlock()
+			if len(saw) != 0 {
+				t.Fatalf("the prompt was forwarded to the router in cleartext: paths %v", saw)
+			}
+			// The refusal uses the same JSON error envelope as every other gateway
+			// error, so a thin client parses it without a special case — and names
+			// the path, so the caller learns which surface this build lacks.
+			var env struct {
+				Error struct {
+					Message string `json:"message"`
+					Type    string `json:"type"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(body, &env); err != nil {
+				t.Fatalf("refusal body is not the standard error envelope: %v (%s)", err, body)
+			}
+			if !strings.Contains(env.Error.Message, ep.Path) {
+				t.Errorf("refusal must name the surface, got %q", env.Error.Message)
+			}
+		})
 	}
 }
 
@@ -671,7 +692,7 @@ func TestSealedRoutesShareOneInFlightLimiter(t *testing.T) {
 	// Chat holds the slot; the image client is ordinary — the point is that the
 	// image ROUTE cannot find a slot, not that the image client is special.
 	gw := httptest.NewServer(newHandler(
-		core.NewWithResolver(blocker), routeClient(),
+		sealedClients(core.NewWithResolver(blocker), routeClient()),
 		mustURL(t, "http://router.unused"), testOrigins(), "", "",
 		1, nil, nil, nil, discardLogger()))
 	// Release BEFORE Close: httptest's Close waits for outstanding requests, and
@@ -715,4 +736,18 @@ func TestSealedRoutesShareOneInFlightLimiter(t *testing.T) {
 	if resp.Header.Get("Retry-After") == "" {
 		t.Errorf("a shed response must carry Retry-After (body %s)", body)
 	}
+}
+
+// sealedClients is the map newHandler takes, built from the two clients most
+// tests think in terms of. nil for either leaves that surface unserved, which the
+// gateway then mounts as an explicit refusal.
+func sealedClients(chat, image *core.Client) map[string]*core.Client {
+	m := map[string]*core.Client{}
+	if chat != nil {
+		m[endpoint.Chat.Path] = chat
+	}
+	if image != nil {
+		m[endpoint.Image.Path] = image
+	}
+	return m
 }
