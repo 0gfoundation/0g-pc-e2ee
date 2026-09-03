@@ -205,6 +205,7 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("POST /v1/routing/preview", s.handlePreview)
 	mux.HandleFunc("POST /v1/chat/completions", s.handleCompletions)
 	mux.HandleFunc("POST /v1/images/generations", s.handleImages)
+	mux.HandleFunc("POST /v1/messages", s.handleMessages)
 	mux.HandleFunc("GET /v1/providers", s.handleProviders)
 	// Provider-broker surface (reached at the endpoint the preview advertises).
 	mux.HandleFunc("GET /v1/e2ee/pubkey", s.handlePubkey)
