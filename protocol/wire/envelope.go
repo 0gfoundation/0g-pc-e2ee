@@ -582,13 +582,30 @@ var profiles = map[Profile]profileSpec{
 	},
 	ProfileSpeech: {
 		// The audio. Voice is biometric, so a sealed set omitting it defeats the
-		// profile entirely; `filename`, `language` and `prompt` are payload of
-		// lesser degree and ride in the default set. They are OPTIONAL fields, so
-		// the default is a set to filter by presence, exactly as chat's `tools`
-		// is — SealRequestFor refuses a sealed field the request does not have,
-		// and DefaultSealedFieldsFor documents that the caller filters.
-		required: fieldFileBase64,
-		request:  []string{fieldFileBase64, fieldFilename, fieldLanguage, fieldPrompt},
+		// profile entirely. `filename`, `language` and `prompt` are payload of
+		// lesser degree, and being in `request` only makes them a DEFAULT — which
+		// a default alone cannot enforce, since it is droppable. They are
+		// therefore also requiredIfPresent, the same treatment Anthropic's
+		// top-level `system` gets and for the same reason: each is optional, so
+		// `required` would reject every request that omits one, while a mere
+		// default lets a sender keep it in the cleartext half with every
+		// unconditional check still passing.
+		//
+		// Getting this wrong is quiet, and it undercuts the profile's own
+		// argument. `filename` is the clearest case: as a multipart part header
+		// it is readable by every intermediary today, and JSON-ifying the request
+		// is what makes sealing it POSSIBLE — but possible is not required, and
+		// without this line a conforming envelope could still hand
+		// "board-meeting-2026Q3.m4a" to the router in the clear.
+		//
+		// `language` is the weakest of the three and is included anyway: a
+		// request hint is low-entropy (one of a hundred codes) but it is still
+		// information about what was said, the router does not route on it, and
+		// sealing it costs nothing. There is no reason to leave it readable, and
+		// "no reason to seal" is not the standard this profile is held to.
+		required:          fieldFileBase64,
+		requiredIfPresent: []string{fieldFilename, fieldLanguage, fieldPrompt},
+		request:           []string{fieldFileBase64, fieldFilename, fieldLanguage, fieldPrompt},
 		// `text` is the transcript and is always there. The other three are
 		// conditional and therefore NOT in this set — see
 		// responseRequiredIfPresent for why listing them here would be wrong

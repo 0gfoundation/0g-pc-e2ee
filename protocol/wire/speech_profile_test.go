@@ -128,6 +128,65 @@ func TestSpeechProfileRejectsSealedSetWithoutAudio(t *testing.T) {
 	}
 }
 
+// `filename`, `language` and `prompt` are CONDITIONALLY REQUIRED, not merely
+// defaulted: a default is droppable, so without this a conforming envelope could
+// hand the filename to the router in the clear — which would undercut the
+// profile's own argument for JSON-ifying the request in the first place.
+//
+// Both ends, and the enclave's half is the load-bearing one: a third-party
+// client runs no seal-time check.
+func TestSpeechConditionalPayloadFieldsMustBeSealedWhenPresent(t *testing.T) {
+	for _, field := range []string{"filename", "language", "prompt"} {
+		t.Run(field, func(t *testing.T) {
+			priv, pub, ephPub := speechKeys(t)
+
+			// A sender that seals only the audio and leaves this field readable.
+			_, err := wire.SealRequestFor(wire.ProfileSpeech, pub, mustReq(t, sampleSpeechReq),
+				[]string{"file_base64"}, testProvider, ephPub)
+			if err == nil {
+				t.Fatalf("a request carrying %q in cleartext must be refused at seal time", field)
+			}
+
+			// And the receiver's half, on an envelope built without the field so it
+			// can be added afterwards the way a third-party client would send it.
+			req := mustReq(t, sampleSpeechReq)
+			for _, f := range []string{"filename", "language", "prompt"} {
+				delete(req, f)
+			}
+			env, err := wire.SealRequestFor(wire.ProfileSpeech, pub, req,
+				[]string{"file_base64"}, testProvider, ephPub)
+			if err != nil {
+				t.Fatalf("seal without the optional fields: %v", err)
+			}
+			env[field] = json.RawMessage(`"leaked"`)
+
+			if _, err := wire.OpenRequestFor(wire.ProfileSpeech, priv, env); err == nil {
+				t.Fatalf("the enclave must refuse an envelope carrying %q in the clear", field)
+			} else if !strings.Contains(err.Error(), field) {
+				t.Errorf("the profile check should fire before the AEAD, naming the field; got %v", err)
+			}
+		})
+	}
+}
+
+// The flip side: they are OPTIONAL, so a request that omits them must still
+// seal. `required` would have rejected this.
+func TestSpeechConditionalPayloadFieldsMayBeAbsent(t *testing.T) {
+	priv, pub, ephPub := speechKeys(t)
+	req := mustReq(t, sampleSpeechReq)
+	for _, f := range []string{"filename", "language", "prompt"} {
+		delete(req, f)
+	}
+
+	env, err := wire.SealRequestFor(wire.ProfileSpeech, pub, req, []string{"file_base64"}, testProvider, ephPub)
+	if err != nil {
+		t.Fatalf("a request with only the audio must seal: %v", err)
+	}
+	if _, err := wire.OpenRequestFor(wire.ProfileSpeech, priv, env); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // response_format: a pin with TWO permitted values (SPEC §5.3.2)
 // ---------------------------------------------------------------------------

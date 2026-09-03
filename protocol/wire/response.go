@@ -504,6 +504,24 @@ func validateResponseSealedFieldsForFrame(p Profile, frame Response, fields []st
 	if err := validateProtectedCleartextFor(p, spec, frame, fields); err != nil {
 		return err
 	}
+	// The fields a required quantity is LOCATED in, likewise for every profile
+	// and every frame. `usage` is already covered by the profile-independent
+	// floor, so only the names that floor cannot reach are checked here — a
+	// top-level `duration` being the case.
+	//
+	// This is not belt-and-braces over the §7.3 presence check, and the reason is
+	// alternation. With one locator, sealing it IS fail-closed: it disappears
+	// from the cleartext and the presence check refuses the frame. With two, a
+	// frame can seal `duration` and satisfy the requirement through a cleartext
+	// `usage.seconds` — so the presence check passes and the sealed locator is
+	// simply invisible. What that costs is the AGREEMENT rule: at seal time both
+	// values are in hand and a disagreement is caught, but at open time the
+	// sealed one is gone from the cleartext, so a client cannot compare them.
+	// Refusing the seal is what keeps both locators visible to the receiver, and
+	// therefore what makes the client's half of the agreement rule exist at all.
+	if err := validateQuantityLocatorsNotSealed(p, spec, fields); err != nil {
+		return err
+	}
 	rule := spec.responseFrames
 	if rule == nil {
 		if err := validateResponseSealedFieldsFor(p, fields); err != nil {
@@ -540,6 +558,29 @@ func validateResponseSealedFieldsForFrame(p Profile, frame Response, fields []st
 		}
 	}
 	return validateNoCleartextContent(p, kind, *rule, frame, fields)
+}
+
+// validateQuantityLocatorsNotSealed rejects a sealed set that swallows a field
+// one of the profile's required quantities is located in.
+//
+// Names already on mustStayCleartextInResponse are skipped: `usage` is refused
+// by that floor with a message about the router's inputs, which is the right
+// message for it, and duplicating the rejection here would only change which
+// error a caller sees. What this adds is the names the floor cannot reach,
+// because the floor is a list of names and a locator can be any field the
+// profile declares.
+func validateQuantityLocatorsNotSealed(p Profile, spec profileSpec, fields []string) error {
+	for _, q := range spec.requiredResponseCleartext {
+		for _, loc := range q.locators {
+			if slices.Contains(mustStayCleartextInResponse, loc.field) {
+				continue
+			}
+			if slices.Contains(fields, loc.field) {
+				return fmt.Errorf("%q must stay CLEARTEXT for the %s profile: it locates %s, and sealing it hides the value from the router that bills on it — and, where a quantity has alternative locators, from the client that would otherwise check the two against each other", loc.field, p, q.what)
+			}
+		}
+	}
+	return nil
 }
 
 // validateResponseSealedIfPresent enforces a single-shape profile's

@@ -222,7 +222,7 @@ signed-text format.)
 | `chat`  | `/v1/chat/completions` | `messages` | — | `messages`, `tools` | `choices` |
 | `image` | `/v1/images/generations` | `prompt` | `response_format` = `b64_json` (§7.1) | `prompt` | `data` |
 | `anthropic` | `/v1/messages` | `messages`, **and `system` whenever present** | — | `messages`, `system`, `tools` | per frame shape (§7.2) |
-| `speech` | `/v1/audio/transcriptions` (JSON-ified, §5.3) | `file_base64` | `response_format` ∈ {`json`, `verbose_json`} (§5.3.2); `stream` **refused** when `true` (§5.3.3) | `file_base64`, `filename`, `language`, `prompt` | `text`, **and `segments` / `words` / `language` whenever present** (§7.3) |
+| `speech` | `/v1/audio/transcriptions` (JSON-ified, §5.3) | `file_base64`, **and `filename` / `language` / `prompt` whenever present** | `response_format` ∈ {`json`, `verbose_json`} (§5.3.2); `stream` **refused** when `true` (§5.3.3) | `file_base64`, `filename`, `language`, `prompt` | `text`, **and `segments` / `words` / `language` whenever present** (§7.3) |
 
 A **pinned cleartext field** is one that stays readable but may hold only a
 **permitted value** in a sealed request — one value, or a small set of them
@@ -252,8 +252,14 @@ rejected. See §5.3.3 for the case (`stream` on the `speech` profile) and for wh
 reusing the pinned-field machinery for it rejects every conforming request.
 
 A **conditionally required payload field** is one that need not exist, but MUST
-be sealed whenever the request carries it. `system` on `/v1/messages` is the
-case: Anthropic puts the system prompt at the **top level** rather than as a
+be sealed whenever the request carries it. Two profiles use it: `system` on
+`/v1/messages`, and speech's `filename` / `language` / `prompt` (§5.3.2). It is
+the common shape of "optional but still payload", and reaching for a mere
+default instead is the mistake it exists to prevent — a default is droppable,
+so the field rides in the cleartext half with every unconditional check passing.
+
+`system` is the clearest case: Anthropic puts the system prompt at the **top
+level** rather than as a
 message with `role: "system"`, so it is payload of exactly the same kind as
 `messages` while being optional. Neither of the other two categories covers it —
 required-always rejects the (common) request that omits it, and a mere default is
@@ -292,7 +298,7 @@ to the §8.2 corollary:
 | `usage` (response) | no — the router bills on it | **no** — its value must be authenticated |
 | a pinned cleartext field (§5.1) | **no** — sealing it removes it from the cleartext the server reads, which then falls back to its own default | **no** — the pin would hold only at seal time |
 | the top-level field CONTAINING a billable value, when a profile nests one — Anthropic's `message` (§7.2 rule 4) | no — the router bills on what is inside it | **no** — same reason as `usage`, one level down |
-| **any field a profile's required cleartext quantity is LOCATED in** — speech's `usage` *and* its top-level `duration` (§7.3) | no — but this is already fail-closed: a sealed locator is absent from the cleartext, so the §7.3 presence check refuses the frame | **no** — same reason as `usage`, one level UP. The `usage` row above is a NAME, so it says nothing about a quantity that is not nested in it |
+| **any field a profile's required cleartext quantity is LOCATED in** — speech's `usage` *and* its top-level `duration` (§7.3) | **no** — refused explicitly, because with ALTERNATIVE locators it is not otherwise fail-closed: a frame may seal `duration` and still satisfy §7.3 through a cleartext `usage.seconds`, leaving the sealed value invisible and the agreement rule uncheckable by the receiver (see below) | **no** — same reason as `usage`, one level UP. The `usage` row above is a NAME, so it says nothing about a quantity that is not nested in it |
 | `model` | no — the router attributes on it | yes — the router rewrites the alias back; the resulting value is *not* authenticated (a known trade-off, see §9 and `DefaultUnboundFields`) |
 | `x_0g_trace` | n/a — router-injected | yes — nothing may trust it (§8.2) |
 
@@ -322,6 +328,18 @@ profile's declared quantity **locators**, not from a list of names — then a ne
 profile billing on a differently-named field is covered without anyone
 remembering to extend the list. The reference implementation does this
 (`validateResponseUnboundFieldsFor` walks `requiredResponseCleartext`).
+
+**A locator MUST NOT be sealed either, and with alternatives that does not follow
+from anything else.** With a single locator it would: sealing it removes it from
+the cleartext, so the §7.3 presence check refuses the frame. With two, a frame
+can seal `duration` and satisfy the requirement through a cleartext
+`usage.seconds` — the presence check passes and the sealed value is simply
+invisible. What that costs is §7.3's agreement rule: at seal time both values are
+in hand and a disagreement is caught, but at open time the sealed one is gone
+from the cleartext, so a client has nothing to compare and a non-conforming
+enclave could seal a `duration` that contradicts the number the router bills on.
+Refusing the seal is what keeps both locators visible to the receiver, and
+therefore what makes the client's half of the agreement rule exist at all.
 
 **Both ends enforce this, and for the "may be unbound" column the RECEIVER is
 the end that matters.** Checking only at seal time stops a conforming
@@ -462,17 +480,26 @@ holds on every multipart endpoint, including those with no profile yet.
 
 `/v1/audio/transcriptions`, JSON-ified. Fields, and where each must travel:
 
-| Field | Kind | Sealed by default | Why |
+| Field | Kind | Must be sealed | Why |
 |---|---|---|---|
-| `file_base64` | base64 audio | **yes — payload field** | The audio. Voice is biometric, so this is the profile's whole point; a sealed set that omits it MUST be refused (§12) |
-| `filename` | string | yes | Payload (see above) |
-| `language` | string | yes | The caller's own language hint; content-adjacent and useless for routing |
-| `prompt` | string | yes | A biasing text the caller writes — payload of the same kind as a chat prompt |
+| `file_base64` | base64 audio | **yes — payload field, always** | The audio. Voice is biometric, so this is the profile's whole point; a sealed set that omits it MUST be refused (§12) |
+| `filename` | string | **yes — whenever present** | Payload. As a multipart part header it is readable by every intermediary today, so JSON-ifying is what makes sealing it possible — and a mere default would leave "possible" as far as it got |
+| `language` | string | **yes — whenever present** | The caller's language hint. The weakest of the three (one of a hundred codes) and required anyway: it is still information about what was said, the router does not route on it, and sealing it costs nothing |
+| `prompt` | string | **yes — whenever present** | A biasing text the caller writes — payload of the same kind as a chat prompt |
 | `model` | string | no | The router routes and attributes on it (§5.1) |
 | `response_format` | string | **no — pinned to {`json`, `verbose_json`}** | Below |
 | `timestamp_granularities` | array | no | A knob selecting whether the response carries `words[]`; not content itself. What it turns on IS content, and §7.3 seals that |
 | `stream` | bool | **no — refused when `true`** | §5.3.3 |
 | `temperature`, and any field a future upstream adds | — | no (§5.1 default) | Not content |
+
+The three "whenever present" rows are **conditionally required payload fields**
+(§5.1), not defaults, and the distinction is the whole difference between a rule
+and a suggestion: a default is droppable, so a sender could keep `filename` in
+the cleartext half with every unconditional check still passing. Only
+`file_base64` is required unconditionally, because the other three are optional
+and a `required` entry would reject every request that omits one. This is
+Anthropic's top-level `system` treatment exactly, and the profile needs it for
+the same reason.
 
 **A sealed speech request MUST carry an explicit `response_format`, and its
 value MUST be one of `json` or `verbose_json`.** The pin is a **value set**, not
@@ -1114,7 +1141,7 @@ other, that party's column is the load-bearing one.
 | Invariant | Sender must refuse to build | Receiver must refuse to accept |
 |---|---|---|
 | sealed set covers the request payload field (§5.1) | yes | **yes — enclave** (a third-party client is not obliged to check) |
-| a conditionally required payload field present in the request is sealed — Anthropic's top-level `system` (§5.1) | yes | **yes — enclave** (it is the half that sees a third-party client's envelope, and the field's presence in the cleartext half IS the violation) |
+| a conditionally required payload field present in the request is sealed — Anthropic's top-level `system` (§5.1), speech's `filename` / `language` / `prompt` (§5.3.2) | yes | **yes — enclave** (it is the half that sees a third-party client's envelope, and the field's presence in the cleartext half IS the violation) |
 | a frame seals its shape's content field, and a shape with none seals nothing (§7.2) | yes | **yes — client** (otherwise the content rides in the clear and Open still succeeds) |
 | no frame carries another shape's content field in cleartext (§7.2) | yes | **yes — client** (this is what detects a mislabeled frame; the shape rules alone trust the sender's own label) |
 | `message_start.message.content` is empty (§7.2) | yes | **yes — client** (`message` must stay cleartext for the token count, so nothing else would notice content placed there) |
@@ -1124,7 +1151,7 @@ other, that party's column is the load-bearing one.
 | a stream ends with a frame marked `final` — for Anthropic, `message_stop` OR `error` (§7.2) | sealer marks it | **yes — client** (§7 already: a missing final frame is a truncation). An enclave that treats only `message_stop` as terminal emits an error stream the client must then reject. |
 | an unrecognized frame shape is refused (§7.2) | yes | **yes — both** (an unknown shape may carry content) |
 | pinned cleartext field: correct value, not sealed, not unbound (§5.1/§7.1) | yes | **yes — enclave** |
-| refused cleartext value absent — speech: `stream` is not `true`, and is neither sealed nor unbound (§5.3.3) | yes | **yes — enclave**. It is the only side that can decline: the alternative is emitting a stream whose frame shape this document does not define, which no receiver can then validate. Unlike a pinned field, ABSENCE is compliant — the check is on the value, so an implementation that reuses the pinned-field machinery here will reject every conforming request |
+| a REFUSED cleartext value is absent, and its field is neither sealed nor unbound — speech's `stream` (§5.3.3) | yes | **yes — enclave**, the only side that can decline: the alternative is emitting a stream whose frame shape this document does not define, which no receiver can then validate. Two traps, in opposite directions. Unlike a pinned field, ABSENCE IS COMPLIANT — the check is on the value, so an implementation that reuses the pinned-field machinery here rejects every conforming request. And the SEALED case is not the pinned field's either: §6 reconstructs `cleartext ∪ decrypted` and forwards it, so a sealed `stream: true` reaches the upstream while the router sees a non-streaming request |
 | on a multipart endpoint, a JSON-typed body is a valid envelope, and a multipart body carries no `_e2ee` part (§5.3.1) | n/a — the sender chooses one shape and uses it | **yes — enclave, both halves**. The second is the one that gets omitted: an envelope smuggled into a multipart part fails to parse as JSON, and "parse failure ⇒ not sealed" then forwards it in the clear. This is the only row whose violation leaks the payload with every other rule in this document still satisfied |
 | response sealed set covers the generated content (§7) | yes | **yes — client** (otherwise the content rides in the clear and Open still succeeds) |
 | `usage` not sealed (§7) | yes | client (loud either way: the router cannot bill) |
@@ -1133,8 +1160,7 @@ other, that party's column is the load-bearing one.
 | final frame carries the profile's billable cleartext — speech: `usage.seconds` OR top-level `duration`, written by the enclave even when the upstream omitted it (§7.3) | yes | **yes — client**, and more load-bearing than the image row. A router with no usage block on this endpoint estimates from the transcript text, which sealing makes empty, so it falls through to a flat constant: the omission does not under-bill quietly, it bills a fabricated number nothing downstream can distinguish from a real one |
 | where a billable cleartext has ALTERNATIVE locators, a frame carrying both states the same value — speech (§7.3) | **yes — sealer**, the only side that can compare both against the audio it measured | client (it can detect the disagreement, but not which locator is honest). The sealer's column is load-bearing because the two readers differ: a client opening one locator while a router bills the other would silently transact on different numbers for one response |
 | a conditionally sealed RESPONSE field is sealed when the frame carries it — speech: `segments` / `words` / `language` (§7.3) | yes | **yes — client**. A field still in the received cleartext was never sealed, and that is the receiver's only evidence: a router forwards such a frame unremarkably and the transcript rides through it in the clear. Same shape as the request side's conditional payload field, direction reversed |
-| a required quantity's LOCATOR field is not `unbound` — speech's `duration` as well as its `usage` (§5.2 table) | yes | **yes — client**, on every frame. The floor list is the name `usage`, so nothing else in this document reaches a top-level `duration`: derive the rule from the profile's locators rather than from names |
-| a REFUSED cleartext value is absent, and its field is neither sealed nor unbound — speech's `stream` (§5.3.3) | yes | **yes — enclave**. Note the sealed case is not the pinned field's: §6 reconstructs `cleartext ∪ decrypted` and forwards it, so a sealed `stream: true` reaches the upstream while the router sees a non-streaming request |
+| a required quantity's LOCATOR field is neither sealed nor `unbound` — speech's `duration` as well as its `usage` (§5.2 table) | yes | **yes — client**, on every frame. The floor list is the name `usage`, so nothing else in this document reaches a top-level `duration`: derive the rule from the profile's locators rather than from names. The SEALED half is not redundant with the presence check once a quantity has alternatives — see §5.2 |
 | decrypted keys == declared `sealed_fields` (§5.1/§6) | by construction | **yes** |
 | no sealed/cleartext collision (§5.1) | by construction | **yes** |
 | envelope `v` / `kem_id` supported (§9) | by construction | **yes** |

@@ -369,6 +369,56 @@ func TestSpeechClientRefusesAFrameThatFreesTheDuration(t *testing.T) {
 	}
 }
 
+// A locator MUST NOT be sealed either, and with ALTERNATIVES that does not
+// follow from the presence check: a frame can seal `duration` and still satisfy
+// §7.3 through a cleartext `usage.seconds`, so the presence check passes and the
+// sealed value is invisible.
+//
+// What refusing the seal buys is the client's half of the agreement rule. At
+// seal time both values are in hand and a disagreement is caught; at open time a
+// sealed locator is gone from the cleartext, so a client would have nothing to
+// compare and a non-conforming enclave could seal a `duration` contradicting the
+// number the router bills on.
+func TestSpeechDurationLocatorCannotBeSealed(t *testing.T) {
+	_, ephPub := ephKeys(t)
+	frame := mustResp(t, speechVerboseFrame)
+	frame["usage"] = json.RawMessage(`{"type":"duration","seconds":12.5}`)
+
+	_, err := wire.SealResponseFor(wire.ProfileSpeech, ephPub, frame,
+		[]string{"text", "segments", "language", "duration"})
+	if err == nil {
+		t.Fatal("sealing the duration locator must be refused even when the other locator stays cleartext")
+	}
+	if !strings.Contains(err.Error(), "duration") {
+		t.Errorf("error should name the field, got %v", err)
+	}
+}
+
+// The client half of the same rule, on a frame a non-conforming enclave would
+// emit: the sealed set names `duration` and the cleartext no longer has it.
+func TestSpeechClientRefusesAFrameThatSealedALocator(t *testing.T) {
+	ephPriv, ephPub := ephKeys(t)
+
+	sealed, err := wire.SealResponseFor(wire.ProfileSpeech, ephPub, mustResp(t, speechJSONFrame), nil)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	e2ee, err := sealed.E2EE()
+	if err != nil {
+		t.Fatalf("read _e2ee: %v", err)
+	}
+	e2ee.SealedFields = append(e2ee.SealedFields, "duration")
+	rewritten, err := json.Marshal(e2ee)
+	if err != nil {
+		t.Fatalf("marshal _e2ee: %v", err)
+	}
+	sealed[e2eeKeyForTest] = rewritten
+
+	if _, err := wire.OpenResponseFor(wire.ProfileSpeech, ephPriv, sealed); err == nil {
+		t.Fatal("the client must refuse a frame whose sealed set swallows a quantity locator")
+	}
+}
+
 // `usage` stays covered by the floor, so the derived rule must not have replaced
 // it — both paths have to hold.
 func TestSpeechUsageStillCannotBeDeclaredUnbound(t *testing.T) {
