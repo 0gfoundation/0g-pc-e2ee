@@ -674,11 +674,21 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 		// whether this build seals the surface itself has no bearing on whether its
 		// sub-resources may leak.
 		surface := ep.Path
+		// ...but it does bear on what the refusal may CLAIM. In direct-broker mode
+		// this build holds a chat client only, so telling an operator debugging
+		// /v1/messages there that "this gateway seals it at POST /v1/messages" is
+		// simply false, and it contradicts the POST refusal below on the same path.
+		// One reason, two accurate wordings, decided here where the answer is known.
+		served := clients[ep.Path] != nil
 		refuse := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			reason := fmt.Sprintf("this build does not serve the sealed %s surface at all", surface)
+			if served {
+				reason = fmt.Sprintf("it is part of the sealed %s surface, which this gateway seals only at POST %s",
+					surface, surface)
+			}
 			openaiproxy.WriteError(w, http.StatusNotImplemented, "gateway",
-				fmt.Sprintf("%s %s is not served by this gateway: it is part of the sealed %s surface, "+
-					"which this gateway seals only at POST %s, so it is refused rather than forwarded in the clear",
-					r.Method, r.URL.Path, surface, surface))
+				fmt.Sprintf("%s %s is not served by this gateway: %s, so it is refused rather than "+
+					"forwarded in the clear", r.Method, r.URL.Path, reason))
 		})
 		// The subtree, and the exact path on every method but the sealed POST. The
 		// method-less exact pattern is the LESS specific of the two on that path, so

@@ -1427,16 +1427,28 @@ func (r *Router) preview(ctx context.Context, ep endpoint.Endpoint, req wire.Req
 	// Anthropic request previews as OpenAI chat and can be pinned to a provider
 	// that does not serve /v1/messages at all.
 	//
+	// The ROW decides it, exactly as it decides service_type above, and a value in
+	// the request body is DROPPED rather than forwarded. That deletion is the
+	// load-bearing half: everything not withheld is copied into this payload, so
+	// before it a caller could put `"api_format": "anthropic"` in an ordinary
+	// /v1/chat/completions body and have it reach preview — narrowing the pool to
+	// providers that serve only /v1/messages while the request was sealed under the
+	// chat profile and POSTed to /v1/chat/completions. On an image request the same
+	// field is worse: the router refuses a surface on a non-chat service type, so
+	// the preview 400s and the request fails outright. Passing unknown body fields
+	// through is fine — the router ignores them — but this one it now acts on, so
+	// it is ours to state and not the caller's to influence.
+	//
 	// Sent only when the row names one. An omitted api_format and "openai" mean
 	// the same thing upstream — neither narrows, because OpenAI is the default
 	// surface every chat provider answers and many do not enumerate it in
 	// `api_formats` — so sending it for chat would add a field that cannot change
-	// the answer. It is also refused outright on a non-chat service type, which is
-	// the router telling us the axis does not exist there; the image row leaves it
-	// empty for that reason and not by omission.
+	// the answer.
 	if ep.APIFormat != "" {
 		apiFormatJSON, _ := json.Marshal(ep.APIFormat)
 		payload["api_format"] = apiFormatJSON
+	} else {
+		delete(payload, "api_format")
 	}
 
 	// One call-level observation on EVERY exit path, recorded by a defer rather than

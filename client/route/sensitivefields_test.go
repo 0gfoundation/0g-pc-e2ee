@@ -446,3 +446,87 @@ func TestResolvedProviderURLMatchesTheRequestsServiceType(t *testing.T) {
 		t.Errorf("candidate upstream URL = %q, want %q", rc.upstreamURL, want)
 	}
 }
+
+// The ROW decides api_format, and a value in the request body is dropped rather
+// than forwarded.
+//
+// Everything not withheld is copied into the preview payload, so before the
+// deletion a caller could put `"api_format": "anthropic"` in an ordinary
+// /v1/chat/completions body and have it reach preview — narrowing the pool to
+// providers that serve only /v1/messages while the request was sealed under the
+// chat profile and POSTed to /v1/chat/completions. On an image request it is
+// worse than a mismatch: the router refuses a surface on a non-chat service
+// type, so the preview 400s and the request fails outright.
+//
+// Passing unknown body fields through is deliberate and unchanged — the router
+// ignores what it does not know. This one it now ACTS on, which is what moves it
+// from noise to ours to state. Asserted for both rows that leave APIFormat
+// empty, since the two failure modes differ.
+func TestCallerSuppliedAPIFormatDoesNotReachThePreview(t *testing.T) {
+	var body map[string]json.RawMessage
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != previewPath {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"providers":[]}`))
+	}))
+	defer srv.Close()
+
+	for _, tc := range []struct {
+		ep  endpoint.Endpoint
+		req wire.Request
+	}{
+		{endpoint.Chat, wire.Request{
+			"model":      json.RawMessage(`"gpt-x"`),
+			"messages":   json.RawMessage(`[{"role":"user","content":"hi"}]`),
+			"api_format": json.RawMessage(`"anthropic"`),
+		}},
+		{endpoint.Image, wire.Request{
+			"model":      json.RawMessage(`"z-image"`),
+			"prompt":     json.RawMessage(`"a cat"`),
+			"api_format": json.RawMessage(`"anthropic"`),
+		}},
+	} {
+		t.Run(tc.ep.Path, func(t *testing.T) {
+			body = nil
+			_, _ = New(srv.URL).Resolve(context.Background(), tc.ep, tc.req)
+			if body == nil {
+				t.Fatal("preview was never called")
+			}
+			if raw, sent := body["api_format"]; sent {
+				t.Errorf("the caller's api_format=%s reached the preview; the row (empty) decides it", raw)
+			}
+			// The rest of the body still passes through: the fix is scoped to the one
+			// field the router acts on, not a new allowlist.
+			if _, ok := body["model"]; !ok {
+				t.Error("model must still reach the preview")
+			}
+		})
+	}
+
+	// And the Anthropic row still sends its OWN value — a deletion that fired on
+	// every row would silently un-narrow the surface this branch exists to add.
+	t.Run("the row's own value survives", func(t *testing.T) {
+		body = nil
+		_, _ = New(srv.URL).Resolve(context.Background(), endpoint.Anthropic, wire.Request{
+			"model":      json.RawMessage(`"claude-x"`),
+			"max_tokens": json.RawMessage(`16`),
+			"messages":   json.RawMessage(`[{"role":"user","content":"hi"}]`),
+			// A caller value that DISAGREES with the row: the row still wins.
+			"api_format": json.RawMessage(`"openai"`),
+		})
+		if body == nil {
+			t.Fatal("preview was never called")
+		}
+		var got string
+		if err := json.Unmarshal(body["api_format"], &got); err != nil {
+			t.Fatalf("api_format missing or not a string: %v", err)
+		}
+		if got != "anthropic" {
+			t.Errorf("api_format = %q, want the row's %q", got, "anthropic")
+		}
+	})
+}

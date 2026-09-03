@@ -1005,3 +1005,67 @@ func TestGatewayAnswersPreflightOnRefusedPaths(t *testing.T) {
 		}
 	}
 }
+
+// The refusal must not claim the gateway seals a surface this build does not
+// serve.
+//
+// In direct-broker mode the build holds a chat client only, so the same path
+// answered two contradictory things: the subtree/method refusal said "this
+// gateway seals that surface only at POST /v1/messages" while the POST refusal
+// on the very same path said it is "not served by this gateway build". The first
+// is false there, and an operator debugging direct mode reads it as the surface
+// being available on some other method.
+//
+// One reason, two wordings, chosen where the answer is known — which is also why
+// this is a test rather than a comment: the closure captures `served` at mount
+// time, so a future refactor that moved the registration would silently take the
+// wrong branch.
+func TestGatewayRefusalDoesNotClaimAnUnservedSurfaceIsSealed(t *testing.T) {
+	router := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("the router must not see %s %s", r.Method, r.URL.Path)
+	}))
+	defer router.Close()
+
+	// The direct-broker shape: chat served, every other row not.
+	clients := map[string]*core.Client{endpoint.Chat.Path: routeClient()}
+	gw := httptest.NewServer(newHandler(clients, mustURL(t, router.URL), testOrigins(), "", "",
+		noInFlightCap, nil, nil, nil, discardLogger()))
+	defer gw.Close()
+
+	body := func(t *testing.T, method, path string) string {
+		t.Helper()
+		req, _ := http.NewRequest(method, gw.URL+path, strings.NewReader(`{}`))
+		req.Header.Set("Authorization", "Bearer sk-user-key")
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s %s: %v", method, path, err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != http.StatusNotImplemented {
+			t.Fatalf("%s %s = %d, want 501: %s", method, path, resp.StatusCode, b)
+		}
+		return string(b)
+	}
+
+	// UNSERVED row: nothing may promise a sealed method on it.
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodGet, endpoint.Anthropic.Path},
+		{http.MethodPost, endpoint.Anthropic.Path + "/count_tokens"},
+	} {
+		got := body(t, tc.method, tc.path)
+		if strings.Contains(got, "seals") {
+			t.Errorf("%s %s claims this build seals an unserved surface: %s", tc.method, tc.path, got)
+		}
+		if !strings.Contains(got, "does not serve the sealed") {
+			t.Errorf("%s %s must say the build does not serve the surface: %s", tc.method, tc.path, got)
+		}
+	}
+
+	// SERVED row: the "only at POST" wording is the accurate one, and must survive.
+	got := body(t, http.MethodGet, endpoint.Chat.Path)
+	if !strings.Contains(got, "seals only at POST "+endpoint.Chat.Path) {
+		t.Errorf("a served row's refusal must name the sealed method: %s", got)
+	}
+}
