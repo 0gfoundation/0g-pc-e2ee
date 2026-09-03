@@ -2,6 +2,7 @@ package endpoint
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -115,8 +116,8 @@ func TestWithB64ResponseFormatPreservesOtherFields(t *testing.T) {
 }
 
 // All is the registry every other layer reads, so a malformed row does not fail
-// here — it fails somewhere else, at runtime: a refused request, a surface
-// silently shadowed by an earlier row with the same service type. This is where
+// here — it fails somewhere else, at runtime: a refused request, or a surface
+// silently confused with another that shares one of its fields. This is where
 // those are caught instead.
 //
 // It is also the only place the empty-UpstreamPath guard in route.upstreamURL is
@@ -126,11 +127,12 @@ func TestAllRowsAreWellFormed(t *testing.T) {
 	if len(All) == 0 {
 		t.Fatal("All is empty; the gateway would mount nothing")
 	}
-	seen := map[string]int{}
+	byPath := map[string]int{}
+	bySurface := map[string]int{}
 	for i, ep := range All {
-		name := ep.ServiceType
+		name := ep.Path
 		if name == "" {
-			name = "row " + string(rune('0'+i))
+			name = "row " + strconv.Itoa(i)
 		}
 		if ep.ServiceType == "" {
 			t.Errorf("%s: no ServiceType — the resolver could not ask the router for it", name)
@@ -146,36 +148,45 @@ func TestAllRowsAreWellFormed(t *testing.T) {
 		if ep.UpstreamPath == "" {
 			t.Errorf("%s: no UpstreamPath — route would POST the sealed request to the bare router origin", name)
 		}
-		if j, dup := seen[ep.ServiceType]; dup {
-			t.Errorf("rows %d and %d share ServiceType %q; ByServiceType returns the first, so the second is shadowed with no error anywhere", j, i, ep.ServiceType)
+		// Path is the row's IDENTITY, and the only field that has to be unique.
+		// Every layer keys off it: proxycli's client map, the gateway's mount loop
+		// (a duplicate would mount the same pattern twice and panic), metrics'
+		// route label, and direct mode's "chat only" check.
+		if j, dup := byPath[ep.Path]; dup {
+			t.Errorf("rows %d and %d share Path %q; it is the key every layer uses, so one would shadow the other", j, i, ep.Path)
 		}
-		seen[ep.ServiceType] = i
-
-		// Round-trip: the lookup must return THIS row, not merely some row. Endpoint
-		// carries a func field, so compare the fields that identify a row.
-		got, ok := ByServiceType(ep.ServiceType)
-		if !ok {
-			t.Errorf("%s: ByServiceType missed a row that is in All", name)
-			continue
+		byPath[ep.Path] = i
+		// ServiceType alone is deliberately NOT unique — Chat and Anthropic are
+		// both "chatbot", one provider pool answering two request shapes. What must
+		// stay unique is the PAIR the router resolves a pool from: two rows with the
+		// same (service type, api_format) would preview identically and be
+		// indistinguishable upstream, which is a table bug even though each row
+		// serves its own path.
+		surface := ep.ServiceType + "\x00" + ep.APIFormat
+		if j, dup := bySurface[surface]; dup {
+			t.Errorf("rows %d and %d share (ServiceType %q, APIFormat %q); they would preview the same pool",
+				j, i, ep.ServiceType, ep.APIFormat)
 		}
-		if got.Profile != ep.Profile || got.Path != ep.Path || got.UpstreamPath != ep.UpstreamPath ||
-			got.Streams != ep.Streams || (got.PreSeal == nil) != (ep.PreSeal == nil) {
-			t.Errorf("%s: ByServiceType returned a different row", name)
-		}
+		bySurface[surface] = i
 	}
 }
 
-// A miss is the zero Endpoint and false — the contract route builds on. Stated
-// on its own because it is what a caller reasons about, and because the zero
-// value's "fails closed" promise (see ByServiceType) only holds if the value
-// really is zero rather than, say, the last row visited.
-func TestByServiceTypeMissIsTheZeroValue(t *testing.T) {
-	got, ok := ByServiceType("no-such-service-type")
-	if ok {
-		t.Fatal("ByServiceType reported a hit for a service type not in All")
+// The zero Endpoint must fail closed for SEALING: its empty profile is unknown to
+// wire, so every seal and open rejects it rather than falling back to chat's
+// rules on a request shape nobody analysed.
+//
+// It is stated here because the zero value is reachable — a struct literal that
+// forgot a field, or a caller that built one by hand — and because the OTHER half
+// of the promise does not hold: wire.DefaultSealedFieldsFor of the empty profile
+// is the EMPTY set, so a caller asking the zero row "what must I withhold from
+// the untrusted router" is told "nothing". route.sensitiveFieldsFor keys its
+// fallback on that empty answer for exactly this reason.
+func TestZeroEndpointFailsClosedForSealing(t *testing.T) {
+	var zero Endpoint
+	if fields := wire.DefaultSealedFieldsFor(zero.Profile); len(fields) != 0 {
+		t.Errorf("the zero profile has default sealed fields %v; the fail-closed argument assumes it has none", fields)
 	}
-	if got.ServiceType != "" || got.Profile != "" || got.Path != "" || got.UpstreamPath != "" ||
-		got.Streams || got.PreSeal != nil {
-		t.Errorf("a miss must return the zero Endpoint, got %+v", got)
+	if err := wire.ValidateSealedFieldsFor(zero.Profile, []string{"messages"}); err == nil {
+		t.Error("wire accepted a sealed set for the zero profile; a malformed row would seal under no rules at all")
 	}
 }

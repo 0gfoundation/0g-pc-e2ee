@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
@@ -38,7 +39,7 @@ func TestDirect_ResolveSealsStraightToBroker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDirect: %v", err)
 	}
-	cands, err := res.Resolve(context.Background(), DefaultServiceType, wire.Request{})
+	cands, err := res.Resolve(context.Background(), endpoint.Chat, wire.Request{})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -122,7 +123,7 @@ func TestDirect_PubkeyFetchFailurePropagates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewDirect: %v", err)
 	}
-	cands, err := res.Resolve(context.Background(), DefaultServiceType, wire.Request{})
+	cands, err := res.Resolve(context.Background(), endpoint.Chat, wire.Request{})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}

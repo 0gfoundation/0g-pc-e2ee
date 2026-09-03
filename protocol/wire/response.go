@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"sort"
+	"strings"
 
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 )
@@ -119,6 +120,82 @@ func IsTerminalResponseFrame(p Profile, frame Response) (bool, error) {
 		return false, fmt.Errorf("%s-profile: %w", p, err)
 	}
 	return shape.terminal, nil
+}
+
+// ResponseFramesAreTyped reports whether this profile's responses are frame-typed
+// — an event taxonomy where each frame declares its own shape (SPEC §7.2) — as
+// opposed to a single response shape.
+//
+// It is the question a stream's FRAMING depends on, which is why it is answered
+// here rather than by each receiver testing for a profile by name. Two things
+// differ, and neither is derivable from a frame:
+//
+//   - a frame-typed stream announces every event by name, so a receiver must
+//     emit an `event:` line (see ResponseEventName);
+//   - it ends with a TERMINAL FRAME of its own (Anthropic's `message_stop`, or
+//     `error` on a turn that failed partway), so OpenAI's `data: [DONE]`
+//     sentinel must NOT be appended. `[DONE]` is a chat convention; sending it
+//     on a frame-typed stream is a protocol violation, and an SDK reading that
+//     stream has no rule that would let it ignore the extra event.
+//
+// Both are the same class of fact as stream_options being a chat-only field, and
+// they are all read off the profile for the same reason: a surface that streams
+// is not thereby an OpenAI stream.
+func ResponseFramesAreTyped(p Profile) bool {
+	spec, err := p.spec()
+	if err != nil {
+		return false
+	}
+	return spec.responseFrames != nil
+}
+
+// ResponseEventName is the SSE `event:` name a receiver MUST announce a frame
+// under, or "" for a profile whose responses are not frame-typed.
+//
+// It exists because §7.2 puts a requirement on the RECEIVER that nothing else
+// could satisfy: the `event:` line sits outside the JSON and therefore outside
+// the AAD, so an intermediary can rewrite it undetected. A sender must drop the
+// upstream's line and a receiver must not trust one — both rebuild it from the
+// frame's own bound discriminator, which the seal covers. Handing a client an
+// Anthropic stream with no `event:` lines is not a lesser version of the
+// protocol either: an Anthropic SDK dispatches on the event name, so the frames
+// arrive unusable.
+//
+// The frame must be the OPENED (plaintext) one, since that is what the receiver
+// announces. The discriminator itself is cleartext on the wire, so either would
+// read the same value — but opening is what proves the frame was sealed as its
+// shape requires, and a name derived before that check would announce a shape
+// nothing had validated.
+//
+// A single-shape profile (chat, image) answers "" with no error: those streams
+// have no event taxonomy, and their frames carry no name to announce. An unknown
+// or malformed discriminator IS an error, via shapeOf — the same refusal the
+// seal and open paths give, for the same reason.
+//
+// A name containing a line break is refused rather than emitted. It is
+// unreachable through the taxonomy (shapeOf accepts only a fixed set of
+// identifiers), and that is exactly why it is checked here: a name written into
+// an SSE line would end that line and start a fresh one, so a value that ever
+// escaped the taxonomy would let an intermediary inject an unsealed `data:`
+// frame ahead of the real one — the channel dropping the upstream's own
+// `event:` line exists to close.
+func ResponseEventName(p Profile, frame Response) (string, error) {
+	spec, err := p.spec()
+	if err != nil {
+		return "", err
+	}
+	if spec.responseFrames == nil {
+		return "", nil
+	}
+	kind, _, err := spec.responseFrames.shapeOf(frame)
+	if err != nil {
+		return "", fmt.Errorf("%s-profile: %w", p, err)
+	}
+	if strings.ContainsAny(kind, "\r\n") {
+		return "", fmt.Errorf("%s-profile: frame %s %q contains a line break",
+			p, spec.responseFrames.discriminator, kind)
+	}
+	return kind, nil
 }
 
 // shapeOf reads a frame's cleartext discriminator and returns its shape. An

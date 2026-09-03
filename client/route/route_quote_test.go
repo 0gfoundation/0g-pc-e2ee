@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
@@ -95,7 +96,7 @@ func TestProvider_QuoteVerification_EnforceSuccess(t *testing.T) {
 		attest.WithQuoteParser(qvParser(m, qvReportData(t))))
 	r := New(srv.URL, WithQuoteVerification(v, slog.New(slog.NewTextHandler(bytes.NewBuffer(nil), nil))))
 
-	cands, err := r.Resolve(context.Background(), DefaultServiceType, wire.Request{})
+	cands, err := r.Resolve(context.Background(), endpoint.Chat, wire.Request{})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -112,7 +113,7 @@ func TestProvider_QuoteVerification_EnforceSuccess(t *testing.T) {
 	if prov.Address != testProviderAddr || prov.Model != "canon-1" {
 		t.Errorf("Address/Model = %s/%s", prov.Address, prov.Model)
 	}
-	want, _ := r.upstreamURL(DefaultServiceType)
+	want, _ := r.upstreamURL(endpoint.Chat)
 	if prov.URL != want {
 		t.Errorf("URL = %s, want completions %s", prov.URL, want)
 	}
@@ -126,7 +127,7 @@ func TestProvider_QuoteVerification_EnforceRejectsUntrusted(t *testing.T) {
 		attest.WithQuoteParser(qvParser(served, qvReportData(t)))) // ModeEnforce (default)
 	r := New(srv.URL, WithQuoteVerification(v, nil))
 
-	cands, err := r.Resolve(context.Background(), DefaultServiceType, wire.Request{})
+	cands, err := r.Resolve(context.Background(), endpoint.Chat, wire.Request{})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -145,7 +146,7 @@ func TestProvider_QuoteVerification_WarnAcceptsAndLogs(t *testing.T) {
 		attest.WithMeasurementMode(attest.ModeWarn))
 	r := New(srv.URL, WithQuoteVerification(v, logger))
 
-	cands, _ := r.Resolve(context.Background(), DefaultServiceType, wire.Request{})
+	cands, _ := r.Resolve(context.Background(), endpoint.Chat, wire.Request{})
 	prov, err := cands.Provider(context.Background(), 0)
 	if err != nil {
 		t.Fatalf("warn mode should accept: %v", err)
@@ -165,7 +166,7 @@ func TestProvider_QuoteVerification_QuoteEndpointError(t *testing.T) {
 		attest.WithQuoteParser(qvParser(m, qvReportData(t))))
 	r := New(srv.URL, WithQuoteVerification(v, nil))
 
-	cands, _ := r.Resolve(context.Background(), DefaultServiceType, wire.Request{})
+	cands, _ := r.Resolve(context.Background(), endpoint.Chat, wire.Request{})
 	if _, err := cands.Provider(context.Background(), 0); err == nil {
 		t.Fatal("expected error when the quote endpoint fails, got nil")
 	}

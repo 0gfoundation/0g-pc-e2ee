@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
@@ -26,12 +27,20 @@ import (
 // returned as a staged *Error so the proxy maps it to a sensible HTTP status; a
 // plain error is treated as an upstream (502) failure.
 type Resolver interface {
-	// Resolve picks the candidates for one request. serviceType describes the
-	// request ("chatbot", "text-to-image"), not the resolver: a resolver that
-	// fronts the 0G Router talks to one host serving every endpoint, so which
-	// providers to rank, which fields to withhold from the control plane, and
-	// which upstream path to use are all per request.
-	Resolve(ctx context.Context, serviceType string, req wire.Request) (Candidates, error)
+	// Resolve picks the candidates for one request. ep describes the REQUEST, not
+	// the resolver: a resolver that fronts the 0G Router talks to one host serving
+	// every endpoint, so which providers to rank, which fields to withhold from the
+	// control plane, and which upstream path to use are all per request.
+	//
+	// It takes the whole row rather than the service-type string it used to,
+	// because the string is a lossy projection: /v1/chat/completions and
+	// /v1/messages are both "chatbot", so a resolver handed the string cannot tell
+	// which surface it is ranking for, and re-deriving the row from it returned
+	// whichever chat row came first. Every question the resolver answers per
+	// request — the api_format to preview under, the profile whose payload fields
+	// must be withheld, the upstream path — is a field of the row the caller
+	// already holds.
+	Resolve(ctx context.Context, ep endpoint.Endpoint, req wire.Request) (Candidates, error)
 }
 
 // Candidates is an ordered list of provider candidates to seal to, best first.
@@ -158,7 +167,7 @@ func (w *candidateWalk) exhausted() bool { return w.spent >= w.limit() }
 // provider caller; the shipped server forms route instead (client/route).
 type staticResolver struct{ provider Provider }
 
-func (s staticResolver) Resolve(context.Context, string, wire.Request) (Candidates, error) {
+func (s staticResolver) Resolve(context.Context, endpoint.Endpoint, wire.Request) (Candidates, error) {
 	return staticCandidates{s.provider}, nil
 }
 

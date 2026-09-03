@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/proof"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
@@ -523,7 +524,7 @@ func TestBudgetExhaustionKeepsTheUpstreamError(t *testing.T) {
 // fixedResolver returns a prepared Candidates, so a test can control materialization.
 type fixedResolver struct{ c Candidates }
 
-func (f fixedResolver) Resolve(context.Context, string, wire.Request) (Candidates, error) {
+func (f fixedResolver) Resolve(context.Context, endpoint.Endpoint, wire.Request) (Candidates, error) {
 	return f.c, nil
 }
 

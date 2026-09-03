@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
+	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
@@ -162,7 +163,7 @@ func pidAllowAll() attest.BootChainPolicy {
 // request runs before sealing.
 func pidResolve(t *testing.T, r *Router) {
 	t.Helper()
-	cands, err := r.Resolve(context.Background(), DefaultServiceType, wire.Request{})
+	cands, err := r.Resolve(context.Background(), endpoint.Chat, wire.Request{})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -378,7 +379,7 @@ func TestProviderIdentity_RecordedEvenWhenTheVerdictRejects(t *testing.T) {
 		WithQuoteVerification(v, discardLogger()),
 		WithOnChainVerification(&stubRegistry{signer: ocOther, ack: true}, true, discardLogger()))
 
-	cands, err := r.Resolve(context.Background(), DefaultServiceType, wire.Request{})
+	cands, err := r.Resolve(context.Background(), endpoint.Chat, wire.Request{})
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}

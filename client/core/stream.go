@@ -41,7 +41,7 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 	// Pick the candidates to seal to, best first (a static resolver returns one
 	// fixed provider; the route resolver consults the router/broker — a network
 	// call bounded by ctx).
-	cands, err := c.resolver.Resolve(ctx, c.serviceType, req)
+	cands, err := c.resolver.Resolve(ctx, c.ep, req)
 	if err != nil {
 		return resolveErr(err)
 	}
@@ -266,7 +266,7 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 		}
 		if opener == nil {
 			// The first frame carries enc; it sets up the shared HPKE context.
-			opener, err = wire.NewResponseOpenerFor(c.profile, ephPriv, frame)
+			opener, err = wire.NewResponseOpenerFor(c.ep.Profile, ephPriv, frame)
 			if err != nil {
 				c.logOpenFailure(frameIdx, frame, err)
 				outcome = UpstreamUndecodable

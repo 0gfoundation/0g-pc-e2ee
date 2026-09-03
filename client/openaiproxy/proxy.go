@@ -339,7 +339,7 @@ func Register(mux *http.ServeMux, ep endpoint.Endpoint, c *core.Client, opts ...
 		meta := &core.ResponseMeta{}
 		ctx = core.WithResponseMeta(ctx, meta)
 		if stream {
-			serveStream(ctx, w, c, req, o, meta)
+			serveStream(ctx, w, ep, c, req, o, meta)
 			return
 		}
 		resp, err := c.Complete(ctx, req)
@@ -474,10 +474,18 @@ func statusFor(err error) int {
 }
 
 // serveStream proxies a streaming completion as Server-Sent Events: it opens
-// each sealed frame from the core and re-emits it as `data: <json>` to the user,
-// terminating with `data: [DONE]`. Status is only settable before the first
-// frame; once bytes are on the wire an error can only end the stream.
-func serveStream(ctx context.Context, w http.ResponseWriter, c *core.Client, req wire.Request, o options, meta *core.ResponseMeta) {
+// each sealed frame from the core and re-emits it to the user. Status is only
+// settable before the first frame; once bytes are on the wire an error can only
+// end the stream.
+//
+// The FRAMING follows the surface, which is why this takes the row. An OpenAI
+// chat stream is unnamed events terminated by a `[DONE]` sentinel; a frame-typed
+// stream (Anthropic) names every event and ends with a terminal frame of its
+// own. Emitting the chat framing for both is not a lesser version of the
+// protocol — an Anthropic SDK dispatches on the event name, so unnamed frames
+// arrive unusable, and the trailing `[DONE]` is an event its taxonomy has no
+// rule for.
+func serveStream(ctx context.Context, w http.ResponseWriter, ep endpoint.Endpoint, c *core.Client, req wire.Request, o options, meta *core.ResponseMeta) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeGatewayError(w, http.StatusInternalServerError, "streaming not supported by server")
@@ -504,12 +512,22 @@ func serveStream(ctx context.Context, w http.ResponseWriter, c *core.Client, req
 	}
 
 	err := c.CompleteStream(ctx, req, func(frame wire.Response) error {
+		// Rebuilt from the OPENED frame's own bound discriminator, which is what
+		// §7.2 requires of a receiver: the `event:` line sits outside the JSON and
+		// so outside the AAD, meaning an intermediary can rewrite it undetected —
+		// the sender drops the upstream's line and we derive our own. "" for a
+		// profile with no event taxonomy, which is how the chat surface keeps
+		// emitting exactly the bytes it always has.
+		name, err := wire.ResponseEventName(ep.Profile, frame)
+		if err != nil {
+			return err
+		}
 		b, err := json.Marshal(frame)
 		if err != nil {
 			return err
 		}
 		writeHeader()
-		if _, err := fmt.Fprintf(w, "data: %s\n\n", b); err != nil {
+		if err := writeSSEEvent(w, name, b); err != nil {
 			return err
 		}
 		flusher.Flush()
@@ -524,16 +542,49 @@ func serveStream(ctx context.Context, w http.ResponseWriter, c *core.Client, req
 		}
 		// Mid-stream: surface as a final SSE error event, then stop. Build the
 		// payload with json.Marshal — %q is not JSON-safe for arbitrary bytes.
-		errEvent, _ := json.Marshal(o.errorEnvelope(err))
-		fmt.Fprintf(w, "data: %s\n\n", errEvent)
+		envelope := o.errorEnvelope(err)
+		errName := ""
+		if wire.ResponseFramesAreTyped(ep.Profile) {
+			// Announce it as the surface's own error event, and carry the top-level
+			// discriminator its clients read. The envelope already holds an `error`
+			// object with `type`/`message` plus the `_0g` attribution, so this adds
+			// the one field that makes it dispatchable rather than reshaping a
+			// documented body — an unnamed event here would be silently ignored by
+			// an SDK and the stream would simply stop with no reason given.
+			errName = "error"
+			envelope["type"] = "error"
+		}
+		errEvent, _ := json.Marshal(envelope)
+		_ = writeSSEEvent(w, errName, errEvent)
 		flusher.Flush()
 		return
 	}
 	// A successful stream always delivered its final frame, so wroteHeader is
 	// already true here; this is a defensive no-op guard.
 	writeHeader()
-	fmt.Fprint(w, "data: [DONE]\n\n")
+	// `[DONE]` is an OpenAI CHAT convention. A frame-typed stream already ended
+	// with its own terminal frame (message_stop, or error on a turn that failed
+	// partway), and the core refuses a stream that arrives without one — so there
+	// is nothing left to terminate, and an extra unnamed event would be one the
+	// taxonomy has no rule for. Image never reaches here (Register refuses
+	// `stream` on a row that does not stream).
+	if !wire.ResponseFramesAreTyped(ep.Profile) {
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}
 	flusher.Flush()
+}
+
+// writeSSEEvent writes one Server-Sent Event, announcing it by name when the
+// surface has an event taxonomy and omitting the `event:` line entirely when it
+// does not — so a chat stream stays byte-for-byte what it was.
+func writeSSEEvent(w io.Writer, name string, payload []byte) error {
+	if name != "" {
+		if _, err := fmt.Fprintf(w, "event: %s\n", name); err != nil {
+			return err
+		}
+	}
+	_, err := fmt.Fprintf(w, "data: %s\n\n", payload)
+	return err
 }
 
 // writeErrorObject emits a JSON error response body at the given status.

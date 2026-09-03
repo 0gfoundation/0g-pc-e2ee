@@ -264,16 +264,30 @@ type Option func(*Router)
 // the request, not this router — this is a property of the router: it says which
 // slice of the fleet to keep hot.
 //
-// A caller serving both endpoints passes both, so the image providers' quotes
-// are verified ahead of the first image request rather than on it. Empty values
-// are ignored; passing none leaves the default.
+// A caller serving several surfaces passes each one's service type, so their
+// providers' quotes are verified ahead of the first request rather than on it.
+// Empty values are ignored; passing none leaves the default.
+//
+// DUPLICATES are collapsed, because a caller that derives this from the rows it
+// serves now legitimately produces them: /v1/chat/completions and /v1/messages
+// are both "chatbot", so a gateway serving both hands us that value twice. The
+// sweep already de-duplicates by provider ADDRESS, so the waste was one extra
+// fleet ENUMERATION per sweep — a GET the router answers identically — rather
+// than repeated verification. Collapsing here keeps every caller from having to
+// know that two rows can share a service type.
 func WithWarmServiceTypes(types ...string) Option {
 	return func(r *Router) {
 		var out []string
+		seen := make(map[string]struct{}, len(types))
 		for _, t := range types {
-			if t != "" {
-				out = append(out, t)
+			if t == "" {
+				continue
 			}
+			if _, dup := seen[t]; dup {
+				continue
+			}
+			seen[t] = struct{}{}
+			out = append(out, t)
 		}
 		if len(out) > 0 {
 			r.warmServiceTypes = out
@@ -318,11 +332,11 @@ func WithSensitiveFields(fields []string) Option {
 	}
 }
 
-// withheldForServiceType is the set of fields kept out of the preview body for
-// one request: the service type's own payload fields plus any the operator
-// added. Computed per call because the service type is per call.
-func (r *Router) withheldForServiceType(serviceType string) map[string]struct{} {
-	base := sensitiveFieldsForServiceType(serviceType)
+// withheldFor is the set of fields kept out of the preview body for one request:
+// the surface's own payload fields plus any the operator added. Computed per
+// call because the surface is per call.
+func (r *Router) withheldFor(ep endpoint.Endpoint) map[string]struct{} {
+	base := sensitiveFieldsFor(ep)
 	out := make(map[string]struct{}, len(base)+len(r.extraSensitiveFields))
 	for _, f := range base {
 		out[f] = struct{}{}
@@ -333,30 +347,38 @@ func (r *Router) withheldForServiceType(serviceType string) map[string]struct{} 
 	return out
 }
 
-// sensitiveFieldsForServiceType returns the fields to withhold from the preview
-// for a service type, derived from the wire profile that service type belongs to
-// — so an image request cannot be previewed with its `prompt` in the clear.
+// sensitiveFieldsFor returns the fields to withhold from the preview for one
+// surface, derived from its wire profile — so an image request cannot be
+// previewed with its `prompt` in the clear, nor an Anthropic one with its
+// top-level `system`.
 //
-// The set used to be an independent option kept in sync with the service type by
+// The set used to be an independent option kept in sync with the surface by
 // hand, with the chat set hardcoded as the default. That is a leak waiting to
 // happen: the preview body is everything NOT in this set, so a stale set does not
 // fail, it silently ships the payload to the router.
 //
-// A service type this package's table does not carry gets the union of every
-// payload field ANY profile has. Over-stripping is the safe direction — it can
-// only cost routing fidelity, since the router then ranks on fewer fields, while
-// under-stripping leaks — and an unrecognised service type is exactly the case
-// where guessing narrow would be wrong.
+// A row whose profile WIRE does not know gets the union of every payload field
+// any profile has. Over-stripping is the safe direction — it can only cost
+// routing fidelity, since the router then ranks on fewer fields, while
+// under-stripping leaks — and an unanalysed surface is exactly the case where
+// guessing narrow would be wrong.
+//
+// Keying that fallback on "wire does not know this profile" rather than on "the
+// endpoint table has no such row" is what makes the zero Endpoint safe HERE. The
+// zero row fails closed for sealing all by itself (wire rejects its empty
+// profile on every seal and open), but wire.DefaultSealedFieldsFor of an empty
+// profile is the EMPTY SET — so a caller that trusted the row and asked only for
+// its default sealed fields would withhold NOTHING and upload the entire payload,
+// prompt included, to the untrusted router. The empty answer is the dangerous
+// one, so it is the one that triggers the union.
 //
 // That union is taken over wire.Profiles(), the PROTOCOL's list, and NOT over
-// endpoint.All, the surfaces this gateway mounts. The two diverge precisely
-// where it costs: ProfileAnthropic seals a top-level `system` that neither chat
-// nor image has, so a union over the mounted surfaces would stop withholding it
-// — re-opening the leak the "anthropic-chat" case was added to close, silently,
-// because the preview body is the complement of this set.
-func sensitiveFieldsForServiceType(t string) []string {
-	if ep, ok := endpoint.ByServiceType(t); ok {
-		return wire.DefaultSealedFieldsFor(ep.Profile)
+// endpoint.All, the surfaces this gateway mounts. The two can diverge, and a
+// union over the mounted rows would silently shrink as rows are added or removed
+// — the wrong direction for a complement.
+func sensitiveFieldsFor(ep endpoint.Endpoint) []string {
+	if fields := wire.DefaultSealedFieldsFor(ep.Profile); len(fields) > 0 {
+		return fields
 	}
 	return everyProfilesPayloadFields()
 }
@@ -503,23 +525,31 @@ func New(routerURL string, opts ...Option) *Router {
 // the ranked candidate list as core.Candidates. Materializing a candidate (its
 // pubkey fetch) is deferred to Candidates.Provider, so the happy path fetches
 // only the head's key; core walks the rest only on fallback.
-// Resolve previews the fleet for one request. serviceType describes the REQUEST
-// — "chatbot", "text-to-image" — and so travels with it rather than being fixed
-// on the Router: one 0G Router serves every endpoint at one URL, and everything
-// that differs between endpoints (which providers to rank, which fields to
-// withhold from the preview body, which upstream path to POST to) is a property
-// of the request shape.
+// Resolve previews the fleet for one request. ep describes the REQUEST — its
+// surface, its profile, its upstream path — and so travels with it rather than
+// being fixed on the Router: one 0G Router serves every endpoint at one URL, and
+// everything that differs between endpoints (which providers to rank, which
+// fields to withhold from the preview body, which upstream path to POST to) is a
+// property of the request shape.
 //
-// An unknown service type is refused rather than defaulted. There is no safe
-// guess: falling back to chat would preview the wrong pool AND send the request
-// to the chat endpoint, and withhold the chat payload fields from a body that
-// does not have them — uploading whatever it does have.
-func (r *Router) Resolve(ctx context.Context, serviceType string, req wire.Request) (core.Candidates, error) {
-	upstream, err := r.upstreamURL(serviceType)
+// It takes the row rather than the service-type string it used to, because the
+// string cannot name a surface: /v1/chat/completions and /v1/messages are both
+// "chatbot", and re-deriving the row from it here returned whichever came first
+// in the table — previewing and POSTing the Anthropic surface as OpenAI chat,
+// which withholds the wrong payload fields (uploading the top-level `system` the
+// chat profile has no opinion about) and reaches a handler expecting another
+// request shape. The three questions below are now read off the row the caller
+// already holds instead of looked up from a projection of it.
+//
+// A malformed row is still refused rather than defaulted — see upstreamURL and
+// withheldFor, which fail closed in opposite directions because a wrong upstream
+// and a wrong withheld set have different safe answers.
+func (r *Router) Resolve(ctx context.Context, ep endpoint.Endpoint, req wire.Request) (core.Candidates, error) {
+	upstream, err := r.upstreamURL(ep)
 	if err != nil {
 		return nil, err
 	}
-	providers, err := r.preview(ctx, serviceType, req)
+	providers, err := r.preview(ctx, ep, req)
 	if err != nil {
 		return nil, err
 	}
@@ -540,22 +570,17 @@ func (r *Router) Resolve(ctx context.Context, serviceType string, req wire.Reque
 // because the upstream path was a property of this Router while the profile was
 // a property of the Client, and nothing held the two together.
 //
-// A service type the table does not carry is REFUSED rather than defaulted.
-// There is no safe guess: falling back to chat would send the request to the
-// chat endpoint under the wrong pool. Note that the withheld set does not fail
-// here — sensitiveFieldsForServiceType still answers, over-strippingly, for a
-// service type this refuses, because the two questions have different safe
-// answers.
-func (r *Router) upstreamURL(serviceType string) (string, error) {
-	ep, ok := endpoint.ByServiceType(serviceType)
-	if !ok {
-		return "", fmt.Errorf("no sealed upstream path for service type %q", serviceType)
-	}
-	// A row without an upstream path is a table bug, and the loud failure the old
-	// switch gave for an unknown type must survive the move: left unchecked, this
-	// would resolve to the bare router origin and POST the sealed request there.
+// A row without an upstream path is REFUSED rather than defaulted. There is no
+// safe guess: left unchecked this would resolve to the bare router origin and
+// POST the sealed request there, and falling back to chat would send it to the
+// chat endpoint under the wrong pool. Note that the withheld set does NOT fail
+// here — sensitiveFieldsFor still answers, over-strippingly, for the same row,
+// because the two questions have opposite safe answers: refusing to send is safe,
+// refusing to withhold is a leak.
+func (r *Router) upstreamURL(ep endpoint.Endpoint) (string, error) {
 	if ep.UpstreamPath == "" {
-		return "", fmt.Errorf("endpoint row for service type %q has no upstream path", serviceType)
+		return "", fmt.Errorf("endpoint row %q (service type %q) has no sealed upstream path",
+			ep.Path, ep.ServiceType)
 	}
 	return r.base + ep.UpstreamPath, nil
 }
@@ -1368,18 +1393,18 @@ type previewResponse struct {
 // preview asks the router to rank providers for req and returns the full ordered
 // candidate list (the router's provider-retry budget — the fallback chain). It
 // sends the routing-relevant fields (the request minus the sealed fields) plus
-// the service_type, forwarding the caller's credential and X-0G-* directives so
-// the router authenticates/bills and steers exactly as it would for the sealed
-// request. "model" is optional and passes through when present (it is not a
-// sealed field): present → candidates are that model's providers; omitted →
-// candidates are any provider of the service type.
+// the surface's service_type and api_format, forwarding the caller's credential
+// and X-0G-* directives so the router authenticates/bills and steers exactly as
+// it would for the sealed request. "model" is optional and passes through when
+// present (it is not a sealed field): present → candidates are that model's
+// providers; omitted → candidates are any provider of the service type.
 //
 // A transient failure is retried (see previewAttempts and previewRetryBudget for
 // the policy and its sizing); a definitive one is returned on the first attempt,
 // so a caller's 401 or 404 is never delayed by a retry that cannot change it.
-func (r *Router) preview(ctx context.Context, serviceType string, req wire.Request) ([]previewProvider, error) {
-	withheld := r.withheldForServiceType(serviceType)
-	payload := make(map[string]json.RawMessage, len(req)+1)
+func (r *Router) preview(ctx context.Context, ep endpoint.Endpoint, req wire.Request) ([]previewProvider, error) {
+	withheld := r.withheldFor(ep)
+	payload := make(map[string]json.RawMessage, len(req)+2)
 	for k, v := range req {
 		if _, sensitive := withheld[k]; sensitive {
 			continue
@@ -1388,8 +1413,25 @@ func (r *Router) preview(ctx context.Context, serviceType string, req wire.Reque
 	}
 	// Force the service type of THIS request; a chat body carries no service_type
 	// of its own, and the router needs it to route.
-	serviceTypeJSON, _ := json.Marshal(serviceType)
+	serviceTypeJSON, _ := json.Marshal(ep.ServiceType)
 	payload["service_type"] = serviceTypeJSON
+	// api_format selects the SURFACE within that service type, for the one service
+	// type that has two: `chatbot` answers /v1/chat/completions and /v1/messages,
+	// and only this field tells the router which pool to rank. Without it an
+	// Anthropic request previews as OpenAI chat and can be pinned to a provider
+	// that does not serve /v1/messages at all.
+	//
+	// Sent only when the row names one. An omitted api_format and "openai" mean
+	// the same thing upstream — neither narrows, because OpenAI is the default
+	// surface every chat provider answers and many do not enumerate it in
+	// `api_formats` — so sending it for chat would add a field that cannot change
+	// the answer. It is also refused outright on a non-chat service type, which is
+	// the router telling us the axis does not exist there; the image row leaves it
+	// empty for that reason and not by omission.
+	if ep.APIFormat != "" {
+		apiFormatJSON, _ := json.Marshal(ep.APIFormat)
+		payload["api_format"] = apiFormatJSON
+	}
 
 	// One call-level observation on EVERY exit path, recorded by a defer rather than
 	// at each return so the counter cannot drift from the control flow as this loop

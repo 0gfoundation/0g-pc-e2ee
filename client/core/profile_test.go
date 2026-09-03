@@ -28,7 +28,7 @@ func TestWithEndpointSelectsProfileAndDefaults(t *testing.T) {
 			name       string
 			ep         endpoint.Endpoint
 			useDefault bool
-		}{ep.ServiceType, ep, false})
+		}{ep.Path, ep, false})
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -39,15 +39,21 @@ func TestWithEndpointSelectsProfileAndDefaults(t *testing.T) {
 				opts = append(opts, WithEndpoint(tc.ep))
 			}
 			c := NewWithResolver(staticResolver{Provider{URL: DefaultProviderURL}}, opts...)
-			if c.profile != wantProfile {
-				t.Errorf("profile = %q, want %q", c.profile, wantProfile)
+			if c.ep.Profile != wantProfile {
+				t.Errorf("profile = %q, want %q", c.ep.Profile, wantProfile)
 			}
 			if !equalStrings(c.sealFields, wantFields) {
 				t.Errorf("sealFields = %v, want %v", c.sealFields, wantFields)
 			}
-			if c.serviceType != tc.ep.ServiceType {
-				t.Errorf("serviceType = %q, want %q — it is what the resolver is asked for",
-					c.serviceType, tc.ep.ServiceType)
+			// The whole row reaches the resolver, so assert the row and not just the
+			// service type: /v1/chat/completions and /v1/messages share "chatbot", so
+			// a service-type-only check passes for a client bound to the wrong one.
+			// Field-wise because Endpoint carries a func (PreSeal) and so is not
+			// comparable with ==; these are the fields that identify a row.
+			if got := c.ep; got.ServiceType != tc.ep.ServiceType || got.APIFormat != tc.ep.APIFormat ||
+				got.Profile != tc.ep.Profile || got.Path != tc.ep.Path ||
+				got.UpstreamPath != tc.ep.UpstreamPath || got.Streams != tc.ep.Streams {
+				t.Errorf("ep = %+v, want %+v — the row is what the resolver is handed", got, tc.ep)
 			}
 		})
 	}
@@ -69,7 +75,7 @@ func TestWithEndpointSelectsProfileAndDefaults(t *testing.T) {
 // identical assertion five times and imply a coverage it does not have.
 func TestUnknownSurfaceFailsClosedRatherThanDefaultingToChat(t *testing.T) {
 	c := NewWithResolver(staticResolver{Provider{URL: DefaultProviderURL}}, WithEndpoint(endpoint.Endpoint{}))
-	if c.profile == wire.ProfileChat {
+	if c.ep.Profile == wire.ProfileChat {
 		t.Fatalf("the zero Endpoint must not resolve to the chat profile")
 	}
 	if len(c.sealFields) != 0 {
@@ -77,7 +83,7 @@ func TestUnknownSurfaceFailsClosedRatherThanDefaultingToChat(t *testing.T) {
 	}
 	// wire must refuse it, which is what makes the empty profile safe rather than
 	// merely undefined.
-	if err := wire.ValidateSealedFieldsFor(c.profile, []string{"messages"}); err == nil {
+	if err := wire.ValidateSealedFieldsFor(c.ep.Profile, []string{"messages"}); err == nil {
 		t.Error("wire must reject an unknown profile")
 	}
 }
@@ -101,8 +107,8 @@ func TestExplicitSealFieldsWinRegardlessOfOptionOrder(t *testing.T) {
 			if !equalStrings(c.sealFields, custom) {
 				t.Errorf("sealFields = %v, want the explicit %v", c.sealFields, custom)
 			}
-			if c.profile != wire.ProfileImage {
-				t.Errorf("profile = %q, want image", c.profile)
+			if c.ep.Profile != wire.ProfileImage {
+				t.Errorf("profile = %q, want image", c.ep.Profile)
 			}
 		})
 	}

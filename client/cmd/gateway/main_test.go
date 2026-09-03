@@ -663,7 +663,7 @@ type blockingResolver struct {
 	release chan struct{}
 }
 
-func (b blockingResolver) Resolve(ctx context.Context, _ string, _ wire.Request) (core.Candidates, error) {
+func (b blockingResolver) Resolve(ctx context.Context, _ endpoint.Endpoint, _ wire.Request) (core.Candidates, error) {
 	b.entered <- struct{}{}
 	select {
 	case <-b.release:
@@ -750,4 +750,67 @@ func sealedClients(chat, image *core.Client) map[string]*core.Client {
 		m[endpoint.Image.Path] = image
 	}
 	return m
+}
+
+// A row this build DOES serve is mounted at its own path, not left to the
+// cleartext catch-all and not refused.
+//
+// The complement of TestGatewayRefusesEveryUnservedSealedSurface, and worth
+// stating separately for the surface that most recently became a row: before
+// /v1/messages was one, an Anthropic SDK pointed at this gateway fell through to
+// the reverse proxy — which is not a 404, it is the caller's PROMPT forwarded to
+// the router in the clear, the one thing this process exists to prevent.
+//
+// The assertion is deliberately negative on the outcome (it must not be refused,
+// and the router must not have heard the path) rather than expecting a 200: the
+// resolver here points at an unused host, so the request fails upstream. That it
+// fails INSIDE the sealed handler is the property under test.
+func TestGatewayMountsAServedAnthropicSurface(t *testing.T) {
+	var (
+		mu        sync.Mutex
+		routerSaw []string
+	)
+	router := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		routerSaw = append(routerSaw, r.URL.Path)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[]}`))
+	}))
+	defer router.Close()
+
+	clients := map[string]*core.Client{endpoint.Anthropic.Path: routeClient()}
+	gw := httptest.NewServer(newHandler(clients, mustURL(t, router.URL), testOrigins(), "", "",
+		noInFlightCap, nil, nil, nil, discardLogger()))
+	defer gw.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, gw.URL+endpoint.Anthropic.Path,
+		strings.NewReader(`{"model":"claude-x","max_tokens":16,"system":"my secret system prompt",`+
+			`"messages":[{"role":"user","content":"my secret prompt"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer sk-user-key")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("post %s: %v", endpoint.Anthropic.Path, err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode == http.StatusNotImplemented {
+		t.Errorf("a served row must not be refused: got 501 (body %s)", body)
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		t.Errorf("%s is not mounted: got 404 (body %s)", endpoint.Anthropic.Path, body)
+	}
+	mu.Lock()
+	saw := append([]string(nil), routerSaw...)
+	mu.Unlock()
+	for _, p := range saw {
+		if p == endpoint.Anthropic.Path {
+			t.Fatalf("the request reached the cleartext catch-all: the router saw %v", saw)
+		}
+	}
+	if bytes.Contains(body, []byte("my secret")) {
+		t.Errorf("the prompt was echoed back in the error body: %s", body)
+	}
 }

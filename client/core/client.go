@@ -191,17 +191,19 @@ type Client struct {
 	resolver      Resolver
 	sealFields    []string
 	unboundFields []string
-	// profile is the wire profile whose rules this client seals and opens under
-	// (SPEC §5.1). It fixes which field carries the payload and which the
-	// response must seal, so a chat client cannot silently accept an
-	// image-shaped response or vice versa. Set from the service type; see
-	// WithEndpoint.
-	profile wire.Profile
-	// serviceType is the request family this client serves, passed to the
-	// resolver on every request. Held here rather than on the resolver because
-	// one resolver (one 0G Router) serves every endpoint; the client is the thing
-	// that is bound to one request shape.
-	serviceType string
+	// ep is the surface this client serves — one row of endpoint.All; see
+	// WithEndpoint. Its Profile fixes which field carries the payload and which
+	// the response must seal (SPEC §5.1), so a chat client cannot silently accept
+	// an image-shaped response or vice versa, and the whole row is what the
+	// resolver is handed per request.
+	//
+	// Held as the row rather than as the profile and service type it was
+	// destructured into: those two were halves of one row held apart, and the
+	// service-type half is a lossy projection — /v1/chat/completions and
+	// /v1/messages share "chatbot", so a resolver given only that string cannot
+	// tell which of them it is ranking for. One field cannot go stale against
+	// itself.
+	ep endpoint.Endpoint
 	// sealFieldsSet records that WithSealFields was passed, so NewWithResolver
 	// can derive the default set from the profile without overriding an explicit
 	// choice. Needed because the derivation must happen AFTER the options loop:
@@ -487,8 +489,7 @@ func WithSealFields(fields []string) Option {
 // silently applying chat's rules to a request shape nobody analysed.
 func WithEndpoint(ep endpoint.Endpoint) Option {
 	return func(c *Client) {
-		c.serviceType = ep.ServiceType
-		c.profile = ep.Profile
+		c.ep = ep
 	}
 }
 
@@ -593,8 +594,7 @@ func NewWithResolver(r Resolver, opts ...Option) *Client {
 	tr.ResponseHeaderTimeout = providerTimeout
 	c := &Client{
 		resolver:      r,
-		profile:       endpoint.Chat.Profile,
-		serviceType:   endpoint.Chat.ServiceType,
+		ep:            endpoint.Chat,
 		unboundFields: wire.DefaultUnboundFields(),
 		http:          &http.Client{Transport: tr},
 
@@ -607,7 +607,7 @@ func NewWithResolver(r Resolver, opts ...Option) *Client {
 	// profile they settled on regardless of the order WithEndpoint and
 	// WithSealFields were passed in. An explicit WithSealFields still wins.
 	if !c.sealFieldsSet {
-		c.sealFields = wire.DefaultSealedFieldsFor(c.profile)
+		c.sealFields = wire.DefaultSealedFieldsFor(c.ep.Profile)
 	}
 	return c
 }
@@ -630,7 +630,7 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 	// fallback chain — a control-plane call bounded by the resolver's own HTTP
 	// client (route.New sets ResponseHeaderTimeout), not by a request deadline
 	// here; the per-attempt data-plane deadline is applied inside completeOnce.
-	cands, err := c.resolver.Resolve(ctx, c.serviceType, req)
+	cands, err := c.resolver.Resolve(ctx, c.ep, req)
 	if err != nil {
 		return nil, resolveErr(err)
 	}
@@ -783,7 +783,7 @@ func (c *Client) completeOnce(parent context.Context, provider Provider, req wir
 		outcome = UpstreamUndecodable
 		return nil, true, stageErr(StageUpstream, fmt.Errorf("decode sealed response: %w", err))
 	}
-	out, err := wire.OpenResponseFor(c.profile, ephPriv, sealedResp)
+	out, err := wire.OpenResponseFor(c.ep.Profile, ephPriv, sealedResp)
 	if err != nil {
 		c.logOpenFailure(0, sealedResp, err)
 		outcome = UpstreamUndecodable
@@ -882,8 +882,8 @@ func (c *Client) doRequest(ctx context.Context, provider Provider, env wire.Requ
 // model and enc key differ per candidate.
 func (c *Client) seal(provider Provider, req wire.Request, ephPub []byte) (wire.Request, error) {
 	req = withModel(req, provider.Model)
-	req = withStreamUsage(c.profile, req)
-	return wire.SealRequestFor(c.profile, provider.EncPubKey, req, c.sealedFieldsFor(req), provider.SignerAddr, ephPub, c.unboundFields...)
+	req = withStreamUsage(c.ep.Profile, req)
+	return wire.SealRequestFor(c.ep.Profile, provider.EncPubKey, req, c.sealedFieldsFor(req), provider.SignerAddr, ephPub, c.unboundFields...)
 }
 
 // withStreamUsage forces "stream_options":{"include_usage":true} on a streaming
