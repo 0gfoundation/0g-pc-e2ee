@@ -392,17 +392,49 @@ func Serves(eps ...endpoint.Endpoint) BuildOption {
 	return func(c *buildConfig) { c.serves = append(c.serves, eps...) }
 }
 
+// servedSurfaces is the one place the served set is decided. It defaults an
+// empty request to chat (the sidecar's shape), collapses duplicates by Path so
+// composing Serves options twice cannot warm a fleet twice or validate a profile
+// twice, and in direct-broker mode narrows to chat alone: route.NewDirect
+// derives the broker's paths as chat, so any other surface would seal to a chat
+// endpoint. Build reads the result for validation, warming and client
+// construction alike, so those three can no longer disagree about what this
+// binary serves.
+func servedSurfaces(requested []endpoint.Endpoint, directMode bool) []endpoint.Endpoint {
+	if directMode {
+		return []endpoint.Endpoint{endpoint.Chat}
+	}
+	if len(requested) == 0 {
+		return []endpoint.Endpoint{endpoint.Chat}
+	}
+	seen := make(map[string]struct{}, len(requested))
+	out := make([]endpoint.Endpoint, 0, len(requested))
+	for _, ep := range requested {
+		if _, dup := seen[ep.Path]; dup {
+			continue
+		}
+		seen[ep.Path] = struct{}{}
+		out = append(out, ep)
+	}
+	return out
+}
+
 func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *Built {
 	var bc buildConfig
 	for _, o := range opts {
 		o(&bc)
 	}
-	if len(bc.serves) == 0 {
-		bc.serves = []endpoint.Endpoint{endpoint.Chat}
-	}
+	// Decide the served set ONCE, here, and let everything below read it:
+	// validation, the warmer's service types, and the clients loop. It used to be
+	// decided twice — the option list drove validation while the direct-broker
+	// branch hard-coded chat — so a direct-mode gateway validated -unbound-fields
+	// against the image profile it would never seal under and refused to start on
+	// a setting that was valid for the only surface it served.
+	directMode := strings.TrimSpace(*f.providerURL) != ""
+	served := servedSurfaces(bc.serves, directMode)
 	sealFields := parseCSV(*f.sealFieldsCSV)
 	unboundFields := parseCSV(*f.unboundFieldsCSV)
-	if flag, err := validateFieldSets(sealFields, unboundFields, bc.serves); err != nil {
+	if flag, err := validateFieldSets(sealFields, unboundFields, served); err != nil {
 		logger.Error("invalid "+flag, "err", err)
 		os.Exit(1)
 	}
@@ -414,7 +446,6 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 	// rejected. These checks come before the router-mode interdependency checks
 	// below so a direct-mode operator gets the direct-mode message (not, say,
 	// "-onchain requires -attest") for the same flag combination.
-	directMode := strings.TrimSpace(*f.providerURL) != ""
 	if directMode && *f.onchainOn {
 		logger.Error("-onchain is not supported in direct-broker mode (-provider-url); run without -provider-url to route through the router")
 		os.Exit(1)
@@ -546,9 +577,10 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 			os.Exit(1)
 		}
 		logger.Info("direct-broker mode enabled (no router)", "label", label, "provider_url", *f.providerURL, "attest", *f.attestOn)
-		// Chat only, whatever was asked for: NewDirect derives the broker's paths as
-		// chat, so any other surface would seal to a chat endpoint. The gateway
-		// refuses the rest explicitly rather than leaving them to its catch-all.
+		// served is chat alone here (servedSurfaces narrowed it): NewDirect derives
+		// the broker's paths as chat, so any other surface would seal to a chat
+		// endpoint. The gateway refuses the rest explicitly rather than leaving them
+		// to its catch-all.
 		return &Built{Clients: map[string]*core.Client{
 			endpoint.Chat.Path: core.NewWithResolver(directRes, append(append([]core.Option{}, coreOpts...),
 				core.WithSealFields(sealFields), core.WithEndpoint(endpoint.Chat))...),
@@ -566,8 +598,8 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 	// router knows: warming a fleet we will never seal to buys nothing and takes on
 	// that enumeration's failure modes for free. It de-duplicates by address, so a
 	// provider serving several surfaces is verified once.
-	warmTypes := make([]string, 0, len(bc.serves))
-	for _, ep := range bc.serves {
+	warmTypes := make([]string, 0, len(served))
+	for _, ep := range served {
 		warmTypes = append(warmTypes, ep.ServiceType)
 	}
 	router := route.New(*f.RouterURL, append(append([]route.Option{}, routeOpts...),
@@ -583,8 +615,8 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 	// every other row seals its profile's default. Nothing else here names a row:
 	// what a surface is comes from endpoint.All, and whether it is served from
 	// Serves.
-	clients := make(map[string]*core.Client, len(bc.serves))
-	for _, ep := range bc.serves {
+	clients := make(map[string]*core.Client, len(served))
+	for _, ep := range served {
 		opts := append(append([]core.Option{}, coreOpts...), core.WithEndpoint(ep))
 		if ep.Profile == wire.ProfileChat {
 			opts = append(opts, core.WithSealFields(sealFields))

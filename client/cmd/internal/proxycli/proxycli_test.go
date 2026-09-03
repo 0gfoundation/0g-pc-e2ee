@@ -417,6 +417,50 @@ func TestValidateFieldSetsCoversTheImageProfile(t *testing.T) {
 	}
 }
 
+// Direct-broker mode serves chat alone whatever the binary asked for, and — the
+// part that was broken — validates the operator's flags against chat alone too.
+// The served set used to be decided twice: the Serves list drove validation
+// while the direct branch hard-coded chat, so a direct-mode gateway (which asks
+// for endpoint.All) refused to start on `-unbound-fields=model,response_format`,
+// a setting that is only invalid for the image profile it would never seal
+// under. Both halves are asserted: it starts, and it built exactly one client.
+func TestBuildDirectModeServesAndValidatesChatOnly(t *testing.T) {
+	fs := flag.NewFlagSet("t", flag.ContinueOnError)
+	f := RegisterFlags(fs, "ZG_TEST", ":0")
+	if err := fs.Parse([]string{
+		"-provider-url", "https://broker.example/v1",
+		"-unbound-fields", "model,response_format", // invalid for image, fine for chat
+	}); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	// Build exits the process on a validation failure, so reaching the assertions
+	// below IS the first half of the test.
+	built := f.Build("test", testLogger(), Serves(endpoint.All...))
+	if len(built.Clients) != 1 || built.Clients[endpoint.Chat.Path] == nil {
+		t.Errorf("direct mode must build the chat client and nothing else, got %d clients", len(built.Clients))
+	}
+}
+
+// Composing Serves more than once must not warm a fleet twice or validate a
+// profile twice: the served set is de-duplicated by Path before anything reads
+// it. Only the clients map is observable from here (the warm list is internal
+// to route), so that is what is asserted.
+func TestBuildServesDeduplicates(t *testing.T) {
+	fs := flag.NewFlagSet("t", flag.ContinueOnError)
+	f := RegisterFlags(fs, "ZG_TEST", ":0")
+	if err := fs.Parse(nil); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	built := f.Build("test", testLogger(), Serves(endpoint.All...), Serves(endpoint.Chat), Serves(endpoint.All...))
+	if len(built.Clients) != len(endpoint.All) {
+		t.Errorf("built %d clients from a triple-composed Serves, want %d", len(built.Clients), len(endpoint.All))
+	}
+	got := servedSurfaces([]endpoint.Endpoint{endpoint.Chat, endpoint.Image, endpoint.Chat}, false)
+	if len(got) != 2 || got[0].Path != endpoint.Chat.Path || got[1].Path != endpoint.Image.Path {
+		t.Errorf("servedSurfaces must de-duplicate preserving first-seen order, got %v", got)
+	}
+}
+
 // A client is built per served row and only per served row: the gateway passes
 // endpoint.All and gets one per surface, the sidecar passes nothing and gets
 // chat alone. The same list picks the router's warm service types — warming a

@@ -657,11 +657,15 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 			mux.Handle("POST "+ep.Path, sealedGate)
 			continue
 		}
+		// The same envelope every other gateway-origin error uses (WriteError:
+		// json-encoded, so the path cannot break the body, and attributed to
+		// "gateway" in _0g.source so a thin client keys fault attribution off one
+		// field). The old hand-rolled body was type "invalid_request_error" with no
+		// attribution — the one gateway error a client could not attribute.
 		path := ep.Path
 		mux.Handle("POST "+path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusNotImplemented)
-			_, _ = fmt.Fprintf(w, `{"error":{"message":"sealed POST %s is not served by this gateway build","type":"invalid_request_error"}}`+"\n", path)
+			openaiproxy.WriteError(w, http.StatusNotImplemented, "gateway",
+				fmt.Sprintf("sealed POST %s is not served by this gateway build", path))
 		}))
 	}
 	// /healthz answers "is this process serving?" and nothing more. It is the
