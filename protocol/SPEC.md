@@ -222,7 +222,7 @@ signed-text format.)
 | `chat`  | `/v1/chat/completions` | `messages` | — | `messages`, `tools` | `choices` |
 | `image` | `/v1/images/generations` | `prompt` | `response_format` = `b64_json` (§7.1) | `prompt` | `data` |
 | `anthropic` | `/v1/messages` | `messages`, **and `system` whenever present** | — | `messages`, `system`, `tools` | per frame shape (§7.2) |
-| `speech` | `/v1/audio/transcriptions` (JSON-ified, §5.3) | `file_base64`, **and `filename` / `language` / `prompt` whenever present** | `response_format` ∈ {`json`, `verbose_json`} (§5.3.2); `stream` **refused** when `true` (§5.3.3) | `file_base64`, `filename`, `language`, `prompt` | `text`, **and `segments` / `words` / `language` whenever present** (§7.3) |
+| `speech` | `/v1/audio/transcriptions` (JSON-ified, §5.3) | `file_base64`, **and `filename` / `language` / `prompt` whenever present** | `response_format` ∈ {`json`, `verbose_json`} (§5.3.2); `stream` = `false` **when present** (§5.3.3) | `file_base64`, `filename`, `language`, `prompt` | `text`, **and `segments` / `words` / `language` whenever present** (§7.3) |
 
 A **pinned cleartext field** is one that stays readable but may hold only a
 **permitted value** in a sealed request — one value, or a small set of them
@@ -246,10 +246,13 @@ apart when adding a profile: the first argues for requiring the field (silence
 means the leak), the second does not (silence may already be the safe value) and
 argues instead for a legible refusal.
 
-A **refused cleartext value** is the weaker sibling: the field may be absent —
-the endpoint's default is what the profile wants — but one specific value is
-rejected. See §5.3.3 for the case (`stream` on the `speech` profile) and for why
-reusing the pinned-field machinery for it rejects every conforming request.
+A **conditionally pinned cleartext field** is the optional-presence sibling: the
+field may be absent — the endpoint's default is what the profile wants — but when
+present it must hold a permitted value. See §5.3.3 for the case (`stream` on the
+`speech` profile), for why reusing the unconditional machinery rejects every
+conforming request, and for why the rule must be a permitted SET rather than a
+list of refused values on an endpoint whose request is materialized back into
+multipart.
 
 A **conditionally required payload field** is one that need not exist, but MUST
 be sealed whenever the request carries it. Two profiles use it: `system` on
@@ -489,7 +492,7 @@ holds on every multipart endpoint, including those with no profile yet.
 | `model` | string | no | The router routes and attributes on it (§5.1) |
 | `response_format` | string | **no — pinned to {`json`, `verbose_json`}** | Below |
 | `timestamp_granularities` | array | no | A knob selecting whether the response carries `words[]`; not content itself. What it turns on IS content, and §7.3 seals that |
-| `stream` | bool | **no — refused when `true`** | §5.3.3 |
+| `stream` | bool | **no — pinned to `false` whenever present** | §5.3.3 |
 | `temperature`, and any field a future upstream adds | — | no (§5.1 default) | Not content |
 
 The three "whenever present" rows are **conditionally required payload fields**
@@ -552,7 +555,7 @@ explicit value makes the refusal of `srt` legible to the caller. A profile autho
 reading only §7.1 would conclude "pin because silence is dangerous"; on this
 profile the reason is "pin because three of the five values are inexpressible".
 
-#### 5.3.3 The `speech` profile is non-streaming: a refused cleartext value
+#### 5.3.3 The `speech` profile is non-streaming: a conditionally pinned field
 
 `/v1/audio/transcriptions` has a streaming shape (`stream: true`, delivering
 `transcript.text.delta` / `transcript.text.done` events). **The `speech` profile
@@ -560,19 +563,45 @@ does not cover it**, so a sealed speech request MUST NOT request streaming: a
 sender MUST refuse to seal one, and an enclave MUST reject one it receives rather
 than emit frames whose shape this document does not define.
 
-This is a **refused cleartext value**, a construct distinct from a pinned
-cleartext field, and the difference is which way absence falls:
+`stream` is therefore a **conditionally pinned cleartext field**: it may be
+absent, and when present its value MUST be the permitted one (`false`). The
+construct differs from §5.1's unconditional pin only in which way absence falls:
 
-|  | Pinned cleartext field | Refused cleartext value |
+|  | Pinned cleartext field | Conditionally pinned |
 |---|---|---|
 | Absent | **violation** — the server's own default applies, and the profile exists because that default is wrong | **fine** — the endpoint's default is the value the profile wants |
-| Present, allowed value | fine | fine |
+| Present, permitted value | fine | fine |
 | Present, other value | violation | violation |
 | Sealed away, or `unbound` | violation (§5.1) | violation, same reasons |
 
-`stream` is the second: the endpoint defaults to non-streaming, so silence is
-exactly what the profile wants and requiring the field would reject the common
-request for no gain. Only the value `true` is refused.
+It is to the unconditional pin what §5.1's *conditionally required payload field*
+is to a required one, and those four are the whole taxonomy: required or optional
+presence, crossed with payload or pin.
+
+**It MUST be expressed as a permitted set, never as a set of refused values, and
+on a JSON-ified endpoint that is a correctness requirement rather than a style
+preference.** §5.3's whole premise is that the enclave re-materializes the
+request as `multipart/form-data`, where **every value is a string** and
+`stream=true` is exactly how a real streaming request is written. So the values
+that must not get through are whatever the materialized form reads as true —
+`true`, `"true"`, `1`, `"1"`, `"yes"`, and whatever else the upstream's form
+parser is lenient about. That set is **open**, so no list of refused values over
+it can be complete; "must be `false`" is closed, and only a closed rule fails
+closed. An implementation MUST compare the value's *materialized* rendering
+rather than its JSON type, so the boolean `false` and the string `"false"` are
+one value — a sender carrying form fields across as strings is doing nothing
+wrong, since the form they came from had no types.
+
+> This is not a hypothetical failure mode. The first implementation of this
+> profile expressed the rule as a blacklist compared by exact JSON type, and
+> `"stream": "true"` and `"stream": 1` both passed both ends — producing exactly
+> the router/enclave split brain described below, on the only profile that has
+> this rule. Its tests asserted that as intended, reasoning that "the upstream
+> rejects such junk": true of a JSON endpoint, false of a JSON-ified one.
+
+The error message MUST name the **permitted** value rather than the refused one.
+A message that says "must not be `true`" invites an operator to try the nearest
+other spelling, which on this endpoint is the bypass.
 
 It MUST NOT be sealed or declared `unbound`. Unbinding is refused for a pinned
 field's reason exactly — outside the AAD, an intermediary can set it in transit
@@ -950,6 +979,18 @@ Two constraints are specific to this profile.
   must write two parsers for. An explicit `0` is a valid quantity; `null`, or
   neither locator present, is an omission and is not a zero.
 
+  **A locator's containing field being `null` is an ERROR, not an unused
+  alternative.** `"usage": null` is the block being present and not being an
+  object, so the frame is malformed and MUST be refused — distinct from `usage`
+  being absent, which is simply this alternative not being used and is fine when
+  the other locator carries the value. The distinction needs stating because it
+  is where an implementation slips: decoding a JSON `null` into a map succeeds
+  and yields an empty one, so `"usage": null` reads as "the key is not in there"
+  and the requirement is then satisfied by `duration` alone. `null` is also the
+  likeliest value an upstream emits for a block it did not populate, so this is
+  the common case rather than the exotic one — the reference implementation had
+  exactly this bug while correctly refusing `"usage": 7`.
+
   The enclave MUST write it **even when the upstream response omits it**,
   deriving the duration from the audio it decoded, and MUST reject rather than
   seal a response whose duration it cannot establish. This is not the same
@@ -970,6 +1011,17 @@ Two constraints are specific to this profile.
   audio and looks entirely plausible on a dashboard. Nothing downstream can tell
   that number from a real one, and only the client can refuse the frame that
   produced it.
+
+**A profile with conditionally sealed response fields has no profile-wide sealed
+set, and an implementation MUST NOT offer one.** The tempting answer for this
+profile is `["text"]`, and it is worse than incomplete: it is *valid for every
+`json` transcription and invalid for every `verbose_json` one*, so an enclave
+holding it passes all of its own testing and then fails 100% of verbose
+responses the first time a client asks for timestamps — after the upstream call,
+which is already paid for. A frame-less accessor MUST therefore answer with the
+empty set for such a profile, exactly as it does for a frame-typed one (§7.2),
+so the mistake surfaces on the first request rather than on the first verbose
+one. Resolving the set against the frame is the only correct way to name it.
 
 Everything else stays cleartext and bound: `model`, and `verbose_json`'s `task`.
 Note that the duration is cleartext under **both** permitted formats, so
@@ -1151,7 +1203,7 @@ other, that party's column is the load-bearing one.
 | a stream ends with a frame marked `final` — for Anthropic, `message_stop` OR `error` (§7.2) | sealer marks it | **yes — client** (§7 already: a missing final frame is a truncation). An enclave that treats only `message_stop` as terminal emits an error stream the client must then reject. |
 | an unrecognized frame shape is refused (§7.2) | yes | **yes — both** (an unknown shape may carry content) |
 | pinned cleartext field: correct value, not sealed, not unbound (§5.1/§7.1) | yes | **yes — enclave** |
-| a REFUSED cleartext value is absent, and its field is neither sealed nor unbound — speech's `stream` (§5.3.3) | yes | **yes — enclave**, the only side that can decline: the alternative is emitting a stream whose frame shape this document does not define, which no receiver can then validate. Two traps, in opposite directions. Unlike a pinned field, ABSENCE IS COMPLIANT — the check is on the value, so an implementation that reuses the pinned-field machinery here rejects every conforming request. And the SEALED case is not the pinned field's either: §6 reconstructs `cleartext ∪ decrypted` and forwards it, so a sealed `stream: true` reaches the upstream while the router sees a non-streaming request |
+| a CONDITIONALLY PINNED field is absent or holds a permitted value, and is neither sealed nor unbound — speech's `stream` (§5.3.3) | yes | **yes — enclave**, the only side that can decline: the alternative is emitting a stream whose frame shape this document does not define, which no receiver can then validate. Three traps. ABSENCE IS COMPLIANT, so an implementation that reuses the unconditional machinery rejects every conforming request. The rule must be a PERMITTED SET, not a list of refused values: the request is materialized back into multipart, where the renderings that read as true are an open set, and the first implementation's blacklist let `"true"` and `1` straight through. And the SEALED case is not the unconditional pin's: §6 reconstructs `cleartext ∪ decrypted` and forwards it, so a sealed `stream: true` reaches the upstream while the router sees a non-streaming request |
 | on a multipart endpoint, a JSON-typed body is a valid envelope, and a multipart body carries no `_e2ee` part (§5.3.1) | n/a — the sender chooses one shape and uses it | **yes — enclave, both halves**. The second is the one that gets omitted: an envelope smuggled into a multipart part fails to parse as JSON, and "parse failure ⇒ not sealed" then forwards it in the clear. This is the only row whose violation leaks the payload with every other rule in this document still satisfied |
 | response sealed set covers the generated content (§7) | yes | **yes — client** (otherwise the content rides in the clear and Open still succeeds) |
 | `usage` not sealed (§7) | yes | client (loud either way: the router cannot bill) |

@@ -53,9 +53,19 @@ type ResponseE2EE struct {
 // frame; an empty set held for a whole stream would seal nothing on every
 // content frame. SealFrame refuses that (the frame's shape requires its content
 // field), so the mistake fails loudly rather than shipping cleartext.
+//
+// A profile with CONDITIONALLY sealed response fields (speech, §7.3) has no
+// profile-wide answer either, and yields the same empty set — for a reason worth
+// spelling out, because here the tempting answer is not merely incomplete but
+// LATENT. Returning `["text"]` would be valid for every `json` transcription and
+// invalid for every `verbose_json` one, so a broker holding it would pass all its
+// own testing and then fail 100% of verbose responses in production, the first
+// time a client asked for timestamps — after the upstream call, which is already
+// billed. An empty set fails on the very first request instead. Use
+// ResponseSealedFieldsForFrame, or pass nil to SealFrame.
 func DefaultResponseSealedFieldsFor(p Profile) []string {
 	s, err := p.spec()
-	if err != nil || s.responseFrames != nil {
+	if err != nil || s.responseFrames != nil || len(s.responseRequiredIfPresent) > 0 {
 		return []string{}
 	}
 	return slices.Clone(s.response)
@@ -729,6 +739,18 @@ func validateCleartextQuantity(p Profile, q cleartextQuantity, frame Response) e
 			var obj map[string]json.RawMessage
 			if err := json.Unmarshal(raw, &obj); err != nil {
 				return fmt.Errorf("sealed %s response field %q must be a JSON object carrying %s: %w", p, loc.field, loc, err)
+			}
+			// A JSON `null` decodes into a map WITHOUT error, yielding a nil map — so
+			// it would have slipped past the line above and then read as "the key is
+			// not there", i.e. as this alternative simply being unused. That is the
+			// same `null`-reads-as-absence trap the numeric parse below documents,
+			// one level up, and it is worse here because `null` is the likeliest junk
+			// value an upstream emits for a block it did not populate: `"usage": 7`
+			// was correctly refused while `"usage": null` sealed cleanly. The field
+			// is PRESENT and is not an object, which is the error this branch exists
+			// to report.
+			if obj == nil {
+				return fmt.Errorf("sealed %s response field %q must be a JSON object carrying %s, got null: a null block is not the absence of the block, and %s cannot be read from it", p, loc.field, loc, loc)
 			}
 			inner, present := obj[loc.key]
 			if !present {

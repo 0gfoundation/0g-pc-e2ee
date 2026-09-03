@@ -289,36 +289,8 @@ func TestSpeechProfileAcceptsAnAbsentStreamField(t *testing.T) {
 	}
 }
 
-func TestSpeechProfileAcceptsStreamFalse(t *testing.T) {
-	priv, pub, ephPub := speechKeys(t)
-	req := mustReq(t, sampleSpeechReq)
-	req["stream"] = json.RawMessage(`false`)
-
-	env, err := wire.SealRequestFor(wire.ProfileSpeech, pub, req, nil, testProvider, ephPub)
-	if err != nil {
-		t.Fatalf("stream:false must be accepted: %v", err)
-	}
-	if _, err := wire.OpenRequestFor(wire.ProfileSpeech, priv, env); err != nil {
-		t.Fatalf("open: %v", err)
-	}
-}
-
-func TestSpeechProfileRefusesStreamTrue(t *testing.T) {
-	_, pub, ephPub := speechKeys(t)
-	req := mustReq(t, sampleSpeechReq)
-	req["stream"] = json.RawMessage(`true`)
-
-	_, err := wire.SealRequestFor(wire.ProfileSpeech, pub, req, nil, testProvider, ephPub)
-	if err == nil {
-		t.Fatal("stream:true must be refused: the profile defines no streaming frame shape")
-	}
-	if !strings.Contains(err.Error(), "stream") {
-		t.Errorf("error should name the field, got %v", err)
-	}
-}
-
 // Whitespace around the value must not decide the outcome: the comparison is on
-// the decoded value's canonical JSON, not the sender's bytes.
+// the DECODED value's materialized token, not on the sender's bytes.
 func TestSpeechStreamRefusalIgnoresSenderWhitespace(t *testing.T) {
 	_, pub, ephPub := speechKeys(t)
 	req := mustReq(t, sampleSpeechReq)
@@ -329,40 +301,108 @@ func TestSpeechStreamRefusalIgnoresSenderWhitespace(t *testing.T) {
 	}
 }
 
-// A quoted "true" is a different value from the boolean and is not on the
-// refused list. It is nonsense the upstream will reject, but this package must
-// not silently conflate a string with a bool — the refusal set is exact.
-func TestSpeechStreamRefusalDoesNotConflateStringWithBool(t *testing.T) {
-	_, pub, ephPub := speechKeys(t)
-	req := mustReq(t, sampleSpeechReq)
-	req["stream"] = json.RawMessage(`"true"`)
-
-	if _, err := wire.SealRequestFor(wire.ProfileSpeech, pub, req, nil, testProvider, ephPub); err != nil {
-		t.Fatalf(`the string "true" is not the boolean true and is not refused here: %v`, err)
-	}
-}
-
-// A non-scalar value in a refused field cannot equal a declared boolean or
-// string, so it is not refused HERE — it is nonsense that fails upstream. The
-// case is pinned because the comparison must not panic or mis-decode on it.
-func TestSpeechStreamRefusalIgnoresNonScalarValues(t *testing.T) {
-	for _, value := range []string{`{"enabled":true}`, `[true]`, `null`, `1`} {
+// THE test for this rule, and the one an earlier version of this profile got
+// backwards. The pin is a whitelist, not a blacklist of refused values, because
+// the enclave re-materializes this request as multipart/form-data — where every
+// value is a STRING and `stream=true` is exactly how a real streaming request is
+// written. A blacklist over JSON types let `"true"`, `1`, `"1"` and `"yes"`
+// through on the one profile whose premise makes them equivalent to `true`.
+//
+// The earlier tests here asserted that bypass as intended behaviour, justified
+// by "the upstream rejects such junk". That holds for a JSON endpoint and not
+// for a JSON-ified one, which is the whole point of §5.3.
+func TestSpeechStreamRefusesEveryValueThatMaterializesAsTruthy(t *testing.T) {
+	for _, value := range []string{`true`, `"true"`, `1`, `"1"`, `"yes"`, `"on"`, `null`, `2`, `-1`} {
 		t.Run(value, func(t *testing.T) {
-			_, pub, ephPub := speechKeys(t)
+			priv, pub, ephPub := speechKeys(t)
 			req := mustReq(t, sampleSpeechReq)
 			req["stream"] = json.RawMessage(value)
 
-			if _, err := wire.SealRequestFor(wire.ProfileSpeech, pub, req, nil, testProvider, ephPub); err != nil {
-				t.Fatalf("a non-scalar stream value is not on the refused list: %v", err)
+			_, err := wire.SealRequestFor(wire.ProfileSpeech, pub, req, nil, testProvider, ephPub)
+			if err == nil {
+				t.Fatalf("stream=%s must be refused: only the safe value is permitted, since the set of truthy multipart renderings is open", value)
+			}
+
+			// And the receiver's half, on an envelope the field is added to after
+			// sealing — the shape a third-party client produces.
+			clean := mustReq(t, sampleSpeechReq)
+			env, err := wire.SealRequestFor(wire.ProfileSpeech, pub, clean, nil, testProvider, ephPub)
+			if err != nil {
+				t.Fatalf("seal: %v", err)
+			}
+			env["stream"] = json.RawMessage(value)
+			if _, err := wire.OpenRequestFor(wire.ProfileSpeech, priv, env); err == nil {
+				t.Fatalf("the enclave must refuse a received envelope with stream=%s", value)
 			}
 		})
 	}
 }
 
-// Malformed JSON in a refused field is an error, not a skip: the field is there
-// and unparseable, and letting it through would mean sealing a request no
-// receiver can evaluate.
-func TestSpeechStreamRefusalRejectsMalformedJSON(t *testing.T) {
+// A composite has no multipart rendering at all, so it cannot be the permitted
+// value: refused, and without panicking or mis-decoding.
+func TestSpeechStreamRefusesCompositeValues(t *testing.T) {
+	for _, value := range []string{`{"enabled":true}`, `[true]`, `{}`, `[]`} {
+		t.Run(value, func(t *testing.T) {
+			_, pub, ephPub := speechKeys(t)
+			req := mustReq(t, sampleSpeechReq)
+			req["stream"] = json.RawMessage(value)
+
+			if _, err := wire.SealRequestFor(wire.ProfileSpeech, pub, req, nil, testProvider, ephPub); err == nil {
+				t.Fatalf("stream=%s must be refused", value)
+			}
+		})
+	}
+}
+
+// Both spellings of the SAFE value are accepted, and that is deliberate rather
+// than lax: §5.3's conversion turns form fields into JSON, and a sender that
+// carries them across as strings is doing nothing wrong — the form it came from
+// had no types. It is also what keeps the error message from being a trap: it
+// says `must be "false"`, and a reader who sends the quoted string lands on the
+// safe value rather than on a bypass.
+func TestSpeechStreamAcceptsBothSpellingsOfFalse(t *testing.T) {
+	for _, value := range []string{`false`, `"false"`} {
+		t.Run(value, func(t *testing.T) {
+			priv, pub, ephPub := speechKeys(t)
+			req := mustReq(t, sampleSpeechReq)
+			req["stream"] = json.RawMessage(value)
+
+			env, err := wire.SealRequestFor(wire.ProfileSpeech, pub, req, nil, testProvider, ephPub)
+			if err != nil {
+				t.Fatalf("stream=%s is the safe value and must be accepted: %v", value, err)
+			}
+			if _, err := wire.OpenRequestFor(wire.ProfileSpeech, priv, env); err != nil {
+				t.Fatalf("open: %v", err)
+			}
+		})
+	}
+}
+
+// The error message must name the PERMITTED value, not the refused one. Naming
+// the refused value is how an operator following the message walks into the
+// bypass this rule exists to close.
+func TestSpeechStreamErrorNamesThePermittedValue(t *testing.T) {
+	_, pub, ephPub := speechKeys(t)
+	req := mustReq(t, sampleSpeechReq)
+	req["stream"] = json.RawMessage(`true`)
+
+	_, err := wire.SealRequestFor(wire.ProfileSpeech, pub, req, nil, testProvider, ephPub)
+	if err == nil {
+		t.Fatal("expected a refusal")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, `must be "false"`) {
+		t.Errorf("message should tell the caller what IS allowed, got %v", err)
+	}
+	if !strings.Contains(msg, "omitted entirely") {
+		t.Errorf("message should also offer omission, which is the common case: %v", err)
+	}
+}
+
+// Malformed JSON in the field is an error, not a skip: the field is there and
+// unparseable, and letting it through would mean sealing a request no receiver
+// can evaluate.
+func TestSpeechStreamRejectsMalformedJSON(t *testing.T) {
 	_, pub, ephPub := speechKeys(t)
 	req := mustReq(t, sampleSpeechReq)
 	req["stream"] = json.RawMessage(`tru`)
@@ -372,7 +412,8 @@ func TestSpeechStreamRefusalRejectsMalformedJSON(t *testing.T) {
 	}
 }
 
-// Sealing `stream` is refused for a reason DIFFERENT from a pinned field's. A
+// Sealing `stream` is refused for a reason DIFFERENT from an unconditional
+// pinned field's. A
 // pin sealed away leaves the server on its own default; here the enclave
 // reconstructs `cleartext ∪ decrypted` and forwards the result, so the router
 // would see a non-streaming request while the enclave asks the upstream to
@@ -418,10 +459,10 @@ func TestSpeechEnclaveRefusesAnEnvelopeArrivingWithStreamTrue(t *testing.T) {
 	}
 }
 
-// Chat and image declare no refused values, so the new machinery must be
-// completely inert for them — including for a chat request that legitimately
-// streams.
-func TestRefusedCleartextIsInertForOtherProfiles(t *testing.T) {
+// Chat and image declare no conditionally pinned fields, so the new machinery
+// must be completely inert for them — including for a chat request that
+// legitimately streams.
+func TestConditionalPinIsInertForOtherProfiles(t *testing.T) {
 	priv, pub, ephPub := speechKeys(t)
 	req := mustReq(t, `{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}`)
 
@@ -433,7 +474,7 @@ func TestRefusedCleartextIsInertForOtherProfiles(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	if err := wire.ValidateUnboundFieldsFor(wire.ProfileChat, []string{"stream"}, []string{"messages"}); err != nil {
-		t.Errorf("chat has no refused values, so unbinding stream is its own business: %v", err)
+		t.Errorf("chat pins nothing conditionally, so unbinding stream is its own business: %v", err)
 	}
 }
 

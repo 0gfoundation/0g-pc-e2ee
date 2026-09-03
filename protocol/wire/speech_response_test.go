@@ -294,6 +294,12 @@ func TestSpeechDurationNumericDomain(t *testing.T) {
 		{"null is the absence of a value, not a zero", `{"type":"duration","seconds":null}`, "null"},
 		{"negative is not a duration", `{"type":"duration","seconds":-1}`, "negative"},
 		{"a non-object usage is malformed, not an unused alternative", `"twelve"`, "JSON object"},
+		// `null` decodes into a map with NO error, yielding a nil map, so it would
+		// have read as "this alternative is unused" and been satisfied by the other
+		// locator. It is also the likeliest junk value for a block an upstream did
+		// not populate — `usage: 7` was already refused while `usage: null` sealed
+		// cleanly.
+		{"a null usage block is not the absence of the block", `null`, "got null"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
