@@ -69,16 +69,22 @@ import (
 // runtime with "no sealed upstream path for service type". Deriving them removes
 // the second spelling instead of documenting it.
 //
-// Exported for the same reason as before: a caller passing a service type to
-// Resolve or WithWarmServiceTypes should name it rather than retype it.
+// Exported for WithWarmServiceTypes, whose argument really is a service type: it
+// says which slice of the FLEET to keep hot, and the provider catalog is indexed
+// by service type. Resolve no longer takes one — it takes the row, because a
+// service type cannot name a surface.
 var (
-	// DefaultServiceType is the service type sent to the preview API for a chat
-	// completion. It is the router's internal service-type vocabulary — the same
-	// strings GET /v1/service-types returns and GET /v1/providers?service_type=
-	// accepts — not the model modality on /v1/models.
+	// DefaultServiceType is the service type of the chat fleet. It is the router's
+	// internal service-type vocabulary — the same strings GET /v1/service-types
+	// returns and GET /v1/providers?service_type= accepts — not the model modality
+	// on /v1/models.
+	//
+	// It covers BOTH chat surfaces: /v1/chat/completions and /v1/messages are one
+	// pool of providers answering two request shapes, so warming this one value
+	// keeps the Anthropic surface's providers hot too, and there is deliberately no
+	// second constant for it.
 	DefaultServiceType = endpoint.Chat.ServiceType
-	// ServiceTypeTextToImage is the preview service type for
-	// /v1/images/generations.
+	// ServiceTypeTextToImage is the service type of the image fleet.
 	ServiceTypeTextToImage = endpoint.Image.ServiceType
 )
 

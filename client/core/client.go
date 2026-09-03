@@ -471,7 +471,7 @@ func WithSealFields(fields []string) Option {
 
 // WithEndpoint binds the client to the surface it serves — one row of
 // endpoint.All — which selects the wire profile it seals and opens under, the
-// service type it asks the resolver for, and, unless WithSealFields overrides
+// row the resolver is handed per request, and, unless WithSealFields overrides
 // it, the default sealed set for that profile ("messages"/"tools" vs "prompt").
 //
 // The profile is what stops a chat client accepting an image-shaped response
@@ -481,12 +481,18 @@ func WithSealFields(fields []string) Option {
 // default keeps behaving exactly as before (endpoint.Chat).
 //
 // Taking the row rather than a service-type STRING is what removed this
-// package's copy of the string-to-profile mapping. A surface the table does not
-// carry is now unrepresentable here instead of being caught by an allowlist that
-// had to be kept in step with three others. The zero Endpoint — what
-// endpoint.ByServiceType returns on a miss — still fails closed: its empty
-// profile makes every seal and open fail with "unknown profile" rather than
-// silently applying chat's rules to a request shape nobody analysed.
+// package's copy of the string-to-profile mapping, and the row is now what
+// crosses the resolver boundary too — a service type cannot name a surface,
+// since /v1/chat/completions and /v1/messages share "chatbot". A surface the
+// table does not carry is unrepresentable here instead of being caught by an
+// allowlist that had to be kept in step with three others.
+//
+// The zero Endpoint still fails closed: its empty profile makes every seal and
+// open fail with "unknown profile" rather than silently applying chat's rules to
+// a request shape nobody analysed. That promise is about SEALING only — asking
+// the zero row what to withhold from an untrusted router answers "nothing", so
+// route.sensitiveFieldsFor keys its own fallback on that empty answer rather
+// than trusting the row.
 func WithEndpoint(ep endpoint.Endpoint) Option {
 	return func(c *Client) {
 		c.ep = ep

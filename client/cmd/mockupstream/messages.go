@@ -190,7 +190,7 @@ func (s *server) serveAnthropicStream(w http.ResponseWriter, r *http.Request, ep
 	if err != nil {
 		return
 	}
-	for i := 0; i < s.cfg.Chunks; i++ {
+	for range s.cfg.Chunks {
 		frames = append(frames, wire.Response{
 			"type":  json.RawMessage(`"content_block_delta"`),
 			"index": json.RawMessage(`0`),
@@ -202,7 +202,12 @@ func (s *server) serveAnthropicStream(w http.ResponseWriter, r *http.Request, ep
 		wire.Response{
 			"type":  json.RawMessage(`"message_delta"`),
 			"delta": json.RawMessage(`{"stop_reason":"end_turn","stop_sequence":null}`),
-			"usage": s.anthropicUsageRaw(),
+			// ONLY the output count, as the real surface sends it: the input count
+			// arrived on message_start. Repeating it here is not a protocol
+			// violation (`usage` has no required shape, only the rule that it stays
+			// cleartext) but a client summing across frames would double-count it,
+			// and this fixture's value is being indistinguishable from the real thing.
+			"usage": json.RawMessage(fmt.Sprintf(`{"output_tokens":%d}`, s.cfg.Chunks)),
 		},
 		wire.Response{"type": json.RawMessage(`"message_stop"`)},
 	)
@@ -285,9 +290,11 @@ func isContentDelta(frame wire.Response) bool {
 // cleartext count in the place §7.2 puts it.
 const promptTokens = 11
 
-// anthropicUsageRaw is the cleartext output count, in the top-level `usage` that
-// message_delta and the non-streaming `message` frame carry. Sized off -chunks so
-// it moves with the content rather than contradicting it.
+// anthropicUsageRaw is the non-streaming `message` frame's cleartext `usage`,
+// which carries BOTH counts because that frame is the whole turn. The streaming
+// path splits them the way the real surface does: input on message_start, output
+// on message_delta. Sized off -chunks so it moves with the content rather than
+// contradicting it.
 func (s *server) anthropicUsageRaw() json.RawMessage {
 	return json.RawMessage(fmt.Sprintf(`{"input_tokens":%d,"output_tokens":%d}`, promptTokens, s.cfg.Chunks))
 }
