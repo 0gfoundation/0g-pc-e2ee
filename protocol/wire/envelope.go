@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 	"github.com/gowebpki/jcs"
@@ -73,6 +74,41 @@ const (
 	// profileSpec.requiredResponseCleartext.
 	fieldUsage        = "usage"
 	fieldOutputImages = "output_images"
+	// The speech profile's request fields (SPEC §5.3.2). The request reaches this
+	// protocol JSON-ified: the audio that was a multipart file part is a base64
+	// string in fieldFileBase64, which is why the payload field has a name at all
+	// rather than being "the body".
+	//
+	// fieldFilename is payload for a reason worth stating: as a multipart part
+	// header it is readable by every intermediary today, and a filename is
+	// content ("board-meeting-2026Q3.m4a"). JSON-ifying is what lets a profile
+	// seal it.
+	fieldFileBase64 = "file_base64"
+	fieldFilename   = "filename"
+	// fieldLanguage is BOTH a request field and a response field, and they are
+	// different things wearing one name: on the request it is the caller's
+	// language hint, on the response it is the language the enclave INFERRED from
+	// the audio. Both are payload, so both are sealed, but only the response one
+	// is conditional (see profileSpec.responseRequiredIfPresent).
+	fieldLanguage = "language"
+	// fieldStream is the speech profile's refused cleartext value (SPEC §5.3.3):
+	// the profile defines no streaming frame taxonomy, so `true` is rejected —
+	// see profileSpec.refusedCleartext.
+	fieldStream = "stream"
+	// The speech profile's response fields (SPEC §7.3). fieldText is always
+	// sealed; fieldSegments / fieldWords carry the same transcript cut per
+	// segment and per word and are sealed WHENEVER PRESENT, since `verbose_json`
+	// carries segments and carries words only when word granularity was asked
+	// for.
+	fieldText     = "text"
+	fieldSegments = "segments"
+	fieldWords    = "words"
+	// fieldSeconds / fieldDuration are the two places a transcription response
+	// reports the billable audio length: `usage.seconds` on a `json` response,
+	// and a TOP-LEVEL `duration` on a `verbose_json` one, which commonly carries
+	// no `usage` block at all. Either satisfies §7.3 — see cleartextQuantity.
+	fieldSeconds  = "seconds"
+	fieldDuration = "duration"
 	// clientEphPubLen is the byte length of an X25519 public key — the client's
 	// response ephemeral key (SPEC §3 suite).
 	clientEphPubLen = 32
@@ -106,6 +142,16 @@ const (
 	// is a sequence of DIFFERENTLY SHAPED frames rather than one shape repeated
 	// (SPEC §7.2).
 	ProfileAnthropic Profile = "anthropic"
+	// ProfileSpeech is /v1/audio/transcriptions, JSON-ified (SPEC §5.3): the
+	// payload is the base64 audio in "file_base64". It is the first profile whose
+	// endpoint speaks multipart on the wire the caller sees — the conversion to
+	// and from JSON happens outside this package, at the sender and inside the
+	// enclave, precisely so nothing in here has to be multipart-aware.
+	//
+	// It is single-shape like chat and image, but its response sealed set is not
+	// a constant: `verbose_json` adds `segments`, and `words` only when word
+	// granularity was requested (see responseRequiredIfPresent).
+	ProfileSpeech Profile = "speech"
 )
 
 // profileSpec fixes, per profile, the field that MUST be sealed, any CLEARTEXT
@@ -140,16 +186,52 @@ type profileSpec struct {
 	// rather than of the profile. nil means single-shape (chat, image), where
 	// responseRequired/response answer for every frame.
 	responseFrames *responseFrameRule
-	// pinnedCleartext maps a cleartext field to the ONLY value a sealed request
-	// of this profile may carry. The field must be present — an absent one is
+	// responseRequiredIfPresent is responseRequired's conditional twin, on the
+	// response side: fields that need not exist, but MUST be sealed whenever the
+	// FRAME carries one. It is what lets a single-shape profile have a
+	// non-constant sealed set.
+	//
+	// The speech profile is the case. `verbose_json` carries `segments`, and
+	// `words` only when word granularity was requested; both hold the same
+	// transcript as `text`, cut differently, and the response's `language` is
+	// inferred from the audio. A constant `response` set cannot express that:
+	// listing all of them rejects every conforming `json` response (SealFrame
+	// refuses a sealed field the frame does not have), and listing none of them
+	// is the leak.
+	//
+	// Note these are NOT also listed in `response`. That field is "always
+	// sealed"; this one is additive, and ResponseSealedFieldsForFrame unions them
+	// per frame. Listing a name in both would make the frameless
+	// DefaultResponseSealedFieldsFor claim a field a `json` response never has.
+	responseRequiredIfPresent []string
+	// pinnedCleartext maps a cleartext field to the PERMITTED values a sealed
+	// request of this profile may carry — usually one (image: exactly
+	// `b64_json`), sometimes a small set (speech: either of `json` /
+	// `verbose_json`). The field must be present in every case — an absent one is
 	// rejected, never defaulted — because a server-side default is exactly what
-	// this guards against (§7.1). Empty for profiles with no such constraint.
-	pinnedCleartext map[string]string
+	// this guards against (§5.1/§7.1), and that does not weaken because two
+	// values are permitted instead of one. Empty for profiles with no such
+	// constraint.
+	pinnedCleartext map[string][]string
+	// refusedCleartext is the pin's weaker sibling (SPEC §5.3.3): the field may
+	// be ABSENT — the endpoint's default is what the profile wants — but the
+	// listed values are rejected when it is present.
+	//
+	// Values are compared as their JSON encoding after canonicalization by the
+	// decoder below, so a boolean is "true"/"false" rather than a Go bool: the
+	// one member so far is `stream`, a JSON bool, and a future one could as
+	// easily be a string. Comparing rendered JSON keeps one code path.
+	//
+	// The direction of absence is the whole distinction from a pin, and getting
+	// it backwards is not a subtle failure: implementing this with
+	// pinnedCleartext would demand `stream` be PRESENT on every sealed speech
+	// request and reject every conforming one.
+	refusedCleartext map[string][]string
 	// requiredResponseCleartext are numeric values a sealed FINAL response frame
 	// of this profile MUST carry in cleartext, because the router bills on them
-	// and cannot recover them from the sealed content (§7.1). Empty for profiles
-	// with no such requirement.
-	requiredResponseCleartext []cleartextNumber
+	// and cannot recover them from the sealed content (§7.1/§7.3). Empty for
+	// profiles with no such requirement.
+	requiredResponseCleartext []cleartextQuantity
 	// protected are top-level response fields this profile must keep READABLE and
 	// AUTHENTICATED — see protectedCleartext. Empty for a profile whose router
 	// inputs are all covered by the profile-independent floor.
@@ -198,17 +280,79 @@ type protectedCleartext struct {
 	reads string
 }
 
-// cleartextNumber locates a required cleartext number one level inside a
-// top-level response field — `usage.output_images`, and so far only that. A
-// two-level struct rather than general dotted-path resolution because the one
-// requirement that exists is two levels deep, and a path parser would be more
-// machinery than the rule it enforces.
+// cleartextNumber locates a required cleartext number in a response frame:
+// either one level inside a top-level field (`usage.output_images`,
+// `usage.seconds`) or a top-level field that IS the number (`duration`), which
+// is what an empty key means.
+//
+// Still two levels at most rather than general dotted-path resolution: no
+// requirement is deeper, and a path parser would be more machinery than the
+// rules it enforces. The top-level form is not a generalization toward one — it
+// is the degenerate case, and it exists because `verbose_json` genuinely reports
+// the audio length at the top level with no `usage` object to nest it in.
 type cleartextNumber struct {
-	field string // top-level cleartext response field, e.g. "usage"
-	key   string // key within that object, e.g. "output_images"
+	field string // top-level cleartext response field, e.g. "usage" or "duration"
+	key   string // key within that object, e.g. "output_images"; "" = field IS the number
 }
 
-func (c cleartextNumber) String() string { return c.field + "." + c.key }
+func (c cleartextNumber) String() string {
+	if c.key == "" {
+		return c.field
+	}
+	return c.field + "." + c.key
+}
+
+// numberKind is the numeric domain a required cleartext quantity must fall in.
+// It exists because the two quantities that exist are genuinely different
+// domains, not because generality seemed nice: an image COUNT is a whole number
+// and an audio DURATION is not.
+type numberKind int
+
+const (
+	// numberWhole is a non-negative integer. As strict as the router's own `*int`
+	// parse, deliberately: the protocol must not accept a value its consumer will
+	// reject, since a conforming enclave would then seal a response (2.5 images,
+	// 1e3) the router refuses to bill — a spec question turned into a 502 nobody
+	// can act on.
+	numberWhole numberKind = iota
+	// numberFractional is a non-negative finite number, integral or not. Audio
+	// duration genuinely is fractional, so §7.1's whole-number rule would reject
+	// every honest transcription response.
+	numberFractional
+)
+
+// cleartextQuantity is one value a sealed FINAL frame must carry in cleartext,
+// located by ALTERNATIVE locators: any one satisfies the requirement.
+//
+// The alternation is not laxity. It encodes the two shapes upstreams actually
+// emit for one quantity: a `json` transcription reports the audio length as
+// `usage.seconds`, a `verbose_json` one commonly carries no `usage` block at all
+// and reports it as a top-level `duration`. A profile forced to name one locator
+// would reject half of the conforming responses on its own endpoint.
+//
+// What alternation DOES add is a rule a single locator has no need for: a frame
+// carrying more than one must state the same value in all of them (§7.3). The
+// two readers differ — a client opens one locator, a router bills the other — so
+// disagreement is one response transacted at two prices, with nothing anywhere
+// comparing them.
+type cleartextQuantity struct {
+	// locators are the places this quantity may appear, in the order error
+	// messages should list them. At least one; any one present satisfies.
+	locators []cleartextNumber
+	kind     numberKind
+	// what names the quantity for error messages — the operator needs to know
+	// what was missing, not just which key.
+	what string
+}
+
+// String renders the locator alternatives for an error message.
+func (q cleartextQuantity) String() string {
+	parts := make([]string, len(q.locators))
+	for i, l := range q.locators {
+		parts[i] = l.String()
+	}
+	return strings.Join(parts, " or ")
+}
 
 // responseFrameRule describes a profile whose response is a sequence of
 // differently shaped frames (SPEC §7.2). Each frame names its own shape in a
@@ -386,12 +530,16 @@ var profiles = map[Profile]profileSpec{
 		// banning "url" is the point: OpenAI's own default for the DALL·E
 		// family IS "url", so an omitted field is a request to leak, spelled
 		// as silence.
-		pinnedCleartext: map[string]string{fieldResponseFormat: "b64_json"},
+		pinnedCleartext: map[string][]string{fieldResponseFormat: {"b64_json"}},
 		// The billable count. Sealing `data` makes the images uncountable from
 		// outside, so §7.1 requires the enclave to restate how many it produced
 		// in cleartext; without this the router's own parse of a sealed frame
 		// yields zero images and bills nothing, silently, forever.
-		requiredResponseCleartext: []cleartextNumber{{field: fieldUsage, key: fieldOutputImages}},
+		requiredResponseCleartext: []cleartextQuantity{{
+			locators: []cleartextNumber{{field: fieldUsage, key: fieldOutputImages}},
+			kind:     numberWhole,
+			what:     "the count of images actually delivered",
+		}},
 	},
 	ProfileAnthropic: {
 		// "messages" is the conversation and is always there; "system" is the
@@ -430,6 +578,49 @@ var profiles = map[Profile]profileSpec{
 		// (the router reads zero and cannot tell that from a genuine zero — the
 		// §7.1 failure mode), so it wants the same treatment once the locator
 		// handles three levels and per-shape required cleartext.
+	},
+	ProfileSpeech: {
+		// The audio. Voice is biometric, so a sealed set omitting it defeats the
+		// profile entirely; `filename`, `language` and `prompt` are payload of
+		// lesser degree and ride in the default set. They are OPTIONAL fields, so
+		// the default is a set to filter by presence, exactly as chat's `tools`
+		// is — SealRequestFor refuses a sealed field the request does not have,
+		// and DefaultSealedFieldsFor documents that the caller filters.
+		required: fieldFileBase64,
+		request:  []string{fieldFileBase64, fieldFilename, fieldLanguage, fieldPrompt},
+		// `text` is the transcript and is always there. The other three are
+		// conditional and therefore NOT in this set — see
+		// responseRequiredIfPresent for why listing them here would be wrong
+		// rather than merely redundant.
+		responseRequired:          fieldText,
+		response:                  []string{fieldText},
+		responseRequiredIfPresent: []string{fieldSegments, fieldWords, fieldLanguage},
+		// `text` / `srt` / `vtt` return a body that is not a JSON object, so they
+		// have nowhere to put `_e2ee`, no §7 frame and no aad for §8's respH:
+		// inexpressible under sealing rather than merely leaky. Both JSON-shaped
+		// values are permitted, because excluding `verbose_json` would cost the
+		// profile its timestamps and with them subtitles (SPEC §5.3.2).
+		//
+		// Note this pin is argued differently from the image profile's, which
+		// looks identical. There the field is required because the DEFAULT IS THE
+		// LEAK (`url`); here the endpoint's default (`json`) is already permitted,
+		// and the pin exists because three of the five values cannot be expressed.
+		pinnedCleartext: map[string][]string{fieldResponseFormat: {"json", "verbose_json"}},
+		// The profile defines no streaming frame taxonomy, so a streaming request
+		// is refused rather than answered with frames whose shape the SPEC does
+		// not define. Absence is compliant: the endpoint defaults to
+		// non-streaming, which is what the profile wants (SPEC §5.3.3).
+		refusedCleartext: map[string][]string{fieldStream: {"true"}},
+		// The billable audio length, in either of the two places upstreams put it.
+		// Fractional, unlike the image count: audio duration genuinely is.
+		requiredResponseCleartext: []cleartextQuantity{{
+			locators: []cleartextNumber{
+				{field: fieldUsage, key: fieldSeconds},
+				{field: fieldDuration},
+			},
+			kind: numberFractional,
+			what: "the billable duration of the audio actually processed, in seconds",
+		}},
 	},
 }
 
@@ -479,6 +670,125 @@ func validatePinnedCleartextFor(p Profile, env Request) error {
 	return validatePinnedCleartext(spec, env)
 }
 
+// quotedList renders a set of JSON string values for an error message:
+// `"b64_json"` for one, `"json" or "verbose_json"` for two, a comma list beyond
+// that. Used for both a pin's PERMITTED values and a refusal's REFUSED ones, so
+// it deliberately renders only the list — the calling sentence says which.
+func quotedList(vals []string) string {
+	quoted := make([]string, len(vals))
+	for i, v := range vals {
+		quoted[i] = fmt.Sprintf("%q", v)
+	}
+	switch len(quoted) {
+	case 0:
+		return "(no permitted value)"
+	case 1:
+		return quoted[0]
+	case 2:
+		return quoted[0] + " or " + quoted[1]
+	default:
+		return strings.Join(quoted[:len(quoted)-1], ", ") + " or " + quoted[len(quoted)-1]
+	}
+}
+
+// validateRefusedCleartextFor enforces a profile's refused cleartext values
+// (SPEC §5.3.3) on a RECEIVED envelope — the enclave-side counterpart of the
+// seal-time checks, and the load-bearing half: refusing a request whose response
+// shape this document does not define is something only the receiver can do, and
+// a third-party client is under no obligation to check.
+//
+// Three ways the refusal can be defeated, and — this is the part that differs
+// from a pin — the SEALING one is defeated for a different reason:
+//
+//   - the value is present and refused;
+//   - the field was SEALED. A pin sealed away leaves the server reading nothing
+//     and falling back to its own default. Here it is worse than that: the
+//     enclave reconstructs `request = cleartext ∪ decrypted` and forwards the
+//     result upstream, so a sealed `stream: true` means the ROUTER sees a
+//     non-streaming request while the enclave asks the upstream to stream. The
+//     two halves of the system then disagree about the response shape, which is
+//     not a fallback but a split brain;
+//   - the field was declared UNBOUND, so an intermediary could set it in transit
+//     and Open would still succeed.
+func validateRefusedCleartextFor(p Profile, env Request) error {
+	spec, err := p.spec()
+	if err != nil {
+		return err
+	}
+	if len(spec.refusedCleartext) == 0 {
+		return nil
+	}
+	e2ee, err := env.E2EE()
+	if err != nil {
+		return err
+	}
+	if err := validateRefusedNotSealed(spec, e2ee.SealedFields); err != nil {
+		return err
+	}
+	if err := validateRefusedNotUnbound(spec, e2ee.UnboundFields); err != nil {
+		return err
+	}
+	return validateRefusedCleartext(spec, env)
+}
+
+// validateRefusedNotSealed rejects a sealed set that hides a field carrying a
+// refused value. See validateRefusedCleartextFor for why this is not the pinned
+// field's "server falls back to its default" — it is a disagreement between the
+// router and the enclave about what the request asked for.
+func validateRefusedNotSealed(spec profileSpec, sealed []string) error {
+	for _, f := range sealed {
+		if _, refused := spec.refusedCleartext[f]; refused {
+			return fmt.Errorf("%q must stay CLEARTEXT: sealing it hides from every intermediary a value the enclave will still reconstruct and forward upstream, so the router and the enclave would disagree about the response shape", f)
+		}
+	}
+	return nil
+}
+
+// validateRefusedNotUnbound rejects an unbound set that frees a field with
+// refused values: outside the AAD, an intermediary can set it in transit and the
+// enclave accepts the result, which makes a seal-time refusal a refusal in name
+// only.
+func validateRefusedNotUnbound(spec profileSpec, unbound []string) error {
+	for _, f := range unbound {
+		if vals, refused := spec.refusedCleartext[f]; refused {
+			return fmt.Errorf("%q cannot be unbound: it may not be %s, and an unbound field is outside the AAD, so an intermediary could set it in transit and the enclave would accept the result", f, quotedList(vals))
+		}
+	}
+	return nil
+}
+
+// validateRefusedCleartext rejects a request whose cleartext carries one of a
+// refused value. An ABSENT field passes: that is the whole difference from a pin
+// (SPEC §5.3.3) — the endpoint's default is the value the profile wants, so
+// demanding presence would reject every conforming request.
+//
+// The comparison is on the value's JSON encoding, canonicalized through a decode
+// and re-encode so `true`, ` true` and `TRUE`-less variants of whitespace all
+// compare equal while a string `"true"` stays distinct from the boolean. A raw
+// bytes.Equal on the un-decoded value would make refusal depend on the sender's
+// whitespace.
+func validateRefusedCleartext(spec profileSpec, req Request) error {
+	for field, refusedVals := range spec.refusedCleartext {
+		raw, ok := req[field]
+		if !ok {
+			continue
+		}
+		var v any
+		if err := json.Unmarshal(raw, &v); err != nil {
+			return fmt.Errorf("sealed request field %q is not valid JSON: %w", field, err)
+		}
+		norm, err := json.Marshal(v)
+		if err != nil {
+			return fmt.Errorf("sealed request field %q cannot be re-encoded: %w", field, err)
+		}
+		got := string(norm)
+		if slices.Contains(refusedVals, got) {
+			return fmt.Errorf("sealed request field %q must not be %s: this profile defines no response shape for it (SPEC §5.3.3)", field, quotedList(refusedVals))
+		}
+	}
+	return nil
+}
+
 // validatePinnedNotSealed rejects a sealed set that swallows a pinned cleartext
 // field. Sealing it removes it from the cleartext envelope entirely, so the
 // server reads nothing where the pin should be and falls back to its own default
@@ -488,7 +798,7 @@ func validatePinnedCleartextFor(p Profile, env Request) error {
 func validatePinnedNotSealed(spec profileSpec, sealed []string) error {
 	for _, f := range sealed {
 		if want, pinned := spec.pinnedCleartext[f]; pinned {
-			return fmt.Errorf("%q is pinned to %q and must stay CLEARTEXT: sealing it removes it from the envelope the server reads, which then falls back to its own default", f, want)
+			return fmt.Errorf("%q is pinned to %s and must stay CLEARTEXT: sealing it removes it from the envelope the server reads, which then falls back to its own default", f, quotedList(want))
 		}
 	}
 	return nil
@@ -503,7 +813,7 @@ func validatePinnedNotSealed(spec profileSpec, sealed []string) error {
 func validatePinnedNotUnbound(spec profileSpec, unbound []string) error {
 	for _, f := range unbound {
 		if want, pinned := spec.pinnedCleartext[f]; pinned {
-			return fmt.Errorf("%q is pinned to %q and cannot be unbound: an unbound field is outside the AAD, so an intermediary could rewrite it in transit and the enclave would accept the result", f, want)
+			return fmt.Errorf("%q is pinned to %s and cannot be unbound: an unbound field is outside the AAD, so an intermediary could rewrite it in transit and the enclave would accept the result", f, quotedList(want))
 		}
 	}
 	return nil
@@ -517,14 +827,17 @@ func validatePinnedCleartext(spec profileSpec, req Request) error {
 	for field, want := range spec.pinnedCleartext {
 		raw, ok := req[field]
 		if !ok {
-			return fmt.Errorf("sealed request must set %q to %q explicitly (an absent value takes the server's default, which may not be %q)", field, want, want)
+			// Presence is required whether one value is permitted or several: what a
+			// pin guards against is the server's own default, which an absent field
+			// selects, and a set of two permitted values does not change that.
+			return fmt.Errorf("sealed request must set %q to %s explicitly (an absent value takes the server's default, which may not be permitted)", field, quotedList(want))
 		}
 		var got string
 		if err := json.Unmarshal(raw, &got); err != nil {
-			return fmt.Errorf("sealed request field %q must be the JSON string %q: %w", field, want, err)
+			return fmt.Errorf("sealed request field %q must be a JSON string, %s: %w", field, quotedList(want), err)
 		}
-		if got != want {
-			return fmt.Errorf("sealed request field %q must be %q, got %q", field, want, got)
+		if !slices.Contains(want, got) {
+			return fmt.Errorf("sealed request field %q must be %s, got %q", field, quotedList(want), got)
 		}
 	}
 	return nil
@@ -699,6 +1012,9 @@ func ValidateSealedFieldsFor(p Profile, fields []string) error {
 	if err := validatePinnedNotSealed(spec, fields); err != nil {
 		return err
 	}
+	if err := validateRefusedNotSealed(spec, fields); err != nil {
+		return err
+	}
 	seen := make(map[string]struct{}, len(fields))
 	hasRequired := false
 	for _, f := range fields {
@@ -739,6 +1055,9 @@ func ValidateUnboundFieldsFor(p Profile, unbound, sealed []string) error {
 		return err
 	}
 	if err := validatePinnedNotUnbound(spec, unbound); err != nil {
+		return err
+	}
+	if err := validateRefusedNotUnbound(spec, unbound); err != nil {
 		return err
 	}
 	return ValidateUnboundFields(unbound, sealed)
@@ -849,6 +1168,17 @@ func SealRequestFor(profile Profile, encPub crypto.PublicKey, req Request, seale
 	if err := validatePinnedCleartext(spec, req); err != nil {
 		return nil, err
 	}
+	// The pin's weaker sibling: a value this profile refuses rather than a value
+	// it demands (§5.3.3). Absence is compliant here, so this cannot be folded
+	// into the pin checks above — doing so would demand `stream` on every sealed
+	// speech request. ValidateSealedFieldsFor already rejected a set that seals
+	// such a field away; these are the unbound and value halves.
+	if err := validateRefusedNotUnbound(spec, unboundFields); err != nil {
+		return nil, err
+	}
+	if err := validateRefusedCleartext(spec, req); err != nil {
+		return nil, err
+	}
 	if err := ValidateUnboundFields(unboundFields, sealedFields); err != nil {
 		return nil, err
 	}
@@ -951,7 +1281,10 @@ func SealRequestFor(profile Profile, encPub crypto.PublicKey, req Request, seale
 //   - validatePayloadIfPresentFor — no conditional payload field (Anthropic's
 //     top-level `system`) arrived in the cleartext half;
 //   - validatePinnedCleartextFor — the pinned cleartext field is present, has
-//     the required value, and was neither sealed away nor declared unbound.
+//     a permitted value, and was neither sealed away nor declared unbound;
+//   - validateRefusedCleartextFor — no field carries a value this profile
+//     refuses, and no such field was sealed away or declared unbound. Distinct
+//     from the pin check because absence is COMPLIANT here (§5.3.3).
 //
 // Then OpenRequest's own fail-closed checks (version, suite, AEAD, decrypted
 // keys == declared sealed_fields, no collision with cleartext).
@@ -972,6 +1305,9 @@ func OpenRequestFor(profile Profile, priv crypto.PrivateKey, env Request) (Reque
 		return nil, err
 	}
 	if err := validatePinnedCleartextFor(profile, env); err != nil {
+		return nil, err
+	}
+	if err := validateRefusedCleartextFor(profile, env); err != nil {
 		return nil, err
 	}
 	return OpenRequest(priv, env)

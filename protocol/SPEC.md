@@ -292,6 +292,7 @@ to the §8.2 corollary:
 | `usage` (response) | no — the router bills on it | **no** — its value must be authenticated |
 | a pinned cleartext field (§5.1) | **no** — sealing it removes it from the cleartext the server reads, which then falls back to its own default | **no** — the pin would hold only at seal time |
 | the top-level field CONTAINING a billable value, when a profile nests one — Anthropic's `message` (§7.2 rule 4) | no — the router bills on what is inside it | **no** — same reason as `usage`, one level down |
+| **any field a profile's required cleartext quantity is LOCATED in** — speech's `usage` *and* its top-level `duration` (§7.3) | no — but this is already fail-closed: a sealed locator is absent from the cleartext, so the §7.3 presence check refuses the frame | **no** — same reason as `usage`, one level UP. The `usage` row above is a NAME, so it says nothing about a quantity that is not nested in it |
 | `model` | no — the router attributes on it | yes — the router rewrites the alias back; the resulting value is *not* authenticated (a known trade-off, see §9 and `DefaultUnboundFields`) |
 | `x_0g_trace` | n/a — router-injected | yes — nothing may trust it (§8.2) |
 
@@ -304,6 +305,23 @@ are different. A profile that nests a value whose *value* must be trusted MUST
 therefore name the top-level field that contains it (§7.2 rule 4 does), and any
 new profile MUST answer this question explicitly rather than inheriting the
 general rule and assuming it reaches.
+
+**The trap runs in both directions, and the second one is easy to miss because
+the row that fails is the one that looks most obviously right.** "`usage` must
+stay bound" also says nothing about a quantity that is not nested in `usage` at
+all: the speech profile's `verbose_json` shape reports its billable duration as
+a **top-level `duration`**, so a frame declaring `duration` unbound satisfies
+every rule in the table above while handing an intermediary the number the router
+bills on — with `Open` succeeding and the §8 binding, which hashes the same AAD,
+coming out byte-identical. This is not hypothetical: the first implementation of
+the speech profile passed every test in this document and left exactly that hole,
+because each rule it implemented was the rule as written.
+
+An implementation SHOULD therefore derive the bound requirement from the
+profile's declared quantity **locators**, not from a list of names — then a new
+profile billing on a differently-named field is covered without anyone
+remembering to extend the list. The reference implementation does this
+(`validateResponseUnboundFieldsFor` walks `requiredResponseCleartext`).
 
 **Both ends enforce this, and for the "may be unbound" column the RECEIVER is
 the end that matters.** Checking only at seal time stops a conforming
@@ -527,11 +545,20 @@ cleartext field, and the difference is which way absence falls:
 
 `stream` is the second: the endpoint defaults to non-streaming, so silence is
 exactly what the profile wants and requiring the field would reject the common
-request for no gain. Only the value `true` is refused. It MUST NOT be sealed or
-declared `unbound` for the same reasons a pinned field must not be — sealing it
-removes it from the cleartext the server reads, and unbinding it lets an
-intermediary set it in transit while `Open` and the §8 verification both still
-pass.
+request for no gain. Only the value `true` is refused.
+
+It MUST NOT be sealed or declared `unbound`. Unbinding is refused for a pinned
+field's reason exactly — outside the AAD, an intermediary can set it in transit
+while `Open` and the §8 verification both still pass — but **sealing is refused
+for a different and worse reason, and a profile author who reasons by analogy
+with a pin will get this wrong.** A pin sealed away leaves the server reading
+nothing where the pin should be, so it falls back to its own default. A sealed
+`stream` does not fall back to anything: §6 has the enclave reconstruct
+`request = cleartext ∪ decrypted` and forward the result, so `stream: true`
+sealed inside the envelope reaches the **upstream** while the router — which
+reads only the cleartext — sees a non-streaming request. That is not a default
+being taken; it is the two halves of the system disagreeing about the shape of
+the response, each acting correctly on what it was told.
 
 The refusal is because the shape is **undefined**, not because it is unsafe.
 Adding it later means a frame taxonomy in the shape of §7.2 (a discriminator,
@@ -1106,6 +1133,8 @@ other, that party's column is the load-bearing one.
 | final frame carries the profile's billable cleartext — speech: `usage.seconds` OR top-level `duration`, written by the enclave even when the upstream omitted it (§7.3) | yes | **yes — client**, and more load-bearing than the image row. A router with no usage block on this endpoint estimates from the transcript text, which sealing makes empty, so it falls through to a flat constant: the omission does not under-bill quietly, it bills a fabricated number nothing downstream can distinguish from a real one |
 | where a billable cleartext has ALTERNATIVE locators, a frame carrying both states the same value — speech (§7.3) | **yes — sealer**, the only side that can compare both against the audio it measured | client (it can detect the disagreement, but not which locator is honest). The sealer's column is load-bearing because the two readers differ: a client opening one locator while a router bills the other would silently transact on different numbers for one response |
 | a conditionally sealed RESPONSE field is sealed when the frame carries it — speech: `segments` / `words` / `language` (§7.3) | yes | **yes — client**. A field still in the received cleartext was never sealed, and that is the receiver's only evidence: a router forwards such a frame unremarkably and the transcript rides through it in the clear. Same shape as the request side's conditional payload field, direction reversed |
+| a required quantity's LOCATOR field is not `unbound` — speech's `duration` as well as its `usage` (§5.2 table) | yes | **yes — client**, on every frame. The floor list is the name `usage`, so nothing else in this document reaches a top-level `duration`: derive the rule from the profile's locators rather than from names |
+| a REFUSED cleartext value is absent, and its field is neither sealed nor unbound — speech's `stream` (§5.3.3) | yes | **yes — enclave**. Note the sealed case is not the pinned field's: §6 reconstructs `cleartext ∪ decrypted` and forwards it, so a sealed `stream: true` reaches the upstream while the router sees a non-streaming request |
 | decrypted keys == declared `sealed_fields` (§5.1/§6) | by construction | **yes** |
 | no sealed/cleartext collision (§5.1) | by construction | **yes** |
 | envelope `v` / `kem_id` supported (§9) | by construction | **yes** |
