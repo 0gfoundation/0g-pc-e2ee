@@ -202,8 +202,14 @@ The tradeoff is explicit: an unbound `model` is **not** tamper-evident on the wi
 — the AAD no longer covers it. Trust in the model that actually ran therefore
 comes **only** from the TEE response signature (D4), which attests what the
 enclave executed; it must never be inferred from the request's cleartext `model`.
-A deployment that wants `model` bound on the wire re-binds it by dropping it from
-the unbound set (`core.WithUnboundFields`, or the `-unbound-fields` flag).
+Re-binding `model` on the wire means dropping it from the unbound set. That is a
+code change to `wire.DefaultUnboundFields` (see its `TODO(model-binding)`), or
+`core.WithUnboundFields` for a library caller — deliberately **not** a deployment
+setting. The proxy binaries once took an `-unbound-fields` / `UNBOUND_FIELDS`
+flag and no longer do: the startup check it fed only ever rejected the fields a
+profile *pins*, so `model,max_tokens` validated clean while granting the
+untrusted router exactly the tampering this section is about. Widening an
+AAD-exclusion set is not an operational knob.
 
 ### D3 — AAD binds everything except a declared unbound set (denylist, not allowlist) 🆕
 Choose **bind-all-except** over **bind-only-these**. Rationale:

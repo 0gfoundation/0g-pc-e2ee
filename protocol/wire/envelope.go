@@ -1146,11 +1146,16 @@ func ValidateSealedFieldsFor(p Profile, fields []string) error {
 // transit with the enclave still accepting the result.
 //
 // It is the exact pair of checks SealRequestFor runs on every request, exposed so
-// a caller can run them once at startup for each profile it will seal under.
-// Validating only the profile whose sealed set the operator configured is how a
-// binary passes startup clean and then fails 100% of the requests it makes under
-// another profile — `-unbound-fields=model,response_format` is valid for chat and
-// unsealable for image.
+// a caller can run them once up front for each profile it will seal under.
+// Checking only ONE profile is how a caller passes that up-front check clean and
+// then fails 100% of the requests it makes under another: `model,response_format`
+// is a valid unbound set for chat and unsealable for image.
+//
+// Note what it does NOT reject: a field the profile does not pin. `model,
+// max_tokens` passes here, and unbinding `max_tokens` hands the untrusted router
+// the "inflate max_tokens" edit §5.2 cites as what the AAD prevents. That is why
+// the proxy binaries no longer expose the unbound set as a flag — this check was
+// never a substitute for not making it configurable.
 func ValidateUnboundFieldsFor(p Profile, unbound, sealed []string) error {
 	spec, err := p.spec()
 	if err != nil {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -148,45 +149,29 @@ func TestComposeAllowedOriginsMatchesDefault(t *testing.T) {
 	}
 }
 
-// composeCommentedDefault matches a commented-out `# - "NAME=value"` entry in the
-// compose's environment block — the form used to document a setting the deployment
-// leaves at its built-in default.
-func composeCommentedDefault(t *testing.T, compose []byte, name string) string {
-	t.Helper()
-	re := regexp.MustCompile(`(?m)^\s*#\s*-\s*"` + regexp.QuoteMeta(name) + `=([^"]*)"`)
-	m := re.FindSubmatch(compose)
-	if m == nil {
-		t.Fatalf("no commented-out %s entry in %s", name, composePath)
-	}
-	return string(m[1])
-}
-
-// TestComposeCommentedDefaultsMatchTheBinary is TestComposeAllowedOriginsMatchesDefault's
-// counterpart for the field set the deployment does NOT set. It is written out as
-// a commented line so a reader of the measured manifest can see what the enclave
-// leaves unbound without opening the Go source — which makes it a copy of
-// wire.DefaultUnboundFields, and a copy needs a test.
+// TestComposeStatesTheUnboundSet is TestComposeAllowedOriginsMatchesDefault's
+// counterpart for the unbound field set. The set is no longer settable per
+// deployment, so the manifest states it in prose instead of as a commented-out
+// env var — which still makes it a copy of wire.DefaultUnboundFields, and a copy
+// still needs a test.
 //
 // Not a hypothetical: DefaultUnboundFields carries TODO(model-binding), which
-// reverts it to the empty set once the router stops rewriting "model". The day that
-// lands, an untested comment here would start telling operators the enclave leaves
-// the model name unbound when it no longer does.
-func TestComposeCommentedDefaultsMatchTheBinary(t *testing.T) {
+// reverts it to the empty set once the router stops rewriting "model". The day
+// that lands, an untested sentence here would go on telling a reader of the
+// MEASURED manifest that the enclave leaves the model name rewritable when it no
+// longer does — and this manifest is the artifact someone verifies the enclave
+// against, so it is the worst place for a stale claim.
+func TestComposeStatesTheUnboundSet(t *testing.T) {
 	compose, err := os.ReadFile(composePath)
 	if err != nil {
 		t.Fatalf("read %s: %v", composePath, err)
 	}
-	for _, tc := range []struct {
-		env  string
-		want []string
-	}{
-		{"ZG_GATEWAY_UNBOUND_FIELDS", wire.DefaultUnboundFields()},
-	} {
-		got := composeCommentedDefault(t, compose, tc.env)
-		if want := strings.Join(tc.want, ","); got != want {
-			t.Errorf("%s comment claims %q, but the binary defaults to %q; update the "+
-				"compose comment (it is read by operators as what the enclave seals)",
-				tc.env, got, want)
-		}
+	// Rendered the way Go prints a []string, which is how the manifest spells it:
+	// ["model"] today, [] once model becomes bound.
+	want := fmt.Sprintf("%q", wire.DefaultUnboundFields())
+	if !strings.Contains(string(compose), want) {
+		t.Errorf("%s does not state the current unbound set %s; the manifest is what a "+
+			"verifier reads, so update its prose to match wire.DefaultUnboundFields()",
+			composePath, want)
 	}
 }

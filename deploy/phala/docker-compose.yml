@@ -255,17 +255,20 @@ services:
       # unaffected. The localhost entries are development conveniences — drop them via
       # the override on any deployment that does not need them.
       - "ZG_GATEWAY_ALLOWED_ORIGINS=${ZG_GATEWAY_ALLOWED_ORIGINS:-https://0g.ai,https://*.0g.ai,http://localhost:3000,http://localhost:5173}"
-      # Cleartext fields excluded from the AAD (an empty value binds everything).
-      # Left to the binary's built-in set. The commented line below IS that default
-      # (protocol/wire/envelope.go), spelled out as the starting point to edit — NOT
-      # an example override. The value REPLACES the set rather than adding to it, so
-      # an override must restate every field it still wants: dropping "model" binds
-      # the model name into the AAD.
+      # NEITHER field set is deployment config, and there is deliberately no env
+      # var for either.
       #
-      # There is no SEAL_FIELDS counterpart. Which request fields are sealed is not
-      # deployment config: every surface seals its wire profile's set, so the
-      # enclave cannot be deployed into sealing less than its profile requires.
-      # - "ZG_GATEWAY_UNBOUND_FIELDS=model"
+      # Which request fields are SEALED comes from each surface's wire profile, so
+      # the enclave cannot be deployed into sealing less than its profile requires.
+      #
+      # Which cleartext fields are UNBOUND — excluded from the AAD, hence
+      # rewritable in transit by the untrusted router — is wire's built-in set,
+      # today ["model"]. Per SPEC §5.2 this is the one construct that can silently
+      # undo every other guarantee in the protocol, and the startup check only ever
+      # rejected the fields a profile PINS: an override of "model,max_tokens" would
+      # have validated clean while handing the router exactly the tampering the AAD
+      # exists to prevent. It is a code constant so that reading this manifest tells
+      # you the answer.
       # DCAP-verify each provider's TDX quote and seal only to the verified enc key,
       # instead of trusting the router-supplied pubkey endpoint. Enforced per request:
       # a provider that fails is rejected.

@@ -40,7 +40,6 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/client/route"
 	"github.com/0gfoundation/0g-pc-e2ee/client/sig"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
-	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
 // ShutdownTimeout bounds how long Serve waits for in-flight requests to drain
@@ -175,26 +174,40 @@ type Flags struct {
 	Listen      *string
 	RouterURL   *string
 	providerURL *string
-	// The sealed set is NOT an operator knob: every surface seals its profile's
-	// set, from wire's table, and the row is what says which profile. There was a
-	// `-seal-fields` / `SEAL_FIELDS` flag here (chat-only, defaulting to the
-	// package default, and applied only when it DIFFERED from that default). It
-	// was the last thing that made chat a special case in this file — a separate
-	// route option list, a separate core option in the clients loop, and a
-	// tri-state "did the operator actually choose this" comparison — and no
-	// deployment set it.
-	unboundFieldsCSV *string
-	attestOn         *bool
-	attestEnforce    *bool
-	onchainOn        *bool
-	onchainEnforce   *bool
-	verifyResponses  *bool
-	chainRPCURL      *string
-	servingContract  *string
-	warmOn           *bool
-	warmInterval     *time.Duration
-	pccsURL          *string
-	collateralTTL    *time.Duration
+	// Neither field set is an operator knob. Both were flags here
+	// (`-seal-fields` / `SEAL_FIELDS` and `-unbound-fields` / `UNBOUND_FIELDS`,
+	// each defaulting to wire's set); no deployment set either, the Phala compose
+	// carried both commented out, and neither was documented outside the design
+	// notes. What they are now: the sealed set comes from the endpoint row's
+	// profile, and the unbound set is wire.DefaultUnboundFields(), which
+	// core.New already installs.
+	//
+	// Removing the unbound one closes a footgun rather than just deleting code.
+	// `unbound_fields` is, per SPEC §5.2, the one construct that can silently
+	// undo every other guarantee: an unbound field is outside the AAD, so an
+	// intermediary may rewrite it with Open still succeeding. The startup check
+	// only ever caught the cases a profile PINS, so
+	// `UNBOUND_FIELDS=model,max_tokens` validated clean — handing the untrusted
+	// router exactly the "inflate max_tokens" edit §5.2 cites as what binding
+	// prevents. And for this binary a flag was never even cheap: the gateway's
+	// compose `environment:` block is inside compose_hash (see client/compose),
+	// which a quote commits to in mr_config_id, so setting one changes the
+	// measurement — as heavy as a code change, and it yields a manifest that is
+	// not the published one.
+	//
+	// core.WithUnboundFields stays for a library caller that genuinely faces an
+	// intermediary rewriting some other field.
+	attestOn        *bool
+	attestEnforce   *bool
+	onchainOn       *bool
+	onchainEnforce  *bool
+	verifyResponses *bool
+	chainRPCURL     *string
+	servingContract *string
+	warmOn          *bool
+	warmInterval    *time.Duration
+	pccsURL         *string
+	collateralTTL   *time.Duration
 }
 
 // defaultWarmInterval is the refresh-ahead period the background quote-cache
@@ -217,7 +230,7 @@ const defaultCollateralTTL = time.Hour
 // whose pointers are filled by fs.Parse. envPrefix (e.g. "ZG_GATEWAY",
 // "ZG_SIDECAR") selects the environment variables consulted for each flag's
 // default: <envPrefix>_LISTEN, _ROUTER_URL, _PROVIDER_URL,
-// _UNBOUND_FIELDS, _ATTEST, _ATTEST_ENFORCE, _ONCHAIN, _ONCHAIN_ENFORCE,
+// _ATTEST, _ATTEST_ENFORCE, _ONCHAIN, _ONCHAIN_ENFORCE,
 // _CHAIN_RPC_URL, _SERVING_CONTRACT, _WARM, _WARM_INTERVAL, _PCCS_URL,
 // _COLLATERAL_TTL.
 // defaultListen is the built-in listen address used when neither the flag nor
@@ -229,8 +242,6 @@ func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen string) *Flags {
 		RouterURL: fs.String("router-url", envOr(env("ROUTER_URL"), route.DefaultRouterURL), fmt.Sprintf("0G router base URL/domain (the route-preview path is appended) (env %s)", env("ROUTER_URL"))),
 		providerURL: fs.String("provider-url", envOr(env("PROVIDER_URL"), ""),
 			fmt.Sprintf("direct-broker mode: seal each request straight to this provider endpoint, skipping the router's route-preview (for an environment with a broker but no centralized router, e.g. dev); the provider's enc key + signer are fetched from its broker's /v1/e2ee/pubkey. Empty keeps the default router mode (env %s)", env("PROVIDER_URL"))),
-		unboundFieldsCSV: fs.String("unbound-fields", envOr(env("UNBOUND_FIELDS"), strings.Join(wire.DefaultUnboundFields(), ",")),
-			fmt.Sprintf("comma-separated cleartext fields excluded from the AAD (intermediary-mutable, untrusted); empty binds everything (env %s)", env("UNBOUND_FIELDS"))),
 		attestOn: fs.Bool("attest", envBool(env("ATTEST"), false),
 			fmt.Sprintf("DCAP-verify each provider's TDX quote and seal only to the verified enc key (instead of trusting the router-supplied pubkey endpoint) (env %s)", env("ATTEST"))),
 		attestEnforce: fs.Bool("attest-enforce", envBool(env("ATTEST_ENFORCE"), false),
@@ -322,32 +333,14 @@ func (b *Built) ProviderIdentities() route.ProviderIdentitySource {
 // so a misconfigured proxy never starts with, say, an unsealed "messages" field
 // or attestation silently off. logger is also attached as the core's debug
 // logger, so open-failure diagnostics share the binary's format and sink.
-// validateFieldSets checks -unbound-fields against EVERY profile this binary
-// will seal under, returning the flag name to blame. Split out of Build so it is
-// testable: Build's own failure path is os.Exit(1).
 //
-// Covering every served row is the part that is easy to leave out and expensive
-// to omit. All rows share one -unbound-fields set but seal under their own
-// profiles, and what a profile pins in cleartext differs — the image profile's
-// sealed set is ["prompt"] and its "response_format" is pinned. SealRequestFor
-// re-runs the check on every request, so validating against one profile lets a
-// binary start clean and then fail 100% of the requests it makes under another:
-// `-unbound-fields=model,prompt` and `model,response_format` are each valid for
-// chat and unsealable for image. Check what we will actually seal under, at
-// startup, where the operator can still fix the flag.
-//
-// It is driven off the rows this binary serves, so a new row is covered the day
-// it is added rather than the day someone remembers to extend a list here. That
-// also means there is no longer a chat branch: chat is a row like any other.
-func validateFieldSets(unboundFields []string, served []endpoint.Endpoint) (string, error) {
-	for _, ep := range served {
-		if err := wire.ValidateUnboundFieldsFor(ep.Profile, unboundFields,
-			wire.DefaultSealedFieldsFor(ep.Profile)); err != nil {
-			return fmt.Sprintf("-unbound-fields (for the %s profile this binary serves)", ep.Profile), err
-		}
-	}
-	return "", nil
-}
+// There is no longer a startup field-set check here. It validated
+// -unbound-fields against every served row's sealed set, and with both sets now
+// package constants of wire, its verdict cannot vary between runs: the identical
+// assertion is made for EVERY profile — not just the subset a given binary
+// serves — by wire's TestEveryProfileDefaultSatisfiesItsOwnRules. That is a
+// strictly wider check that runs before the binary ships, which is the one case
+// where a runtime check really does belong in a test.
 
 // BuildOption states something about the BINARY that Build cannot infer from the
 // flags — today, which sealed surfaces it actually mounts.
@@ -363,9 +356,6 @@ type buildConfig struct{ serves []endpoint.Endpoint }
 //   - the background warmer enumerates each row's fleet. Warming a fleet the
 //     binary will never seal to buys nothing and takes on that enumeration's
 //     failure modes for free.
-//   - startup validates -unbound-fields against each row's profile. Without
-//     that, a binary can pass startup clean and then fail every request on one
-//     surface at seal time (see validateFieldSets).
 //
 // The gateway passes endpoint.All. The sidecar mounts chat only and passes
 // nothing, which is the default.
@@ -405,19 +395,14 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 	for _, o := range opts {
 		o(&bc)
 	}
-	// Decide the served set ONCE, here, and let everything below read it:
-	// validation, the warmer's service types, and the clients loop. It used to be
-	// decided twice — the option list drove validation while the direct-broker
-	// branch hard-coded chat — so a direct-mode gateway validated -unbound-fields
+	// Decide the served set ONCE, here, and let everything below read it: the
+	// warmer's service types and the clients loop. It used to be decided twice —
+	// the option list drove the startup field-set validation while the
+	// direct-broker branch hard-coded chat — so a direct-mode gateway validated
 	// against the image profile it would never seal under and refused to start on
-	// a setting that was valid for the only surface it served.
+	// a setting valid for the only surface it served.
 	directMode := strings.TrimSpace(*f.providerURL) != ""
 	served := servedSurfaces(bc.serves, directMode)
-	unboundFields := parseCSV(*f.unboundFieldsCSV)
-	if flag, err := validateFieldSets(unboundFields, served); err != nil {
-		logger.Error("invalid "+flag, "err", err)
-		os.Exit(1)
-	}
 	// Direct-broker mode (-provider-url set) skips the router and seals straight to
 	// one fixed provider — for an environment with a broker but no centralized
 	// router (dev). It reuses the pubkey/quote fetch but not the router-only steps:
@@ -513,9 +498,9 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 	}
 	// Shared by every client. Nothing per-row goes here — the row itself travels
 	// via core.WithEndpoint, and each client derives its sealed set from that
-	// row's profile.
+	// row's profile. No WithUnboundFields either: core.New already installs
+	// wire.DefaultUnboundFields(), so passing it would be a restatement.
 	coreOpts := []core.Option{
-		core.WithUnboundFields(unboundFields),
 		core.WithDebugLogger(logger),
 		// Meter response-open failures. The counter lives in client/metrics and is
 		// only exported by the gateway's /metrics listener; the sidecar increments it
@@ -777,9 +762,10 @@ func collateralSource(pccsURL string) string {
 }
 
 // envOr returns the value of environment variable key, or def if it is unset.
-// An explicitly-set-but-empty variable (e.g. ZG_GATEWAY_UNBOUND_FIELDS=) is
-// honored as empty, which for CSV fields is a meaningful value (bind everything),
-// so we branch on presence via LookupEnv rather than treating "" as unset.
+// An explicitly-set-but-empty variable is honored as empty rather than treated
+// as unset — for a string setting, "" can be the value an operator means (e.g.
+// ZG_GATEWAY_PROVIDER_URL= to select router mode against a default that is not
+// empty) — so we branch on presence via LookupEnv.
 func envOr(key, def string) string {
 	if v, ok := os.LookupEnv(key); ok {
 		return v
@@ -850,15 +836,4 @@ func envDuration(key string, def time.Duration) time.Duration {
 		log.Fatalf("invalid %s=%q: must be a Go duration (e.g. 4m, 90s)", key, v)
 	}
 	return d
-}
-
-// parseCSV splits a comma-separated flag value into trimmed, non-empty parts.
-func parseCSV(s string) []string {
-	var out []string
-	for _, part := range strings.Split(s, ",") {
-		if p := strings.TrimSpace(part); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
 }
