@@ -365,12 +365,16 @@ func Serves(eps ...endpoint.Endpoint) BuildOption {
 
 // servedSurfaces is the one place the served set is decided. It defaults an
 // empty request to chat (the sidecar's shape), collapses duplicates by Path so
-// composing Serves options twice cannot warm a fleet twice or validate a profile
-// twice, and in direct-broker mode narrows to chat alone: route.NewDirect
-// derives the broker's paths as chat, so any other surface would seal to a chat
-// endpoint. Build reads the result for validation, warming and client
-// construction alike, so those three can no longer disagree about what this
-// binary serves.
+// composing Serves options twice cannot warm a fleet twice, and in direct-broker
+// mode narrows to chat alone: route.NewDirect derives the broker's paths as
+// chat, so any other surface would seal to a chat endpoint.
+//
+// Build reads the result for warming and for client construction on BOTH the
+// router and direct paths (via sealingClients), so those cannot disagree about
+// what this binary serves. That mattered enough to be a bug once — the Serves
+// list drove the then-existing startup validation while the direct branch
+// hard-coded chat — so the narrowing must stay something the code reads, not
+// something a comment asserts.
 func servedSurfaces(requested []endpoint.Endpoint, directMode bool) []endpoint.Endpoint {
 	if directMode {
 		return []endpoint.Endpoint{endpoint.Chat}
@@ -388,6 +392,28 @@ func servedSurfaces(requested []endpoint.Endpoint, directMode bool) []endpoint.E
 		out = append(out, ep)
 	}
 	return out
+}
+
+// sealingClients builds one client per served row against one resolver, keyed by
+// the row's Path.
+//
+// A client is a SEALING CONTEXT bound to one request shape — its profile fixes
+// which field must be sealed and which the response must seal — which is a real
+// per-surface property, unlike the resolver's caches. They are cheap: no
+// transport, no cache, no verifier of their own.
+//
+// Both of Build's paths call it, which is the point: the router path and the
+// direct-broker path differ ONLY in the resolver they hand it, so neither can
+// grow a per-row rule the other lacks. Nothing here names a row — what a surface
+// is comes from endpoint.All, whether it is served from Serves, and what it seals
+// from its profile.
+func sealingClients(r core.Resolver, served []endpoint.Endpoint, coreOpts []core.Option) map[string]*core.Client {
+	clients := make(map[string]*core.Client, len(served))
+	for _, ep := range served {
+		clients[ep.Path] = core.NewWithResolver(r,
+			append(append([]core.Option{}, coreOpts...), core.WithEndpoint(ep))...)
+	}
+	return clients
 }
 
 func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *Built {
@@ -529,14 +555,18 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 			os.Exit(1)
 		}
 		logger.Info("direct-broker mode enabled (no router)", "label", label, "provider_url", *f.providerURL, "attest", *f.attestOn)
-		// served is chat alone here (servedSurfaces narrowed it): NewDirect derives
-		// the broker's paths as chat, so any other surface would seal to a chat
-		// endpoint. The gateway refuses the rest explicitly rather than leaving them
-		// to its catch-all.
-		return &Built{Clients: map[string]*core.Client{
-			endpoint.Chat.Path: core.NewWithResolver(directRes, append(append([]core.Option{}, coreOpts...),
-				core.WithEndpoint(endpoint.Chat))...),
-		}}
+		// Built from `served`, which servedSurfaces has already narrowed to chat
+		// alone: NewDirect derives the broker's paths as chat, so any other row
+		// would seal to a chat endpoint, and the gateway refuses the rest
+		// explicitly rather than leaving them to its catch-all.
+		//
+		// Reading `served` rather than restating endpoint.Chat is the point. The
+		// served set used to be decided twice — the Serves list drove the startup
+		// field-set validation while this branch hard-coded chat — and that
+		// disagreement was a real bug. Now that the validation is gone, deriving
+		// the map here is what keeps "decided once" a property of the code rather
+		// than a claim in this comment.
+		return &Built{Clients: sealingClients(directRes, served, coreOpts)}
 	}
 
 	// ONE router. It is one 0G Router, at one URL, serving every endpoint — so
@@ -557,22 +587,7 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 	router := route.New(*f.RouterURL, append(append([]route.Option{}, routeOpts...),
 		route.WithWarmServiceTypes(warmTypes...))...)
 
-	// One client per served row, one router. A client is a SEALING CONTEXT bound
-	// to one request shape — its profile fixes which field must be sealed and
-	// which the response must seal — which is a real per-surface property, unlike
-	// the router's caches. They are cheap: no transport, no cache, no verifier of
-	// their own.
-	//
-	// Every row is built the same way: the row goes in, the sealed set comes from
-	// its profile. Nothing here names a row — what a surface is comes from
-	// endpoint.All, and whether it is served from Serves.
-	clients := make(map[string]*core.Client, len(served))
-	for _, ep := range served {
-		clients[ep.Path] = core.NewWithResolver(router,
-			append(append([]core.Option{}, coreOpts...), core.WithEndpoint(ep))...)
-	}
-
-	b := &Built{Clients: clients, router: router, verifiesQuotes: *f.attestOn}
+	b := &Built{Clients: sealingClients(router, served, coreOpts), router: router, verifiesQuotes: *f.attestOn}
 	if *f.warmOn {
 		b.resolver = resolver
 		b.warmInterval = *f.warmInterval
@@ -763,9 +778,12 @@ func collateralSource(pccsURL string) string {
 
 // envOr returns the value of environment variable key, or def if it is unset.
 // An explicitly-set-but-empty variable is honored as empty rather than treated
-// as unset — for a string setting, "" can be the value an operator means (e.g.
-// ZG_GATEWAY_PROVIDER_URL= to select router mode against a default that is not
-// empty) — so we branch on presence via LookupEnv.
+// as unset, so we branch on presence via LookupEnv.
+//
+// The distinction only bites where the DEFAULT is non-empty, and it bites hard
+// there: `ZG_GATEWAY_ALLOWED_ORIGINS=` is how an operator turns browser access
+// off, and treating it as unset would silently restore the shipped allowlist —
+// the opposite of what was asked. Same shape for ZG_GATEWAY_DSTACK_SOCKET.
 func envOr(key, def string) string {
 	if v, ok := os.LookupEnv(key); ok {
 		return v
