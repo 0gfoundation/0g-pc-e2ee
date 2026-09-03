@@ -171,10 +171,10 @@ is ours or upstream, and a structural review of the manifest (unpinned images,
 the review has no rule for). A manifest that does not match the hash fails the run; a
 provider that publishes none makes the run incomplete (exit 3). The review itself
 **gates nothing** — it exists so a per-service baseline can be written from a real
-deployment, and that baseline, compared byte-exact, is what will adjudicate.
+deployment, and that baseline, compared byte-exact, is what adjudicates.
 
 Each service also carries its **canonical block** fingerprint, and `-blocks` prints the
-canonical text. That is the form the future baseline will be written and compared in:
+canonical text. That is the form the baseline is written and compared in:
 comments, indentation and quoting are dropped, everything that changes what runs is kept,
 and the image **identity** is held out separately so a broker release does not force a
 gateway release.
@@ -193,13 +193,26 @@ manifest section that can fail a run. Every direction: a recorded service the ma
 does not declare, a declared service the baseline does not record (an unlisted container
 runs in the same guest as the reviewed ones), a service declared twice, a differing
 block, an image outside its rule. A mismatch carries no severity — it is not a review
-finding; either the deployment is the one we approved or it is not.
+finding; either the deployment is the one we recorded or it is not.
 
-The baseline **ships empty**, because recording cn-20's manifest as it stands would bless
-the ten blocking findings the review reports on it. So provider mode returns 3 until it is
-filled, saying the containers were not compared against anything. `-app-baseline <file>`
-reads a candidate instead, which is how the first one gets written and checked against a
-live provider before it is committed.
+The baseline **records cn-20's twelve services** as of 2026-08-28 (`compose_hash`
+`720530b4…`), each block taken from that provider's own `-blocks` output and its
+fingerprint checked back against it. Nine entries pin the image exactly as the deployment
+has it; three run 0G's own broker image and pin the image-held-out block plus a repository
+rule, so a broker release does not force a gateway release.
+
+**Recording is not approval.** The review still reports ten blocking findings on this
+manifest and recording silences none of them — four tag-only images, `privileged` plus
+`/`, `/proc`, `/sys` on prometheus-node-exporter, `SYS_ADMIN` on dcgm-exporter, and the
+container runtime's socket held by 0g-controller. What the baseline buys is that those
+stop being able to *grow*: from here on, a service added, removed, renamed or changed in
+any way that changes what runs is a mismatch, named per service with the first differing
+line. Each entry carries a `note` recording why it stands as it does; 0g-controller's says
+plainly that its `docker.sock` mount is an open question rather than an accepted risk, and
+until that is answered the baseline must not be wired into the sealing path as a refusal.
+
+`-app-baseline <file>` reads a candidate instead of the embedded one, which is how the
+next revision gets checked against a live provider before it is committed.
 
 The gateway mode matters for the third form above, which adds one attested trust
 party: it verifies the dstack-ingress cert-binding quote, confirms the certificate
@@ -221,11 +234,12 @@ compose text is then matched against the newest 5 published releases by default
 Both modes exit non-zero on a failed check, so either works as a deploy gate, and both
 separate "failed" (1) from "did not run" (3) so a skipped check cannot read as a full
 pass. `-strict` makes every check mandatory and turns the latter into the former. In
-provider mode a 3 means one of three things — hop 3's allowlist held no entry, the
-provider published no app-compose, or no per-service baseline is recorded — and the
-verdict line names every one that applies. **The last always applies as shipped**, since
-`evidence/brokercompose.json` is deliberately empty, so a clean 0 needs `-app-baseline`
-with a candidate. See
+provider mode a 3 means one of four things — hop 3's allowlist held no entry, the
+provider published no app-compose, no per-service baseline is recorded, or `-no-quote`
+skipped hops 2–4 by request — and the verdict line names every one that applies. The
+third no longer applies as shipped: `evidence/brokercompose.json` records cn-20's
+services, so against that manifest a clean 0 is reachable, and against a different one
+the comparison **fails** rather than skipping. See
 [`docs/design/cloud-gateway.md`](../docs/design/cloud-gateway.md) §10 for what the
 result does and does not cover.
 

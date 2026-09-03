@@ -13,8 +13,9 @@ see there are no gaps — and where the gaps still are.
 >
 > - **hop 3** (the *code root*) — the allowlist is populated
 >   (`client/evidence/brokerimages.json`, one entry per audited OS image) and enforce is
->   **on**: an unlisted image is refused, not warned about. Its OS half is closed; the
->   container half below it is read but not adjudicated.
+>   **on**: an unlisted image is refused, not warned about. Its OS half is closed. The
+>   container half below it is read and adjudicated *in the verifier* — the per-service
+>   baseline is populated — but that comparison is not yet in the gateway's sealing path.
 > - **hop 5** — wired, observed, and enforce is **on**: a provider the registry does not
 >   vouch for is skipped, not warned about.
 > - **hop 11** — enforced, but only because `-verify-responses` is on; it is off by default.
@@ -269,10 +270,12 @@ build, which is a migration to sequence rather than a gap in the mechanism (see
 beside it, the deployment no longer merely seals to "an attested enclave" but to "the
 **expected** attested enclave" — the audited image *and* the registered operator.
 
-What is genuinely not done is the code root's OTHER half: hop 3 pins the guest OS and
-says nothing about the containers inside it. That half is **read but not adjudicated**
-(see below) — and unlike hop 5's switch, closing it needs a baseline that does not
-exist yet.
+The code root's OTHER half — hop 3 pins the guest OS and says nothing about the
+containers inside it — is now **read and adjudicated** in `pcverify -provider`: the
+per-service baseline records cn-20's twelve services, and any manifest that is not that
+one is a mismatch rather than a skipped check (see below). What is not done is wiring
+that comparison into the SEALING path, which unlike hop 5's switch waits on the one
+entry in that baseline whose justification is still open.
 
 Hop 3 is no longer blocked on either of the two things that used to hold it — the shape
 of an allowlist entry, and having no published source for its values. Its allowlist takes one entry per OS image
@@ -328,16 +331,31 @@ precondition for flipping a switch.
 > declare, a declared service the baseline does not record, a service declared twice, a
 > differing block, an image outside its rule. A mismatch is not a review finding and
 > carries no severity: either the deployment is the one that was reviewed and recorded,
-> or it is not. What is still missing is the baseline's CONTENT. It ships empty, because
-> recording cn-20's manifest as it stands would bless the ten blocking findings the
-> review reports on it — four images pinned only by tag, `privileged` on
-> prometheus-node-exporter, and the container runtime's socket held by 0g-controller. So
-> `pcverify -provider` reports the containers as not compared (exit 3) until the file is
-> filled, and `-app-baseline` reads a candidate for checking one against a live provider
-> first. Wiring it into the SEALING path, behind its own enforce switch, waits on there
-> being a baseline worth enforcing.
+> or it is not.
 >
-> The comparison form that baseline will use already exists:
+> That baseline now has CONTENT: `brokercompose.json` records cn-20's twelve services as
+> of 2026-08-28 (`compose_hash` `720530b4…`), each block taken from that provider's own
+> `-blocks` output and its fingerprint checked back against it. Nine entries pin the image
+> as the deployment has it; three run 0G's own broker image and pin the image-held-out
+> block plus a repository rule.
+>
+> Recording is not approval, and the distinction is the whole reason the review and the
+> baseline are separate mechanisms. The review still reports ten blocking findings on this
+> manifest and recording silences none of them — four images pinned only by tag,
+> `privileged` plus `/`, `/proc` and `/sys` on prometheus-node-exporter, `SYS_ADMIN` on
+> dcgm-exporter, and the container runtime's socket held by 0g-controller. What recording
+> buys is that the set cannot GROW unseen: a service added, removed, renamed, or changed in
+> any way that changes what runs is now a mismatch. Every entry carries a `note` saying why
+> it stands as it does, and 0g-controller's records its `docker.sock` mount as an open
+> question rather than an accepted risk — a container holding the runtime socket can start
+> any container it likes, which leaves no per-service reasoning in the file worth much.
+>
+> Wiring the comparison into the SEALING path, behind its own enforce switch, waits on
+> that question: enforcing a baseline whose central entry is unexplained would convert an
+> open question into a shipped decision. `-app-baseline` reads a candidate for checking the
+> next revision against a live provider first.
+>
+> The comparison form the baseline uses:
 > `client/evidence/composeblock.go` reduces each service to a **canonical block**, keeping
 > every difference that changes what runs (values, keys, key order, scalar types) and
 > dropping every one that does not (comments, indentation, quoting, flow-versus-block
@@ -352,7 +370,7 @@ precondition for flipping a switch.
 > share a digest. The reference and its digest are erased wherever they appear in the
 > block, and deliberately no further, because erasing too much would let a modified block
 > compare equal to its baseline while erasing too little only causes churn. The baseline
-> will store canonical **text**, not digests, so that both sides are reduced by the same
+> stores canonical **text**, not digests, so that both sides are reduced by the same
 > function at comparison time and the linked YAML library's formatting preferences cancel
 > out — and so that a reviewer can read the file and a broker upgrade shows up as a
 > legible diff. `pcverify -provider` prints the fingerprints; `-blocks` prints the text.

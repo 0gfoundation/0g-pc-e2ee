@@ -11,7 +11,7 @@ package evidence
 // month. So the comparison needs a form that keeps every difference that matters and
 // drops every one that does not. That form is what this file produces.
 //
-// THE BASELINE WILL STORE TEXT, NOT DIGESTS, and the canonicalizer is why it can. Both
+// THE BASELINE STORES TEXT, NOT DIGESTS, and the canonicalizer is why it can. Both
 // sides — the stored baseline and the manifest being checked — go through the SAME
 // function at comparison time, so which version of gopkg.in/yaml.v3 is linked in cancels
 // out entirely. Storing a precomputed digest instead would bake the library's formatting
@@ -167,7 +167,7 @@ func blockOf(name string, body *yaml.Node) ServiceBlock {
 	// provider wrote as the placeholder lands in the reduced form at exactly the position
 	// a real held-out digest would. Two different manifests then reduce identically. The
 	// collision is unlikely and, today, worth nothing to an attacker — the field it would
-	// realistically hit is the one being held out anyway — but a baseline matcher will be
+	// realistically hit is the one being held out anyway — but the baseline matcher is
 	// built on this reduction, and a manifest has no legitimate reason to carry the string.
 	//
 	// Refused uniformly, including when there is no digest to hold out and no substitution
