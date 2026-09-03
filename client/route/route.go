@@ -105,6 +105,7 @@ const (
 	// ROUTER rather than the provider directly, because the router is the
 	// centralized auth/billing point: it authenticates, then forwards to the
 	// pinned provider (SPEC §4.4).
+
 	// defaultPubkeyTTL bounds how long a fetched provider enc key is reused
 	// before re-fetching, amortizing the extra round trip the route path adds
 	// (docs/design/router-e2e.md "extra round trip"). Providers rotate keys
@@ -554,6 +555,12 @@ func (r *Router) upstreamURL(serviceType string) (string, error) {
 	ep, ok := endpoint.ByServiceType(serviceType)
 	if !ok {
 		return "", fmt.Errorf("no sealed upstream path for service type %q", serviceType)
+	}
+	// A row without an upstream path is a table bug, and the loud failure the old
+	// switch gave for an unknown type must survive the move: left unchecked, this
+	// would resolve to the bare router origin and POST the sealed request there.
+	if ep.UpstreamPath == "" {
+		return "", fmt.Errorf("endpoint row for service type %q has no upstream path", serviceType)
 	}
 	return r.base + ep.UpstreamPath, nil
 }

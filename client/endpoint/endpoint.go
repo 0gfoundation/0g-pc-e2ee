@@ -124,12 +124,18 @@ var All = []Endpoint{Chat, Image}
 // layer that is handed one rather than an Endpoint: route, whose Resolve
 // signature carries the service type across the core boundary.
 //
-// A miss returns the ZERO Endpoint and false. The zero value fails closed by
-// construction — its Profile is the empty profile, which wire rejects on every
-// seal and open — so a caller that ignores ok cannot silently get chat's rules
-// applied to a surface nobody analysed. A caller that does honour ok must still
-// decide what a miss means for it; route treats it as "withhold everything any
-// profile could carry", which is the safe direction.
+// A miss returns the ZERO Endpoint and false. The zero value fails closed for
+// SEALING: its Profile is the empty profile, which wire rejects on every seal
+// and open, so a caller that ignores ok cannot get chat's rules applied to a
+// surface nobody analysed.
+//
+// It does NOT fail closed for every question, and a caller must not assume it
+// does. wire.DefaultSealedFieldsFor of the empty profile is the EMPTY set, so a
+// caller deriving "what to withhold from the untrusted router" from a miss and
+// ignoring ok would withhold nothing and upload the whole payload. That caller
+// must honour ok and choose its own safe answer — route does, taking the union
+// over every profile the protocol defines — which is why ok is returned rather
+// than folded into the zero value.
 func ByServiceType(t string) (Endpoint, bool) {
 	for _, ep := range All {
 		if ep.ServiceType == t {
