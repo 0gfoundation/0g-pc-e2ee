@@ -283,6 +283,36 @@ func TestSpeechStreamRefusalDoesNotConflateStringWithBool(t *testing.T) {
 	}
 }
 
+// A non-scalar value in a refused field cannot equal a declared boolean or
+// string, so it is not refused HERE — it is nonsense that fails upstream. The
+// case is pinned because the comparison must not panic or mis-decode on it.
+func TestSpeechStreamRefusalIgnoresNonScalarValues(t *testing.T) {
+	for _, value := range []string{`{"enabled":true}`, `[true]`, `null`, `1`} {
+		t.Run(value, func(t *testing.T) {
+			_, pub, ephPub := speechKeys(t)
+			req := mustReq(t, sampleSpeechReq)
+			req["stream"] = json.RawMessage(value)
+
+			if _, err := wire.SealRequestFor(wire.ProfileSpeech, pub, req, nil, testProvider, ephPub); err != nil {
+				t.Fatalf("a non-scalar stream value is not on the refused list: %v", err)
+			}
+		})
+	}
+}
+
+// Malformed JSON in a refused field is an error, not a skip: the field is there
+// and unparseable, and letting it through would mean sealing a request no
+// receiver can evaluate.
+func TestSpeechStreamRefusalRejectsMalformedJSON(t *testing.T) {
+	_, pub, ephPub := speechKeys(t)
+	req := mustReq(t, sampleSpeechReq)
+	req["stream"] = json.RawMessage(`tru`)
+
+	if _, err := wire.SealRequestFor(wire.ProfileSpeech, pub, req, nil, testProvider, ephPub); err == nil {
+		t.Fatal("a malformed stream value must be refused")
+	}
+}
+
 // Sealing `stream` is refused for a reason DIFFERENT from a pinned field's. A
 // pin sealed away leaves the server on its own default; here the enclave
 // reconstructs `cleartext ∪ decrypted` and forwards the result, so the router

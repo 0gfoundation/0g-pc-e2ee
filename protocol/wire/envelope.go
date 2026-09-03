@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
@@ -217,10 +218,10 @@ type profileSpec struct {
 	// be ABSENT — the endpoint's default is what the profile wants — but the
 	// listed values are rejected when it is present.
 	//
-	// Values are compared as their JSON encoding after canonicalization by the
-	// decoder below, so a boolean is "true"/"false" rather than a Go bool: the
-	// one member so far is `stream`, a JSON bool, and a future one could as
-	// easily be a string. Comparing rendered JSON keeps one code path.
+	// Values are the JSON rendering of a BOOLEAN or a STRING — the one member so
+	// far is `stream`, a JSON bool, and a future one could as easily be a string.
+	// Numbers are deliberately not supported: see validateRefusedCleartext for
+	// why supporting them silently would fail OPEN.
 	//
 	// The direction of absence is the whole distinction from a pin, and getting
 	// it backwards is not a subtle failure: implementing this with
@@ -757,16 +758,25 @@ func validateRefusedNotUnbound(spec profileSpec, unbound []string) error {
 	return nil
 }
 
-// validateRefusedCleartext rejects a request whose cleartext carries one of a
-// refused value. An ABSENT field passes: that is the whole difference from a pin
-// (SPEC §5.3.3) — the endpoint's default is the value the profile wants, so
-// demanding presence would reject every conforming request.
+// validateRefusedCleartext rejects a request whose cleartext carries a refused
+// value. An ABSENT field passes: that is the whole difference from a pin (SPEC
+// §5.3.3) — the endpoint's default is the value the profile wants, so demanding
+// presence would reject every conforming request.
 //
-// The comparison is on the value's JSON encoding, canonicalized through a decode
-// and re-encode so `true`, ` true` and `TRUE`-less variants of whitespace all
-// compare equal while a string `"true"` stays distinct from the boolean. A raw
-// bytes.Equal on the un-decoded value would make refusal depend on the sender's
-// whitespace.
+// A refused value is declared as the JSON rendering of a **boolean or a string**
+// (`"true"`, and so far only that), and the comparison decodes the wire value to
+// one of those two kinds rather than comparing raw bytes: raw bytes would make
+// the refusal depend on the sender's whitespace, so ` true ` would slip through
+// where `true` is caught.
+//
+// NUMERIC refused values are deliberately NOT supported, and the omission has a
+// direction. Canonicalizing a wire number for comparison means decoding it to
+// float64 and re-rendering (`1.0` becomes `1`, `1e2` becomes `100`), which for a
+// large integer is lossy — and a comparison that loses on the value being
+// checked FAILS OPEN, quietly permitting what the profile refuses. A profile
+// needing to refuse a number should get a checked mechanism rather than inherit
+// this one; declaring one here silently would not work, so the switch below
+// simply never matches it.
 func validateRefusedCleartext(spec profileSpec, req Request) error {
 	for field, refusedVals := range spec.refusedCleartext {
 		raw, ok := req[field]
@@ -777,11 +787,20 @@ func validateRefusedCleartext(spec profileSpec, req Request) error {
 		if err := json.Unmarshal(raw, &v); err != nil {
 			return fmt.Errorf("sealed request field %q is not valid JSON: %w", field, err)
 		}
-		norm, err := json.Marshal(v)
-		if err != nil {
-			return fmt.Errorf("sealed request field %q cannot be re-encoded: %w", field, err)
+		var got string
+		switch t := v.(type) {
+		case bool:
+			got = strconv.FormatBool(t)
+		case string:
+			// Quoted, so a string "true" stays distinct from the boolean true: a
+			// nonsense value the upstream will reject is not the profile's business,
+			// and conflating the two would refuse a request this rule is not about.
+			got = strconv.Quote(t)
+		default:
+			// A number, object, array or null cannot equal a declared boolean or
+			// string, so there is nothing to compare.
+			continue
 		}
-		got := string(norm)
 		if slices.Contains(refusedVals, got) {
 			return fmt.Errorf("sealed request field %q must not be %s: this profile defines no response shape for it (SPEC §5.3.3)", field, quotedList(refusedVals))
 		}

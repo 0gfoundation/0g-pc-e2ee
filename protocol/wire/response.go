@@ -3,7 +3,6 @@ package wire
 import (
 	"encoding/json"
 	"fmt"
-	"math"
 	"slices"
 	"sort"
 	"strings"
@@ -661,6 +660,12 @@ func validateCleartextQuantity(p Profile, q cleartextQuantity, frame Response) e
 	// found records the value read from each locator that was present, so the
 	// agreement check below has something to compare and the error can name which
 	// locators disagreed.
+	//
+	// float64 for both numeric kinds, which is exact for every value either
+	// quantity can hold (a whole number up to 2^53, a duration in seconds). A
+	// future WHOLE quantity with alternative locators and values past 2^53 would
+	// need a kind-aware comparison; there is none today, and one alternative-free
+	// quantity (the image count) never reaches the comparison at all.
 	type reading struct {
 		locator cleartextNumber
 		value   float64
@@ -748,13 +753,13 @@ func parseCleartextNumber(p Profile, q cleartextQuantity, loc cleartextNumber, r
 		if n == nil {
 			return 0, fmt.Errorf("sealed %s response %s is null: %s must be a number, and null is the absence of one, not a zero", p, loc, q.what)
 		}
-		// Go's decoder already refuses a literal that overflows float64 (1e400), so
-		// an infinity cannot arrive through JSON — but the invariant is stated here
-		// rather than left to decoder trivia, because a NaN or Inf reaching a
-		// biller silently produces a charge nobody can reconstruct.
-		if math.IsNaN(*n) || math.IsInf(*n, 0) {
-			return 0, fmt.Errorf("sealed %s response %s must be finite, got %v", p, loc, *n)
-		}
+		// No finiteness check, and that is checked rather than assumed: JSON has no
+		// Inf or NaN literal, and Go's decoder REFUSES a finite literal that
+		// overflows float64 ("cannot unmarshal number 1e400") rather than yielding
+		// +Inf. So a non-finite value cannot reach here through this decode, and a
+		// guard for it would be unreachable code claiming to defend something.
+		// Stated because "must be finite" is what §7.3 says, and the reason it
+		// needs no code is not self-evident.
 		if *n < 0 {
 			return 0, fmt.Errorf("sealed %s response %s must not be negative, got %v", p, loc, *n)
 		}
