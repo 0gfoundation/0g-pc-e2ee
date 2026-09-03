@@ -11,9 +11,9 @@
 // off a bool and a nil check. Five spellings of one split, in four packages, and
 // adding a surface meant finding all of them.
 //
-// This package carries the rows that core and openaiproxy read today. route's
-// two switches and the hand-written enumerations in proxycli and the gateway are
-// still outstanding — see All.
+// This package carries the rows core, openaiproxy and route read. The
+// hand-written enumerations in proxycli and the gateway are still outstanding —
+// see All.
 //
 // The cost of that was not hypothetical. route.upstreamURL records one instance
 // (every sealed image request POSTed to /v1/chat/completions, because the

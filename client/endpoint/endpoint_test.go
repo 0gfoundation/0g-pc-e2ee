@@ -113,3 +113,69 @@ func TestWithB64ResponseFormatPreservesOtherFields(t *testing.T) {
 		t.Error("the caller's request must not be mutated")
 	}
 }
+
+// All is the registry every other layer reads, so a malformed row does not fail
+// here — it fails somewhere else, at runtime: a refused request, a surface
+// silently shadowed by an earlier row with the same service type. This is where
+// those are caught instead.
+//
+// It is also the only place the empty-UpstreamPath guard in route.upstreamURL is
+// exercised at all: with the real table that branch is unreachable, so without
+// this nothing checks the property it defends.
+func TestAllRowsAreWellFormed(t *testing.T) {
+	if len(All) == 0 {
+		t.Fatal("All is empty; the gateway would mount nothing")
+	}
+	seen := map[string]int{}
+	for i, ep := range All {
+		name := ep.ServiceType
+		if name == "" {
+			name = "row " + string(rune('0'+i))
+		}
+		if ep.ServiceType == "" {
+			t.Errorf("%s: no ServiceType — the resolver could not ask the router for it", name)
+		}
+		if ep.Profile == "" {
+			t.Errorf("%s: no Profile — every seal and open would fail closed", name)
+		} else if fields := wire.DefaultSealedFieldsFor(ep.Profile); len(fields) == 0 {
+			t.Errorf("%s: Profile %q is unknown to wire — it would seal nothing", name, ep.Profile)
+		}
+		if ep.Path == "" {
+			t.Errorf("%s: no Path — nothing to mount", name)
+		}
+		if ep.UpstreamPath == "" {
+			t.Errorf("%s: no UpstreamPath — route would POST the sealed request to the bare router origin", name)
+		}
+		if j, dup := seen[ep.ServiceType]; dup {
+			t.Errorf("rows %d and %d share ServiceType %q; ByServiceType returns the first, so the second is shadowed with no error anywhere", j, i, ep.ServiceType)
+		}
+		seen[ep.ServiceType] = i
+
+		// Round-trip: the lookup must return THIS row, not merely some row. Endpoint
+		// carries a func field, so compare the fields that identify a row.
+		got, ok := ByServiceType(ep.ServiceType)
+		if !ok {
+			t.Errorf("%s: ByServiceType missed a row that is in All", name)
+			continue
+		}
+		if got.Profile != ep.Profile || got.Path != ep.Path || got.UpstreamPath != ep.UpstreamPath ||
+			got.Streams != ep.Streams || (got.PreSeal == nil) != (ep.PreSeal == nil) {
+			t.Errorf("%s: ByServiceType returned a different row", name)
+		}
+	}
+}
+
+// A miss is the zero Endpoint and false — the contract route builds on. Stated
+// on its own because it is what a caller reasons about, and because the zero
+// value's "fails closed" promise (see ByServiceType) only holds if the value
+// really is zero rather than, say, the last row visited.
+func TestByServiceTypeMissIsTheZeroValue(t *testing.T) {
+	got, ok := ByServiceType("no-such-service-type")
+	if ok {
+		t.Fatal("ByServiceType reported a hit for a service type not in All")
+	}
+	if got.ServiceType != "" || got.Profile != "" || got.Path != "" || got.UpstreamPath != "" ||
+		got.Streams || got.PreSeal != nil {
+		t.Errorf("a miss must return the zero Endpoint, got %+v", got)
+	}
+}

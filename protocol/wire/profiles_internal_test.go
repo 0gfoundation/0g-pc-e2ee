@@ -45,6 +45,13 @@ func TestProfilesCoversEveryDefinedProfile(t *testing.T) {
 // that matters: it is ProfileAnthropic's alone, so a union taken over the
 // surfaces a chat-and-image gateway mounts would omit it.
 func TestProfilesUnionCoversFieldsNoChatOrImageProfileHas(t *testing.T) {
+	// The premise, checked BEFORE anything is asserted: `system` is in the union
+	// only via a profile chat and image do not cover. If either ever seals it the
+	// assertions below would pass for the wrong reason, so skip rather than assert.
+	if slices.Contains(DefaultSealedFieldsFor(ProfileChat), "system") ||
+		slices.Contains(DefaultSealedFieldsFor(ProfileImage), "system") {
+		t.Skip("chat or image now seals `system`; this test's premise no longer holds")
+	}
 	var union []string
 	for _, p := range Profiles() {
 		for _, f := range DefaultSealedFieldsFor(p) {
@@ -57,11 +64,5 @@ func TestProfilesUnionCoversFieldsNoChatOrImageProfileHas(t *testing.T) {
 		if !slices.Contains(union, f) {
 			t.Errorf("the union over Profiles() is missing %q: %v", f, union)
 		}
-	}
-	// Stated explicitly because it is the whole reason Profiles exists: `system`
-	// is in the union only via a profile chat and image do not cover.
-	if slices.Contains(DefaultSealedFieldsFor(ProfileChat), "system") ||
-		slices.Contains(DefaultSealedFieldsFor(ProfileImage), "system") {
-		t.Skip("chat or image now seals `system`; this test's premise no longer holds")
 	}
 }

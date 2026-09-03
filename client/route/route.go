@@ -98,14 +98,6 @@ const (
 	// (with ?service_type=) to enumerate provider on-chain addresses; the serving
 	// endpoint itself is resolved from chain, not from this list.
 	providersPath = "/v1/providers"
-	// The per-surface upstream paths that used to live here — chat's, image's, and
-	// the Anthropic /v1/messages one no client could reach — are now
-	// endpoint.Endpoint.UpstreamPath, carried by the row alongside the profile and
-	// service type they have to agree with. The sealed request still goes to the
-	// ROUTER rather than the provider directly, because the router is the
-	// centralized auth/billing point: it authenticates, then forwards to the
-	// pinned provider (SPEC §4.4).
-
 	// defaultPubkeyTTL bounds how long a fetched provider enc key is reused
 	// before re-fetching, amortizing the extra round trip the route path adds
 	// (docs/design/router-e2e.md "extra round trip"). Providers rotate keys
@@ -535,7 +527,10 @@ func (r *Router) Resolve(ctx context.Context, serviceType string, req wire.Reque
 }
 
 // upstreamURL is the router endpoint a sealed request of this service type is
-// POSTed to. Derived from the service type rather than fixed at construction:
+// POSTed to — the ROUTER, not the provider directly, because the router is the
+// centralized auth/billing point: it authenticates, then forwards to the pinned
+// provider (SPEC §4.4). Derived from the service type rather than fixed at
+// construction:
 // fixing it is how every sealed image request came to be POSTed to
 // /v1/chat/completions, where the router hands it to the chatbot handler and the
 // pinned image provider is not in the pool.
