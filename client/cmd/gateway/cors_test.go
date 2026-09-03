@@ -162,10 +162,10 @@ func composeCommentedDefault(t *testing.T, compose []byte, name string) string {
 }
 
 // TestComposeCommentedDefaultsMatchTheBinary is TestComposeAllowedOriginsMatchesDefault's
-// counterpart for the two field sets the deployment does NOT set. They are written
-// out as commented lines so a reader of the measured manifest can see what the
-// enclave seals without opening the Go source — which makes them a copy of
-// wire.DefaultSealedFields/DefaultUnboundFields, and a copy needs a test.
+// counterpart for the field set the deployment does NOT set. It is written out as
+// a commented line so a reader of the measured manifest can see what the enclave
+// leaves unbound without opening the Go source — which makes it a copy of
+// wire.DefaultUnboundFields, and a copy needs a test.
 //
 // Not a hypothetical: DefaultUnboundFields carries TODO(model-binding), which
 // reverts it to the empty set once the router stops rewriting "model". The day that
@@ -180,7 +180,6 @@ func TestComposeCommentedDefaultsMatchTheBinary(t *testing.T) {
 		env  string
 		want []string
 	}{
-		{"ZG_GATEWAY_SEAL_FIELDS", wire.DefaultSealedFields()},
 		{"ZG_GATEWAY_UNBOUND_FIELDS", wire.DefaultUnboundFields()},
 	} {
 		got := composeCommentedDefault(t, compose, tc.env)

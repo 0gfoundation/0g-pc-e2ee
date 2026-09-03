@@ -675,12 +675,17 @@ var profiles = map[Profile]profileSpec{
 //
 // It checks all three ways the pin can be defeated:
 //
-//   - the value is wrong, absent, or not a string;
 //   - the field was SEALED, so it is gone from the cleartext the server reads
 //     and the server falls back to its own default (which for the image profile
 //     is `url` — the leak);
 //   - the field was declared UNBOUND, so an intermediary could have rewritten it
-//     in transit and Open would still succeed.
+//     in transit and Open would still succeed;
+//   - the value is wrong, absent, or not a string.
+//
+// The first two are shared with the conditional pin family and live in
+// validatePinnedNotSealed / validatePinnedNotUnbound, which read both families
+// off the spec; only the value check is specific to this one, because here an
+// ABSENT field is a violation (see validatePinnedCleartext).
 //
 // A profile with no pinned fields (chat) always passes.
 func validatePinnedCleartextFor(p Profile, env Request) error {
@@ -733,10 +738,12 @@ func quotedList(vals []string) string {
 // response shape this document does not define is something only the receiver
 // can do, and a third-party client is under no obligation to check.
 //
-// Three ways the pin can be defeated, and — this is the part that differs from
-// an unconditional pin — the SEALING one is defeated for a different reason:
+// Three ways the pin can be defeated. Only the last is specific to this
+// function: the structural two are one rule over both pin families, so they are
+// checked by the shared validatePinnedNotSealed / validatePinnedNotUnbound
+// (which read every family on the spec and carry the per-family sentence — see
+// pinFamily).
 //
-//   - the field is present with a value outside the permitted set;
 //   - the field was SEALED. An unconditional pin sealed away leaves the server
 //     reading nothing and falling back to its own default. Here it is worse than
 //     that: the enclave reconstructs `request = cleartext ∪ decrypted` and
@@ -745,7 +752,10 @@ func quotedList(vals []string) string {
 //     stream. The two halves of the system then disagree about the response
 //     shape, which is not a fallback but a split brain;
 //   - the field was declared UNBOUND, so an intermediary could set it in transit
-//     and Open would still succeed.
+//     and Open would still succeed;
+//   - the field is present with a value outside the permitted set — the VALUE
+//     check, which stays per-family because absence is compliant here and
+//     rejected there.
 func validatePinnedIfPresentFor(p Profile, env Request) error {
 	spec, err := p.spec()
 	if err != nil {
@@ -758,40 +768,13 @@ func validatePinnedIfPresentFor(p Profile, env Request) error {
 	if err != nil {
 		return err
 	}
-	if err := validatePinnedIfPresentNotSealed(spec, e2ee.SealedFields); err != nil {
+	if err := validatePinnedNotSealed(spec, e2ee.SealedFields); err != nil {
 		return err
 	}
-	if err := validatePinnedIfPresentNotUnbound(spec, e2ee.UnboundFields); err != nil {
+	if err := validatePinnedNotUnbound(spec, e2ee.UnboundFields); err != nil {
 		return err
 	}
 	return validatePinnedIfPresent(spec, env)
-}
-
-// validatePinnedIfPresentNotSealed rejects a sealed set that hides a
-// conditionally pinned field. See validatePinnedIfPresentFor for why this is not
-// the unconditional pin's "server falls back to its default" — it is a
-// disagreement between the router and the enclave about what the request asked
-// for.
-func validatePinnedIfPresentNotSealed(spec profileSpec, sealed []string) error {
-	for _, f := range sealed {
-		if _, pinned := spec.pinnedIfPresent[f]; pinned {
-			return fmt.Errorf("%q must stay CLEARTEXT: sealing it hides from every intermediary a value the enclave will still reconstruct and forward upstream, so the router and the enclave would disagree about the response shape", f)
-		}
-	}
-	return nil
-}
-
-// validatePinnedIfPresentNotUnbound rejects an unbound set that frees a
-// conditionally pinned field: outside the AAD, an intermediary can set it in
-// transit and the enclave accepts the result, which makes a seal-time pin a pin
-// in name only.
-func validatePinnedIfPresentNotUnbound(spec profileSpec, unbound []string) error {
-	for _, f := range unbound {
-		if vals, pinned := spec.pinnedIfPresent[f]; pinned {
-			return fmt.Errorf("%q cannot be unbound: when present it must be %s, and an unbound field is outside the AAD, so an intermediary could set it to anything in transit and the enclave would accept the result", f, quotedList(vals))
-		}
-	}
-	return nil
 }
 
 // validatePinnedIfPresent rejects a request whose cleartext carries a
@@ -865,31 +848,71 @@ func cleartextToken(raw json.RawMessage) (string, bool) {
 	}
 }
 
+// pinFamily is one of the two pinned-cleartext maps on a profileSpec, paired
+// with why sealing a field of that family is a leak.
+//
+// The families differ only in whether ABSENCE is compliant, and that difference
+// is confined to the VALUE check (validatePinnedCleartext demands the field,
+// validatePinnedIfPresent permits its absence). For the two structural rules —
+// must stay cleartext, must stay bound — they are one rule over two maps, so
+// the checks below iterate both instead of existing once per family.
+type pinFamily struct {
+	pins map[string][]string
+	// sealedWhy completes "…must stay CLEARTEXT: " for this family. It is per
+	// family because the two failures genuinely differ: sealing an
+	// UNCONDITIONAL pin leaves the server reading nothing where the pin should
+	// be, falling back to its own default (for the image profile, `url` — the
+	// leak), while sealing a CONDITIONAL one leaves the router seeing one
+	// request and the enclave forwarding another, since the enclave
+	// reconstructs `cleartext ∪ decrypted` and sends the result upstream. A
+	// fallback and a split brain want different sentences.
+	sealedWhy string
+}
+
+// pinFamilies is every pinned-cleartext family of the spec. Both are checked
+// wherever either is, so a profile that gains a family gets both rules for
+// free. A field cannot appear in both maps (no profile declares one, and either
+// error would be correct if one did), so iteration order is not load-bearing.
+func (s profileSpec) pinFamilies() []pinFamily {
+	return []pinFamily{
+		{s.pinnedCleartext, "sealing it removes it from the envelope the server reads, which then falls back to its own default"},
+		{s.pinnedIfPresent, "sealing it hides from every intermediary a value the enclave will still reconstruct and forward upstream, so the router and the enclave would disagree about the response shape"},
+	}
+}
+
 // validatePinnedNotSealed rejects a sealed set that swallows a pinned cleartext
-// field. Sealing it removes it from the cleartext envelope entirely, so the
-// server reads nothing where the pin should be and falls back to its own default
-// — for the image profile, `url`. That makes this the one way to satisfy the
-// VALUE check and still leak: the value is verified against the pre-seal
-// request, and the field is then encrypted away.
+// field of either family. Sealing it removes the field from the cleartext
+// envelope entirely, which makes this the one way to satisfy the VALUE check
+// and still leak: the value is verified against the pre-seal request, and the
+// field is then encrypted away. See pinFamily.sealedWhy for how the two
+// families fail differently.
 func validatePinnedNotSealed(spec profileSpec, sealed []string) error {
-	for _, f := range sealed {
-		if want, pinned := spec.pinnedCleartext[f]; pinned {
-			return fmt.Errorf("%q is pinned to %s and must stay CLEARTEXT: sealing it removes it from the envelope the server reads, which then falls back to its own default", f, quotedList(want))
+	for _, fam := range spec.pinFamilies() {
+		for _, f := range sealed {
+			if want, pinned := fam.pins[f]; pinned {
+				return fmt.Errorf("%q is pinned to %s and must stay CLEARTEXT: %s", f, quotedList(want), fam.sealedWhy)
+			}
 		}
 	}
 	return nil
 }
 
 // validatePinnedNotUnbound rejects an unbound set that frees a pinned cleartext
-// field. An unbound field is excluded from the AAD, so an intermediary can
-// rewrite it and Open still succeeds — which would let a router flip a pinned
-// `response_format: "b64_json"` to `"url"` in transit and hand the enclave a
-// request that publishes the images in the clear. A pin on an unbound field is
-// a pin in name only: it constrains the value at seal time and nothing after.
+// field of either family. An unbound field is excluded from the AAD, so an
+// intermediary can set it and Open still succeeds — which would let a router
+// flip a pinned `response_format: "b64_json"` to `"url"` in transit and hand
+// the enclave a request that publishes the images in the clear. A pin on an
+// unbound field is a pin in name only: it constrains the value at seal time and
+// nothing after.
+//
+// Unlike the sealing rule this reads the same for both families: outside the
+// AAD, "rewritten" and "set from absent" are the same edit by the same party.
 func validatePinnedNotUnbound(spec profileSpec, unbound []string) error {
-	for _, f := range unbound {
-		if want, pinned := spec.pinnedCleartext[f]; pinned {
-			return fmt.Errorf("%q is pinned to %s and cannot be unbound: an unbound field is outside the AAD, so an intermediary could rewrite it in transit and the enclave would accept the result", f, quotedList(want))
+	for _, fam := range spec.pinFamilies() {
+		for _, f := range unbound {
+			if want, pinned := fam.pins[f]; pinned {
+				return fmt.Errorf("%q is pinned to %s and cannot be unbound: an unbound field is outside the AAD, so an intermediary could set it to anything in transit and the enclave would accept the result", f, quotedList(want))
+			}
 		}
 	}
 	return nil
@@ -924,9 +947,9 @@ func validatePinnedCleartext(spec profileSpec, req Request) error {
 // carries it. Anthropic's `system` is the case — see profileSpec.requiredIfPresent.
 //
 // It cannot live in ValidateSealedFieldsFor, which answers "is this set of field
-// names valid for this profile?" from (profile, fields) alone. That is what lets
-// an operator validate `-seal-fields` at startup, before any request exists, and
-// this rule needs the request. So it is called from both ends instead:
+// names valid for this profile?" from (profile, fields) alone — a set can be
+// checked before any request exists, and this rule needs the request. So it is
+// called from both ends instead:
 //
 //   - SealRequestFor, on the pre-seal request, where the field is present
 //     whether or not it is about to be sealed: "you have a system prompt and are
@@ -1060,17 +1083,23 @@ func ValidateSealedFields(fields []string) error {
 //
 // SealRequestFor calls this fail-closed per request, so a client cannot build an
 // envelope that silently leaves the payload exposed — the only place a leak can
-// actually be *prevented*. It is also exported so a caller can validate an
-// operator-supplied sealed set up front (e.g. the sidecar's -seal-fields flag)
-// and fail fast instead of erroring on every request.
+// actually be *prevented*. It is also exported so a caller can validate a
+// caller-supplied sealed set up front (core.WithSealFields) and fail fast
+// instead of erroring on every request.
 //
 // That second use is why the pinned check belongs here and not only in
 // SealRequestFor. The two rules answer the same question — "is this set of field
 // names valid for this profile?" — and depend on nothing but (profile, fields),
-// so an operator validating `-seal-fields` up front must see both verdicts. With
-// the pinned half elsewhere, `prompt,response_format` passed startup validation
-// clean and then failed 100% of requests: the exact failure mode the fail-fast
-// call exists to prevent.
+// so anyone validating a set up front must see both verdicts. With the pinned
+// half elsewhere, `prompt,response_format` passed validation clean and then
+// failed 100% of requests: the exact failure mode the fail-fast call exists to
+// prevent.
+//
+// The up-front use was once load-bearing for a `-seal-fields` operator flag,
+// which no longer exists — the sealed set now comes from the endpoint row's
+// profile, so a deployment cannot configure it at all. What survives is the
+// library option, so this stays name-only rather than folding into the
+// request-shaped checks.
 //
 // By the same rule, what it does NOT check is a profile's CONDITIONAL payload
 // fields (requiredIfPresent, e.g. Anthropic's `system`): whether those are
@@ -1086,9 +1115,6 @@ func ValidateSealedFieldsFor(p Profile, fields []string) error {
 		return fmt.Errorf("no sealed fields")
 	}
 	if err := validatePinnedNotSealed(spec, fields); err != nil {
-		return err
-	}
-	if err := validatePinnedIfPresentNotSealed(spec, fields); err != nil {
 		return err
 	}
 	seen := make(map[string]struct{}, len(fields))
@@ -1131,9 +1157,6 @@ func ValidateUnboundFieldsFor(p Profile, unbound, sealed []string) error {
 		return err
 	}
 	if err := validatePinnedNotUnbound(spec, unbound); err != nil {
-		return err
-	}
-	if err := validatePinnedIfPresentNotUnbound(spec, unbound); err != nil {
 		return err
 	}
 	return ValidateUnboundFields(unbound, sealed)
@@ -1236,23 +1259,20 @@ func SealRequestFor(profile Profile, encPub crypto.PublicKey, req Request, seale
 	// the value AND that it will still be readable and authenticated when it gets
 	// there — a pin that is sealed away, or that an intermediary can rewrite, is
 	// not a pin. ValidateSealedFieldsFor above already rejected a set that seals
-	// the pin away; validatePinnedCleartextFor runs all three checks together on
-	// the receiving side.
+	// either family's pin away, and this covers both families' unbound half;
+	// validatePinnedCleartextFor / validatePinnedIfPresentFor run all three
+	// checks together on the receiving side.
 	if err := validatePinnedNotUnbound(spec, unboundFields); err != nil {
 		return nil, err
 	}
+	// The two VALUE checks stay separate, which is the whole of what the two
+	// families still differ on: validatePinnedCleartext DEMANDS its field, and
+	// folding the conditional one into it would demand `stream` on every sealed
+	// speech request. Neither is "a value this profile refuses rather than one it
+	// demands" — expressing the conditional pin that way is what let `"true"` and
+	// `1` through, on an endpoint that materializes the request back into
+	// multipart.
 	if err := validatePinnedCleartext(spec, req); err != nil {
-		return nil, err
-	}
-	// The pin's optional-presence twin (§5.3.3): the same "must be one of these"
-	// rule, differing only in that ABSENCE is compliant. That is why it cannot be
-	// folded into the checks above — doing so would demand `stream` on every
-	// sealed speech request. It is emphatically NOT "a value this profile refuses
-	// rather than one it demands": expressing it that way is what let `"true"`
-	// and `1` through, on an endpoint that materializes the request back into
-	// multipart. ValidateSealedFieldsFor already rejected a set that seals such a
-	// field away; these are the unbound and value halves.
-	if err := validatePinnedIfPresentNotUnbound(spec, unboundFields); err != nil {
 		return nil, err
 	}
 	if err := validatePinnedIfPresent(spec, req); err != nil {

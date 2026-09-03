@@ -172,28 +172,29 @@ func NewLogger() *slog.Logger {
 // by flag.Parse after RegisterFlags. Callers read Listen to bind their server
 // and pass the rest to Build.
 type Flags struct {
-	Listen        *string
-	RouterURL     *string
-	providerURL   *string
-	sealFieldsCSV *string
-	// sealFieldsDefault is the PACKAGE default for sealFieldsCSV — deliberately
-	// not the registered default, which folds in the env var. Build compares
-	// against it to tell "the operator chose this set" (by flag OR env) from
-	// "nobody touched it". Only the former should pin the router's
-	// withheld-field set; see the route.WithSensitiveFields call in Build.
-	sealFieldsDefault string
-	unboundFieldsCSV  *string
-	attestOn          *bool
-	attestEnforce     *bool
-	onchainOn         *bool
-	onchainEnforce    *bool
-	verifyResponses   *bool
-	chainRPCURL       *string
-	servingContract   *string
-	warmOn            *bool
-	warmInterval      *time.Duration
-	pccsURL           *string
-	collateralTTL     *time.Duration
+	Listen      *string
+	RouterURL   *string
+	providerURL *string
+	// The sealed set is NOT an operator knob: every surface seals its profile's
+	// set, from wire's table, and the row is what says which profile. There was a
+	// `-seal-fields` / `SEAL_FIELDS` flag here (chat-only, defaulting to the
+	// package default, and applied only when it DIFFERED from that default). It
+	// was the last thing that made chat a special case in this file — a separate
+	// route option list, a separate core option in the clients loop, and a
+	// tri-state "did the operator actually choose this" comparison — and no
+	// deployment set it.
+	unboundFieldsCSV *string
+	attestOn         *bool
+	attestEnforce    *bool
+	onchainOn        *bool
+	onchainEnforce   *bool
+	verifyResponses  *bool
+	chainRPCURL      *string
+	servingContract  *string
+	warmOn           *bool
+	warmInterval     *time.Duration
+	pccsURL          *string
+	collateralTTL    *time.Duration
 }
 
 // defaultWarmInterval is the refresh-ahead period the background quote-cache
@@ -215,7 +216,7 @@ const defaultCollateralTTL = time.Hour
 // RegisterFlags declares the shared startup flags on fs and returns a Flags
 // whose pointers are filled by fs.Parse. envPrefix (e.g. "ZG_GATEWAY",
 // "ZG_SIDECAR") selects the environment variables consulted for each flag's
-// default: <envPrefix>_LISTEN, _ROUTER_URL, _PROVIDER_URL, _SEAL_FIELDS,
+// default: <envPrefix>_LISTEN, _ROUTER_URL, _PROVIDER_URL,
 // _UNBOUND_FIELDS, _ATTEST, _ATTEST_ENFORCE, _ONCHAIN, _ONCHAIN_ENFORCE,
 // _CHAIN_RPC_URL, _SERVING_CONTRACT, _WARM, _WARM_INTERVAL, _PCCS_URL,
 // _COLLATERAL_TTL.
@@ -223,18 +224,11 @@ const defaultCollateralTTL = time.Hour
 // <envPrefix>_LISTEN is set.
 func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen string) *Flags {
 	env := func(name string) string { return envPrefix + "_" + name }
-	// The PACKAGE default, kept separate from the registered default below: an
-	// operator who sets the env var HAS chosen a set, and comparing against a
-	// default that already folded that env var in could never see it.
-	sealFieldsPkgDefault := strings.Join(wire.DefaultSealedFieldsFor(wire.ProfileChat), ",")
 	return &Flags{
 		Listen:    fs.String("listen", envOr(env("LISTEN"), defaultListen), fmt.Sprintf("address to listen on (env %s)", env("LISTEN"))),
 		RouterURL: fs.String("router-url", envOr(env("ROUTER_URL"), route.DefaultRouterURL), fmt.Sprintf("0G router base URL/domain (the route-preview path is appended) (env %s)", env("ROUTER_URL"))),
 		providerURL: fs.String("provider-url", envOr(env("PROVIDER_URL"), ""),
 			fmt.Sprintf("direct-broker mode: seal each request straight to this provider endpoint, skipping the router's route-preview (for an environment with a broker but no centralized router, e.g. dev); the provider's enc key + signer are fetched from its broker's /v1/e2ee/pubkey. Empty keeps the default router mode (env %s)", env("PROVIDER_URL"))),
-		sealFieldsCSV: fs.String("seal-fields", envOr(env("SEAL_FIELDS"), sealFieldsPkgDefault),
-			fmt.Sprintf("comma-separated request fields to seal (must include \"messages\") (env %s)", env("SEAL_FIELDS"))),
-		sealFieldsDefault: sealFieldsPkgDefault,
 		unboundFieldsCSV: fs.String("unbound-fields", envOr(env("UNBOUND_FIELDS"), strings.Join(wire.DefaultUnboundFields(), ",")),
 			fmt.Sprintf("comma-separated cleartext fields excluded from the AAD (intermediary-mutable, untrusted); empty binds everything (env %s)", env("UNBOUND_FIELDS"))),
 		attestOn: fs.Bool("attest", envBool(env("ATTEST"), false),
@@ -328,41 +322,28 @@ func (b *Built) ProviderIdentities() route.ProviderIdentitySource {
 // so a misconfigured proxy never starts with, say, an unsealed "messages" field
 // or attestation silently off. logger is also attached as the core's debug
 // logger, so open-failure diagnostics share the binary's format and sink.
-// validateFieldSets checks the seal/unbound flags against EVERY profile this
-// binary will seal under, returning the flag name to blame. Split out of Build so
-// it is testable: Build's own failure path is os.Exit(1).
+// validateFieldSets checks -unbound-fields against EVERY profile this binary
+// will seal under, returning the flag name to blame. Split out of Build so it is
+// testable: Build's own failure path is os.Exit(1).
 //
-// The image half is the part that is easy to leave out and expensive to omit. The
-// image client shares one -unbound-fields set with the chat client but seals under
-// a different profile, whose sealed set is ["prompt"] and whose "response_format"
-// is pinned cleartext. SealRequestFor re-runs both checks on every request, so
-// validating only against chat lets a binary start clean and then fail 100% of its
-// image requests at seal time — `-unbound-fields=model,prompt` and
-// `model,response_format` each do exactly that. Check what we will actually seal
-// under, at startup, where the operator can still fix the flag.
-func validateFieldSets(sealFields, unboundFields []string, served []endpoint.Endpoint) (string, error) {
-	// -seal-fields is chat's set by definition (its default and its documentation
-	// are chat's), so it is validated against the chat profile whether or not chat
-	// is served: the flag was parsed, and a nonsensical value is a misconfiguration
-	// either way.
-	if err := wire.ValidateSealedFieldsFor(wire.ProfileChat, sealFields); err != nil {
-		return "-seal-fields", err
-	}
-	if err := wire.ValidateUnboundFieldsFor(wire.ProfileChat, unboundFields, sealFields); err != nil {
-		return "-unbound-fields", err
-	}
-	// Every OTHER served surface seals its profile's default set (the operator's
-	// -seal-fields does not apply to it), so validate -unbound-fields against that
-	// — the set it will really seal with. Driven off the rows this binary serves,
-	// so a new row is covered at startup the day it is added rather than the day
-	// someone remembers to extend this list.
+// Covering every served row is the part that is easy to leave out and expensive
+// to omit. All rows share one -unbound-fields set but seal under their own
+// profiles, and what a profile pins in cleartext differs — the image profile's
+// sealed set is ["prompt"] and its "response_format" is pinned. SealRequestFor
+// re-runs the check on every request, so validating against one profile lets a
+// binary start clean and then fail 100% of the requests it makes under another:
+// `-unbound-fields=model,prompt` and `model,response_format` are each valid for
+// chat and unsealable for image. Check what we will actually seal under, at
+// startup, where the operator can still fix the flag.
+//
+// It is driven off the rows this binary serves, so a new row is covered the day
+// it is added rather than the day someone remembers to extend a list here. That
+// also means there is no longer a chat branch: chat is a row like any other.
+func validateFieldSets(unboundFields []string, served []endpoint.Endpoint) (string, error) {
 	for _, ep := range served {
-		if ep.Profile == wire.ProfileChat {
-			continue
-		}
 		if err := wire.ValidateUnboundFieldsFor(ep.Profile, unboundFields,
 			wire.DefaultSealedFieldsFor(ep.Profile)); err != nil {
-			return fmt.Sprintf("-unbound-fields (this binary also serves the %s profile)", ep.Profile), err
+			return fmt.Sprintf("-unbound-fields (for the %s profile this binary serves)", ep.Profile), err
 		}
 	}
 	return "", nil
@@ -432,9 +413,8 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 	// a setting that was valid for the only surface it served.
 	directMode := strings.TrimSpace(*f.providerURL) != ""
 	served := servedSurfaces(bc.serves, directMode)
-	sealFields := parseCSV(*f.sealFieldsCSV)
 	unboundFields := parseCSV(*f.unboundFieldsCSV)
-	if flag, err := validateFieldSets(sealFields, unboundFields, served); err != nil {
+	if flag, err := validateFieldSets(unboundFields, served); err != nil {
 		logger.Error("invalid "+flag, "err", err)
 		os.Exit(1)
 	}
@@ -501,26 +481,14 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 	// withholds the sealed fields from the control-plane preview call, so the
 	// prompt never reaches it in cleartext there either.
 	//
-	// WithSensitiveFields is passed ONLY when the operator actually chose a seal
-	// set. Passing it unconditionally pins the withheld set to whatever this
-	// binary defaults to — today the CHAT set — and permanently overrides
-	// route.New's derivation of that set from the service type. That is a no-op
-	// while this binary is chat-only, and becomes a prompt leak the moment a
-	// -service-type flag lands and someone runs the image profile: the preview
-	// body is everything NOT withheld, so a stale set does not fail, it uploads
-	// the payload. Leaving the option off keeps the withheld set tied to the
-	// service type by construction.
+	// route.WithSensitiveFields is deliberately NOT passed. Its argument would be
+	// one fixed set applied to the single shared router, which permanently
+	// overrides route.New's derivation of the withheld set from the request's
+	// service type. The preview body is everything NOT withheld, so a stale set
+	// does not fail — it uploads the payload. Leaving the option off keeps the
+	// withheld set tied to the row by construction, which is the only form that
+	// stays correct as rows are added.
 	var routeOpts []route.Option
-	// chatRouteOpts carries the operator's -seal-fields override. It is a CHAT set
-	// by definition (the flag's default and its validation are chat's), and
-	// route.WithSensitiveFields now ADDS to whatever the request's service type
-	// already withholds rather than replacing it — so applying it to the single
-	// shared router withholds the chat payload fields from image previews too,
-	// which is harmless over-stripping, never the under-stripping that leaks.
-	var chatRouteOpts []route.Option
-	if *f.sealFieldsCSV != f.sealFieldsDefault {
-		chatRouteOpts = append(chatRouteOpts, route.WithSensitiveFields(sealFields))
-	}
 	if *f.attestOn {
 		routeOpts = append(routeOpts, route.WithQuoteVerification(
 			newVerifier(label, *f.attestEnforce, *f.pccsURL, *f.collateralTTL, logger), logger))
@@ -543,10 +511,9 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 			"enforce", *f.onchainEnforce,
 			"contract", *f.servingContract, "cache_ttl", onchainCacheTTL, "cache_grace", onchainCacheGrace)
 	}
-	// Shared by both clients. The chat-only -seal-fields override is NOT here:
-	// it is appended to the chat client alone, so the image client falls back to
-	// its profile's default set ("prompt") instead of being handed chat's
-	// ("messages", "tools"), which would fail its profile check on every request.
+	// Shared by every client. Nothing per-row goes here — the row itself travels
+	// via core.WithEndpoint, and each client derives its sealed set from that
+	// row's profile.
 	coreOpts := []core.Option{
 		core.WithUnboundFields(unboundFields),
 		core.WithDebugLogger(logger),
@@ -571,7 +538,7 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 	// preview. The warmer stays off (no provider list to enumerate), so Built holds
 	// only the client.
 	if directMode {
-		directRes, err := route.NewDirect(*f.providerURL, append(routeOpts, chatRouteOpts...)...)
+		directRes, err := route.NewDirect(*f.providerURL, routeOpts...)
 		if err != nil {
 			logger.Error("invalid -provider-url", "url", *f.providerURL, "err", err)
 			os.Exit(1)
@@ -583,7 +550,7 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 		// to its catch-all.
 		return &Built{Clients: map[string]*core.Client{
 			endpoint.Chat.Path: core.NewWithResolver(directRes, append(append([]core.Option{}, coreOpts...),
-				core.WithSealFields(sealFields), core.WithEndpoint(endpoint.Chat))...),
+				core.WithEndpoint(endpoint.Chat))...),
 		}}
 	}
 
@@ -603,7 +570,7 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 		warmTypes = append(warmTypes, ep.ServiceType)
 	}
 	router := route.New(*f.RouterURL, append(append([]route.Option{}, routeOpts...),
-		append(chatRouteOpts, route.WithWarmServiceTypes(warmTypes...))...)...)
+		route.WithWarmServiceTypes(warmTypes...))...)
 
 	// One client per served row, one router. A client is a SEALING CONTEXT bound
 	// to one request shape — its profile fixes which field must be sealed and
@@ -611,17 +578,13 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 	// the router's caches. They are cheap: no transport, no cache, no verifier of
 	// their own.
 	//
-	// -seal-fields is chat's set by definition, so only the chat client takes it;
-	// every other row seals its profile's default. Nothing else here names a row:
-	// what a surface is comes from endpoint.All, and whether it is served from
-	// Serves.
+	// Every row is built the same way: the row goes in, the sealed set comes from
+	// its profile. Nothing here names a row — what a surface is comes from
+	// endpoint.All, and whether it is served from Serves.
 	clients := make(map[string]*core.Client, len(served))
 	for _, ep := range served {
-		opts := append(append([]core.Option{}, coreOpts...), core.WithEndpoint(ep))
-		if ep.Profile == wire.ProfileChat {
-			opts = append(opts, core.WithSealFields(sealFields))
-		}
-		clients[ep.Path] = core.NewWithResolver(router, opts...)
+		clients[ep.Path] = core.NewWithResolver(router,
+			append(append([]core.Option{}, coreOpts...), core.WithEndpoint(ep))...)
 	}
 
 	b := &Built{Clients: clients, router: router, verifiesQuotes: *f.attestOn}

@@ -255,15 +255,16 @@ services:
       # unaffected. The localhost entries are development conveniences — drop them via
       # the override on any deployment that does not need them.
       - "ZG_GATEWAY_ALLOWED_ORIGINS=${ZG_GATEWAY_ALLOWED_ORIGINS:-https://0g.ai,https://*.0g.ai,http://localhost:3000,http://localhost:5173}"
-      # Request fields sealed end-to-end to the provider (must include "messages"),
-      # and cleartext fields excluded from the AAD (an empty value binds everything).
-      # Left to the binary's built-in sets. The two commented lines below ARE those
-      # defaults (protocol/wire/envelope.go), spelled out as the starting point to
-      # edit — NOT example overrides. Either value REPLACES the set rather than
-      # adding to it, so an override must restate every field it still wants:
-      # dropping "tools" from the first stops sealing tool definitions, and dropping
-      # "model" from the second binds the model name into the AAD.
-      # - "ZG_GATEWAY_SEAL_FIELDS=messages,tools"
+      # Cleartext fields excluded from the AAD (an empty value binds everything).
+      # Left to the binary's built-in set. The commented line below IS that default
+      # (protocol/wire/envelope.go), spelled out as the starting point to edit — NOT
+      # an example override. The value REPLACES the set rather than adding to it, so
+      # an override must restate every field it still wants: dropping "model" binds
+      # the model name into the AAD.
+      #
+      # There is no SEAL_FIELDS counterpart. Which request fields are sealed is not
+      # deployment config: every surface seals its wire profile's set, so the
+      # enclave cannot be deployed into sealing less than its profile requires.
       # - "ZG_GATEWAY_UNBOUND_FIELDS=model"
       # DCAP-verify each provider's TDX quote and seal only to the verified enc key,
       # instead of trusting the router-supplied pubkey endpoint. Enforced per request:

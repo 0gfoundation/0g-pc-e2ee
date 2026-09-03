@@ -304,8 +304,9 @@ func TestExplicitSensitiveFieldsAddToTheServiceTypeDefault(t *testing.T) {
 	}
 }
 
-// A chat-shaped override — which is what -seal-fields is — must not be able to
-// strip the image payload out of the withheld set. This is the concrete leak the
+// A chat-shaped override must not be able to strip the image payload out of the
+// withheld set — WithSensitiveFields takes one set for a router that serves
+// every row, so a chat-shaped one reaches image previews. This is the leak the
 // additive semantics prevent, stated as its own case because it is the one that
 // motivated the change.
 func TestAChatOverrideCannotUnwithholdTheImagePrompt(t *testing.T) {
