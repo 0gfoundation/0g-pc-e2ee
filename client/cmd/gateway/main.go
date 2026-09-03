@@ -78,6 +78,7 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/client/cmd/internal/proxycli"
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/dstack"
+	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/client/evidence"
 	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
@@ -631,13 +632,13 @@ func newHandler(c *core.Client, imageClient *core.Client, routerTarget *url.URL,
 	// memory that ceiling is derived from (see defaultMaxInFlight) and putting the
 	// wrong denominator under every in-flight/limit alert.
 	sealed := http.NewServeMux()
-	sealed.Handle("POST /v1/chat/completions", openaiproxy.Handler(c))
+	openaiproxy.Register(sealed, endpoint.Chat, c)
 	if imageClient != nil {
-		openaiproxy.RegisterImages(sealed, imageClient)
+		openaiproxy.Register(sealed, endpoint.Image, imageClient)
 	}
 	sealedGate := openaiproxy.RequireInferenceCredential(
 		openaiproxy.LimitInFlight(maxInFlight, sealed))
-	mux.Handle("POST /v1/chat/completions", sealedGate)
+	mux.Handle("POST "+endpoint.Chat.Path, sealedGate)
 	// The sealed image endpoint shares that gate — it does the same expensive work
 	// and must not have its own separate budget.
 	//
@@ -647,10 +648,17 @@ func newHandler(c *core.Client, imageClient *core.Client, routerTarget *url.URL,
 	// reverse proxy to the router, and routerTarget is parsed in every mode, so an
 	// unmounted sealed endpoint forwards the caller's PROMPT to the router in
 	// cleartext — the one thing this gateway exists to prevent. Fail closed.
+	//
+	// Both mounts name endpoint.*.Path rather than repeating the literal the inner
+	// mux already uses. A divergence between the two is not a 404: the outer mux is
+	// what stands between a path and the cleartext catch-all below, so a route the
+	// inner mux serves and the outer one does not is exactly the leak this comment
+	// describes. Enumerating endpoint.All here is the next step; naming the rows is
+	// what keeps the two ends together until then.
 	if imageClient != nil {
-		mux.Handle("POST /v1/images/generations", sealedGate)
+		mux.Handle("POST "+endpoint.Image.Path, sealedGate)
 	} else {
-		mux.Handle("POST /v1/images/generations", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mux.Handle("POST "+endpoint.Image.Path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotImplemented)
 			_, _ = w.Write([]byte(`{"error":{"message":"sealed image generation is not available in direct-broker mode","type":"invalid_request_error"}}` + "\n"))

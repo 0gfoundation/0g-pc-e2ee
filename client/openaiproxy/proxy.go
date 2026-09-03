@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
@@ -254,25 +255,42 @@ func truncate(s string, n int) string {
 	return s[:n] + "…(truncated)"
 }
 
-// Handler returns the OpenAI-compatible proxy over the client core, mounted at
-// POST /v1/chat/completions. It is the whole request-handling surface both
-// server forms share; callers add their own routes (health, attestation quote)
-// on top of the returned mux.
+// Handler returns the OpenAI-compatible proxy over the client core with the
+// CHAT surface mounted, for a caller that serves only chat: the sidecar, and
+// every test that is about the proxy rather than about which surface it carries.
+// Callers add their own routes (health, attestation quote) on top of the
+// returned mux.
+//
+// It is a convenience over Register, not a second implementation — one line,
+// naming endpoint.Chat. A caller serving more than chat calls Register per row
+// of endpoint.All.
 func Handler(c *core.Client, opts ...Option) http.Handler {
 	mux := http.NewServeMux()
-	Register(mux, c, opts...)
+	Register(mux, endpoint.Chat, c, opts...)
 	return mux
 }
 
-// Register mounts the proxy's routes on an existing mux, so a caller can serve
-// the OpenAI endpoint alongside its own (e.g. the gateway's /healthz) on one
-// server.
-func Register(mux *http.ServeMux, c *core.Client, opts ...Option) {
+// Register mounts ONE sealed surface — the endpoint ep describes, sealed to c —
+// on an existing mux, so a caller can serve several alongside its own routes
+// (the gateway's /healthz) on one server.
+//
+// One handler serves every surface. What differs between them travels in ep:
+// the path it mounts on, whether a streaming request is a mode to serve or a
+// caller error, and any body normalisation the surface owes before sealing
+// (ep.PreSeal). Everything else here — the body cap, the credential and routing
+// headers forwarded, the response metadata re-exposed, the error envelope — is
+// common to all of them, and was previously copied per surface.
+//
+// c must be built for ep (core.WithEndpoint): a client's profile fixes which
+// field it seals, so a mismatch fails closed at seal time rather than serving
+// the wrong rules. Register does not check it, because a *core.Client does not
+// publish its endpoint; proxycli builds the two together from one row.
+func Register(mux *http.ServeMux, ep endpoint.Endpoint, c *core.Client, opts ...Option) {
 	var o options
 	for _, opt := range opts {
 		opt(&o)
 	}
-	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("POST "+ep.Path, func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxRequestBytes))
 		if err != nil {
 			var tooLarge *http.MaxBytesError
@@ -288,10 +306,26 @@ func Register(mux *http.ServeMux, c *core.Client, opts ...Option) {
 			writeGatewayError(w, http.StatusBadRequest, "request body is not a JSON object")
 			return
 		}
+		// `stream` is parsed for EVERY surface, so a malformed value gets one
+		// answer whichever one the caller hit. What a true means is the surface's
+		// property: a mode to serve where ep.Streams, and a caller error where it
+		// does not — refused rather than ignored, the same way an explicit
+		// `response_format: "url"` is refused rather than rewritten.
 		stream, err := streamRequested(req)
 		if err != nil {
 			writeGatewayError(w, http.StatusBadRequest, err.Error())
 			return
+		}
+		if stream && !ep.Streams {
+			writeGatewayError(w, http.StatusBadRequest, fmt.Sprintf(
+				"field \"stream\" is not supported for POST %s: the response is a single JSON object", ep.Path))
+			return
+		}
+		if ep.PreSeal != nil {
+			if req, err = ep.PreSeal(req); err != nil {
+				writeGatewayError(w, http.StatusBadRequest, err.Error())
+				return
+			}
 		}
 		// Forward the caller's 0G key (an OpenAI SDK sends it as Authorization, an
 		// Anthropic SDK as x-api-key) so the provider can authenticate and bill, plus
@@ -544,134 +578,3 @@ func (o options) writeError(w http.ResponseWriter, err error) {
 	setPassthrough(w, upstreamHeader(err))
 	writeErrorObject(w, statusFor(err), o.errorEnvelope(err))
 }
-
-// RegisterImages mounts POST /v1/images/generations on mux, sealed to c.
-//
-// It is a separate entry point from Register rather than another route inside
-// it because a Client is bound to ONE service type (core.WithServiceType): its
-// profile decides which request field must be sealed and which the response
-// must seal, and its resolver asks the router for providers of that service
-// type. A caller serving both endpoints builds two Clients and calls both
-// Register and RegisterImages; the sidecar, which serves only chat, keeps
-// mounting Register alone and is untouched by this.
-//
-// There is no streaming variant: image generation returns one JSON object.
-func RegisterImages(mux *http.ServeMux, c *core.Client, opts ...Option) {
-	var o options
-	for _, opt := range opts {
-		opt(&o)
-	}
-	mux.HandleFunc("POST /v1/images/generations", func(w http.ResponseWriter, r *http.Request) {
-		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxRequestBytes))
-		if err != nil {
-			var tooLarge *http.MaxBytesError
-			if errors.As(err, &tooLarge) {
-				writeGatewayError(w, http.StatusRequestEntityTooLarge, "request body too large")
-				return
-			}
-			writeGatewayError(w, http.StatusBadRequest, "read request body")
-			return
-		}
-		var req wire.Request
-		if err := json.Unmarshal(body, &req); err != nil {
-			writeGatewayError(w, http.StatusBadRequest, "request body is not a JSON object")
-			return
-		}
-		// Image generation returns one JSON object; there is no stream to ask for.
-		// The chat handler branches on this field, so a `"stream": true` there
-		// selects a mode; here there is no branch to select, and without this check
-		// the field was neither honoured nor refused — it went to the provider as an
-		// ordinary cleartext field, and the client core added a chat-profile
-		// `stream_options` next to it (core.withStreamUsage, now profile-guarded).
-		// Refuse it for the same reason an explicit `response_format: "url"` is
-		// refused just below: the caller named a mode this endpoint cannot serve and
-		// has to learn that, rather than getting something else silently.
-		if stream, err := streamRequested(req); err != nil {
-			writeGatewayError(w, http.StatusBadRequest, err.Error())
-			return
-		} else if stream {
-			writeGatewayError(w, http.StatusBadRequest,
-				`field "stream" is not supported for image generation: the response is a single JSON object`)
-			return
-		}
-		req, err = withB64ResponseFormat(req)
-		if err != nil {
-			writeGatewayError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-
-		ctx := core.WithCredential(r.Context(), credential(r))
-		ctx = core.WithForwardedHeaders(ctx, routingHeaders(r.Header))
-		meta := &core.ResponseMeta{}
-		ctx = core.WithResponseMeta(ctx, meta)
-
-		resp, err := c.Complete(ctx, req)
-		recordCompletion(err)
-		if err != nil {
-			o.writeError(w, err)
-			return
-		}
-		out, err := json.Marshal(resp)
-		if err != nil {
-			writeGatewayError(w, http.StatusInternalServerError, "encode response")
-			return
-		}
-		setPassthrough(w, meta.Header)
-		setResKey(w, meta)
-		setProvider(w, meta)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(out)
-	})
-}
-
-// withB64ResponseFormat fills in the image profile's pinned cleartext
-// `response_format: "b64_json"` when the caller omitted it, and rejects an
-// explicit conflicting value.
-//
-// The pin exists because url mode has the provider persist the images and serve
-// them from a plain URL — outside the sealed channel, which is a worse leak than
-// the prompt since it is the generated content itself (SPEC §7.1). The field is
-// REQUIRED rather than defaulted at the protocol layer precisely because
-// OpenAI's own default for the DALL·E family is `url`, so an omitted field is a
-// request to publish in the clear, spelled as silence.
-//
-// Defaulting it HERE rather than in wire is the difference between a gateway
-// being convenient and a protocol being safe: this gateway knows its callers
-// reached a sealed endpoint on purpose, so filling the field in is honouring an
-// intent they already expressed. The protocol layer knows nothing about the
-// caller and must keep failing closed for every other client. An explicit `url`
-// is refused rather than silently rewritten: the caller asked for a format this
-// mode cannot honour and has to learn that, which is the same reasoning the
-// broker applies to the same value.
-//
-// The request map is shallow-copied so the caller's body is never mutated.
-func withB64ResponseFormat(req wire.Request) (wire.Request, error) {
-	const want = "b64_json"
-	// A JSON `null` is the absence of a value, not a value — treat it as omitted
-	// and fill it in, the same reading wire.IsE2EESealed gives `_e2ee: null`.
-	// Spelled out because it is otherwise an accident: decoding `null` into a
-	// string is a no-op that returns NO error, so it would fall through to the
-	// value comparison and be rejected as `response_format=""`, which is a
-	// confusing message for a field the caller never set.
-	if raw, ok := req[fieldResponseFormat]; ok && string(raw) != "null" {
-		var got string
-		if err := json.Unmarshal(raw, &got); err != nil {
-			return nil, fmt.Errorf("%s must be the JSON string %q", fieldResponseFormat, want)
-		}
-		if got != want {
-			return nil, fmt.Errorf(
-				"%s=%q is not supported for a sealed image request (the images would be served outside the sealed channel); use %q",
-				fieldResponseFormat, got, want)
-		}
-		return req, nil
-	}
-	out := make(wire.Request, len(req)+1)
-	for k, v := range req {
-		out[k] = v
-	}
-	out[fieldResponseFormat] = json.RawMessage(`"` + want + `"`)
-	return out, nil
-}
-
-// fieldResponseFormat is the image profile's pinned cleartext field (SPEC §7.1).
-const fieldResponseFormat = "response_format"

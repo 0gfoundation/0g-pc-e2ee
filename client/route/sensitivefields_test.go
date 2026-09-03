@@ -13,7 +13,7 @@ import (
 // The preview body is everything NOT in sensitiveFields, so a set that does not
 // match the service type does not fail — it silently ships the payload to the
 // (untrusted) router. These two used to be independent options with the chat set
-// hardcoded as the default, so configuring an image proxy with WithServiceType
+// hardcoded as the default, so configuring an image proxy with WithEndpoint
 // alone previewed the prompt in the clear.
 func TestSensitiveFieldsFollowTheServiceType(t *testing.T) {
 	tests := []struct {

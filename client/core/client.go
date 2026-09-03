@@ -13,6 +13,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/proof"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
@@ -194,7 +195,7 @@ type Client struct {
 	// (SPEC §5.1). It fixes which field carries the payload and which the
 	// response must seal, so a chat client cannot silently accept an
 	// image-shaped response or vice versa. Set from the service type; see
-	// WithServiceType.
+	// WithEndpoint.
 	profile wire.Profile
 	// serviceType is the request family this client serves, passed to the
 	// resolver on every request. Held here rather than on the resolver because
@@ -466,53 +467,30 @@ func WithSealFields(fields []string) Option {
 	}
 }
 
-// WithServiceType binds the client to the endpoint it serves — "chatbot" (the
-// default) or "text-to-image" — which selects the wire profile it seals and
-// opens under, and, unless WithSealFields overrides it, the default sealed set
-// for that profile ("messages"/"tools" vs "prompt").
+// WithEndpoint binds the client to the surface it serves — one row of
+// endpoint.All — which selects the wire profile it seals and opens under, the
+// service type it asks the resolver for, and, unless WithSealFields overrides
+// it, the default sealed set for that profile ("messages"/"tools" vs "prompt").
 //
 // The profile is what stops a chat client accepting an image-shaped response
 // and vice versa: OpenResponseFor refuses a frame whose sealed set does not
 // cover the profile's content field, which is the client's only way to notice
 // that its response was never actually sealed (SPEC §12). A client left on the
-// default keeps behaving exactly as before.
+// default keeps behaving exactly as before (endpoint.Chat).
 //
-// An unrecognised service type leaves the profile empty, which makes every seal
-// and open fail closed with "unknown profile" rather than silently applying the
-// chat rules to a request shape nobody analysed.
-func WithServiceType(serviceType string) Option {
+// Taking the row rather than a service-type STRING is what removed this
+// package's copy of the string-to-profile mapping. A surface the table does not
+// carry is now unrepresentable here instead of being caught by an allowlist that
+// had to be kept in step with three others. The zero Endpoint — what
+// endpoint.ByServiceType returns on a miss — still fails closed: its empty
+// profile makes every seal and open fail with "unknown profile" rather than
+// silently applying chat's rules to a request shape nobody analysed.
+func WithEndpoint(ep endpoint.Endpoint) Option {
 	return func(c *Client) {
-		c.serviceType = serviceType
-		c.profile = profileForServiceType(serviceType)
+		c.serviceType = ep.ServiceType
+		c.profile = ep.Profile
 	}
 }
-
-// profileForServiceType maps the endpoint a client serves to its wire profile.
-// An allowlist, deliberately: SPEC §1 covers exactly two profiles, and anything
-// else — the multipart service types, video generation, whatever is added next —
-// has no envelope format defined. Returning the empty profile makes the wire
-// package reject it, which is the honest answer; guessing ProfileChat would
-// apply the wrong rules to an unanalysed request shape, silently. The broker
-// resolves the same mapping on its side for the same reason.
-func profileForServiceType(serviceType string) wire.Profile {
-	switch serviceType {
-	case ServiceTypeChatbot:
-		return wire.ProfileChat
-	case ServiceTypeTextToImage:
-		return wire.ProfileImage
-	default:
-		return ""
-	}
-}
-
-// Service types a client can be bound to with WithServiceType. They match the
-// router's own service_type values, so the same string this client seals under
-// is the one the resolver receives per request and the one the router's catalog
-// and preview APIs speak.
-const (
-	ServiceTypeChatbot     = "chatbot"
-	ServiceTypeTextToImage = "text-to-image"
-)
 
 // WithUnboundFields overrides the set of cleartext request fields excluded from
 // the AAD (SPEC §5.2) — the fields an intermediary may add, modify, or remove in
@@ -615,8 +593,8 @@ func NewWithResolver(r Resolver, opts ...Option) *Client {
 	tr.ResponseHeaderTimeout = providerTimeout
 	c := &Client{
 		resolver:      r,
-		profile:       wire.ProfileChat,
-		serviceType:   ServiceTypeChatbot,
+		profile:       endpoint.Chat.Profile,
+		serviceType:   endpoint.Chat.ServiceType,
 		unboundFields: wire.DefaultUnboundFields(),
 		http:          &http.Client{Transport: tr},
 
@@ -626,7 +604,7 @@ func NewWithResolver(r Resolver, opts ...Option) *Client {
 		o(c)
 	}
 	// Resolved AFTER the options, not as a struct default, so it tracks whichever
-	// profile they settled on regardless of the order WithServiceType and
+	// profile they settled on regardless of the order WithEndpoint and
 	// WithSealFields were passed in. An explicit WithSealFields still wins.
 	if !c.sealFieldsSet {
 		c.sealFields = wire.DefaultSealedFieldsFor(c.profile)
@@ -926,8 +904,8 @@ func (c *Client) seal(provider Provider, req wire.Request, ephPub []byte) (wire.
 // grafted a fabricated chat field onto every other profile's requests whenever
 // the caller's body happened to carry "stream" — see
 // TestE2E_Image_NoStreamOptionsGrafted. The HTTP layer refuses "stream" on the
-// image endpoint too (openaiproxy.RegisterImages); this is the half that holds
-// however the request reached the core.
+// image endpoint too (endpoint.Image.Streams, acted on by openaiproxy.Register);
+// this is the half that holds however the request reached the core.
 func withStreamUsage(profile wire.Profile, req wire.Request) wire.Request {
 	if profile != wire.ProfileChat {
 		return req

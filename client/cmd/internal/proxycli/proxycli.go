@@ -34,6 +34,7 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/dcap"
+	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/client/evidence"
 	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/0gfoundation/0g-pc-e2ee/client/route"
@@ -530,7 +531,7 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 		}
 		logger.Info("direct-broker mode enabled (no router)", "label", label, "provider_url", *f.providerURL, "attest", *f.attestOn)
 		return &Built{Client: core.NewWithResolver(directRes, append(append([]core.Option{}, coreOpts...),
-			core.WithSealFields(sealFields), core.WithServiceType(core.ServiceTypeChatbot))...)}
+			core.WithSealFields(sealFields), core.WithEndpoint(endpoint.Chat))...)}
 	}
 
 	// ONE router. It is one 0G Router, at one URL, serving every endpoint — so
@@ -546,9 +547,9 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 	// them too, so the image providers' quotes are verified ahead of the first image
 	// request rather than on it; it de-duplicates by address, so a provider serving
 	// both is verified once.
-	warmTypes := []string{core.ServiceTypeChatbot}
+	warmTypes := []string{endpoint.Chat.ServiceType}
 	if bc.servesImages {
-		warmTypes = append(warmTypes, core.ServiceTypeTextToImage)
+		warmTypes = append(warmTypes, endpoint.Image.ServiceType)
 	}
 	router := route.New(*f.RouterURL, append(append([]route.Option{}, routeOpts...),
 		append(chatRouteOpts, route.WithWarmServiceTypes(warmTypes...))...)...)
@@ -558,14 +559,14 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 	// must seal — which is a real per-endpoint property, unlike the router's
 	// caches. They are cheap: no transport, no cache, no verifier of their own.
 	client := core.NewWithResolver(router, append(append([]core.Option{}, coreOpts...),
-		core.WithSealFields(sealFields), core.WithServiceType(core.ServiceTypeChatbot))...)
+		core.WithSealFields(sealFields), core.WithEndpoint(endpoint.Chat))...)
 	// -seal-fields is chat's set by definition, so the image client takes its
 	// profile default instead of inheriting it. Built only for a binary that mounts
 	// the endpoint; nil leaves the gateway's image route as its explicit refusal.
 	var imageClient *core.Client
 	if bc.servesImages {
 		imageClient = core.NewWithResolver(router,
-			append(append([]core.Option{}, coreOpts...), core.WithServiceType(core.ServiceTypeTextToImage))...)
+			append(append([]core.Option{}, coreOpts...), core.WithEndpoint(endpoint.Image))...)
 	}
 
 	b := &Built{Client: client, ImageClient: imageClient, router: router, verifiesQuotes: *f.attestOn}
