@@ -222,11 +222,15 @@ signed-text format.)
 | `chat`  | `/v1/chat/completions` | `messages` | — | `messages`, `tools` | `choices` |
 | `image` | `/v1/images/generations` | `prompt` | `response_format` = `b64_json` (§7.1) | `prompt` | `data` |
 | `anthropic` | `/v1/messages` | `messages`, **and `system` whenever present** | — | `messages`, `system`, `tools` | per frame shape (§7.2) |
-| `speech` | `/v1/audio/transcriptions` (JSON-ified, §5.3) | `file_base64` | `response_format` = `json` (§5.3.2); `stream` **refused** when `true` (§5.3.3) | `file_base64`, `filename`, `language`, `prompt` | `text` |
+| `speech` | `/v1/audio/transcriptions` (JSON-ified, §5.3) | `file_base64` | `response_format` ∈ {`json`, `verbose_json`} (§5.3.2); `stream` **refused** when `true` (§5.3.3) | `file_base64`, `filename`, `language`, `prompt` | `text`, **and `segments` / `words` / `language` whenever present** (§7.3) |
 
-A **pinned cleartext field** is one that stays readable but may hold only one
-value in a sealed request. Sealing the payload does not cover it, and two
-distinct reasons put a field in this category:
+A **pinned cleartext field** is one that stays readable but may hold only a
+**permitted value** in a sealed request — one value, or a small set of them
+(image: exactly `b64_json`; speech: either of `json` / `verbose_json`). The
+field must still be PRESENT: what a pin guards against is the server's own
+default, which an absent field selects, so a set of two permitted values is not
+a licence to omit the field. Sealing the payload does not cover any of this, and
+two distinct reasons put a field in this category:
 
 - Its other values direct the server to publish the *result* outside the sealed
   channel — the image profile's `response_format`, where `url` has the enclave
@@ -259,6 +263,13 @@ the clear. Because the requirement depends on the request rather than on the set
 of field names, it is checked where the request is in hand: by the sender before
 sealing, and by the enclave on the received envelope, where a field that was
 sealed is already gone and one still present therefore arrived in the clear.
+
+The same category exists on the **response** side, with the direction of the
+receiver-side check reversed — the client is then the half that holds. Two
+profiles use it: Anthropic's `stop_sequence` (§7.2 rule 6) and speech's
+`segments` / `words` / `language` (§7.3). The predicate is identical in all
+four places, which is the point: *present in the received cleartext* means *never
+sealed*.
 
 Whatever a profile seals, a response frame MUST leave `usage` and `model`
 cleartext: the router reads them without a key to bill and attribute, so sealing
@@ -440,50 +451,61 @@ holds on every multipart endpoint, including those with no profile yet.
 | `language` | string | yes | The caller's own language hint; content-adjacent and useless for routing |
 | `prompt` | string | yes | A biasing text the caller writes — payload of the same kind as a chat prompt |
 | `model` | string | no | The router routes and attributes on it (§5.1) |
-| `response_format` | string | **no — pinned to `json`** | Below |
+| `response_format` | string | **no — pinned to {`json`, `verbose_json`}** | Below |
+| `timestamp_granularities` | array | no | A knob selecting whether the response carries `words[]`; not content itself. What it turns on IS content, and §7.3 seals that |
 | `stream` | bool | **no — refused when `true`** | §5.3.3 |
 | `temperature`, and any field a future upstream adds | — | no (§5.1 default) | Not content |
 
-**A sealed speech request MUST carry an explicit `response_format: "json"`.**
-The reason is structural rather than a matter of degree: `text`, `srt` and `vtt`
-return a body that is **not a JSON object at all** — plain text, or a subtitle
-track. There is no object to attach `_e2ee` to, so the transcript would travel in
-the clear; and there is no frame for §7 to describe and no `aad` for §8's `respH`
-to hash, so such a response is not merely leaky but **unverifiable**. A sealed
-request cannot express those formats, which is why the field is pinned rather
-than sanitized.
+**A sealed speech request MUST carry an explicit `response_format`, and its
+value MUST be one of `json` or `verbose_json`.** The pin is a **value set**, not
+a single value — see §5.1, where the definition covers both.
 
-The pin is a **single value in v1, and that half is a scope choice, not a
-requirement.** `verbose_json` is JSON-shaped and could be allowed; what it costs
-is three things, none of which v1 needs:
+The set is drawn by what the protocol can express, and the line is sharp rather
+than a matter of degree. `text`, `srt` and `vtt` return a body that is **not a
+JSON object at all** — plain text, or a subtitle track. There is no object to
+attach `_e2ee` to, so the transcript would travel in the clear; and there is no
+frame for §7 to describe and no `aad` for §8's `respH` to hash, so such a
+response is not merely leaky but **unverifiable**. Those three are therefore
+outside any sealed exchange this document can define, which is why the field is
+pinned rather than sanitized.
 
-1. The pin becomes a value **set** rather than a value.
-2. A second billable-cleartext locator: `verbose_json` responses commonly carry
-   no `usage` block at all, only a top-level `duration` (§7.3's required
-   cleartext would have to accept either).
-3. **Conditional sealing on the response side.** `segments[]` carries the
-   transcript per segment and `words[]` per word, and the detected `language` is
-   inferred from the audio — all payload. So the response sealed set stops being
-   the constant `["text"]` and becomes "`text`, plus each of `segments` / `words`
-   / `language` that the frame carries", with the matching receiver-side rule (a
-   client MUST reject a frame carrying any of them in cleartext — see §7.2 rule
-   6 for the same shape on the Anthropic profile).
+`json` and `verbose_json` are both on the JSON side of that line, and the set
+admits both because excluding `verbose_json` would cost the profile its
+timestamps, and with them subtitles — a product capability, not a detail.
+Admitting it is what §7.3 pays for in two places, and both are worth naming here
+because they are the only reason the narrower set was ever attractive:
 
-Widening the pin later is **additive** (§9): the value set grows, the response
-sealed set gains conditionally-sealed fields, and no version is bumped. Note the
-product consequence of the narrow v1, which is not an engineering detail:
-**pinned to `json`, a sealed transcription cannot return timestamps, so it cannot
-produce subtitles.** If that is required, take the wider pin from the start.
+1. **Two billable-cleartext locators, as alternatives.** `verbose_json`
+   responses commonly carry no `usage` block at all, only a top-level
+   `duration`, so §7.3's required cleartext is satisfied by **either**.
+2. **Conditional sealing on the response side.** `segments[]` carries the
+   transcript per segment, `words[]` per word, and the response's `language` is
+   inferred from the audio — all payload. So the response sealed set is not the
+   constant `["text"]` but "`text`, plus each of `segments` / `words` /
+   `language` the frame carries", with the receiver-side rule that makes it
+   enforceable (§7.3, and §7.2 rule 6 for the same shape on the Anthropic
+   profile).
+
+Neither is an argument for a narrower set; they are the work the set implies.
+
+**What is deliberately left out, and how it comes back.** `text` / `srt` / `vtt`
+are future work, and they do NOT come back by widening this set: a non-JSON body
+has no envelope, so serving them under sealing means the enclave returns
+`verbose_json` over the sealed channel and the RECEIVER renders the requested
+format locally from the sealed segments. That is a client capability plus a
+relaxation of the caller-facing contract, not a protocol change — the wire
+exchange stays exactly what this section already defines. Adding a value to this
+set is additive per §9 either way, and no version is bumped.
 
 Contrast with the image profile's pin (§7.1), which looks identical and is
 argued differently. There, the field is required because **the default is the
 leak** — OpenAI defaults `response_format` to `url` for the DALL·E family, so
-silence publishes the images. Here the endpoint's default (`json`) is already the
-safe value, so requiring the field explicitly buys no safety; it is required for
-uniformity with §5.1's pinned-cleartext machinery and because an explicit value
-makes the refusal of `srt` legible to the caller. A profile author reading only
-§7.1 would conclude "pin because silence is dangerous"; on this profile the
-reason is "pin because three of the five values are inexpressible".
+silence publishes the images. Here the endpoint's default (`json`) is already in
+the permitted set, so requiring the field explicitly buys no safety; it is
+required for uniformity with §5.1's pinned-cleartext machinery and because an
+explicit value makes the refusal of `srt` legible to the caller. A profile author
+reading only §7.1 would conclude "pin because silence is dangerous"; on this
+profile the reason is "pin because three of the five values are inexpressible".
 
 #### 5.3.3 The `speech` profile is non-streaming: a refused cleartext value
 
@@ -809,7 +831,7 @@ and MUST be rejected. `final` is in the AAD, so a flipped flag is detected.
 
 ### 7.3 Speech-to-text responses
 
-A transcription response is one non-streaming frame (§5.3.3) with `text` sealed:
+A transcription response is one non-streaming frame (§5.3.3). `json`:
 
 ```json
 {
@@ -819,17 +841,60 @@ A transcription response is one non-streaming frame (§5.3.3) with `text` sealed
 }
 ```
 
-One constraint is specific to this profile, and it is the §7.1
-`usage.output_images` rule with a sharper failure mode:
+`verbose_json`, which additionally carries the per-segment transcript and can
+report its duration only at the top level:
 
-- **`usage.seconds` is the billable quantity and MUST be cleartext, bound, and
-  present.** The router bills audio duration and cannot recover it from a sealed
-  transcript. The enclave writes the duration of the audio it actually processed,
-  in the `{"type": "duration", "seconds": N}` shape, where `N` is a
-  **non-negative finite** JSON number. Fractional values are valid here (unlike
-  §7.1's whole-number image count — audio duration genuinely is fractional);
-  infinities, `NaN`-alikes and negatives are not. An explicit `0` is a valid
-  quantity; `null` or an absent `usage` is an omission and is not a zero.
+```json
+{
+  "model": "whisper-large-v3",
+  "task": "transcribe",
+  "duration": 12.5,
+  "_e2ee": { "v": 1, "enc": "…", "sealed_fields": ["text", "segments", "language"], "final": true, "ciphertext": "…" }
+}
+```
+
+Two constraints are specific to this profile.
+
+- **The sealed set MUST cover `text`, and MUST additionally cover each of
+  `segments`, `words` and `language` that the response carries.** These are
+  **conditionally sealed** on the response side, exactly as the top-level
+  `system` is on the Anthropic REQUEST side (§5.1): they need not exist, but a
+  frame that has one and does not seal it is refused. `segments[]` holds the
+  transcript per segment and `words[]` per word — the same content as `text`,
+  cut differently — and `language` here is not the caller's request hint but the
+  language the enclave *inferred from the audio*, so all three are payload.
+
+  A profile-wide constant sealed set cannot express this: `verbose_json` carries
+  `segments` and, only when word granularity was asked for, `words`, so
+  requiring all of them rejects conforming responses and requiring none of them
+  is the leak.
+
+  **The client is the half that holds** (§12). At seal time the fields are still
+  in hand, so a sealer knows what it must seal; at open time a field that WAS
+  sealed is already gone from the cleartext, so one still sitting there was
+  never sealed — and nobody else can tell. A router forwards such a frame
+  unremarkably, and the transcript rides through it in the clear.
+
+- **The billable quantity MUST be cleartext, bound, and present — as EITHER
+  `usage.seconds` OR the top-level `duration`.** This is the §7.1
+  `usage.output_images` rule with two alternatives and a sharper failure mode.
+
+  The alternation is not laxity: it is the two shapes upstreams actually emit.
+  `json` responses carry `{"type": "duration", "seconds": N}`; `verbose_json`
+  responses commonly carry no `usage` block at all and report the audio length
+  only as a top-level `duration`. A frame satisfying either is compliant, and a
+  frame carrying both MUST NOT disagree — the seal-time half rejects that, since
+  a receiver reading one locator and a router reading the other would otherwise
+  bill different numbers for one response.
+
+  `N` is a **non-negative finite** JSON number, and unlike §7.1's whole-number
+  image count, **fractional values are valid** — audio duration genuinely is
+  fractional. Infinities, `NaN`-alikes and negatives are not. It MUST be a JSON
+  number, **not a quoted string**: a consumer may tolerate `"12.5"` defensively
+  against non-conforming providers, but this document does not bless the form,
+  because a value that is sometimes a string is a value every implementation
+  must write two parsers for. An explicit `0` is a valid quantity; `null`, or
+  neither locator present, is an omission and is not a zero.
 
   The enclave MUST write it **even when the upstream response omits it**,
   deriving the duration from the audio it decoded, and MUST reject rather than
@@ -852,12 +917,12 @@ One constraint is specific to this profile, and it is the §7.1
   that number from a real one, and only the client can refuse the frame that
   produced it.
 
-Nothing else in the frame is sealed under the v1 pin: with
-`response_format: "json"` the response body is `{"text": …}` plus `usage`, so the
-sealed set is the constant `["text"]`. If the pin is widened to `verbose_json`
-(§5.3.2), this section gains a second locator (top-level `duration`) and the
-conditionally-sealed `segments` / `words` / `language` — with the receiver-side
-rejection that makes conditional sealing enforceable.
+Everything else stays cleartext and bound: `model`, and `verbose_json`'s `task`.
+Note that the duration is cleartext under **both** permitted formats, so
+admitting `verbose_json` reveals nothing new — the length of the audio is
+already visible to the router in the `json` case, as the thing it bills on. The
+sealed channel protects what was said, not that something was said for 12.5
+seconds.
 
 ## 8. Response signature
 
@@ -1038,7 +1103,9 @@ other, that party's column is the load-bearing one.
 | `usage` not sealed (§7) | yes | client (loud either way: the router cannot bill) |
 | `usage` not unbound (§5.2/§7.1) | yes | **yes — client** (otherwise a rewritten count verifies) |
 | final frame carries the profile's billable cleartext — image: `usage.output_images` (§7.1) | yes | **yes — client** (a router cannot distinguish an omitted count from a zero, so it bills nothing and reports nothing) |
-| final frame carries the profile's billable cleartext — speech: `usage.seconds`, written by the enclave even when the upstream omitted it (§7.3) | yes | **yes — client**, and more load-bearing than the image row. A router with no usage block on this endpoint estimates from the transcript text, which sealing makes empty, so it falls through to a flat constant: the omission does not under-bill quietly, it bills a fabricated number nothing downstream can distinguish from a real one |
+| final frame carries the profile's billable cleartext — speech: `usage.seconds` OR top-level `duration`, written by the enclave even when the upstream omitted it (§7.3) | yes | **yes — client**, and more load-bearing than the image row. A router with no usage block on this endpoint estimates from the transcript text, which sealing makes empty, so it falls through to a flat constant: the omission does not under-bill quietly, it bills a fabricated number nothing downstream can distinguish from a real one |
+| where a billable cleartext has ALTERNATIVE locators, a frame carrying both states the same value — speech (§7.3) | **yes — sealer**, the only side that can compare both against the audio it measured | client (it can detect the disagreement, but not which locator is honest). The sealer's column is load-bearing because the two readers differ: a client opening one locator while a router bills the other would silently transact on different numbers for one response |
+| a conditionally sealed RESPONSE field is sealed when the frame carries it — speech: `segments` / `words` / `language` (§7.3) | yes | **yes — client**. A field still in the received cleartext was never sealed, and that is the receiver's only evidence: a router forwards such a frame unremarkably and the transcript rides through it in the clear. Same shape as the request side's conditional payload field, direction reversed |
 | decrypted keys == declared `sealed_fields` (§5.1/§6) | by construction | **yes** |
 | no sealed/cleartext collision (§5.1) | by construction | **yes** |
 | envelope `v` / `kem_id` supported (§9) | by construction | **yes** |
