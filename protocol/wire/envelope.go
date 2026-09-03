@@ -706,8 +706,10 @@ func validatePinnedCleartextFor(p Profile, env Request) error {
 
 // quotedList renders a set of JSON string values for an error message:
 // `"b64_json"` for one, `"json" or "verbose_json"` for two, a comma list beyond
-// that. Used for both a pin's PERMITTED values and a refusal's REFUSED ones, so
-// it deliberately renders only the list — the calling sentence says which.
+// that. Every caller renders a set of PERMITTED values — there is no refusal
+// list in this package, by design (§5.3.3) — so the sentence around it should
+// always read "must be …", never "must not be …": naming the refused value is
+// how a message points an operator at the nearest bypass.
 func quotedList(vals []string) string {
 	quoted := make([]string, len(vals))
 	for i, v := range vals {
@@ -1242,11 +1244,14 @@ func SealRequestFor(profile Profile, encPub crypto.PublicKey, req Request, seale
 	if err := validatePinnedCleartext(spec, req); err != nil {
 		return nil, err
 	}
-	// The pin's weaker sibling: a value this profile refuses rather than a value
-	// it demands (§5.3.3). Absence is compliant here, so this cannot be folded
-	// into the pin checks above — doing so would demand `stream` on every sealed
-	// speech request. ValidateSealedFieldsFor already rejected a set that seals
-	// such a field away; these are the unbound and value halves.
+	// The pin's optional-presence twin (§5.3.3): the same "must be one of these"
+	// rule, differing only in that ABSENCE is compliant. That is why it cannot be
+	// folded into the checks above — doing so would demand `stream` on every
+	// sealed speech request. It is emphatically NOT "a value this profile refuses
+	// rather than one it demands": expressing it that way is what let `"true"`
+	// and `1` through, on an endpoint that materializes the request back into
+	// multipart. ValidateSealedFieldsFor already rejected a set that seals such a
+	// field away; these are the unbound and value halves.
 	if err := validatePinnedIfPresentNotUnbound(spec, unboundFields); err != nil {
 		return nil, err
 	}

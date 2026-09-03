@@ -23,18 +23,33 @@ var sampleSpeechReq = `{
 }`
 
 // sampleAudio / sampleAudioB64 are the §10 KAT fixture for a binary payload
-// field. The bytes are chosen so the encoding cannot pass by accident:
+// field, chosen so the encoding cannot pass by accident. Its triples, ALIGNED on
+// multiples of three, which is the part that has to be got right:
 //
-//   - 0xFB 0xEF 0xBE encodes to "++++" territory under standard base64 and to
-//     the URL-safe alphabet's "-" / "_" under base64url, so a decoder wired to
-//     §3's base64url instead of §5.3's standard base64 produces DIFFERENT bytes
-//     rather than an error;
-//   - the length is not a multiple of 3, so the encoding requires padding, which
-//     base64url-without-padding omits.
+//	52 49 46 -> "UklG"   (ordinary bytes, to make the string readable)
+//	FB EF BE -> "++++"   (alphabet index 62 four times; base64url renders "-")
+//	FF FF FF -> "////"   (index 63 four times;          base64url renders "_")
+//	7F       -> "fw=="   (a 1-byte remainder, so padding is required)
 //
-// Both mistakes are silent: they corrupt the audio inside the enclave rather
-// than failing Open, which is why SPEC §10 requires this vector.
-var sampleAudio = []byte{0x52, 0x49, 0x46, 0x46, 0xFB, 0xEF, 0xBE, 0xFF, 0x00, 0x7F}
+// So the fixture differs from base64url in BOTH of the characters where the two
+// alphabets diverge, and separately requires padding. Three ways of getting the
+// encoding wrong are therefore all caught, and all three are silent — they
+// corrupt the audio inside the enclave rather than failing Open, which is why
+// SPEC §10 requires this vector:
+//
+//   - base64url without padding (§3's wire encoding, the tempting mistake in
+//     this codebase, since every other binary field uses it);
+//   - base64url WITH padding, which the previous version of this fixture did
+//     not catch at all — see the test;
+//   - standard base64 without padding.
+//
+// The alignment is the trap. An earlier fixture put these bytes after a 4-byte
+// prefix, which offset the grouping so the intended triples were never triples:
+// the real groups came out `(46 FB EF)` and `(BE FF 00)`, encoding to "Rvvv" and
+// "vv8A" with neither a "+" nor a "/" anywhere. Its output was byte-identical
+// under standard and padded-URL-safe base64, so the assertion that was supposed
+// to distinguish the alphabets was only ever testing padding.
+var sampleAudio = []byte{0x52, 0x49, 0x46, 0xFB, 0xEF, 0xBE, 0xFF, 0xFF, 0xFF, 0x7F}
 
 var sampleAudioB64 = base64.StdEncoding.EncodeToString(sampleAudio)
 
@@ -42,19 +57,34 @@ var sampleAudioB64 = base64.StdEncoding.EncodeToString(sampleAudio)
 // encoding choice itself. It pins the exact string, so a change of alphabet or
 // padding fails here rather than in an enclave's audio decoder.
 func TestSpeechBinaryPayloadEncodingKAT(t *testing.T) {
-	const want = "UklGRvvvvv8Afw=="
+	const want = "UklG++++////fw=="
 	if sampleAudioB64 != want {
 		t.Fatalf("standard base64 of the fixture = %q, want %q", sampleAudioB64, want)
+	}
+
+	// The fixture must exercise both characters where the alphabets diverge, or
+	// the comparisons below can pass for a fixture that distinguishes nothing.
+	// Asserted rather than assumed: this is exactly what the previous fixture got
+	// wrong, and it got it wrong in a comment that did the arithmetic by hand.
+	if !strings.Contains(sampleAudioB64, "+") || !strings.Contains(sampleAudioB64, "/") {
+		t.Fatalf("the fixture must contain both %q and %q — the two characters standard base64 and base64url disagree on; got %q", "+", "/", sampleAudioB64)
 	}
 	if !strings.HasSuffix(sampleAudioB64, "==") {
 		t.Error("the fixture must require padding, so an unpadded encoder is caught")
 	}
-	// The same bytes under §3's wire alphabet, which a binary payload field must
-	// NOT use. Different string, same length class — so mixing them up is silent.
-	urlSafe := base64.RawURLEncoding.EncodeToString(sampleAudio)
-	if urlSafe == sampleAudioB64 {
-		t.Fatal("the fixture no longer distinguishes standard base64 from base64url; pick bytes that encode differently")
+
+	// base64url WITH padding is the case the previous fixture missed entirely:
+	// its output was byte-identical to standard base64, so a decoder wired to
+	// base64.URLEncoding passed the KAT and would then have silently corrupted
+	// every audio payload containing a 62 or 63 sextet.
+	if padded := base64.URLEncoding.EncodeToString(sampleAudio); padded == sampleAudioB64 {
+		t.Fatalf("the fixture does not distinguish standard base64 from PADDED base64url (both %q); pick bytes that encode differently", padded)
 	}
+	// And §3's wire alphabet, which a binary payload field must not use.
+	if raw := base64.RawURLEncoding.EncodeToString(sampleAudio); raw == sampleAudioB64 {
+		t.Fatal("the fixture does not distinguish standard base64 from base64url; pick bytes that encode differently")
+	}
+
 	if decoded, err := base64.StdEncoding.DecodeString(sampleAudioB64); err != nil || string(decoded) != string(sampleAudio) {
 		t.Fatalf("round trip: %v / %q", err, decoded)
 	}
