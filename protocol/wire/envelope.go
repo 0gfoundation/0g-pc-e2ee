@@ -853,9 +853,9 @@ func cleartextToken(raw json.RawMessage) (string, bool) {
 //
 // The families differ only in whether ABSENCE is compliant, and that difference
 // is confined to the VALUE check (validatePinnedCleartext demands the field,
-// validatePinnedIfPresent permits its absence). For the two structural rules —
-// must stay cleartext, must stay bound — they are one rule over two maps, so
-// the checks below iterate both instead of existing once per family.
+// validatePinnedIfPresent permits its absence). The two structural rules — must
+// stay cleartext, must stay bound — are one rule over both maps, so the checks
+// below iterate every family the spec declares.
 type pinFamily struct {
 	pins map[string][]string
 	// sealedWhy completes "…must stay CLEARTEXT: " for this family. It is per
@@ -1095,12 +1095,6 @@ func ValidateSealedFields(fields []string) error {
 // failed 100% of requests: the exact failure mode the fail-fast call exists to
 // prevent.
 //
-// The up-front use was once load-bearing for a `-seal-fields` operator flag,
-// which no longer exists — the sealed set now comes from the endpoint row's
-// profile, so a deployment cannot configure it at all. What survives is the
-// library option, so this stays name-only rather than folding into the
-// request-shaped checks.
-//
 // By the same rule, what it does NOT check is a profile's CONDITIONAL payload
 // fields (requiredIfPresent, e.g. Anthropic's `system`): whether those are
 // required depends on the request, not on the field names, so they cannot be
@@ -1153,9 +1147,9 @@ func ValidateSealedFieldsFor(p Profile, fields []string) error {
 //
 // Note what it does NOT reject: a field the profile does not pin. `model,
 // max_tokens` passes here, and unbinding `max_tokens` hands the untrusted router
-// the "inflate max_tokens" edit §5.2 cites as what the AAD prevents. That is why
-// the proxy binaries no longer expose the unbound set as a flag — this check was
-// never a substitute for not making it configurable.
+// the "inflate max_tokens" edit §5.2 cites as what the AAD prevents. So passing
+// this is not evidence that an unbound set is safe to accept from outside the
+// binary — it bounds the damage, it does not rule it out.
 func ValidateUnboundFieldsFor(p Profile, unbound, sealed []string) error {
 	spec, err := p.spec()
 	if err != nil {
@@ -1208,14 +1202,10 @@ func ValidateUnboundFields(unbound, sealed []string) error {
 // caller can run the exported halves once at startup (ValidateSealedFieldsFor,
 // ValidateUnboundFieldsFor) and fail fast instead of on every request.
 //
-// Grouped here rather than dropped, and the distinction is worth stating
-// because it is easy to get backwards. "The gateway's sealed set is now
-// hardcoded, so these are assertions about our own constants" is true of the
-// gateway and false of this package: sealedFields and unboundFields are
-// PARAMETERS here, core.WithSealFields still supplies them, and a caller who
-// omits the payload field from the first gets a leak rather than an error if
-// nothing checks. A startup call is an earlier verdict on the same inputs,
-// never a substitute for this one.
+// A startup call is an earlier verdict on the same inputs, never a substitute
+// for this one: sealedFields and unboundFields are PARAMETERS here
+// (core.WithSealFields supplies them), and a caller who omits the payload field
+// from the first gets a leak rather than an error if nothing checks.
 func validateSealInputs(profile Profile, spec profileSpec, sealedFields, unboundFields []string, signerAddr string, clientEphPub []byte) error {
 	if err := ValidateSealedFieldsFor(profile, sealedFields); err != nil {
 		return err

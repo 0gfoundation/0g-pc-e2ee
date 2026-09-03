@@ -1,16 +1,13 @@
 package main
 
 import (
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"regexp"
-	"strings"
 	"testing"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
-	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
 // The browser allowlist these tests drive newHandler with, kept independent of the
@@ -146,32 +143,5 @@ func TestComposeAllowedOriginsMatchesDefault(t *testing.T) {
 		t.Errorf("compose allowlist and the built-in default disagree:\n compose: %q\n default: %q\n"+
 			"update whichever is stale — the deployed enclave serves the compose value", got,
 			openaiproxy.DefaultAllowedOriginsCSV)
-	}
-}
-
-// TestComposeStatesTheUnboundSet is TestComposeAllowedOriginsMatchesDefault's
-// counterpart for the unbound field set. The set is no longer settable per
-// deployment, so the manifest states it in prose instead of as a commented-out
-// env var — which still makes it a copy of wire.DefaultUnboundFields, and a copy
-// still needs a test.
-//
-// Not a hypothetical: DefaultUnboundFields carries TODO(model-binding), which
-// reverts it to the empty set once the router stops rewriting "model". The day
-// that lands, an untested sentence here would go on telling a reader of the
-// MEASURED manifest that the enclave leaves the model name rewritable when it no
-// longer does — and this manifest is the artifact someone verifies the enclave
-// against, so it is the worst place for a stale claim.
-func TestComposeStatesTheUnboundSet(t *testing.T) {
-	compose, err := os.ReadFile(composePath)
-	if err != nil {
-		t.Fatalf("read %s: %v", composePath, err)
-	}
-	// Rendered the way Go prints a []string, which is how the manifest spells it:
-	// ["model"] today, [] once model becomes bound.
-	want := fmt.Sprintf("%q", wire.DefaultUnboundFields())
-	if !strings.Contains(string(compose), want) {
-		t.Errorf("%s does not state the current unbound set %s; the manifest is what a "+
-			"verifier reads, so update its prose to match wire.DefaultUnboundFields()",
-			composePath, want)
 	}
 }

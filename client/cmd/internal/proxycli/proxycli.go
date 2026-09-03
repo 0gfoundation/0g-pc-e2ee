@@ -171,32 +171,9 @@ func NewLogger() *slog.Logger {
 // by flag.Parse after RegisterFlags. Callers read Listen to bind their server
 // and pass the rest to Build.
 type Flags struct {
-	Listen      *string
-	RouterURL   *string
-	providerURL *string
-	// Neither field set is an operator knob. Both were flags here
-	// (`-seal-fields` / `SEAL_FIELDS` and `-unbound-fields` / `UNBOUND_FIELDS`,
-	// each defaulting to wire's set); no deployment set either, the Phala compose
-	// carried both commented out, and neither was documented outside the design
-	// notes. What they are now: the sealed set comes from the endpoint row's
-	// profile, and the unbound set is wire.DefaultUnboundFields(), which
-	// core.New already installs.
-	//
-	// Removing the unbound one closes a footgun rather than just deleting code.
-	// `unbound_fields` is, per SPEC §5.2, the one construct that can silently
-	// undo every other guarantee: an unbound field is outside the AAD, so an
-	// intermediary may rewrite it with Open still succeeding. The startup check
-	// only ever caught the cases a profile PINS, so
-	// `UNBOUND_FIELDS=model,max_tokens` validated clean — handing the untrusted
-	// router exactly the "inflate max_tokens" edit §5.2 cites as what binding
-	// prevents. And for this binary a flag was never even cheap: the gateway's
-	// compose `environment:` block is inside compose_hash (see client/compose),
-	// which a quote commits to in mr_config_id, so setting one changes the
-	// measurement — as heavy as a code change, and it yields a manifest that is
-	// not the published one.
-	//
-	// core.WithUnboundFields stays for a library caller that genuinely faces an
-	// intermediary rewriting some other field.
+	Listen          *string
+	RouterURL       *string
+	providerURL     *string
 	attestOn        *bool
 	attestEnforce   *bool
 	onchainOn       *bool
@@ -330,17 +307,9 @@ func (b *Built) ProviderIdentities() route.ProviderIdentitySource {
 //
 // It exits the process via os.Exit(1) (after logging through logger) on an
 // invalid flag combination — the same fail-loud behavior both mains had inline —
-// so a misconfigured proxy never starts with, say, an unsealed "messages" field
-// or attestation silently off. logger is also attached as the core's debug
-// logger, so open-failure diagnostics share the binary's format and sink.
-//
-// There is no longer a startup field-set check here. It validated
-// -unbound-fields against every served row's sealed set, and with both sets now
-// package constants of wire, its verdict cannot vary between runs: the identical
-// assertion is made for EVERY profile — not just the subset a given binary
-// serves — by wire's TestEveryProfileDefaultSatisfiesItsOwnRules. That is a
-// strictly wider check that runs before the binary ships, which is the one case
-// where a runtime check really does belong in a test.
+// so a misconfigured proxy never starts with, say, attestation silently off.
+// logger is also attached as the core's debug logger, so open-failure
+// diagnostics share the binary's format and sink.
 
 // BuildOption states something about the BINARY that Build cannot infer from the
 // flags — today, which sealed surfaces it actually mounts.
@@ -371,10 +340,8 @@ func Serves(eps ...endpoint.Endpoint) BuildOption {
 //
 // Build reads the result for warming and for client construction on BOTH the
 // router and direct paths (via sealingClients), so those cannot disagree about
-// what this binary serves. That mattered enough to be a bug once — the Serves
-// list drove the then-existing startup validation while the direct branch
-// hard-coded chat — so the narrowing must stay something the code reads, not
-// something a comment asserts.
+// what this binary serves. Keep it that way: a path that restates the narrowing
+// instead of reading it is free to drift from this one.
 func servedSurfaces(requested []endpoint.Endpoint, directMode bool) []endpoint.Endpoint {
 	if directMode {
 		return []endpoint.Endpoint{endpoint.Chat}
@@ -422,11 +389,7 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 		o(&bc)
 	}
 	// Decide the served set ONCE, here, and let everything below read it: the
-	// warmer's service types and the clients loop. It used to be decided twice —
-	// the option list drove the startup field-set validation while the
-	// direct-broker branch hard-coded chat — so a direct-mode gateway validated
-	// against the image profile it would never seal under and refused to start on
-	// a setting valid for the only surface it served.
+	// warmer's service types and both clients-map paths.
 	directMode := strings.TrimSpace(*f.providerURL) != ""
 	served := servedSurfaces(bc.serves, directMode)
 	// Direct-broker mode (-provider-url set) skips the router and seals straight to
@@ -555,17 +518,12 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 			os.Exit(1)
 		}
 		logger.Info("direct-broker mode enabled (no router)", "label", label, "provider_url", *f.providerURL, "attest", *f.attestOn)
-		// Built from `served`, which servedSurfaces has already narrowed to chat
-		// alone: NewDirect derives the broker's paths as chat, so any other row
-		// would seal to a chat endpoint, and the gateway refuses the rest
-		// explicitly rather than leaving them to its catch-all.
-		//
-		// Reading `served` rather than restating endpoint.Chat is the point. The
-		// served set used to be decided twice — the Serves list drove the startup
-		// field-set validation while this branch hard-coded chat — and that
-		// disagreement was a real bug. Now that the validation is gone, deriving
-		// the map here is what keeps "decided once" a property of the code rather
-		// than a claim in this comment.
+		// Built from `served` rather than from a restated endpoint.Chat, so this
+		// branch cannot disagree with servedSurfaces about what it serves — that
+		// function has already narrowed it to chat alone, because NewDirect derives
+		// the broker's paths as chat and any other row would seal to a chat
+		// endpoint. The gateway refuses the rest explicitly rather than leaving them
+		// to its catch-all.
 		return &Built{Clients: sealingClients(directRes, served, coreOpts)}
 	}
 

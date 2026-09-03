@@ -291,14 +291,8 @@ func TestIdleKeepAliveIsBoundedOnlyByIdleTimeout(t *testing.T) {
 // Direct-broker mode serves chat alone whatever the binary asked for: NewDirect
 // derives the broker's paths as chat, so any other row would seal to a chat
 // endpoint. A binary that asks for endpoint.All must therefore still end up with
-// exactly one client.
-//
-// The served set used to be decided twice — the Serves list drove the startup
-// field-set validation while the direct branch hard-coded chat — so a direct-mode
-// gateway asking for endpoint.All refused to start on a setting that was only
-// invalid for the image profile it would never seal under. That validation is
-// gone with the flags that fed it, but the narrowing it exposed is the behavior
-// asserted here.
+// exactly one client, which is what pins the narrowing in servedSurfaces to
+// something the direct path actually reads.
 func TestBuildDirectModeServesChatOnly(t *testing.T) {
 	fs := flag.NewFlagSet("t", flag.ContinueOnError)
 	f := RegisterFlags(fs, "ZG_TEST", ":0")
