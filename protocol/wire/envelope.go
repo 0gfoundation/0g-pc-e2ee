@@ -42,6 +42,11 @@ const (
 	fieldMessages = "messages"
 	// fieldPrompt is the sensitive field an image request MUST always seal.
 	fieldPrompt = "prompt"
+	// fieldTools is the tool/function schema list both chat and Anthropic carry.
+	// It is payload for the reason `messages` is: a schema names an operation the
+	// calling application performs, so the set of them describes what the user is
+	// doing, in the caller's own vocabulary.
+	fieldTools = "tools"
 	// fieldSystem is Anthropic's TOP-LEVEL system prompt (/v1/messages), as
 	// opposed to OpenAI's system message inside "messages". Being its own
 	// top-level field is why it needs naming at all: it is payload the chat
@@ -164,12 +169,6 @@ type profileSpec struct {
 	// order the default sealed set lists them. See payloadField for the one axis
 	// they differ on.
 	payload []payloadField
-	// extraDefaults are further fields the v1 default seals that are NOT payload:
-	// worth sealing, but droppable without a leak the profile is responsible for
-	// ("tools"). The default request set is `payload` followed by these — see
-	// defaultRequestSealed — so each field is named once and a default can never
-	// omit a field the checks demand.
-	extraDefaults []string
 	// responsePayload is every field a sealed frame of this profile must cover —
 	// the generated content (§7) — with the same optional flag `payload` uses on
 	// the request side, and meaning the same thing: the field need not exist, but
@@ -552,8 +551,15 @@ func (s frameShape) sealedFieldsFor(frame Response) []string {
 
 var profiles = map[Profile]profileSpec{
 	ProfileChat: {
-		payload:         []payloadField{{name: fieldMessages}},
-		extraDefaults:   []string{"tools"},
+		// "tools" is optional payload, not a mere default: the schemas name what
+		// the calling application can DO — `transfer_funds`, `get_patient_record` —
+		// so they describe the user's domain as directly as a prompt does. As a
+		// default it was droppable, and a sealed set of just `messages` handed them
+		// to the router with every check passing.
+		payload: []payloadField{
+			{name: fieldMessages},
+			{name: fieldTools, optional: true},
+		},
 		responsePayload: []payloadField{{name: fieldChoices}},
 	},
 	ProfileImage: {
@@ -585,13 +591,13 @@ var profiles = map[Profile]profileSpec{
 	ProfileAnthropic: {
 		// "messages" is the conversation and is always there; "system" is the
 		// top-level system prompt, the same class of payload but optional — hence
-		// the flag rather than a second mandatory field. "tools" follows chat: a
-		// default, not payload.
+		// the flag rather than a second mandatory field. "tools" follows chat, and
+		// for chat's reason: tool schemas are payload, and optional.
 		payload: []payloadField{
 			{name: fieldMessages},
 			{name: fieldSystem, optional: true},
+			{name: fieldTools, optional: true},
 		},
-		extraDefaults: []string{"tools"},
 		// The response is frame-typed, so there is no single field a frame must
 		// seal and no meaningful profile-wide default set: both are properties of
 		// the frame (see anthropicFrames). responsePayload stays zero so the
@@ -954,19 +960,23 @@ func DefaultSealedFieldsFor(p Profile) []string {
 	return s.defaultRequestSealed()
 }
 
-// defaultRequestSealed is the v1 default request sealed set: every payload field
-// (mandatory and optional alike), then the extra defaults. Derived rather than
-// listed, so a profile names each field once and the default can never omit a
-// field the checks demand — which was a real hazard while the two were written
-// separately: an optional payload field missing from the default set is refused
-// by validatePayloadSealedFor on the first request that carries it, or worse,
+// defaultRequestSealed is the v1 default request sealed set: every payload
+// field, mandatory and optional alike. It is exactly the payload list, which is
+// what makes the default and the requirement incapable of disagreeing — a
+// default that omitted a field the checks demand would be refused by
+// validatePayloadSealedFor on the first request that carried it, or worse,
 // handed to the router in the clear by a caller who skips that check.
+//
+// There is deliberately no second list of "seal this too, but do not require
+// it". Such a field is droppable by definition, so declaring one is declaring a
+// leak a conforming client may choose — which is what `tools` was until it
+// became payload in its own right.
 func (s profileSpec) defaultRequestSealed() []string {
-	out := make([]string, 0, len(s.payload)+len(s.extraDefaults))
+	out := make([]string, 0, len(s.payload))
 	for _, f := range s.payload {
 		out = append(out, f.name)
 	}
-	return append(out, s.extraDefaults...)
+	return out
 }
 
 // Profiles returns every profile this package defines, sorted for determinism.

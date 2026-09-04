@@ -194,12 +194,26 @@ The request is the original OpenAI JSON with the **sealed fields removed** and a
   required here: the AEAD binds the exact ciphertext bytes and the §8 signature
   binds the ciphertext, so the pre-encryption byte layout is irrelevant.
   Example: `{"messages": <original>, "tools": <original>}`.
-- v1 default sealed set: **`messages` and `tools`**. On the router path a client
-  SHOULD seal `messages` (leaving it cleartext exposes the prompt, defeating the
-  purpose). This is a recommended default, not a protocol-enforced invariant: a
-  broker MAY reject a router-path request whose `sealed_fields` omits `messages`
-  as a deployment policy, but is not required to. (The reference client library
-  defaults to sealing `messages` and may enforce it as a stricter local choice.)
+- v1 default sealed set: **`messages` and `tools`** — which for this profile is
+  exactly its payload fields, `messages` always and `tools` whenever the request
+  carries one. The default and the requirement are the same list by
+  construction, and that is the point: a default that omitted a payload field
+  would produce, on a conforming client, an envelope the rules refuse.
+- The payload field is **REQUIRED, not recommended**. A sealed envelope whose
+  `sealed_fields` omits it MUST be refused, by the sender at seal time and by
+  the enclave at open time — before any decryption, since the check reads only
+  `sealed_fields` (§12, first row). Leaving `messages` cleartext exposes the
+  prompt, which defeats the purpose of sealing at all, so this is not a
+  deployment policy a broker may decline: it is what makes a "sealed request"
+  mean anything. What remains a deployment choice is the separate question of
+  whether a broker accepts UNSEALED requests on the same endpoint.
+- `tools` was a mere default in earlier v1 implementations and is now a
+  **conditionally required payload field** (below). A tool schema names an
+  operation the calling application performs — `transfer_funds`,
+  `get_patient_record` — so a schema list describes what the user is doing, in
+  the caller's own vocabulary, as directly as a prompt does. As a default it was
+  droppable: a `sealed_fields` of just `["messages"]` satisfied every rule in
+  this document and handed the schemas to the router.
 - A client MAY seal additional fields (e.g. `metadata`, `user`); it declares them
   in `sealed_fields`.
 - **New / unknown fields default to cleartext.** A field only becomes sealed when
@@ -219,9 +233,9 @@ signed-text format.)
 
 | Profile | Endpoint | Payload field (required) | Pinned cleartext field | Default request sealed set | Default response sealed set |
 |---|---|---|---|---|---|
-| `chat`  | `/v1/chat/completions` | `messages` | — | `messages`, `tools` | `choices` |
+| `chat`  | `/v1/chat/completions` | `messages`, **and `tools` whenever present** | — | `messages`, `tools` | `choices` |
 | `image` | `/v1/images/generations` | `prompt` | `response_format` = `b64_json` (§7.1) | `prompt` | `data` |
-| `anthropic` | `/v1/messages` | `messages`, **and `system` whenever present** | — | `messages`, `system`, `tools` | per frame shape (§7.2) |
+| `anthropic` | `/v1/messages` | `messages`, **and `system` / `tools` whenever present** | — | `messages`, `system`, `tools` | per frame shape (§7.2) |
 | `speech` | `/v1/audio/transcriptions` (JSON-ified, §5.3) | `file_base64`, **and `filename` / `language` / `prompt` whenever present** | `response_format` ∈ {`json`, `verbose_json`} (§5.3.2); `stream` = `false` **when present** (§5.3.3) | `file_base64`, `filename`, `language`, `prompt` | `text`, **and `segments` / `words` / `language` whenever present** (§7.3) |
 
 A **pinned cleartext field** is one that stays readable but may hold only a
@@ -255,11 +269,47 @@ list of refused values on an endpoint whose request is materialized back into
 multipart.
 
 A **conditionally required payload field** is one that need not exist, but MUST
-be sealed whenever the request carries it. Two profiles use it: `system` on
-`/v1/messages`, and speech's `filename` / `language` / `prompt` (§5.3.2). It is
-the common shape of "optional but still payload", and reaching for a mere
-default instead is the mistake it exists to prevent — a default is droppable,
-so the field rides in the cleartext half with every unconditional check passing.
+be sealed whenever the request carries it. Three of the four profiles use it:
+`tools` on `chat` and `/v1/messages`, `system` on `/v1/messages`, and speech's
+`filename` / `language` / `prompt` (§5.3.2). `image` has none: its payload is the
+mandatory `prompt` and nothing else, and that is worth stating rather than
+generalising over — the category is what a profile needs when payload is
+OPTIONAL, not a box every profile has to fill.
+
+It is the common shape of "optional but still payload", and reaching for a mere
+default instead is the mistake it exists to prevent — a default is droppable, so
+the field rides in the cleartext half with every unconditional check passing.
+`tools` is the case that made the point twice: it spent v1 as a default
+precisely because it is optional, which is the reason it needed this category
+rather than an argument against it.
+
+**Presence is LITERAL**, deliberately: a field that appears in the request object
+is payload, whatever its value, so `"tools": []` and `"system": null` must be
+sealed exactly like a populated one. That errs toward sealing, which is the safe
+direction, and it keeps the rule out of reach of a sender who would otherwise aim
+at a value-shaped exemption. The cost is real and belongs on record: an empty
+array leaks nothing, so a sender that leaves `"tools": []` in the cleartext is
+refused for a request that discloses nothing — and SDKs that emit an empty array
+rather than omitting the field are a normal population, not a malformed one. A
+deployment tightening this rule should therefore expect the refusals to reach
+further than "senders that actually leak schemas".
+
+Note the consequence for the DEFAULT sealed set, which is what keeps the two
+from disagreeing: a profile's default MUST contain every payload field it has,
+optional ones included. A default that omitted one would produce, on a
+conforming client, exactly the envelope this rule refuses.
+
+**Known residual: `tool_choice` is NOT payload in this version, and the argument
+for `tools` applies to it verbatim.** A `tool_choice` of
+`{"type":"function","function":{"name":"transfer_funds"}}` names an operation in
+the caller's own vocabulary — the same class as a schema list, and more
+concentrated, since it is the operation being INVOKED rather than the menu of
+available ones. It stays cleartext today, so a sealed request that seals every
+tool schema still hands the router the name of the one it selected. The §12 row
+below covers the fields listed above and no others; do not read it as closing
+this one. Sealing it is a protocol change of its own, because the router reads
+its PRESENCE (not its value) to match provider capabilities, and a sender that
+seals it must signal that presence by another route.
 
 `system` is the clearest case: Anthropic puts the system prompt at the **top
 level** rather than as a
@@ -1193,7 +1243,7 @@ other, that party's column is the load-bearing one.
 | Invariant | Sender must refuse to build | Receiver must refuse to accept |
 |---|---|---|
 | sealed set covers the request payload field (§5.1) | yes | **yes — enclave** (a third-party client is not obliged to check) |
-| a conditionally required payload field present in the request is sealed — Anthropic's top-level `system` (§5.1), speech's `filename` / `language` / `prompt` (§5.3.2) | yes | **yes — enclave** (it is the half that sees a third-party client's envelope, and the field's presence in the cleartext half IS the violation) |
+| a conditionally required payload field present in the request is sealed — `tools` on chat and `/v1/messages` (§5.1), Anthropic's top-level `system` (§5.1), speech's `filename` / `language` / `prompt` (§5.3.2) | yes | **yes — enclave** (it is the half that sees a third-party client's envelope, and the field's presence in the cleartext half IS the violation). `tools` is the row's own cautionary case: it was a mere DEFAULT through most of v1, so a client that sealed only `messages` passed every check while the schemas went to the router — the failure this category exists to prevent, sitting in the category's own table |
 | a frame seals its shape's content field, and a shape with none seals nothing (§7.2) | yes | **yes — client** (otherwise the content rides in the clear and Open still succeeds) |
 | no frame carries another shape's content field in cleartext (§7.2) | yes | **yes — client** (this is what detects a mislabeled frame; the shape rules alone trust the sender's own label) |
 | `message_start.message.content` is empty (§7.2) | yes | **yes — client** (`message` must stay cleartext for the token count, so nothing else would notice content placed there) |
