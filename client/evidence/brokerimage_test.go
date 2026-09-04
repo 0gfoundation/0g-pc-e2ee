@@ -65,13 +65,34 @@ func TestBuiltinBrokerImages_EntriesAreWellFormed(t *testing.T) {
 // to the os_image_hash below) and then found to equal what a live provider quote
 // reports, RTMR0 included. Editing this test is editing that claim.
 func TestBuiltinBrokerImages_PinsTheAuditedNvidia059(t *testing.T) {
-	const (
-		name  = "dstack-nvidia-0.5.9"
-		hash  = "806a352e16175d90568de97dff563f31f680239e6b90e9b5b2e9141d0955b0d9"
-		mrtd  = "b24d3b24e9e3c16012376b52362ca09856c4adecb709d5fac33addf1c47e193da075b125b6c364115771390a5461e217"
-		rtmr1 = "07e6f51aa763abfe75c3ddfbf4f425fe3f0ceff66d807a75e049303dce9addf68e7218729bd419638af63a370f65878c"
-		rtmr2 = "f1c82667a354194467cd8419efd14a714560dd9b85b4c13b25c11e44bf4e126248c2255fad58c303fb0ca2921765d53a"
-	)
+	requirePinned(t,
+		"dstack-nvidia-0.5.9",
+		"806a352e16175d90568de97dff563f31f680239e6b90e9b5b2e9141d0955b0d9",
+		"b24d3b24e9e3c16012376b52362ca09856c4adecb709d5fac33addf1c47e193da075b125b6c364115771390a5461e217",
+		"07e6f51aa763abfe75c3ddfbf4f425fe3f0ceff66d807a75e049303dce9addf68e7218729bd419638af63a370f65878c",
+		"f1c82667a354194467cd8419efd14a714560dd9b85b4c13b25c11e44bf4e126248c2255fad58c303fb0ca2921765d53a")
+}
+
+// dstack-nvidia-0.5.4.1's registers, pinned on the same terms. Computed with dstack-mr
+// from the published private-ml-sdk v0.5.4.1 release (whose sha256sum.txt hashes to the
+// os_image_hash below), in the single-pass page-add mode, and equal to what a live
+// broker quote reports for all three. RTMR0 is not part of the claim here: that CVM's
+// VM shape is not published, and the boot chain excludes RTMR0 by design.
+func TestBuiltinBrokerImages_PinsTheAuditedNvidia0541(t *testing.T) {
+	requirePinned(t,
+		"dstack-nvidia-0.5.4.1",
+		"86b181377635db21c415f9ece8cc8505f7d4936ad3be7043969005a8c4690c1a",
+		"b24d3b24e9e3c16012376b52362ca09856c4adecb709d5fac33addf1c47e193da075b125b6c364115771390a5461e217",
+		"6e1afb7464ed0b941e8f5bf5b725cf1df9425e8105e3348dca52502f27c453f3018a28b90749cf05199d5a17820101a7",
+		"89e73cedf48f976ffebe8ac1129790ff59a0f52d54d969cb73455b1a79793f1dc16edc3b1fccc0fd65ea5905774bbd57")
+}
+
+// requirePinned asserts the embedded allowlist still carries `name` with exactly these
+// registers. Shared by the pins above so that adding one is writing down the values and
+// nothing else — a second copy of the comparison is a second chance for one of them to
+// check something weaker than the other.
+func requirePinned(t *testing.T, name, hash, mrtd, rtmr1, rtmr2 string) {
+	t.Helper()
 	imgs, err := BuiltinBrokerImages()
 	if err != nil {
 		t.Fatalf("BuiltinBrokerImages: %v", err)
