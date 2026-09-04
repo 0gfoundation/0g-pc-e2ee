@@ -196,12 +196,17 @@ The request is the original OpenAI JSON with the **sealed fields removed** and a
   Example: `{"messages": <original>, "tools": <original>}`.
 - v1 default sealed set: **`messages` and `tools`** — which for this profile is
   exactly its payload fields, `messages` always and `tools` whenever the request
-  carries one. On the router path a client SHOULD seal `messages` (leaving it
-  cleartext exposes the prompt, defeating the purpose). This is a recommended
-  default, not a protocol-enforced invariant: a broker MAY reject a router-path
-  request whose `sealed_fields` omits `messages` as a deployment policy, but is
-  not required to. (The reference client library defaults to sealing `messages`
-  and may enforce it as a stricter local choice.)
+  carries one. The default and the requirement are the same list by
+  construction, and that is the point: a default that omitted a payload field
+  would produce, on a conforming client, an envelope the rules refuse.
+- The payload field is **REQUIRED, not recommended**. A sealed envelope whose
+  `sealed_fields` omits it MUST be refused, by the sender at seal time and by
+  the enclave at open time — before any decryption, since the check reads only
+  `sealed_fields` (§12, first row). Leaving `messages` cleartext exposes the
+  prompt, which defeats the purpose of sealing at all, so this is not a
+  deployment policy a broker may decline: it is what makes a "sealed request"
+  mean anything. What remains a deployment choice is the separate question of
+  whether a broker accepts UNSEALED requests on the same endpoint.
 - `tools` was a mere default in earlier v1 implementations and is now a
   **conditionally required payload field** (below). A tool schema names an
   operation the calling application performs — `transfer_funds`,

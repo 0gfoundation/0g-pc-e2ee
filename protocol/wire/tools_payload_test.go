@@ -68,27 +68,53 @@ func TestToolsMustBeSealedWheneverPresent(t *testing.T) {
 // client runs no seal-time check, so the enclave is the only party that can
 // refuse an envelope built elsewhere.
 //
-// The hostile envelope is built by sealing a request that has no tools and then
-// adding them to the cleartext half — which is what a non-conforming sealer
-// produces directly. The payload check runs before any decryption, so it is the
-// check that must reject this; without it the request would open cleanly, since
-// nothing else in the envelope is malformed.
+// The envelope must be SELF-CONSISTENT, and that is the whole difficulty. An
+// envelope sealed without tools and then edited to add them is not the threat:
+// the AAD covers every cleartext top-level field, so that edit invalidates it
+// and the AEAD refuses the request on the pure crypto path, with this check
+// removed or not. A non-conforming sealer does not tamper — it BUILDS an
+// envelope with `tools` in the cleartext half from the start, over which the
+// AAD is computed and therefore valid. Nothing in the crypto notices, and
+// validatePayloadSealedFor is the only thing between that request and the
+// upstream.
+//
+// It is built here through a profile whose payload does NOT include `tools`
+// (image seals `prompt`), sealing `messages` as an extra so the set still
+// satisfies the target profile's mandatory-payload check and the request
+// reaches the check under test. Same technique as the `system` test above, and
+// it uses nothing but the exported API — which is the point: a third-party
+// sealer needs no special access to produce this.
 func TestEnclaveRefusesAnEnvelopeCarryingToolsInTheClear(t *testing.T) {
 	for _, p := range []wire.Profile{wire.ProfileChat, wire.ProfileAnthropic} {
 		t.Run(string(p), func(t *testing.T) {
 			encPriv, encPub, ephPub := toolsKeys(t)
 
-			noTools := toolsReq(t, p)
-			delete(noTools, "tools")
-			env, err := wire.SealRequestFor(p, encPub, noTools, []string{"messages"}, testProvider, ephPub)
-			if err != nil {
-				t.Fatalf("precondition: a request without tools seals fine: %v", err)
+			hostile := wire.Request{
+				"model":           json.RawMessage(`"m"`),
+				"prompt":          json.RawMessage(`"a cat"`),
+				"response_format": json.RawMessage(`"b64_json"`),
+				"messages":        json.RawMessage(`[{"role":"user","content":"hi"}]`),
+				"max_tokens":      json.RawMessage(`16`),
+				"tools":           json.RawMessage(toolsJSON),
 			}
-			if _, err := wire.OpenRequestFor(p, encPriv, env); err != nil {
-				t.Fatalf("precondition: that envelope opens: %v", err)
+			env, err := wire.SealRequestFor(wire.ProfileImage, encPub, hostile,
+				[]string{"prompt", "messages"}, testProvider, ephPub)
+			if err != nil {
+				t.Fatalf("building the hostile envelope: %v", err)
+			}
+			if _, ok := env["tools"]; !ok {
+				t.Fatal("precondition: the image profile should have left tools cleartext")
 			}
 
-			env["tools"] = json.RawMessage(toolsJSON)
+			// The envelope is cryptographically sound: the AAD was computed over a
+			// cleartext half that INCLUDES tools, so the profile-less open — the
+			// pure crypto path — accepts it. Everything the AEAD can say, it says
+			// here, and it says the request is fine.
+			if _, err := wire.OpenRequest(encPriv, env); err != nil {
+				t.Fatalf("precondition: the envelope must be crypto-valid, or this test "+
+					"proves nothing about the profile check: %v", err)
+			}
+
 			_, err = wire.OpenRequestFor(p, encPriv, env)
 			if err == nil {
 				t.Fatal("an enclave must refuse a request whose tool schemas arrived in the clear")
@@ -97,6 +123,31 @@ func TestEnclaveRefusesAnEnvelopeCarryingToolsInTheClear(t *testing.T) {
 				t.Errorf("error should name the field that arrived in the clear, got %v", err)
 			}
 		})
+	}
+}
+
+// The tampered case, kept because the reasoning above depends on it: an
+// envelope EDITED after sealing is refused by the AAD, not by the payload
+// check. Pinning it is what stops the test above from being rewritten into the
+// weaker form, which passes whether or not the profile check exists.
+func TestEditingToolsIntoASealedEnvelopeBreaksTheAAD(t *testing.T) {
+	encPriv, encPub, ephPub := toolsKeys(t)
+
+	req := toolsReq(t, wire.ProfileChat)
+	delete(req, "tools")
+	env, err := wire.SealRequestFor(wire.ProfileChat, encPub, req, []string{"messages"}, testProvider, ephPub)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	env["tools"] = json.RawMessage(toolsJSON)
+
+	// Profile-less: nothing but the crypto runs, and the crypto already refuses.
+	_, err = wire.OpenRequest(encPriv, env)
+	if err == nil {
+		t.Fatal("editing a cleartext field into a sealed envelope must invalidate the AAD")
+	}
+	if strings.Contains(err.Error(), "payload") {
+		t.Errorf("this must fail in the AEAD, not in a profile check: %v", err)
 	}
 }
 
