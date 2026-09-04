@@ -1123,6 +1123,17 @@ func ValidateSealedFieldsFor(p Profile, fields []string) error {
 // the "inflate max_tokens" edit §5.2 cites as what the AAD prevents. So passing
 // this is not evidence that an unbound set is safe to accept from outside the
 // binary — it bounds the damage, it does not rule it out.
+//
+// It judges the sealed set it is GIVEN, which is worth stating now that a nil
+// set at seal time means the default NARROWED to the request (see
+// SealRequestFor). A caller validating its configuration up front passes the raw
+// default, so an unbound entry naming an OPTIONAL payload field is refused here
+// — both sealed and unbound — while the same entry passes at seal time for a
+// request that does not carry that field, because the narrowing removed the
+// overlap. The startup verdict is therefore the WORST CASE over requests, and
+// being stricter is the safe direction: it flags a configuration that will fail
+// every request that does carry the field, rather than letting it surprise the
+// caller later. TestNilNarrowingMakesStartupValidationTheWorstCase pins it.
 func ValidateUnboundFieldsFor(p Profile, unbound, sealed []string) error {
 	spec, err := p.spec()
 	if err != nil {

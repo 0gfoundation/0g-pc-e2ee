@@ -230,6 +230,17 @@ The request is the original OpenAI JSON with the **sealed fields removed** and a
   reconstructed request.
 - A client MAY seal additional fields (e.g. `metadata`, `user`); it declares them
   in `sealed_fields`.
+- **Applying the default to a request.** A profile's default contains every
+  payload field it has, optional ones included, so an ordinary request will not
+  carry all of them — a chat request with no `tool_choice`, an Anthropic one with
+  no `system`. A sender applying the default MUST therefore narrow it to the
+  fields the request actually carries, and `sealed_fields` names the narrowed
+  set. This cannot widen what leaks: narrowing only ever drops a field the
+  request does not have, and an absent field cannot ride in the cleartext half.
+  The rules above still apply to the result, so a request carrying no payload
+  field at all is still refused. (The reference library does this for a nil
+  sealed set; a caller passing an explicit set is stating exactly what to seal
+  and it is used verbatim.)
 - **New / unknown fields default to cleartext.** A field only becomes sealed when
   a client version adds it to its sealed set. (Accepted trade-off, §1.)
 - After `Open`, the enclave MUST verify the decrypted object's keys **exactly

@@ -385,14 +385,25 @@ func TestValidateUnboundFieldsForMatchesWhatSealEnforces(t *testing.T) {
 			case wire.ProfileAnthropic:
 				body = sampleAnthropicReq
 			}
-			// Seal with what a CALLER would pass, which is tc.sealed verbatim —
-			// including nil, where the caller validated the raw default up front
-			// (above) and lets SealRequestFor narrow it to the request. Passing the
-			// resolved `sealed` here instead would assert an asymmetry no caller
-			// has: an explicit set demands every field be present, and the raw
-			// default contains optional ones this body does not carry.
-			_, sealErr := wire.SealRequestFor(tc.profile, pub, mustReq(t, body),
-				tc.sealed, testProvider, ephPub, tc.unbound...)
+			// BOTH sides get the SAME resolved set — that is the invariant. Passing
+			// tc.sealed (nil) to the seal instead would hand the two checks
+			// different sets and make this table blind to the divergence it exists
+			// to catch; see TestNilNarrowingMakesStartupValidationTheWorstCase for
+			// what nil does differently and why that is deliberate.
+			//
+			// The body is widened to carry every field in that set, because an
+			// explicit set demands each of its fields be present. That is a
+			// property of explicit sets, not a workaround: the default now contains
+			// optional payload fields, and a fixture missing one would make this
+			// row assert "field not present" instead of the unbound verdict.
+			reqBody := mustReq(t, body)
+			for _, f := range sealed {
+				if _, ok := reqBody[f]; !ok {
+					reqBody[f] = json.RawMessage(`"x"`)
+				}
+			}
+			_, sealErr := wire.SealRequestFor(tc.profile, pub, reqBody,
+				sealed, testProvider, ephPub, tc.unbound...)
 			if got := sealErr != nil; got != tc.wantErr {
 				t.Errorf("SealRequestFor error = %v (%v), but startup validation said %v",
 					got, sealErr, tc.wantErr)

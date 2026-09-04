@@ -92,3 +92,68 @@ func TestExplicitSealedSetIsNotNarrowed(t *testing.T) {
 		t.Fatal("an explicit set naming a field the request lacks must still fail")
 	}
 }
+
+// The narrowing makes STARTUP validation the worst case, and that is worth
+// pinning rather than leaving as an accident.
+//
+// ValidateUnboundFieldsFor judges the set it is GIVEN. A caller validating its
+// configuration up front passes the raw profile default, so an unbound entry
+// that names an optional payload field is refused: it would be both sealed and
+// unbound. At seal time with nil, the same entry is fine for a request that does
+// not carry the field — the narrowing removed it from the sealed set, so there
+// is no overlap left to conflict.
+//
+// The two verdicts therefore differ, and the direction is the safe one: startup
+// flags a configuration that WILL fail on every request that carries the field,
+// instead of letting it through to surprise the caller later. What it is not is
+// the failure TestValidateUnboundFieldsForMatchesWhatSealEnforces guards
+// against, which is startup being more LENIENT than the seal.
+//
+// Asserted per profile so a new optional payload field is covered by existing.
+func TestNilNarrowingMakesStartupValidationTheWorstCase(t *testing.T) {
+	_, encPub, ephPub := toolsKeys(t)
+
+	// One optional payload field per profile, and a request that does NOT carry
+	// it — the case where the two verdicts come apart.
+	cases := map[wire.Profile]struct {
+		optional string
+		body     string
+	}{
+		wire.ProfileChat: {"tool_choice",
+			`{"model":"m","messages":[{"role":"user","content":"hi"}],"tools":[{"a":1}]}`},
+		wire.ProfileAnthropic: {"system",
+			`{"model":"m","max_tokens":16,"messages":[]}`},
+		wire.ProfileSpeech: {"prompt",
+			`{"model":"m","file_base64":"AA","response_format":"json"}`},
+	}
+	for p, tc := range cases {
+		t.Run(string(p), func(t *testing.T) {
+			unbound := []string{tc.optional}
+
+			// Startup, on the raw default: refused, because the field is in both sets.
+			if err := wire.ValidateUnboundFieldsFor(p, unbound, wire.DefaultSealedFieldsFor(p)); err == nil {
+				t.Errorf("startup validation must refuse unbinding %q, which the default seals", tc.optional)
+			}
+
+			// Per request with nil, on a request lacking the field: accepted, because
+			// the narrowing already removed it from the sealed set.
+			var req wire.Request
+			if err := json.Unmarshal([]byte(tc.body), &req); err != nil {
+				t.Fatalf("fixture: %v", err)
+			}
+			if _, present := req[tc.optional]; present {
+				t.Fatalf("premise broken: the body must NOT carry %q", tc.optional)
+			}
+			if _, err := wire.SealRequestFor(p, encPub, req, nil, testProvider, ephPub, unbound...); err != nil {
+				t.Errorf("a request that does not carry %q has no conflict to report: %v", tc.optional, err)
+			}
+
+			// And the configuration startup warned about does fail, on a request
+			// that DOES carry the field — which is what makes the strictness right.
+			req[tc.optional] = json.RawMessage(`"x"`)
+			if _, err := wire.SealRequestFor(p, encPub, req, nil, testProvider, ephPub, unbound...); err == nil {
+				t.Errorf("a request carrying %q must hit the conflict startup predicted", tc.optional)
+			}
+		})
+	}
+}
