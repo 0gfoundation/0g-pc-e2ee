@@ -264,19 +264,47 @@ list of refused values on an endpoint whose request is materialized back into
 multipart.
 
 A **conditionally required payload field** is one that need not exist, but MUST
-be sealed whenever the request carries it. Every profile uses it: `tools` on
-`chat` and `/v1/messages`, `system` on `/v1/messages`, and speech's `filename` /
-`language` / `prompt` (§5.3.2). It is the common shape of "optional but still
-payload", and reaching for a mere default instead is the mistake it exists to
-prevent — a default is droppable, so the field rides in the cleartext half with
-every unconditional check passing. `tools` is the case that made the point
-twice: it spent v1 as a default precisely because it is optional, which is the
-reason it needed this category rather than an argument against it.
+be sealed whenever the request carries it. Three of the four profiles use it:
+`tools` on `chat` and `/v1/messages`, `system` on `/v1/messages`, and speech's
+`filename` / `language` / `prompt` (§5.3.2). `image` has none: its payload is the
+mandatory `prompt` and nothing else, and that is worth stating rather than
+generalising over — the category is what a profile needs when payload is
+OPTIONAL, not a box every profile has to fill.
+
+It is the common shape of "optional but still payload", and reaching for a mere
+default instead is the mistake it exists to prevent — a default is droppable, so
+the field rides in the cleartext half with every unconditional check passing.
+`tools` is the case that made the point twice: it spent v1 as a default
+precisely because it is optional, which is the reason it needed this category
+rather than an argument against it.
+
+**Presence is LITERAL**, deliberately: a field that appears in the request object
+is payload, whatever its value, so `"tools": []` and `"system": null` must be
+sealed exactly like a populated one. That errs toward sealing, which is the safe
+direction, and it keeps the rule out of reach of a sender who would otherwise aim
+at a value-shaped exemption. The cost is real and belongs on record: an empty
+array leaks nothing, so a sender that leaves `"tools": []` in the cleartext is
+refused for a request that discloses nothing — and SDKs that emit an empty array
+rather than omitting the field are a normal population, not a malformed one. A
+deployment tightening this rule should therefore expect the refusals to reach
+further than "senders that actually leak schemas".
 
 Note the consequence for the DEFAULT sealed set, which is what keeps the two
 from disagreeing: a profile's default MUST contain every payload field it has,
 optional ones included. A default that omitted one would produce, on a
 conforming client, exactly the envelope this rule refuses.
+
+**Known residual: `tool_choice` is NOT payload in this version, and the argument
+for `tools` applies to it verbatim.** A `tool_choice` of
+`{"type":"function","function":{"name":"transfer_funds"}}` names an operation in
+the caller's own vocabulary — the same class as a schema list, and more
+concentrated, since it is the operation being INVOKED rather than the menu of
+available ones. It stays cleartext today, so a sealed request that seals every
+tool schema still hands the router the name of the one it selected. The §12 row
+below covers the fields listed above and no others; do not read it as closing
+this one. Sealing it is a protocol change of its own, because the router reads
+its PRESENCE (not its value) to match provider capabilities, and a sender that
+seals it must signal that presence by another route.
 
 `system` is the clearest case: Anthropic puts the system prompt at the **top
 level** rather than as a
