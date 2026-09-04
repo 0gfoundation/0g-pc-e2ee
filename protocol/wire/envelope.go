@@ -786,10 +786,13 @@ func validatePinnedValues(spec profileSpec, req Request) error {
 		}
 		got, ok := cleartextToken(raw)
 		if !ok {
-			return fmt.Errorf("sealed request field %q %s, and a composite value is not one of them", p.field, p.mustBe())
+			// Both halves of what cleartextToken refuses: a composite (object or
+			// array), which has no form rendering at all, and malformed JSON, which
+			// has no value to render. Naming only the first misdescribes the second.
+			return fmt.Errorf("sealed request field %q %s, and a composite or unparseable value is not one of them (SPEC §5)", p.field, p.mustBe())
 		}
 		if !slices.Contains(p.permitted, got) {
-			return fmt.Errorf("sealed request field %q %s, got %q: a sealed request of this profile may carry no other value", p.field, p.mustBe(), got)
+			return fmt.Errorf("sealed request field %q %s, got %q: a sealed request of this profile may carry no other value (SPEC §5)", p.field, p.mustBe(), got)
 		}
 	}
 	return nil
