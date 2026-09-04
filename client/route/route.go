@@ -389,6 +389,142 @@ func sensitiveFieldsFor(ep endpoint.Endpoint) []string {
 	return everyProfilesPayloadFields()
 }
 
+// previewCapabilitySignal is what the preview carries in place of a WITHHELD
+// field whose mere PRESENCE the router routes on.
+//
+// The preview body is "the request minus the withheld fields", and the router
+// matches provider capabilities off that body. So a field that is both withheld
+// and a capability signal does not merely arrive redacted — it arrives ABSENT,
+// and the match silently stops applying. Nothing reports that: the ranking is
+// still returned, just computed as though the request did not need the
+// capability.
+//
+// `tools` is the live case and the reason this exists. The router hard-filters
+// on function-calling support keyed on a non-empty top-level `tools`, and
+// `tools` has been in the default sealed set since v1 — so every sealed request
+// has previewed as "no tools" and could be ranked onto a provider that cannot
+// function-call at all. The failure mode is the bad kind: the provider either
+// errors after the routing decision or answers without calling the tool, and
+// the request is billed either way.
+//
+// This is not a lie told to the router, and the distinction is structural: the
+// preview is already a STATEMENT this gateway constructs rather than a copy of
+// the request. It forces `service_type`, forces `api_format`, and deletes a
+// caller-supplied one. A signal is the same kind of assertion — "a tools array
+// was present" — with the caller's content removed.
+//
+// Presence is also the whole of what the router reads: its detection is
+// `len > 0 && != "null" && != "[]"`, and the schemas are never inspected. So the
+// shape without the content yields the correct routing answer while the tool
+// names stay sealed, which is the entire point of withholding them.
+//
+// Why this lives here rather than in the router: the router cannot recover the
+// information on its own. The preview is sent BEFORE sealing, so it carries no
+// `_e2ee` and therefore no `sealed_fields` to read; and the sealed request that
+// does carry one is PINNED to a provider, which bypasses capability filtering
+// entirely. There is no point in that chain where the router could look this up.
+//
+// The cost, stated plainly: this table encodes what the ROUTER reads, so a
+// capability it later keys on another withheld field needs a row here, and
+// nothing in this repository will fail if one is not added. TestPreview…Signals
+// is the guard that at least keeps the existing rows honest.
+type previewCapabilitySignal struct {
+	// detected mirrors the router's own "is this capability required" rule, so
+	// the preview signals exactly when the unsealed request would have. It is
+	// deliberately not "is present": `tools: []` means NO tools to the router,
+	// and signalling on it would hard-filter for function calling on a request
+	// that does not use it — under `require_parameters` a 400 on a request that
+	// works today.
+	detected func(json.RawMessage) bool
+	// placeholder is what the preview carries instead of the value: the same
+	// JSON shape, with nothing of the caller's left in it.
+	//
+	// Per PROFILE, because the shape is. `tools` is the case: OpenAI's entries
+	// are `{"type":"function","function":{…}}` and Anthropic's are
+	// `{"name","input_schema"}`, and BOTH surfaces withhold the field. One
+	// value cannot be well-formed for both, and sending an OpenAI-shaped array
+	// on a /v1/messages preview is exactly the thing that would break the day
+	// the router starts validating the preview body per api_format.
+	//
+	// A profile with no entry gets NO signal — the pre-signal behaviour, so a
+	// missing row cannot make anything worse than it already was. It is caught
+	// by TestEveryWithheldSurfaceHasAPlaceholder instead, which is the right
+	// place: a silent gap here reinstates the very bug this file fixes.
+	placeholder map[wire.Profile]json.RawMessage
+}
+
+// previewCapabilitySignals is keyed by the field name as it appears in the
+// request. A field absent from this map is simply withheld, as before.
+//
+// `tool_choice` is NOT here because it is not withheld today — it is not a
+// payload field, so the preview carries the caller's own value. When it becomes
+// payload it needs a row, or the router's soft preference (and, under
+// `require_parameters`, its hard filter) silently stops applying to it too.
+var previewCapabilitySignals = map[string]previewCapabilitySignal{
+	"tools": {
+		detected: nonEmptyJSONArray,
+		// Well-formed for each surface's own schema, rather than minimal
+		// (`[{}]` satisfies today's presence check on both): the router does
+		// not validate the preview body today, and a shape that survives
+		// validation if it ever does costs nothing here — but only if it is the
+		// RIGHT shape, which is why this is per profile.
+		placeholder: map[wire.Profile]json.RawMessage{
+			wire.ProfileChat:      json.RawMessage(`[{"type":"function","function":{"name":"_"}}]`),
+			wire.ProfileAnthropic: json.RawMessage(`[{"name":"_","input_schema":{"type":"object"}}]`),
+		},
+	},
+}
+
+// nonEmptyJSONArray reports whether raw is a JSON array with at least one
+// element, or a present non-null value that is not an array at all.
+//
+// It parses rather than comparing the raw bytes, and that is a correctness fix
+// rather than a tidy-up: json.RawMessage keeps the CALLER'S bytes, so a client
+// that pretty-prints its request body sends `tools: [ ]` or `[\n]`, which a
+// string comparison against "[]" does not catch. The signal then fires for a
+// request that uses no tools — the false positive the empty-array rule exists
+// to prevent, and under `require_parameters` a 400 on a request that works
+// today.
+//
+// A non-array (an object, a string) counts as present, matching the router's
+// own permissiveness: its rule is `len > 0 && != "null" && != "[]"`, so it too
+// reads a malformed `tools` as "this request needs tools". Over-signalling
+// there costs only routing fidelity toward providers that support tools —
+// which is where such a request wants to go anyway — while under-signalling is
+// the bug being fixed. Unparseable JSON cannot reach here (the request was
+// decoded into a map of RawMessage, which validates every value), so `false` is
+// the unreachable-safe answer rather than a judgement.
+//
+// On the pretty-printed empty array this is deliberately STRICTER than the
+// router, which reads `[ ]` as tools-present for the same textual reason this
+// function exists. Copying that would mean signalling "needs function calling"
+// for a request that uses none, so the divergence is the point rather than an
+// oversight: `[ ]` means no tools, and the signal says what the request means.
+func nonEmptyJSONArray(raw json.RawMessage) bool {
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return false
+	}
+	if v == nil {
+		return false
+	}
+	if arr, ok := v.([]any); ok {
+		return len(arr) > 0
+	}
+	return true
+}
+
+// capabilitySignalFor returns the placeholder to send for a withheld field on
+// this surface, and whether to send one at all.
+func capabilitySignalFor(profile wire.Profile, field string, raw json.RawMessage) (json.RawMessage, bool) {
+	sig, ok := previewCapabilitySignals[field]
+	if !ok || !sig.detected(raw) {
+		return nil, false
+	}
+	placeholder, ok := sig.placeholder[profile]
+	return placeholder, ok
+}
+
 // everyProfilesPayloadFields is the union of the default sealed set of every
 // profile the protocol defines — what an unrecognised service type withholds.
 // Recomputed per call rather than cached in a package var: it is off the hot
@@ -1432,6 +1568,12 @@ func (r *Router) preview(ctx context.Context, ep endpoint.Endpoint, req wire.Req
 	payload := make(map[string]json.RawMessage, len(req)+2)
 	for k, v := range req {
 		if _, sensitive := withheld[k]; sensitive {
+			// Withheld, but the router may still need to know the field was THERE
+			// — see previewCapabilitySignals. The signal replaces the value; it
+			// never carries it.
+			if sig, ok := capabilitySignalFor(ep.Profile, k, v); ok {
+				payload[k] = sig
+			}
 			continue
 		}
 		payload[k] = v
