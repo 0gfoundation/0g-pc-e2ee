@@ -506,8 +506,8 @@ func TestAnthropicRefusesAContentFieldThatIsBothSealedAndCleartext(t *testing.T)
 }
 
 // The profile-wide validator has no answer for a frame-typed profile and must
-// say so, rather than resolving to spec.responseRequired — which is "" for such a
-// profile, and would reject every frame for not sealing a field named "".
+// say so, rather than resolving against an empty spec.responsePayload — which is
+// what such a profile has, and would wave through a frame that seals nothing.
 func TestFrameTypedProfileRefusesTheProfileWideValidator(t *testing.T) {
 	err := wire.ValidateResponseSealedFieldsForTest(wire.ProfileAnthropic, []string{"delta"})
 	if err == nil {

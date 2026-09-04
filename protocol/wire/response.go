@@ -65,10 +65,36 @@ type ResponseE2EE struct {
 // ResponseSealedFieldsForFrame, or pass nil to SealFrame.
 func DefaultResponseSealedFieldsFor(p Profile) []string {
 	s, err := p.spec()
-	if err != nil || s.responseFrames != nil || len(s.responseRequiredIfPresent) > 0 {
+	if err != nil || s.responseFrames != nil || s.hasOptionalResponsePayload() {
 		return []string{}
 	}
-	return slices.Clone(s.response)
+	return s.alwaysSealedResponseFields()
+}
+
+// alwaysSealedResponseFields are the response payload fields every frame of this
+// profile must seal — the mandatory ones. The optional ones are deliberately not
+// here: they are added per frame by responseFieldsFor, because a set naming
+// `segments` would be refused by SealFrame on every plain `json` transcription
+// (see profileSpec.responsePayload for why this differs from the request side).
+func (s profileSpec) alwaysSealedResponseFields() []string {
+	out := make([]string, 0, len(s.responsePayload))
+	for _, f := range s.responsePayload {
+		if !f.optional {
+			out = append(out, f.name)
+		}
+	}
+	return out
+}
+
+// hasOptionalResponsePayload reports whether this profile's response sealed set
+// varies with the frame, which is what makes a profile-wide default unanswerable.
+func (s profileSpec) hasOptionalResponsePayload() bool {
+	for _, f := range s.responsePayload {
+		if f.optional {
+			return true
+		}
+	}
+	return false
 }
 
 // ResponseSealedFieldsForFrame resolves what THIS frame must seal under a
@@ -94,32 +120,32 @@ func ResponseSealedFieldsForFrame(p Profile, frame Response) ([]string, error) {
 	return shape.sealedFieldsFor(frame), nil
 }
 
-// responseFieldsFor is what a frame of a SINGLE-SHAPE profile must seal: the
-// profile's always-sealed set, plus each conditionally-sealed field this frame
-// actually carries.
+// responseFieldsFor is what a frame of a SINGLE-SHAPE profile must seal: every
+// mandatory response payload field, plus each optional one this frame actually
+// carries.
 //
-// For chat and image responseRequiredIfPresent is empty and this is exactly the
-// former slices.Clone(spec.response) — the change is inert for them by
-// construction, not by a flag.
+// For chat and image no field is optional and this is exactly the always-sealed
+// set — the conditional half is inert for them by construction, not by a flag.
 //
 // It mirrors frameShape.sealedFieldsFor, and for the same reason: one function
 // serves both ends. At seal time the frame still holds what it is about to seal,
 // so a present `segments` is required; at open time a sealed one is already gone
 // from the cleartext, so it is not required — but one that is STILL there was
 // never sealed, and that is exactly the rejection the receiver owes (SPEC §12).
+//
+// One list per profile is also what makes a duplicate unrepresentable. While the
+// mandatory and optional fields were two lists, a name in both produced a
+// doubled entry here that validateResponseSealedFieldNames would reject with a
+// confusing message about the CALLER's set.
 func (s profileSpec) responseFieldsFor(frame Response) []string {
-	out := make([]string, 0, len(s.response)+len(s.responseRequiredIfPresent))
-	out = append(out, s.response...)
-	for _, f := range s.responseRequiredIfPresent {
-		if _, present := frame[f]; !present {
-			continue
+	out := make([]string, 0, len(s.responsePayload))
+	for _, f := range s.responsePayload {
+		if f.optional {
+			if _, present := frame[f.name]; !present {
+				continue
+			}
 		}
-		// Defensive against a profile that lists a name in both sets: the union
-		// must not produce a duplicate, which validateResponseSealedFieldNames
-		// would then reject with a confusing message about the caller's set.
-		if !slices.Contains(out, f) {
-			out = append(out, f)
-		}
+		out = append(out, f.name)
 	}
 	return out
 }
@@ -458,9 +484,9 @@ func validateResponseSealedFieldNames(fields []string) error {
 // call it: SealFrame so a conforming enclave cannot emit such a frame, OpenFrame
 // on every frame so a client can refuse one that was emitted anyway.
 //
-// Sealing a superset is still fine — only spec.responseRequired is mandatory, so
-// any superset satisfies it. That distinction is why the check can run at seal
-// time at all.
+// Sealing a superset is still fine — only the MANDATORY response payload fields
+// have to be there, so any superset satisfies them. That distinction is why the
+// check can run at seal time at all.
 func validateResponseSealedFieldsFor(p Profile, fields []string) error {
 	spec, err := p.spec()
 	if err != nil {
@@ -468,21 +494,26 @@ func validateResponseSealedFieldsFor(p Profile, fields []string) error {
 	}
 	if spec.responseFrames != nil {
 		// A frame-typed profile has no profile-wide answer, and guessing one here
-		// would be the wrong kind of wrong: spec.responseRequired is "" for such a
-		// profile, so the check below would demand that every frame seal a field
-		// named "" and reject the entire stream with a nonsense message. Refuse the
-		// entry point instead — the frame-aware one is the only correct caller.
+		// would be the wrong kind of wrong: spec.responsePayload is empty for such
+		// a profile, so the loop below would demand nothing at all and wave through
+		// a frame that seals nothing. Refuse the entry point instead — the
+		// frame-aware one is the only correct caller.
 		return fmt.Errorf("%s-profile response frames are typed: validate against the frame, not the profile alone", p)
 	}
 	if err := validateResponseSealedFields(fields); err != nil {
 		return err
 	}
-	// Only the profile's CONTENT field is mandatory — not every member of its
-	// default set. A caller may legitimately seal a superset, and a future
-	// profile whose default covers something besides the content must not make
-	// that extra field's absence a hard failure.
-	if !slices.Contains(fields, spec.responseRequired) {
-		return fmt.Errorf("%s-profile response sealed fields must include %q", p, spec.responseRequired)
+	// Only the MANDATORY fields — not every member of the default set. A caller
+	// may legitimately seal a superset, and an optional field's absence must not
+	// be a hard failure here: whether it is required depends on the frame, which
+	// this name-only check does not have (see validateResponseSealedIfPresent).
+	for _, f := range spec.responsePayload {
+		if f.optional {
+			continue
+		}
+		if !slices.Contains(fields, f.name) {
+			return fmt.Errorf("%s-profile response sealed fields must include %q", p, f.name)
+		}
 	}
 	return nil
 }
@@ -597,7 +628,7 @@ func validateQuantityLocatorsNotSealed(p Profile, spec profileSpec, fields []str
 // conditionally-sealed response fields (SPEC §7.3): a field that need not
 // exist, but MUST be sealed whenever the frame carries it.
 //
-// It is the response-side twin of validatePayloadIfPresentFor, with the
+// It is the response-side twin of validatePayloadSealedFor, with the
 // receiving end swapped — the client is the half that holds here, where the
 // enclave is on the request side. The predicate is the same in both: a field
 // still present in the received cleartext was never sealed, because a sealer
@@ -613,18 +644,18 @@ func validateQuantityLocatorsNotSealed(p Profile, spec profileSpec, fields []str
 // non-conforming one did — a router forwards such a frame unremarkably, and
 // nothing else in the chain has a reason to look.
 func validateResponseSealedIfPresent(p Profile, spec profileSpec, frame Response, fields []string) error {
-	if len(spec.responseRequiredIfPresent) == 0 {
-		return nil
-	}
 	sealed := toSet(fields)
-	for _, f := range spec.responseRequiredIfPresent {
-		if _, present := frame[f]; !present {
+	for _, f := range spec.responsePayload {
+		if !f.optional {
 			continue
 		}
-		if _, isSealed := sealed[f]; isSealed {
+		if _, present := frame[f.name]; !present {
 			continue
 		}
-		return fmt.Errorf("%s-profile frame carries %q in cleartext: it is generated content and MUST be sealed whenever present", p, f)
+		if _, isSealed := sealed[f.name]; isSealed {
+			continue
+		}
+		return fmt.Errorf("%s-profile frame carries %q in cleartext: it is generated content and MUST be sealed whenever present", p, f.name)
 	}
 	return nil
 }
