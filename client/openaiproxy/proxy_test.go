@@ -505,8 +505,9 @@ func TestProxySealsConfiguredExtraField(t *testing.T) {
 }
 
 // A full tool-calling round trip. The tests above seal a prompt-only request;
-// this one carries "tools" as well, so both halves of the v1 default sealed set
-// (wire.DefaultSealedFields) are exercised on a request that actually uses them:
+// this one carries "tools" and "tool_choice" as well, so every member of the v1
+// default sealed set (wire.DefaultSealedFields) is exercised on a request that
+// actually uses them:
 // the tool DEFINITIONS go up sealed, the model's tool_calls come back sealed
 // inside "choices", and the second turn — the assistant's tool_calls plus the
 // role:"tool" result — is sealed the same way, since it all lives in "messages".
@@ -534,15 +535,17 @@ func TestProxyToolCallRoundTrip(t *testing.T) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		if !slices.Equal(e2ee.SealedFields, []string{"messages", "tools"}) {
-			t.Errorf("sealed_fields = %v, want [messages tools]", e2ee.SealedFields)
+		if !slices.Equal(e2ee.SealedFields, []string{"messages", "tools", "tool_choice"}) {
+			t.Errorf("sealed_fields = %v, want [messages tools tool_choice]", e2ee.SealedFields)
 		}
-		// "tool_choice" is NOT in the v1 sealed set (SPEC §5.1), so it stays
-		// cleartext and bound. Asserted rather than assumed: a caller who forces
-		// a named function there hands the router that name, and this is the
-		// test that would notice if the default set ever changed underneath it.
-		if _, ok := env["tool_choice"]; !ok {
-			t.Error(`"tool_choice" should stay cleartext for the router`)
+		// This assertion used to say the opposite, and its comment recorded why
+		// that was a gap: "a caller who forces a named function there hands the
+		// router that name". `tool_choice` is payload now (SPEC §5.1), so the
+		// name goes with the schemas it selects from, and what the router needs
+		// — that the field was set at all — reaches it as a capability signal on
+		// the preview instead (see route.previewCapabilitySignals).
+		if _, leaked := env["tool_choice"]; leaked {
+			t.Errorf(`"tool_choice" reached the broker in cleartext: %s`, env["tool_choice"])
 		}
 		req, err := wire.OpenRequest(encPriv, env)
 		if err != nil {
@@ -551,6 +554,14 @@ func TestProxyToolCallRoundTrip(t *testing.T) {
 		}
 		if !bytes.Contains(req["tools"], []byte("get_current_weather")) {
 			http.Error(w, "tool definitions not recovered in enclave", http.StatusInternalServerError)
+			return
+		}
+		// The selection, not just the menu: sealing it must not drop it. Turn 1
+		// forces the tool by NAME — the disclosure this seal exists to stop — and
+		// turn 2 sends the "auto" enum, so both shapes are covered.
+		if len(req["tool_choice"]) == 0 {
+			t.Error("tool_choice not recovered in enclave")
+			http.Error(w, "tool_choice not recovered in enclave", http.StatusInternalServerError)
 			return
 		}
 		ephPub, err := base64.RawURLEncoding.DecodeString(e2ee.ClientEphPub)
@@ -624,7 +635,8 @@ func TestProxyToolCallRoundTrip(t *testing.T) {
 
 	// Turn 1: the model asks for the tool.
 	first := post(`{"model":"gpt-4o","messages":[{"role":"user","content":"weather in Beijing?"}],` +
-		`"tools":` + tools + `,"tool_choice":"auto"}`)
+		`"tools":` + tools +
+		`,"tool_choice":{"type":"function","function":{"name":"get_current_weather"}}}`)
 	if !bytes.Contains(first["choices"], []byte(`"tool_calls"`)) ||
 		!bytes.Contains(first["choices"], []byte("call_1")) {
 		t.Fatalf("user did not get the tool call back in plaintext: %s", first["choices"])

@@ -208,21 +208,67 @@ func TestSealRequestRejectsBadSignerAddr(t *testing.T) {
 	}
 }
 
-func TestSealRequestNilUsesDefaultSet(t *testing.T) {
+// A nil sealed set is the profile default NARROWED to what the request carries.
+// Both halves matter: the default must not be shrunk for a request that has
+// every field, and it must not demand a field the request does not have — the
+// chat default contains two optional payload fields, so an unfiltered default
+// would refuse the ordinary request below.
+func TestSealRequestNilUsesDefaultSetFilteredByPresence(t *testing.T) {
 	priv, pub, _ := crypto.GenerateRecipientKey()
-	env, err := wire.SealRequest(pub, mustReq(t, sampleReq), nil, testProvider, validEph)
-	if err != nil {
-		t.Fatalf("seal: %v", err)
+
+	for _, tc := range []struct {
+		name string
+		body string
+		want []string
+	}{
+		{
+			name: "every default field present",
+			body: `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],` +
+				`"tools":[{"type":"function","function":{"name":"calc"}}],` +
+				`"tool_choice":{"type":"function","function":{"name":"calc"}}}`,
+			want: []string{"messages", "tools", "tool_choice"},
+		},
+		{
+			// The ordinary tool-calling request: no tool_choice.
+			name: "an optional default field is absent",
+			body: sampleReq,
+			want: []string{"messages", "tools"},
+		},
+		{
+			// The ordinary chat request: neither optional field.
+			name: "no optional default field at all",
+			body: `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`,
+			want: []string{"messages"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env, err := wire.SealRequest(pub, mustReq(t, tc.body), nil, testProvider, validEph)
+			if err != nil {
+				t.Fatalf("seal: %v", err)
+			}
+			e2ee, err := env.E2EE()
+			if err != nil {
+				t.Fatalf("read _e2ee: %v", err)
+			}
+			if !reflect.DeepEqual(e2ee.SealedFields, tc.want) {
+				t.Fatalf("nil sealedFields = %v, want %v", e2ee.SealedFields, tc.want)
+			}
+			if _, err := wire.OpenRequest(priv, env); err != nil {
+				t.Fatalf("open after default-set seal: %v", err)
+			}
+		})
 	}
-	e2ee, err := env.E2EE()
-	if err != nil {
-		t.Fatalf("read _e2ee: %v", err)
-	}
-	if !reflect.DeepEqual(e2ee.SealedFields, []string{"messages", "tools"}) {
-		t.Fatalf("nil sealedFields should use the default set, got %v", e2ee.SealedFields)
-	}
-	if _, err := wire.OpenRequest(priv, env); err != nil {
-		t.Fatalf("open after default-set seal: %v", err)
+}
+
+// Filtering must not weaken the mandatory payload rule: a request with no
+// `messages` at all still fails closed, because the filtered set cannot contain
+// what the request does not have.
+func TestNilSealedSetStillFailsClosedWithoutThePayloadField(t *testing.T) {
+	_, pub, _ := crypto.GenerateRecipientKey()
+	_, err := wire.SealRequest(pub, mustReq(t, `{"model":"gpt-4o","temperature":0.5}`),
+		nil, testProvider, validEph)
+	if err == nil {
+		t.Fatal("a request carrying no payload field must not seal, filtered default or not")
 	}
 }
 
@@ -339,7 +385,24 @@ func TestValidateUnboundFieldsForMatchesWhatSealEnforces(t *testing.T) {
 			case wire.ProfileAnthropic:
 				body = sampleAnthropicReq
 			}
-			_, sealErr := wire.SealRequestFor(tc.profile, pub, mustReq(t, body),
+			// BOTH sides get the SAME resolved set — that is the invariant. Passing
+			// tc.sealed (nil) to the seal instead would hand the two checks
+			// different sets and make this table blind to the divergence it exists
+			// to catch; see TestNilNarrowingMakesStartupValidationTheWorstCase for
+			// what nil does differently and why that is deliberate.
+			//
+			// The body is widened to carry every field in that set, because an
+			// explicit set demands each of its fields be present. That is a
+			// property of explicit sets, not a workaround: the default now contains
+			// optional payload fields, and a fixture missing one would make this
+			// row assert "field not present" instead of the unbound verdict.
+			reqBody := mustReq(t, body)
+			for _, f := range sealed {
+				if _, ok := reqBody[f]; !ok {
+					reqBody[f] = json.RawMessage(`"x"`)
+				}
+			}
+			_, sealErr := wire.SealRequestFor(tc.profile, pub, reqBody,
 				sealed, testProvider, ephPub, tc.unbound...)
 			if got := sealErr != nil; got != tc.wantErr {
 				t.Errorf("SealRequestFor error = %v (%v), but startup validation said %v",

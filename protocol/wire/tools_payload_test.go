@@ -180,19 +180,12 @@ func TestSealedToolsSurviveTheRoundTripAndLeaveNoCleartext(t *testing.T) {
 			encPriv, encPub, ephPub := toolsKeys(t)
 			req := toolsReq(t, p)
 
-			// The profile default filtered to the fields this request actually
-			// carries, which is what a client does (core.Client.sealedFieldsFor):
-			// passing the raw default would demand Anthropic's `system`, which this
-			// fixture has no reason to set.
-			var fields []string
-			for _, f := range wire.DefaultSealedFieldsFor(p) {
-				if _, present := req[f]; present {
-					fields = append(fields, f)
-				}
-			}
-			env, err := wire.SealRequestFor(p, encPub, req, fields, testProvider, ephPub)
+			// nil: the profile default, narrowed to what this request carries — so
+			// Anthropic's `system`, which this fixture has no reason to set, is not
+			// demanded.
+			env, err := wire.SealRequestFor(p, encPub, req, nil, testProvider, ephPub)
 			if err != nil {
-				t.Fatalf("seal with the presence-filtered profile default %v: %v", fields, err)
+				t.Fatalf("seal with the profile default: %v", err)
 			}
 			if _, leaked := env["tools"]; leaked {
 				t.Error("the default sealed set left tools in the cleartext half")

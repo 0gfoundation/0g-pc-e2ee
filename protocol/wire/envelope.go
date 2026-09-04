@@ -47,6 +47,19 @@ const (
 	// calling application performs, so the set of them describes what the user is
 	// doing, in the caller's own vocabulary.
 	fieldTools = "tools"
+	// fieldToolChoice is the caller's instruction about WHICH tool to use. Its
+	// object form names one — `{"type":"function","function":{"name":"…"}}` on
+	// chat, `{"type":"tool","name":"…"}` on Anthropic — so it is payload for
+	// fieldTools' reason, carried further: the schema list is the menu of
+	// operations the application can perform, and this is the one it is
+	// INVOKING. Sealing every schema and leaving this readable would hand the
+	// router the selection while hiding the catalogue.
+	//
+	// Its enum forms ("auto", "none", "required") carry nothing, and are sealed
+	// anyway: the rule is about the field, not its value, so a sender cannot
+	// keep it cleartext by choosing a shape (see payloadField.optional and
+	// §5.1's literal-presence rule).
+	fieldToolChoice = "tool_choice"
 	// fieldSystem is Anthropic's TOP-LEVEL system prompt (/v1/messages), as
 	// opposed to OpenAI's system message inside "messages". Being its own
 	// top-level field is why it needs naming at all: it is payload the chat
@@ -559,6 +572,7 @@ var profiles = map[Profile]profileSpec{
 		payload: []payloadField{
 			{name: fieldMessages},
 			{name: fieldTools, optional: true},
+			{name: fieldToolChoice, optional: true},
 		},
 		responsePayload: []payloadField{{name: fieldChoices}},
 	},
@@ -597,6 +611,7 @@ var profiles = map[Profile]profileSpec{
 			{name: fieldMessages},
 			{name: fieldSystem, optional: true},
 			{name: fieldTools, optional: true},
+			{name: fieldToolChoice, optional: true},
 		},
 		// The response is frame-typed, so there is no single field a frame must
 		// seal and no meaningful profile-wide default set: both are properties of
@@ -1108,6 +1123,17 @@ func ValidateSealedFieldsFor(p Profile, fields []string) error {
 // the "inflate max_tokens" edit §5.2 cites as what the AAD prevents. So passing
 // this is not evidence that an unbound set is safe to accept from outside the
 // binary — it bounds the damage, it does not rule it out.
+//
+// It judges the sealed set it is GIVEN, which is worth stating now that a nil
+// set at seal time means the default NARROWED to the request (see
+// SealRequestFor). A caller validating its configuration up front passes the raw
+// default, so an unbound entry naming an OPTIONAL payload field is refused here
+// — both sealed and unbound — while the same entry passes at seal time for a
+// request that does not carry that field, because the narrowing removed the
+// overlap. The startup verdict is therefore the WORST CASE over requests, and
+// being stricter is the safe direction: it flags a configuration that will fail
+// every request that does carry the field, rather than letting it surprise the
+// caller later. TestNilNarrowingMakesStartupValidationTheWorstCase pins it.
 func ValidateUnboundFieldsFor(p Profile, unbound, sealed []string) error {
 	spec, err := p.spec()
 	if err != nil {
@@ -1250,8 +1276,12 @@ func SealRequest(encPub crypto.PublicKey, req Request, sealedFields []string, si
 //     which field MUST be sealed — the wire format is identical, and the profile
 //     is not carried on the wire (`sealed_fields` is self-describing).
 //   - encPub:       the provider enc key (verified out of a quote by the caller)
-//   - sealedFields: fields to seal; nil uses the profile's v1 default. The
-//     profile's payload field is required and each field MUST be present in req.
+//   - sealedFields: fields to seal. A nil slice means the profile's v1 default
+//     FILTERED TO THE FIELDS req ACTUALLY CARRIES; an explicit (non-nil) slice is
+//     used verbatim, and every field in it MUST be present in req. The
+//     profile's mandatory payload field is required either way — filtering can
+//     only drop fields the request does not have, so a request missing it still
+//     fails, with "must include" or "no sealed fields".
 //   - signerAddr:   the provider's on-chain TEE signer address ("0x…"), the pin
 //   - clientEphPub: the client's response ephemeral X25519 public key (raw bytes)
 //   - unboundFields: optional cleartext fields excluded from the AAD (§5.2), i.e.
@@ -1269,7 +1299,7 @@ func SealRequestFor(profile Profile, encPub crypto.PublicKey, req Request, seale
 		return nil, err
 	}
 	if sealedFields == nil {
-		sealedFields = DefaultSealedFieldsFor(profile)
+		sealedFields = presentSubset(DefaultSealedFieldsFor(profile), req)
 	}
 	if err := validateSealInputs(profile, spec, sealedFields, unboundFields, signerAddr, clientEphPub); err != nil {
 		return nil, err
@@ -1364,8 +1394,9 @@ func SealRequestFor(profile Profile, encPub crypto.PublicKey, req Request, seale
 //
 //   - ValidateSealedFieldsFor — the sealed set covers this profile's mandatory
 //     payload fields, so the request did not arrive with its prompt in the clear;
-//   - validatePayloadSealedFor — no optional payload field (Anthropic's
-//     top-level `system`) arrived in the cleartext half;
+//   - validatePayloadSealedFor — no optional payload field (`tools` and
+//     `tool_choice` on chat and Anthropic, Anthropic's top-level `system`)
+//     arrived in the cleartext half;
 //   - validatePinnedFor — every pinned cleartext field holds a permitted value
 //     (and is present, unless the pin is optional), and none was sealed away or
 //     declared unbound.
@@ -1568,6 +1599,34 @@ func isSignerAddr(s string) bool {
 		}
 	}
 	return true
+}
+
+// presentSubset is the profile default narrowed to what this request carries.
+// It is what a nil sealedFields resolves to, and it exists because the
+// unfiltered default is not satisfiable by an ordinary request: the default
+// contains every payload field the profile has, optional ones included, while
+// SealRequestFor requires every field in the set it is GIVEN to be present. An
+// unfiltered nil therefore refused any chat request without both `tools` and
+// `tool_choice` — a "default" no common request could meet.
+//
+// Filtering cannot widen what leaks, which is what makes it safe rather than
+// lax: it only ever removes a field the request does not have, and a field that
+// is absent cannot ride in the cleartext half. Every rule that follows still
+// runs on the result, so a request missing the profile's MANDATORY payload
+// field still fails closed — ValidateSealedFieldsFor with "must include", or
+// "no sealed fields" when nothing at all matched.
+//
+// It applies to nil ONLY. An explicit set is the caller stating exactly what to
+// seal, and silently shrinking that would hide a mistake rather than serve one;
+// an explicit EMPTY set keeps meaning "seal nothing", which fails closed.
+func presentSubset(fields []string, req Request) []string {
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		if _, present := req[f]; present {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 func toSet(ss []string) map[string]struct{} {

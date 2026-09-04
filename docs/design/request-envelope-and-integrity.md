@@ -140,7 +140,7 @@ by the transport crypto — so nothing security-relevant may depend on them.
 | `signer_addr` | The pinned recipient's on-chain TEE signer address (`0x…`). Client asserts "I sealed to *this* provider/gateway." | Recipient checks `signer_addr == self`; a router cannot silently reroute to another provider. **Bound.** |
 | `client_eph_pub` | Client's **ephemeral** X25519 public key; the enclave seals the **response** to it (§7). | Stored at request time, used at response time. **Must be bound** — else a MITM swaps its own key and reads the response. |
 | `enc` | HPKE **encapsulated key** (sender's ephemeral KEM output). Recipient derives the shared secret from `enc` + its private key. | **Bound.** |
-| `sealed_fields` | **Allowlist** of which fields were encrypted ({`messages`, `tools`} by default). After `Open`, decrypted keys must equal this set exactly; must include `messages`. | **Bound** — prevents lying about what was sealed. Fail-open on unknown fields is accepted (D6). |
+| `sealed_fields` | **Allowlist** of which fields were encrypted ({`messages`, `tools`, `tool_choice`} by default for chat; per profile, see SPEC §5.1, which also covers narrowing the default to the fields a request actually carries). After `Open`, decrypted keys must equal this set exactly; must include `messages`. | **Bound** — prevents lying about what was sealed. Fail-open on unknown fields is accepted (D6). |
 | `unbound_fields` 🆕 | **Denylist** of cleartext fields intermediaries may add/modify/remove; these are **excluded from the AAD**. Everything else (except `ciphertext`) is bound by default. | The **list itself is bound** (it lives in `_e2ee`), so a router cannot enlarge it. Must be disjoint from `sealed_fields`. |
 | `ciphertext` | AEAD output (sealed body + tag), base64url. | The one field **always** excluded from the AAD (can't bind the ciphertext into its own AAD). |
 
@@ -243,8 +243,9 @@ intermediary-owned metadata only.
 ### D6 — sealing stays an explicit `sealed_fields` allowlist; fail-open on new fields is accepted
 The mirror of D3 for confidentiality (seal-by-default via a `visible_fields`
 allowlist) was **considered and declined**. Sealing keeps today's model:
-`sealed_fields` explicitly lists what is **encrypted** ({`messages`, `tools`} by
-default), and unknown/new fields stay **cleartext** — fail-*open*.
+`sealed_fields` explicitly lists what is **encrypted** ({`messages`, `tools`,
+`tool_choice`} by default for chat; per profile, see SPEC §5.1), and unknown/new
+fields stay **cleartext** — fail-*open*.
 
 Rationale for accepting fail-open:
 
