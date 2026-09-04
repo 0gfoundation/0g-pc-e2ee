@@ -438,7 +438,19 @@ type previewCapabilitySignal struct {
 	detected func(json.RawMessage) bool
 	// placeholder is what the preview carries instead of the value: the same
 	// JSON shape, with nothing of the caller's left in it.
-	placeholder json.RawMessage
+	//
+	// Per PROFILE, because the shape is. `tools` is the case: OpenAI's entries
+	// are `{"type":"function","function":{…}}` and Anthropic's are
+	// `{"name","input_schema"}`, and BOTH surfaces withhold the field. One
+	// value cannot be well-formed for both, and sending an OpenAI-shaped array
+	// on a /v1/messages preview is exactly the thing that would break the day
+	// the router starts validating the preview body per api_format.
+	//
+	// A profile with no entry gets NO signal — the pre-signal behaviour, so a
+	// missing row cannot make anything worse than it already was. It is caught
+	// by TestEveryWithheldSurfaceHasAPlaceholder instead, which is the right
+	// place: a silent gap here reinstates the very bug this file fixes.
+	placeholder map[wire.Profile]json.RawMessage
 }
 
 // previewCapabilitySignals is keyed by the field name as it appears in the
@@ -450,25 +462,67 @@ type previewCapabilitySignal struct {
 // `require_parameters`, its hard filter) silently stops applying to it too.
 var previewCapabilitySignals = map[string]previewCapabilitySignal{
 	"tools": {
-		detected: func(raw json.RawMessage) bool {
-			s := strings.TrimSpace(string(raw))
-			return len(s) > 0 && s != "null" && s != "[]"
+		detected: nonEmptyJSONArray,
+		// Well-formed for each surface's own schema, rather than minimal
+		// (`[{}]` satisfies today's presence check on both): the router does
+		// not validate the preview body today, and a shape that survives
+		// validation if it ever does costs nothing here — but only if it is the
+		// RIGHT shape, which is why this is per profile.
+		placeholder: map[wire.Profile]json.RawMessage{
+			wire.ProfileChat:      json.RawMessage(`[{"type":"function","function":{"name":"_"}}]`),
+			wire.ProfileAnthropic: json.RawMessage(`[{"name":"_","input_schema":{"type":"object"}}]`),
 		},
-		// Well-formed rather than minimal (`[{}]` would satisfy today's check):
-		// the router does not validate the preview body now, and a shape that
-		// survives validation if it ever does costs nothing here.
-		placeholder: json.RawMessage(`[{"type":"function","function":{"name":"_"}}]`),
 	},
 }
 
-// capabilitySignalFor returns the placeholder to send for a withheld field, and
-// whether to send one at all.
-func capabilitySignalFor(field string, raw json.RawMessage) (json.RawMessage, bool) {
+// nonEmptyJSONArray reports whether raw is a JSON array with at least one
+// element, or a present non-null value that is not an array at all.
+//
+// It parses rather than comparing the raw bytes, and that is a correctness fix
+// rather than a tidy-up: json.RawMessage keeps the CALLER'S bytes, so a client
+// that pretty-prints its request body sends `tools: [ ]` or `[\n]`, which a
+// string comparison against "[]" does not catch. The signal then fires for a
+// request that uses no tools — the false positive the empty-array rule exists
+// to prevent, and under `require_parameters` a 400 on a request that works
+// today.
+//
+// A non-array (an object, a string) counts as present, matching the router's
+// own permissiveness: its rule is `len > 0 && != "null" && != "[]"`, so it too
+// reads a malformed `tools` as "this request needs tools". Over-signalling
+// there costs only routing fidelity toward providers that support tools —
+// which is where such a request wants to go anyway — while under-signalling is
+// the bug being fixed. Unparseable JSON cannot reach here (the request was
+// decoded into a map of RawMessage, which validates every value), so `false` is
+// the unreachable-safe answer rather than a judgement.
+//
+// On the pretty-printed empty array this is deliberately STRICTER than the
+// router, which reads `[ ]` as tools-present for the same textual reason this
+// function exists. Copying that would mean signalling "needs function calling"
+// for a request that uses none, so the divergence is the point rather than an
+// oversight: `[ ]` means no tools, and the signal says what the request means.
+func nonEmptyJSONArray(raw json.RawMessage) bool {
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return false
+	}
+	if v == nil {
+		return false
+	}
+	if arr, ok := v.([]any); ok {
+		return len(arr) > 0
+	}
+	return true
+}
+
+// capabilitySignalFor returns the placeholder to send for a withheld field on
+// this surface, and whether to send one at all.
+func capabilitySignalFor(profile wire.Profile, field string, raw json.RawMessage) (json.RawMessage, bool) {
 	sig, ok := previewCapabilitySignals[field]
 	if !ok || !sig.detected(raw) {
 		return nil, false
 	}
-	return sig.placeholder, true
+	placeholder, ok := sig.placeholder[profile]
+	return placeholder, ok
 }
 
 // everyProfilesPayloadFields is the union of the default sealed set of every
@@ -1517,7 +1571,7 @@ func (r *Router) preview(ctx context.Context, ep endpoint.Endpoint, req wire.Req
 			// Withheld, but the router may still need to know the field was THERE
 			// — see previewCapabilitySignals. The signal replaces the value; it
 			// never carries it.
-			if sig, ok := capabilitySignalFor(k, v); ok {
+			if sig, ok := capabilitySignalFor(ep.Profile, k, v); ok {
 				payload[k] = sig
 			}
 			continue
