@@ -389,6 +389,88 @@ func sensitiveFieldsFor(ep endpoint.Endpoint) []string {
 	return everyProfilesPayloadFields()
 }
 
+// previewCapabilitySignal is what the preview carries in place of a WITHHELD
+// field whose mere PRESENCE the router routes on.
+//
+// The preview body is "the request minus the withheld fields", and the router
+// matches provider capabilities off that body. So a field that is both withheld
+// and a capability signal does not merely arrive redacted — it arrives ABSENT,
+// and the match silently stops applying. Nothing reports that: the ranking is
+// still returned, just computed as though the request did not need the
+// capability.
+//
+// `tools` is the live case and the reason this exists. The router hard-filters
+// on function-calling support keyed on a non-empty top-level `tools`, and
+// `tools` has been in the default sealed set since v1 — so every sealed request
+// has previewed as "no tools" and could be ranked onto a provider that cannot
+// function-call at all. The failure mode is the bad kind: the provider either
+// errors after the routing decision or answers without calling the tool, and
+// the request is billed either way.
+//
+// This is not a lie told to the router, and the distinction is structural: the
+// preview is already a STATEMENT this gateway constructs rather than a copy of
+// the request. It forces `service_type`, forces `api_format`, and deletes a
+// caller-supplied one. A signal is the same kind of assertion — "a tools array
+// was present" — with the caller's content removed.
+//
+// Presence is also the whole of what the router reads: its detection is
+// `len > 0 && != "null" && != "[]"`, and the schemas are never inspected. So the
+// shape without the content yields the correct routing answer while the tool
+// names stay sealed, which is the entire point of withholding them.
+//
+// Why this lives here rather than in the router: the router cannot recover the
+// information on its own. The preview is sent BEFORE sealing, so it carries no
+// `_e2ee` and therefore no `sealed_fields` to read; and the sealed request that
+// does carry one is PINNED to a provider, which bypasses capability filtering
+// entirely. There is no point in that chain where the router could look this up.
+//
+// The cost, stated plainly: this table encodes what the ROUTER reads, so a
+// capability it later keys on another withheld field needs a row here, and
+// nothing in this repository will fail if one is not added. TestPreview…Signals
+// is the guard that at least keeps the existing rows honest.
+type previewCapabilitySignal struct {
+	// detected mirrors the router's own "is this capability required" rule, so
+	// the preview signals exactly when the unsealed request would have. It is
+	// deliberately not "is present": `tools: []` means NO tools to the router,
+	// and signalling on it would hard-filter for function calling on a request
+	// that does not use it — under `require_parameters` a 400 on a request that
+	// works today.
+	detected func(json.RawMessage) bool
+	// placeholder is what the preview carries instead of the value: the same
+	// JSON shape, with nothing of the caller's left in it.
+	placeholder json.RawMessage
+}
+
+// previewCapabilitySignals is keyed by the field name as it appears in the
+// request. A field absent from this map is simply withheld, as before.
+//
+// `tool_choice` is NOT here because it is not withheld today — it is not a
+// payload field, so the preview carries the caller's own value. When it becomes
+// payload it needs a row, or the router's soft preference (and, under
+// `require_parameters`, its hard filter) silently stops applying to it too.
+var previewCapabilitySignals = map[string]previewCapabilitySignal{
+	"tools": {
+		detected: func(raw json.RawMessage) bool {
+			s := strings.TrimSpace(string(raw))
+			return len(s) > 0 && s != "null" && s != "[]"
+		},
+		// Well-formed rather than minimal (`[{}]` would satisfy today's check):
+		// the router does not validate the preview body now, and a shape that
+		// survives validation if it ever does costs nothing here.
+		placeholder: json.RawMessage(`[{"type":"function","function":{"name":"_"}}]`),
+	},
+}
+
+// capabilitySignalFor returns the placeholder to send for a withheld field, and
+// whether to send one at all.
+func capabilitySignalFor(field string, raw json.RawMessage) (json.RawMessage, bool) {
+	sig, ok := previewCapabilitySignals[field]
+	if !ok || !sig.detected(raw) {
+		return nil, false
+	}
+	return sig.placeholder, true
+}
+
 // everyProfilesPayloadFields is the union of the default sealed set of every
 // profile the protocol defines — what an unrecognised service type withholds.
 // Recomputed per call rather than cached in a package var: it is off the hot
@@ -1432,6 +1514,12 @@ func (r *Router) preview(ctx context.Context, ep endpoint.Endpoint, req wire.Req
 	payload := make(map[string]json.RawMessage, len(req)+2)
 	for k, v := range req {
 		if _, sensitive := withheld[k]; sensitive {
+			// Withheld, but the router may still need to know the field was THERE
+			// — see previewCapabilitySignals. The signal replaces the value; it
+			// never carries it.
+			if sig, ok := capabilitySignalFor(k, v); ok {
+				payload[k] = sig
+			}
 			continue
 		}
 		payload[k] = v
