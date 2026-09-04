@@ -759,7 +759,12 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 	//   - SignerAddr (broker's signer_address) → sealed into _e2ee.signer_addr,
 	//     the crypto pin the provider enclave verifies and that signs responses.
 	//   - Address (the router's provider address) → the routing pin core sends as
-	//     X-0G-Provider-Address so the router forwards to exactly this provider.
+	//     X-0G-Provider-Address so the router forwards to exactly this provider,
+	//     together with the candidate's provider_identity as X-0G-Provider-Identity.
+	//     Both halves, because an address that fronts several same-model upstreams
+	//     names a row only with the identity beside it; pinning the address alone
+	//     lets the router re-pick among them and serve one other than the candidate
+	//     whose key we just fetched and are about to seal to.
 	// Model is the candidate's canonical_id, written into the sealed request's
 	// cleartext "model" so it names the model this provider serves (the preview
 	// list is heterogeneous when the caller omits "model"). URL is the router's
@@ -770,7 +775,11 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 		EncPubKey:  encPub,
 		SignerAddr: signer,
 		Address:    prov.Address,
-		Model:      prov.CanonicalID,
+		// Name-checked deliberately: this is the ROUTER's provider_identity, not the
+		// route.ProviderIdentity recorded a few lines above, which is what this
+		// gateway verified about the enclave. Same words, orthogonal axes.
+		RouterProviderIdentity: prov.ProviderIdentity,
+		Model:                  prov.CanonicalID,
 		// The provider's own endpoint (where its enc key / quote were fetched) is
 		// also where its §8 response signature is served — the router does not
 		// proxy /v1/proxy/signature. Carry it so verification can fetch direct.
@@ -1381,10 +1390,20 @@ func (r previewResult) callOutcome() string {
 
 // previewProvider is one candidate in the route-preview reply.
 type previewProvider struct {
-	Address     string `json:"address"`
-	CanonicalID string `json:"canonical_id"`
-	Endpoint    string `json:"endpoint"`
-	ModelID     string `json:"model_id"`
+	Address string `json:"address"`
+	// ProviderIdentity names the upstream this provider forwards to — the other
+	// half of the routing pin, so two candidates in THIS list can share an address
+	// and differ only here. Treat it as opaque and pin back whatever it carries;
+	// empty is not "this broker has one upstream" but "it reports none", which
+	// every decentralized endpoint does and no centralized forwarder does.
+	//
+	// A pointer so ABSENT (a router predating the field) stays distinguishable
+	// from present-and-empty, which the pin treats differently — see
+	// core.Provider.RouterProviderIdentity.
+	ProviderIdentity *string `json:"provider_identity"`
+	CanonicalID      string  `json:"canonical_id"`
+	Endpoint         string  `json:"endpoint"`
+	ModelID          string  `json:"model_id"`
 }
 
 // previewResponse is the route-preview reply. ServiceType echoes the requested

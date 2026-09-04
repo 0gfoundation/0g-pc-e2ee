@@ -116,9 +116,16 @@ identify the caller. Send no key and the request goes upstream unauthenticated.
 
 Any request header in the **`X-0G-*`** namespace is forwarded verbatim to the
 provider — the router's cleartext routing directives (`X-0G-Provider-Address`
-to pin a provider, `-Sort`, `-Trust-Mode`, `-Allow-Fallbacks`,
-`-Require-Parameters`, and the `-Max-Price-Usd-{Prompt,Completion,Image}` caps,
-which the router accepts as headers only). No other header is forwarded: arbitrary client headers
+and `X-0G-Provider-Identity` to pin a provider, `-Sort`, `-Trust-Mode`,
+`-Allow-Fallbacks`, `-Require-Parameters`, and the
+`-Max-Price-Usd-{Prompt,Completion,Image}` caps, which the router accepts as
+headers only). In route mode the resolved candidate's address is written over any
+forwarded one, so the pin always names a candidate this client actually resolved
+and sealed to. The identity is written over only when the router reported one for
+that candidate (either a value or an explicit "none"); when the router's preview
+does not carry the field at all, a forwarded `X-0G-Provider-Identity` is left
+alone — it still narrowed the preview, so clearing it would drop a pin that is
+working. No other header is forwarded: arbitrary client headers
 (cookies, app-internal metadata) must not leak to the router, which terminates
 TLS on the router path.
 

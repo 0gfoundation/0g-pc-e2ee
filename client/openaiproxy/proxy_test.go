@@ -969,9 +969,14 @@ func TestProxyForwardsRoutingHeaders(t *testing.T) {
 		t.Errorf("X-0G-Provider-Address = %q, want it forwarded", v)
 	}
 	// Fallback is forced off whenever we seal (a sealed request can be opened only
-	// by the one provider it is sealed to).
-	if v := got.Get("X-0G-Allow-Fallbacks"); v != "false" {
-		t.Errorf("X-0G-Allow-Fallbacks = %q, want %q", v, "false")
+	// by the one provider it is sealed to), under the name the router actually
+	// parses — the old X-0G-Allow-Fallbacks spelling was outside its
+	// X-0G-Provider-* namespace and read nowhere.
+	if v := got.Get("X-0G-Provider-Allow-Fallbacks"); v != "false" {
+		t.Errorf("X-0G-Provider-Allow-Fallbacks = %q, want %q", v, "false")
+	}
+	if v := got.Get("X-0G-Allow-Fallbacks"); v != "" {
+		t.Errorf("unparsed X-0G-Allow-Fallbacks spelling = %q, want it gone", v)
 	}
 	if v := got.Get("X-0G-Provider-Sort"); v != "latency" {
 		t.Errorf("X-0G-Provider-Sort = %q, want %q", v, "latency")

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -28,6 +29,11 @@ const (
 	testSigner       = "0xd45b4301940B297F76d6e622c1CeA2AE660617d4"
 	testProviderAddr = "0xC0FFEE0000000000000000000000000000000001"
 )
+
+// strptr builds the "the router REPORTED this identity" form. A nil
+// previewProvider.ProviderIdentity is the different statement "the router said
+// nothing", so the two cannot share a spelling in these tests either.
+func strptr(s string) *string { return &s }
 
 // mockBroker serves the provider's control-plane e2ee pubkey API only. The
 // data-plane chat request goes through the router (mockRouter), not here. It
@@ -127,18 +133,28 @@ type mockRouter struct {
 	lastAuth        string
 	lastHeaders     http.Header
 	lastChatHeaders http.Header
-	lastChatModel   string            // cleartext "model" the data-plane request carried
-	status          int               // override preview response status; 0 = 200
-	previewHits     int32             // preview attempts served (retry assertions)
-	previewFailN    int32             // fail the first N preview attempts with previewFailStatus
-	previewFailCode int               // status for previewFailN attempts (0 = 503)
-	noProviders     bool              // preview returns no providers
-	previewAddress  string            // head provider's address in preview (default testProviderAddr)
+	lastChatModel   string // cleartext "model" the data-plane request carried
+	status          int    // override preview response status; 0 = 200
+	previewHits     int32  // preview attempts served (retry assertions)
+	previewFailN    int32  // fail the first N preview attempts with previewFailStatus
+	previewFailCode int    // status for previewFailN attempts (0 = 503)
+	noProviders     bool   // preview returns no providers
+	previewAddress  string // head provider's address in preview (default testProviderAddr)
+	// previewIdentity is the head provider's provider_identity in preview. nil
+	// models a router that predates the field and omits it entirely — a distinct
+	// case from a router that reports an empty one, which is why it is a pointer
+	// here as on the wire.
+	previewIdentity *string
 	extra           []previewProvider // extra candidates appended after the head
-	failPin         string            // data plane fails for this X-0G-Provider-Address pin
-	failStatus      int               // status returned for failPin (0 = 503)
-	badBodyPin      string            // data plane returns 200 with an unopenable body for this pin
-	truncBodyPin    string            // data plane returns 200 then truncates the body mid-read for this pin
+	// chatIdentities records the X-0G-Provider-Identity of every data-plane hit in
+	// order. Two candidates sharing an address are told apart ONLY by this, so a
+	// same-address fallback is unassertable from lastChatHeaders alone.
+	chatIdentities []string
+	failIdentity   string // data plane fails for this X-0G-Provider-Identity pin
+	failPin        string // data plane fails for this X-0G-Provider-Address pin
+	failStatus     int    // status returned for failPin (0 = 503)
+	badBodyPin     string // data plane returns 200 with an unopenable body for this pin
+	truncBodyPin   string // data plane returns 200 then truncates the body mid-read for this pin
 }
 
 func newMockRouter(t *testing.T, broker *mockBroker) *mockRouter {
@@ -168,10 +184,11 @@ func newMockRouter(t *testing.T, broker *mockBroker) *mockRouter {
 			return
 		}
 		providers := []previewProvider{{
-			Address:     m.previewAddress,
-			CanonicalID: "canon-1",
-			Endpoint:    broker.srv.URL,
-			ModelID:     "gpt-4o@v1",
+			Address:          m.previewAddress,
+			ProviderIdentity: m.previewIdentity,
+			CanonicalID:      "canon-1",
+			Endpoint:         broker.srv.URL,
+			ModelID:          "gpt-4o@v1",
 		}}
 		providers = append(providers, m.extra...)
 		if m.noProviders {
@@ -190,6 +207,15 @@ func newMockRouter(t *testing.T, broker *mockBroker) *mockRouter {
 	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
 		m.lastChatHeaders = r.Header.Clone()
 		pin := r.Header.Get("X-0G-Provider-Address")
+		identity := r.Header.Get("X-0G-Provider-Identity")
+		m.chatIdentities = append(m.chatIdentities, identity)
+		// Simulate the failure of ONE upstream behind an address whose sibling stays
+		// up — the case an address-only pin cannot express, and an address-keyed
+		// failPin cannot simulate.
+		if m.failIdentity != "" && identity == m.failIdentity {
+			http.Error(w, "upstream failure", http.StatusServiceUnavailable)
+			return
+		}
 		// Simulate a provider failure at the data plane: on a retryable status the
 		// client should re-seal to the next candidate; on a 4xx it should fail fast.
 		if m.failPin != "" && pin == m.failPin {
@@ -348,8 +374,14 @@ func TestResolveEndToEnd(t *testing.T) {
 	if got := router.lastChatHeaders.Get("X-0G-Provider-Address"); got != testProviderAddr {
 		t.Errorf("chat pin = %q, want provider address %q", got, testProviderAddr)
 	}
-	if got := router.lastChatHeaders.Get("X-0G-Allow-Fallbacks"); got != "false" {
+	// The router parses X-0G-Provider-Allow-Fallbacks; the old X-0G-Allow-Fallbacks
+	// spelling was read nowhere, so this directive rode entirely on the router's
+	// default (an address pin implies no fallback) rather than on anything we said.
+	if got := router.lastChatHeaders.Get("X-0G-Provider-Allow-Fallbacks"); got != "false" {
 		t.Errorf("chat allow-fallbacks = %q, want \"false\"", got)
+	}
+	if got := router.lastChatHeaders.Get("X-0G-Allow-Fallbacks"); got != "" {
+		t.Errorf("chat sent the unparsed X-0G-Allow-Fallbacks spelling = %q, want it gone", got)
 	}
 }
 
@@ -426,6 +458,156 @@ func TestCompleteFallsBackToNextCandidate(t *testing.T) {
 	}
 	if router.lastChatModel != "canon-2" {
 		t.Errorf("data-plane model = %q, want fallback canonical_id \"canon-2\"", router.lastChatModel)
+	}
+}
+
+// The preview candidate's provider_identity is pinned back alongside its
+// address. Without it the router re-ranks that address's same-model upstreams
+// at execute time and may serve one other than the candidate whose enc key we
+// fetched and sealed to — a substitution nothing downstream would notice, since
+// the enc key is per broker and the seal opens either way.
+func TestCompletePinsCandidateRouterProviderIdentity(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	router.previewIdentity = strptr("aliyun")
+
+	client := core.NewWithResolver(New(router.srv.URL))
+	if _, err := client.Complete(context.Background(), chatReq()); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if got := router.lastChatHeaders.Get("X-0G-Provider-Identity"); got != "aliyun" {
+		t.Errorf("upstream pin = %q, want the candidate's provider_identity %q", got, "aliyun")
+	}
+	if got := router.lastChatHeaders.Get("X-0G-Provider-Address"); got != testProviderAddr {
+		t.Errorf("address pin = %q, want %q", got, testProviderAddr)
+	}
+}
+
+// A candidate whose provider reports no upstream identity carries none, and the
+// pin must not invent one: absent is what the router reads as "no identity pin",
+// so such a request goes out exactly as it did before this field existed.
+func TestCompleteSendsNoRouterProviderIdentityForCandidateWithoutIdentity(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	router.previewIdentity = strptr("") // reported, and empty
+
+	client := core.NewWithResolver(New(router.srv.URL))
+	if _, err := client.Complete(context.Background(), chatReq()); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if got := router.lastChatHeaders.Get("X-0G-Provider-Identity"); got != "" {
+		t.Errorf("upstream pin = %q, want none for a candidate that reported no identity", got)
+	}
+}
+
+// A caller cannot re-enable server-side fallback on a sealed request. This is
+// the other half of the header rename: forwarded routing directives are copied
+// in BEFORE ours, so under the old X-0G-Allow-Fallbacks spelling a caller's
+// X-0G-Provider-Allow-Fallbacks: true was never overridden and reached the
+// router intact — the one header there that decides whether ciphertext this
+// gateway sealed to one enclave may be handed to another.
+func TestCompleteOverridesAForwardedAllowFallbacks(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+
+	ctx := core.WithForwardedHeaders(context.Background(),
+		http.Header{"X-0G-Provider-Allow-Fallbacks": []string{"true"}})
+	client := core.NewWithResolver(New(router.srv.URL))
+	if _, err := client.Complete(ctx, chatReq()); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if got := router.lastChatHeaders.Get("X-0G-Provider-Allow-Fallbacks"); got != "false" {
+		t.Errorf("allow-fallbacks = %q, want our \"false\" to win over the caller's", got)
+	}
+}
+
+// A forwarded X-0G-Provider-Identity must not outlive our own address pin. The
+// resolved provider is authoritative over both halves or over neither: leaving a
+// caller's identity standing next to an address we chose pins a pair that was
+// never resolved — at best a mismatch the router rejects, at worst an upstream
+// we did not seal for. The address pin is already written last for this reason;
+// the identity has to be deleted, since "write only when non-empty" leaves the
+// stale one in place.
+func TestCompleteDoesNotLeaveAForwardedRouterProviderIdentityBesideOurAddress(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	router.previewIdentity = strptr("") // the router SAYS this candidate has none
+
+	ctx := core.WithForwardedHeaders(context.Background(),
+		http.Header{"X-0G-Provider-Identity": []string{"zhipu"}})
+	client := core.NewWithResolver(New(router.srv.URL))
+	if _, err := client.Complete(ctx, chatReq()); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if got := router.lastChatHeaders.Get("X-0G-Provider-Identity"); got != "" {
+		t.Errorf("forwarded upstream pin %q survived next to our own address pin", got)
+	}
+}
+
+// The mirror image, and the reason previewProvider.ProviderIdentity is a
+// pointer: against a router that OMITS the field, a forwarded pin must survive.
+//
+// Such a router still READS X-0G-Provider-Identity — the gateway forwards it to
+// the preview call, where it narrows the candidate list — so every candidate
+// coming back already IS the caller's chosen upstream while reporting no identity
+// of its own. Decoding that as "" and clearing the header would drop a pin that
+// was working, and hand the request back to the price-ranking this whole change
+// exists to take it away from: the same substitution, in through the other door.
+func TestCompleteKeepsAForwardedIdentityWhenPreviewOmitsTheField(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker) // previewIdentity nil: the field is absent
+
+	ctx := core.WithForwardedHeaders(context.Background(),
+		http.Header{"X-0G-Provider-Identity": []string{"zhipu"}})
+	client := core.NewWithResolver(New(router.srv.URL))
+	if _, err := client.Complete(ctx, chatReq()); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	// The preview saw it (that is how such a router narrows), and so must the
+	// data plane.
+	if got := router.lastHeaders.Get("X-0G-Provider-Identity"); got != "zhipu" {
+		t.Errorf("preview upstream pin = %q, want the caller's %q", got, "zhipu")
+	}
+	if got := router.lastChatHeaders.Get("X-0G-Provider-Identity"); got != "zhipu" {
+		t.Errorf("data-plane upstream pin = %q, want the caller's %q preserved", got, "zhipu")
+	}
+}
+
+// Two candidates behind ONE address, differing only by upstream: when the head's
+// upstream fails, the fallback must reach the sibling. This is the case the
+// address-only pin degenerated on — "try the next candidate" re-pinned the same
+// address, the router resolved it back to the same (cheapest) upstream, and the
+// retry burned a slot on the provider that had just failed.
+func TestCompleteFallsBackToSiblingUpstreamUnderOneAddress(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+	router.previewIdentity = strptr("aliyun")
+	router.extra = []previewProvider{{
+		Address:          testProviderAddr, // SAME address as the head
+		ProviderIdentity: strptr("zhipu"),
+		CanonicalID:      "canon-2",
+		Endpoint:         broker.srv.URL,
+		ModelID:          "gpt-4o@v2",
+	}}
+	router.failIdentity = "aliyun" // only the head's upstream is down
+
+	client := core.NewWithResolver(New(router.srv.URL))
+	resp, err := client.Complete(context.Background(), chatReq())
+	if err != nil {
+		t.Fatalf("Complete should have fallen back to the sibling upstream: %v", err)
+	}
+	choices, _ := json.Marshal(resp["choices"])
+	if !strings.Contains(string(choices), "routed answer") {
+		t.Fatalf("did not get plaintext back after fallback: %s", choices)
+	}
+	// Both attempts named the same address, so the identities are the only
+	// evidence the retry went somewhere new.
+	want := []string{"aliyun", "zhipu"}
+	if !reflect.DeepEqual(router.chatIdentities, want) {
+		t.Fatalf("data-plane upstream pins = %v, want %v", router.chatIdentities, want)
+	}
+	if got := router.lastChatHeaders.Get("X-0G-Provider-Address"); got != testProviderAddr {
+		t.Errorf("succeeded pin = %q, want the shared address %q", got, testProviderAddr)
 	}
 }
 

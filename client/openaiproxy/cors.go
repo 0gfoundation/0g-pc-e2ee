@@ -50,6 +50,12 @@ const corsAllowMethods = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
 //   - The Max-Price-Usd caps are header-only on the router (no body equivalent), so
 //     omitting them here does not merely make a header awkward to send — it puts
 //     price ceilings entirely out of reach of a browser client.
+//   - X-0G-Provider-Identity is the second half of the provider pin (the router
+//     keys a provider row by address AND provider_identity), so an address listed
+//     without it advertises a pin a browser cannot fully express. It was missing
+//     here for the same reason it was missing from the router's own preflight list
+//     (0g-router#772): the header was added to the pin and not to the lists that
+//     describe it.
 //
 // This list is the BASELINE advertisement, not the limit: allowHeadersFor also
 // grants whatever else a preflight asks for (see there for why that is safe, and
@@ -58,7 +64,7 @@ const corsAllowMethods = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
 // directives exist, and it documents them next to the code that forwards them.
 const corsAllowHeaders = "Origin, Content-Type, Authorization, x-api-key, X-Request-Id, " +
 	"X-0G-Source-Id, HTTP-Referer, X-Title, " +
-	"X-0G-Provider-Address, X-0G-Provider-Sort, X-0G-Provider-Trust-Mode, X-0G-Provider-Allow-Fallbacks, " +
+	"X-0G-Provider-Address, X-0G-Provider-Identity, X-0G-Provider-Sort, X-0G-Provider-Trust-Mode, X-0G-Provider-Allow-Fallbacks, " +
 	"X-0G-Provider-Require-Parameters, X-0G-Provider-Max-Price-Usd-Prompt, " +
 	"X-0G-Provider-Max-Price-Usd-Completion, X-0G-Provider-Max-Price-Usd-Image"
 

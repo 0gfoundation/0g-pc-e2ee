@@ -668,10 +668,17 @@ does not.
   preview call, so the prompt stays confidential. The sealed request itself is
   still POSTed to the **router** (at the surface's own path there — see
   `client/endpoint`, whose row carries it; the router is the centralized
-  auth/billing point), pinned to the chosen provider (`X-0G-Provider-Address`,
-  fallback off) so the router forwards to exactly the provider whose key it was
-  sealed to; the provider `endpoint` from preview is used only to fetch the enc
-  key. A caller selects a specific provider by setting `X-0G-Provider-Address`,
+  auth/billing point), pinned to the chosen candidate (`X-0G-Provider-Address`
+  **plus** `X-0G-Provider-Identity`, fallback off) so the router forwards to
+  exactly the provider whose key it was sealed to; the provider `endpoint` from
+  preview is used only to fetch the enc key. Both halves of the pin, because the
+  router keys a provider row `(model, address, provider_identity)`: an address
+  fronting several same-model upstreams is re-ranked by price at execute time,
+  so the address alone does not name the candidate that was previewed. The seal
+  survives that substitution — the enc key is per broker — which is why it has
+  to be pinned rather than caught: what changes is the price, the capabilities,
+  and the upstream the broker names in its routing proof. A caller selects a
+  specific provider by setting `X-0G-Provider-Address`,
   which the gateway forwards to preview so it returns that provider (this
   replaces a separate "pin/direct" mode). Client-side fallback over the
   remaining candidates, verifying the enc key out of an attestation quote, and
