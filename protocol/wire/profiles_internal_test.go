@@ -95,14 +95,18 @@ func TestEveryProfileDefaultSatisfiesItsOwnRules(t *testing.T) {
 			if err := ValidateSealedFieldsFor(p, sealed); err != nil {
 				t.Errorf("the shipped default sealed set %v is invalid for its own profile: %v", sealed, err)
 			}
-			// A field that is mandatory WHEN PRESENT must be in the default set.
-			// Otherwise the default itself leaks: a request carrying Anthropic's
-			// `system`, or a transcription carrying `filename`, would be refused
-			// by validatePayloadIfPresentFor — or worse, accepted by a caller who
-			// skips it, handing the field to the router in the clear.
-			for _, f := range spec.requiredIfPresent {
-				if !slices.Contains(sealed, f) {
-					t.Errorf("%q is required-when-present but missing from the default sealed set %v", f, sealed)
+			// Every payload field must be in the default set, optional ones
+			// included. Otherwise the default itself leaks: a request carrying
+			// Anthropic's `system`, or a transcription carrying `filename`, would
+			// be refused by validatePayloadSealedFor — or worse, accepted by a
+			// caller who skips it, handing the field to the router in the clear.
+			//
+			// defaultRequestSealed derives the set from `payload`, so this now
+			// holds by construction; it stays asserted because the derivation is
+			// what makes it hold, and that is a thing a future edit can undo.
+			for _, f := range spec.payload {
+				if !slices.Contains(sealed, f.name) {
+					t.Errorf("%q is payload but missing from the default sealed set %v", f.name, sealed)
 				}
 			}
 			// The shipped unbound default must be usable with the shipped sealed
@@ -137,18 +141,20 @@ func TestEveryProfileDefaultSatisfiesItsOwnRules(t *testing.T) {
 					t.Errorf("%q is listed both as always-sealed and as sealed-when-present", f)
 				}
 			}
-			// The request-side twin, on the two PIN families. pinFamilies' doc
-			// leans on this: it says iteration order is not load-bearing, which
-			// holds only while no field is in both maps. A field in both would
-			// draw contradictory verdicts from the value checks —
-			// validatePinnedCleartext demands it, validatePinnedIfPresent permits
-			// its absence — and which error a caller saw would then depend on the
-			// order that doc calls irrelevant.
-			for f := range spec.pinnedCleartext {
-				if _, both := spec.pinnedIfPresent[f]; both {
-					t.Errorf("%q is pinned in both families: one demands the field and the other "+
-						"permits its absence, so the verdict would depend on iteration order", f)
+			// The request-side twin, on the PINS. A field pinned twice would draw
+			// two verdicts from one request — pinFor answers with the first entry
+			// while validatePinnedValues checks every one — so a mandatory and an
+			// optional entry for the same field would disagree about whether
+			// absence is compliant, and which error a caller saw would depend on
+			// declaration order. One entry per field is what makes that
+			// unrepresentable rather than merely unlikely.
+			seenPin := map[string]bool{}
+			for _, p := range spec.pinned {
+				if seenPin[p.field] {
+					t.Errorf("%q is pinned twice: two entries for one field can disagree about "+
+						"whether absence is compliant", p.field)
 				}
+				seenPin[p.field] = true
 			}
 		})
 	}

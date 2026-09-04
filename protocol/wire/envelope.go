@@ -45,11 +45,11 @@ const (
 	// fieldSystem is Anthropic's TOP-LEVEL system prompt (/v1/messages), as
 	// opposed to OpenAI's system message inside "messages". Being its own
 	// top-level field is why it needs naming at all: it is payload the chat
-	// profile's rules do not reach. Conditionally required — see
-	// profileSpec.requiredIfPresent.
+	// profile's rules do not reach. It is an optional payload field — see
+	// payloadField.optional.
 	fieldSystem = "system"
 	// fieldResponseFormat is the cleartext image field pinned to "b64_json"
-	// (SPEC §7.1) — see profileSpec.pinnedCleartext.
+	// (SPEC §7.1) — see profileSpec.pinned.
 	fieldResponseFormat = "response_format"
 	// fieldChoices / fieldData are the generated content a sealed RESPONSE frame
 	// MUST cover, per profile (SPEC §7).
@@ -95,7 +95,7 @@ const (
 	// fieldStream is the speech profile's conditionally pinned cleartext field
 	// (SPEC §5.3.3): the profile defines no streaming frame taxonomy, so the
 	// field may be omitted but must be `false` when present — see
-	// profileSpec.pinnedIfPresent.
+	// pinnedField.optional.
 	fieldStream = "stream"
 	// The speech profile's response fields (SPEC §7.3). fieldText is always
 	// sealed; fieldSegments / fieldWords carry the same transcript cut per
@@ -156,33 +156,28 @@ const (
 	ProfileSpeech Profile = "speech"
 )
 
-// profileSpec fixes, per profile, the field that MUST be sealed, any CLEARTEXT
-// field pinned to a specific value, and the v1 default sealed sets for a request
-// and for the response it produces.
+// profileSpec fixes, per profile, which request fields are payload (and so must
+// be sealed), any CLEARTEXT field pinned to a permitted value, and the v1
+// default sealed sets for a request and for the response it produces.
 type profileSpec struct {
-	// required / responseRequired are the fields that MUST be sealed; request /
-	// response are the v1 DEFAULTS, which may be supersets. Keeping the two
-	// distinct on both sides matters: the request side has always had it right
-	// ("tools" is a default but not mandatory), and reusing one field for both on
-	// the response side would silently mean "every default is mandatory" — fine
-	// while each response default has exactly one member, wrong the moment a
-	// profile defaults to sealing two fields of which only one is the content.
-	required         string   // the request field a sealed envelope MUST cover (§5.1)
-	request          []string // v1 default request sealed set (§5.1)
-	responseRequired string   // the response field a sealed frame MUST cover (§7)
-	response         []string // v1 default response sealed set (§7)
-	// requiredIfPresent are request fields that need not EXIST, but MUST be
-	// sealed whenever the request carries one. `required` cannot express that: it
-	// is checked from (profile, field names) alone, so a field that is only
-	// sometimes there would either reject every request that omits it or, listed
-	// as a mere default, be silently droppable.
-	//
-	// Anthropic's `system` is the case the distinction exists for. It is prompt
-	// content — the same class as `messages` — but it is optional, and it sits at
-	// the TOP LEVEL rather than inside `messages`, so nothing about sealing
-	// `messages` covers it. Left out, a request seals the conversation and hands
-	// the system prompt to the router in the clear, passing every other check.
-	requiredIfPresent []string
+	// payload is every request field this profile treats as sensitive, in the
+	// order the default sealed set lists them. See payloadField for the one axis
+	// they differ on.
+	payload []payloadField
+	// extraDefaults are further fields the v1 default seals that are NOT payload:
+	// worth sealing, but droppable without a leak the profile is responsible for
+	// ("tools"). The default request set is `payload` followed by these — see
+	// defaultRequestSealed — so each field is named once and a default can never
+	// omit a field the checks demand.
+	extraDefaults []string
+	// responseRequired is the field a sealed frame MUST cover (§7); response is
+	// the v1 DEFAULT, which may be a superset. Keeping the two distinct matters
+	// for the same reason payloadField.optional exists: reusing one field would
+	// silently mean "every default is mandatory" — fine while each response
+	// default has exactly one member, wrong the moment a profile defaults to
+	// sealing two fields of which only one is the content.
+	responseRequired string
+	response         []string
 	// responseFrames is set for a profile whose response frames do not all have
 	// the same shape, so "the field a frame must seal" is a property of the FRAME
 	// rather than of the profile. nil means single-shape (chat, image), where
@@ -206,42 +201,11 @@ type profileSpec struct {
 	// per frame. Listing a name in both would make the frameless
 	// DefaultResponseSealedFieldsFor claim a field a `json` response never has.
 	responseRequiredIfPresent []string
-	// pinnedCleartext maps a cleartext field to the PERMITTED values a sealed
-	// request of this profile may carry — usually one (image: exactly
-	// `b64_json`), sometimes a small set (speech: either of `json` /
-	// `verbose_json`). The field must be present in every case — an absent one is
-	// rejected, never defaulted — because a server-side default is exactly what
-	// this guards against (§5.1/§7.1), and that does not weaken because two
-	// values are permitted instead of one. Empty for profiles with no such
-	// constraint.
-	pinnedCleartext map[string][]string
-	// pinnedIfPresent is pinnedCleartext's conditional twin (SPEC §5.3.3): the
-	// field may be ABSENT — the endpoint's default is what the profile wants —
-	// but when present its value MUST be one of the permitted ones. It is to
-	// pinnedCleartext exactly what requiredIfPresent is to required, and the four
-	// together are the whole taxonomy: required/optional presence × payload/pin.
-	//
-	// It is a WHITELIST, and that is the correction of a real bug rather than a
-	// stylistic choice. The first version was a blacklist of refused values
-	// compared by exact JSON type, which `"stream": "true"` and `"stream": 1`
-	// both walked straight through — on the one profile whose whole premise is
-	// that the enclave re-materializes the request as multipart/form-data, where
-	// EVERY value is a string and `stream=true` is precisely how a real streaming
-	// request is spelled. A blacklist over JSON types cannot be right on a
-	// JSON-ified endpoint: the values that matter are whatever the materialized
-	// form renders to, which is an open set. Only "must be one of these" is
-	// closed, and only a closed rule fails closed.
-	//
-	// Values are compared as the token cleartextToken derives, so the boolean
-	// `false` and the string `"false"` are the same value here — see that
-	// function for why both spellings of the safe value are honest on this
-	// endpoint.
-	//
-	// The direction of absence is the distinction from pinnedCleartext, and
-	// getting it backwards is not a subtle failure: implementing this with
-	// pinnedCleartext would demand `stream` be PRESENT on every sealed speech
-	// request and reject every conforming one.
-	pinnedIfPresent map[string][]string
+	// pinned are CLEARTEXT fields whose value this profile constrains to a
+	// permitted set — usually one value (image: exactly `b64_json`), sometimes a
+	// small set (speech: either of `json` / `verbose_json`). Empty for profiles
+	// with no such constraint. See pinnedField.
+	pinned []pinnedField
 	// requiredResponseCleartext are numeric values a sealed FINAL response frame
 	// of this profile MUST carry in cleartext, because the router bills on them
 	// and cannot recover them from the sealed content (§7.1/§7.3). Empty for
@@ -251,6 +215,73 @@ type profileSpec struct {
 	// AUTHENTICATED — see protectedCleartext. Empty for a profile whose router
 	// inputs are all covered by the profile-independent floor.
 	protected []protectedCleartext
+}
+
+// payloadField is one sensitive request field of a profile: something the sealed
+// set must cover, or the request hands it to the router in the clear.
+//
+// One list with a flag, rather than a mandatory field plus a conditional list,
+// because the two only ever differed on whether the field has to EXIST. Split,
+// the same name had to be written twice (once as the rule, once in the default
+// set) and a profile could get the two out of step; here the default set is
+// derived from this list, so it cannot.
+type payloadField struct {
+	name string
+	// optional marks a field that need not EXIST, but MUST be sealed whenever the
+	// request carries one. A name-only check cannot express that — it is made
+	// from (profile, field names) alone, before any request — so a sometimes-there
+	// field would either reject every request that omits it or, as a mere default,
+	// be silently droppable.
+	//
+	// Anthropic's `system` is the case the flag exists for. It is prompt content —
+	// the same class as `messages` — but it is optional, and it sits at the TOP
+	// LEVEL rather than inside `messages`, so nothing about sealing `messages`
+	// covers it. Left out, a request seals the conversation and hands the system
+	// prompt to the router in the clear, passing every other check.
+	optional bool
+}
+
+// pinnedField is a CLEARTEXT request field pinned to a set of permitted values
+// (§5.1 / §5.3.3). Three things have to hold, and all three are checked wherever
+// one is: the field stays cleartext (sealing it hides it from the server, which
+// then falls back to its own default, while the enclave still reconstructs
+// `cleartext ∪ decrypted` and forwards the sealed value upstream), it stays
+// bound (outside the AAD an intermediary could rewrite it in transit with Open
+// still succeeding), and its value is permitted.
+//
+// The permitted set is a WHITELIST, and that is the correction of a real bug
+// rather than a stylistic choice. The first version was a blacklist of refused
+// values compared by exact JSON type, which `"stream": "true"` and `"stream": 1`
+// both walked straight through — on the one profile whose whole premise is that
+// the enclave re-materializes the request as multipart/form-data, where EVERY
+// value is a string and `stream=true` is precisely how a real streaming request
+// is spelled. A blacklist over JSON types cannot be right on a JSON-ified
+// endpoint: the values that matter are whatever the materialized form renders
+// to, which is an open set. Only "must be one of these" is closed, and only a
+// closed rule fails closed.
+type pinnedField struct {
+	field     string
+	permitted []string
+	// optional says an ABSENT field is compliant, because the endpoint's own
+	// default is a value the profile permits (speech's `stream`, SPEC §5.3.3).
+	// The default is otherwise exactly what a pin guards against, so absence is
+	// rejected rather than defaulted — and that does not weaken because two
+	// values are permitted instead of one (§5.1/§7.1).
+	//
+	// Getting the direction backwards is not a subtle failure: demanding
+	// `stream` on every sealed speech request rejects every conforming one.
+	optional bool
+}
+
+// mustBe completes "sealed request field %q " for an error message: what the
+// value has to be, plus — for an optional pin — the fact that omitting the
+// field entirely is the other compliant answer. That is the common case, and an
+// operator reading only the permitted values would not guess it.
+func (p pinnedField) mustBe() string {
+	if p.optional {
+		return fmt.Sprintf("must be %s when present (or omitted entirely)", quotedList(p.permitted))
+	}
+	return fmt.Sprintf("must be %s", quotedList(p.permitted))
 }
 
 // protectedCleartext is a top-level response field that must reach the router
@@ -413,7 +444,7 @@ type frameShape struct {
 	// characterized.
 	terminal bool
 	// sealIfPresent are fields this shape must seal WHENEVER THE FRAME CARRIES
-	// them — the response-side twin of the request's requiredIfPresent, and for
+	// them — the response-side twin of an optional request payload field, and for
 	// the same reason: a field that is sensitive but optional cannot be expressed
 	// by `content` (required-always would reject every frame that omits it).
 	//
@@ -523,8 +554,8 @@ func (s frameShape) sealedFieldsFor(frame Response) []string {
 
 var profiles = map[Profile]profileSpec{
 	ProfileChat: {
-		required:         fieldMessages,
-		request:          []string{"messages", "tools"},
+		payload:          []payloadField{{name: fieldMessages}},
+		extraDefaults:    []string{"tools"},
 		responseRequired: fieldChoices,
 		response:         []string{"choices"},
 	},
@@ -534,8 +565,7 @@ var profiles = map[Profile]profileSpec{
 		// The image COUNT stays cleartext as `usage.output_images` so the router
 		// can bill without decrypting (§7.1), the same trade-off chat makes for
 		// `usage`.
-		required:         fieldPrompt,
-		request:          []string{"prompt"},
+		payload:          []payloadField{{name: fieldPrompt}},
 		responseRequired: fieldData,
 		response:         []string{"data"},
 		// response_format must be an EXPLICIT "b64_json" (§7.1). "url" has the
@@ -545,7 +575,7 @@ var profiles = map[Profile]profileSpec{
 		// banning "url" is the point: OpenAI's own default for the DALL·E
 		// family IS "url", so an omitted field is a request to leak, spelled
 		// as silence.
-		pinnedCleartext: map[string][]string{fieldResponseFormat: {"b64_json"}},
+		pinned: []pinnedField{{field: fieldResponseFormat, permitted: []string{"b64_json"}}},
 		// The billable count. Sealing `data` makes the images uncountable from
 		// outside, so §7.1 requires the enclave to restate how many it produced
 		// in cleartext; without this the router's own parse of a sealed frame
@@ -559,11 +589,13 @@ var profiles = map[Profile]profileSpec{
 	ProfileAnthropic: {
 		// "messages" is the conversation and is always there; "system" is the
 		// top-level system prompt, the same class of payload but optional — hence
-		// requiredIfPresent rather than a second `required`. "tools" follows chat:
-		// a default, not mandatory.
-		required:          fieldMessages,
-		requiredIfPresent: []string{fieldSystem},
-		request:           []string{"messages", "system", "tools"},
+		// the flag rather than a second mandatory field. "tools" follows chat: a
+		// default, not payload.
+		payload: []payloadField{
+			{name: fieldMessages},
+			{name: fieldSystem, optional: true},
+		},
+		extraDefaults: []string{"tools"},
 		// The response is frame-typed, so there is no single field a frame must
 		// seal and no meaningful profile-wide default set: both are properties of
 		// the frame (see anthropicFrames). responseRequired/response stay zero so
@@ -597,19 +629,16 @@ var profiles = map[Profile]profileSpec{
 	ProfileSpeech: {
 		// The audio. Voice is biometric, so a sealed set omitting it defeats the
 		// profile entirely. `filename`, `language` and `prompt` are payload of
-		// lesser degree, and being in `request` only makes them a DEFAULT — which
-		// a default alone cannot enforce, since it is droppable. They are
-		// therefore also requiredIfPresent, the same treatment Anthropic's
-		// top-level `system` gets and for the same reason: each is optional, so
-		// `required` would reject every request that omits one, while a mere
-		// default lets a sender keep it in the cleartext half with every
-		// unconditional check still passing.
+		// lesser degree and are optional rather than absent from this list: a
+		// mere DEFAULT cannot enforce them, since a default is droppable, and
+		// making them mandatory would reject every request that omits one. Same
+		// treatment as Anthropic's top-level `system`, for the same reason.
 		//
 		// Getting this wrong is quiet, and it undercuts the profile's own
 		// argument. `filename` is the clearest case: as a multipart part header
 		// it is readable by every intermediary today, and JSON-ifying the request
 		// is what makes sealing it POSSIBLE — but possible is not required, and
-		// without this line a conforming envelope could still hand
+		// as a plain default a conforming envelope could still hand
 		// "board-meeting-2026Q3.m4a" to the router in the clear.
 		//
 		// `language` is the weakest of the three and is included anyway: a
@@ -617,9 +646,12 @@ var profiles = map[Profile]profileSpec{
 		// information about what was said, the router does not route on it, and
 		// sealing it costs nothing. There is no reason to leave it readable, and
 		// "no reason to seal" is not the standard this profile is held to.
-		required:          fieldFileBase64,
-		requiredIfPresent: []string{fieldFilename, fieldLanguage, fieldPrompt},
-		request:           []string{fieldFileBase64, fieldFilename, fieldLanguage, fieldPrompt},
+		payload: []payloadField{
+			{name: fieldFileBase64},
+			{name: fieldFilename, optional: true},
+			{name: fieldLanguage, optional: true},
+			{name: fieldPrompt, optional: true},
+		},
 		// `text` is the transcript and is always there. The other three are
 		// conditional and therefore NOT in this set — see
 		// responseRequiredIfPresent for why listing them here would be wrong
@@ -637,14 +669,17 @@ var profiles = map[Profile]profileSpec{
 		// looks identical. There the field is required because the DEFAULT IS THE
 		// LEAK (`url`); here the endpoint's default (`json`) is already permitted,
 		// and the pin exists because three of the five values cannot be expressed.
-		pinnedCleartext: map[string][]string{fieldResponseFormat: {"json", "verbose_json"}},
-		// The profile defines no streaming frame taxonomy, so a streaming request
-		// is refused rather than answered with frames whose shape the SPEC does
-		// not define. Absence is compliant — the endpoint defaults to
-		// non-streaming, which is what the profile wants — and PRESENT means
-		// `false` and nothing else, because the values a multipart materialization
-		// reads as true are an open set (SPEC §5.3.3).
-		pinnedIfPresent: map[string][]string{fieldStream: {"false"}},
+		//
+		// `stream` is the optional pin: the profile defines no streaming frame
+		// taxonomy, so a streaming request is refused rather than answered with
+		// frames whose shape the SPEC does not define. Absence is compliant — the
+		// endpoint defaults to non-streaming, which is what the profile wants —
+		// and PRESENT means `false` and nothing else, because the values a
+		// multipart materialization reads as true are an open set (SPEC §5.3.3).
+		pinned: []pinnedField{
+			{field: fieldResponseFormat, permitted: []string{"json", "verbose_json"}},
+			{field: fieldStream, permitted: []string{"false"}, optional: true},
+		},
 		// The billable audio length, in either of the two places upstreams put it.
 		// Fractional, unlike the image count: audio duration genuinely is.
 		requiredResponseCleartext: []cleartextQuantity{{
@@ -663,37 +698,29 @@ var profiles = map[Profile]profileSpec{
 // caller asked for it (stream_options.include_usage). Requiring it here would
 // reject conforming chat streams to enforce a rule §7 does not state.
 
-// validatePinnedCleartextFor enforces a profile's pinned cleartext constraints
-// (§5.1 / §7.1) on a RECEIVED envelope. It is the enclave-side counterpart of
+// validatePinnedFor enforces a profile's pinned cleartext constraints (§5.1 /
+// §5.3.3 / §7.1) on a RECEIVED envelope. It is the enclave-side counterpart of
 // the checks SealRequestFor runs before sealing, and the SPEC requires it: the
 // client-side half stops the reference library from BUILDING a violating
-// request, but a third-party client is under no obligation to use it.
+// request, but a third-party client is under no obligation to use it. Refusing
+// a request whose response shape this document does not define is something
+// only the receiver can do.
 //
 // Unexported because OpenRequestFor is the enclave's entry point and calls this
 // itself. An enclave should not be able to open an envelope without the check
 // having run, which a second, exported way in would allow.
 //
-// It checks all three ways the pin can be defeated:
+// It checks all three ways a pin can be defeated — sealed away, declared
+// unbound, or set to an impermissible value — for both mandatory and optional
+// pins in one pass. See pinnedField for what each of the three costs.
 //
-//   - the field was SEALED, so it is gone from the cleartext the server reads
-//     and the server falls back to its own default (which for the image profile
-//     is `url` — the leak);
-//   - the field was declared UNBOUND, so an intermediary could have rewritten it
-//     in transit and Open would still succeed;
-//   - the value is wrong, absent, or not a string.
-//
-// The first two are shared with the conditional pin family and live in
-// validatePinnedNotSealed / validatePinnedNotUnbound, which read both families
-// off the spec; only the value check is specific to this one, because here an
-// ABSENT field is a violation (see validatePinnedCleartext).
-//
-// A profile with no pinned fields (chat) always passes.
-func validatePinnedCleartextFor(p Profile, env Request) error {
+// A profile with no pinned fields (chat, Anthropic) always passes.
+func validatePinnedFor(p Profile, env Request) error {
 	spec, err := p.spec()
 	if err != nil {
 		return err
 	}
-	if len(spec.pinnedCleartext) == 0 {
+	if len(spec.pinned) == 0 {
 		return nil
 	}
 	e2ee, err := env.E2EE()
@@ -706,7 +733,7 @@ func validatePinnedCleartextFor(p Profile, env Request) error {
 	if err := validatePinnedNotUnbound(spec, e2ee.UnboundFields); err != nil {
 		return err
 	}
-	return validatePinnedCleartext(spec, env)
+	return validatePinnedValues(spec, env)
 }
 
 // quotedList renders a set of JSON string values for an error message:
@@ -732,77 +759,37 @@ func quotedList(vals []string) string {
 	}
 }
 
-// validatePinnedIfPresentFor enforces a profile's conditionally pinned cleartext
-// fields (SPEC §5.3.3) on a RECEIVED envelope — the enclave-side counterpart of
-// the seal-time checks, and the load-bearing half: refusing a request whose
-// response shape this document does not define is something only the receiver
-// can do, and a third-party client is under no obligation to check.
+// validatePinnedValues enforces spec.pinned against a request's CLEARTEXT
+// fields. It runs at seal time too, before any ciphertext exists, so a request
+// that would have leaked is never built — the same reason the sealed-set check
+// lives here rather than only in the enclave.
 //
-// Three ways the pin can be defeated. Only the last is specific to this
-// function: the structural two are one rule over both pin families, so they are
-// checked by the shared validatePinnedNotSealed / validatePinnedNotUnbound
-// (which read every family on the spec and carry the per-family sentence — see
-// pinFamily).
+// Absence is the one axis the pins differ on, so it is the one branch here: an
+// optional pin skips, a mandatory one is refused, because what a mandatory pin
+// guards against is the server's own default and an absent field selects it.
 //
-//   - the field was SEALED. An unconditional pin sealed away leaves the server
-//     reading nothing and falling back to its own default. Here it is worse than
-//     that: the enclave reconstructs `request = cleartext ∪ decrypted` and
-//     forwards the result upstream, so a sealed `stream: true` means the ROUTER
-//     sees a non-streaming request while the enclave asks the upstream to
-//     stream. The two halves of the system then disagree about the response
-//     shape, which is not a fallback but a split brain;
-//   - the field was declared UNBOUND, so an intermediary could set it in transit
-//     and Open would still succeed;
-//   - the field is present with a value outside the permitted set — the VALUE
-//     check, which stays per-family because absence is compliant here and
-//     rejected there.
-func validatePinnedIfPresentFor(p Profile, env Request) error {
-	spec, err := p.spec()
-	if err != nil {
-		return err
-	}
-	if len(spec.pinnedIfPresent) == 0 {
-		return nil
-	}
-	e2ee, err := env.E2EE()
-	if err != nil {
-		return err
-	}
-	if err := validatePinnedNotSealed(spec, e2ee.SealedFields); err != nil {
-		return err
-	}
-	if err := validatePinnedNotUnbound(spec, e2ee.UnboundFields); err != nil {
-		return err
-	}
-	return validatePinnedIfPresent(spec, env)
-}
-
-// validatePinnedIfPresent rejects a request whose cleartext carries a
-// conditionally pinned field with a value outside the permitted set. An ABSENT
-// field passes: that is the whole difference from an unconditional pin (SPEC
-// §5.3.3) — the endpoint's default is the value the profile wants, so demanding
-// presence would reject every conforming request.
-//
-// A WHITELIST, and the reason is this profile's own premise. The first version
-// was a blacklist of refused values compared by exact JSON type, so
-// `"stream": "true"` and `"stream": 1` both passed — on the one endpoint where
-// the enclave re-materializes the request as multipart/form-data, in which every
-// value is a string and `stream=true` is exactly how a real streaming request is
-// written. The set of values a materialized form renders to as "true" is open
-// (`"true"`, `1`, `"1"`, `"yes"`, …), so no blacklist over it can be complete.
-// "Must be one of these" is closed, and only a closed rule fails closed.
-func validatePinnedIfPresent(spec profileSpec, req Request) error {
-	for field, permitted := range spec.pinnedIfPresent {
-		raw, ok := req[field]
+// Values are compared as the token cleartextToken derives rather than by JSON
+// type, so the boolean `false` and the string `"false"` are one value. That is
+// not laxity: §5.3 has the enclave re-materialize a JSON-ified request as
+// multipart/form-data, where every value is a string, and a sender that carries
+// them across as strings is doing nothing wrong. Comparing the materialized
+// token is what makes the rule mean the same thing on both sides of that
+// conversion — and against a whitelist a lossy rendering can only reject.
+func validatePinnedValues(spec profileSpec, req Request) error {
+	for _, p := range spec.pinned {
+		raw, ok := req[p.field]
 		if !ok {
-			continue
+			if p.optional {
+				continue
+			}
+			return fmt.Errorf("sealed request must set %q to %s explicitly (an absent value takes the server's default, which may not be permitted)", p.field, quotedList(p.permitted))
 		}
 		got, ok := cleartextToken(raw)
 		if !ok {
-			return fmt.Errorf("sealed request field %q must be %s when present, and a composite value is not one of them (SPEC §5.3.3)", field, quotedList(permitted))
+			return fmt.Errorf("sealed request field %q %s, and a composite value is not one of them", p.field, p.mustBe())
 		}
-		if !slices.Contains(permitted, got) {
-			return fmt.Errorf("sealed request field %q must be %s when present (or omitted entirely), got %q: this profile defines no response shape for any other value (SPEC §5.3.3)", field, quotedList(permitted), got)
+		if !slices.Contains(p.permitted, got) {
+			return fmt.Errorf("sealed request field %q %s, got %q: a sealed request of this profile may carry no other value", p.field, p.mustBe(), got)
 		}
 	}
 	return nil
@@ -848,108 +835,54 @@ func cleartextToken(raw json.RawMessage) (string, bool) {
 	}
 }
 
-// pinFamily is one of the two pinned-cleartext maps on a profileSpec, paired
-// with why sealing a field of that family is a leak.
-//
-// The families differ only in whether ABSENCE is compliant, and that difference
-// is confined to the VALUE check (validatePinnedCleartext demands the field,
-// validatePinnedIfPresent permits its absence). The two structural rules — must
-// stay cleartext, must stay bound — are one rule over both maps, so the checks
-// below iterate every family the spec declares.
-type pinFamily struct {
-	pins map[string][]string
-	// sealedWhy completes "…must stay CLEARTEXT: " for this family. It is per
-	// family because the two failures genuinely differ: sealing an
-	// UNCONDITIONAL pin leaves the server reading nothing where the pin should
-	// be, falling back to its own default (for the image profile, `url` — the
-	// leak), while sealing a CONDITIONAL one leaves the router seeing one
-	// request and the enclave forwarding another, since the enclave
-	// reconstructs `cleartext ∪ decrypted` and sends the result upstream. A
-	// fallback and a split brain want different sentences.
-	sealedWhy string
-}
-
-// pinFamilies is every pinned-cleartext family of the spec. Both are checked
-// wherever either is, so a profile that gains a family gets both rules for
-// free. A field cannot appear in both maps (no profile declares one, and either
-// error would be correct if one did), so iteration order is not load-bearing.
-func (s profileSpec) pinFamilies() []pinFamily {
-	return []pinFamily{
-		{s.pinnedCleartext, "sealing it removes it from the envelope the server reads, which then falls back to its own default"},
-		{s.pinnedIfPresent, "sealing it hides from every intermediary a value the enclave will still reconstruct and forward upstream, so the router and the enclave would disagree about the response shape"},
+// pinFor reports the pin on a field, if the profile pins it.
+func (s profileSpec) pinFor(field string) (pinnedField, bool) {
+	for _, p := range s.pinned {
+		if p.field == field {
+			return p, true
+		}
 	}
+	return pinnedField{}, false
 }
 
 // validatePinnedNotSealed rejects a sealed set that swallows a pinned cleartext
-// field of either family. Sealing it removes the field from the cleartext
-// envelope entirely, which makes this the one way to satisfy the VALUE check
-// and still leak: the value is verified against the pre-seal request, and the
-// field is then encrypted away. See pinFamily.sealedWhy for how the two
-// families fail differently.
+// field. Sealing it removes the field from the cleartext envelope entirely,
+// which makes this the one way to satisfy the VALUE check and still leak: the
+// value is verified against the pre-seal request, and the field is then
+// encrypted away.
 func validatePinnedNotSealed(spec profileSpec, sealed []string) error {
-	for _, fam := range spec.pinFamilies() {
-		for _, f := range sealed {
-			if want, pinned := fam.pins[f]; pinned {
-				return fmt.Errorf("%q is pinned to %s and must stay CLEARTEXT: %s", f, quotedList(want), fam.sealedWhy)
-			}
+	for _, f := range sealed {
+		if p, pinned := spec.pinFor(f); pinned {
+			return fmt.Errorf("%q is pinned to %s and must stay CLEARTEXT: sealing it leaves the server reading nothing where the pin should be, so it falls back to its own default, while the enclave still reconstructs `cleartext ∪ decrypted` and forwards the sealed value upstream — the router and the enclave then disagree about the request", f, quotedList(p.permitted))
 		}
 	}
 	return nil
 }
 
 // validatePinnedNotUnbound rejects an unbound set that frees a pinned cleartext
-// field of either family. An unbound field is excluded from the AAD, so an
-// intermediary can set it and Open still succeeds — which would let a router
-// flip a pinned `response_format: "b64_json"` to `"url"` in transit and hand
-// the enclave a request that publishes the images in the clear. A pin on an
-// unbound field is a pin in name only: it constrains the value at seal time and
-// nothing after.
+// field. An unbound field is excluded from the AAD, so an intermediary can set
+// it and Open still succeeds — which would let a router flip a pinned
+// `response_format: "b64_json"` to `"url"` in transit and hand the enclave a
+// request that publishes the images in the clear. A pin on an unbound field is
+// a pin in name only: it constrains the value at seal time and nothing after.
 //
-// Unlike the sealing rule this reads the same for both families: outside the
-// AAD, "rewritten" and "set from absent" are the same edit by the same party.
+// Optional pins read the same way: outside the AAD, "rewritten" and "set from
+// absent" are the same edit by the same party.
 func validatePinnedNotUnbound(spec profileSpec, unbound []string) error {
-	for _, fam := range spec.pinFamilies() {
-		for _, f := range unbound {
-			if want, pinned := fam.pins[f]; pinned {
-				return fmt.Errorf("%q is pinned to %s and cannot be unbound: an unbound field is outside the AAD, so an intermediary could set it to anything in transit and the enclave would accept the result", f, quotedList(want))
-			}
+	for _, f := range unbound {
+		if p, pinned := spec.pinFor(f); pinned {
+			return fmt.Errorf("%q is pinned to %s and cannot be unbound: an unbound field is outside the AAD, so an intermediary could set it to anything in transit and the enclave would accept the result", f, quotedList(p.permitted))
 		}
 	}
 	return nil
 }
 
-// validatePinnedCleartext enforces spec.pinnedCleartext against the request's
-// cleartext fields (§5.1 profiles). It runs at seal time, before any ciphertext
-// exists, so a request that would have leaked is never built — the same reason
-// the sealed-set check lives here rather than only in the enclave.
-func validatePinnedCleartext(spec profileSpec, req Request) error {
-	for field, want := range spec.pinnedCleartext {
-		raw, ok := req[field]
-		if !ok {
-			// Presence is required whether one value is permitted or several: what a
-			// pin guards against is the server's own default, which an absent field
-			// selects, and a set of two permitted values does not change that.
-			return fmt.Errorf("sealed request must set %q to %s explicitly (an absent value takes the server's default, which may not be permitted)", field, quotedList(want))
-		}
-		var got string
-		if err := json.Unmarshal(raw, &got); err != nil {
-			return fmt.Errorf("sealed request field %q must be a JSON string, %s: %w", field, quotedList(want), err)
-		}
-		if !slices.Contains(want, got) {
-			return fmt.Errorf("sealed request field %q must be %s, got %q", field, quotedList(want), got)
-		}
-	}
-	return nil
-}
-
-// validatePayloadIfPresentFor enforces a profile's CONDITIONAL payload fields
-// (§5.1): a field that need not exist, but MUST be sealed whenever the message
-// carries it. Anthropic's `system` is the case — see profileSpec.requiredIfPresent.
-//
-// It cannot live in ValidateSealedFieldsFor, which answers "is this set of field
-// names valid for this profile?" from (profile, fields) alone — a set can be
-// checked before any request exists, and this rule needs the request. So it is
-// called from both ends instead:
+// validatePayloadSealedFor enforces that every payload field the message
+// actually carries is in the sealed set (§5.1). It is the half of the payload
+// rule that needs the REQUEST: ValidateSealedFieldsFor answers "is this set of
+// field names valid for this profile?" from (profile, fields) alone — a set can
+// be checked before any request exists — which settles the mandatory fields and
+// can say nothing about the optional ones. So this is called from both ends:
 //
 //   - SealRequestFor, on the pre-seal request, where the field is present
 //     whether or not it is about to be sealed: "you have a system prompt and are
@@ -965,23 +898,20 @@ func validatePinnedCleartext(spec profileSpec, req Request) error {
 // must be sealed like any other value. That errs toward sealing, which is the
 // safe direction, and keeps the rule "if the field is in the object, it is
 // payload" rather than a JSON-value special case a sender could aim at.
-func validatePayloadIfPresentFor(p Profile, fields []string, msg Request) error {
+func validatePayloadSealedFor(p Profile, fields []string, msg Request) error {
 	spec, err := p.spec()
 	if err != nil {
 		return err
 	}
-	if len(spec.requiredIfPresent) == 0 {
-		return nil
-	}
 	sealed := toSet(fields)
-	for _, f := range spec.requiredIfPresent {
-		if _, present := msg[f]; !present {
+	for _, f := range spec.payload {
+		if _, present := msg[f.name]; !present {
 			continue
 		}
-		if _, isSealed := sealed[f]; isSealed {
+		if _, isSealed := sealed[f.name]; isSealed {
 			continue
 		}
-		return fmt.Errorf("%s-profile request carries %q in cleartext: it is payload and MUST be sealed whenever present", p, f)
+		return fmt.Errorf("%s-profile request carries %q in cleartext: it is payload and MUST be sealed whenever present", p, f.name)
 	}
 	return nil
 }
@@ -1018,7 +948,22 @@ func DefaultSealedFieldsFor(p Profile) []string {
 	if err != nil {
 		return []string{}
 	}
-	return slices.Clone(s.request)
+	return s.defaultRequestSealed()
+}
+
+// defaultRequestSealed is the v1 default request sealed set: every payload field
+// (mandatory and optional alike), then the extra defaults. Derived rather than
+// listed, so a profile names each field once and the default can never omit a
+// field the checks demand — which was a real hazard while the two were written
+// separately: an optional payload field missing from the default set is refused
+// by validatePayloadSealedFor on the first request that carries it, or worse,
+// handed to the router in the clear by a caller who skips that check.
+func (s profileSpec) defaultRequestSealed() []string {
+	out := make([]string, 0, len(s.payload)+len(s.extraDefaults))
+	for _, f := range s.payload {
+		out = append(out, f.name)
+	}
+	return append(out, s.extraDefaults...)
 }
 
 // Profiles returns every profile this package defines, sorted for determinism.
@@ -1095,11 +1040,10 @@ func ValidateSealedFields(fields []string) error {
 // failed 100% of requests: the exact failure mode the fail-fast call exists to
 // prevent.
 //
-// By the same rule, what it does NOT check is a profile's CONDITIONAL payload
-// fields (requiredIfPresent, e.g. Anthropic's `system`): whether those are
-// required depends on the request, not on the field names, so they cannot be
-// answered here. SealRequestFor and OpenRequestFor run that half — see
-// validatePayloadIfPresentFor.
+// By the same rule, what it does NOT check is a profile's OPTIONAL payload
+// fields (e.g. Anthropic's `system`): whether those must be sealed depends on
+// the request, not on the field names, so it cannot be answered here.
+// SealRequestFor and OpenRequestFor run that half — see validatePayloadSealedFor.
 func ValidateSealedFieldsFor(p Profile, fields []string) error {
 	spec, err := p.spec()
 	if err != nil {
@@ -1112,7 +1056,6 @@ func ValidateSealedFieldsFor(p Profile, fields []string) error {
 		return err
 	}
 	seen := make(map[string]struct{}, len(fields))
-	hasRequired := false
 	for _, f := range fields {
 		if f == "" {
 			return fmt.Errorf("empty sealed field name")
@@ -1124,12 +1067,14 @@ func ValidateSealedFieldsFor(p Profile, fields []string) error {
 			return fmt.Errorf("duplicate sealed field %q", f)
 		}
 		seen[f] = struct{}{}
-		if f == spec.required {
-			hasRequired = true
-		}
 	}
-	if !hasRequired {
-		return fmt.Errorf("%s-profile sealed fields must include %q", p, spec.required)
+	for _, f := range spec.payload {
+		if f.optional {
+			continue
+		}
+		if _, ok := seen[f.name]; !ok {
+			return fmt.Errorf("%s-profile sealed fields must include %q", p, f.name)
+		}
 	}
 	return nil
 }
@@ -1245,22 +1190,16 @@ func validateSealInputs(profile Profile, spec profileSpec, sealedFields, unbound
 // line between this function and validateSealInputs, and it is the same line
 // that says which checks could ever become assertions about constants.
 //
-// The two pinned VALUE checks stay separate, which is the whole of what the two
-// pin families still differ on: validatePinnedCleartext DEMANDS its field, and
-// folding the conditional one into it would demand `stream` on every sealed
-// speech request. Neither is "a value this profile refuses rather than one it
-// demands" — expressing the conditional pin that way is what let `"true"` and
-// `1` through, on an endpoint that materializes the request back into multipart.
+// Neither check is "a value this profile refuses rather than one it demands" —
+// expressing a pin that way is what let `"true"` and `1` through, on an endpoint
+// that materializes the request back into multipart (see pinnedField).
 func validateSealableRequest(profile Profile, spec profileSpec, sealedFields []string, req Request) error {
-	// The conditional half of the payload requirement: a field the profile only
-	// demands when it is there (Anthropic's `system`).
-	if err := validatePayloadIfPresentFor(profile, sealedFields, req); err != nil {
+	// The half of the payload requirement that needs the request: a field the
+	// profile only demands when it is there (Anthropic's `system`).
+	if err := validatePayloadSealedFor(profile, sealedFields, req); err != nil {
 		return err
 	}
-	if err := validatePinnedCleartext(spec, req); err != nil {
-		return err
-	}
-	return validatePinnedIfPresent(spec, req)
+	return validatePinnedValues(spec, req)
 }
 
 // E2EE is the sealing-metadata object added to the request under `_e2ee` (§5).
@@ -1410,15 +1349,13 @@ func SealRequestFor(profile Profile, encPub crypto.PublicKey, req Request, seale
 //
 // The checks, in order, all before any decryption:
 //
-//   - ValidateSealedFieldsFor — the sealed set covers this profile's payload
-//     field, so the request did not arrive with its prompt in the clear;
-//   - validatePayloadIfPresentFor — no conditional payload field (Anthropic's
+//   - ValidateSealedFieldsFor — the sealed set covers this profile's mandatory
+//     payload fields, so the request did not arrive with its prompt in the clear;
+//   - validatePayloadSealedFor — no optional payload field (Anthropic's
 //     top-level `system`) arrived in the cleartext half;
-//   - validatePinnedCleartextFor — the pinned cleartext field is present, has
-//     a permitted value, and was neither sealed away nor declared unbound;
-//   - validatePinnedIfPresentFor — every conditionally pinned field is absent or
-//     holds a permitted value, and none was sealed away or declared unbound.
-//     Distinct from the check above because absence is COMPLIANT here (§5.3.3).
+//   - validatePinnedFor — every pinned cleartext field holds a permitted value
+//     (and is present, unless the pin is optional), and none was sealed away or
+//     declared unbound.
 //
 // Then OpenRequest's own fail-closed checks (version, suite, AEAD, decrypted
 // keys == declared sealed_fields, no collision with cleartext).
@@ -1433,15 +1370,12 @@ func OpenRequestFor(profile Profile, priv crypto.PrivateKey, env Request) (Reque
 	if err := ValidateSealedFieldsFor(profile, e2ee.SealedFields); err != nil {
 		return nil, err
 	}
-	// Read on the ENVELOPE, where a sealed field is already gone: a conditional
+	// Read on the ENVELOPE, where a sealed field is already gone: an optional
 	// payload field still present here arrived in the clear.
-	if err := validatePayloadIfPresentFor(profile, e2ee.SealedFields, env); err != nil {
+	if err := validatePayloadSealedFor(profile, e2ee.SealedFields, env); err != nil {
 		return nil, err
 	}
-	if err := validatePinnedCleartextFor(profile, env); err != nil {
-		return nil, err
-	}
-	if err := validatePinnedIfPresentFor(profile, env); err != nil {
+	if err := validatePinnedFor(profile, env); err != nil {
 		return nil, err
 	}
 	return OpenRequest(priv, env)

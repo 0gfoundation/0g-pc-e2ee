@@ -597,7 +597,7 @@ func validateQuantityLocatorsNotSealed(p Profile, spec profileSpec, fields []str
 // conditionally-sealed response fields (SPEC §7.3): a field that need not
 // exist, but MUST be sealed whenever the frame carries it.
 //
-// It is the response-side twin of validatePayloadIfPresentFor, with the
+// It is the response-side twin of validatePayloadSealedFor, with the
 // receiving end swapped — the client is the half that holds here, where the
 // enclave is on the request side. The predicate is the same in both: a field
 // still present in the received cleartext was never sealed, because a sealer
