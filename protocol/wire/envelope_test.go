@@ -30,6 +30,29 @@ const sampleReq = `{
   "tools": [{"type":"function","function":{"name":"lookup"}}]
 }`
 
+// sampleReqAllDefaults carries every field the chat profile's DEFAULT sealed set
+// covers. SealRequestFor requires each field in the set it is given to be
+// present, so a test that seals with a nil (= default) set needs a request that
+// has them all; sampleReq deliberately does not, because a request that uses no
+// tool_choice is the ordinary case and is what the crypto tests should exercise.
+const sampleReqAllDefaults = `{
+  "model": "gpt-4o",
+  "temperature": 0.7,
+  "messages": [{"role":"user","content":"my secret prompt"}],
+  "tools": [{"type":"function","function":{"name":"lookup"}}],
+  "tool_choice": {"type":"function","function":{"name":"lookup"}}
+}`
+
+// sampleAnthropicReqAllDefaults is the same for /v1/messages.
+const sampleAnthropicReqAllDefaults = `{
+  "model": "claude-x",
+  "max_tokens": 1024,
+  "system": "my secret system prompt",
+  "messages": [{"role":"user","content":"my secret question"}],
+  "tools": [{"name":"lookup","input_schema":{"type":"object"}}],
+  "tool_choice": {"type":"tool","name":"lookup"}
+}`
+
 func mustReq(t *testing.T, s string) wire.Request {
 	t.Helper()
 	var r wire.Request
@@ -210,7 +233,7 @@ func TestSealRequestRejectsBadSignerAddr(t *testing.T) {
 
 func TestSealRequestNilUsesDefaultSet(t *testing.T) {
 	priv, pub, _ := crypto.GenerateRecipientKey()
-	env, err := wire.SealRequest(pub, mustReq(t, sampleReq), nil, testProvider, validEph)
+	env, err := wire.SealRequest(pub, mustReq(t, sampleReqAllDefaults), nil, testProvider, validEph)
 	if err != nil {
 		t.Fatalf("seal: %v", err)
 	}
@@ -218,7 +241,7 @@ func TestSealRequestNilUsesDefaultSet(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read _e2ee: %v", err)
 	}
-	if !reflect.DeepEqual(e2ee.SealedFields, []string{"messages", "tools"}) {
+	if !reflect.DeepEqual(e2ee.SealedFields, []string{"messages", "tools", "tool_choice"}) {
 		t.Fatalf("nil sealedFields should use the default set, got %v", e2ee.SealedFields)
 	}
 	if _, err := wire.OpenRequest(priv, env); err != nil {
@@ -338,6 +361,19 @@ func TestValidateUnboundFieldsForMatchesWhatSealEnforces(t *testing.T) {
 				body = sampleReq
 			case wire.ProfileAnthropic:
 				body = sampleAnthropicReq
+			}
+			// A nil `sealed` became the profile's full DEFAULT above, and
+			// SealRequestFor requires every field in that set to be present. Use a
+			// body that carries them all, so this row asserts the two verdicts
+			// agreeing rather than a "sealed field not present" error that has
+			// nothing to do with unbound fields.
+			if tc.sealed == nil {
+				switch tc.profile {
+				case wire.ProfileChat:
+					body = sampleReqAllDefaults
+				case wire.ProfileAnthropic:
+					body = sampleAnthropicReqAllDefaults
+				}
 			}
 			_, sealErr := wire.SealRequestFor(tc.profile, pub, mustReq(t, body),
 				sealed, testProvider, ephPub, tc.unbound...)

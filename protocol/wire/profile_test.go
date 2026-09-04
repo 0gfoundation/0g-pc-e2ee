@@ -244,10 +244,10 @@ func TestProfileDefaults(t *testing.T) {
 		// reason applies.
 		why string
 	}{
-		wire.ProfileChat:  {request: []string{"messages", "tools"}, response: []string{"choices"}},
+		wire.ProfileChat:  {request: []string{"messages", "tools", "tool_choice"}, response: []string{"choices"}},
 		wire.ProfileImage: {request: []string{"prompt"}, response: []string{"data"}},
 		wire.ProfileAnthropic: {
-			request:  []string{"messages", "system", "tools"},
+			request:  []string{"messages", "system", "tools", "tool_choice"},
 			response: []string{},
 			why:      "frame-typed (§7.2): what a frame seals is a property of the frame",
 		},

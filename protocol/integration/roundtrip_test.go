@@ -63,6 +63,11 @@ func sampleRequest() wire.Request {
 		"temperature": json.RawMessage(`0.7`),
 		"messages":    json.RawMessage(`[{"role":"user","content":"the secret prompt"}]`),
 		"tools":       json.RawMessage(`[{"type":"function","function":{"name":"calc"}}]`),
+		// Carried because these tests seal with a nil set, which means the profile
+		// DEFAULT, and SealRequest requires every field in the set it is given to
+		// be present. A tool-calling request that also directs the choice is a
+		// realistic end-to-end shape, so this covers more rather than less.
+		"tool_choice": json.RawMessage(`{"type":"function","function":{"name":"calc"}}`),
 	}
 }
 

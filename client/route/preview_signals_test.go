@@ -246,3 +246,58 @@ func TestSignalPlaceholdersAreSelfContained(t *testing.T) {
 		}
 	}
 }
+
+// `tool_choice` joined the signal table in the same change that made it
+// payload, and the two had to ship together: the moment it becomes payload the
+// preview withholds it automatically, so without this the router's soft
+// preference — and, under `require_parameters`, its HARD filter — would stop
+// applying with nothing reporting it.
+func TestPreviewSignalsToolChoiceWithoutTheSelectedTool(t *testing.T) {
+	choices := map[wire.Profile]string{
+		wire.ProfileChat:      `{"type":"function","function":{"name":"transfer_funds"}}`,
+		wire.ProfileAnthropic: `{"type":"tool","name":"transfer_funds"}`,
+	}
+	r := New("http://unused")
+	for _, ep := range endpoint.All {
+		if _, withheld := r.withheldFor(ep)["tool_choice"]; !withheld {
+			continue
+		}
+		t.Run(string(ep.Profile), func(t *testing.T) {
+			req := toolsRequest(ep, secretToolSchema)
+			req["tool_choice"] = json.RawMessage(choices[ep.Profile])
+			preview := previewOn(t, ep, req)
+
+			raw, ok := preview["tool_choice"]
+			if !ok {
+				t.Fatal("preview omits tool_choice: the router cannot tell the request sets it, " +
+					"so require_parameters would stop enforcing it")
+			}
+			if !presentAndNotNull(raw) {
+				t.Errorf("the signal must satisfy the router's detection, got %s", raw)
+			}
+			body, err := json.Marshal(preview)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if strings.Contains(string(body), "transfer_funds") {
+				t.Errorf("preview leaked the SELECTED tool's name: %s", body)
+			}
+		})
+	}
+}
+
+// A request that sets no tool_choice must not preview as if it did.
+func TestPreviewAddsNoToolChoiceSignalWhenAbsent(t *testing.T) {
+	r := New("http://unused")
+	for _, ep := range endpoint.All {
+		if _, withheld := r.withheldFor(ep)["tool_choice"]; !withheld {
+			continue
+		}
+		t.Run(string(ep.Profile), func(t *testing.T) {
+			preview := previewOn(t, ep, toolsRequest(ep, secretToolSchema))
+			if _, ok := preview["tool_choice"]; ok {
+				t.Error("a request that sets no tool_choice must not preview as if it did")
+			}
+		})
+	}
+}

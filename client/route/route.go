@@ -455,11 +455,6 @@ type previewCapabilitySignal struct {
 
 // previewCapabilitySignals is keyed by the field name as it appears in the
 // request. A field absent from this map is simply withheld, as before.
-//
-// `tool_choice` is NOT here because it is not withheld today — it is not a
-// payload field, so the preview carries the caller's own value. When it becomes
-// payload it needs a row, or the router's soft preference (and, under
-// `require_parameters`, its hard filter) silently stops applying to it too.
 var previewCapabilitySignals = map[string]previewCapabilitySignal{
 	"tools": {
 		detected: nonEmptyJSONArray,
@@ -473,6 +468,45 @@ var previewCapabilitySignals = map[string]previewCapabilitySignal{
 			wire.ProfileAnthropic: json.RawMessage(`[{"name":"_","input_schema":{"type":"object"}}]`),
 		},
 	},
+	// `tool_choice` became payload in the same change that added this row, and
+	// the two had to ship together: the moment it joins a profile's payload it
+	// is withheld from the preview automatically (the withheld set IS the
+	// default sealed set), so without a signal the router's soft preference —
+	// and, under `require_parameters`, its HARD filter — would stop applying
+	// with nothing reporting it. That failure is not about third-party senders:
+	// `require_parameters: true` is a guarantee our own callers ask for, and it
+	// would have been silently weakened.
+	fieldToolChoice: {
+		// The router's rule for this field, verbatim: set and not JSON null. No
+		// no-op exception, unlike the penalties — `tool_choice` has no numeric
+		// default to filter out, so its mere presence is genuine caller intent.
+		detected: presentAndNotNull,
+		// The neutral value on each surface, which is what the enum forms already
+		// are: "let the model decide". The router reads only presence, so the
+		// placeholder answers the routing question exactly while the SELECTED
+		// tool — the thing sealing this field exists to hide — never leaves.
+		placeholder: map[wire.Profile]json.RawMessage{
+			wire.ProfileChat:      json.RawMessage(`"auto"`),
+			wire.ProfileAnthropic: json.RawMessage(`{"type":"auto"}`),
+		},
+	},
+}
+
+// fieldToolChoice is the request field naming which tool to call. Spelled here
+// rather than imported: this table is keyed by the name as it appears in the
+// caller's JSON, which is the router's view of it, not the protocol's.
+const fieldToolChoice = "tool_choice"
+
+// presentAndNotNull is the router's own presence rule for a scalar-or-object
+// field: set, and not JSON null. Unlike nonEmptyJSONArray there is no "empty"
+// spelling to see through — any value of `tool_choice` is a real instruction,
+// including the enum forms.
+func presentAndNotNull(raw json.RawMessage) bool {
+	var v any
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return false
+	}
+	return v != nil
 }
 
 // nonEmptyJSONArray reports whether raw is a JSON array with at least one

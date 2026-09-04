@@ -47,6 +47,19 @@ const (
 	// calling application performs, so the set of them describes what the user is
 	// doing, in the caller's own vocabulary.
 	fieldTools = "tools"
+	// fieldToolChoice is the caller's instruction about WHICH tool to use. Its
+	// object form names one — `{"type":"function","function":{"name":"…"}}` on
+	// chat, `{"type":"tool","name":"…"}` on Anthropic — so it is payload for
+	// fieldTools' reason, carried further: the schema list is the menu of
+	// operations the application can perform, and this is the one it is
+	// INVOKING. Sealing every schema and leaving this readable would hand the
+	// router the selection while hiding the catalogue.
+	//
+	// Its enum forms ("auto", "none", "required") carry nothing, and are sealed
+	// anyway: the rule is about the field, not its value, so a sender cannot
+	// keep it cleartext by choosing a shape (see payloadField.optional and
+	// §5.1's literal-presence rule).
+	fieldToolChoice = "tool_choice"
 	// fieldSystem is Anthropic's TOP-LEVEL system prompt (/v1/messages), as
 	// opposed to OpenAI's system message inside "messages". Being its own
 	// top-level field is why it needs naming at all: it is payload the chat
@@ -559,6 +572,7 @@ var profiles = map[Profile]profileSpec{
 		payload: []payloadField{
 			{name: fieldMessages},
 			{name: fieldTools, optional: true},
+			{name: fieldToolChoice, optional: true},
 		},
 		responsePayload: []payloadField{{name: fieldChoices}},
 	},
@@ -597,6 +611,7 @@ var profiles = map[Profile]profileSpec{
 			{name: fieldMessages},
 			{name: fieldSystem, optional: true},
 			{name: fieldTools, optional: true},
+			{name: fieldToolChoice, optional: true},
 		},
 		// The response is frame-typed, so there is no single field a frame must
 		// seal and no meaningful profile-wide default set: both are properties of

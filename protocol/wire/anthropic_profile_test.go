@@ -451,7 +451,7 @@ func TestAnthropicRefusesAnUnknownFrameShape(t *testing.T) {
 // response default keeps a caller that feeds it back into SealFrame failing
 // closed on every content frame instead of sealing nothing.
 func TestAnthropicProfileDefaults(t *testing.T) {
-	if got, want := wire.DefaultSealedFieldsFor(wire.ProfileAnthropic), []string{"messages", "system", "tools"}; !equalStrings(got, want) {
+	if got, want := wire.DefaultSealedFieldsFor(wire.ProfileAnthropic), []string{"messages", "system", "tools", "tool_choice"}; !equalStrings(got, want) {
 		t.Errorf("request defaults = %v, want %v", got, want)
 	}
 	respDefaults := wire.DefaultResponseSealedFieldsFor(wire.ProfileAnthropic)
