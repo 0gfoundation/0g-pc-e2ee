@@ -71,10 +71,10 @@ func (u *upstreamRecorder) bodyAt(t *testing.T, path string) map[string]json.Raw
 // fixture. It is how proxycli.Build wires the gateway, minus the attestation the
 // fixture cannot satisfy.
 //
-// It deliberately does NOT pass WithSealFields: -seal-fields is chat's set by
-// definition, and this surface seals its own profile's default (messages, plus
-// system when present). Passing chat's set here is the misconfiguration the row
-// exists to make impossible.
+// It deliberately does NOT pass WithSealFields: this surface seals its own
+// profile's default (messages, plus system when present), derived from the row.
+// Handing it another profile's set is the misconfiguration the row exists to
+// make impossible — which is why no deployment can configure the set at all.
 func anthropicGateway(t *testing.T, upstreamURL string, c *http.Client) *httptest.Server {
 	t.Helper()
 	router := route.New(upstreamURL)

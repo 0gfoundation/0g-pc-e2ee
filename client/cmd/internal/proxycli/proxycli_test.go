@@ -9,13 +9,11 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"strings"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
-	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
 // testLogger discards output; the shutdown tests assert on serve's return value
@@ -164,21 +162,6 @@ func TestStartWarmerNoopWhenOff(t *testing.T) {
 	stop() // must not panic or block
 }
 
-// parseCSV trims each element and drops empty ones, so surrounding spaces and a
-// trailing comma do not produce blank fields.
-func TestParseCSV(t *testing.T) {
-	got := parseCSV(" messages , model ,")
-	want := []string{"messages", "model"}
-	if len(got) != len(want) {
-		t.Fatalf("got %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("index %d: got %q, want %q", i, got[i], want[i])
-		}
-	}
-}
-
 // TestBuildDirectMode: -provider-url selects direct-broker mode — Build wires a
 // working client with no router (so no warmer), and -verify-responses is allowed
 // without -attest (in direct mode the signer comes from the broker the operator
@@ -305,136 +288,17 @@ func TestIdleKeepAliveIsBoundedOnlyByIdleTimeout(t *testing.T) {
 	}
 }
 
-// Build passes route.WithSensitiveFields only when the operator actually chose a
-// seal set. Passing it unconditionally pins the router's withheld-field set to
-// this binary's default — the CHAT set — permanently overriding route.New's
-// derivation of it from the service type. Today that is a no-op (this binary is
-// chat-only); it becomes a prompt leak the moment a -service-type flag lands and
-// someone runs the image profile, and the preview body is everything NOT
-// withheld, so a stale set uploads the payload rather than failing.
-func TestSealFieldsExplicitnessDrivesTheRouteOption(t *testing.T) {
-	tests := []struct {
-		name       string
-		args       []string
-		env        string
-		wantCustom bool
-	}{
-		{"untouched flag is not an operator choice", nil, "", false},
-		{"an explicit flag is", []string{"-seal-fields", "messages,tools,user"}, "", true},
-		{"an explicit env var is", nil, "messages,user", true},
-		{
-			// Spelling the default out by hand is indistinguishable from not
-			// setting it, and means the same thing, so it stays a no-op.
-			"restating the default is not a choice",
-			[]string{"-seal-fields", strings.Join(wire.DefaultSealedFields(), ",")},
-			"", false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if tt.env != "" {
-				t.Setenv("ZG_TEST_SEAL_FIELDS", tt.env)
-			}
-			fs := flag.NewFlagSet("t", flag.ContinueOnError)
-			f := RegisterFlags(fs, "ZG_TEST", ":0")
-			if err := fs.Parse(tt.args); err != nil {
-				t.Fatalf("parse: %v", err)
-			}
-			gotCustom := *f.sealFieldsCSV != f.sealFieldsDefault
-			if gotCustom != tt.wantCustom {
-				t.Fatalf("treated as operator-chosen = %v, want %v (value=%q default=%q)",
-					gotCustom, tt.wantCustom, *f.sealFieldsCSV, f.sealFieldsDefault)
-			}
-		})
-	}
-}
-
-// A binary that also serves the image profile must validate -unbound-fields
-// against THAT profile too, at startup.
-//
-// The two clients share one -unbound-fields set but seal under different
-// profiles, and SealRequestFor re-runs the check per request. So a chat-only
-// validation accepts sets that make every image request fail at seal time — the
-// exact failure mode ValidateSealedFieldsFor's own doc calls out: "passed startup
-// validation clean and then failed 100% of requests." A startup error is the
-// operator's chance to fix a flag; a per-request seal error is an outage.
-func TestValidateFieldSetsCoversTheImageProfile(t *testing.T) {
-	chatSeal := wire.DefaultSealedFieldsFor(wire.ProfileChat)
-	for _, tc := range []struct {
-		name    string
-		unbound []string
-		serves  []endpoint.Endpoint // nil = chat only, the sidecar's shape
-		wantErr bool
-	}{
-		{
-			name:    "unbinding the image prompt is fine for a chat-only binary",
-			unbound: []string{"model", "prompt"},
-		},
-		{
-			// "prompt" is the image profile's whole sealed payload: unbound and sealed
-			// at once is a contradiction, and every image seal would reject it.
-			name:    "...and refused once the binary also serves images",
-			unbound: []string{"model", "prompt"},
-			serves:  endpoint.All,
-			wantErr: true,
-		},
-		{
-			name:    "unbinding response_format is fine for a chat-only binary",
-			unbound: []string{"model", "response_format"},
-		},
-		{
-			// Pinned cleartext: unbound puts it outside the AAD, where an intermediary
-			// could rewrite "b64_json" to "url" and have the enclave accept it.
-			name:    "...and refused once the binary also serves images",
-			unbound: []string{"model", "response_format"},
-			serves:  endpoint.All,
-			wantErr: true,
-		},
-		{
-			name:    "an ordinary unbound field passes every served profile",
-			unbound: []string{"model", "user"},
-			serves:  endpoint.All,
-		},
-		{
-			name:    "the shipped default passes every served profile",
-			unbound: wire.DefaultUnboundFields(),
-			serves:  endpoint.All,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			serves := tc.serves
-			if serves == nil {
-				serves = []endpoint.Endpoint{endpoint.Chat}
-			}
-			which, err := validateFieldSets(chatSeal, tc.unbound, serves)
-			if got := err != nil; got != tc.wantErr {
-				t.Fatalf("validateFieldSets error = %v (%v), want %v", got, err, tc.wantErr)
-			}
-			if tc.wantErr && which == "" {
-				t.Error("a rejection must name the flag to blame")
-			}
-		})
-	}
-}
-
-// Direct-broker mode serves chat alone whatever the binary asked for, and — the
-// part that was broken — validates the operator's flags against chat alone too.
-// The served set used to be decided twice: the Serves list drove validation
-// while the direct branch hard-coded chat, so a direct-mode gateway (which asks
-// for endpoint.All) refused to start on `-unbound-fields=model,response_format`,
-// a setting that is only invalid for the image profile it would never seal
-// under. Both halves are asserted: it starts, and it built exactly one client.
-func TestBuildDirectModeServesAndValidatesChatOnly(t *testing.T) {
+// Direct-broker mode serves chat alone whatever the binary asked for: NewDirect
+// derives the broker's paths as chat, so any other row would seal to a chat
+// endpoint. A binary that asks for endpoint.All must therefore still end up with
+// exactly one client, which is what pins the narrowing in servedSurfaces to
+// something the direct path actually reads.
+func TestBuildDirectModeServesChatOnly(t *testing.T) {
 	fs := flag.NewFlagSet("t", flag.ContinueOnError)
 	f := RegisterFlags(fs, "ZG_TEST", ":0")
-	if err := fs.Parse([]string{
-		"-provider-url", "https://broker.example/v1",
-		"-unbound-fields", "model,response_format", // invalid for image, fine for chat
-	}); err != nil {
+	if err := fs.Parse([]string{"-provider-url", "https://broker.example/v1"}); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
-	// Build exits the process on a validation failure, so reaching the assertions
-	// below IS the first half of the test.
 	built := f.Build("test", testLogger(), Serves(endpoint.All...))
 	if len(built.Clients) != 1 || built.Clients[endpoint.Chat.Path] == nil {
 		t.Errorf("direct mode must build the chat client and nothing else, got %d clients", len(built.Clients))

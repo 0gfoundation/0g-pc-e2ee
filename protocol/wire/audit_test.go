@@ -336,10 +336,10 @@ func TestOnlyTheFinalFrameOwesTheBillableCount(t *testing.T) {
 	}
 }
 
-// ValidateSealedFieldsFor is documented as the fail-fast validator for an
-// operator-supplied set (the sidecar's -seal-fields). Both rules it enforces
-// depend on nothing but (profile, fields), so an operator must get both verdicts
-// at startup. With the pinned half checked only inside SealRequestFor,
+// ValidateSealedFieldsFor is documented as the fail-fast validator for a
+// caller-supplied set (core.WithSealFields). Both rules it enforces depend on
+// nothing but (profile, fields), so a caller checking a set up front must get
+// both verdicts. With the pinned half checked only inside SealRequestFor,
 // `prompt,response_format` validated clean and then failed every single request
 // — precisely the outcome the up-front call exists to rule out.
 func TestConfigTimeValidationRejectsASetThatSealsThePin(t *testing.T) {

@@ -66,3 +66,90 @@ func TestProfilesUnionCoversFieldsNoChatOrImageProfileHas(t *testing.T) {
 		}
 	}
 }
+
+// Every profile's own SHIPPED DEFAULTS must satisfy that profile's own rules.
+//
+// This is the coverage the per-request checks structurally cannot give. Those
+// run only for profiles a given binary actually serves, and only for requests
+// it actually receives, so a table edit that makes a default set inconsistent
+// with its own profile is invisible until the first request on that surface —
+// which is after the upstream call, hence after the bill. Here it is one
+// assertion per row, for every row, at compile-and-test time.
+//
+// It is a test rather than a runtime check for the reason SealRequestFor's two
+// validators are split: these inputs are CONSTANTS of this package, so their
+// verdict never changes between runs. What the runtime checks answer instead is
+// what a CALLER supplied — a set from core.WithSealFields, a request from a
+// user — which this can say nothing about.
+func TestEveryProfileDefaultSatisfiesItsOwnRules(t *testing.T) {
+	for _, p := range Profiles() {
+		t.Run(string(p), func(t *testing.T) {
+			spec, err := p.spec()
+			if err != nil {
+				t.Fatalf("spec(): %v", err)
+			}
+			sealed := DefaultSealedFieldsFor(p)
+			// The default set must pass the same name-only validation a caller's
+			// set does: it contains the payload field, has no duplicates, and
+			// seals away neither pin family's field.
+			if err := ValidateSealedFieldsFor(p, sealed); err != nil {
+				t.Errorf("the shipped default sealed set %v is invalid for its own profile: %v", sealed, err)
+			}
+			// A field that is mandatory WHEN PRESENT must be in the default set.
+			// Otherwise the default itself leaks: a request carrying Anthropic's
+			// `system`, or a transcription carrying `filename`, would be refused
+			// by validatePayloadIfPresentFor — or worse, accepted by a caller who
+			// skips it, handing the field to the router in the clear.
+			for _, f := range spec.requiredIfPresent {
+				if !slices.Contains(sealed, f) {
+					t.Errorf("%q is required-when-present but missing from the default sealed set %v", f, sealed)
+				}
+			}
+			// The shipped unbound default must be usable with the shipped sealed
+			// default, for EVERY profile — not just whichever one a binary serves.
+			// A mismatch here is the "passed startup clean, then failed 100% of
+			// requests" failure that ValidateUnboundFieldsFor exists to prevent.
+			if err := ValidateUnboundFieldsFor(p, DefaultUnboundFields(), sealed); err != nil {
+				t.Errorf("the shipped default unbound set %v is unusable with the default sealed set %v: %v",
+					DefaultUnboundFields(), sealed, err)
+			}
+
+			// Response side. A frame-typed profile has no profile-wide default
+			// (the sealed set is a property of the frame), and so does one whose
+			// set is not constant — both correctly report an empty set, which is
+			// the "fail on the first request rather than on the first UNUSUAL
+			// request" choice DefaultResponseSealedFieldsFor documents.
+			respDefault := DefaultResponseSealedFieldsFor(p)
+			if ResponseFramesAreTyped(p) || len(spec.responseRequiredIfPresent) > 0 {
+				if len(respDefault) != 0 {
+					t.Errorf("profile has no constant response default, but got %v", respDefault)
+				}
+			} else if !slices.Contains(respDefault, spec.responseRequired) {
+				t.Errorf("the default response sealed set %v omits the field every frame must seal (%q)",
+					respDefault, spec.responseRequired)
+			}
+			// A conditional response field must NOT also be listed as always
+			// sealed: responseFieldsFor unions the two, and a name in both would
+			// make the frameless default claim a field a plain `json` response
+			// never carries.
+			for _, f := range spec.responseRequiredIfPresent {
+				if slices.Contains(spec.response, f) {
+					t.Errorf("%q is listed both as always-sealed and as sealed-when-present", f)
+				}
+			}
+			// The request-side twin, on the two PIN families. pinFamilies' doc
+			// leans on this: it says iteration order is not load-bearing, which
+			// holds only while no field is in both maps. A field in both would
+			// draw contradictory verdicts from the value checks —
+			// validatePinnedCleartext demands it, validatePinnedIfPresent permits
+			// its absence — and which error a caller saw would then depend on the
+			// order that doc calls irrelevant.
+			for f := range spec.pinnedCleartext {
+				if _, both := spec.pinnedIfPresent[f]; both {
+					t.Errorf("%q is pinned in both families: one demands the field and the other "+
+						"permits its absence, so the verdict would depend on iteration order", f)
+				}
+			}
+		})
+	}
+}

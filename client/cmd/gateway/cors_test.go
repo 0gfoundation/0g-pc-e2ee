@@ -5,11 +5,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"regexp"
-	"strings"
 	"testing"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
-	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
 // The browser allowlist these tests drive newHandler with, kept independent of the
@@ -145,49 +143,5 @@ func TestComposeAllowedOriginsMatchesDefault(t *testing.T) {
 		t.Errorf("compose allowlist and the built-in default disagree:\n compose: %q\n default: %q\n"+
 			"update whichever is stale — the deployed enclave serves the compose value", got,
 			openaiproxy.DefaultAllowedOriginsCSV)
-	}
-}
-
-// composeCommentedDefault matches a commented-out `# - "NAME=value"` entry in the
-// compose's environment block — the form used to document a setting the deployment
-// leaves at its built-in default.
-func composeCommentedDefault(t *testing.T, compose []byte, name string) string {
-	t.Helper()
-	re := regexp.MustCompile(`(?m)^\s*#\s*-\s*"` + regexp.QuoteMeta(name) + `=([^"]*)"`)
-	m := re.FindSubmatch(compose)
-	if m == nil {
-		t.Fatalf("no commented-out %s entry in %s", name, composePath)
-	}
-	return string(m[1])
-}
-
-// TestComposeCommentedDefaultsMatchTheBinary is TestComposeAllowedOriginsMatchesDefault's
-// counterpart for the two field sets the deployment does NOT set. They are written
-// out as commented lines so a reader of the measured manifest can see what the
-// enclave seals without opening the Go source — which makes them a copy of
-// wire.DefaultSealedFields/DefaultUnboundFields, and a copy needs a test.
-//
-// Not a hypothetical: DefaultUnboundFields carries TODO(model-binding), which
-// reverts it to the empty set once the router stops rewriting "model". The day that
-// lands, an untested comment here would start telling operators the enclave leaves
-// the model name unbound when it no longer does.
-func TestComposeCommentedDefaultsMatchTheBinary(t *testing.T) {
-	compose, err := os.ReadFile(composePath)
-	if err != nil {
-		t.Fatalf("read %s: %v", composePath, err)
-	}
-	for _, tc := range []struct {
-		env  string
-		want []string
-	}{
-		{"ZG_GATEWAY_SEAL_FIELDS", wire.DefaultSealedFields()},
-		{"ZG_GATEWAY_UNBOUND_FIELDS", wire.DefaultUnboundFields()},
-	} {
-		got := composeCommentedDefault(t, compose, tc.env)
-		if want := strings.Join(tc.want, ","); got != want {
-			t.Errorf("%s comment claims %q, but the binary defaults to %q; update the "+
-				"compose comment (it is read by operators as what the enclave seals)",
-				tc.env, got, want)
-		}
 	}
 }
