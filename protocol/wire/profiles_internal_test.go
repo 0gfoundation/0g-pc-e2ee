@@ -137,6 +137,19 @@ func TestEveryProfileDefaultSatisfiesItsOwnRules(t *testing.T) {
 					t.Errorf("%q is listed both as always-sealed and as sealed-when-present", f)
 				}
 			}
+			// The request-side twin, on the two PIN families. pinFamilies' doc
+			// leans on this: it says iteration order is not load-bearing, which
+			// holds only while no field is in both maps. A field in both would
+			// draw contradictory verdicts from the value checks —
+			// validatePinnedCleartext demands it, validatePinnedIfPresent permits
+			// its absence — and which error a caller saw would then depend on the
+			// order that doc calls irrelevant.
+			for f := range spec.pinnedCleartext {
+				if _, both := spec.pinnedIfPresent[f]; both {
+					t.Errorf("%q is pinned in both families: one demands the field and the other "+
+						"permits its absence, so the verdict would depend on iteration order", f)
+				}
+			}
 		})
 	}
 }

@@ -359,3 +359,59 @@ func TestBuildClientsFollowWhatTheBinaryServes(t *testing.T) {
 		})
 	}
 }
+
+// A retired field-set variable must be DETECTED by presence, not by value.
+// Removing a flag announces itself through flag.Parse; removing the env var that
+// fed it does not, and both drift directions weaken the field split — so
+// RegisterFlags refuses to start. The refusal itself is log.Fatalf (as for a
+// malformed envBool), so what is asserted here is the decision behind it.
+//
+// The empty case is the one a `!= ""` test would miss and the one that matters
+// most: UNBOUND_FIELDS= is how an operator asks for everything bound, and
+// silently ignoring it leaves `model` outside the AAD.
+func TestRetiredFieldSetEnvIsDetectedByPresence(t *testing.T) {
+	env := func(name string) string { return "ZG_RETIRED_TEST_" + name }
+	for _, tc := range []struct {
+		name, key, val string
+		wantFound      bool
+	}{
+		{"nothing set", "", "", false},
+		{"SEAL_FIELDS with a value", "SEAL_FIELDS", "messages,tools,user", true},
+		{"SEAL_FIELDS set empty", "SEAL_FIELDS", "", true},
+		{"UNBOUND_FIELDS with a value", "UNBOUND_FIELDS", "model,max_tokens", true},
+		{"UNBOUND_FIELDS set empty (bind everything)", "UNBOUND_FIELDS", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.key != "" {
+				t.Setenv(env(tc.key), tc.val)
+			}
+			name, value, found := setRetiredFieldSetEnv(env)
+			if found != tc.wantFound {
+				t.Fatalf("found = %v, want %v (name=%q value=%q)", found, tc.wantFound, name, value)
+			}
+			if !found {
+				return
+			}
+			if name != env(tc.key) {
+				t.Errorf("named %q, want %q", name, env(tc.key))
+			}
+			if value != tc.val {
+				t.Errorf("value = %q, want %q", value, tc.val)
+			}
+		})
+	}
+}
+
+// Every retired name must be covered by the check, so adding one to the list is
+// all it takes — no second place to remember.
+func TestRetiredFieldSetEnvCoversEveryListedName(t *testing.T) {
+	env := func(name string) string { return "ZG_RETIRED_COVER_" + name }
+	for _, n := range retiredFieldSetEnv {
+		t.Run(n, func(t *testing.T) {
+			t.Setenv(env(n), "anything")
+			if _, _, found := setRetiredFieldSetEnv(env); !found {
+				t.Errorf("%s is listed as retired but setting it is not refused", env(n))
+			}
+		})
+	}
+}
