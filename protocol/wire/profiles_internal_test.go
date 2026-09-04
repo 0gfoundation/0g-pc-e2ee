@@ -124,21 +124,26 @@ func TestEveryProfileDefaultSatisfiesItsOwnRules(t *testing.T) {
 			// the "fail on the first request rather than on the first UNUSUAL
 			// request" choice DefaultResponseSealedFieldsFor documents.
 			respDefault := DefaultResponseSealedFieldsFor(p)
-			if ResponseFramesAreTyped(p) || len(spec.responseRequiredIfPresent) > 0 {
+			if ResponseFramesAreTyped(p) || spec.hasOptionalResponsePayload() {
 				if len(respDefault) != 0 {
 					t.Errorf("profile has no constant response default, but got %v", respDefault)
 				}
-			} else if !slices.Contains(respDefault, spec.responseRequired) {
-				t.Errorf("the default response sealed set %v omits the field every frame must seal (%q)",
-					respDefault, spec.responseRequired)
+			} else {
+				for _, f := range spec.responsePayload {
+					if !slices.Contains(respDefault, f.name) {
+						t.Errorf("the default response sealed set %v omits %q, which every frame must seal",
+							respDefault, f.name)
+					}
+				}
 			}
-			// A conditional response field must NOT also be listed as always
-			// sealed: responseFieldsFor unions the two, and a name in both would
-			// make the frameless default claim a field a plain `json` response
-			// never carries.
-			for _, f := range spec.responseRequiredIfPresent {
-				if slices.Contains(spec.response, f) {
-					t.Errorf("%q is listed both as always-sealed and as sealed-when-present", f)
+			// An OPTIONAL response payload field must never reach the always-sealed
+			// default: SealFrame refuses a sealed field the frame does not have, so
+			// a default naming `segments` would reject every plain `json` response.
+			// Deriving the default from one list is what enforces that — while the
+			// two were separate lists, a name could sit in both.
+			for _, f := range spec.responsePayload {
+				if f.optional && slices.Contains(spec.alwaysSealedResponseFields(), f.name) {
+					t.Errorf("%q is optional but reached the always-sealed response set", f.name)
 				}
 			}
 			// The request-side twin, on the PINS. A field pinned twice would draw

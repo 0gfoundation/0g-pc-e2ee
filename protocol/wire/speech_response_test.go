@@ -77,7 +77,7 @@ func TestSpeechJSONResponseSealsOnlyTheTranscript(t *testing.T) {
 	}
 }
 
-// The point of responseRequiredIfPresent: a nil sealed set resolves against THIS
+// The point of an OPTIONAL response payload field: a nil sealed set resolves against THIS
 // frame, so the verbose shape's `segments` and inferred `language` are sealed
 // without the caller naming them, and the json shape above is not asked for
 // fields it does not have.

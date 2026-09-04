@@ -90,7 +90,7 @@ const (
 	// different things wearing one name: on the request it is the caller's
 	// language hint, on the response it is the language the enclave INFERRED from
 	// the audio. Both are payload, so both are sealed, but only the response one
-	// is conditional (see profileSpec.responseRequiredIfPresent).
+	// is conditional (see profileSpec.responsePayload).
 	fieldLanguage = "language"
 	// fieldStream is the speech profile's conditionally pinned cleartext field
 	// (SPEC §5.3.3): the profile defines no streaming frame taxonomy, so the
@@ -152,7 +152,7 @@ const (
 	//
 	// It is single-shape like chat and image, but its response sealed set is not
 	// a constant: `verbose_json` adds `segments`, and `words` only when word
-	// granularity was requested (see responseRequiredIfPresent).
+	// granularity was requested (see responsePayload).
 	ProfileSpeech Profile = "speech"
 )
 
@@ -170,37 +170,35 @@ type profileSpec struct {
 	// defaultRequestSealed — so each field is named once and a default can never
 	// omit a field the checks demand.
 	extraDefaults []string
-	// responseRequired is the field a sealed frame MUST cover (§7); response is
-	// the v1 DEFAULT, which may be a superset. Keeping the two distinct matters
-	// for the same reason payloadField.optional exists: reusing one field would
-	// silently mean "every default is mandatory" — fine while each response
-	// default has exactly one member, wrong the moment a profile defaults to
-	// sealing two fields of which only one is the content.
-	responseRequired string
-	response         []string
+	// responsePayload is every field a sealed frame of this profile must cover —
+	// the generated content (§7) — with the same optional flag `payload` uses on
+	// the request side, and meaning the same thing: the field need not exist, but
+	// MUST be sealed whenever the FRAME carries one.
+	//
+	// The speech profile is what the flag is for here. `verbose_json` carries
+	// `segments`, and `words` only when word granularity was requested; both hold
+	// the same transcript as `text`, cut differently, and the response's
+	// `language` is inferred from the audio. A flat list cannot express that:
+	// making them all mandatory rejects every conforming `json` response (SealFrame
+	// refuses a sealed field the frame does not have), and leaving them out is the
+	// leak.
+	//
+	// Zero for a FRAME-TYPED profile, where what a frame must seal is a property
+	// of the frame rather than of the profile — see responseFrames.
+	//
+	// Where the two sides DIFFER is what the default set contains, because the
+	// callers differ: a client filters the request default by presence, so
+	// defaultRequestSealed lists optional fields too, while an enclave seals the
+	// response default as given, so the always-sealed set is the mandatory fields
+	// alone and ResponseSealedFieldsForFrame adds the optional ones per frame. A
+	// response default naming `segments` would reject every plain `json`
+	// transcription.
+	responsePayload []payloadField
 	// responseFrames is set for a profile whose response frames do not all have
 	// the same shape, so "the field a frame must seal" is a property of the FRAME
 	// rather than of the profile. nil means single-shape (chat, image), where
-	// responseRequired/response answer for every frame.
+	// responsePayload answers for every frame.
 	responseFrames *responseFrameRule
-	// responseRequiredIfPresent is responseRequired's conditional twin, on the
-	// response side: fields that need not exist, but MUST be sealed whenever the
-	// FRAME carries one. It is what lets a single-shape profile have a
-	// non-constant sealed set.
-	//
-	// The speech profile is the case. `verbose_json` carries `segments`, and
-	// `words` only when word granularity was requested; both hold the same
-	// transcript as `text`, cut differently, and the response's `language` is
-	// inferred from the audio. A constant `response` set cannot express that:
-	// listing all of them rejects every conforming `json` response (SealFrame
-	// refuses a sealed field the frame does not have), and listing none of them
-	// is the leak.
-	//
-	// Note these are NOT also listed in `response`. That field is "always
-	// sealed"; this one is additive, and ResponseSealedFieldsForFrame unions them
-	// per frame. Listing a name in both would make the frameless
-	// DefaultResponseSealedFieldsFor claim a field a `json` response never has.
-	responseRequiredIfPresent []string
 	// pinned are CLEARTEXT fields whose value this profile constrains to a
 	// permitted set — usually one value (image: exactly `b64_json`), sometimes a
 	// small set (speech: either of `json` / `verbose_json`). Empty for profiles
@@ -554,10 +552,9 @@ func (s frameShape) sealedFieldsFor(frame Response) []string {
 
 var profiles = map[Profile]profileSpec{
 	ProfileChat: {
-		payload:          []payloadField{{name: fieldMessages}},
-		extraDefaults:    []string{"tools"},
-		responseRequired: fieldChoices,
-		response:         []string{"choices"},
+		payload:         []payloadField{{name: fieldMessages}},
+		extraDefaults:   []string{"tools"},
+		responsePayload: []payloadField{{name: fieldChoices}},
 	},
 	ProfileImage: {
 		// "prompt" is the whole sensitive payload of an image request; "data" —
@@ -565,9 +562,8 @@ var profiles = map[Profile]profileSpec{
 		// The image COUNT stays cleartext as `usage.output_images` so the router
 		// can bill without decrypting (§7.1), the same trade-off chat makes for
 		// `usage`.
-		payload:          []payloadField{{name: fieldPrompt}},
-		responseRequired: fieldData,
-		response:         []string{"data"},
+		payload:         []payloadField{{name: fieldPrompt}},
+		responsePayload: []payloadField{{name: fieldData}},
 		// response_format must be an EXPLICIT "b64_json" (§7.1). "url" has the
 		// enclave persist the images and serve them from a plain URL, outside
 		// the sealed channel — a worse leak than the prompt, since it is the
@@ -598,9 +594,9 @@ var profiles = map[Profile]profileSpec{
 		extraDefaults: []string{"tools"},
 		// The response is frame-typed, so there is no single field a frame must
 		// seal and no meaningful profile-wide default set: both are properties of
-		// the frame (see anthropicFrames). responseRequired/response stay zero so
-		// the single-shape helpers refuse this profile outright rather than
-		// resolving to something plausible and wrong.
+		// the frame (see anthropicFrames). responsePayload stays zero so the
+		// single-shape helpers refuse this profile outright rather than resolving
+		// to something plausible and wrong.
 		responseFrames: &anthropicFrames,
 		// No pinned cleartext field: /v1/messages has no equivalent of the image
 		// profile's response_format — nothing in it directs the server to publish
@@ -652,13 +648,17 @@ var profiles = map[Profile]profileSpec{
 			{name: fieldLanguage, optional: true},
 			{name: fieldPrompt, optional: true},
 		},
-		// `text` is the transcript and is always there. The other three are
-		// conditional and therefore NOT in this set — see
-		// responseRequiredIfPresent for why listing them here would be wrong
-		// rather than merely redundant.
-		responseRequired:          fieldText,
-		response:                  []string{fieldText},
-		responseRequiredIfPresent: []string{fieldSegments, fieldWords, fieldLanguage},
+		// `text` is the transcript and is always there; the other three are
+		// optional, which on this side means they stay out of the always-sealed
+		// default and are added per frame — see profileSpec.responsePayload for
+		// why naming `segments` in the default would reject every plain `json`
+		// transcription.
+		responsePayload: []payloadField{
+			{name: fieldText},
+			{name: fieldSegments, optional: true},
+			{name: fieldWords, optional: true},
+			{name: fieldLanguage, optional: true},
+		},
 		// `text` / `srt` / `vtt` return a body that is not a JSON object, so they
 		// have nowhere to put `_e2ee`, no §7 frame and no aad for §8's respH:
 		// inexpressible under sealing rather than merely leaky. Both JSON-shaped
