@@ -203,50 +203,6 @@ const defaultWarmInterval = 4 * time.Minute
 // nextUpdate. Tunable via -collateral-ttl (0 disables the cache).
 const defaultCollateralTTL = time.Hour
 
-// retiredFieldSetEnv are the environment variables that used to configure the
-// sealed and unbound field sets. Both sets are now fixed in code — the sealed
-// one by each surface's wire profile, the unbound one by
-// wire.DefaultUnboundFields.
-var retiredFieldSetEnv = []string{"SEAL_FIELDS", "UNBOUND_FIELDS"}
-
-// setRetiredFieldSetEnv reports the first retired variable this environment
-// sets, and whether one was found. Presence is what counts, not the value: an
-// explicitly EMPTY UNBOUND_FIELDS is how an operator asks to bind everything, so
-// a `!= ""` test would miss exactly the case worth catching.
-func setRetiredFieldSetEnv(env func(string) string) (name, value string, found bool) {
-	for _, n := range retiredFieldSetEnv {
-		if v, ok := os.LookupEnv(env(n)); ok {
-			return env(n), v, true
-		}
-	}
-	return "", "", false
-}
-
-// refuseRetiredFieldSetEnv exits if a deployment still sets one of them.
-//
-// Removing a FLAG is self-announcing: flag.Parse rejects the unknown name and
-// the process dies. Removing the env var that fed it is not — nothing reads the
-// variable, so a value someone set deliberately is silently dropped, and in both
-// directions the drift WEAKENS the field split rather than merely changing it:
-//
-//   - SEAL_FIELDS=messages,tools,user stops sealing `user`, which then reaches
-//     the untrusted router in cleartext;
-//   - UNBOUND_FIELDS= asks for everything bound, and ignoring it puts `model`
-//     back outside the AAD.
-//
-// Neither is a thing to discover from traffic. No in-repo deployment sets either,
-// so refusing costs nothing here and covers whatever is configured outside this
-// repo. log.Fatalf matches how envBool and envDuration reject a value they
-// cannot honor, at the same point in startup; as with those, the exit itself is
-// not exercised by a test — setRetiredFieldSetEnv holds the decision.
-func refuseRetiredFieldSetEnv(env func(string) string) {
-	if name, value, found := setRetiredFieldSetEnv(env); found {
-		log.Fatalf("%s is set (%q) but is no longer honored: the sealed set comes from each "+
-			"surface's wire profile and the unbound set from wire.DefaultUnboundFields. Unset it — "+
-			"leaving it set would hide a weaker field split than you asked for", name, value)
-	}
-}
-
 // RegisterFlags declares the shared startup flags on fs and returns a Flags
 // whose pointers are filled by fs.Parse. envPrefix (e.g. "ZG_GATEWAY",
 // "ZG_SIDECAR") selects the environment variables consulted for each flag's
@@ -256,12 +212,8 @@ func refuseRetiredFieldSetEnv(env func(string) string) {
 // _COLLATERAL_TTL.
 // defaultListen is the built-in listen address used when neither the flag nor
 // <envPrefix>_LISTEN is set.
-//
-// It refuses to start when a retired field-set variable is set — see
-// refuseRetiredFieldSetEnv.
 func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen string) *Flags {
 	env := func(name string) string { return envPrefix + "_" + name }
-	refuseRetiredFieldSetEnv(env)
 	return &Flags{
 		Listen:    fs.String("listen", envOr(env("LISTEN"), defaultListen), fmt.Sprintf("address to listen on (env %s)", env("LISTEN"))),
 		RouterURL: fs.String("router-url", envOr(env("ROUTER_URL"), route.DefaultRouterURL), fmt.Sprintf("0G router base URL/domain (the route-preview path is appended) (env %s)", env("ROUTER_URL"))),
