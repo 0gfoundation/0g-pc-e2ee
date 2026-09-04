@@ -156,11 +156,35 @@ func resolveErr(err error) error {
 //     so a fronting router forwards to exactly this provider (the routing pin).
 //     Empty means "set no routing pin" (a static provider that does not select
 //     via the router).
+//
+// RouterProviderIdentity completes that routing pin; see its own comment for why
+// an address alone no longer names one provider row.
 type Provider struct {
 	URL        string           // OpenAI-shaped endpoint (router or broker) the sealed request POSTs to
 	EncPubKey  crypto.PublicKey // provider HPKE recipient key
 	SignerAddr string           // on-chain TEE signer; sealed into _e2ee.signer_addr, verifies responses
 	Address    string           // router-facing provider address; sent as X-0G-Provider-Address (routing pin)
+	// RouterProviderIdentity is the router's provider_identity, the other half of
+	// the routing pin: a provider row is keyed (model, address, provider_identity),
+	// so where one address fronts several same-model upstreams (glm-5.2 via aliyun
+	// vs zhipu), the address alone lets the router re-rank them by price and serve
+	// one we did not resolve. The seal opens either way — the enc key is per broker
+	// — so that swap is silent, which is why it needs a pin rather than showing up
+	// as a decrypt failure. Sent as X-0G-Provider-Identity, only alongside Address.
+	//
+	// Tri-state, because "this candidate has none" and "the router did not say" are
+	// different instructions: nil leaves a forwarded pin untouched, non-nil empty
+	// clears it, non-nil set pins it. nil is the zero value, so a Provider built
+	// without it behaves exactly as before this field existed. Collapsing nil into
+	// empty would strip a caller's own pin against a router that filters the route
+	// preview on this header without echoing it back — see
+	// TestCompleteKeepsAForwardedIdentityWhenPreviewOmitsTheField.
+	//
+	// The Router prefix disambiguates route.ProviderIdentity, this repository's
+	// ATTESTATION identity (what we verified about an enclave). Orthogonal axes,
+	// both written in routeCandidates.Provider, in different packages so only the
+	// name keeps them apart.
+	RouterProviderIdentity *string
 	// Endpoint is the provider's OWN serving URL (the broker, ultimately the
 	// on-chain Service.url), distinct from URL when a router fronts the chat POST.
 	// The §8 response signature is fetched directly from here — the router does
@@ -820,6 +844,21 @@ func (c *Client) completeOnce(parent context.Context, provider Provider, req wir
 // 4xx (a client fault: bad request, auth, not found) is not and fails fast. It
 // is only called with a real response status — transport failures (no response)
 // and unusable-body failures are classified at their own call sites.
+//
+// KNOWN GAP, now that the pin names an upstream as well as an address. "A 4xx
+// recurs on every candidate" rests on the candidates differing in ways a 4xx does
+// not depend on, and same-address siblings break that: a pin the router cannot
+// resolve — the row withdrawn by a provider sync between preview and execute, an
+// expired model — comes back 400 (provider_model_mismatch), and the sibling
+// upstream under that same address, which may be serving perfectly, is never
+// tried. The router used to absorb this by silently re-ranking to the sibling
+// itself, which is precisely the substitution this pin exists to stop; so the
+// trade is deliberate — fidelity over availability, a failed request rather than
+// a silent one served by an upstream nobody chose. It is recorded rather than
+// fixed because the honest fix is narrow (make only the "pin unresolvable" 400s
+// fall back, which means reading the router's error CODE out of the body rather
+// than widening 4xx wholesale) and belongs with the router's error taxonomy, not
+// with a status-class predicate.
 func retryableStatus(status int) bool {
 	return status == http.StatusTooManyRequests || (status >= 500 && status <= 599)
 }
@@ -832,10 +871,23 @@ const (
 	// provider address (Provider.Address) — distinct from the signer address in
 	// the envelope's signer_addr, which is the enclave's crypto identity.
 	headerProviderPin = "X-0G-Provider-Address"
+	// headerRouterProviderIdentityPin completes the pin with the router's
+	// provider_identity (Provider.RouterProviderIdentity), naming which same-model
+	// upstream behind that address serves the request. Without it an address
+	// fronting two upstreams is re-ranked by price at execute time.
+	headerRouterProviderIdentityPin = "X-0G-Provider-Identity"
 	// headerAllowFallbacks disables server-side fallback. A sealed request can be
 	// opened only by the provider whose enc key it used, so a fallback to another
 	// provider would fail to decrypt — the client must pin, not fall back.
-	headerAllowFallbacks = "X-0G-Allow-Fallbacks"
+	//
+	// The name carries the router's X-0G-Provider-* prefix because that is the
+	// namespace the router actually parses. It was spelled X-0G-Allow-Fallbacks
+	// here, which the router reads nowhere: the directive was inert on the wire,
+	// and only the router's own default (an address pin implies no fallback) kept
+	// sealed requests from being fanned out to a provider that cannot decrypt
+	// them. That default is the router's to change; this is our own statement of
+	// a property we depend on, so it has to be a header that is actually read.
+	headerAllowFallbacks = "X-0G-Provider-Allow-Fallbacks"
 )
 
 // doRequest POSTs the sealed envelope to provider.URL and returns the raw
@@ -862,13 +914,26 @@ func (c *Client) doRequest(ctx context.Context, provider Provider, env wire.Requ
 	// Pin the forward to the provider this request is sealed to, and disable
 	// fallback, so a router routes to exactly that provider — never re-routing or
 	// falling back to one whose key cannot open this envelope. The pin is the
-	// router-facing provider address (Address), not the signer. When there is no
-	// routing pin (Address empty — a static provider) or provider.URL is a
-	// provider/broker directly, only the fallback directive is set (and a direct
-	// provider ignores it). Set after the forwarded headers so the resolved
-	// provider is authoritative over any forwarded pin.
+	// router-facing provider address (Address), not the signer, plus the upstream
+	// identity that completes it. When there is no routing pin (Address empty — a
+	// static provider) or provider.URL is a provider/broker directly, only the
+	// fallback directive is set (and a direct provider ignores it). Set after the
+	// forwarded headers so the resolved provider is authoritative over any
+	// forwarded pin.
+	//
+	// The identity is written only when the resolver knows it, and then
+	// unconditionally, so a forwarded one cannot survive beside an address we
+	// chose. nil means we do not know and must leave it alone — see
+	// Provider.RouterProviderIdentity.
 	if provider.Address != "" {
 		httpReq.Header.Set(headerProviderPin, provider.Address)
+		if id := provider.RouterProviderIdentity; id != nil {
+			if *id != "" {
+				httpReq.Header.Set(headerRouterProviderIdentityPin, *id)
+			} else {
+				httpReq.Header.Del(headerRouterProviderIdentityPin)
+			}
+		}
 	}
 	httpReq.Header.Set(headerAllowFallbacks, "false")
 	// Forward the caller's credential (if any) verbatim as the Authorization
