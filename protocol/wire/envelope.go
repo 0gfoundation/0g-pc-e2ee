@@ -1265,8 +1265,12 @@ func SealRequest(encPub crypto.PublicKey, req Request, sealedFields []string, si
 //     which field MUST be sealed — the wire format is identical, and the profile
 //     is not carried on the wire (`sealed_fields` is self-describing).
 //   - encPub:       the provider enc key (verified out of a quote by the caller)
-//   - sealedFields: fields to seal; nil uses the profile's v1 default. The
-//     profile's payload field is required and each field MUST be present in req.
+//   - sealedFields: fields to seal. A nil slice means the profile's v1 default
+//     FILTERED TO THE FIELDS req ACTUALLY CARRIES; an explicit (non-nil) slice is
+//     used verbatim, and every field in it MUST be present in req. The
+//     profile's mandatory payload field is required either way — filtering can
+//     only drop fields the request does not have, so a request missing it still
+//     fails, with "must include" or "no sealed fields".
 //   - signerAddr:   the provider's on-chain TEE signer address ("0x…"), the pin
 //   - clientEphPub: the client's response ephemeral X25519 public key (raw bytes)
 //   - unboundFields: optional cleartext fields excluded from the AAD (§5.2), i.e.
@@ -1284,7 +1288,7 @@ func SealRequestFor(profile Profile, encPub crypto.PublicKey, req Request, seale
 		return nil, err
 	}
 	if sealedFields == nil {
-		sealedFields = DefaultSealedFieldsFor(profile)
+		sealedFields = presentSubset(DefaultSealedFieldsFor(profile), req)
 	}
 	if err := validateSealInputs(profile, spec, sealedFields, unboundFields, signerAddr, clientEphPub); err != nil {
 		return nil, err
@@ -1379,8 +1383,9 @@ func SealRequestFor(profile Profile, encPub crypto.PublicKey, req Request, seale
 //
 //   - ValidateSealedFieldsFor — the sealed set covers this profile's mandatory
 //     payload fields, so the request did not arrive with its prompt in the clear;
-//   - validatePayloadSealedFor — no optional payload field (Anthropic's
-//     top-level `system`) arrived in the cleartext half;
+//   - validatePayloadSealedFor — no optional payload field (`tools` and
+//     `tool_choice` on chat and Anthropic, Anthropic's top-level `system`)
+//     arrived in the cleartext half;
 //   - validatePinnedFor — every pinned cleartext field holds a permitted value
 //     (and is present, unless the pin is optional), and none was sealed away or
 //     declared unbound.
@@ -1583,6 +1588,34 @@ func isSignerAddr(s string) bool {
 		}
 	}
 	return true
+}
+
+// presentSubset is the profile default narrowed to what this request carries.
+// It is what a nil sealedFields resolves to, and it exists because the
+// unfiltered default is not satisfiable by an ordinary request: the default
+// contains every payload field the profile has, optional ones included, while
+// SealRequestFor requires every field in the set it is GIVEN to be present. An
+// unfiltered nil therefore refused any chat request without both `tools` and
+// `tool_choice` — a "default" no common request could meet.
+//
+// Filtering cannot widen what leaks, which is what makes it safe rather than
+// lax: it only ever removes a field the request does not have, and a field that
+// is absent cannot ride in the cleartext half. Every rule that follows still
+// runs on the result, so a request missing the profile's MANDATORY payload
+// field still fails closed — ValidateSealedFieldsFor with "must include", or
+// "no sealed fields" when nothing at all matched.
+//
+// It applies to nil ONLY. An explicit set is the caller stating exactly what to
+// seal, and silently shrinking that would hide a mistake rather than serve one;
+// an explicit EMPTY set keeps meaning "seal nothing", which fails closed.
+func presentSubset(fields []string, req Request) []string {
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		if _, present := req[f]; present {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 func toSet(ss []string) map[string]struct{} {

@@ -505,8 +505,9 @@ func TestProxySealsConfiguredExtraField(t *testing.T) {
 }
 
 // A full tool-calling round trip. The tests above seal a prompt-only request;
-// this one carries "tools" as well, so both halves of the v1 default sealed set
-// (wire.DefaultSealedFields) are exercised on a request that actually uses them:
+// this one carries "tools" and "tool_choice" as well, so every member of the v1
+// default sealed set (wire.DefaultSealedFields) is exercised on a request that
+// actually uses them:
 // the tool DEFINITIONS go up sealed, the model's tool_calls come back sealed
 // inside "choices", and the second turn — the assistant's tool_calls plus the
 // role:"tool" result — is sealed the same way, since it all lives in "messages".
@@ -553,6 +554,14 @@ func TestProxyToolCallRoundTrip(t *testing.T) {
 		}
 		if !bytes.Contains(req["tools"], []byte("get_current_weather")) {
 			http.Error(w, "tool definitions not recovered in enclave", http.StatusInternalServerError)
+			return
+		}
+		// The selection, not just the menu: sealing it must not drop it. Turn 1
+		// forces the tool by NAME — the disclosure this seal exists to stop — and
+		// turn 2 sends the "auto" enum, so both shapes are covered.
+		if len(req["tool_choice"]) == 0 {
+			t.Error("tool_choice not recovered in enclave")
+			http.Error(w, "tool_choice not recovered in enclave", http.StatusInternalServerError)
 			return
 		}
 		ephPub, err := base64.RawURLEncoding.DecodeString(e2ee.ClientEphPub)
@@ -626,7 +635,8 @@ func TestProxyToolCallRoundTrip(t *testing.T) {
 
 	// Turn 1: the model asks for the tool.
 	first := post(`{"model":"gpt-4o","messages":[{"role":"user","content":"weather in Beijing?"}],` +
-		`"tools":` + tools + `,"tool_choice":"auto"}`)
+		`"tools":` + tools +
+		`,"tool_choice":{"type":"function","function":{"name":"get_current_weather"}}}`)
 	if !bytes.Contains(first["choices"], []byte(`"tool_calls"`)) ||
 		!bytes.Contains(first["choices"], []byte("call_1")) {
 		t.Fatalf("user did not get the tool call back in plaintext: %s", first["choices"])

@@ -196,9 +196,10 @@ The request is the original OpenAI JSON with the **sealed fields removed** and a
   Example: `{"messages": <original>, "tools": <original>}`.
 - v1 default sealed set: **`messages`, `tools` and `tool_choice`** — which for
   this profile is exactly its payload fields, `messages` always and the other
-  two whenever the request carries them. The default and the requirement are the same list by
-  construction, and that is the point: a default that omitted a payload field
-  would produce, on a conforming client, an envelope the rules refuse.
+  two whenever the request carries them. The default and the requirement are the
+  same list by construction, and that is the point: a default that omitted a
+  payload field would produce, on a conforming client, an envelope the rules
+  refuse.
 - The payload field is **REQUIRED, not recommended**. A sealed envelope whose
   `sealed_fields` omits it MUST be refused, by the sender at seal time and by
   the enclave at open time — before any decryption, since the check reads only
@@ -222,9 +223,11 @@ The request is the original OpenAI JSON with the **sealed fields removed** and a
   readable would hide the catalogue and hand over the selection. Its enum forms
   (`"auto"`, `"none"`, `"required"`) carry nothing and are sealed anyway, per the
   literal-presence rule below: the requirement is about the field, not its value.
-  A RECEIVER may no longer range-check it — its value is ciphertext — so a
-  malformed `tool_choice` is refused by the upstream rather than at the router,
-  the same trade `tools` already makes.
+  An INTERMEDIARY may no longer range-check it — its value is ciphertext to
+  everything without the key — so a malformed `tool_choice` is refused by the
+  upstream rather than at the router, the same trade `tools` already makes. The
+  enclave is unaffected: it holds the key, and `OpenRequestFor` hands it the
+  reconstructed request.
 - A client MAY seal additional fields (e.g. `metadata`, `user`); it declares them
   in `sealed_fields`.
 - **New / unknown fields default to cleartext.** A field only becomes sealed when
@@ -282,8 +285,9 @@ multipart.
 A **conditionally required payload field** is one that need not exist, but MUST
 be sealed whenever the request carries it. Three of the four profiles use it:
 `tools` and `tool_choice` on `chat` and `/v1/messages`, `system` on
-`/v1/messages`, and speech's `filename` / `language` / `prompt` (§5.3.2). `image` has none: its payload is the
-mandatory `prompt` and nothing else, and that is worth stating rather than
+`/v1/messages`, and speech's `filename` / `language` / `prompt` (§5.3.2).
+`image` has none: its payload is the mandatory `prompt` and nothing else, and
+that is worth stating rather than
 generalising over — the category is what a profile needs when payload is
 OPTIONAL, not a box every profile has to fill.
 

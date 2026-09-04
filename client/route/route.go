@@ -454,7 +454,10 @@ type previewCapabilitySignal struct {
 }
 
 // previewCapabilitySignals is keyed by the field name as it appears in the
-// request. A field absent from this map is simply withheld, as before.
+// caller's JSON — a string literal rather than a protocol constant, because
+// what this table tracks is the ROUTER's view of the request, which can drift
+// from the protocol's names without either being wrong. A field absent from
+// this map is simply withheld, as before.
 var previewCapabilitySignals = map[string]previewCapabilitySignal{
 	"tools": {
 		detected: nonEmptyJSONArray,
@@ -476,7 +479,7 @@ var previewCapabilitySignals = map[string]previewCapabilitySignal{
 	// with nothing reporting it. That failure is not about third-party senders:
 	// `require_parameters: true` is a guarantee our own callers ask for, and it
 	// would have been silently weakened.
-	fieldToolChoice: {
+	"tool_choice": {
 		// The router's rule for this field, verbatim: set and not JSON null. No
 		// no-op exception, unlike the penalties — `tool_choice` has no numeric
 		// default to filter out, so its mere presence is genuine caller intent.
@@ -491,11 +494,6 @@ var previewCapabilitySignals = map[string]previewCapabilitySignal{
 		},
 	},
 }
-
-// fieldToolChoice is the request field naming which tool to call. Spelled here
-// rather than imported: this table is keyed by the name as it appears in the
-// caller's JSON, which is the router's view of it, not the protocol's.
-const fieldToolChoice = "tool_choice"
 
 // presentAndNotNull is the router's own presence rule for a scalar-or-object
 // field: set, and not JSON null. Unlike nonEmptyJSONArray there is no "empty"

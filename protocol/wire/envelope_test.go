@@ -30,29 +30,6 @@ const sampleReq = `{
   "tools": [{"type":"function","function":{"name":"lookup"}}]
 }`
 
-// sampleReqAllDefaults carries every field the chat profile's DEFAULT sealed set
-// covers. SealRequestFor requires each field in the set it is given to be
-// present, so a test that seals with a nil (= default) set needs a request that
-// has them all; sampleReq deliberately does not, because a request that uses no
-// tool_choice is the ordinary case and is what the crypto tests should exercise.
-const sampleReqAllDefaults = `{
-  "model": "gpt-4o",
-  "temperature": 0.7,
-  "messages": [{"role":"user","content":"my secret prompt"}],
-  "tools": [{"type":"function","function":{"name":"lookup"}}],
-  "tool_choice": {"type":"function","function":{"name":"lookup"}}
-}`
-
-// sampleAnthropicReqAllDefaults is the same for /v1/messages.
-const sampleAnthropicReqAllDefaults = `{
-  "model": "claude-x",
-  "max_tokens": 1024,
-  "system": "my secret system prompt",
-  "messages": [{"role":"user","content":"my secret question"}],
-  "tools": [{"name":"lookup","input_schema":{"type":"object"}}],
-  "tool_choice": {"type":"tool","name":"lookup"}
-}`
-
 func mustReq(t *testing.T, s string) wire.Request {
 	t.Helper()
 	var r wire.Request
@@ -231,21 +208,67 @@ func TestSealRequestRejectsBadSignerAddr(t *testing.T) {
 	}
 }
 
-func TestSealRequestNilUsesDefaultSet(t *testing.T) {
+// A nil sealed set is the profile default NARROWED to what the request carries.
+// Both halves matter: the default must not be shrunk for a request that has
+// every field, and it must not demand a field the request does not have — the
+// chat default contains two optional payload fields, so an unfiltered default
+// would refuse the ordinary request below.
+func TestSealRequestNilUsesDefaultSetFilteredByPresence(t *testing.T) {
 	priv, pub, _ := crypto.GenerateRecipientKey()
-	env, err := wire.SealRequest(pub, mustReq(t, sampleReqAllDefaults), nil, testProvider, validEph)
-	if err != nil {
-		t.Fatalf("seal: %v", err)
+
+	for _, tc := range []struct {
+		name string
+		body string
+		want []string
+	}{
+		{
+			name: "every default field present",
+			body: `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],` +
+				`"tools":[{"type":"function","function":{"name":"calc"}}],` +
+				`"tool_choice":{"type":"function","function":{"name":"calc"}}}`,
+			want: []string{"messages", "tools", "tool_choice"},
+		},
+		{
+			// The ordinary tool-calling request: no tool_choice.
+			name: "an optional default field is absent",
+			body: sampleReq,
+			want: []string{"messages", "tools"},
+		},
+		{
+			// The ordinary chat request: neither optional field.
+			name: "no optional default field at all",
+			body: `{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`,
+			want: []string{"messages"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env, err := wire.SealRequest(pub, mustReq(t, tc.body), nil, testProvider, validEph)
+			if err != nil {
+				t.Fatalf("seal: %v", err)
+			}
+			e2ee, err := env.E2EE()
+			if err != nil {
+				t.Fatalf("read _e2ee: %v", err)
+			}
+			if !reflect.DeepEqual(e2ee.SealedFields, tc.want) {
+				t.Fatalf("nil sealedFields = %v, want %v", e2ee.SealedFields, tc.want)
+			}
+			if _, err := wire.OpenRequest(priv, env); err != nil {
+				t.Fatalf("open after default-set seal: %v", err)
+			}
+		})
 	}
-	e2ee, err := env.E2EE()
-	if err != nil {
-		t.Fatalf("read _e2ee: %v", err)
-	}
-	if !reflect.DeepEqual(e2ee.SealedFields, []string{"messages", "tools", "tool_choice"}) {
-		t.Fatalf("nil sealedFields should use the default set, got %v", e2ee.SealedFields)
-	}
-	if _, err := wire.OpenRequest(priv, env); err != nil {
-		t.Fatalf("open after default-set seal: %v", err)
+}
+
+// Filtering must not weaken the mandatory payload rule: a request with no
+// `messages` at all still fails closed, because the filtered set cannot contain
+// what the request does not have.
+func TestNilSealedSetStillFailsClosedWithoutThePayloadField(t *testing.T) {
+	_, pub, _ := crypto.GenerateRecipientKey()
+	_, err := wire.SealRequest(pub, mustReq(t, `{"model":"gpt-4o","temperature":0.5}`),
+		nil, testProvider, validEph)
+	if err == nil {
+		t.Fatal("a request carrying no payload field must not seal, filtered default or not")
 	}
 }
 
@@ -362,21 +385,14 @@ func TestValidateUnboundFieldsForMatchesWhatSealEnforces(t *testing.T) {
 			case wire.ProfileAnthropic:
 				body = sampleAnthropicReq
 			}
-			// A nil `sealed` became the profile's full DEFAULT above, and
-			// SealRequestFor requires every field in that set to be present. Use a
-			// body that carries them all, so this row asserts the two verdicts
-			// agreeing rather than a "sealed field not present" error that has
-			// nothing to do with unbound fields.
-			if tc.sealed == nil {
-				switch tc.profile {
-				case wire.ProfileChat:
-					body = sampleReqAllDefaults
-				case wire.ProfileAnthropic:
-					body = sampleAnthropicReqAllDefaults
-				}
-			}
+			// Seal with what a CALLER would pass, which is tc.sealed verbatim —
+			// including nil, where the caller validated the raw default up front
+			// (above) and lets SealRequestFor narrow it to the request. Passing the
+			// resolved `sealed` here instead would assert an asymmetry no caller
+			// has: an explicit set demands every field be present, and the raw
+			// default contains optional ones this body does not carry.
 			_, sealErr := wire.SealRequestFor(tc.profile, pub, mustReq(t, body),
-				sealed, testProvider, ephPub, tc.unbound...)
+				tc.sealed, testProvider, ephPub, tc.unbound...)
 			if got := sealErr != nil; got != tc.wantErr {
 				t.Errorf("SealRequestFor error = %v (%v), but startup validation said %v",
 					got, sealErr, tc.wantErr)

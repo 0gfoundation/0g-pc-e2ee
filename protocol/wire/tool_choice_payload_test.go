@@ -65,7 +65,7 @@ func TestToolChoiceMustBeSealedWheneverPresent(t *testing.T) {
 // FIELD, not its value: a value-shaped exemption is what a sender would aim at,
 // and "auto" is not a safe spelling of "cleartext".
 func TestToolChoiceEnumFormsAreSealedToo(t *testing.T) {
-	for _, choice := range []string{`"auto"`, `"none"`, `"required"`, `null`} {
+	for _, choice := range []string{`"auto"`, `"none"`, `"required"`} {
 		t.Run(choice, func(t *testing.T) {
 			_, encPub, ephPub := toolsKeys(t)
 			_, err := wire.SealRequestFor(wire.ProfileChat, encPub,
@@ -75,6 +75,30 @@ func TestToolChoiceEnumFormsAreSealedToo(t *testing.T) {
 				t.Errorf("tool_choice:%s is present and must be sealed like any other value", choice)
 			}
 		})
+	}
+}
+
+// A JSON null is a different claim from the enum forms: not "a value that
+// carries nothing" but "the literal-presence rule, at its edge". The field is
+// in the object, so it is payload and must be sealed — the same reading that
+// makes `"system": null` payload.
+//
+// It is also the half that pairs with the ROUTING side answering the opposite:
+// route.presentAndNotNull reads a null as absent and emits no capability
+// signal, because a null instructs nothing. Sealed but unsignalled is the
+// correct combination, and each side is right for its own question — see
+// route.TestEmptyToolsMeansNoToolsToRoutingAndPresentToSealing for the same
+// divergence on `tools`.
+func TestToolChoiceNullIsPresentForSealing(t *testing.T) {
+	_, encPub, ephPub := toolsKeys(t)
+	_, err := wire.SealRequestFor(wire.ProfileChat, encPub,
+		toolChoiceReq(t, wire.ProfileChat, `null`),
+		[]string{"messages", "tools"}, testProvider, ephPub)
+	if err == nil {
+		t.Fatal("an explicit null is in the object, so it is payload and must be sealed")
+	}
+	if !strings.Contains(err.Error(), "tool_choice") {
+		t.Errorf("error should name the field, got %v", err)
 	}
 }
 
@@ -150,15 +174,10 @@ func TestSealedToolChoiceSurvivesAndLeavesNoCleartext(t *testing.T) {
 			encPriv, encPub, ephPub := toolsKeys(t)
 			req := toolChoiceReq(t, p, toolChoiceFor(p))
 
-			var fields []string
-			for _, f := range wire.DefaultSealedFieldsFor(p) {
-				if _, present := req[f]; present {
-					fields = append(fields, f)
-				}
-			}
-			env, err := wire.SealRequestFor(p, encPub, req, fields, testProvider, ephPub)
+			// nil: the profile default, narrowed to what this request carries.
+			env, err := wire.SealRequestFor(p, encPub, req, nil, testProvider, ephPub)
 			if err != nil {
-				t.Fatalf("seal with the presence-filtered default %v: %v", fields, err)
+				t.Fatalf("seal with the profile default: %v", err)
 			}
 			if _, leaked := env["tool_choice"]; leaked {
 				t.Error("the default sealed set left tool_choice in the cleartext half")
