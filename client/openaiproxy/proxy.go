@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"strings"
 
@@ -301,8 +302,26 @@ func Register(mux *http.ServeMux, ep endpoint.Endpoint, c *core.Client, opts ...
 			writeGatewayError(w, http.StatusBadRequest, "read request body")
 			return
 		}
+		// A surface with a DecodeMultipart converts a multipart body into the
+		// JSON-ified request it seals (SPEC §5.3) — speech today, since every
+		// OpenAI SDK posts multipart to /v1/audio/transcriptions. Content-type is
+		// what selects the branch, so such a surface still accepts a JSON body on
+		// the same path: that is a caller sending the JSON-ified shape itself, and
+		// it is sealed exactly the same way.
+		//
+		// Rows without one are untouched — a multipart body simply is not a JSON
+		// object, which is what they already say. So is a body that declares no
+		// Content-Type at all: there is no boundary to parse, so it takes the JSON
+		// branch exactly as it did before this existed.
+		contentType := r.Header.Get("Content-Type")
 		var req wire.Request
-		if err := json.Unmarshal(body, &req); err != nil {
+		if ep.DecodeMultipart != nil && isMultipartForm(contentType) {
+			req, err = ep.DecodeMultipart(body, contentType)
+			if err != nil {
+				writeGatewayError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+		} else if err := json.Unmarshal(body, &req); err != nil {
 			writeGatewayError(w, http.StatusBadRequest, "request body is not a JSON object")
 			return
 		}
@@ -418,6 +437,23 @@ func credential(r *http.Request) string {
 		return "Bearer " + apiKey
 	}
 	return ""
+}
+
+// isMultipartForm reports whether a Content-Type selects the multipart branch.
+// It answers only that question — the boundary and the parts belong to the
+// decoder — and the fallback is what keeps that division honest.
+//
+// A header this cannot parse but that ANNOUNCES itself as multipart still goes
+// to the decoder. Returning false for it would be defensible in isolation and
+// wrong in effect: the caller would be told "request body is not a JSON object",
+// which is not the complaint, and the decoder's own message about the header
+// would become unreachable. Whoever owns the header's parameters should be the
+// one to say what is wrong with them.
+func isMultipartForm(contentType string) bool {
+	if mediaType, _, err := mime.ParseMediaType(contentType); err == nil {
+		return mediaType == "multipart/form-data"
+	}
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(contentType)), "multipart/")
 }
 
 // streamRequested reports whether the request asked for a streamed (SSE)

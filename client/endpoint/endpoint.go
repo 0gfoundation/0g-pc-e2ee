@@ -97,6 +97,24 @@ type Endpoint struct {
 	// nothing to do. It must not mutate the request it is given: the same body is
 	// re-sealed to each fallback candidate.
 	PreSeal func(wire.Request) (wire.Request, error)
+	// DecodeMultipart converts a multipart/form-data body into the JSON-ified
+	// request this surface seals (SPEC §5.3). nil — every surface but speech —
+	// means the surface speaks JSON on the wire the caller sees, and a multipart
+	// body is simply not a JSON object.
+	//
+	// §5.3 puts the conversion on the SENDER, and this is that place:
+	//
+	//	caller ──multipart──▶ sender ──JSON envelope──▶ router ──▶ enclave ──multipart──▶ upstream
+	//	                      seals here                opaque       re-materializes here
+	//
+	// It takes the raw body and the Content-Type rather than an *http.Request so
+	// this package still imports no HTTP — the boundary the package header draws
+	// is about not creating a cycle, and `mime/multipart` creates none. The
+	// Content-Type is passed whole because the boundary lives in its parameters.
+	//
+	// The body arrives already capped by the caller (openaiproxy.MaxRequestBytes),
+	// so a decoder may read it all; it must not read from anywhere else.
+	DecodeMultipart func(body []byte, contentType string) (wire.Request, error)
 }
 
 // Chat is POST /v1/chat/completions: the OpenAI chat-completions surface.
@@ -158,7 +176,7 @@ var Image = Endpoint{
 // silently confused with another. A ByServiceType("chatbot") would have returned
 // whichever chat row came first in this slice and shadowed the other with no
 // error anywhere.
-var All = []Endpoint{Chat, Anthropic, Image}
+var All = []Endpoint{Chat, Anthropic, Image, Speech}
 
 // fieldResponseFormat is the image profile's pinned cleartext field (SPEC §7.1).
 const fieldResponseFormat = "response_format"
