@@ -239,15 +239,21 @@ func materializeTranscription(req wire.Request) (*transcriptionUpload, error) {
 		if err != nil {
 			return nil, fmt.Errorf("field %q: %w", name, err)
 		}
-		if omit {
-			continue
-		}
 		field := name
 		if repeated {
 			field += "[]"
 		}
+		// Checked even when the field is OMITTED, which is what the broker does.
+		// It looks pointless — a name that writes no part cannot appear in a part
+		// header — and the point is not the header: it is that whether a request
+		// materializes at all must not depend on one field happening to be null.
+		// Measured: the broker refuses `{"zz; name=model": null}` and this returned
+		// nil until the two were compared.
 		if err := headerSafe("field name", field); err != nil {
 			return nil, err
+		}
+		if omit {
+			continue
 		}
 		for _, v := range values {
 			if err := w.WriteField(field, v); err != nil {
@@ -409,9 +415,16 @@ func transcriptionFrame(req wire.Request, upload *transcriptionUpload) (wire.Res
 		seconds = 1
 	}
 
+	// The pin has already been enforced by OpenRequestFor, so by here the value is
+	// one of the two permitted strings. The decode error is dropped deliberately
+	// rather than by omission: anything that does not decode to a string leaves
+	// `format` empty and takes the `json` branch, which is the endpoint's own
+	// default and the safe shape of the two.
 	var format string
 	if raw, ok := req["response_format"]; ok {
-		_ = json.Unmarshal(raw, &format)
+		if err := json.Unmarshal(raw, &format); err != nil {
+			format = ""
+		}
 	}
 	if format != "verbose_json" {
 		return wire.Response{

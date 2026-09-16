@@ -115,17 +115,10 @@ func speechDecodeMultipart(body []byte, contentType string) (wire.Request, error
 			return nil, fmt.Errorf("malformed multipart body: %w", err)
 		}
 		name := part.FormName()
-		if name == "" {
+		key, bracketed := strings.CutSuffix(name, "[]")
+		if err := speechFormNameAllowed(name, key, req); err != nil {
 			part.Close()
-			return nil, errors.New(`multipart body has a part with no "name": every form field must be named`)
-		}
-		// SPEC §5.3.1: a multipart request MUST NOT carry a part named `_e2ee`,
-		// and one that does MUST be rejected rather than forwarded. wire.SealRequestFor
-		// refuses such a request too, but as a seal-stage failure — caught here it is
-		// the request error it actually is.
-		if name == e2eeField {
-			part.Close()
-			return nil, fmt.Errorf("multipart body carries a %q part: a sealed envelope cannot be smuggled through a form field (SPEC §5.3.1)", e2eeField)
+			return nil, err
 		}
 		// The body is already capped by the caller, so the whole part is bounded;
 		// reading it in full is what lets the audio be base64'd without a second
@@ -133,6 +126,7 @@ func speechDecodeMultipart(body []byte, contentType string) (wire.Request, error
 		// parts over its memory threshold to temporary files — inside the CVM that
 		// would write the caller's audio to disk, outside the sealed channel.
 		val, err := io.ReadAll(part)
+		partFilename := part.FileName()
 		part.Close()
 		if err != nil {
 			return nil, fmt.Errorf("read multipart part %q: %w", name, err)
@@ -144,10 +138,9 @@ func speechDecodeMultipart(body []byte, contentType string) (wire.Request, error
 			// a payload field rides inside the ciphertext, and `file_base64` already
 			// has an unsealed contract on the router's JSON surface — one field name
 			// must not have two decoders depending on whether the request was sealed.
-			filename = part.FileName()
+			filename = partFilename
 			continue
 		}
-		key, bracketed := strings.CutSuffix(name, "[]")
 		values[key] = append(values[key], string(val))
 		isArray[key] = isArray[key] || bracketed
 	}
@@ -163,9 +156,9 @@ func speechDecodeMultipart(body []byte, contentType string) (wire.Request, error
 		}
 		req[key] = jsonString(vs[0])
 	}
-	// After the loop, so the part header wins over a form field of the same name:
-	// the header is where an SDK actually puts it, and a request carrying both is
-	// incoherent rather than a case to honour.
+	// After the loop, and unconditionally safe to write: a form field named
+	// `filename` is refused by speechFormNameAllowed, so nothing else can have
+	// claimed this key. The part header is where an SDK actually puts the name.
 	if filename != "" {
 		req[fieldFilename] = jsonString(filename)
 	}
@@ -179,6 +172,61 @@ func speechDecodeMultipart(body []byte, contentType string) (wire.Request, error
 		}
 	}
 	return req, nil
+}
+
+// speechFormNameAllowed refuses a form field whose name collides with one this
+// decoder PRODUCES. Everything else is carried through, so the reserved set is
+// exactly four names and it is the decoder's own output, not a denylist of
+// things that look dangerous.
+//
+// It exists because the collisions are silent and each one loses something the
+// caller sent. Measured, all three:
+//
+//   - a text field named `file_base64` alongside the real `file` part REPLACES
+//     the audio. The parts are read into one map and the form loop runs after
+//     the file part is written, so the field wins: the uploaded audio is
+//     discarded, the request still seals (the field is present), and the caller
+//     pays to transcribe a string they did not mean as audio.
+//   - a SECOND `file` part overwrites the first, so which audio was transcribed
+//     depends on part order and nothing says so.
+//   - `_e2ee[]` slips past a check written against the raw name, lands as
+//     `_e2ee`, and is then refused by wire.SealRequestFor as "request already
+//     contains" — fail-closed, but at the seal stage, which is the error surface
+//     the §5.3.1 check exists to avoid.
+//
+// `file` is reserved as a KEY too (a `file[]` field strips to it), because the
+// broker refuses a sealed field by that name outright: it is where the enclave
+// writes the materialized audio part, and a second part with that name makes two
+// readers disagree about which one is the audio.
+//
+// Refused rather than resolved by a precedence rule, which is this file's
+// standing choice: silently dropping a field the caller sent is the one outcome
+// the profile must not produce. The one deliberate exception is documented at
+// its own site — the part header's filename beats a `filename` form field, and
+// that field is refused here so the exception never has to fire.
+func speechFormNameAllowed(name, key string, req wire.Request) error {
+	if name == "" {
+		return errors.New(`multipart body has a part with no "name": every form field must be named`)
+	}
+	// SPEC §5.3.1: a multipart request MUST NOT carry a part named `_e2ee`, and
+	// one that does MUST be rejected rather than forwarded. Checked on the
+	// bracket-stripped key as well as the raw name, since that is what would
+	// actually land in the request.
+	if name == e2eeField || key == e2eeField {
+		return fmt.Errorf("multipart body carries a %q part: a sealed envelope cannot be smuggled through a form field (SPEC §5.3.1)", e2eeField)
+	}
+	if name == fieldFile {
+		if _, dup := req[fieldFileBase64]; dup {
+			return fmt.Errorf("multipart body carries more than one %q part: which of them is the audio is not something this can decide for you", fieldFile)
+		}
+		return nil
+	}
+	switch key {
+	case fieldFileBase64, fieldFilename, fieldFile:
+		return fmt.Errorf("form field %q collides with a field this profile builds from the %q part (SPEC §5.3.2); send the audio and its name as that part, not as a field",
+			name, fieldFile)
+	}
+	return nil
 }
 
 // multipartBoundary pulls the boundary out of a Content-Type. The caller has

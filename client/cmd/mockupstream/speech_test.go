@@ -441,6 +441,13 @@ func TestMaterializeMatchesTheBrokerEnclave(t *testing.T) {
 			name: "an object has no form rendering", field: "chunking_strategy", value: `{"type":"auto"}`,
 			wantErr: "no multipart rendering",
 		},
+		{
+			// A null value does not excuse an unsafe NAME. The name writes no part,
+			// so the header argument does not apply — what applies is that whether a
+			// request materializes must not depend on one field happening to be null.
+			name: "an unsafe field name with a null value", field: "zz; name=model", value: `null`,
+			wantErr: "cannot appear in a multipart part header",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

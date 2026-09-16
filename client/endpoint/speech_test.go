@@ -567,3 +567,115 @@ func TestSpeechPreSealAcceptsWhatTheEnclaveAccepts(t *testing.T) {
 		})
 	}
 }
+
+// The decoder produces four names, and a form field claiming one of them is
+// refused rather than resolved by precedence. Each row below was MEASURED
+// against the decoder before the check existed, and each lost something the
+// caller sent, silently.
+func TestSpeechDecodeMultipartRefusesReservedNames(t *testing.T) {
+	tests := []struct {
+		name    string
+		build   func(t *testing.T) ([]byte, string)
+		wantErr string
+	}{
+		{
+			// The serious one. The form loop runs after the file part is written, so
+			// the field WON: the uploaded audio was discarded, the request still
+			// sealed (file_base64 was present), and the caller would have paid to
+			// transcribe a string they never meant as audio. Measured: the decoded
+			// file_base64 came back "SEFDS0VE" instead of the real audio.
+			name: "a form field named file_base64 replaces the audio",
+			build: func(t *testing.T) ([]byte, string) {
+				return buildMultipart(t, "a.mp3", audioWithAwkwardBytes,
+					[2]string{"model", "whisper-1"},
+					[2]string{"file_base64", "SEFDS0VE"})
+			},
+			wantErr: "collides with a field this profile builds",
+		},
+		{
+			name: "a form field named filename",
+			build: func(t *testing.T) ([]byte, string) {
+				return buildMultipart(t, "real.mp3", audioWithAwkwardBytes,
+					[2]string{"filename", "decoy.wav"})
+			},
+			wantErr: "collides with a field this profile builds",
+		},
+		{
+			// The broker refuses a sealed field by this name outright — it is where
+			// the enclave writes the materialized audio part, and a second part with
+			// that name makes two readers disagree about which one is the audio.
+			name: "a bracketed file[] field strips to the reserved key",
+			build: func(t *testing.T) ([]byte, string) {
+				return buildMultipart(t, "a.mp3", audioWithAwkwardBytes,
+					[2]string{"file[]", "decoy"})
+			},
+			wantErr: "collides with a field this profile builds",
+		},
+		{
+			// Slipped past a check written against the raw name, landed as `_e2ee`,
+			// and was then refused by wire.SealRequestFor at the SEAL stage — which
+			// is the error surface the §5.3.1 check exists to avoid. Measured: the
+			// decoded request came back carrying `_e2ee: ["{\"v\":1}"]`.
+			name: "an _e2ee[] part",
+			build: func(t *testing.T) ([]byte, string) {
+				return buildMultipart(t, "a.mp3", audioWithAwkwardBytes,
+					[2]string{"_e2ee[]", `{"v":1}`})
+			},
+			wantErr: "sealed envelope cannot be smuggled",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			body, ct := tt.build(t)
+			if _, err := speechDecodeMultipart(body, ct); err == nil {
+				t.Fatalf("decode accepted %s", tt.name)
+			} else if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error %q does not mention %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// Two `file` parts: the second overwrote the first, so which audio got
+// transcribed depended on part order and nothing said so.
+func TestSpeechDecodeMultipartRefusesASecondFilePart(t *testing.T) {
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	for _, f := range []struct{ name, content string }{{"first.mp3", "REAL AUDIO"}, {"second.mp3", "DECOY"}} {
+		fw, err := w.CreateFormFile("file", f.name)
+		if err != nil {
+			t.Fatalf("CreateFormFile: %v", err)
+		}
+		if _, err := fw.Write([]byte(f.content)); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	if _, err := speechDecodeMultipart(buf.Bytes(), w.FormDataContentType()); err == nil {
+		t.Fatal("decode accepted two file parts; the second silently replaced the first")
+	} else if !strings.Contains(err.Error(), "more than one") {
+		t.Errorf("error %q should say there is more than one", err)
+	}
+}
+
+// And the check must not reach further than the four names it owns: an ordinary
+// field is carried through, including one that merely CONTAINS a reserved name.
+func TestSpeechDecodeMultipartKeepsOrdinaryFields(t *testing.T) {
+	body, ct := buildMultipart(t, "a.mp3", audioWithAwkwardBytes,
+		[2]string{"model", "whisper-1"},
+		[2]string{"my_file_base64_note", "kept"},
+		[2]string{"filenames", "kept"},
+	)
+	req, err := speechDecodeMultipart(body, ct)
+	if err != nil {
+		t.Fatalf("decode refused an ordinary field: %v", err)
+	}
+	for _, name := range []string{"my_file_base64_note", "filenames"} {
+		if got := field(t, req, name); got != `"kept"` {
+			t.Errorf("%s = %s, want it carried through", name, got)
+		}
+	}
+}
