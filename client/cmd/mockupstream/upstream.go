@@ -206,6 +206,7 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("POST /v1/chat/completions", s.handleCompletions)
 	mux.HandleFunc("POST /v1/images/generations", s.handleImages)
 	mux.HandleFunc("POST /v1/messages", s.handleMessages)
+	mux.HandleFunc("POST /v1/audio/transcriptions", s.handleSpeech)
 	mux.HandleFunc("GET /v1/providers", s.handleProviders)
 	// Provider-broker surface (reached at the endpoint the preview advertises).
 	mux.HandleFunc("GET /v1/e2ee/pubkey", s.handlePubkey)
@@ -219,6 +220,7 @@ func (s *server) handler() http.Handler {
 	// gateway got here, not in what it sends.
 	mux.HandleFunc("POST /v1/proxy/chat/completions", s.handleCompletions)
 	mux.HandleFunc("POST /v1/proxy/images/generations", s.handleImages)
+	mux.HandleFunc("POST /v1/proxy/audio/transcriptions", s.handleSpeech)
 	// There is deliberately no GET /v1/quote: the fixture cannot produce a genuine
 	// TDX quote, so a gateway pointed at it must run with -attest=false. Leaving
 	// the route absent makes that a loud 404 at startup rather than a confusing
@@ -232,8 +234,15 @@ func (s *server) handler() http.Handler {
 
 // handlePreview answers the gateway's per-request route preview with the
 // configured number of candidates, all pointing back at this process.
+//
+// The reply's service_type ECHOES the request's, as the router's does. Nothing
+// in the client reads the field today, so a constant would work — and would be a
+// fixture that says "chatbot" to a speech request, which is the kind of lie a
+// reader later takes for a fact about the system. Any service type gets
+// candidates: the fixture has one fleet, and narrowing it would only mean
+// inventing a second one to serve the same process.
 func (s *server) handlePreview(w http.ResponseWriter, r *http.Request) {
-	drain(r.Body)
+	serviceType := previewServiceType(r.Body)
 	if !sleep(r.Context(), s.cfg.PreviewDelay) {
 		return
 	}
@@ -249,9 +258,27 @@ func (s *server) handlePreview(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object":       "routing.preview",
-		"service_type": "chatbot",
+		"service_type": serviceType,
 		"providers":    providers,
 	})
+}
+
+// previewServiceType reads service_type off a preview request, defaulting to
+// chat when the body does not say. It drains the body either way: the caller's
+// connection is reused, so an unread body is a leak whatever the parse did.
+func previewServiceType(body io.ReadCloser) string {
+	raw, err := io.ReadAll(io.LimitReader(body, maxRequestBytes))
+	drain(body)
+	if err != nil {
+		return "chatbot"
+	}
+	var req struct {
+		ServiceType string `json:"service_type"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil || req.ServiceType == "" {
+		return "chatbot"
+	}
+	return req.ServiceType
 }
 
 func (s *server) handleProviders(w http.ResponseWriter, r *http.Request) {

@@ -66,6 +66,21 @@ func (u *upstreamRecorder) bodyAt(t *testing.T, path string) map[string]json.Raw
 	return body
 }
 
+// rawAt returns the bytes last seen at path, unparsed. bodyAt answers "which
+// fields did the router get"; this answers the stricter question "is this string
+// anywhere in what the router got" — under another name, spelled differently, or
+// in a field nobody thought to check.
+func (u *upstreamRecorder) rawAt(t *testing.T, path string) []byte {
+	t.Helper()
+	u.mu.Lock()
+	raw, ok := u.seen[path]
+	u.mu.Unlock()
+	if !ok {
+		t.Fatalf("nothing reached %s; the hop did not happen", path)
+	}
+	return raw
+}
+
 // anthropicGateway is the real serving stack for /v1/messages: the HTTP front
 // end over the real client core over the real route resolver, pointed at the
 // fixture. It is how proxycli.Build wires the gateway, minus the attestation the

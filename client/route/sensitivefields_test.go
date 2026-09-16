@@ -56,9 +56,15 @@ func TestSensitiveFieldsFollowTheServiceType(t *testing.T) {
 			// reachable case — withholds every payload field any profile has.
 			// Over-stripping only costs routing fidelity; under-stripping leaks, and
 			// the empty answer wire gives for an unknown profile is the leaking one.
+			//
+			// The service type here must be one NO row claims: it stood in as
+			// "speech-to-text" while that surface did not exist, which made the case
+			// read as a statement about speech the day it did. What is under test is
+			// the empty PROFILE, so the name only has to be a surface nobody has
+			// sketched yet.
 			name:            "a row with an unknown profile withholds every payload field",
-			ep:              endpoint.Endpoint{ServiceType: "speech-to-text"},
-			mustWithhold:    []string{"messages", "tools", "prompt", "system"},
+			ep:              endpoint.Endpoint{ServiceType: "video-to-text"},
+			mustWithhold:    []string{"messages", "tools", "prompt", "file_base64", "system"},
 			mustPassThrough: []string{"model"},
 		},
 	}
@@ -400,7 +406,9 @@ func TestRowWithoutUpstreamPathHasNoUpstreamURL(t *testing.T) {
 	r := New("http://router.example")
 	for _, ep := range []endpoint.Endpoint{
 		{},
-		{ServiceType: "speech-to-text"},
+		// A service type no row claims — see the note in the sensitive-fields
+		// table above for why this must not name a surface that exists.
+		{ServiceType: "video-to-text"},
 		{ServiceType: "chatbot", Path: "/v1/sketch"},
 	} {
 		if _, err := r.upstreamURL(ep); err == nil {
@@ -409,7 +417,7 @@ func TestRowWithoutUpstreamPathHasNoUpstreamURL(t *testing.T) {
 	}
 	// And Resolve refuses before it previews anything, so the router never even
 	// learns the request exists.
-	if _, err := r.Resolve(context.Background(), endpoint.Endpoint{ServiceType: "speech-to-text"}, wire.Request{}); err == nil {
+	if _, err := r.Resolve(context.Background(), endpoint.Endpoint{ServiceType: "video-to-text"}, wire.Request{}); err == nil {
 		t.Error("Resolve must refuse a row with no upstream path")
 	}
 }
