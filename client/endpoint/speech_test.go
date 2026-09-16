@@ -205,6 +205,11 @@ func TestSpeechDecodeMultipartRepeatedStreamIsNotTyped(t *testing.T) {
 // Every value here is caller input, so it goes through encoding/json rather than
 // hand-quoting: a filename or prompt carrying a quote, a backslash or a newline
 // must not be able to break the object it lands in.
+// (A filename carrying a quote is refused later, by speechPreSeal, because the
+// enclave cannot put it in a part header — see
+// TestSpeechPreSealRefusesWhatTheEnclaveWillRefuse. What is under test here is
+// the DECODER's escaping, which has to be right for `prompt` regardless.)
+//
 // The filename carries a quote and a backslash but no newline: Go's multipart
 // WRITER percent-escapes a newline into the Content-Disposition header, so a
 // filename containing one never reaches a reader as one and asserting otherwise
@@ -454,5 +459,111 @@ func TestSpeechRow(t *testing.T) {
 		if ep.Path != Speech.Path && ep.DecodeMultipart != nil {
 			t.Errorf("row %s also has a DecodeMultipart; the JSON-only rows must be untouched", ep.Path)
 		}
+	}
+}
+
+// The enclave writes the part headers of the multipart it rebuilds, and both the
+// filename and the field names come out of the envelope — i.e. from the caller.
+// Refusing here is not belt-and-braces: without it the request is sealed, sent,
+// and refused by the enclave, so the caller gets a relayed upstream error three
+// hops from the thing they got wrong. Reproduced end to end before this existed.
+//
+// The set mirrors the broker's speechHeaderSafe character for character. No
+// stricter — that would refuse requests the enclave would serve — and no looser.
+func TestSpeechPreSealRefusesWhatTheEnclaveWillRefuse(t *testing.T) {
+	tests := []struct {
+		name    string
+		req     map[string]json.RawMessage
+		wantErr string
+	}{
+		{
+			"a quoted filename",
+			map[string]json.RawMessage{"filename": json.RawMessage(`"a\".mp3"`)},
+			"cannot appear in a multipart part header",
+		},
+		{
+			// A separate mechanism from the quote: inside a quoted parameter a
+			// semicolon is RFC-legal and needs no escaping, so what breaks is a
+			// parser that splits the disposition on `;` before honouring the quotes.
+			"a semicolon in the filename",
+			map[string]json.RawMessage{"filename": json.RawMessage(`"a;b.mp3"`)},
+			"cannot appear in a multipart part header",
+		},
+		{
+			"a newline in the filename",
+			map[string]json.RawMessage{"filename": json.RawMessage(`"a.mp3\nX-Injected: yes"`)},
+			"cannot appear in a multipart part header",
+		},
+		{
+			// Reaches only the JSON-ified caller in practice — a multipart upload's
+			// filename has already been through filepath.Base by the time the decoder
+			// sees it — which is exactly why the rule cannot live in the decoder.
+			"a path filename",
+			map[string]json.RawMessage{"filename": json.RawMessage(`"../../etc/cron.d/x"`)},
+			"is a path, not a filename",
+		},
+		{
+			// A field NAME reaches a part header too, and this is the injection the
+			// broker's comment records: a `;`-splitting parser reads a second
+			// `name=model` out of it and disagrees with the broker about the model.
+			"a field name that forges a second parameter",
+			map[string]json.RawMessage{"zz; name=model": json.RawMessage(`"x"`)},
+			"cannot appear in a multipart part header",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := map[string]json.RawMessage{
+				"model":       json.RawMessage(`"whisper-1"`),
+				"file_base64": json.RawMessage(`"YXVkaW8="`),
+			}
+			for k, v := range tt.req {
+				req[k] = v
+			}
+			if _, err := speechPreSeal(req); err == nil {
+				t.Fatalf("preseal accepted %s", tt.name)
+			} else if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error %q does not mention %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// And the other half of "no stricter": these all materialize fine, so refusing
+// them would break requests the enclave would have served.
+func TestSpeechPreSealAcceptsWhatTheEnclaveAccepts(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		req  map[string]json.RawMessage
+	}{
+		{"an ordinary filename", map[string]json.RawMessage{"filename": json.RawMessage(`"board-meeting.m4a"`)}},
+		{
+			// The broker accepts this deliberately: on the POSIX upstreams it runs
+			// against, a backslash is an ordinary filename character rather than a
+			// separator, and refusing it would reject a Windows-style name for nothing.
+			"a Windows-style filename",
+			map[string]json.RawMessage{"filename": json.RawMessage(`"C:\\recordings\\a.mp3"`)},
+		},
+		{
+			// `=` is not in the set, and measured for the same reason the backslash is
+			// not: a `;`-splitter still sees one segment, so there is no second
+			// parameter to read out of it.
+			"an equals sign in a field name",
+			map[string]json.RawMessage{"zz=model": json.RawMessage(`"x"`)},
+		},
+		{"no filename at all", map[string]json.RawMessage{}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			req := map[string]json.RawMessage{
+				"model":       json.RawMessage(`"whisper-1"`),
+				"file_base64": json.RawMessage(`"YXVkaW8="`),
+			}
+			for k, v := range tt.req {
+				req[k] = v
+			}
+			if _, err := speechPreSeal(req); err != nil {
+				t.Errorf("preseal refused %s, which the enclave materializes fine: %v", tt.name, err)
+			}
+		})
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/proof"
@@ -23,6 +24,14 @@ import (
 const (
 	fieldFileBase64 = "file_base64"
 	fieldFilename   = "filename"
+	fieldStream     = "stream"
+
+	// fallbackFilename is written when the request sealed none. The part needs
+	// SOME filename to read as a file upload at all: with an empty one Go's
+	// ReadForm classifies it as a text field, so an upstream reading
+	// form.File["file"] finds no audio. Measured, and it is what the broker's
+	// speechFallbackFilename exists for.
+	fallbackFilename = "audio"
 )
 
 // handleSpeech is the sealed transcription path — POST /v1/audio/transcriptions.
@@ -182,11 +191,23 @@ func materializeTranscription(req wire.Request) (*transcriptionUpload, error) {
 			fieldFileBase64, err)
 	}
 
-	var filename string
+	filename := fallbackFilename
 	if raw, ok := req[fieldFilename]; ok {
-		if err := json.Unmarshal(raw, &filename); err != nil {
+		var sealed string
+		if err := json.Unmarshal(raw, &sealed); err != nil {
 			return nil, errors.New(`"filename" is not a JSON string`)
 		}
+		if sealed != "" {
+			filename = sealed
+		}
+	}
+	// A filename is a NAME, not a path: a backend that joins it onto an upload
+	// directory would follow "../../etc/cron.d/x" verbatim.
+	if strings.Contains(filename, "/") || filename == "." || filename == ".." {
+		return nil, fmt.Errorf("%q is a path, not a filename (SPEC §5.3)", filename)
+	}
+	if err := headerSafe("filename", filename); err != nil {
+		return nil, err
 	}
 
 	var buf bytes.Buffer
@@ -206,16 +227,27 @@ func materializeTranscription(req wire.Request) (*transcriptionUpload, error) {
 	}
 	slices.Sort(names)
 	for _, name := range names {
-		if name == fieldFileBase64 || name == fieldFilename {
+		// `stream` is DROPPED rather than rendered. The pin has already guaranteed
+		// it is false, the endpoint's default is non-streaming, so writing it adds
+		// nothing — and a field that is not written cannot be misread by a form
+		// parser whose notion of truthiness differs (SPEC §5.3.3 calls that set
+		// open).
+		if name == fieldFileBase64 || name == fieldFilename || name == fieldStream {
 			continue
 		}
-		values, repeated, err := formValues(req[name])
+		values, repeated, omit, err := formValues(req[name])
 		if err != nil {
 			return nil, fmt.Errorf("field %q: %w", name, err)
+		}
+		if omit {
+			continue
 		}
 		field := name
 		if repeated {
 			field += "[]"
+		}
+		if err := headerSafe("field name", field); err != nil {
+			return nil, err
 		}
 		for _, v := range values {
 			if err := w.WriteField(field, v); err != nil {
@@ -277,33 +309,63 @@ func readBackUpload(body []byte, boundary string) (audio []byte, filename string
 // formValues renders one JSON field as the form value(s) it materializes to. A
 // form carries strings and nothing else, so this is where the JSON types the
 // sender used collapse back — a string as itself, a bool or number as its JSON
-// text, an array as repeated values.
+// text, an array as repeated values, and a null as no field at all (absence is a
+// value the endpoint understands; the four letters are a string it would parse).
 //
 // That collapse is why §5.1 compares a rendered TOKEN rather than a JSON type:
 // `false` and `"false"` arrive here as the same form value, so a pin that
 // distinguished them would mean different things on the two sides of this
 // function.
-func formValues(raw json.RawMessage) (values []string, repeated bool, err error) {
-	var any0 any
-	if err := json.Unmarshal(raw, &any0); err != nil {
-		return nil, false, fmt.Errorf("not valid JSON: %w", err)
+//
+// Numbers are decoded with UseNumber and emitted as the LITERAL the client
+// sealed. Through float64 they are both a rewrite of what was sealed and lossy
+// above 2^53 — 12345678901234567890 comes back as 1.2345678901234567e+19 —
+// which is the bug the broker's speechFormValues already carries a comment
+// about, and which this fixture reproduced until it was measured against it.
+func formValues(raw json.RawMessage) (values []string, repeated, omit bool, err error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, false, false, fmt.Errorf("not valid JSON: %w", err)
 	}
-	if arr, ok := any0.([]any); ok {
-		out := make([]string, 0, len(arr))
-		for _, el := range arr {
-			v, err := formScalar(el)
+	switch t := v.(type) {
+	case nil:
+		return nil, false, true, nil
+	case []any:
+		out := make([]string, 0, len(t))
+		for _, el := range t {
+			s, err := formScalar(el)
 			if err != nil {
-				return nil, false, err
+				return nil, false, false, err
 			}
-			out = append(out, v)
+			out = append(out, s)
 		}
-		return out, true, nil
+		return out, true, false, nil
+	default:
+		s, err := formScalar(t)
+		if err != nil {
+			return nil, false, false, err
+		}
+		return []string{s}, false, false, nil
 	}
-	v, err := formScalar(any0)
-	if err != nil {
-		return nil, false, err
+}
+
+// headerSafe refuses a form field name or filename that cannot appear in a
+// multipart part header without changing its meaning (RFC 7578 §5.1). Both
+// strings come out of the opened envelope, i.e. from the client, and
+// multipart.Writer escapes only `\` and `"` — writing CR and LF verbatim.
+//
+// The set matches the broker's speechHeaderSafe exactly, refused rather than
+// escaped for the reason it gives: a rewritten name is not the name the client
+// sealed, and the client's signature covers what it sealed. The semicolon is in
+// the set because a parser that splits the disposition on `;` before honouring
+// the quotes reads a second parameter out of it.
+func headerSafe(kind, s string) error {
+	if i := strings.IndexAny(s, "\r\n\";"); i >= 0 {
+		return fmt.Errorf("%s %q contains %q at offset %d, which cannot appear in a multipart part header (RFC 7578 §5.1, SPEC §5.3)", kind, s, s[i], i)
 	}
-	return []string{v}, false, nil
+	return nil
 }
 
 func formScalar(v any) (string, error) {
@@ -312,12 +374,9 @@ func formScalar(v any) (string, error) {
 		return t, nil
 	case bool:
 		return strconv.FormatBool(t), nil
-	case float64:
-		return strconv.FormatFloat(t, 'g', -1, 64), nil
-	case nil:
-		// A JSON null has no form rendering — the same reason §5.1 gives it a token
-		// nothing permits. An upstream would have to guess what part to write.
-		return "", errors.New("a JSON null has no multipart rendering")
+	case json.Number:
+		// The literal, verbatim — see the UseNumber note in formValues.
+		return t.String(), nil
 	default:
 		return "", errors.New("a JSON object has no multipart rendering")
 	}

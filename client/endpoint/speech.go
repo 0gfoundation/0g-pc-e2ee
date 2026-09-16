@@ -217,6 +217,9 @@ func multipartBoundary(contentType string) (string, error) {
 // is cheap even here: wire.Request holds json.RawMessage, so copying the map
 // copies slice headers — the base64 audio is not duplicated.
 func speechPreSeal(req wire.Request) (wire.Request, error) {
+	if err := speechMaterializable(req); err != nil {
+		return nil, err
+	}
 	if raw, ok := req[fieldResponseFormat]; ok && string(raw) != "null" {
 		var got string
 		if err := json.Unmarshal(raw, &got); err != nil {
@@ -248,6 +251,69 @@ func speechPreSeal(req wire.Request) (wire.Request, error) {
 		delete(out, fieldStream)
 	}
 	return out, nil
+}
+
+// speechMaterializable refuses a request the ENCLAVE is guaranteed to refuse,
+// so the caller learns why here rather than three hops away as a relayed
+// upstream error.
+//
+// The enclave writes the part headers of the multipart it rebuilds, and both the
+// filename and every field name come straight out of the envelope — i.e. from
+// the caller. multipart.Writer escapes only `\` and `"`, writing CR and LF
+// verbatim, so those strings can change what a part header MEANS. The broker
+// refuses them rather than escaping (a rewritten name is not the name the client
+// sealed, and the signature covers what was sealed), and this mirrors its rule
+// set exactly — no stricter, which would refuse requests the enclave would
+// serve, and no looser, which is the gap this closes.
+//
+// Reproduced end to end before it was written: a caller posting a multipart
+// filename of `a".mp3` or `a;b.mp3` had it sealed here and refused by the
+// enclave. The `;` matters for a reason separate from the quote — inside a
+// quoted parameter it needs no escaping and is RFC-legal, so what breaks is a
+// parser that splits the disposition on `;` before honouring the quotes.
+//
+// The path check reaches only the JSON-ified caller in practice: Go's
+// multipart.Part.FileName passes the value through filepath.Base, so a multipart
+// upload of `../../etc/cron.d/x` already arrives here as `x`. A caller sending
+// the JSON shape directly has no such filter, which is exactly why the rule
+// cannot live in the decoder.
+func speechMaterializable(req wire.Request) error {
+	if raw, ok := req[fieldFilename]; ok {
+		var name string
+		if err := json.Unmarshal(raw, &name); err != nil {
+			return fmt.Errorf("%s must be a JSON string", fieldFilename)
+		}
+		if strings.Contains(name, "/") || name == "." || name == ".." {
+			return fmt.Errorf("%s %q is a path, not a filename: a form filename carries no directory separator", fieldFilename, name)
+		}
+		if err := speechHeaderSafe(fieldFilename, name); err != nil {
+			return err
+		}
+	}
+	for name := range req {
+		switch name {
+		case fieldFileBase64, fieldFilename, fieldStream:
+			// Not written as form fields by the enclave — the first two become the
+			// audio part, and `stream` is dropped — so their names never reach a part
+			// header.
+			continue
+		}
+		if err := speechHeaderSafe("field name", name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// speechHeaderSafe refuses a string that cannot appear in a multipart part
+// header without changing its meaning (RFC 7578 §5.1). The set matches the
+// broker's speechHeaderSafe character for character; see speechMaterializable
+// for why each is in it.
+func speechHeaderSafe(kind, s string) error {
+	if i := strings.IndexAny(s, "\r\n\";"); i >= 0 {
+		return fmt.Errorf("%s %q contains %q at offset %d, which cannot appear in a multipart part header (RFC 7578 §5.1, SPEC §5.3)", kind, s, s[i], i)
+	}
+	return nil
 }
 
 // quotedList renders a permitted set for an error message, matching the phrasing

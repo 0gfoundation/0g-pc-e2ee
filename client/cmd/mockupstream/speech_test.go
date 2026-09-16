@@ -345,10 +345,12 @@ func TestMaterializeTranscription(t *testing.T) {
 	if _, ok := form.Value["timestamp_granularities"]; ok {
 		t.Error("the unbracketed name must not also be written")
 	}
-	// A JSON bool collapses back to the form value it came from — the round trip
-	// that closes the loop with the sender's typing of `stream`.
-	if got := form.Value["stream"]; len(got) != 1 || got[0] != "false" {
-		t.Errorf("stream = %v, want [false]", got)
+	// `stream` is DROPPED, not rendered: the pin already guarantees false, the
+	// endpoint's default is non-streaming, and a field that is not written cannot
+	// be misread by a parser whose truthiness differs. Measured against the
+	// broker's materializeSpeechRequest, which does the same.
+	if got, ok := form.Value["stream"]; ok {
+		t.Errorf("stream = %v, want it absent", got)
 	}
 	if got := form.Value["temperature"]; len(got) != 1 || got[0] != "0.2" {
 		t.Errorf("temperature = %v, want the string carried straight through", got)
@@ -373,5 +375,165 @@ func TestMaterializeTranscriptionRefusesBase64URL(t *testing.T) {
 		t.Fatal("materialize accepted base64url")
 	} else if !strings.Contains(err.Error(), "standard padded base64") {
 		t.Errorf("error %q should name the encoding rule", err)
+	}
+}
+
+// The fixture must materialize what the REAL enclave materializes, and it is a
+// re-implementation rather than a shared package — the broker is another module
+// in another repository, so nothing makes the two agree except this table.
+//
+// Every row was MEASURED by running the same input through
+// 0g-serving-broker's materializeSpeechRequest and reading the form back. Five
+// of them disagreed the first time this comparison was made, and two of those
+// were outright bugs here rather than differences of taste:
+//
+//   - a number went through float64, so 12345678901234567890 materialized as
+//     1.2345678901234567e+19 — a rewrite of what the client sealed, and lossy
+//     above 2^53. The broker carries a comment about having fixed exactly this.
+//   - with no sealed filename the file part was written with an empty one, and
+//     Go's ReadForm then classifies it as a TEXT FIELD: an upstream reading
+//     form.File["file"] finds no audio at all. Invisible here until measured,
+//     because the fixture's own read-back looks the part up by FormName.
+//
+// A row that starts failing means one side moved. Go find out which.
+func TestMaterializeMatchesTheBrokerEnclave(t *testing.T) {
+	const audioB64 = `"YXVkaW8="`
+	tests := []struct {
+		name       string
+		field      string
+		value      string
+		wantValues map[string][]string // form fields, beyond the file part
+		wantFile   string              // the file part's filename
+		wantErr    string
+	}{
+		{
+			name: "stream is dropped, not rendered", field: "stream", value: `false`,
+			wantValues: map[string][]string{}, wantFile: "audio",
+		},
+		{
+			name: "a big integer keeps its literal", field: "temperature", value: `12345678901234567890`,
+			wantValues: map[string][]string{"temperature": {"12345678901234567890"}}, wantFile: "audio",
+		},
+		{
+			name: "a float keeps its shortest form", field: "temperature", value: `0.2`,
+			wantValues: map[string][]string{"temperature": {"0.2"}}, wantFile: "audio",
+		},
+		{
+			// Absence is a value the endpoint understands; "null" is a string it
+			// would try to parse.
+			name: "a null field is omitted", field: "language", value: `null`,
+			wantValues: map[string][]string{}, wantFile: "audio",
+		},
+		{
+			name: "an array becomes repeated bracketed parts", field: "timestamp_granularities",
+			value:      `["segment","word"]`,
+			wantValues: map[string][]string{"timestamp_granularities[]": {"segment", "word"}}, wantFile: "audio",
+		},
+		{
+			name: "a quoted filename is refused", field: "filename", value: `"a\".mp3"`,
+			wantErr: "cannot appear in a multipart part header",
+		},
+		{
+			name: "a path filename is refused", field: "filename", value: `"../../etc/cron.d/x"`,
+			wantErr: "is a path, not a filename",
+		},
+		{
+			name: "an object has no form rendering", field: "chunking_strategy", value: `{"type":"auto"}`,
+			wantErr: "no multipart rendering",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := wire.Request{
+				"file_base64": json.RawMessage(audioB64),
+				tt.field:      json.RawMessage(tt.value),
+			}
+			upload, err := materializeTranscription(req)
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("materialize accepted %s=%s; the enclave refuses it", tt.field, tt.value)
+				}
+				if !strings.Contains(err.Error(), tt.wantErr) {
+					t.Errorf("error %q does not mention %q", err, tt.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("materialize: %v", err)
+			}
+			_, params, err := mime.ParseMediaType(upload.ContentType)
+			if err != nil {
+				t.Fatalf("content type: %v", err)
+			}
+			form, err := multipart.NewReader(bytes.NewReader(upload.Body), params["boundary"]).ReadForm(1 << 20)
+			if err != nil {
+				t.Fatalf("read back: %v", err)
+			}
+			defer form.RemoveAll()
+
+			files := form.File["file"]
+			if len(files) != 1 {
+				t.Fatalf("file parts = %d, want 1 — an empty filename degrades the part to a text field", len(files))
+			}
+			if files[0].Filename != tt.wantFile {
+				t.Errorf("file part filename = %q, want %q", files[0].Filename, tt.wantFile)
+			}
+			if len(form.Value) != len(tt.wantValues) {
+				t.Errorf("form fields = %v, want %v", form.Value, tt.wantValues)
+			}
+			for name, want := range tt.wantValues {
+				got := form.Value[name]
+				if len(got) != len(want) {
+					t.Errorf("%s = %v, want %v", name, got, want)
+					continue
+				}
+				for i := range want {
+					if got[i] != want[i] {
+						t.Errorf("%s[%d] = %q, want %q", name, i, got[i], want[i])
+					}
+				}
+			}
+		})
+	}
+}
+
+// The gateway refuses a filename the enclave could not put in a part header, and
+// refuses it ITSELF — `_0g.source` is "gateway", not "upstream". Before
+// speechPreSeal checked, this request was sealed, routed, and refused by the
+// enclave, so the caller learned about their filename from a relayed upstream
+// error three hops away. Both spellings of the damage are covered: the quote,
+// which multipart.Writer escapes and a non-unescaping parser still misreads, and
+// the semicolon, which is RFC-legal inside a quoted parameter and which a
+// `;`-splitting parser reads as a second parameter.
+func TestSpeechGatewayRefusesAnUnmaterializableFilename(t *testing.T) {
+	s, err := newServer(testConfig())
+	if err != nil {
+		t.Fatalf("newServer: %v", err)
+	}
+	rec := recordUpstream(s.handler())
+	upstream := httptest.NewServer(rec)
+	defer upstream.Close()
+	gw := speechGateway(t, upstream.URL, upstream.Client())
+
+	for _, filename := range []string{`a".mp3`, "a;b.mp3"} {
+		t.Run(filename, func(t *testing.T) {
+			body, ct := sdkTranscription(t, filename, []byte("audio"), [2]string{"model", "mock-model"})
+			resp, err := http.Post(gw.URL+endpoint.Speech.Path, ct, body)
+			if err != nil {
+				t.Fatalf("post: %v", err)
+			}
+			defer resp.Body.Close()
+			raw, _ := io.ReadAll(resp.Body)
+
+			if resp.StatusCode != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400: %s", resp.StatusCode, raw)
+			}
+			if !strings.Contains(string(raw), `"source":"gateway"`) {
+				t.Errorf("body = %s, want the gateway to own this refusal", raw)
+			}
+			if strings.Contains(string(raw), "upstream") {
+				t.Errorf("body = %s — the request reached the enclave before being refused", raw)
+			}
+		})
 	}
 }
