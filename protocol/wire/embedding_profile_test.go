@@ -195,42 +195,83 @@ func TestEmbeddingResponseSealsTheVectorsAndLeavesUsageReadable(t *testing.T) {
 	}
 }
 
-// Unlike image, this profile requires NO restated billable quantity in the
-// cleartext half, and the asymmetry is the thing to lock in: both profiles seal a
-// single field named `data` on a single non-streaming frame, so "image needs
-// usage.output_images, therefore embedding needs a count too" is the natural
-// wrong conclusion.
+// A sealed embedding response MUST restate `usage.prompt_tokens` in cleartext,
+// on both sides (§7.4). This is the regression test for a wrong argument, not
+// just for the rule: the first version of this profile required nothing here, on
+// the grounds that `usage` is already kept readable, unsealable and bound by the
+// profile-independent floor. Those floors forbid SEALING and UNBINDING the
+// field; they never require it to EXIST, so a frame with no `usage` at all
+// sealed and opened cleanly.
 //
-// It does not, because the two bill on different things. The router bills an
-// image response per delivered image — sealed inside `data`, hence uncountable,
-// hence restated per §7.1. It bills an embedding response on INPUT tokens, which
-// are in `usage.prompt_tokens`: cleartext already, and kept readable and bound by
-// the profile-independent floor. Nothing bills on the number of vectors.
+// What that costs is not a missed count but a priced one. The router's estimator
+// for a provider that omits usage measures the request's `input`, since an
+// embedding response echoes no text back to measure instead — and this profile
+// seals `input`, so the estimate floors to a constant while the enclave, holding
+// the decrypted input, bills the provider accurately.
 //
-// The contrast is asserted in both directions in one test, so neither half can
-// pass vacuously: the same frame shape (no count) opens for embedding and is
-// refused for image.
-func TestEmbeddingResponseOwesNoRestatedCountWhereImageDoes(t *testing.T) {
+// Both halves are asserted because §12 gives them to different parties: the
+// sealer must refuse to build the frame, and the client must refuse to accept one
+// a third-party enclave built anyway.
+func TestSealedEmbeddingResponseMustRestateTheBillableTokenCount(t *testing.T) {
 	ephPriv, ephPub := ephKeys(t)
 
-	// Only a token count — no image-style restated output quantity anywhere.
-	frame := `{"object":"list","model":"m","usage":{"prompt_tokens":14,"total_tokens":14},` +
-		`"data":[{"index":0,"embedding":[0.5]}]}`
+	noUsage := `{"object":"list","model":"m","data":[{"index":0,"embedding":[0.5]}]}`
+	if _, err := wire.SealResponseFor(wire.ProfileEmbedding, ephPub, mustResp(t, noUsage), nil); err == nil {
+		t.Error("the sealer must refuse an embedding response that states no billable count")
+	} else if !strings.Contains(err.Error(), "prompt_tokens") {
+		t.Errorf("error should name the missing count, got: %v", err)
+	}
 
-	sealed, err := wire.SealResponseFor(wire.ProfileEmbedding, ephPub, mustResp(t, frame), nil)
+	// A `usage` block that exists but omits the count is the same violation, and
+	// the one the "it's already cleartext" argument most invited: the field the
+	// floor protects IS present.
+	emptyUsage := `{"object":"list","model":"m","usage":{"total_tokens":14},` +
+		`"data":[{"index":0,"embedding":[0.5]}]}`
+	if _, err := wire.SealResponseFor(wire.ProfileEmbedding, ephPub, mustResp(t, emptyUsage), nil); err == nil {
+		t.Error("a usage block without prompt_tokens must be refused too")
+	}
+
+	// The receive side, against a sealer with the profile checks dropped —
+	// exactly the frame a third-party enclave that never ran them would emit.
+	frame, err := wire.SealResponseNonConforming(ephPub, mustResp(t, noUsage),
+		wire.DefaultResponseSealedFieldsFor(wire.ProfileEmbedding))
 	if err != nil {
-		t.Fatalf("an embedding response owes no restated count, so this must seal: %v", err)
+		t.Fatalf("seal: %v", err)
+	}
+	if _, ok := frame["usage"]; ok {
+		t.Fatal("precondition: this frame is supposed to be missing its billable count")
+	}
+	if _, err := wire.OpenResponseFor(wire.ProfileEmbedding, ephPriv, frame); err == nil {
+		t.Error("the client must refuse an embedding response that states no billable count")
+	} else if !strings.Contains(err.Error(), "prompt_tokens") {
+		t.Errorf("error should name the missing count, got: %v", err)
+	}
+
+	// And the conforming frame still round-trips, so the rule above is a
+	// requirement rather than a blanket refusal.
+	ok := `{"object":"list","model":"m","usage":{"prompt_tokens":14,"total_tokens":14},` +
+		`"data":[{"index":0,"embedding":[0.5]}]}`
+	sealed, err := wire.SealResponseFor(wire.ProfileEmbedding, ephPub, mustResp(t, ok), nil)
+	if err != nil {
+		t.Fatalf("a conforming embedding response must seal: %v", err)
 	}
 	if _, err := wire.OpenResponseFor(wire.ProfileEmbedding, ephPriv, sealed); err != nil {
-		t.Fatalf("and the client must accept it: %v", err)
+		t.Fatalf("and open: %v", err)
 	}
+}
 
-	// The other direction, proving the check above is not vacuous: an image frame
-	// with no `usage.output_images` is refused. If this ever stops failing, §7.1's
-	// requirement has been lost and the test above is asserting nothing.
-	imageFrame := `{"created":1700000000,"model":"m","data":[{"b64_json":"aW1n"}]}`
-	if _, err := wire.SealResponseFor(wire.ProfileImage, ephPub, mustResp(t, imageFrame), nil); err == nil {
-		t.Error("precondition: an image response with no billable count must still be refused")
+// The vector COUNT, by contrast, is correctly not required: nothing bills on how
+// many vectors came back, so a rule restating it would enforce a number no party
+// reads. Asserted so the fix above is not over-applied into image's shape.
+func TestEmbeddingResponseOwesNoVectorCount(t *testing.T) {
+	_, ephPub := ephKeys(t)
+
+	// `usage` carries the token count and nothing resembling image's
+	// `output_images` / an embedding count anywhere.
+	frame := `{"object":"list","model":"m","usage":{"prompt_tokens":14,"total_tokens":14},` +
+		`"data":[{"index":0,"embedding":[0.5]},{"index":1,"embedding":[0.25]}]}`
+	if _, err := wire.SealResponseFor(wire.ProfileEmbedding, ephPub, mustResp(t, frame), nil); err != nil {
+		t.Fatalf("two vectors and no restated vector count must still seal: %v", err)
 	}
 }
 

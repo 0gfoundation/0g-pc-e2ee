@@ -102,6 +102,11 @@ const (
 	// profileSpec.requiredResponseCleartext.
 	fieldUsage        = "usage"
 	fieldOutputImages = "output_images"
+	// fieldPromptTokens is the same requirement for the embedding profile
+	// (SPEC §7.4): the input token count the router bills on. `usage` being on
+	// mustStayCleartextInResponse does NOT supply it — that list forbids SEALING
+	// the field, it never requires the field to exist.
+	fieldPromptTokens = "prompt_tokens"
 	// The speech profile's request fields (SPEC §5.3.2). The request reaches this
 	// protocol JSON-ified: the audio that was a multipart file part is a base64
 	// string in fieldFileBase64, which is why the payload field has a name at all
@@ -184,10 +189,11 @@ const (
 	// ProfileEmbedding is /v1/embeddings: the payload is "input" and the response
 	// seals "data", the vectors.
 	//
-	// It is the plainest profile in the table, and worth saying so: the request is
-	// already JSON (nothing to JSON-ify), the response is a single non-streaming
-	// frame of one shape, and the endpoint has no `stream` parameter to pin. What
-	// it adds to this package is therefore nothing but a row.
+	// Its REQUEST side is the plainest in the table: already JSON (nothing to
+	// JSON-ify), one mandatory payload field with no optional half, no `stream`
+	// parameter to pin, nothing pinned at all. Its response side is image's, minus
+	// the pin — a single non-streaming frame that seals one field and must restate
+	// one billable quantity in cleartext.
 	//
 	// It pins NO cleartext field, which is the one thing about it that looks wrong
 	// at a glance. `/v1/embeddings` carries `encoding_format` ("float" /
@@ -752,16 +758,36 @@ var profiles = map[Profile]profileSpec{
 		// `encoding_format` is not one despite resembling image's
 		// `response_format`.
 		//
-		// No requiredResponseCleartext either, and this profile is where that
-		// deserves a reason rather than a silence, because the profile it most
-		// resembles (image: one frame, seals `data`) has one. Image needs it
-		// because sealing `data` makes the billable quantity UNCOUNTABLE from
-		// outside: the router bills per delivered image and the images are the
-		// sealed thing. Embedding bills on INPUT tokens, which live in
-		// `usage.prompt_tokens` — cleartext, and already kept readable, unsealable
-		// and bound by the profile-independent floor on `usage`. So sealing `data`
-		// costs the router nothing it needs, and a rule restating the vector count
-		// would be enforcing a number nothing bills on.
+		// The billable input count, and the reason it is REQUIRED here rather
+		// than assumed present is a distinction worth stating, because the first
+		// version of this profile got it wrong: it argued that no rule was needed
+		// since `usage` is "already kept readable, unsealable and bound by the
+		// profile-independent floor". That conflates two different things.
+		// mustStayCleartextInResponse / mustStayBoundInResponse forbid SEALING or
+		// UNBINDING `usage`; neither requires it to EXIST. A frame with no `usage`
+		// at all sealed and opened cleanly under that reasoning.
+		//
+		// Unlike image, the gap is not merely uncountable-from-outside — it is
+		// uncountable from ANYWHERE the router can reach, because sealing removes
+		// the router's own fallback. Its estimator for a provider that omits
+		// usage measures the request's `input` (an embedding response echoes no
+		// text to measure instead), which this profile seals, so it floors to 1
+		// token: an arbitrarily large sealed batch bills as one token, silently.
+		// Worse than under-billing, it is a margin error in a known direction —
+		// the enclave holds the DECRYPTED input, so it bills the provider an
+		// accurate count while the router charges the user for 1.
+		//
+		// Chat's exemption does not transfer (see its note below): it rests on a
+		// streaming response legitimately withholding `usage` until asked, which
+		// an endpoint with no `stream` parameter cannot claim. The cost is the one
+		// speech already accepted — the enclave must write the count even when the
+		// upstream omitted one — and it is close to free here, since the enclave
+		// already computes exactly this number to bill on.
+		requiredResponseCleartext: []cleartextQuantity{{
+			locators: []cleartextNumber{{field: fieldUsage, key: fieldPromptTokens}},
+			kind:     numberWhole,
+			what:     "the billable count of input tokens actually embedded",
+		}},
 	},
 }
 

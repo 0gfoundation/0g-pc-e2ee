@@ -1151,25 +1151,48 @@ structure —
 and, against a known candidate set, its text — without the text ever appearing.
 Treating them as opaque numbers is the mistake this rule forecloses.
 
-**This profile adds no constraint of its own** — no pinned field, no restated
-quantity, no conditional payload field on either side, no frame taxonomy. It is
-the only profile in §5.1 with none of the four (`chat`, the closest, has
-conditional payload in `tools` / `tool_choice`), which is why this section exists
-to say so rather than leaving the absences to be inferred. The two a reader would
-most expect are both deliberate:
+Two constraints, one on each side, and they are asymmetric: the request side adds
+nothing at all (no pinned field, no conditional payload — see §5.1), while the
+response side carries exactly one requirement.
 
-- **No pinned cleartext field.** `encoding_format` and `dimensions` stay
-  readable at any value. See §5.1 for the test they fail and why pinning them
-  would refuse conforming traffic.
-- **No restated billable quantity**, though the profile it most resembles has
-  one. The image profile (§7.1) must restate `usage.output_images` because
-  sealing `data` makes the billable thing — delivered images — uncountable from
-  outside. An embedding response bills on **input** tokens, which are in
-  `usage.prompt_tokens`: cleartext already, and kept readable, unsealable and
-  bound by the §5.2/§7 floor on `usage`. Nothing bills on the number of vectors,
-  so there is no count to restate, and §12 correspondingly gains no row for this
-  profile. A profile added later that bills on something inside its sealed field
-  does owe one.
+**`usage.prompt_tokens` is the billable count and MUST be cleartext on the final
+frame.** The router bills an embedding response on input tokens, and the enclave
+MUST write the count even when the upstream omitted one. This is the same
+requirement §7.1 places on image's `usage.output_images`, and the reason it
+cannot be left to the `usage` floor is a distinction worth stating outright:
+
+> **Kept readable is not the same as required present.** §5.2/§7 forbid
+> *sealing* `usage` and forbid declaring it *unbound*. Neither requires the
+> field to exist. A frame carrying no `usage` at all therefore satisfies every
+> floor rule in this document — so the requirement has to be stated per
+> profile, as image's is.
+
+The gap it closes is worse than image's, because sealing removes the router's own
+fallback rather than merely its ability to count. A router that receives no usage
+on this endpoint has nothing in the response to estimate from — an embedding
+response echoes no text back — so it estimates from the **request's `input`**,
+which this profile seals. It then floors to a flat constant, and an arbitrarily
+large sealed batch bills as one token, silently. Nor does that merely under-bill:
+the enclave holds the *decrypted* input, so it bills the provider an accurate
+count while the router charges the caller for the constant — a margin error in a
+known direction. Compare §7.3's speech row, which is the same failure.
+
+`chat`'s exemption does not transfer. It rests on a streaming response
+legitimately withholding `usage` until the caller asks for it
+(`stream_options.include_usage`), which an endpoint with no `stream` parameter
+cannot claim; this profile's one frame is always the final frame.
+
+The locator is `usage.prompt_tokens` alone, with no alternative in the manner of
+§7.3's `usage.seconds` / `duration`. Speech needs the alternation because
+upstreams genuinely report the duration in two places and naming one would reject
+half of the conforming responses; here the **enclave writes the frame**, so an
+upstream that reported only `total_tokens` is normalized by the enclave (an
+embedding response has no completion side, so the total *is* the prompt count)
+rather than by every reader. One locator also avoids the agreement rule
+alternation drags in.
+
+**No restated vector count**, on the other hand, is correct: nothing bills on how
+many vectors came back, so requiring one would enforce a number no party reads.
 
 **What stays visible**, and is worth naming because this endpoint's traffic
 pattern is more revealing than chat's: `usage.prompt_tokens` gives the router the
@@ -1361,6 +1384,7 @@ other, that party's column is the load-bearing one.
 | `usage` not unbound (§5.2/§7.1) | yes | **yes — client** (otherwise a rewritten count verifies) |
 | final frame carries the profile's billable cleartext — image: `usage.output_images` (§7.1) | yes | **yes — client** (a router cannot distinguish an omitted count from a zero, so it bills nothing and reports nothing) |
 | final frame carries the profile's billable cleartext — speech: `usage.seconds` OR top-level `duration`, written by the enclave even when the upstream omitted it (§7.3) | yes | **yes — client**, and more load-bearing than the image row. A router with no usage block on this endpoint estimates from the transcript text, which sealing makes empty, so it falls through to a flat constant: the omission does not under-bill quietly, it bills a fabricated number nothing downstream can distinguish from a real one |
+| final frame carries the profile's billable cleartext — embedding: `usage.prompt_tokens`, written by the enclave even when the upstream omitted it (§7.4) | yes | **yes — client**. Same shape as the speech row and for the same reason, one step worse: a router with no usage block here has nothing in the RESPONSE to estimate from (no text is echoed back), so it estimates from the request's `input` — which this profile seals — and floors to a constant. The enclave meanwhile holds the decrypted input and bills the provider accurately, so the two sides transact the same request at different prices. The sender's column is not sufficient on its own for the reason every row in this table exists: a third-party enclave that skips it produces a frame only the client can refuse |
 | where a billable cleartext has ALTERNATIVE locators, a frame carrying both states the same value — speech (§7.3) | **yes — sealer**, the only side that can compare both against the audio it measured | client (it can detect the disagreement, but not which locator is honest). The sealer's column is load-bearing because the two readers differ: a client opening one locator while a router bills the other would silently transact on different numbers for one response |
 | a conditionally sealed RESPONSE field is sealed when the frame carries it — speech: `segments` / `words` / `language` (§7.3) | yes | **yes — client**. A field still in the received cleartext was never sealed, and that is the receiver's only evidence: a router forwards such a frame unremarkably and the transcript rides through it in the clear. Same shape as the request side's conditional payload field, direction reversed |
 | a required quantity's LOCATOR field is neither sealed nor `unbound` — speech's `duration` as well as its `usage` (§5.2 table) | yes | **yes — client**, on every frame. The floor list is the name `usage`, so nothing else in this document reaches a top-level `duration`: derive the rule from the profile's locators rather than from names. The SEALED half is not redundant with the presence check once a quantity has alternatives — see §5.2 |
