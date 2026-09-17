@@ -31,6 +31,13 @@ func TestNilSealedSetNeverLeavesPayloadCleartext(t *testing.T) {
 		wire.ProfileSpeech: `{"model":"m","file_base64":"AA","filename":"board-meeting.m4a",` +
 			`"language":"en","prompt":"hint","response_format":"json"}`,
 		wire.ProfileImage: `{"model":"m","prompt":"a cat","response_format":"b64_json"}`,
+		// Embedding's payload is `input` alone, so the cleartext fields here are
+		// carrying their own weight: `encoding_format` and `dimensions` are exactly
+		// the two the profile deliberately does NOT pin, and a filter that started
+		// treating either as payload would strip them from the half the router
+		// routes on.
+		wire.ProfileEmbedding: `{"model":"m","input":["chunk one","chunk two"],` +
+			`"encoding_format":"base64","dimensions":256}`,
 	}
 
 	for _, p := range wire.Profiles() {

@@ -9,8 +9,8 @@ MUST agree on it. Keywords MUST / SHOULD / MAY per RFC 2119.
 > Status: draft. This cut covers the **router path**: provider discovery +
 > attestation binding, **field-level request sealing (E2E confidentiality of the
 > sensitive fields)**, **response sealing**, and **response-signature
-> verification**, for the **chat**, **image**, **anthropic** and **speech**
-> request profiles (§5.1).
+> verification**, for the **chat**, **image**, **anthropic**, **speech** and
+> **embedding** request profiles (§5.1).
 > Candidate scoring is the router's own internal concern
 > (surfaced through its candidate API), not part of this protocol.
 >
@@ -262,6 +262,7 @@ signed-text format.)
 | `image` | `/v1/images/generations` | `prompt` | `response_format` = `b64_json` (§7.1) | `prompt` | `data` |
 | `anthropic` | `/v1/messages` | `messages`, **and `system` / `tools` / `tool_choice` whenever present** | — | `messages`, `system`, `tools`, `tool_choice` | per frame shape (§7.2) |
 | `speech` | `/v1/audio/transcriptions` (JSON-ified, §5.3) | `file_base64`, **and `filename` / `language` / `prompt` whenever present** | `response_format` ∈ {`json`, `verbose_json`} (§5.3.2); `stream` = `false` **when present** (§5.3.3) | `file_base64`, `filename`, `language`, `prompt` | `text`, **and `segments` / `words` / `language` whenever present** (§7.3) |
+| `embedding` | `/v1/embeddings` | `input` | — | `input` | `data` (§7.4) |
 
 A **pinned cleartext field** is one that stays readable but may hold only a
 **permitted value** in a sealed request — one value, or a small set of them
@@ -285,6 +286,31 @@ apart when adding a profile: the first argues for requiring the field (silence
 means the leak), the second does not (silence may already be the safe value) and
 argues instead for a legible refusal.
 
+**A field that resembles both and is neither must NOT be pinned.** The test is
+what the *other* values do, not what the field is called, and the `embedding`
+profile is the case that makes the distinction load-bearing:
+`/v1/embeddings` carries `encoding_format` (`float` / `base64`), which reads
+exactly like the image profile's pinned `response_format`. It is not the same
+kind of field. Image's `url` sends the result *outside* the sealed channel;
+both of `encoding_format`'s values put the vectors in `data`, which the profile
+seals either way. It selects an encoding, not a destination — so there is
+nothing for a pin to protect. `dimensions` is the same: it truncates the vector,
+and the vector is sealed at any length.
+
+Pinning either would also refuse conforming traffic, and note which half of that
+does the work: a pin **requires the field to be present** (silence selects the
+server's default, which is the thing a pin guards against), so pinning
+`encoding_format` would reject every request that simply omits it — the ordinary
+case on an endpoint where the default is fine. OpenAI's official Python client,
+which requests `base64` explicitly for wire efficiency, would be rejected too,
+on the value rather than the absence.
+
+A profile whose cleartext fields are merely *metadata about* the request pins
+nothing, and `embedding` is the table's example of one. `user`, where a caller
+sends it, is likewise cleartext — the default above for a field no profile names —
+and a caller putting a real end-user identifier in it SHOULD add it to its own
+`sealed_fields`, which §5.1 permits.
+
 A **conditionally pinned cleartext field** is the optional-presence sibling: the
 field may be absent — the endpoint's default is what the profile wants — but when
 present it must hold a permitted value. See §5.3.3 for the case (`stream` on the
@@ -294,11 +320,11 @@ list of refused values on an endpoint whose request is materialized back into
 multipart.
 
 A **conditionally required payload field** is one that need not exist, but MUST
-be sealed whenever the request carries it. Three of the four profiles use it:
+be sealed whenever the request carries it. Three of the five profiles use it:
 `tools` and `tool_choice` on `chat` and `/v1/messages`, `system` on
 `/v1/messages`, and speech's `filename` / `language` / `prompt` (§5.3.2).
-`image` has none: its payload is the mandatory `prompt` and nothing else, and
-that is worth stating rather than
+`image` and `embedding` have none: their payload is one mandatory field and
+nothing else (`prompt`, `input`), and that is worth stating rather than
 generalising over — the category is what a profile needs when payload is
 OPTIONAL, not a box every profile has to fill.
 
@@ -726,8 +752,9 @@ enclave MUST reject (no plaintext fallback).
 The response is **field-level, symmetric with the request**: the enclave seals
 only the sensitive fields (chat profile: **`choices`** — the generated content
 and per-choice `finish_reason`; image profile: **`data`** — the generated
-images; anthropic profile: **a field per event shape** — §7.2), and leaves the
-rest cleartext so the router can bill
+images; embedding profile: **`data`** — the vectors, §7.4; speech profile:
+**`text`** and its conditional siblings, §7.3; anthropic profile: **a field per
+event shape** — §7.2), and leaves the rest cleartext so the router can bill
 on them. Cleartext response fields (`usage`, `model`, `id`, `created`,
 `system_fingerprint`) are:
 - **readable** by the router (no decryption needed),
@@ -1103,6 +1130,80 @@ already visible to the router in the `json` case, as the thing it bills on. The
 sealed channel protects what was said, not that something was said for 12.5
 seconds.
 
+### 7.4 Embedding responses
+
+An embedding response is one non-streaming frame with `data` — the vectors —
+sealed:
+
+```json
+{
+  "object": "list",
+  "model": "qwen3.7-text-embedding",
+  "usage": { "prompt_tokens": 14, "total_tokens": 14 },
+  "_e2ee": { "v": 1, "enc": "…", "sealed_fields": ["data"], "final": true, "ciphertext": "…" }
+}
+```
+
+The vectors are sealed because they are **recoverable content, not a digest**:
+embeddings of one corpus are comparable to each other and to any vector an
+attacker computes independently, so a readable `data` discloses the corpus'
+structure —
+and, against a known candidate set, its text — without the text ever appearing.
+Treating them as opaque numbers is the mistake this rule forecloses.
+
+Two constraints, one on each side, and they are asymmetric: the request side adds
+nothing at all (no pinned field, no conditional payload — see §5.1), while the
+response side carries exactly one requirement.
+
+**`usage.prompt_tokens` is the billable count and MUST be cleartext on the final
+frame.** The router bills an embedding response on input tokens, and the enclave
+MUST write the count even when the upstream omitted one. This is the same
+requirement §7.1 places on image's `usage.output_images`, and the reason it
+cannot be left to the `usage` floor is a distinction worth stating outright:
+
+> **Kept readable is not the same as required present.** §5.2/§7 forbid
+> *sealing* `usage` and forbid declaring it *unbound*. Neither requires the
+> field to exist. A frame carrying no `usage` at all therefore satisfies every
+> floor rule in this document — so the requirement has to be stated per
+> profile, as image's is.
+
+The gap it closes is worse than image's, because sealing removes the router's own
+fallback rather than merely its ability to count. A router that receives no usage
+on this endpoint has nothing in the response to estimate from — an embedding
+response echoes no text back — so it estimates from the **request's `input`**,
+which this profile seals. It then floors to a flat constant, and an arbitrarily
+large sealed batch bills as one token, silently. Nor does that merely under-bill:
+the enclave holds the *decrypted* input, so it bills the provider an accurate
+count while the router charges the caller for the constant — a margin error in a
+known direction. Compare §7.3's speech row, which is the same failure.
+
+`chat`'s exemption does not transfer. It rests on a streaming response
+legitimately withholding `usage` until the caller asks for it
+(`stream_options.include_usage`), which an endpoint with no `stream` parameter
+cannot claim; this profile's one frame is always the final frame.
+
+The locator is `usage.prompt_tokens` alone, with no alternative in the manner of
+§7.3's `usage.seconds` / `duration`. Speech needs the alternation because
+upstreams genuinely report the duration in two places and naming one would reject
+half of the conforming responses; here the **enclave writes the frame**, so an
+upstream that reported only `total_tokens` is normalized by the enclave (an
+embedding response has no completion side, so the total *is* the prompt count)
+rather than by every reader. One locator also avoids the agreement rule
+alternation drags in.
+
+**No restated vector count**, on the other hand, is correct: nothing bills on how
+many vectors came back, so requiring one would enforce a number no party reads.
+
+**What stays visible**, and is worth naming because this endpoint's traffic
+pattern is more revealing than chat's: `usage.prompt_tokens` gives the router the
+**total length of the text embedded**, and `model` names the embedding space.
+A retrieval pipeline indexes in batches, so a router observing token counts over
+time learns roughly how large a corpus is and when it was ingested — never a word
+of it, but not nothing. This is the same floor every profile has (billing needs
+`usage`, routing needs `model`) rather than anything new here; it is called out
+because the inference from "batch sizes and timing" to "corpus shape" is a
+shorter step than the equivalent for a conversation.
+
 ## 8. Response signature
 
 Each response carries a TEE signature that authenticates it as the enclave's
@@ -1283,6 +1384,7 @@ other, that party's column is the load-bearing one.
 | `usage` not unbound (§5.2/§7.1) | yes | **yes — client** (otherwise a rewritten count verifies) |
 | final frame carries the profile's billable cleartext — image: `usage.output_images` (§7.1) | yes | **yes — client** (a router cannot distinguish an omitted count from a zero, so it bills nothing and reports nothing) |
 | final frame carries the profile's billable cleartext — speech: `usage.seconds` OR top-level `duration`, written by the enclave even when the upstream omitted it (§7.3) | yes | **yes — client**, and more load-bearing than the image row. A router with no usage block on this endpoint estimates from the transcript text, which sealing makes empty, so it falls through to a flat constant: the omission does not under-bill quietly, it bills a fabricated number nothing downstream can distinguish from a real one |
+| final frame carries the profile's billable cleartext — embedding: `usage.prompt_tokens`, written by the enclave even when the upstream omitted it (§7.4) | yes | **yes — client**. Same shape as the speech row and for the same reason, one step worse: a router with no usage block here has nothing in the RESPONSE to estimate from (no text is echoed back), so it estimates from the request's `input` — which this profile seals — and floors to a constant. The enclave meanwhile holds the decrypted input and bills the provider accurately, so the two sides transact the same request at different prices. The sender's column is not sufficient on its own for the reason every row in this table exists: a third-party enclave that skips it produces a frame only the client can refuse |
 | where a billable cleartext has ALTERNATIVE locators, a frame carrying both states the same value — speech (§7.3) | **yes — sealer**, the only side that can compare both against the audio it measured | client (it can detect the disagreement, but not which locator is honest). The sealer's column is load-bearing because the two readers differ: a client opening one locator while a router bills the other would silently transact on different numbers for one response |
 | a conditionally sealed RESPONSE field is sealed when the frame carries it — speech: `segments` / `words` / `language` (§7.3) | yes | **yes — client**. A field still in the received cleartext was never sealed, and that is the receiver's only evidence: a router forwards such a frame unremarkably and the transcript rides through it in the clear. Same shape as the request side's conditional payload field, direction reversed |
 | a required quantity's LOCATOR field is neither sealed nor `unbound` — speech's `duration` as well as its `usage` (§5.2 table) | yes | **yes — client**, on every frame. The floor list is the name `usage`, so nothing else in this document reaches a top-level `duration`: derive the rule from the profile's locators rather than from names. The SEALED half is not redundant with the presence check once a quantity has alternatives — see §5.2 |
