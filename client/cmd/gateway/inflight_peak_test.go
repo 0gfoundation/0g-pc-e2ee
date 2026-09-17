@@ -39,25 +39,40 @@
 // WHAT IT MEASURED (4 vCPU, Go 1.24, GOGC default, bodies at the 10 MiB cap).
 // Two independent methods agree, which is the only reason to believe either:
 //
-//	peak live heap, no memory limit    speech 10.0-12.8x   chat 7.3x
-//	footprint vs K under a 4 GiB limit ~114 MiB/request = 11.4x  (linear to
-//	                                   saturation: K=1 170MiB, K=8 932MiB,
-//	                                   K=34 3890MiB, K=68 pinned at the limit)
+//	peak live heap, no memory limit    speech 10.0-12.8x   chat 6.5-7.7x
+//	footprint vs K under a 4 GiB limit 109-126 MiB/request = 10.9-12.6x
+//
+// Both are RANGES ACROSS RUNS, not one run's readings, because GC scheduling
+// moves them by a MiB or two per request. Quoting a single run to two decimal
+// places would be a precision this harness does not have; what it has is two
+// methods that agree on the same order of magnitude.
+//
+// The footprint figure is the slope, taken where it is linear: K=1 and K=8
+// (143-170 MiB and 932-1027 MiB), because K=34 and K=68 both pin at ~95% of the
+// limit — past saturation the limit binds and the reading stops being about the
+// requests. TestFootprintTracksConcurrency is what establishes where that line
+// is, and without it the saturated rows read as a much worse result than they
+// are.
 //
 // So perRequestPeakFactor = 3 understates the real cost by roughly 4x, and the
 // speech surface is about 1.5x the chat one — the double base64 (+33% into the
 // JSON-ified request, +33% again into the sealed envelope).
 //
-// K=1 reads higher (17x) because the fixed costs are not amortized; the marginal
-// figure, ~11.4x, is the one the constant wants.
+// K=1 alone reads higher (14-17x) because the fixed costs are not amortized over
+// anything; the marginal figure is the one the constant wants.
 //
 // A FACTOR ALONE DOES NOT FIX IT. At 12x the arithmetic comes out right for
-// limits of 4 GiB and up (K x 114 MiB lands near half the limit, which is what
+// limits of 4 GiB and up (K x ~120 MiB lands near half the limit, which is what
 // memBudgetDivisor intends). Below that, minDefaultInFlight = 32 overrides the
-// arithmetic entirely and promises 32 x 114 MiB = 3.6 GiB of slots to a process
+// arithmetic entirely and promises 32 x ~120 MiB = 3.6 GiB of slots to a process
 // limited to 1 GiB. And maxDefaultInFlight = 512, the bound that governs when no
 // limit is set at all, is priced in its comment at 512 x 30 MiB = 15 GiB; at the
 // measured cost it is 512 x 120 MiB = 61 GiB.
+//
+// That was checked rather than inferred: running the same limits priced at 6x
+// moved the footprint barely at all, because the floor still governed. It is the
+// reason this file reports a finding about the FLOOR alongside the one about the
+// factor.
 //
 // Those are capacity decisions with availability consequences — lowering a bound
 // refuses traffic the gateway serves today — so this file measures and does not
