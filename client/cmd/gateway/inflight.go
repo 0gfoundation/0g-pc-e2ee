@@ -38,6 +38,19 @@ import (
 // number — it tries to be a safe one. An L3 run (in-CVM, behind dstack-ingress)
 // produces the real knee, and the deployment should then set
 // ZG_GATEWAY_MAX_INFLIGHT explicitly rather than inherit any of this.
+//
+// MEASURED, AND NOT YET ACTED ON. inflight_peak_test.go (build tag
+// `peakprofile`) measures what a request actually costs, which nothing had done
+// when these numbers were written. On 4 vCPU / Go 1.24 / GOGC default, with
+// bodies at the cap, two independent methods put it at roughly 10-13x
+// MaxRequestBytes for the speech surface and 7-8x for chat — against the 3x
+// perRequestPeakFactor assumes. So every memory bound below is priced about 4x
+// too cheap, and each one now says so where it appears.
+//
+// The constants are left alone on purpose: lowering a concurrency bound refuses
+// traffic this gateway serves today, which is a capacity decision rather than a
+// documentation fix. What follows corrects what the comments CLAIM, so the next
+// reader is not misled by arithmetic that has since been checked.
 const (
 	// inFlightPerCPU is the per-CPU term. Generous on purpose: a streamed
 	// completion is held for its whole token schedule, so healthy in-flight
@@ -51,6 +64,13 @@ const (
 	// MaxRequestBytes and the other at 3x, so the file disagreed with itself about
 	// what a request costs and the looser number won on every deployment that had
 	// no GOMEMLIMIT set. At 512 the worst case is 512 x 30 MiB = 15 GiB.
+	//
+	// That 15 GiB is the figure perRequestPeakFactor implies, and it is what
+	// measurement contradicts hardest: at the measured ~12x it is 512 x 120 MiB =
+	// 61 GiB. It is also the bound the next paragraph rightly calls the one that
+	// matters most, since it governs when no GOMEMLIMIT is set at all — so the
+	// unconfigured path is over-committed by about 4x, and 512 is not a number any
+	// current CVM can honour.
 	//
 	// This is the bound that matters MOST, because it is the one that applies when
 	// nothing else is configured — a deployment outside the Phala CVM (local, a
@@ -70,12 +90,34 @@ const (
 	// minDefaultInFlight floors the memory-derived term. A small GOMEMLIMIT must
 	// not shrink the gateway to a handful of slots, which would be a self-inflicted
 	// outage dressed up as protection.
+	//
+	// But note what it does to everything else here: below roughly a 4 GiB limit
+	// this floor, not the arithmetic, is what picks the concurrency — so changing
+	// perRequestPeakFactor would not move the answer for a small deployment at
+	// all. Measured at a 1 GiB limit: the memory term computes 17, this floor
+	// raises it to 32, and 32 requests at the measured cost want ~3.6 GiB. The
+	// process survives that by collecting continuously rather than by having the
+	// memory. Whether the answer is a lower floor, or a floor expressed as a
+	// fraction of what the limit can actually support, is the capacity question
+	// the file header defers.
 	minDefaultInFlight = 32
 
 	// perRequestPeakFactor multiplies MaxRequestBytes to estimate the peak memory
 	// one in-flight request can hold: the buffered body, plus the parsed copy, plus
 	// the sealed and base64'd envelope built from it. Approximate by nature —
 	// it is a budgeting input, not an accounting one.
+	//
+	// MEASURED AT ROUGHLY 10-13x, NOT 3x (inflight_peak_test.go, build tag
+	// `peakprofile`; the file header has the conditions). The three terms the
+	// sentence above enumerates are not each 1x: on the JSON-ified speech profile
+	// the parsed copy carries base64's +33% and the envelope carries it again, and
+	// the peak also includes allocation the collector has not yet swept, which is
+	// memory the process is really holding. Chat measures 7-8x, so the shape of
+	// the request matters and speech is the worst case — but even chat is well
+	// over 3.
+	//
+	// Left at 3 deliberately; correcting it lowers the admitted concurrency, which
+	// is a capacity decision. See the file header.
 	//
 	// EVERY memory bound in this file must be priced with it. Two bounds using two
 	// different factors is not a conservative belt-and-braces arrangement; it is a
@@ -85,6 +127,12 @@ const (
 	// memBudgetDivisor is the share of GOMEMLIMIT the request bodies may claim.
 	// Half, because the other half is the response side, the quote/collateral
 	// caches, and the headroom Go's collector needs to not thrash.
+	//
+	// In practice that half is not reserved. Because perRequestPeakBytes prices a
+	// request at about a quarter of its measured cost, the admitted concurrency
+	// claims essentially the whole limit: runs at 1, 2 and 4 GiB all peaked at
+	// 95-98% of the limit rather than the 50% intended. The divisor is not the
+	// thing that is wrong — it is the thing the wrong factor cancels out.
 	memBudgetDivisor = 2
 
 	// perRequestPeakBytes is the one place the per-request memory price is
