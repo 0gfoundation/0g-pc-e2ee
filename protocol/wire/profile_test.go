@@ -256,6 +256,12 @@ func TestProfileDefaults(t *testing.T) {
 			response: []string{},
 			why:      "conditionally sealed response fields (§7.3): `[\"text\"]` would be valid for json and invalid for verbose_json, so a broker holding it fails 100% of verbose responses after the billed upstream call",
 		},
+		// Both defaults are single-element and NON-empty, which makes embedding the
+		// one row here with nothing conditional about it: one mandatory payload
+		// field, one mandatory response field, no frame typing and no optional
+		// halves. If either of these ever comes back empty, something has made a
+		// mandatory field optional.
+		wire.ProfileEmbedding: {request: []string{"input"}, response: []string{"data"}},
 	}
 
 	profiles := wire.Profiles()

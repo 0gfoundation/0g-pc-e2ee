@@ -5,12 +5,12 @@
 // associated data, so an intermediary can read but not tamper.
 //
 //   - Request (§5–§6): client seals the payload fields to the provider enc key —
-//     messages/tools for chat, prompt for image, messages/system for Anthropic
-//     (see Profile).
+//     messages/tools for chat, prompt for image, messages/system for Anthropic,
+//     file_base64 for speech, input for embedding (see Profile).
 //   - Response (§7): the enclave seals the generated content to the client's
-//     ephemeral key — choices for chat, data for image, a field per event shape
-//     for Anthropic (§7.2) — one frame for non-streaming or a sequence of frames
-//     for streaming.
+//     ephemeral key — choices for chat, data for image and embedding, text for
+//     speech, a field per event shape for Anthropic (§7.2) — one frame for
+//     non-streaming or a sequence of frames for streaming.
 //
 // Contract: broker <-> client (byte-for-byte, per SPEC.md). All AAD is taken
 // over JCS (RFC 8785) canonical JSON so Go/TS/Rust agree byte-for-byte.
@@ -42,6 +42,12 @@ const (
 	fieldMessages = "messages"
 	// fieldPrompt is the sensitive field an image request MUST always seal.
 	fieldPrompt = "prompt"
+	// fieldInput is the sensitive field an embedding request MUST always seal: the
+	// text (or array of texts, or pre-tokenized arrays) to embed. It is the whole
+	// payload of that endpoint — an embedding request is a prompt with no
+	// instruction attached, and for the retrieval corpora these requests usually
+	// carry, the text IS the private asset.
+	fieldInput = "input"
 	// fieldTools is the tool/function schema list both chat and Anthropic carry.
 	// It is payload for the reason `messages` is: a schema names an operation the
 	// calling application performs, so the set of them describes what the user is
@@ -70,7 +76,10 @@ const (
 	// (SPEC §7.1) — see profileSpec.pinned.
 	fieldResponseFormat = "response_format"
 	// fieldChoices / fieldData are the generated content a sealed RESPONSE frame
-	// MUST cover, per profile (SPEC §7).
+	// MUST cover, per profile (SPEC §7). `data` serves TWO profiles — image's
+	// generated images and embedding's vectors — which is a name collision only
+	// in this file: a profile's rules are resolved from the profile, never from
+	// the field name, so the two never consult each other's spec.
 	fieldChoices = "choices"
 	fieldData    = "data"
 	// The Anthropic response carries its generated content in a different field
@@ -172,6 +181,24 @@ const (
 	// a constant: `verbose_json` adds `segments`, and `words` only when word
 	// granularity was requested (see responsePayload).
 	ProfileSpeech Profile = "speech"
+	// ProfileEmbedding is /v1/embeddings: the payload is "input" and the response
+	// seals "data", the vectors.
+	//
+	// It is the plainest profile in the table, and worth saying so: the request is
+	// already JSON (nothing to JSON-ify), the response is a single non-streaming
+	// frame of one shape, and the endpoint has no `stream` parameter to pin. What
+	// it adds to this package is therefore nothing but a row.
+	//
+	// It pins NO cleartext field, which is the one thing about it that looks wrong
+	// at a glance. `/v1/embeddings` carries `encoding_format` ("float" /
+	// "base64"), which reads like the image profile's pinned `response_format` —
+	// but the two are not the same kind of field. Image's `url` value has the
+	// enclave publish the generated images from a plain URL, i.e. OUTSIDE the
+	// sealed channel; both of `encoding_format`'s values put the vectors in `data`,
+	// which this profile seals either way. It selects an encoding, not a
+	// destination, so there is nothing for a pin to protect. Same answer for
+	// `dimensions` (it truncates the vector; the vector is sealed regardless).
+	ProfileEmbedding Profile = "embedding"
 )
 
 // profileSpec fixes, per profile, which request fields are payload (and so must
@@ -711,6 +738,30 @@ var profiles = map[Profile]profileSpec{
 			kind: numberFractional,
 			what: "the billable duration of the audio actually processed, in seconds",
 		}},
+	},
+	ProfileEmbedding: {
+		// `input` is the whole sensitive payload, and unlike chat there is no
+		// second, optional half to it: `/v1/embeddings` has no tools, no system
+		// prompt, no filename. `user` is the one field a caller might expect here
+		// and it is deliberately absent — §5.1 names it as an example of a field a
+		// CLIENT may add to its own sealed set, so making it profile payload would
+		// force every request to carry it.
+		payload:         []payloadField{{name: fieldInput}},
+		responsePayload: []payloadField{{name: fieldData}},
+		// No pinned cleartext field — see ProfileEmbedding for why
+		// `encoding_format` is not one despite resembling image's
+		// `response_format`.
+		//
+		// No requiredResponseCleartext either, and this profile is where that
+		// deserves a reason rather than a silence, because the profile it most
+		// resembles (image: one frame, seals `data`) has one. Image needs it
+		// because sealing `data` makes the billable quantity UNCOUNTABLE from
+		// outside: the router bills per delivered image and the images are the
+		// sealed thing. Embedding bills on INPUT tokens, which live in
+		// `usage.prompt_tokens` — cleartext, and already kept readable, unsealable
+		// and bound by the profile-independent floor on `usage`. So sealing `data`
+		// costs the router nothing it needs, and a rule restating the vector count
+		// would be enforcing a number nothing bills on.
 	},
 }
 

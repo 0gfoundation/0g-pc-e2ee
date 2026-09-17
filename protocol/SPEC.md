@@ -9,8 +9,8 @@ MUST agree on it. Keywords MUST / SHOULD / MAY per RFC 2119.
 > Status: draft. This cut covers the **router path**: provider discovery +
 > attestation binding, **field-level request sealing (E2E confidentiality of the
 > sensitive fields)**, **response sealing**, and **response-signature
-> verification**, for the **chat**, **image**, **anthropic** and **speech**
-> request profiles (§5.1).
+> verification**, for the **chat**, **image**, **anthropic**, **speech** and
+> **embedding** request profiles (§5.1).
 > Candidate scoring is the router's own internal concern
 > (surfaced through its candidate API), not part of this protocol.
 >
@@ -262,6 +262,7 @@ signed-text format.)
 | `image` | `/v1/images/generations` | `prompt` | `response_format` = `b64_json` (§7.1) | `prompt` | `data` |
 | `anthropic` | `/v1/messages` | `messages`, **and `system` / `tools` / `tool_choice` whenever present** | — | `messages`, `system`, `tools`, `tool_choice` | per frame shape (§7.2) |
 | `speech` | `/v1/audio/transcriptions` (JSON-ified, §5.3) | `file_base64`, **and `filename` / `language` / `prompt` whenever present** | `response_format` ∈ {`json`, `verbose_json`} (§5.3.2); `stream` = `false` **when present** (§5.3.3) | `file_base64`, `filename`, `language`, `prompt` | `text`, **and `segments` / `words` / `language` whenever present** (§7.3) |
+| `embedding` | `/v1/embeddings` | `input` | — | `input` | `data` (§7.4) |
 
 A **pinned cleartext field** is one that stays readable but may hold only a
 **permitted value** in a sealed request — one value, or a small set of them
@@ -285,6 +286,31 @@ apart when adding a profile: the first argues for requiring the field (silence
 means the leak), the second does not (silence may already be the safe value) and
 argues instead for a legible refusal.
 
+**A field that resembles both and is neither must NOT be pinned.** The test is
+what the *other* values do, not what the field is called, and the `embedding`
+profile is the case that makes the distinction load-bearing:
+`/v1/embeddings` carries `encoding_format` (`float` / `base64`), which reads
+exactly like the image profile's pinned `response_format`. It is not the same
+kind of field. Image's `url` sends the result *outside* the sealed channel;
+both of `encoding_format`'s values put the vectors in `data`, which the profile
+seals either way. It selects an encoding, not a destination — so there is
+nothing for a pin to protect. `dimensions` is the same: it truncates the vector,
+and the vector is sealed at any length.
+
+Pinning either would also refuse conforming traffic, and note which half of that
+does the work: a pin **requires the field to be present** (silence selects the
+server's default, which is the thing a pin guards against), so pinning
+`encoding_format` would reject every request that simply omits it — the ordinary
+case on an endpoint where the default is fine. OpenAI's official Python client,
+which requests `base64` explicitly for wire efficiency, would be rejected too,
+on the value rather than the absence.
+
+A profile whose cleartext fields are merely *metadata about* the request pins
+nothing, and `embedding` is the table's example of one. `user`, where a caller
+sends it, is likewise cleartext — the default above for a field no profile names —
+and a caller putting a real end-user identifier in it SHOULD add it to its own
+`sealed_fields`, which §5.1 permits.
+
 A **conditionally pinned cleartext field** is the optional-presence sibling: the
 field may be absent — the endpoint's default is what the profile wants — but when
 present it must hold a permitted value. See §5.3.3 for the case (`stream` on the
@@ -294,11 +320,11 @@ list of refused values on an endpoint whose request is materialized back into
 multipart.
 
 A **conditionally required payload field** is one that need not exist, but MUST
-be sealed whenever the request carries it. Three of the four profiles use it:
+be sealed whenever the request carries it. Three of the five profiles use it:
 `tools` and `tool_choice` on `chat` and `/v1/messages`, `system` on
 `/v1/messages`, and speech's `filename` / `language` / `prompt` (§5.3.2).
-`image` has none: its payload is the mandatory `prompt` and nothing else, and
-that is worth stating rather than
+`image` and `embedding` have none: their payload is one mandatory field and
+nothing else (`prompt`, `input`), and that is worth stating rather than
 generalising over — the category is what a profile needs when payload is
 OPTIONAL, not a box every profile has to fill.
 
@@ -726,8 +752,9 @@ enclave MUST reject (no plaintext fallback).
 The response is **field-level, symmetric with the request**: the enclave seals
 only the sensitive fields (chat profile: **`choices`** — the generated content
 and per-choice `finish_reason`; image profile: **`data`** — the generated
-images; anthropic profile: **a field per event shape** — §7.2), and leaves the
-rest cleartext so the router can bill
+images; embedding profile: **`data`** — the vectors, §7.4; speech profile:
+**`text`** and its conditional siblings, §7.3; anthropic profile: **a field per
+event shape** — §7.2), and leaves the rest cleartext so the router can bill
 on them. Cleartext response fields (`usage`, `model`, `id`, `created`,
 `system_fingerprint`) are:
 - **readable** by the router (no decryption needed),
@@ -1102,6 +1129,57 @@ admitting `verbose_json` reveals nothing new — the length of the audio is
 already visible to the router in the `json` case, as the thing it bills on. The
 sealed channel protects what was said, not that something was said for 12.5
 seconds.
+
+### 7.4 Embedding responses
+
+An embedding response is one non-streaming frame with `data` — the vectors —
+sealed:
+
+```json
+{
+  "object": "list",
+  "model": "qwen3.7-text-embedding",
+  "usage": { "prompt_tokens": 14, "total_tokens": 14 },
+  "_e2ee": { "v": 1, "enc": "…", "sealed_fields": ["data"], "final": true, "ciphertext": "…" }
+}
+```
+
+The vectors are sealed because they are **recoverable content, not a digest**:
+embeddings of one corpus are comparable to each other and to any vector an
+attacker computes independently, so a readable `data` discloses the corpus'
+structure —
+and, against a known candidate set, its text — without the text ever appearing.
+Treating them as opaque numbers is the mistake this rule forecloses.
+
+**This profile adds no constraint of its own** — no pinned field, no restated
+quantity, no conditional payload field on either side, no frame taxonomy. It is
+the only profile in §5.1 with none of the four (`chat`, the closest, has
+conditional payload in `tools` / `tool_choice`), which is why this section exists
+to say so rather than leaving the absences to be inferred. The two a reader would
+most expect are both deliberate:
+
+- **No pinned cleartext field.** `encoding_format` and `dimensions` stay
+  readable at any value. See §5.1 for the test they fail and why pinning them
+  would refuse conforming traffic.
+- **No restated billable quantity**, though the profile it most resembles has
+  one. The image profile (§7.1) must restate `usage.output_images` because
+  sealing `data` makes the billable thing — delivered images — uncountable from
+  outside. An embedding response bills on **input** tokens, which are in
+  `usage.prompt_tokens`: cleartext already, and kept readable, unsealable and
+  bound by the §5.2/§7 floor on `usage`. Nothing bills on the number of vectors,
+  so there is no count to restate, and §12 correspondingly gains no row for this
+  profile. A profile added later that bills on something inside its sealed field
+  does owe one.
+
+**What stays visible**, and is worth naming because this endpoint's traffic
+pattern is more revealing than chat's: `usage.prompt_tokens` gives the router the
+**total length of the text embedded**, and `model` names the embedding space.
+A retrieval pipeline indexes in batches, so a router observing token counts over
+time learns roughly how large a corpus is and when it was ingested — never a word
+of it, but not nothing. This is the same floor every profile has (billing needs
+`usage`, routing needs `model`) rather than anything new here; it is called out
+because the inference from "batch sizes and timing" to "corpus shape" is a
+shorter step than the equivalent for a conversation.
 
 ## 8. Response signature
 
