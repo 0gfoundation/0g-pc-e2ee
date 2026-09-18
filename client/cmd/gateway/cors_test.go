@@ -99,10 +99,17 @@ func TestGatewayCatchAllStripsUpstreamCORS(t *testing.T) {
 	if got[0] != "https://sub.wild.example.com" {
 		t.Errorf("Allow-Origin = %q, want the gateway's own verdict, not the router's", got[0])
 	}
-	// Credentials stay off on this path too: the router's value must not leak
-	// through and turn on ambient-cookie CORS the gateway never opted into.
-	if v := resp.Header.Get("Access-Control-Allow-Credentials"); v != "" {
-		t.Errorf("Allow-Credentials = %q, want unset (the upstream's must be stripped)", v)
+	// Allow-Credentials is the gateway's OWN answer now (a named allowlist means
+	// ambient credentials are on), so "unset" is no longer the assertion — but
+	// "exactly one value" still is, and it is the one that matters. The upstream
+	// sends this header too, and ReverseProxy copies upstream headers with Add, so
+	// a missed strip appends rather than overwrites and the browser sees
+	// "true, true" — which it rejects exactly as it rejects two Allow-Origins.
+	// Same defect as the Allow-Origin case above, and invisible to a Get().
+	creds := resp.Header.Values("Access-Control-Allow-Credentials")
+	if len(creds) != 1 || creds[0] != "true" {
+		t.Errorf("Allow-Credentials values = %v, want exactly [\"true\"] — the gateway's own, with "+
+			"the upstream's stripped rather than appended", creds)
 	}
 	if v := resp.Header.Get("Access-Control-Expose-Headers"); v == "X-Router-Only" {
 		t.Error("the router's Expose-Headers survived; the gateway's own list must govern")

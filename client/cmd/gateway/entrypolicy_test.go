@@ -250,18 +250,71 @@ func TestUpstreamE2EEMarkerIsStripped(t *testing.T) {
 	}
 }
 
-// The cookie credential is wired only when the deployment asks for it, and when
-// it is, the converted credential reaches the router.
+// A default deployment answers browser calls with Access-Control-Allow-Credentials,
+// on the catch-all as well as the sealed path.
 //
-// The off row is the behavior the global-entry cutover would otherwise ship: the
+// This is the assertion that stands between the cutover and a completely broken
+// first-party app. Per the Fetch spec's CORS check, a request whose credentials mode
+// is "include" fails as a NETWORK ERROR without this header — whether or not a cookie
+// was actually sent — and the web app sets `credentials: 'include'` on EVERY router
+// call, not just the authenticated ones. So losing this header does not degrade
+// cookie auth, it takes out the model catalog and the balance read too, and it does
+// so with a CORS error rather than a 401.
+//
+// The catch-all row is the one that would be missed by reasoning about auth: nothing
+// on /v1/models is authenticated, and it still needs the header.
+func TestDefaultDeploymentAnswersCredentialedCORS(t *testing.T) {
+	rr := &recordingRouter{}
+	router := rr.server(nil)
+	defer router.Close()
+
+	gw := httptest.NewServer(newHandler(allSealedClients(), mustURL(t, router.URL), testOrigins(), "", "",
+		noInFlightCap, nil, nil, nil, discardLogger()))
+	defer gw.Close()
+
+	for _, path := range []string{endpoint.Chat.Path, "/v1/models"} {
+		t.Run(path, func(t *testing.T) {
+			req, _ := http.NewRequest(http.MethodGet, gw.URL+path, nil)
+			req.Header.Set("Origin", "https://chat.0g.ai")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("get %s: %v", path, err)
+			}
+			defer resp.Body.Close()
+
+			if got := resp.Header.Get("Access-Control-Allow-Credentials"); got != "true" {
+				t.Errorf("Access-Control-Allow-Credentials = %q, want %q: without it every "+
+					"`credentials: 'include'` call from the first-party app fails as a CORS network error",
+					got, "true")
+			}
+			if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "https://chat.0g.ai" {
+				t.Errorf("Access-Control-Allow-Origin = %q, want the origin echoed (a literal \"*\" is "+
+					"illegal with credentials)", got)
+			}
+		})
+	}
+}
+
+// The cookie credential is wired by DEFAULT, and the converted credential reaches
+// the router.
+//
+// The default row is the one that matters: a gateway with no options configured
+// admits the router's cookie. That is the whole point of there being no flag — the
 // first-party web app authenticates with an HttpOnly cookie and no Authorization
-// header, so every one of its chat requests 401s at the front door.
+// header, and a deployment cannot detect whether it is the one serving the router's
+// hostname, so "on unless the allowlist says otherwise" is the only setting that
+// cannot be forgotten in the breaking direction.
 //
-// The on row asserts the far end rather than the status, which is what makes it
-// meaningful: the router's route-preview call must carry the cookie's value as a
-// bearer token. That proves the gate admitted the request AND that the credential
-// survived the conversion — a 200 from the gateway would prove neither, since the
-// sealed path has plenty of other reasons to fail in a test.
+// It asserts the far end rather than the status, which is what makes it meaningful:
+// the router's route-preview call must carry the cookie's value as a bearer token.
+// That proves the gate admitted the request AND that the credential survived the
+// conversion — a 200 from the gateway would prove neither, since the sealed path has
+// plenty of other reasons to fail in a test.
+//
+// The openOrigins row is the one exception, and it is a security property rather
+// than a configuration preference: the origin allowlist is the entire CSRF defense
+// for an ambient credential, so an allowlist of "*" — which makes that defense pass
+// everything — turns cookie admission off and leaves the gateway keys-only.
 func TestCookieCredentialWiring(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -271,9 +324,10 @@ func TestCookieCredentialWiring(t *testing.T) {
 		wantAuth   string
 		wantStatus int
 	}{
-		{"off by default: the cookie is not a credential", entryPolicy{}, "", http.StatusUnauthorized},
-		{"on: the cookie becomes a bearer credential", entryPolicy{cookieCredential: true},
+		{"on by default: the cookie becomes a bearer credential", entryPolicy{},
 			"Bearer jwt-from-browser", 0},
+		{"off for an open allowlist: keys only", entryPolicy{openOrigins: true},
+			"", http.StatusUnauthorized},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

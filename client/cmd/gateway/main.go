@@ -110,39 +110,42 @@ func main() {
 		"comma-separated browser origin allowlist for CORS: exact origins (https://app.example.com), "+
 			"\"*.\" wildcards (https://*.0g.ai — subdomains only, not the apex), or \"*\" for any; "+
 			"empty allows no origin, disabling browser access (env ZG_GATEWAY_ALLOWED_ORIGINS)")
-	// Whether the router's HttpOnly `jwt` cookie counts as a credential here. OFF by
-	// default, and it is a deployment decision rather than a detail, because turning
-	// it on does two things at once: it admits an ambient credential to the auth path
-	// (openaiproxy.AcceptCookieCredential, which is why that middleware gates it on
-	// the origin allowlist — read its header before changing any of this), and it
-	// makes the CORS answer credentialed.
+	// Cookie credentials have NO FLAG: the router's HttpOnly `jwt` cookie is accepted
+	// whenever the origin allowlist can vouch for a request, and the CORS answer is
+	// credentialed to match. There was a `-allow-cookie-credential` here and it was
+	// removed rather than re-defaulted; the reasoning is worth keeping because it is
+	// the kind that looks prudent while costing something.
 	//
-	// That second effect is BROADER THAN THIS FLAG'S NAME, and the global-entry
-	// topology depends on the wide reading. Per the Fetch spec's CORS check, a request
-	// whose credentials mode is "include" fails as a network error unless the response
-	// carries Access-Control-Allow-Credentials: true — whether or not a cookie was
-	// actually sent. The first-party web app sets `credentials: 'include'` on EVERY
-	// router call it makes, not just the authenticated ones (0g-compute-new,
+	// The flag's "off" position protected nothing that was not already inert. The
+	// router's session cookie is host-only (AUTH_COOKIE_DOMAIN is unset in
+	// production, so the browser scopes it to the exact host that set it), so on any
+	// deployment where this gateway serves some OTHER hostname no cookie can reach it
+	// and there is nothing to admit. The CORS half was equally quiet: a caller that
+	// sends no credentials ignores Access-Control-Allow-Credentials entirely, which is
+	// what today's callers do.
+	//
+	// Its "on" requirement, meanwhile, was absolute and undetectable. Per the Fetch
+	// spec's CORS check, a request whose credentials mode is "include" fails as a
+	// NETWORK ERROR unless the response carries Access-Control-Allow-Credentials:
+	// true — whether or not a cookie was actually sent. The first-party web app sets
+	// `credentials: 'include'` on EVERY router call (0g-compute-new,
 	// web-ui/src/shared/lib/routerClient.ts — both the JSON and the streaming helper),
-	// so once this gateway serves the router's hostname with the flag off, the model
-	// catalog, the provider list and the balance read break in the browser alongside
-	// chat. It is therefore MANDATORY in that topology, not an option: turn it on in
-	// the same change that points the hostname here.
+	// so a gateway serving the router's hostname without it breaks the model catalog,
+	// the provider list and the balance read along with chat. And this process cannot
+	// tell whether it is in that topology: it only learns its public name from the
+	// Host header, which the caller controls (see identity.go for why it refuses to
+	// echo that back as its own). So the flag could not default correctly and could
+	// not warn — it could only be forgotten, in the direction that breaks everything
+	// with a CORS error rather than a 401. Removing it removes that failure mode; it
+	// was the flag's existence, not its default, that created it.
 	//
-	// Turning it on EARLY is harmless, which is the useful half of the same fact. The
-	// router's session cookie is host-only (AUTH_COOKIE_DOMAIN is unset in production,
-	// so the browser scopes it to the exact host that set it), so on any deployment
-	// where this gateway serves some OTHER hostname no cookie can reach it and the
-	// admission half of this flag is inert. Only the CORS half is observable there.
+	// What remains is the guard below: an allowlist of "*" turns cookie admission and
+	// the credentialed CORS answer back OFF. That combination is the one genuinely
+	// unsafe shape (any page acting as a logged-in visitor), and refusing it by
+	// degrading rather than by failing startup keeps the open-API deployment possible
+	// — an API open to every origin is a keys-only API, which is the coherent reading
+	// of "*" anyway.
 	//
-	// The default stays off because a gateway serving its own hostname alongside the
-	// router needs neither half, and because credentials-off is what keeps ambient
-	// browser credentials out of the auth path entirely.
-	allowCookieCredential := flag.Bool("allow-cookie-credential", proxycli.EnvBool("ZG_GATEWAY_ALLOW_COOKIE_CREDENTIAL", false),
-		"accept the router's HttpOnly `jwt` cookie as an inference credential, for browser callers that "+
-			"authenticate by cookie rather than by Authorization header. Honored ONLY for a present, "+
-			"allowlisted Origin (CSRF), and also sets Access-Control-Allow-Credentials — so it cannot be "+
-			"combined with an -allowed-origins of \"*\" (env ZG_GATEWAY_ALLOW_COOKIE_CREDENTIAL)")
 	// What happens to a sealed surface's NAMESPACE — its subtree, and its own path on
 	// every method but the sealed POST. See the endpoint.All loop in newHandler for
 	// the invariant, and unsealedSubtree* below for what each value means.
@@ -339,28 +342,33 @@ func main() {
 		logger.Error("invalid -allowed-origins", "err", err)
 		os.Exit(1)
 	}
+	// An allowlist of "*" allows every browser origin. Not fatal — an operator may
+	// genuinely want an open API — but it means any web page can drive this gateway
+	// with a key its own visitor holds, so it should never be the accidental result of
+	// a misrendered env var.
+	//
+	// It also turns ambient credentials OFF, and that is the load-bearing half. The
+	// origin allowlist is the whole CSRF defense for a cookie (see
+	// openaiproxy.AcceptCookieCredential): a cookie is attached by the browser without
+	// the page asking, so "any origin may authenticate by cookie" means any page on the
+	// internet can spend a logged-in visitor's balance and simply not read the reply.
+	// "*" is precisely the configuration that makes the origin gate pass everything,
+	// silently, while looking like a working deployment.
+	//
+	// So the two are mutually exclusive by construction rather than by a startup
+	// refusal: with "*" this gateway is keys-only, which is the coherent reading of an
+	// API open to every origin anyway. Degrading rather than exiting keeps that
+	// deployment possible, and keeps the unsafe combination unreachable without
+	// anybody having to remember a rule.
+	openOrigins := false
 	for _, o := range origins {
 		if o == "*" {
-			// Not fatal on its own — an operator may genuinely want an open API — but it
-			// means any web page can drive this gateway with a key its own visitor holds,
-			// so it should never be the accidental result of a misrendered env var.
-			//
-			// With cookie credentials it IS fatal, because the visitor no longer has to
-			// hold a key: the browser supplies one ambiently, so "*" would let any page
-			// on the internet spend a logged-in visitor's balance. That is the CSRF
-			// AcceptCookieCredential's origin gate exists to stop, and an allowlist of
-			// "*" is precisely the configuration that makes the gate pass everything —
-			// silently, since it looks like a working deployment. Refuse the combination
-			// instead of serving it: an operator who wants an open API and cookie auth
-			// has to name the origins that may act as their users.
-			if *allowCookieCredential {
-				logger.Error("-allow-cookie-credential cannot be combined with an -allowed-origins of \"*\": "+
-					"an ambient cookie credential plus an unrestricted origin allowlist lets any page act as "+
-					"a logged-in visitor. Name the origins that may authenticate by cookie",
-					"allowed_origins", origins)
-				os.Exit(1)
-			}
-			logger.Warn("CORS allowlist contains \"*\": every browser origin is allowed", "allowed_origins", origins)
+			openOrigins = true
+			logger.Warn("CORS allowlist contains \"*\": every browser origin is allowed, and cookie "+
+				"credentials are therefore DISABLED (an ambient credential plus an unrestricted origin "+
+				"allowlist would let any page act as a logged-in visitor). Callers must authenticate with "+
+				"an Authorization header; name the origins explicitly to allow cookie authentication",
+				"allowed_origins", origins)
 			break
 		}
 	}
@@ -465,8 +473,8 @@ func main() {
 		Handler: newHandler(built.Clients, routerTarget, origins, instanceID, *evidenceDir, *maxInFlight,
 			identity, providerIdentities, built.Readiness(), logger,
 			withEntryPolicy(entryPolicy{
-				cookieCredential: *allowCookieCredential,
-				unsealedSubtree:  *unsealedSubtree,
+				openOrigins:     openOrigins,
+				unsealedSubtree: *unsealedSubtree,
 			})),
 		ReadHeaderTimeout: 10 * time.Second,     // mitigate slow-header (Slowloris) clients
 		IdleTimeout:       proxycli.IdleTimeout, // bound idle keep-alives; unset means unbounded
@@ -670,30 +678,37 @@ const (
 	unsealedSubtreePassthrough = "passthrough"
 )
 
-// entryPolicy holds the knobs that turn this gateway from an ALTERNATE origin
-// (which it is today — a caller opts in by changing base_url, and the router stays
-// reachable on its own name) into the SINGLE PUBLIC ENTRY in front of the router.
+// entryPolicy holds what a deployment says about the shape it is serving.
 //
-// They are grouped because they are one decision wearing two names, and in the
-// global-entry topology they are turned on TOGETHER — neither is independently
-// optional there. Both defaults are the standalone behavior, and both are safe to
-// leave alone precisely while the router is separately reachable; the moment it is
-// not, a caller of a sealed surface's sub-resource gets a 501 and the first-party
-// web app gets a CORS network error on every call (see -allow-cookie-credential for
-// why that is broader than cookie auth), with no other door to try. Design:
-// 0g-router, e2ee-global-entry-design.zh.md §3.
+// The zero value is the ORDINARY deployment: a named origin allowlist, so ambient
+// credentials are on, and sealed subtrees refused. Both fields therefore name the
+// exception rather than the rule, which is deliberate — a caller that passes no
+// option (every test that is about something else, and any future call site) gets
+// the configuration a real gateway runs, not a stripped-down one. Getting that
+// backwards is how a test ends up asserting against a shape nothing deploys.
 //
-// The zero value is the standalone gateway, which is why every caller that has no
-// opinion can keep passing none.
+// Design: 0g-router, e2ee-global-entry-design.zh.md §3.
 type entryPolicy struct {
-	// cookieCredential admits the router's HttpOnly `jwt` cookie as a credential
-	// (openaiproxy.AcceptCookieCredential) and makes the CORS answer credentialed.
-	cookieCredential bool
+	// openOrigins reports that the allowlist contains "*", i.e. every browser origin
+	// is allowed. It turns AMBIENT CREDENTIALS OFF — no cookie admission
+	// (openaiproxy.AcceptCookieCredential) and no credentialed CORS answer — because
+	// the origin allowlist is the entire CSRF defense for a cookie, and "*" makes that
+	// defense pass everything. See the startup warning for the full reasoning; the
+	// short version is that an API open to every origin is a keys-only API.
+	openOrigins bool
 	// unsealedSubtree is one of the two constants above. Anything else — which
 	// startup validation makes unreachable in a real deployment — reads as refuse,
 	// because of the two, refusing is the one that cannot leak.
 	unsealedSubtree string
 }
+
+// credentialsAllowed reports whether this deployment participates in ambient
+// browser credentials. One predicate for the two places that must agree: the
+// cookie middleware and the CORS answer. Splitting them would let a deployment
+// read a cookie the browser will not send, or advertise credentials it then
+// refuses — both of which fail as a CORS error rather than as an auth error, which
+// is the hardest shape to diagnose.
+func (p entryPolicy) credentialsAllowed() bool { return !p.openOrigins }
 
 // handlerOption configures newHandler's entryPolicy. It is variadic and last so
 // the callers with no opinion — every test that is about something else — keep
@@ -701,7 +716,7 @@ type entryPolicy struct {
 type handlerOption func(*entryPolicy)
 
 // withEntryPolicy sets the whole policy in one call, which is how main passes it:
-// the two fields are validated together at startup and mean one thing together.
+// both fields come from the same startup validation and mean one thing together.
 func withEntryPolicy(p entryPolicy) handlerOption {
 	return func(dst *entryPolicy) { *dst = p }
 }
@@ -792,7 +807,7 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	sealed := http.NewServeMux()
 	var sealedGate http.Handler = openaiproxy.RequireInferenceCredential(
 		openaiproxy.LimitInFlight(maxInFlight, sealed))
-	if policy.cookieCredential {
+	if policy.credentialsAllowed() {
 		sealedGate = openaiproxy.AcceptCookieCredential(allowedOrigins, sealedGate)
 	}
 	sealedGate = openaiproxy.MarkE2EE(openaiproxy.E2EEValueSealed, sealedGate)
@@ -986,5 +1001,5 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	// still carrying the serving replica's id. See evidenceRoute.
 	return openaiproxy.LogRequests(logger,
 		openaiproxy.StampInstance(instanceID,
-			evidenceRoute(evidenceDir, openaiproxy.CORS(allowedOrigins, policy.cookieCredential, mux))))
+			evidenceRoute(evidenceDir, openaiproxy.CORS(allowedOrigins, policy.credentialsAllowed(), mux))))
 }
