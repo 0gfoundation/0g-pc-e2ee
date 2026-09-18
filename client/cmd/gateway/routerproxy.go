@@ -59,6 +59,13 @@ func newRouterProxy(target *url.URL, logger *slog.Logger) http.Handler {
 			// let the gateway's own middleware (openaiproxy.CORS, which wraps this
 			// handler) be the single authority for what a browser may reach here.
 			openaiproxy.StripCORSHeaders(resp.Header)
+			// Same class of bug as the doubled CORS header above, and the same fix. The
+			// E2EE marker is set on w.Header() before this proxy runs (MarkE2EE), and
+			// ReverseProxy copies upstream headers with Add — so a router that ever
+			// emitted this name would APPEND to ours, and a client reading the header
+			// would see two contradictory values on one response. The router does not send
+			// it today; this makes that fact stop mattering.
+			resp.Header.Del(openaiproxy.HeaderE2EE)
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {

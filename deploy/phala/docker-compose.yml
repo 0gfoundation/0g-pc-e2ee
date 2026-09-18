@@ -255,6 +255,32 @@ services:
       # unaffected. The localhost entries are development conveniences — drop them via
       # the override on any deployment that does not need them.
       - "ZG_GATEWAY_ALLOWED_ORIGINS=${ZG_GATEWAY_ALLOWED_ORIGINS:-https://0g.ai,https://*.0g.ai,http://localhost:3000,http://localhost:5173}"
+      # The two global-entry knobs (design: 0g-router, e2ee-global-entry-design.zh.md
+      # §3). Both are referenced with their OFF defaults rather than left out, and the
+      # reason is the same one ACME_STAGING is referenced: a variable this file does
+      # not mention can never reach the container, so leaving them out would mean the
+      # cutover needs a compose edit — a new compose_hash, a new measurement, a
+      # redeploy — at the moment it can least afford one. Referenced with a default,
+      # the value switches through the encrypted env and the measured text is
+      # untouched. Both must therefore be entered in allowed_envs on EVERY side,
+      # including while they are false, and toggled by value (README "Serving domain",
+      # and blue-green.md on why a drifting allowed_envs list is its own problem).
+      #
+      # ZG_GATEWAY_ALLOW_COOKIE_CREDENTIAL admits the router's HttpOnly `jwt` cookie as
+      # a credential and makes the CORS answer credentialed. It is what the first-party
+      # web app needs once this gateway serves the router's own hostname, and it must
+      # NOT be turned on together with an ZG_GATEWAY_ALLOWED_ORIGINS of "*" — the
+      # gateway refuses to start in that combination, deliberately, because an ambient
+      # credential plus an open allowlist lets any page act as a logged-in visitor.
+      - "ZG_GATEWAY_ALLOW_COOKIE_CREDENTIAL=${ZG_GATEWAY_ALLOW_COOKIE_CREDENTIAL:-false}"
+      # ZG_GATEWAY_UNSEALED_SUBTREE decides what a sealed surface's sub-resources and
+      # non-sealed methods answer: "refuse" (501, the default — right while a caller
+      # who wants the router's own handling can call the router directly) or
+      # "passthrough" (forward them, marked X-0G-E2EE: none — right once this gateway
+      # IS the only entry, where a 501 removes the feature rather than redirecting).
+      # An unrecognised value fails startup instead of guessing: one of the two answers
+      # forwards content in the clear, and that is not a thing to infer from a typo.
+      - "ZG_GATEWAY_UNSEALED_SUBTREE=${ZG_GATEWAY_UNSEALED_SUBTREE:-refuse}"
       # DCAP-verify each provider's TDX quote and seal only to the verified enc key,
       # instead of trusting the router-supplied pubkey endpoint. Enforced per request:
       # a provider that fails is rejected.

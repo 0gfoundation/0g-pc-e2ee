@@ -110,6 +110,34 @@ func main() {
 		"comma-separated browser origin allowlist for CORS: exact origins (https://app.example.com), "+
 			"\"*.\" wildcards (https://*.0g.ai — subdomains only, not the apex), or \"*\" for any; "+
 			"empty allows no origin, disabling browser access (env ZG_GATEWAY_ALLOWED_ORIGINS)")
+	// Whether the router's HttpOnly `jwt` cookie counts as a credential here. OFF by
+	// default, and it is a deployment decision rather than a detail, because turning
+	// it on does two things at once: it admits an ambient credential to the auth path
+	// (openaiproxy.AcceptCookieCredential, which is why that middleware gates it on
+	// the origin allowlist — read its header before changing any of this), and it
+	// makes the CORS answer credentialed, without which the browser will not send the
+	// cookie cross-origin at all and the app it exists for still fails.
+	//
+	// The global-entry topology needs it: once this gateway serves the router's own
+	// hostname, the first-party web app's chat requests arrive with a cookie and no
+	// Authorization header, and every one of them would 401. A gateway serving its
+	// own hostname alongside the router does not need it — such a caller can still
+	// reach the router directly — so the default stays off.
+	allowCookieCredential := flag.Bool("allow-cookie-credential", proxycli.EnvBool("ZG_GATEWAY_ALLOW_COOKIE_CREDENTIAL", false),
+		"accept the router's HttpOnly `jwt` cookie as an inference credential, for browser callers that "+
+			"authenticate by cookie rather than by Authorization header. Honored ONLY for a present, "+
+			"allowlisted Origin (CSRF), and also sets Access-Control-Allow-Credentials — so it cannot be "+
+			"combined with an -allowed-origins of \"*\" (env ZG_GATEWAY_ALLOW_COOKIE_CREDENTIAL)")
+	// What happens to a sealed surface's NAMESPACE — its subtree, and its own path on
+	// every method but the sealed POST. See the endpoint.All loop in newHandler for
+	// the invariant, and unsealedSubtree* below for what each value means.
+	unsealedSubtree := flag.String("unsealed-subtree", proxycli.EnvOr("ZG_GATEWAY_UNSEALED_SUBTREE", unsealedSubtreeRefuse),
+		"how to answer a sealed surface's sub-resources and non-sealed methods (e.g. "+
+			"POST /v1/messages/count_tokens, GET /v1/chat/completions): \""+unsealedSubtreeRefuse+"\" (default) "+
+			"answers 501 rather than forwarding content the router would read in the clear; \""+
+			unsealedSubtreePassthrough+"\" forwards them to the router like any other unsealed path, marked "+
+			openaiproxy.HeaderE2EE+": "+openaiproxy.E2EEValueNone+". Required by the global-entry topology, "+
+			"where calling the router directly is no longer an option (env ZG_GATEWAY_UNSEALED_SUBTREE)")
 	// Directory holding the public attestation evidence bundle to serve at
 	// /evidences/ — in the TEE deployment, the `evidences` volume dstack-ingress
 	// writes, mounted read-only. Empty (the default) mounts no such route, which is
@@ -298,12 +326,40 @@ func main() {
 	}
 	for _, o := range origins {
 		if o == "*" {
-			// Not fatal — an operator may genuinely want an open API — but it means any
-			// web page can drive this gateway with a key its own visitor holds, so it
-			// should never be the accidental result of a misrendered env var.
+			// Not fatal on its own — an operator may genuinely want an open API — but it
+			// means any web page can drive this gateway with a key its own visitor holds,
+			// so it should never be the accidental result of a misrendered env var.
+			//
+			// With cookie credentials it IS fatal, because the visitor no longer has to
+			// hold a key: the browser supplies one ambiently, so "*" would let any page
+			// on the internet spend a logged-in visitor's balance. That is the CSRF
+			// AcceptCookieCredential's origin gate exists to stop, and an allowlist of
+			// "*" is precisely the configuration that makes the gate pass everything —
+			// silently, since it looks like a working deployment. Refuse the combination
+			// instead of serving it: an operator who wants an open API and cookie auth
+			// has to name the origins that may act as their users.
+			if *allowCookieCredential {
+				logger.Error("-allow-cookie-credential cannot be combined with an -allowed-origins of \"*\": "+
+					"an ambient cookie credential plus an unrestricted origin allowlist lets any page act as "+
+					"a logged-in visitor. Name the origins that may authenticate by cookie",
+					"allowed_origins", origins)
+				os.Exit(1)
+			}
 			logger.Warn("CORS allowlist contains \"*\": every browser origin is allowed", "allowed_origins", origins)
 			break
 		}
+	}
+
+	// A misspelled -unsealed-subtree decides whether a sealed surface's
+	// sub-resources reach the router in the clear, so it fails the deploy rather
+	// than falling back to either value. Falling back to "refuse" would break the
+	// topology that needs passthrough with a 501 nobody asked for; falling back to
+	// "passthrough" would forward content on a deployment that meant to refuse it.
+	// Neither is a default worth guessing at from a typo.
+	if *unsealedSubtree != unsealedSubtreeRefuse && *unsealedSubtree != unsealedSubtreePassthrough {
+		logger.Error("invalid -unsealed-subtree", "value", *unsealedSubtree,
+			"want", []string{unsealedSubtreeRefuse, unsealedSubtreePassthrough})
+		os.Exit(1)
 	}
 
 	// Same stance for the evidence bundle's directory: a mount this process cannot
@@ -392,7 +448,11 @@ func main() {
 	srv := &http.Server{
 		Addr: *f.Listen,
 		Handler: newHandler(built.Clients, routerTarget, origins, instanceID, *evidenceDir, *maxInFlight,
-			identity, providerIdentities, built.Readiness(), logger),
+			identity, providerIdentities, built.Readiness(), logger,
+			withEntryPolicy(entryPolicy{
+				cookieCredential: *allowCookieCredential,
+				unsealedSubtree:  *unsealedSubtree,
+			})),
 		ReadHeaderTimeout: 10 * time.Second,     // mitigate slow-header (Slowloris) clients
 		IdleTimeout:       proxycli.IdleTimeout, // bound idle keep-alives; unset means unbounded
 	}
@@ -572,6 +632,62 @@ func runHealthCheck(listen string) int {
 	return 0
 }
 
+// The two values of -unsealed-subtree. They decide what a sealed surface's
+// NAMESPACE answers — its sub-resources, and its own path on every method but the
+// sealed POST — and nothing else: the sealed POST itself is always sealed, and
+// always refused on a build that holds no client for it, under either value.
+//
+//   - refuse: 501, the standalone default. Correct while a caller who wants the
+//     router's own handling of those paths can call the router directly, which is
+//     the premise the whole refusal was written on (see the endpoint.All loop).
+//   - passthrough: forward them to the router like any other unsealed path. What
+//     the global-entry topology needs, because there the gateway IS the router's
+//     hostname and "call the router directly" no longer exists, so a 501 is not a
+//     redirection to a different choice — it is the feature being gone.
+//
+// The leak the refusal guards is real either way (an Anthropic SDK's
+// messages.count_tokens() POSTs the whole conversation), so passthrough does not
+// pretend otherwise: those responses are marked X-0G-E2EE: none, which makes "this
+// one was not encrypted" a thing a client can see and refuse, rather than something
+// it has to infer from a path.
+const (
+	unsealedSubtreeRefuse      = "refuse"
+	unsealedSubtreePassthrough = "passthrough"
+)
+
+// entryPolicy holds the knobs that turn this gateway from an ALTERNATE origin
+// (which it is today — a caller opts in by changing base_url, and the router stays
+// reachable on its own name) into the SINGLE PUBLIC ENTRY in front of the router.
+//
+// They are grouped because they are one decision wearing two names. Both defaults
+// are the standalone behavior, and both are safe to leave alone precisely while the
+// router is separately reachable; the moment it is not, a caller that authenticates
+// by cookie gets a 401 and a caller of a sealed surface's sub-resource gets a 501,
+// with no other door to try. Design: 0g-router, e2ee-global-entry-design.zh.md §3.
+//
+// The zero value is the standalone gateway, which is why every caller that has no
+// opinion can keep passing none.
+type entryPolicy struct {
+	// cookieCredential admits the router's HttpOnly `jwt` cookie as a credential
+	// (openaiproxy.AcceptCookieCredential) and makes the CORS answer credentialed.
+	cookieCredential bool
+	// unsealedSubtree is one of the two constants above. Anything else — which
+	// startup validation makes unreachable in a real deployment — reads as refuse,
+	// because of the two, refusing is the one that cannot leak.
+	unsealedSubtree string
+}
+
+// handlerOption configures newHandler's entryPolicy. It is variadic and last so
+// the callers with no opinion — every test that is about something else — keep
+// naming only what they care about.
+type handlerOption func(*entryPolicy)
+
+// withEntryPolicy sets the whole policy in one call, which is how main passes it:
+// the two fields are validated together at startup and mean one thing together.
+func withEntryPolicy(p entryPolicy) handlerOption {
+	return func(dst *entryPolicy) { *dst = p }
+}
+
 // newHandler mounts the shared OpenAI proxy, the gateway-only operational routes
 // (health and readiness), and a catch-all that reverse-proxies every other path to
 // the router (routerTarget), all wrapped in the CORS and access-log middleware so
@@ -604,9 +720,22 @@ func runHealthCheck(listen string) int {
 // ready backs GET /readyz: nil means there is nothing to assert (no warmer
 // configured) and the route always answers ready. See proxycli.Built.Readiness and
 // the /healthz vs /readyz split at the routes below.
+//
+// opts carries the entryPolicy: passing none is the standalone gateway (no cookie
+// credential, sealed subtrees refused), which is what main does unless the
+// deployment opted in and what every test that is about something else wants.
 func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedOrigins []string, instanceID, evidenceDir string,
 	maxInFlight int, identity *identityCache, providerIdentities route.ProviderIdentitySource,
-	ready func() error, logger *slog.Logger) http.Handler {
+	ready func() error, logger *slog.Logger, opts ...handlerOption) http.Handler {
+	var policy entryPolicy
+	for _, opt := range opts {
+		opt(&policy)
+	}
+	// The cleartext passthrough to the router, built once: it is the catch-all, and
+	// under unsealedSubtreePassthrough it is also what a sealed surface's namespace
+	// resolves to. Marked as unencrypted at the one place every cleartext response
+	// leaves this process, so no route can forget to say so.
+	passthrough := openaiproxy.MarkE2EE(openaiproxy.E2EEValueNone, newRouterProxy(routerTarget, logger))
 	mux := http.NewServeMux()
 	// Mount the sealed inference path behind the gateway's front-door credential
 	// gate. The gate is a cheap presence/shape check (reject missing credentials
@@ -631,9 +760,24 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	// zg_gateway_inflight_limit still published one number — doubling the peak
 	// memory that ceiling is derived from (see defaultMaxInFlight) and putting the
 	// wrong denominator under every in-flight/limit alert.
+	//
+	// The E2EE marker is the OUTERMOST layer, so it is on the gate's own 401/403 and
+	// the limiter's 503 too. Those are refusals rather than sealed exchanges, but
+	// they are refusals FROM the sealed path, and a client that keys on the header
+	// reads "sealed" as "this path would have sealed it" — which is the honest
+	// answer, and better than an error whose header is absent and so
+	// indistinguishable from a cleartext one.
+	//
+	// The cookie conversion sits outside the gate and inside the marker: it must run
+	// BEFORE the gate (its whole job is to turn a credential the gate does not
+	// recognise into one it does) and it is off unless the deployment opted in.
 	sealed := http.NewServeMux()
-	sealedGate := openaiproxy.RequireInferenceCredential(
+	var sealedGate http.Handler = openaiproxy.RequireInferenceCredential(
 		openaiproxy.LimitInFlight(maxInFlight, sealed))
+	if policy.cookieCredential {
+		sealedGate = openaiproxy.AcceptCookieCredential(allowedOrigins, sealedGate)
+	}
+	sealedGate = openaiproxy.MarkE2EE(openaiproxy.E2EEValueSealed, sealedGate)
 	// Every row of endpoint.All is mounted, as one of two things: the sealed
 	// handler behind the shared gate when this build holds a client for it, or
 	// an explicit refusal when it does not (direct-broker mode, whose single
@@ -661,14 +805,25 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	// 200 back as if nothing had happened. Message Batches
 	// (/v1/messages/batches) carries the same payload the same way.
 	//
-	// Refusing the subtree rather than those two paths is deliberate: the
-	// invariant is that a sealed surface's NAMESPACE never reaches the cleartext
-	// proxy, and a list of known sub-resources is a rule narrower than the thing
-	// it guards — it would go stale the day the API grows a third one, silently
-	// and in the leaking direction. Nothing under these prefixes is sealed by this
-	// gateway, so nothing under them may be proxied; a client that wants the
-	// router's own cleartext handling of them can call the router directly, which
-	// is a choice rather than a surprise.
+	// Claiming the subtree rather than those two paths is deliberate: the unit is a
+	// sealed surface's NAMESPACE, and a list of known sub-resources is a rule
+	// narrower than the thing it guards — it would go stale the day the API grows a
+	// third one, silently and in the leaking direction. So the namespace gets ONE
+	// answer, and -unsealed-subtree is which:
+	//
+	//   - refuse (default): nothing under these prefixes is sealed by this gateway,
+	//     so nothing under them may be proxied. A client that wants the router's own
+	//     cleartext handling of them calls the router directly, which is a choice
+	//     rather than a surprise.
+	//   - passthrough: the choice above does not exist — this gateway IS the router's
+	//     hostname — so refusing is not pointing at another door, it is closing the
+	//     only one. Forward them, and mark them X-0G-E2EE: none so the caller can see
+	//     what it got. The leak is the same leak; what changes is that it is now
+	//     disclosed and deliberate instead of impossible.
+	//
+	// Either way the sealed POST is untouched: it seals, or it is refused on a build
+	// with no client for it. Neither value can put a prompt that WOULD have been
+	// sealed onto the cleartext path.
 	for _, ep := range endpoint.All {
 		// Registered for EVERY row, served or not, and before the branch below:
 		// whether this build seals the surface itself has no bearing on whether its
@@ -680,7 +835,7 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 		// simply false, and it contradicts the POST refusal below on the same path.
 		// One reason, two accurate wordings, decided here where the answer is known.
 		served := clients[ep.Path] != nil
-		refuse := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var namespace http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			reason := fmt.Sprintf("this build does not serve the sealed %s surface at all", surface)
 			if served {
 				reason = fmt.Sprintf("it is part of the sealed %s surface, which this gateway seals only at POST %s",
@@ -690,14 +845,22 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 				fmt.Sprintf("%s %s is not served by this gateway: %s, so it is refused rather than "+
 					"forwarded in the clear", r.Method, r.URL.Path, reason))
 		})
+		// Compared against the passthrough constant rather than the refuse one, so the
+		// unreachable third value (startup validation rejects it) lands on refuse: of
+		// the two, refusing is the one that cannot forward a payload in the clear.
+		if policy.unsealedSubtree == unsealedSubtreePassthrough {
+			namespace = passthrough
+		}
 		// The subtree, and the exact path on every method but the sealed POST. The
 		// method-less exact pattern is the LESS specific of the two on that path, so
 		// `POST <path>` below still wins for the sealed method; without it Go's
 		// ServeMux answers a slash-less request with an implicit 307 into the subtree
 		// (a redirect nobody asked for), and before it a GET on the surface's own path
-		// went to the cleartext proxy.
-		mux.Handle(surface+"/", refuse)
-		mux.Handle(surface, refuse)
+		// went to the cleartext proxy — which is what passthrough now does on purpose,
+		// for the whole namespace and with a marker, rather than for one method by
+		// omission.
+		mux.Handle(surface+"/", namespace)
+		mux.Handle(surface, namespace)
 		if c := clients[ep.Path]; c != nil {
 			openaiproxy.Register(sealed, ep, c)
 			mux.Handle("POST "+ep.Path, sealedGate)
@@ -789,7 +952,7 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	// ServeMux keeps serving them; only unmatched paths fall through here. This is a
 	// cleartext passthrough — safe for metadata, never for sealed content (see
 	// newRouterProxy).
-	mux.Handle("/", newRouterProxy(routerTarget, logger))
+	mux.Handle("/", passthrough)
 	// CORS wraps the whole mux, INSIDE the access log: a preflight must be answered
 	// here — before the mux would hand it to the credential gate (which 401s a
 	// preflight, since a browser sends no credentials on one) or to the catch-all
@@ -805,5 +968,5 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	// still carrying the serving replica's id. See evidenceRoute.
 	return openaiproxy.LogRequests(logger,
 		openaiproxy.StampInstance(instanceID,
-			evidenceRoute(evidenceDir, openaiproxy.CORS(allowedOrigins, mux))))
+			evidenceRoute(evidenceDir, openaiproxy.CORS(allowedOrigins, policy.cookieCredential, mux))))
 }
