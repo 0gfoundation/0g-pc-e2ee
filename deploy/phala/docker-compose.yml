@@ -267,11 +267,17 @@ services:
       # and blue-green.md on why a drifting allowed_envs list is its own problem).
       #
       # ZG_GATEWAY_ALLOW_COOKIE_CREDENTIAL admits the router's HttpOnly `jwt` cookie as
-      # a credential and makes the CORS answer credentialed. It is what the first-party
-      # web app needs once this gateway serves the router's own hostname, and it must
-      # NOT be turned on together with an ZG_GATEWAY_ALLOWED_ORIGINS of "*" — the
-      # gateway refuses to start in that combination, deliberately, because an ambient
-      # credential plus an open allowlist lets any page act as a logged-in visitor.
+      # a credential and makes the CORS answer credentialed. It is MANDATORY once this
+      # gateway serves the router's own hostname — not just for cookie auth: the
+      # first-party web app sets `credentials: 'include'` on every router call, and per
+      # the Fetch spec such a request fails outright without
+      # Access-Control-Allow-Credentials, so with it off the model catalog and the
+      # balance read break in the browser too. Set it in the same change that points the
+      # hostname here. It must NOT be combined with an ZG_GATEWAY_ALLOWED_ORIGINS of
+      # "*" — the gateway refuses to start in that combination, deliberately, because an
+      # ambient credential plus an open allowlist lets any page act as a logged-in
+      # visitor. Turning it on ahead of the cutover is harmless: the session cookie is
+      # host-only, so it cannot reach a gateway serving any other hostname.
       - "ZG_GATEWAY_ALLOW_COOKIE_CREDENTIAL=${ZG_GATEWAY_ALLOW_COOKIE_CREDENTIAL:-false}"
       # ZG_GATEWAY_UNSEALED_SUBTREE decides what a sealed surface's sub-resources and
       # non-sealed methods answer: "refuse" (501, the default — right while a caller

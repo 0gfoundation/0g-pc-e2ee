@@ -115,14 +115,29 @@ func main() {
 	// it on does two things at once: it admits an ambient credential to the auth path
 	// (openaiproxy.AcceptCookieCredential, which is why that middleware gates it on
 	// the origin allowlist — read its header before changing any of this), and it
-	// makes the CORS answer credentialed, without which the browser will not send the
-	// cookie cross-origin at all and the app it exists for still fails.
+	// makes the CORS answer credentialed.
 	//
-	// The global-entry topology needs it: once this gateway serves the router's own
-	// hostname, the first-party web app's chat requests arrive with a cookie and no
-	// Authorization header, and every one of them would 401. A gateway serving its
-	// own hostname alongside the router does not need it — such a caller can still
-	// reach the router directly — so the default stays off.
+	// That second effect is BROADER THAN THIS FLAG'S NAME, and the global-entry
+	// topology depends on the wide reading. Per the Fetch spec's CORS check, a request
+	// whose credentials mode is "include" fails as a network error unless the response
+	// carries Access-Control-Allow-Credentials: true — whether or not a cookie was
+	// actually sent. The first-party web app sets `credentials: 'include'` on EVERY
+	// router call it makes, not just the authenticated ones (0g-compute-new,
+	// web-ui/src/shared/lib/routerClient.ts — both the JSON and the streaming helper),
+	// so once this gateway serves the router's hostname with the flag off, the model
+	// catalog, the provider list and the balance read break in the browser alongside
+	// chat. It is therefore MANDATORY in that topology, not an option: turn it on in
+	// the same change that points the hostname here.
+	//
+	// Turning it on EARLY is harmless, which is the useful half of the same fact. The
+	// router's session cookie is host-only (AUTH_COOKIE_DOMAIN is unset in production,
+	// so the browser scopes it to the exact host that set it), so on any deployment
+	// where this gateway serves some OTHER hostname no cookie can reach it and the
+	// admission half of this flag is inert. Only the CORS half is observable there.
+	//
+	// The default stays off because a gateway serving its own hostname alongside the
+	// router needs neither half, and because credentials-off is what keeps ambient
+	// browser credentials out of the auth path entirely.
 	allowCookieCredential := flag.Bool("allow-cookie-credential", proxycli.EnvBool("ZG_GATEWAY_ALLOW_COOKIE_CREDENTIAL", false),
 		"accept the router's HttpOnly `jwt` cookie as an inference credential, for browser callers that "+
 			"authenticate by cookie rather than by Authorization header. Honored ONLY for a present, "+
@@ -659,11 +674,14 @@ const (
 // (which it is today — a caller opts in by changing base_url, and the router stays
 // reachable on its own name) into the SINGLE PUBLIC ENTRY in front of the router.
 //
-// They are grouped because they are one decision wearing two names. Both defaults
-// are the standalone behavior, and both are safe to leave alone precisely while the
-// router is separately reachable; the moment it is not, a caller that authenticates
-// by cookie gets a 401 and a caller of a sealed surface's sub-resource gets a 501,
-// with no other door to try. Design: 0g-router, e2ee-global-entry-design.zh.md §3.
+// They are grouped because they are one decision wearing two names, and in the
+// global-entry topology they are turned on TOGETHER — neither is independently
+// optional there. Both defaults are the standalone behavior, and both are safe to
+// leave alone precisely while the router is separately reachable; the moment it is
+// not, a caller of a sealed surface's sub-resource gets a 501 and the first-party
+// web app gets a CORS network error on every call (see -allow-cookie-credential for
+// why that is broader than cookie auth), with no other door to try. Design:
+// 0g-router, e2ee-global-entry-design.zh.md §3.
 //
 // The zero value is the standalone gateway, which is why every caller that has no
 // opinion can keep passing none.
