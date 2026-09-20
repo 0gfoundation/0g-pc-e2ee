@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -211,5 +213,54 @@ func TestTrailingSlashSpellingAlsoRoutesByModel(t *testing.T) {
 	if _, _, bodies := rr.snapshot(); len(bodies) != 0 {
 		t.Errorf("router saw %d requests for a SEALED model on the trailing-slash path, want 0: "+
 			"the two spellings must not carry different policies", len(bodies))
+	}
+}
+
+// composeSealModels reads the deployed default out of the compose manifest.
+var composeSealModels = regexp.MustCompile(
+	`ZG_GATEWAY_SEAL_MODELS=\$\{ZG_GATEWAY_SEAL_MODELS:-([^}]*)\}`)
+
+// The deployed model list is pinned here because a typo in it does not fail —
+// it SEALS NOTHING for the misspelt model and forwards its prompts to the
+// router in the clear, looking exactly like a correct rollout. That is the one
+// silent failure this whole feature has, and the compose value is where it
+// would be introduced.
+//
+// This asserts behaviour rather than string equality: what matters is that the
+// deployed value seals the model it is meant to, and does not accidentally
+// sweep in the neighbouring canonical id that differs by one suffix.
+func TestComposeSealModelsSealsTheIntendedModel(t *testing.T) {
+	compose, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", composePath, err)
+	}
+	m := composeSealModels.FindSubmatch(compose)
+	if m == nil {
+		t.Fatalf("no ZG_GATEWAY_SEAL_MODELS=${...:-<default>} entry in %s; if the entry was "+
+			"reshaped deliberately, update this test rather than dropping it", composePath)
+	}
+	deployed := parseSealModels(string(m[1]))
+	if deployed.all() {
+		t.Fatalf("the compose seal-model list is empty, which seals EVERY model — including the "+
+			"ones with no sealable provider, whose route-preview comes back empty and is "+
+			"terminal. If that is deliberate, say so here rather than leaving it to look "+
+			"like a deletion (%q)", m[1])
+	}
+
+	// The 0G in-house model, and its only registry alias — the on-chain spelling,
+	// which differs from the canonical id in case alone.
+	for _, spelling := range []string{"0gm-1.0-35b-a3b", "0GM-1.0-35B-A3B"} {
+		if !deployed.seals(spelling) {
+			t.Errorf("the deployed list %q does not seal %q. A model missing from this list is "+
+				"not an error anywhere — its prompts simply go to the router in the clear, "+
+				"which is indistinguishable from a correct rollout", m[1], spelling)
+		}
+	}
+	// A different canonical model whose id is this one plus a suffix. Matching is
+	// exact, so it must NOT be swept in by the entry above; it gets sealed only
+	// when somebody adds it by name.
+	if deployed.seals("0gm-1.0-35b-a3b-sia") {
+		t.Errorf("the deployed list %q seals 0gm-1.0-35b-a3b-sia, a separate canonical model. "+
+			"Matching must stay exact — if that model is meant to be sealed, name it", m[1])
 	}
 }

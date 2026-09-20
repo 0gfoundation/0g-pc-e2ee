@@ -760,8 +760,7 @@ func runHealthCheck(listen string) int {
 // model with none gets an empty route-preview, which the client treats as
 // terminal), web search and file attachments break by construction
 // (SealedPromptInjectionConflict), and every request pays a route-preview plus an
-// HPKE seal. DNS cutover is a deploy; the sealing default is a release. See
-// 0g-router docs/e2ee-global-entry-design.zh.md §2.
+// HPKE seal. DNS cutover is a deploy; the sealing default is a release.
 //
 // This is the GLOBAL switch, deliberately built before the per-request and
 // per-model ones. Only a couple of chat models have E2EE support on the network
@@ -787,8 +786,6 @@ const (
 // option (every test that is about something else, and any future call site) gets
 // the configuration a real gateway runs, not a stripped-down one. Getting that
 // backwards is how a test ends up asserting against a shape nothing deploys.
-//
-// Design: 0g-router, e2ee-global-entry-design.zh.md §3.
 type entryPolicy struct {
 	// openOrigins reports that the allowlist contains "*", i.e. every browser origin
 	// is allowed. It turns AMBIENT CREDENTIALS OFF — no cookie admission

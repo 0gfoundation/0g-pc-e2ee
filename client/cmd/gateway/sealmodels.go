@@ -25,11 +25,10 @@ import (
 // enable one model, watch, enable the next.
 //
 // This is deliberately NOT a percentage. A per-request percentage would make the
-// same caller's same model sealed on one request and cleartext on the next —
-// "静默降级会把一个隐私保证变成看运气" (0g-router e2ee-global-entry-design.zh.md
-// §2), and worse than a privacy problem: a sealed request carrying plugins or
-// attachments is refused by the router (SealedPromptInjectionConflict), so the
-// coin flip would decide whether a legitimate request works at all. A sticky
+// same caller's same model sealed on one request and cleartext on the next,
+// which turns a privacy guarantee into a coin toss — and it is worse than a
+// privacy problem: a sealed request carrying plugins or attachments is refused
+// upstream, so the draw would decide whether a legitimate request works. A sticky
 // per-account percentage would be coherent, and is a separate decision for
 // later; per-model is a real dial that costs none of that.
 //
