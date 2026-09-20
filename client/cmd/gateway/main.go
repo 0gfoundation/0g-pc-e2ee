@@ -1058,8 +1058,28 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	// recognise into one it does. It is mounted for every deployment except one whose
 	// allowlist is "*", where the origin gate it depends on would admit everything.
 	sealed := http.NewServeMux()
+	// Per-model routing goes INSIDE the credential gate and the in-flight cap, and
+	// the ordering is the point rather than a detail.
+	//
+	// The dispatcher has to read the body to find the model. Mounted outside, that
+	// read happens before either guard, so an unauthenticated caller could make
+	// this process buffer a 9 MiB body and only then receive its 401 — which
+	// contradicts LimitInFlight's own contract ("rejected on shape alone … must
+	// not consume a slot") and invalidates computeMaxInFlight, whose ceiling is
+	// derived from how many requests can be buffering at once. These servers set
+	// no ReadTimeout (only ReadHeaderTimeout) and no global MaxBytesHandler, so a
+	// body fed in slowly could hold that buffer indefinitely while holding no slot
+	// and carrying no credential.
+	//
+	// Both branches sit inside the cap, cleartext included: that branch buffers
+	// exactly as much as the sealed one, so leaving it outside would put the same
+	// memory beyond the ceiling by another door.
+	//
+	// Built ONCE here rather than per row — it does not depend on the endpoint —
+	// and it returns the mux unchanged when no model list is configured, so the
+	// ordinary deployment keeps the exact chain it had.
 	var sealedGate http.Handler = openaiproxy.RequireInferenceCredential(
-		openaiproxy.LimitInFlight(maxInFlight, sealed))
+		openaiproxy.LimitInFlight(maxInFlight, policy.sealModels.dispatch(sealed, passthrough)))
 	if policy.credentialsAllowed() {
 		sealedGate = openaiproxy.AcceptCookieCredential(allowedOrigins, sealedGate)
 	}
@@ -1177,16 +1197,7 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 		mux.Handle(surface, namespace)
 		if c := clients[ep.Path]; c != nil {
 			openaiproxy.Register(sealed, ep, c)
-			// Per-model routing sits OUTSIDE the sealed gate and chooses between the
-			// two chains that already exist, so each one keeps its own E2EE marker
-			// and the response says which way this request actually went. With no
-			// model list configured this returns sealedGate unchanged — the ordinary
-			// deployment keeps the exact chain it had, body buffering included.
-			//
-			// The cleartext side is the PLAIN passthrough, never the cached one: a
-			// model routed here still carries a prompt.
-			surfaceGate := policy.sealModels.dispatch(sealedGate, passthrough)
-			mux.Handle("POST "+ep.Path, surfaceGate)
+			mux.Handle("POST "+ep.Path, sealedGate)
 			// ...and the surface's own TRAILING-SLASH form, which belongs to the sealed
 			// POST and not to the subtree however much it looks like the latter.
 			//
@@ -1205,7 +1216,7 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 			// only `POST <path>`, a 308 would make every caller re-send its body, and a
 			// caller that reached this surface through the router got the request SERVED
 			// rather than refused — which is the behaviour the cutover has to preserve.
-			mux.Handle("POST "+ep.Path+"/{$}", canonicalPath(ep.Path, surfaceGate))
+			mux.Handle("POST "+ep.Path+"/{$}", canonicalPath(ep.Path, sealedGate))
 			continue
 		}
 		// The same envelope every other gateway-origin error uses (WriteError:

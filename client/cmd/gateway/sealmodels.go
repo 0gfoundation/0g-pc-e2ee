@@ -100,9 +100,23 @@ func (s sealModels) label(model string) string {
 // dispatch returns a handler that reads each request's model and sends it to
 // `sealed` or `cleartext` accordingly.
 //
-// A no-op when every model is sealed: the dispatcher is not mounted at all, so
-// the ordinary deployment keeps the exact handler chain it had, and the body is
-// not buffered on its account.
+// The identity function when every model is sealed: it hands back `sealed`
+// untouched, so the ordinary deployment keeps the exact handler chain it had and
+// nothing is buffered on its account.
+//
+// # Where this must be mounted, and why it is not negotiable
+//
+// BEHIND the credential gate and the in-flight cap — see the chain in
+// newHandler. Deciding requires reading the body, so mounting this in front of
+// those guards means an unauthenticated or shed request gets buffered first and
+// refused second. That breaks LimitInFlight's stated contract (a request
+// "rejected on shape alone … must not consume a slot") and the memory ceiling
+// computeMaxInFlight derives from it, and with no ReadTimeout on these servers
+// a slow body could hold that buffer indefinitely while holding no slot.
+//
+// The marker rides along correctly because MarkE2EE uses Set, not Add: the
+// outer layer stamps "sealed" for the whole chain and the cleartext branch,
+// which carries its own marker, overwrites it to "none" on the way out.
 //
 // # The body
 //
@@ -112,7 +126,8 @@ func (s sealModels) label(model string) string {
 // changes there. What DOES change is the cleartext path on these surfaces: it
 // used to stream, and now it is buffered up to the same cap. That is a real
 // narrowing, accepted because the cap is the sealed path's own and these are
-// chat-shaped bodies.
+// chat-shaped bodies — and because being inside the cap is what keeps that
+// memory inside the ceiling.
 //
 // Reading one byte past the cap, rather than enforcing it here, keeps the
 // oversize answer where it already lives: we learn the body is too big, decide
