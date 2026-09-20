@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"net/http"
 	"strconv"
 	"strings"
@@ -85,12 +86,25 @@ const (
 	// catalogCacheMaxEntries bounds memory against query-string cardinality:
 	// /v1/models takes repeatable filters, so the key space is effectively
 	// unbounded and an attacker could otherwise mint a fresh entry per request.
-	// Past the cap we stop STORING but still serve and still share in flight, so
-	// exceeding it degrades to today's behavior rather than to an error.
+	//
+	// It is a bound on LIVE entries, which takes the sweep in acquire to be true.
+	// Without it the cap counts corpses: entries are otherwise only deleted when
+	// their own key is asked for again, so 256 one-shot keys would fill the map
+	// and disable caching for every new key until the process restarted — for
+	// 256 requests, permanently, on purpose. Reaching the cap for real (that many
+	// distinct keys live inside one TTL) still only stops new keys being STORED;
+	// they are served and shared in flight, and the state ends when they expire.
 	catalogCacheMaxEntries = 256
 	// catalogCacheMaxBody bounds a single cached response. Comfortably above a
 	// real catalog; a response past it is streamed through uncached.
 	catalogCacheMaxBody = 8 << 20
+	// catalogUpstreamTimeout bounds the SHARED upstream request, which is
+	// deliberately detached from the leader's client context (see wrap). Something
+	// has to stop a hung router from holding an entry — and its waiters — open
+	// forever, and it can no longer be the client hanging up. Generous: these are
+	// small reads from our own router, so anything near this is already an
+	// incident.
+	catalogUpstreamTimeout = 30 * time.Second
 )
 
 // catalogCache is a tiny single-flight TTL cache over the passthrough.
@@ -119,9 +133,13 @@ type catalogEntry struct {
 	status int
 	header http.Header
 	body   []byte
-	// bypass means the leader's response could not be replayed (it outgrew
-	// catalogCacheMaxBody and was streamed straight out). Waiters fall through and
-	// fetch their own rather than being served something we do not have.
+	// bypass means the leader's response cannot be replayed, so waiters fall
+	// through and fetch their own rather than being served something we do not
+	// hold. Three ways to get here, and only the first is benign: the response
+	// outgrew catalogCacheMaxBody and was streamed straight out; the upstream died
+	// mid-body so the buffer stops in the middle of the JSON; or the leader
+	// produced no status at all, which replayed would be WriteHeader(0) inside
+	// every waiter. See settle.
 	bypass  bool
 	expires time.Time
 }
@@ -173,7 +191,22 @@ func (c *catalogCache) wrap(next http.Handler) http.Handler {
 
 		entry, leader := c.acquire(key)
 		if leader {
-			c.fill(key, entry, next, w, &r2)
+			// The leader's upstream request is SHARED, so it must not die with the
+			// leader's client. Left on r.Context() it does: one caller pressing stop,
+			// or a phone changing networks, cancels the round trip that four other
+			// callers are parked on and they all get 502 — responses they would have
+			// received fine with no cache at all. Because errors are not retained,
+			// an attacker who connects and immediately aborts wins the leader slot
+			// almost every time and can hold the endpoint there.
+			//
+			// WithoutCancel keeps the request's values and drops only the
+			// cancellation; the timeout below puts back a bound, since something has
+			// to stop a hung router from holding an entry open forever. Detaching
+			// also means an abandoned leader still finishes and still fills the
+			// cache, which is the useful outcome rather than a wasted round trip.
+			ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), catalogUpstreamTimeout)
+			defer cancel()
+			c.fill(key, entry, next, w, r2.WithContext(ctx))
 			return
 		}
 		select {
@@ -211,43 +244,100 @@ func (c *catalogCache) acquire(key string) (*catalogEntry, bool) {
 		}
 	}
 	e := &catalogEntry{ready: make(chan struct{})}
-	// Past the cap we still create the entry (so concurrent readers of this key
-	// share one upstream request) but do not publish it, so it cannot be reused
-	// later and cannot grow the map.
+	// Reclaim before deciding the map is full. An entry is otherwise only ever
+	// deleted when its OWN key is asked for again, so a flood of keys asked for
+	// exactly once — `?junk=0` … `?junk=255` — leaves the map permanently full of
+	// corpses and makes the test below false for every new key from then on.
+	//
+	// That is not the graceful degradation this cap was meant to be: it hands back
+	// the single shared per-IP budget this whole cache exists to avoid, it costs
+	// an attacker 256 requests, and it lasts until the process restarts. Sweeping
+	// here makes the cap what it claimed to be — a bound on LIVE entries — and
+	// costs one pass over at most 256 map entries, on the miss path only.
+	if len(c.entries) >= catalogCacheMaxEntries {
+		c.evictExpiredLocked()
+	}
+	// Still full means the cap is doing its job: that many distinct keys really
+	// are live inside one TTL. Then we create the entry (so concurrent readers of
+	// this key still share one upstream request) without publishing it, so it
+	// cannot grow the map. Unlike before, this state now ends on its own.
 	if len(c.entries) < catalogCacheMaxEntries {
 		c.entries[key] = e
 	}
 	return e, true
 }
 
+// evictExpiredLocked drops every settled entry past its TTL. Entries still in
+// flight are left alone: their leader will either publish an expiry or delete
+// them in settle, and removing one here would only orphan it from the waiters
+// already holding it. Caller holds c.mu.
+func (c *catalogCache) evictExpiredLocked() {
+	now := c.now()
+	for k, e := range c.entries {
+		select {
+		case <-e.ready:
+			if !now.Before(e.expires) {
+				delete(c.entries, k)
+			}
+		default:
+		}
+	}
+}
+
 // fill runs the upstream request, answers this client, and settles the entry
 // for everyone waiting on it.
 func (c *catalogCache) fill(key string, e *catalogEntry, next http.Handler, w http.ResponseWriter, r *http.Request) {
 	rec := &catalogRecorder{w: w, limit: catalogCacheMaxBody}
-	// Settle the entry no matter how next returns, panic included: a leader that
-	// died with ready still open would park every waiter until its context
-	// expired, turning one failed request into a stalled endpoint.
+	// completed is set only after next returns NORMALLY and the buffer is out.
+	// It is how a truncated response is told from a whole one, and it has to be a
+	// flag rather than a check afterwards because the failure arrives as a PANIC:
+	// when the upstream connection dies mid-body, ReverseProxy's copy fails and it
+	// panics with http.ErrAbortHandler (that is its documented way of aborting a
+	// response it has already begun). The panic unwinds through this defer with
+	// rec.status already 200 and rec.overflow false, so every after-the-fact test
+	// says "a fine 200" about bytes that stop in the middle of a JSON object.
+	//
+	// That is strictly worse than the 500 the "only cache 200" rule was written
+	// for. A 500 is visibly an error; `{"data":[{"id":"model-a"` is a plausible
+	// catalog, and it would be served to everyone for a full TTL.
+	//
+	// The defer itself must stay unconditional: a leader that died with ready
+	// still open would park every waiter until its own context expired, turning
+	// one failed request into a stalled endpoint. It does NOT recover — the panic
+	// keeps propagating to net/http, which is what closes the connection and tells
+	// this client its response was cut short.
+	completed := false
 	defer func() {
-		c.settle(key, e, rec)
+		c.settle(key, e, rec, completed)
 		close(e.ready)
 	}()
 	next.ServeHTTP(rec, r)
 	rec.flush()
+	completed = true
 }
 
-// settle records the leader's result into the entry. Only a complete 200 is
-// retained; anything else is served to the current waiters and then forgotten,
-// so a transient router error cannot be pinned in front of the catalog for a
-// whole TTL.
-func (c *catalogCache) settle(key string, e *catalogEntry, rec *catalogRecorder) {
-	if rec.overflow {
+// settle records the leader's result into the entry.
+//
+// Two separate questions, and conflating them is what made a truncated response
+// cacheable. REPLAYABLE asks whether we hold a whole response at all, and gates
+// what the waiters already parked on this entry receive. CACHEABLE asks whether
+// it should also be kept, and additionally requires a 200 — so a transient
+// router error is shared with the current waiters and then forgotten rather than
+// pinned in front of the catalog for a whole TTL.
+func (c *catalogCache) settle(key string, e *catalogEntry, rec *catalogRecorder, completed bool) {
+	// rec.status == 0 means the leader panicked before writing anything at all
+	// (the round trip never produced a response). Replaying that calls
+	// WriteHeader(0), which panics inside EVERY waiter's own handler — one failed
+	// upstream request becoming N broken client connections.
+	replayable := completed && !rec.overflow && rec.status != 0 && rec.bodyIsWhole()
+	if !replayable {
 		e.bypass = true
 	} else {
 		e.status = rec.status
 		e.header = snapshotCatalogHeader(rec.Header())
 		e.body = rec.buf.Bytes()
 	}
-	cacheable := !rec.overflow && rec.status == http.StatusOK
+	cacheable := replayable && rec.status == http.StatusOK
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if !cacheable {
@@ -335,6 +425,27 @@ type catalogRecorder struct {
 }
 
 func (rc *catalogRecorder) Header() http.Header { return rc.w.Header() }
+
+// bodyIsWhole cross-checks the buffered body against a Content-Length the
+// upstream declared. Independent of the panic flag on purpose: that flag relies
+// on ReverseProxy choosing to panic, which it only does when it can tell it is
+// running under an http.Server (shouldPanicOnCopyError), so a short body must
+// also be catchable from the bytes themselves.
+//
+// Absent or unparseable Content-Length means "no claim to check" and passes:
+// the header is genuinely missing on a chunked response, and on the identity
+// path where Go's Transport decompressed the body and dropped the length.
+func (rc *catalogRecorder) bodyIsWhole() bool {
+	declared := rc.Header().Get("Content-Length")
+	if declared == "" {
+		return true
+	}
+	n, err := strconv.ParseInt(declared, 10, 64)
+	if err != nil {
+		return true
+	}
+	return n == int64(rc.buf.Len())
+}
 
 func (rc *catalogRecorder) WriteHeader(status int) {
 	if rc.status == 0 {
