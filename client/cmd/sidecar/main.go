@@ -35,10 +35,15 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/client/cmd/internal/proxycli"
 	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
+	"github.com/0gfoundation/0g-pc-e2ee/client/route"
 )
 
 func main() {
-	f := proxycli.RegisterFlags(flag.CommandLine, "ZG_SIDECAR", "localhost:8787")
+	// The public entry, which is where a client belongs: it resolves to the
+	// gateway, so a sidecar pointed here gets the gateway's sealing on everything
+	// it does not seal itself. (The gateway's own default is different — see
+	// route.DefaultRouterOriginURL.)
+	f := proxycli.RegisterFlags(flag.CommandLine, "ZG_SIDECAR", "localhost:8787", route.DefaultRouterURL)
 	flag.Parse()
 
 	// One shared logger for startup, per-request, and the core's open-failure

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
+	"github.com/0gfoundation/0g-pc-e2ee/client/route"
 )
 
 // testLogger discards output; the shutdown tests assert on serve's return value
@@ -169,7 +170,7 @@ func TestStartWarmerNoopWhenOff(t *testing.T) {
 // flag path; a valid combination never hits Build's os.Exit.
 func TestBuildDirectMode(t *testing.T) {
 	fs := flag.NewFlagSet("t", flag.ContinueOnError)
-	f := RegisterFlags(fs, "ZG_TEST", ":0")
+	f := RegisterFlags(fs, "ZG_TEST", ":0", route.DefaultRouterURL)
 	if err := fs.Parse([]string{"-provider-url", "https://broker.example/v1", "-verify-responses"}); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -209,7 +210,7 @@ func TestBuildProviderIdentitiesRequiresAttest(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fs := flag.NewFlagSet("t", flag.ContinueOnError)
-			f := RegisterFlags(fs, "ZG_TEST", ":0")
+			f := RegisterFlags(fs, "ZG_TEST", ":0", route.DefaultRouterURL)
 			if err := fs.Parse(tc.args); err != nil {
 				t.Fatalf("parse: %v", err)
 			}
@@ -295,7 +296,7 @@ func TestIdleKeepAliveIsBoundedOnlyByIdleTimeout(t *testing.T) {
 // something the direct path actually reads.
 func TestBuildDirectModeServesChatOnly(t *testing.T) {
 	fs := flag.NewFlagSet("t", flag.ContinueOnError)
-	f := RegisterFlags(fs, "ZG_TEST", ":0")
+	f := RegisterFlags(fs, "ZG_TEST", ":0", route.DefaultRouterURL)
 	if err := fs.Parse([]string{"-provider-url", "https://broker.example/v1"}); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -311,7 +312,7 @@ func TestBuildDirectModeServesChatOnly(t *testing.T) {
 // to route), so that is what is asserted.
 func TestBuildServesDeduplicates(t *testing.T) {
 	fs := flag.NewFlagSet("t", flag.ContinueOnError)
-	f := RegisterFlags(fs, "ZG_TEST", ":0")
+	f := RegisterFlags(fs, "ZG_TEST", ":0", route.DefaultRouterURL)
 	if err := fs.Parse(nil); err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -343,7 +344,7 @@ func TestBuildClientsFollowWhatTheBinaryServes(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fs := flag.NewFlagSet("t", flag.ContinueOnError)
-			f := RegisterFlags(fs, "ZG_TEST", ":0")
+			f := RegisterFlags(fs, "ZG_TEST", ":0", route.DefaultRouterURL)
 			if err := fs.Parse(nil); err != nil {
 				t.Fatalf("parse: %v", err)
 			}
