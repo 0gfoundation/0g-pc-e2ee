@@ -114,13 +114,13 @@ var corsFixedAllowHeaderSet = func() map[string]bool {
 // This is safe only while both of the following hold. If either changes, this must
 // narrow to an explicit list:
 //   - Ambient credentials, where enabled, are gated on the SAME origin allowlist
-//     this reflection is. Cookie credentials (AcceptCookieCredential, off unless
-//     the deployment opts in) are honored only for a present, allowlisted Origin,
-//     which is also the only case a preflight is answered at all — so reflection
-//     never widens who can make an authenticated request. What would break this is
-//     a credential honored WITHOUT that check; see AcceptCookieCredential for why
-//     it does not do that, and for the CSRF this note used to guard against by
-//     reading no cookie whatsoever.
+//     this reflection is. Cookie credentials (AcceptCookieCredential, on for every
+//     named allowlist and off only for "*") are honored only for a present,
+//     allowlisted Origin, which is also the only case a preflight is answered at all
+//     — so reflection never widens who can make an authenticated request. What
+//     would break this is a credential honored WITHOUT that check; see
+//     AcceptCookieCredential for why it does not do that, and for the CSRF this
+//     note used to guard against by reading no cookie whatsoever.
 //   - No header is treated as proof of origin (the CSRF pattern where a server
 //     trusts that a custom header implies same-origin JS).
 //

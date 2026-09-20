@@ -48,7 +48,33 @@ const cookieCredentialName = "jwt"
 // allowlist is what turns it away. Same rule, same matcher (originAllowed) as the
 // preflight answer, so a page that clears CORS here is not then rejected by this.
 //
-// This is what keeps allowHeadersFor's reflect-what-was-asked-for policy sound.
+// # INVARIANT: this allowlist must stay a SUBSET of the router's own
+//
+// The gateway's origin gate is not a second opinion alongside the router's — it is
+// the ONLY one, and the conversion is what makes it so. The router runs
+// checkCookieCSRF only when it read the credential out of a cookie itself
+// (`isCookie`); a request arriving as `Authorization: Bearer …` never reaches that
+// check, however the bearer was obtained. So every request converted here bypasses
+// the router's CSRF gate by construction, and this allowlist is what stands in for
+// it.
+//
+// Which means: an origin allowed HERE but not in the router's `auth.allowed_origins`
+// is an origin the gateway grants a capability the router would have refused, with
+// nothing anywhere to report it. The two lists live in two repositories and two
+// deployments and are deliberately not identical (deploy/phala/README.md), so
+// nothing mechanical enforces the direction — the containment is a rule a human
+// keeps. It is safe today: the deployed gateway list is the first-party origins and
+// the router's is a strict superset of those.
+//
+// The reverse direction is fine. An origin the router allows and this gateway does
+// not is simply a page that cannot use the gateway, which is a narrowing.
+//
+// One place this design is STRICTER than the router, worth knowing when comparing
+// them: an allowlist of "*" disables ambient credentials here, whereas the router's
+// checkCookieCSRF returns true for "*" and skips the CSRF check entirely.
+//
+// # Why allowHeadersFor's reflect-what-was-asked-for policy is still sound
+//
 // That policy's stated precondition was "no ambient credentials: ACAC unset and no
 // cookie is read", and enabling cookies changes the first half. It stays safe
 // because header reflection only ever happens on a preflight, and a preflight is

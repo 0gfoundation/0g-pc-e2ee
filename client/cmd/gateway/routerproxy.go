@@ -41,8 +41,16 @@ import (
 // /v1/embeddings, which carry the prompt/input), it MUST get its own row in
 // endpoint.All and its own seal path — routing it through this proxy would hand
 // that content to the untrusted router in the clear, defeating the gateway's whole
-// purpose. A sealed surface's own POST, in either spelling (with or without a
-// trailing slash), never reaches here: main.go claims both, and a test pins it.
+// purpose.
+//
+// A sealed surface's own POST never reaches here, in ANY spelling of its path. An
+// earlier version of this note claimed that for "either spelling (with or without
+// a trailing slash)", which was wrong and was wrong in the direction that matters:
+// `%2F` and a differently-cased segment are two more spellings, both of them
+// matched no pattern, and both of them arrived here with the prompt in the clear.
+// sealedNamespaceGuard (main.go) now folds every spelling to the registered one
+// before the mux matches, so the claim holds by construction rather than by
+// enumeration — do not narrow it back to a list.
 func newRouterProxy(target *url.URL, logger *slog.Logger) http.Handler {
 	return &httputil.ReverseProxy{
 		// Every request this proxy makes goes to the one router host, so it needs the

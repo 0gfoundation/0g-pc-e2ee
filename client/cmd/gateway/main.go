@@ -73,6 +73,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/cmd/internal/proxycli"
@@ -718,13 +719,87 @@ func (p entryPolicy) credentialsAllowed() bool { return !p.openOrigins }
 // middleware above still holds the original — the access log reads it after h
 // returns — and a handler that edits its caller's request in place is the kind of
 // action at a distance that is fine until something else reads the field.
+//
+// RawPath is cleared along with it. url.EscapedPath prefers RawPath when it is a
+// valid encoding of Path, so leaving a stale one behind would have ServeMux match
+// the ORIGINAL spelling while every later reader sees the rewritten one — which is
+// the precise shape of the bug this exists to close.
 func canonicalPath(path string, h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r2 := *r
-		u := *r.URL
-		u.Path = path
-		r2.URL = &u
-		h.ServeHTTP(w, &r2)
+		h.ServeHTTP(w, withPath(r, path))
+	})
+}
+
+func withPath(r *http.Request, path string) *http.Request {
+	r2 := *r
+	u := *r.URL
+	u.Path = path
+	u.RawPath = ""
+	r2.URL = &u
+	return &r2
+}
+
+// sealedNamespaceGuard makes a sealed surface's namespace claim hold for every
+// SPELLING of a path, not just the canonical one, by folding the surface prefix to
+// its registered form before the mux ever sees the request.
+//
+// ServeMux cannot express this claim on its own, and the two gaps both end the same
+// way — at the catch-all, which is a cleartext reverse proxy to the untrusted
+// router:
+//
+//   - It matches on the ESCAPED path, segment by segment. `%2F` is therefore an
+//     ordinary character inside one segment rather than a separator, so
+//     `/v1/chat/completions%2F` matches neither `POST /v1/chat/completions` nor the
+//     `/v1/chat/completions/` subtree.
+//   - It is case-SENSITIVE, so `/V1/chat/completions` matches nothing either.
+//
+// Both were confirmed against the real handler: 200, and the whole prompt in the
+// router's log. Like the literal trailing slash before them, they are invisible to
+// the caller — the router's gin answers the decoded path with a 307 onto the
+// canonical one, the retry is served properly, and only the first request leaked.
+// Claiming the exact path, the subtree and the `{$}` anchor closes three spellings;
+// this closes the rest by construction, which is the only way to stop enumerating.
+//
+// FOLDING CASE IS A DELIBERATE WIDENING, and worth naming. The router is
+// case-sensitive too, so `/V1/chat/completions` would 404 there; here it is served
+// as the sealed surface. That is the trade being made: a path's capitalisation is
+// not a security boundary anywhere sane, and treating it as one is exactly what
+// produced the leak. Answering the request is also the friendlier half — the
+// alternative, refusing it, would mean inventing an error for a spelling whose only
+// real-world senders are probes and sloppy clients.
+//
+// It runs OUTSIDE the mux and inside CORS: a preflight must still be answered by
+// the CORS layer, and the guard has nothing to say about a request that never
+// reaches a handler.
+func sealedNamespaceGuard(surfaces []string, mux http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// r.URL.Path is the DECODED path, which is what makes the %2F case visible
+		// here at all: net/http has already turned it back into a separator, while
+		// ServeMux went on to match the escaped form.
+		p := r.URL.Path
+		for _, surface := range surfaces {
+			switch {
+			case strings.EqualFold(p, surface):
+				r = withPath(r, surface)
+			case len(p) > len(surface) && strings.EqualFold(p[:len(surface)+1], surface+"/"):
+				// A sub-resource: fold only the surface prefix and leave the rest
+				// verbatim, so the namespace handler (refuse, or passthrough to the
+				// router) decides it exactly as it decides the canonical spelling.
+				r = withPath(r, surface+p[len(surface):])
+			default:
+				continue
+			}
+			// Rewritten UNCONDITIONALLY on a match, with no "only if it differs" short
+			// circuit. The escaping is half of what is being normalised and it does not
+			// show up in this comparison: `/v1/chat/completions%2F` already has the
+			// canonical Path — net/http decoded it — and differs only in RawPath, which
+			// is the field ServeMux actually matches on. Skipping the rewrite because
+			// the decoded strings agree is precisely how that spelling stayed leaking
+			// after the case variants were fixed. withPath clears RawPath, so one
+			// unconditional call normalises both axes.
+			break
+		}
+		mux.ServeHTTP(w, r)
 	})
 }
 
@@ -772,9 +847,11 @@ func withEntryPolicy(p entryPolicy) handlerOption {
 // configured) and the route always answers ready. See proxycli.Built.Readiness and
 // the /healthz vs /readyz split at the routes below.
 //
-// opts carries the entryPolicy: passing none is the standalone gateway (no cookie
-// credential, sealed subtrees refused), which is what main does unless the
-// deployment opted in and what every test that is about something else wants.
+// opts carries the entryPolicy. Passing NONE is the ordinary deployment — ambient
+// credentials on, sealed subtrees refused — because the policy's fields name the
+// exceptions rather than the rule (see entryPolicy). main always passes one, built
+// from the allowlist and the -unsealed-subtree flag; every test that is about
+// something else passes none and gets the shape a real gateway runs.
 func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedOrigins []string, instanceID, evidenceDir string,
 	maxInFlight int, identity *identityCache, providerIdentities route.ProviderIdentitySource,
 	ready func() error, logger *slog.Logger, opts ...handlerOption) http.Handler {
@@ -820,8 +897,9 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	// indistinguishable from a cleartext one.
 	//
 	// The cookie conversion sits outside the gate and inside the marker: it must run
-	// BEFORE the gate (its whole job is to turn a credential the gate does not
-	// recognise into one it does) and it is off unless the deployment opted in.
+	// BEFORE the gate, since its whole job is to turn a credential the gate does not
+	// recognise into one it does. It is mounted for every deployment except one whose
+	// allowlist is "*", where the origin gate it depends on would admit everything.
 	sealed := http.NewServeMux()
 	var sealedGate http.Handler = openaiproxy.RequireInferenceCredential(
 		openaiproxy.LimitInFlight(maxInFlight, sealed))
@@ -875,6 +953,13 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	// Either way the sealed POST is untouched: it seals, or it is refused on a build
 	// with no client for it. Neither value can put a prompt that WOULD have been
 	// sealed onto the cleartext path.
+	// Collected for sealedNamespaceGuard, which has to fold every spelling of these
+	// prefixes before the mux matches. Built from the same table the loop registers
+	// from, so a row added later is guarded the day it lands.
+	surfaces := make([]string, 0, len(endpoint.All))
+	for _, ep := range endpoint.All {
+		surfaces = append(surfaces, ep.Path)
+	}
 	for _, ep := range endpoint.All {
 		// Registered for EVERY row, served or not, and before the branch below:
 		// whether this build seals the surface itself has no bearing on whether its
@@ -1044,5 +1129,7 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	// still carrying the serving replica's id. See evidenceRoute.
 	return openaiproxy.LogRequests(logger,
 		openaiproxy.StampInstance(instanceID,
-			evidenceRoute(evidenceDir, openaiproxy.CORS(allowedOrigins, policy.credentialsAllowed(), mux))))
+			evidenceRoute(evidenceDir,
+				openaiproxy.CORS(allowedOrigins, policy.credentialsAllowed(),
+					sealedNamespaceGuard(surfaces, mux)))))
 }
