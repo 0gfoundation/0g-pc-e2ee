@@ -21,14 +21,36 @@ import (
 // instead of getting a 404 from the mux.
 //
 // SECURITY: this is a CLEARTEXT passthrough — it carries no E2EE seal, so the
-// router sees whatever transits it in the clear. That is fine for metadata and
-// discovery, which carry no prompt, and is the ONLY thing this path is for. If a
-// content-bearing endpoint that must stay end-to-end encrypted is later added to
-// the router (e.g. /v1/completions or /v1/embeddings, which carry the
-// prompt/input), it MUST get its own seal path in openaiproxy — routing it
-// through this proxy would hand that content to the untrusted router in the
-// clear, defeating the gateway's whole purpose. Keep the catch-all for metadata;
-// never let it become the path for sealed content.
+// router sees whatever transits it in the clear. Every response it produces is
+// marked X-0G-E2EE: none (openaiproxy.MarkE2EE, applied where this handler is
+// mounted), so "the router read this one" is something a caller can see rather
+// than infer.
+//
+// What may travel it is one of two things, and the difference is whether anybody
+// DECIDED:
+//
+//   - Metadata and discovery, always. The model catalog and the provider list
+//     carry no prompt, and this path exists for them.
+//   - A sealed surface's sub-resources, only under -unsealed-subtree=passthrough,
+//     and only because the global-entry topology leaves a caller no other door
+//     (see the endpoint.All loop in main.go). That content IS read by the router;
+//     the marker is what keeps it disclosed rather than silent.
+//
+// Everything else must not. If a content-bearing endpoint that must stay
+// end-to-end encrypted is later added to the router (e.g. /v1/completions or
+// /v1/embeddings, which carry the prompt/input), it MUST get its own row in
+// endpoint.All and its own seal path — routing it through this proxy would hand
+// that content to the untrusted router in the clear, defeating the gateway's whole
+// purpose.
+//
+// A sealed surface's own POST never reaches here, in ANY spelling of its path. An
+// earlier version of this note claimed that for "either spelling (with or without
+// a trailing slash)", which was wrong and was wrong in the direction that matters:
+// `%2F` and a differently-cased segment are two more spellings, both of them
+// matched no pattern, and both of them arrived here with the prompt in the clear.
+// sealedNamespaceGuard (main.go) now folds every spelling to the registered one
+// before the mux matches, so the claim holds by construction rather than by
+// enumeration — do not narrow it back to a list.
 func newRouterProxy(target *url.URL, logger *slog.Logger) http.Handler {
 	return &httputil.ReverseProxy{
 		// Every request this proxy makes goes to the one router host, so it needs the
@@ -59,6 +81,13 @@ func newRouterProxy(target *url.URL, logger *slog.Logger) http.Handler {
 			// let the gateway's own middleware (openaiproxy.CORS, which wraps this
 			// handler) be the single authority for what a browser may reach here.
 			openaiproxy.StripCORSHeaders(resp.Header)
+			// Same class of bug as the doubled CORS header above, and the same fix. The
+			// E2EE marker is set on w.Header() before this proxy runs (MarkE2EE), and
+			// ReverseProxy copies upstream headers with Add — so a router that ever
+			// emitted this name would APPEND to ours, and a client reading the header
+			// would see two contradictory values on one response. The router does not send
+			// it today; this makes that fact stop mattering.
+			resp.Header.Del(openaiproxy.HeaderE2EE)
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {

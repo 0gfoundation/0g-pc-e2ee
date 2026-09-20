@@ -25,10 +25,22 @@ import (
 // erring narrow is the right direction for a list whose entries each widen who can
 // reach the enclave.
 //
-// The localhost entries are development conveniences: they let a page served from
-// a developer's machine seal through whatever enclave this gateway runs in. Drop
-// them via the env override (no code change) on a deployment that does not need
-// that.
+// Every entry on this list now confers AMBIENT CREDENTIALS, which it did not when
+// the list was written. A named allowlist turns on cookie admission and the
+// credentialed CORS answer together (see AcceptCookieCredential), and the router
+// issues its session cookie with SameSite=None — so the browser attaches it to a
+// cross-site request from anywhere, and this list is the only thing deciding who
+// may then act as a logged-in visitor. Adding an entry is no longer "let this page
+// call us with its own key"; it is "let this page spend a visitor's balance".
+//
+// The localhost entries are development conveniences: they let a page served from a
+// developer's machine seal through whatever enclave this gateway runs in. Under the
+// paragraph above they are also the weakest entries here — anything a developer
+// runs on those ports inherits the session — so a PRODUCTION deployment should drop
+// them via the env override, and deploy/phala/docker-compose.yml does exactly that
+// rather than mirroring this constant. Reaching them still requires hostile code
+// already running on the victim's own machine, which is why they stay in the
+// built-in default that a local `go run` uses.
 const DefaultAllowedOriginsCSV = "https://0g.ai,https://*.0g.ai,http://localhost:3000,http://localhost:5173"
 
 // corsAllowMethods is the preflight's Access-Control-Allow-Methods. It mirrors
@@ -101,8 +113,14 @@ var corsFixedAllowHeaderSet = func() map[string]bool {
 //
 // This is safe only while both of the following hold. If either changes, this must
 // narrow to an explicit list:
-//   - No ambient credentials: Access-Control-Allow-Credentials stays unset and no
-//     cookie is read, so a page on an allowed origin still needs its own key.
+//   - Ambient credentials, where enabled, are gated on the SAME origin allowlist
+//     this reflection is. Cookie credentials (AcceptCookieCredential, on for every
+//     named allowlist and off only for "*") are honored only for a present,
+//     allowlisted Origin, which is also the only case a preflight is answered at all
+//     — so reflection never widens who can make an authenticated request. What
+//     would break this is a credential honored WITHOUT that check; see
+//     AcceptCookieCredential for why it does not do that, and for the CSRF this
+//     note used to guard against by reading no cookie whatsoever.
 //   - No header is treated as proof of origin (the CSRF pattern where a server
 //     trusts that a custom header implies same-origin JS).
 //
@@ -171,7 +189,7 @@ const corsMaxAge = "43200"
 // the response does not carry is a no-op, and making the advertisement depend on
 // the toggle would put a deployment flag into the CORS answer for no gain.
 var corsExposeHeaders = strings.Join(append(
-	[]string{headerResKey, headerProvider, HeaderGatewayInstance}, passthroughResponseHeaders...), ", ")
+	[]string{headerResKey, headerProvider, HeaderGatewayInstance, HeaderE2EE}, passthroughResponseHeaders...), ", ")
 
 // ParseOrigins splits a comma-separated origin allowlist into trimmed, non-empty
 // patterns. An empty (or all-blank) value yields nil — no origin matches, i.e.
@@ -283,11 +301,23 @@ func originAllowed(origin string, patterns []string) bool {
 //
 //   - The allowed origin is echoed back (never a literal "*"), with Vary: Origin,
 //     so a shared cache cannot serve one origin's response to another.
-//   - Access-Control-Allow-Credentials is NOT set. The proxy authenticates from an
-//     Authorization / x-api-key header the app sets explicitly, which is not a CORS
-//     "credential" (cookies, TLS certs, HTTP auth are), and no cookie is ever read.
-//     Leaving it off keeps ambient browser credentials out of the auth path and
-//     avoids the "*"-plus-credentials trap.
+//   - Access-Control-Allow-Credentials follows allowCredentials, which the gateway
+//     derives from the allowlist: ON for a named one, OFF when it contains "*". The
+//     two halves have to move together — a deployment that reads the router's `jwt`
+//     cookie (AcceptCookieCredential) needs this header or the browser will not SEND
+//     that cookie cross-origin however willing this side is to read it, and one that
+//     refuses the cookie must not advertise credentials it then ignores. Either
+//     mismatch surfaces as a CORS error rather than an auth error, which is the
+//     hardest shape to diagnose.
+//     With it off the proxy authenticates only from an Authorization / x-api-key
+//     header the app sets explicitly — not a CORS "credential" (cookies, TLS certs,
+//     HTTP auth are) — which keeps ambient browser credentials out of the auth path
+//     entirely. Echoing the origin rather than "*" is what makes the ON case legal at
+//     all: "*" plus credentials is rejected outright by browsers, and this never emits
+//     "*" — not even for an allowlist of "*", where it echoes the actual origin. That
+//     is belt and braces rather than the guard: the gateway turns credentials OFF for
+//     such an allowlist in the first place, because an origin gate that admits
+//     everything is not a CSRF defense.
 //   - A DISALLOWED origin fails differently by request kind: a preflight is
 //     rejected 403 (only a browser sends one, so refusing it is safe and shows up
 //     in the access log as a real signal), while a non-preflight request is served
@@ -296,7 +326,7 @@ func originAllowed(origin string, patterns []string) bool {
 //     proxies do) keeps working. Turning CORS into server-side origin blocking
 //     would break those callers for no security gain: CORS is enforced by the
 //     browser, and any non-browser client can send whatever Origin it likes.
-func CORS(origins []string, h http.Handler) http.Handler {
+func CORS(origins []string, allowCredentials bool, h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		origin := r.Header.Get("Origin")
 		// A preflight is an OPTIONS carrying Access-Control-Request-Method. A bare
@@ -320,6 +350,11 @@ func CORS(origins []string, h http.Handler) http.Handler {
 			return
 		}
 		w.Header().Set("Access-Control-Allow-Origin", origin)
+		// On the preflight AND the real request: the browser checks it on both, and a
+		// preflight that omits it makes the real credentialed request never happen.
+		if allowCredentials {
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+		}
 		if preflight {
 			// The preflight answer depends on the requested method/headers too, so a
 			// cache keyed on Origin alone would still be wrong.

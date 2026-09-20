@@ -10,7 +10,20 @@ import (
 // corsHandler wraps a sentinel handler in CORS and reports whether the inner
 // handler ran, so a test can tell "answered by the middleware" from "passed
 // through" — the distinction that matters for every preflight case.
+//
+// Uncredentialed, which is the default deployment and what every case here but
+// the two credentialed ones is about; corsHandlerCredentialed is the other half.
 func corsHandler(origins []string) (h http.Handler, reached *bool) {
+	return corsHandlerWith(origins, false)
+}
+
+// corsHandlerCredentialed is corsHandler with Access-Control-Allow-Credentials on
+// — the shape a deployment that accepts the router's `jwt` cookie serves.
+func corsHandlerCredentialed(origins []string) (h http.Handler, reached *bool) {
+	return corsHandlerWith(origins, true)
+}
+
+func corsHandlerWith(origins []string, allowCredentials bool) (h http.Handler, reached *bool) {
 	var ran bool
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ran = true
@@ -18,7 +31,7 @@ func corsHandler(origins []string) (h http.Handler, reached *bool) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("inner"))
 	})
-	return CORS(origins, inner), &ran
+	return CORS(origins, allowCredentials, inner), &ran
 }
 
 // preflight builds the OPTIONS request a browser sends before a non-simple call:
@@ -53,7 +66,9 @@ func TestCORSPreflightAllowed(t *testing.T) {
 		t.Error("Allow-Origin must echo the origin, never a literal *")
 	}
 	if got := rec.Header().Get("Access-Control-Allow-Credentials"); got != "" {
-		t.Errorf("Allow-Credentials: got %q, want unset (the proxy authenticates from an explicit header, not ambient cookies)", got)
+		t.Errorf("Allow-Credentials: got %q, want unset in this DEFAULT configuration, where the proxy\n"+
+			"authenticates from an explicit header and reads no cookie. A deployment that accepts the\n"+
+			"router's cookie turns it on — see TestCORSAllowCredentials", got)
 	}
 	if got := rec.Header().Get("Access-Control-Max-Age"); got != corsMaxAge {
 		t.Errorf("Max-Age: got %q, want %q", got, corsMaxAge)
@@ -292,11 +307,11 @@ func TestCORSActualRequestAllowed(t *testing.T) {
 // TestCORSExposeHeadersTracksPassthrough is the anti-drift check: Expose-Headers
 // must be DERIVED from the passthrough set, so adding a header the proxy re-emits
 // automatically makes it readable by browser JS instead of silently invisible.
-// The three proxy-originated headers (ZG-Res-Key, X-Provider, X-0G-Gateway-Instance)
-// lead the list; everything after them is the passthrough set, in order.
+// The four proxy-originated headers (ZG-Res-Key, X-Provider, X-0G-Gateway-Instance,
+// X-0G-E2EE) lead the list; everything after them is the passthrough set, in order.
 func TestCORSExposeHeadersTracksPassthrough(t *testing.T) {
 	got := strings.Split(corsExposeHeaders, ", ")
-	want := append([]string{headerResKey, headerProvider, HeaderGatewayInstance}, passthroughResponseHeaders...)
+	want := append([]string{headerResKey, headerProvider, HeaderGatewayInstance, HeaderE2EE}, passthroughResponseHeaders...)
 	if len(got) != len(want) {
 		t.Fatalf("Expose-Headers has %d entries, want %d (the proxy-originated headers + every passthrough header)", len(got), len(want))
 	}
@@ -482,4 +497,83 @@ func containsValue(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// Access-Control-Allow-Credentials follows the flag, and is absent by default.
+//
+// It is asserted on the PREFLIGHT as well as the real request because the browser
+// checks it on both: a preflight answer that omits it means the credentialed
+// request is never sent at all, so the app fails with the real response never
+// having been attempted. The two halves failing separately is why they are
+// asserted separately.
+func TestCORSAllowCredentials(t *testing.T) {
+	origins := []string{"https://pc.0g.ai"}
+	tests := []struct {
+		name  string
+		build func([]string) (http.Handler, *bool)
+		want  string
+	}{
+		{"off by default", corsHandler, ""},
+		{"on when the deployment accepts cookies", corsHandlerCredentialed, "true"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h, _ := tt.build(origins)
+
+			pre := httptest.NewRecorder()
+			h.ServeHTTP(pre, preflight("https://pc.0g.ai"))
+			if got := pre.Header().Get("Access-Control-Allow-Credentials"); got != tt.want {
+				t.Errorf("preflight Allow-Credentials: got %q, want %q", got, tt.want)
+			}
+
+			real := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			req.Header.Set("Origin", "https://pc.0g.ai")
+			h.ServeHTTP(real, req)
+			if got := real.Header().Get("Access-Control-Allow-Credentials"); got != tt.want {
+				t.Errorf("real request Allow-Credentials: got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// Credentials never widen WHO gets them: a disallowed origin gets no
+// Allow-Credentials, because it gets no Allow-Origin either. The pair has to move
+// together — Allow-Credentials on a response with no Allow-Origin is inert, but a
+// reader of the code should not have to work that out to be sure.
+func TestCORSAllowCredentialsOnlyForAllowedOrigin(t *testing.T) {
+	h, _ := corsHandlerCredentialed([]string{"https://pc.0g.ai"})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set("Origin", "https://evil.example.net")
+	h.ServeHTTP(rec, req)
+
+	if got := rec.Header().Get("Access-Control-Allow-Credentials"); got != "" {
+		t.Errorf("Allow-Credentials on a disallowed origin: got %q, want absent", got)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Errorf("Allow-Origin on a disallowed origin: got %q, want absent", got)
+	}
+}
+
+// Never the literal "*" for the echoed origin, not even for an allowlist of "*" —
+// "*" plus credentials is rejected outright by every browser, so an allowlist of
+// "*" has to keep echoing the real origin. (The gateway refuses to START in that
+// combination; this pins that the middleware would not emit an illegal pair even
+// if it were reached some other way.)
+func TestCORSWildcardAllowlistStillEchoesTheOrigin(t *testing.T) {
+	h, _ := corsHandlerCredentialed([]string{"*"})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set("Origin", "https://anything.example.net")
+	h.ServeHTTP(rec, req)
+
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "https://anything.example.net" {
+		t.Errorf("Allow-Origin: got %q, want the request's origin echoed (never \"*\")", got)
+	}
+	if got := rec.Header().Get("Access-Control-Allow-Credentials"); got != "true" {
+		t.Errorf("Allow-Credentials: got %q, want %q", got, "true")
+	}
 }

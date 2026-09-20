@@ -249,12 +249,51 @@ services:
       # the router is untrusted by construction.
       - "ZG_GATEWAY_ROUTER_URL=${ZG_GATEWAY_ROUTER_URL:-https://router-api.0g.ai}"
       # Browser origin allowlist (CORS): the 0G first-party app origins, and
-      # deliberately not every origin the router accepts. Keep in sync with
-      # openaiproxy.DefaultAllowedOriginsCSV. An empty value turns browser access off
-      # entirely; SDK and server-side callers send no Origin header and are
-      # unaffected. The localhost entries are development conveniences — drop them via
-      # the override on any deployment that does not need them.
-      - "ZG_GATEWAY_ALLOWED_ORIGINS=${ZG_GATEWAY_ALLOWED_ORIGINS:-https://0g.ai,https://*.0g.ai,http://localhost:3000,http://localhost:5173}"
+      # deliberately not every origin the router accepts. An empty value turns browser
+      # access off entirely; SDK and server-side callers send no Origin header and are
+      # unaffected.
+      #
+      # This list is also what decides whether AMBIENT CREDENTIALS are on: a named
+      # allowlist (this) admits the router's `jwt` cookie and answers
+      # Access-Control-Allow-Credentials, while a value of "*" turns both off. So each
+      # entry now means "this page may act as a logged-in visitor", not merely "this
+      # page may call us with its own key" — the router issues that cookie with
+      # SameSite=None, so the browser attaches it cross-site and this list is the only
+      # thing standing in the way.
+      #
+      # It therefore deliberately does NOT mirror openaiproxy.DefaultAllowedOriginsCSV
+      # any more: the two localhost entries in that constant are a convenience for a
+      # local `go run`, and on a public deployment they would extend the session to
+      # whatever a developer happens to be serving on those ports. Keep prod to the
+      # first-party origins.
+      - "ZG_GATEWAY_ALLOWED_ORIGINS=${ZG_GATEWAY_ALLOWED_ORIGINS:-https://0g.ai,https://*.0g.ai}"
+      # The global-entry knob (design: 0g-router, e2ee-global-entry-design.zh.md §3).
+      # Referenced with its OFF default rather than left out, for the same reason
+      # ACME_STAGING is referenced: a variable this file does not mention can never
+      # reach the container, so leaving it out would mean the cutover needs a compose
+      # edit — a new compose_hash, a new measurement, a redeploy — at the moment it can
+      # least afford one. Referenced with a default, the value switches through the
+      # encrypted env and the measured text is untouched. It must therefore be entered
+      # in allowed_envs on EVERY side, including while it is "refuse", and toggled by
+      # value (README "Serving domain", and blue-green.md on why a drifting
+      # allowed_envs list is its own problem).
+      #
+      # There is deliberately NO companion variable for cookie credentials: the
+      # router's `jwt` cookie is admitted, and the CORS answer is credentialed,
+      # whenever ZG_GATEWAY_ALLOWED_ORIGINS names its origins rather than saying "*".
+      # See the long note at the gateway's -allowed-origins flag for why that is not a
+      # knob — in short, a deployment cannot detect whether it is the one serving the
+      # router's hostname, and the setting could only ever be forgotten in the
+      # direction that breaks the whole first-party app with a CORS error rather than
+      # a 401.
+      # ZG_GATEWAY_UNSEALED_SUBTREE decides what a sealed surface's sub-resources and
+      # non-sealed methods answer: "refuse" (501, the default — right while a caller
+      # who wants the router's own handling can call the router directly) or
+      # "passthrough" (forward them, marked X-0G-E2EE: none — right once this gateway
+      # IS the only entry, where a 501 removes the feature rather than redirecting).
+      # An unrecognised value fails startup instead of guessing: one of the two answers
+      # forwards content in the clear, and that is not a thing to infer from a typo.
+      - "ZG_GATEWAY_UNSEALED_SUBTREE=${ZG_GATEWAY_UNSEALED_SUBTREE:-refuse}"
       # DCAP-verify each provider's TDX quote and seal only to the verified enc key,
       # instead of trusting the router-supplied pubkey endpoint. Enforced per request:
       # a provider that fails is rejected.
