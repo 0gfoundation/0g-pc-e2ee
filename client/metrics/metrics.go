@@ -126,6 +126,21 @@ var (
 		Namespace: namespace, Subsystem: subsystem, Name: "response_open_failures_total",
 		Help: "Sealed-response frames that failed to open (AEAD authentication failure).",
 	})
+	// Which way each inference request was routed by the per-model seal gate
+	// (cmd/gateway/sealmodels.go), and why. This is the only signal for the one
+	// failure this feature has: a model gains E2EE support on the network, nobody
+	// adds it to the gateway's list, and its traffic keeps going to the router in
+	// the clear — correct-looking, and silent. Watch `decision="passthrough"`.
+	//
+	// `model` is bounded to the CONFIGURED list plus the literal "other". The raw
+	// value is caller-supplied and unbounded, so labelling by it would let one
+	// client mint a time series per request; "other" keeps the cardinality equal
+	// to the config's size while still answering "is model X being sealed".
+	sealDecisions = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "seal_decisions_total",
+		Help: "Inference requests by seal decision (sealed|passthrough) and reason, " +
+			"with the model bucketed to the configured allowlist or \"other\".",
+	}, []string{"model", "decision", "reason"})
 	verificationFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "response_verification_failures_total",
 		Help: "§8 response-signature verification failures by reason (fetch|signature).",
@@ -351,7 +366,7 @@ func init() {
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		httpRequests, httpDuration, httpInFlight, inFlightLimit, requestsShed,
-		completions, openFailures, verificationFailures,
+		completions, openFailures, verificationFailures, sealDecisions,
 		previewAttempts, previewCalls, previewDuration, previewRetrySuppressed,
 		upstreamAttempts, upstreamDuration, streamTTFF, candidateFallbacks, walkBudgetExhausted,
 		signatureFetchCalls, signatureFetchDuration,
@@ -609,4 +624,11 @@ func hitMiss(hit bool) string {
 		return "hit"
 	}
 	return "miss"
+}
+
+// RecordSealDecision counts one routing decision by the per-model seal gate.
+// The caller is responsible for bucketing `model` to the configured allowlist or
+// "other" — see the metric's declaration for why that bound is not optional.
+func RecordSealDecision(model, decision, reason string) {
+	sealDecisions.WithLabelValues(model, decision, reason).Inc()
 }

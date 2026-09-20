@@ -167,6 +167,15 @@ func main() {
 			"\""+sealPolicyOff+"\" for the global-entry cutover, so pointing the router's hostname "+
 			"here is a deploy and not also a release of default encryption "+
 			"(env ZG_GATEWAY_SEAL_POLICY)")
+	// Which models this deployment seals. See sealModels for why the dial is the
+	// model and deliberately not a percentage.
+	sealModelsCSV := flag.String("seal-models", proxycli.EnvOr("ZG_GATEWAY_SEAL_MODELS", ""),
+		"comma-separated model ids to seal; every other model is proxied to the router in "+
+			"the clear, marked "+openaiproxy.HeaderE2EE+": "+openaiproxy.E2EEValueNone+". EMPTY "+
+			"(the default) seals every model, which is the behaviour before this existed. Only "+
+			"a couple of chat models have E2EE support on the network, so this is the rollout "+
+			"dial: add a model, watch, add the next. Inert while -seal-policy is off "+
+			"(env ZG_GATEWAY_SEAL_MODELS)")
 	// What happens to a sealed surface's NAMESPACE — its subtree, and its own path on
 	// every method but the sealed POST. See the endpoint.All loop in newHandler for
 	// the invariant, and unsealedSubtree* below for what each value means.
@@ -527,6 +536,7 @@ func main() {
 			withEntryPolicy(entryPolicy{
 				openOrigins:     openOrigins,
 				sealPolicy:      *sealPolicy,
+				sealModels:      parseSealModels(*sealModelsCSV),
 				unsealedSubtree: *unsealedSubtree,
 				// The flag says "0 disables" (the conventional spelling for an
 				// operator); entryPolicy says "0 means the default" (so its zero value
@@ -574,7 +584,7 @@ func main() {
 	// and "asked for but silently absent" is precisely the diagnosis an operator would
 	// otherwise have to reconstruct from two other flags.
 	logger.Info("gateway listening", "listen", *f.Listen, "router_url", *f.RouterURL,
-		"seal_policy", *sealPolicy, "unsealed_subtree", *unsealedSubtree,
+		"seal_policy", *sealPolicy, "seal_models", *sealModelsCSV, "unsealed_subtree", *unsealedSubtree,
 		"cors_allowed_origins", origins, "max_inflight", *maxInFlight,
 		"evidence_dir", *evidenceDir, "identity_endpoint", *identityOn,
 		"provider_identity_endpoint", providerIdentities != nil,
@@ -796,6 +806,10 @@ type entryPolicy struct {
 	// deployment, and the ordinary deployment (today, and every deployment before
 	// the cutover) seals. Only an explicit "off" turns sealing off.
 	sealPolicy string
+	// sealModels narrows WHICH models sealPolicy applies to. Its zero value is the
+	// empty set, which means ALL — the same zero-value-is-the-ordinary-deployment
+	// rule as the fields above, and the reason the list can only ever subtract.
+	sealModels sealModels
 	// catalogCacheTTL is how long a public catalog read is reused (catalogcache.go).
 	//
 	// ZERO MEANS defaultCatalogCacheTTL, not "off". That reads backwards for a
@@ -1166,7 +1180,16 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 		mux.Handle(surface, namespace)
 		if c := clients[ep.Path]; c != nil {
 			openaiproxy.Register(sealed, ep, c)
-			mux.Handle("POST "+ep.Path, sealedGate)
+			// Per-model routing sits OUTSIDE the sealed gate and chooses between the
+			// two chains that already exist, so each one keeps its own E2EE marker
+			// and the response says which way this request actually went. With no
+			// model list configured this returns sealedGate unchanged — the ordinary
+			// deployment keeps the exact chain it had, body buffering included.
+			//
+			// The cleartext side is the PLAIN passthrough, never the cached one: a
+			// model routed here still carries a prompt.
+			surfaceGate := policy.sealModels.dispatch(sealedGate, passthrough)
+			mux.Handle("POST "+ep.Path, surfaceGate)
 			// ...and the surface's own TRAILING-SLASH form, which belongs to the sealed
 			// POST and not to the subtree however much it looks like the latter.
 			//
@@ -1185,7 +1208,7 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 			// only `POST <path>`, a 308 would make every caller re-send its body, and a
 			// caller that reached this surface through the router got the request SERVED
 			// rather than refused — which is the behaviour the cutover has to preserve.
-			mux.Handle("POST "+ep.Path+"/{$}", canonicalPath(ep.Path, sealedGate))
+			mux.Handle("POST "+ep.Path+"/{$}", canonicalPath(ep.Path, surfaceGate))
 			continue
 		}
 		// The same envelope every other gateway-origin error uses (WriteError:

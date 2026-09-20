@@ -310,6 +310,27 @@ services:
       # value fails startup rather than guessing — there is no safe direction to
       # guess in when the question is "is this encrypted".
       - "ZG_GATEWAY_SEAL_POLICY=${ZG_GATEWAY_SEAL_POLICY:-always}"
+      # ZG_GATEWAY_SEAL_MODELS narrows WHICH models get sealed. Empty (the default)
+      # seals every model — the behaviour before this existed. A comma-separated list
+      # seals only those and proxies the rest to the router in the clear, marked
+      # X-0G-E2EE: none.
+      #
+      # This is the rollout dial. Only a couple of chat models have E2EE support on
+      # the network, so sealing everything fails the rest (a model with no sealable
+      # provider gets an empty route-preview, which the client treats as TERMINAL),
+      # while sealing nothing gives up encryption for the models that do work.
+      # Add a model, watch, add the next.
+      #
+      # ⚠️ Declared HERE, with an inert default, ON PURPOSE — even though nobody is
+      # using it yet. Adding a key to allowed_envs changes the measured app-compose
+      # and so compose_hash, which is an upgrade, which brings up a fresh CVM with an
+      # EMPTY cert-data volume and re-issues the certificate. Let's Encrypt allows 5
+      # duplicate certificates per hostname per rolling week (README "Verify",
+      # blue-green.md "Let's Encrypt limits"), so keys are cheap to add now and
+      # expensive to add on the day you need them. Declaring it now means every later
+      # adjustment changes only the VALUE — the same reason ACME_STAGING is kept
+      # permanently listed rather than added and removed.
+      - "ZG_GATEWAY_SEAL_MODELS=${ZG_GATEWAY_SEAL_MODELS:-}"
       # ZG_GATEWAY_UNSEALED_SUBTREE decides what a sealed surface's sub-resources and
       # non-sealed methods answer: "refuse" (501, the default — right while a caller
       # who wants the router's own handling can call the router directly) or
