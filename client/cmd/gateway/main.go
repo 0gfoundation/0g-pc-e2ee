@@ -157,6 +157,16 @@ func main() {
 	// — an API open to every origin is a keys-only API, which is the coherent reading
 	// of "*" anyway.
 	//
+	// Whether this gateway seals at all. See sealPolicy* for why this is a switch
+	// rather than a property of the path, and why the default keeps sealing.
+	sealPolicy := flag.String("seal-policy", proxycli.EnvOr("ZG_GATEWAY_SEAL_POLICY", sealPolicyAlways),
+		"whether to seal the inference surfaces: \""+sealPolicyAlways+"\" (default) seals every "+
+			"sealed surface's POST as today; \""+sealPolicyOff+"\" seals nothing and proxies those "+
+			"paths to the router in the clear, marked "+openaiproxy.HeaderE2EE+": "+
+			openaiproxy.E2EEValueNone+", which makes this gateway behave as the plain router. Set "+
+			"\""+sealPolicyOff+"\" for the global-entry cutover, so pointing the router's hostname "+
+			"here is a deploy and not also a release of default encryption "+
+			"(env ZG_GATEWAY_SEAL_POLICY)")
 	// What happens to a sealed surface's NAMESPACE — its subtree, and its own path on
 	// every method but the sealed POST. See the endpoint.All loop in newHandler for
 	// the invariant, and unsealedSubtree* below for what each value means.
@@ -394,6 +404,27 @@ func main() {
 		}
 	}
 
+	// A misspelled -seal-policy decides whether prompts are encrypted at all, so it
+	// fails the deploy rather than guessing. Falling back to "always" would seal a
+	// deployment that meant to be transparent — turning the cutover into a silent
+	// release of default encryption, the one outcome §2 exists to prevent — and
+	// falling back to "off" would silently stop encrypting for everyone already
+	// relying on it. There is no safe guess, only a loud stop.
+	if *sealPolicy != sealPolicyAlways && *sealPolicy != sealPolicyOff {
+		logger.Error("invalid -seal-policy", "value", *sealPolicy,
+			"want", []string{sealPolicyAlways, sealPolicyOff})
+		os.Exit(1)
+	}
+	// -unsealed-subtree only decides what a SEALED surface's namespace answers, so
+	// with sealing off it has nothing to decide — every one of those paths is
+	// proxied. Say so rather than letting an operator read the two settings and
+	// believe the subtree is still being refused.
+	if *sealPolicy == sealPolicyOff && *unsealedSubtree != unsealedSubtreeRefuse {
+		logger.Warn("-unsealed-subtree is ignored while -seal-policy is off: with nothing sealed, "+
+			"every inference path is proxied to the router in the clear",
+			"unsealed_subtree", *unsealedSubtree)
+	}
+
 	// A misspelled -unsealed-subtree decides whether a sealed surface's
 	// sub-resources reach the router in the clear, so it fails the deploy rather
 	// than falling back to either value. Falling back to "refuse" would break the
@@ -495,6 +526,7 @@ func main() {
 			identity, providerIdentities, built.Readiness(), logger,
 			withEntryPolicy(entryPolicy{
 				openOrigins:     openOrigins,
+				sealPolicy:      *sealPolicy,
 				unsealedSubtree: *unsealedSubtree,
 				// The flag says "0 disables" (the conventional spelling for an
 				// operator); entryPolicy says "0 means the default" (so its zero value
@@ -542,6 +574,7 @@ func main() {
 	// and "asked for but silently absent" is precisely the diagnosis an operator would
 	// otherwise have to reconstruct from two other flags.
 	logger.Info("gateway listening", "listen", *f.Listen, "router_url", *f.RouterURL,
+		"seal_policy", *sealPolicy, "unsealed_subtree", *unsealedSubtree,
 		"cors_allowed_origins", origins, "max_inflight", *maxInFlight,
 		"evidence_dir", *evidenceDir, "identity_endpoint", *identityOn,
 		"provider_identity_endpoint", providerIdentities != nil,
@@ -699,6 +732,38 @@ func runHealthCheck(listen string) int {
 // pretend otherwise: those responses are marked X-0G-E2EE: none, which makes "this
 // one was not encrypted" a thing a client can see and refuse, rather than something
 // it has to infer from a path.
+// The two values of -seal-policy. They decide whether this gateway SEALS the
+// inference surfaces at all, which is a different axis from -unsealed-subtree
+// (that one only decides what a sealed surface's NAMESPACE answers).
+//
+//   - always: seal every sealed surface's POST, refuse nothing on that account.
+//     Today's behaviour, and the built-in default, so a deployment that says
+//     nothing keeps sealing rather than silently stopping.
+//   - off: do not seal anything. Every sealed surface — its path, its subtree and
+//     its POST — is proxied to the router in the clear, marked
+//     X-0G-E2EE: none. Behaviourally this gateway becomes the plain router.
+//
+// `off` exists for the global-entry cutover, and it is the whole reason sealing
+// has to stop being decided by the PATH. Pointing router-api.0g.ai at a gateway
+// that seals unconditionally would, in one DNS change, also turn on default
+// encryption for everybody: the provider pool narrows to the sealable ones (a
+// model with none gets an empty route-preview, which the client treats as
+// terminal), web search and file attachments break by construction
+// (SealedPromptInjectionConflict), and every request pays a route-preview plus an
+// HPKE seal. DNS cutover is a deploy; the sealing default is a release. See
+// 0g-router docs/e2ee-global-entry-design.zh.md §2.
+//
+// This is the GLOBAL switch, deliberately built before the per-request and
+// per-model ones. Only a couple of chat models have E2EE support on the network
+// today, so the eventual shape is partial: seal the models that can be sealed,
+// pass the rest through. That needs a capability signal per model and a contract
+// for how a caller asks — neither of which should be invented while the set is
+// "two", and neither of which the cutover waits on.
+const (
+	sealPolicyAlways = "always"
+	sealPolicyOff    = "off"
+)
+
 const (
 	unsealedSubtreeRefuse      = "refuse"
 	unsealedSubtreePassthrough = "passthrough"
@@ -726,6 +791,11 @@ type entryPolicy struct {
 	// startup validation makes unreachable in a real deployment — reads as refuse,
 	// because of the two, refusing is the one that cannot leak.
 	unsealedSubtree string
+	// sealPolicy is one of the two constants above, and the EMPTY string reads as
+	// sealPolicyAlways — the zero value of this struct has to be the ordinary
+	// deployment, and the ordinary deployment (today, and every deployment before
+	// the cutover) seals. Only an explicit "off" turns sealing off.
+	sealPolicy string
 	// catalogCacheTTL is how long a public catalog read is reused (catalogcache.go).
 	//
 	// ZERO MEANS defaultCatalogCacheTTL, not "off". That reads backwards for a
@@ -767,6 +837,15 @@ func (p entryPolicy) newCatalogCache() *catalogCache {
 // refuses — both of which fail as a CORS error rather than as an auth error, which
 // is the hardest shape to diagnose.
 func (p entryPolicy) credentialsAllowed() bool { return !p.openOrigins }
+
+// sealingOn reports whether this deployment seals the inference surfaces.
+//
+// Written as "anything but off" rather than "== always" so that the zero value,
+// and any value startup validation somehow let through, land on SEALING. Of the
+// two, sealing is the one that cannot put a prompt the caller expected to be
+// encrypted onto the cleartext path — the same fail-safe direction
+// unsealedSubtree takes when it reads an unrecognised value as refuse.
+func (p entryPolicy) sealingOn() bool { return p.sealPolicy != sealPolicyOff }
 
 // canonicalPath serves r through h with r.URL.Path replaced by path, for the one
 // case where two spellings name one resource and only one of them is registered
@@ -926,6 +1005,7 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	// layer in both, so it is applied per request rather than stored and replayed —
 	// a cached response that carried its own marker would be a second place the
 	// cleartext claim is made, and the one that could go stale.
+	sealingOn := policy.sealingOn()
 	routerProxy := newRouterProxy(routerTarget, logger)
 	passthrough := openaiproxy.MarkE2EE(openaiproxy.E2EEValueNone, routerProxy)
 	cachedPassthrough := openaiproxy.MarkE2EE(openaiproxy.E2EEValueNone,
@@ -1027,10 +1107,31 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 		surfaces = append(surfaces, ep.Path)
 	}
 	for _, ep := range endpoint.All {
+		surface := ep.Path
+		// Seal policy off: this gateway is a transparent proxy for the whole
+		// surface — path, subtree and POST alike — so none of the machinery below
+		// applies and -unsealed-subtree has nothing left to decide. Registering the
+		// two patterns (exact and subtree) covers every method and every
+		// sub-resource, and the POST lands on them because no more specific
+		// `POST <path>` is registered in this branch.
+		//
+		// The PLAIN passthrough, never the cached one: these carry prompts. The
+		// cache would refuse them anyway (allowlist, GET-only), and that is exactly
+		// why it should not be in the way — the safety of this path must not rest
+		// on a list somewhere else being right.
+		//
+		// Nothing here is a leak the way an unmounted row would be: with sealing
+		// off, cleartext to the router IS the configured behaviour, and every
+		// response says so (X-0G-E2EE: none, applied by the marker around
+		// `passthrough`).
+		if !sealingOn {
+			mux.Handle(surface+"/", passthrough)
+			mux.Handle(surface, passthrough)
+			continue
+		}
 		// Registered for EVERY row, served or not, and before the branch below:
 		// whether this build seals the surface itself has no bearing on whether its
 		// sub-resources may leak.
-		surface := ep.Path
 		// ...but it does bear on what the refusal may CLAIM. In direct-broker mode
 		// this build holds a chat client only, so telling an operator debugging
 		// /v1/messages there that "this gateway seals it at POST /v1/messages" is
