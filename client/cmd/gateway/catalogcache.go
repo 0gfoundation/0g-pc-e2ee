@@ -87,13 +87,17 @@ const (
 	// /v1/models takes repeatable filters, so the key space is effectively
 	// unbounded and an attacker could otherwise mint a fresh entry per request.
 	//
-	// It is a bound on LIVE entries, which takes the sweep in acquire to be true.
-	// Without it the cap counts corpses: entries are otherwise only deleted when
-	// their own key is asked for again, so 256 one-shot keys would fill the map
-	// and disable caching for every new key until the process restarted — for
-	// 256 requests, permanently, on purpose. Reaching the cap for real (that many
-	// distinct keys live inside one TTL) still only stops new keys being STORED;
-	// they are served and shared in flight, and the state ends when they expire.
+	// It bounds the SETTLED map only, and it is a bound on LIVE entries — which
+	// takes the sweep in settle to be true. Without that sweep the cap counts
+	// corpses: entries are otherwise deleted only when their own key is asked for
+	// again, so 256 one-shot keys would fill the map and refuse every new key
+	// until the process restarted.
+	//
+	// Reaching it for real (that many distinct keys live inside one TTL) costs a
+	// future HIT for the unstored key and nothing more. It does NOT cost
+	// single-flight: concurrent readers of one key find each other in the
+	// uncapped inflight map, which is the fix for this cap having silently
+	// switched sharing off.
 	catalogCacheMaxEntries = 256
 	// catalogCacheMaxBody bounds a single cached response. Comfortably above a
 	// real catalog; a response past it is streamed through uncached.
@@ -115,10 +119,35 @@ const (
 // requests every TTL, which is the exact number the router's one shared bucket
 // cannot take. Collapsing concurrent misses onto one upstream request is what
 // makes the global budget survive; the caching is almost the side effect.
+//
+// Two maps, because "can this be found" and "is this worth keeping" are
+// different questions and one map could only answer them together.
+//
+// They were one map, capped, and that made the cap silently switch single-flight
+// off: an entry past the cap was not stored, so no concurrent reader could find
+// it, so each became its own leader. Exactly when key cardinality — and
+// therefore load — is highest, the herd went straight through to the router's
+// one shared budget. Worse, the doc comments asserted the opposite ("served and
+// shared in flight"), so a reader had no reason to look.
+//
+// A full map is also not only an attacker's doing: /v1/models takes repeatable
+// filters, so ordinary query diversity gets there. (Someone trying to HOLD it
+// full would need to sustain >1500 upstream requests a minute and would hit the
+// router's own limit long before this mattered — the realistic exposure is
+// normal traffic, not abuse.)
 type catalogCache struct {
 	ttl time.Duration
 
-	mu      sync.Mutex
+	mu sync.Mutex
+	// inflight holds the entry every leader is currently filling, and is NOT
+	// capped. It does not need to be: an entry lives here only for the duration of
+	// one upstream request, so its size is bounded by concurrency — goroutines and
+	// sockets the server is already holding — rather than by the unbounded key
+	// space the cap exists for. Being uncapped is the whole point: discoverability
+	// is what single-flight is made of, and it must not be the thing rationed.
+	inflight map[string]*catalogEntry
+	// entries holds settled, cacheable responses, and IS capped. Nothing here is
+	// in flight, so the cap only ever costs a future hit, never a shared request.
 	entries map[string]*catalogEntry
 
 	// now is swappable so tests can expire an entry without sleeping.
@@ -148,7 +177,12 @@ func newCatalogCache(ttl time.Duration) *catalogCache {
 	if ttl <= 0 {
 		return nil
 	}
-	return &catalogCache{ttl: ttl, entries: map[string]*catalogEntry{}, now: time.Now}
+	return &catalogCache{
+		ttl:      ttl,
+		inflight: map[string]*catalogEntry{},
+		entries:  map[string]*catalogEntry{},
+		now:      time.Now,
+	}
 }
 
 // wrap returns next with catalog caching in front of it. A nil cache (TTL <= 0,
@@ -224,62 +258,45 @@ func (c *catalogCache) wrap(next http.Handler) http.Handler {
 }
 
 // acquire returns the entry for key and whether the caller is the leader (the
-// one that must go upstream). A fresh, ready entry is returned with leader
-// false and its ready channel already closed, so the caller's select falls
-// straight through.
+// one that must go upstream). A settled, still-fresh entry comes back with
+// leader false and its ready channel already closed, so the caller's select
+// falls straight through.
+//
+// In-flight first, and unconditionally: joining an existing leader is what
+// single-flight IS, so it must not depend on whether that leader's key won a
+// place in the capped map.
 func (c *catalogCache) acquire(key string) (*catalogEntry, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if e, ok := c.inflight[key]; ok {
+		return e, false
+	}
 	if e, ok := c.entries[key]; ok {
-		select {
-		case <-e.ready:
-			// Settled. Serve it while it is fresh; otherwise drop it and lead a refill.
-			if c.now().Before(e.expires) {
-				return e, false
-			}
-			delete(c.entries, key)
-		default:
-			// Still in flight — join it rather than issuing a second identical request.
+		// Everything in entries has settled, so there is no readiness to test —
+		// only freshness. A stale one is dropped here and refilled below.
+		if c.now().Before(e.expires) {
 			return e, false
 		}
+		delete(c.entries, key)
 	}
 	e := &catalogEntry{ready: make(chan struct{})}
-	// Reclaim before deciding the map is full. An entry is otherwise only ever
-	// deleted when its OWN key is asked for again, so a flood of keys asked for
-	// exactly once — `?junk=0` … `?junk=255` — leaves the map permanently full of
-	// corpses and makes the test below false for every new key from then on.
-	//
-	// That is not the graceful degradation this cap was meant to be: it hands back
-	// the single shared per-IP budget this whole cache exists to avoid, it costs
-	// an attacker 256 requests, and it lasts until the process restarts. Sweeping
-	// here makes the cap what it claimed to be — a bound on LIVE entries — and
-	// costs one pass over at most 256 map entries, on the miss path only.
-	if len(c.entries) >= catalogCacheMaxEntries {
-		c.evictExpiredLocked()
-	}
-	// Still full means the cap is doing its job: that many distinct keys really
-	// are live inside one TTL. Then we create the entry (so concurrent readers of
-	// this key still share one upstream request) without publishing it, so it
-	// cannot grow the map. Unlike before, this state now ends on its own.
-	if len(c.entries) < catalogCacheMaxEntries {
-		c.entries[key] = e
-	}
+	c.inflight[key] = e
 	return e, true
 }
 
-// evictExpiredLocked drops every settled entry past its TTL. Entries still in
-// flight are left alone: their leader will either publish an expiry or delete
-// them in settle, and removing one here would only orphan it from the waiters
-// already holding it. Caller holds c.mu.
+// evictExpiredLocked drops every entry past its TTL.
+//
+// Reclaiming at all is what makes catalogCacheMaxEntries a bound on LIVE
+// entries. An entry is otherwise only ever deleted when its own key is asked
+// for again, so a flood of keys asked for exactly once — `?junk=0` …
+// `?junk=255` — would leave the map permanently full of corpses and refuse
+// every new key until the process restarted. It walks only the settled map, so
+// nothing in flight can be pulled out from under its waiters. Caller holds c.mu.
 func (c *catalogCache) evictExpiredLocked() {
 	now := c.now()
 	for k, e := range c.entries {
-		select {
-		case <-e.ready:
-			if !now.Before(e.expires) {
-				delete(c.entries, k)
-			}
-		default:
+		if !now.Before(e.expires) {
+			delete(c.entries, k)
 		}
 	}
 }
@@ -287,7 +304,7 @@ func (c *catalogCache) evictExpiredLocked() {
 // fill runs the upstream request, answers this client, and settles the entry
 // for everyone waiting on it.
 func (c *catalogCache) fill(key string, e *catalogEntry, next http.Handler, w http.ResponseWriter, r *http.Request) {
-	rec := &catalogRecorder{w: w, limit: catalogCacheMaxBody}
+	rec := newCatalogRecorder(w, catalogCacheMaxBody)
 	// completed is set only after next returns NORMALLY and the buffer is out.
 	// It is how a truncated response is told from a whole one, and it has to be a
 	// flag rather than a check afterwards because the failure arrives as a PANIC:
@@ -340,11 +357,25 @@ func (c *catalogCache) settle(key string, e *catalogEntry, rec *catalogRecorder,
 	cacheable := replayable && rec.status == http.StatusOK
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// Release the key we have been holding for waiters. Only this leader can own
+	// it — acquire hands out an inflight key under the same lock and never a
+	// second time — so this removes exactly our own entry and nobody else's.
+	delete(c.inflight, key)
 	if !cacheable {
-		delete(c.entries, key)
 		return
 	}
-	e.expires = c.now().Add(c.ttl)
+	// Publish. Sweeping first is what keeps the cap meaningful; if it is still
+	// full afterwards, that many distinct keys really are live inside one TTL and
+	// this one simply goes unstored. That costs a future HIT and nothing else —
+	// no in-flight sharing depends on it any more, because that lives in the
+	// inflight map.
+	if len(c.entries) >= catalogCacheMaxEntries {
+		c.evictExpiredLocked()
+	}
+	if len(c.entries) < catalogCacheMaxEntries {
+		e.expires = c.now().Add(c.ttl)
+		c.entries[key] = e
+	}
 }
 
 // replayableCatalogHeaders is what a cached response carries forward. It is an
@@ -372,9 +403,21 @@ func snapshotCatalogHeader(h http.Header) http.Header {
 }
 
 func replayCatalog(w http.ResponseWriter, e *catalogEntry) {
+	// Add, never assign. Assigning replaced whatever THIS request's own middleware
+	// had already put on the response, and the one that matters is Vary: the CORS
+	// layer runs before the cache and adds `Vary: Origin` only for an
+	// origin-bearing request. So a leader with no Origin (an SDK, a poller) whose
+	// upstream sent its own Vary — any compressing ingress sends
+	// `Vary: Accept-Encoding`, and StripCORSHeaders deliberately removes only
+	// Access-Control-* — produced a snapshot without Origin; replaying it over a
+	// browser's request then shipped `Access-Control-Allow-Origin: <that origin>`
+	// with `Vary: Accept-Encoding`, which invites any shared cache to hand one
+	// origin's response to another.
 	dst := w.Header()
 	for name, values := range e.header {
-		dst[name] = append([]string(nil), values...)
+		for _, v := range values {
+			dst.Add(name, v)
+		}
 	}
 	w.WriteHeader(e.status)
 	_, _ = w.Write(e.body)
@@ -409,22 +452,49 @@ func acceptsGzip(accept string) bool {
 
 // catalogRecorder buffers a response so it can be both served and cached.
 //
-// Header() hands back the real ResponseWriter's map, so the proxy's own header
-// writes (and ModifyResponse's edits, e.g. StripCORSHeaders) land where they
-// would have without this wrapper; only the status line and body are deferred.
-// If the body outgrows limit we stop buffering, emit what we have, and stream
-// the rest — the response still reaches its client, it just is not cacheable.
+// It owns its OWN header map rather than handing back the real
+// ResponseWriter's, and that separation is what makes the snapshot safe. The
+// writer's map is shared with every middleware wrapped OUTSIDE the cache — CORS
+// has already written `Vary: Origin` and `Access-Control-Allow-Origin` into it
+// before the handler runs — so snapshotting from there captured headers
+// belonging to one request and replayed them to everybody. The allowlist keeps
+// today's blast radius to Vary; the isolation is what stops the next entry
+// added to that list from being a per-request header nobody thought about.
+//
+// The upstream's headers are merged onto the writer's at commit time, with Add,
+// so what the outer layers set survives alongside them. Only the status line
+// and body are deferred; if the body outgrows limit we stop buffering, emit
+// what we have, and stream the rest — the response still reaches its client, it
+// just is not cacheable.
 type catalogRecorder struct {
 	w     http.ResponseWriter
 	limit int
 
+	header   http.Header
 	status   int
 	buf      bytes.Buffer
 	overflow bool
 	flushed  bool
 }
 
-func (rc *catalogRecorder) Header() http.Header { return rc.w.Header() }
+func newCatalogRecorder(w http.ResponseWriter, limit int) *catalogRecorder {
+	return &catalogRecorder{w: w, limit: limit, header: http.Header{}}
+}
+
+func (rc *catalogRecorder) Header() http.Header { return rc.header }
+
+// commitHeader merges the upstream's headers onto the real response. Add rather
+// than assign, for the same reason replayCatalog uses it: the outer middleware
+// has already written to that map and a `Vary` it set must not be replaced by
+// the upstream's.
+func (rc *catalogRecorder) commitHeader() {
+	dst := rc.w.Header()
+	for name, values := range rc.header {
+		for _, v := range values {
+			dst.Add(name, v)
+		}
+	}
+}
 
 // bodyIsWhole cross-checks the buffered body against a Content-Length the
 // upstream declared. Independent of the panic flag on purpose: that flag relies
@@ -463,6 +533,7 @@ func (rc *catalogRecorder) Write(p []byte) (int, error) {
 	if rc.buf.Len()+len(p) > rc.limit {
 		// Too big to hold. Commit what we have and become a pass-through.
 		rc.overflow = true
+		rc.commitHeader()
 		rc.w.WriteHeader(rc.status)
 		rc.flushed = true
 		if _, err := rc.w.Write(rc.buf.Bytes()); err != nil {
@@ -485,6 +556,7 @@ func (rc *catalogRecorder) flush() {
 	if rc.status == 0 {
 		rc.status = http.StatusOK
 	}
+	rc.commitHeader()
 	rc.w.WriteHeader(rc.status)
 	_, _ = rc.w.Write(rc.buf.Bytes())
 }
