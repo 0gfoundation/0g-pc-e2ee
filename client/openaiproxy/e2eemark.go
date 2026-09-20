@@ -22,9 +22,9 @@ import (
 // privacy can refuse anything that is not E2EEValueSealed, and refuse it on the
 // response it actually got rather than on configuration it cannot see.
 //
-// That matters most for what it is not doing yet. The seal policy this design
-// calls for (docs in 0g-router, e2ee-global-entry-design.zh.md §2) has an `auto`
-// mode — seal when a provider can, pass through in cleartext when none can — and
+// That matters most for what it is not doing yet. The seal policy this gateway
+// is growing has an `auto` mode — seal when a provider can, pass through in
+// cleartext when none can — and
 // the objection to `auto` is that silent downgrade turns a privacy guarantee into
 // a coin flip. This header is what makes the downgrade audible.
 //

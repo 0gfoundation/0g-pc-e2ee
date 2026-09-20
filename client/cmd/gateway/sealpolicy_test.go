@@ -19,7 +19,7 @@ import (
 // router-api.0g.ai at a gateway that seals unconditionally would, in one DNS
 // change, narrow the provider pool to sealable endpoints, break web search and
 // file attachments by construction, and add a route-preview plus an HPKE seal to
-// every request (0g-router e2ee-global-entry-design.zh.md §2).
+// every request.
 func TestSealPolicyOffForwardsThePromptInstead(t *testing.T) {
 	rr := &recordingRouter{}
 	router := rr.server(nil)

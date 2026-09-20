@@ -273,7 +273,7 @@ services:
       # whatever a developer happens to be serving on those ports. Keep prod to the
       # first-party origins.
       - "ZG_GATEWAY_ALLOWED_ORIGINS=${ZG_GATEWAY_ALLOWED_ORIGINS:-https://0g.ai,https://*.0g.ai}"
-      # The global-entry knob (design: 0g-router, e2ee-global-entry-design.zh.md §3).
+      # The global-entry knob.
       # Referenced with its OFF default rather than left out, for the same reason
       # ACME_STAGING is referenced: a variable this file does not mention can never
       # reach the container, so leaving it out would mean the cutover needs a compose
@@ -303,13 +303,46 @@ services:
       # pool narrows to the sealable endpoints, web search and file attachments break
       # by construction, and every request pays a route-preview plus an HPKE seal.
       # DNS cutover is a deploy; the sealing default is a release, and they get
-      # separate decisions. See 0g-router docs/e2ee-global-entry-design.zh.md §2.
+      # separate decisions.
       #
       # The default stays "always" so that nothing changes for the deployments
       # running today: a gateway that says nothing keeps sealing. An unrecognised
       # value fails startup rather than guessing — there is no safe direction to
       # guess in when the question is "is this encrypted".
       - "ZG_GATEWAY_SEAL_POLICY=${ZG_GATEWAY_SEAL_POLICY:-always}"
+      # ZG_GATEWAY_SEAL_MODELS narrows WHICH models get sealed. Empty (the default)
+      # seals every model — the behaviour before this existed. A comma-separated list
+      # seals only those and proxies the rest to the router in the clear, marked
+      # X-0G-E2EE: none.
+      #
+      # This is the rollout dial. Only a couple of chat models have E2EE support on
+      # the network, so sealing everything fails the rest (a model with no sealable
+      # provider gets an empty route-preview, which the client treats as TERMINAL),
+      # while sealing nothing gives up encryption for the models that do work.
+      # Add a model, watch, add the next.
+      #
+      # ⚠️ Declared HERE, with an inert default, ON PURPOSE — even though nobody is
+      # using it yet. Adding a key to allowed_envs changes the measured app-compose
+      # and so compose_hash, which is an upgrade, which brings up a fresh CVM with an
+      # EMPTY cert-data volume and re-issues the certificate. Let's Encrypt allows 5
+      # duplicate certificates per hostname per rolling week (README "Verify",
+      # blue-green.md "Let's Encrypt limits"), so keys are cheap to add now and
+      # expensive to add on the day you need them. Declaring it now means every later
+      # adjustment changes only the VALUE — the same reason ACME_STAGING is kept
+      # permanently listed rather than added and removed.
+      #
+      # Currently: 0gm-1.0-35b-a3b, the 0G in-house model. ⚠️ Naming ANY model here
+      # means every OTHER model stops being sealed — the list is exhaustive, not
+      # additive. That is the intended shape (sealing a model with no sealable
+      # provider fails it outright), but it does mean a second E2EE-capable model
+      # has to be added here explicitly before it is sealed again.
+      #
+      # Its only registry alias is the on-chain spelling 0GM-1.0-35B-A3B, a pure
+      # case variant, and matching is case-insensitive — so the one entry covers
+      # both. Matching is also EXACT, so the separate canonical model
+      # 0gm-1.0-35b-a3b-sia is deliberately NOT included; add it by name if it
+      # gains E2EE support.
+      - "ZG_GATEWAY_SEAL_MODELS=${ZG_GATEWAY_SEAL_MODELS:-0gm-1.0-35b-a3b}"
       # ZG_GATEWAY_UNSEALED_SUBTREE decides what a sealed surface's sub-resources and
       # non-sealed methods answer: "refuse" (501, the default — right while a caller
       # who wants the router's own handling can call the router directly) or

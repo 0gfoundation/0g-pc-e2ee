@@ -15,8 +15,8 @@ const cookieCredentialName = "jwt"
 // Authorization bearer header, so a browser that authenticates by cookie reaches
 // the sealed path instead of being rejected at the front door.
 //
-// It exists for the global-entry topology (the gateway fronting the router at the
-// router's own hostname — docs in 0g-router, e2ee-global-entry-design.zh.md §3.2).
+// It exists for the global-entry topology: the gateway fronting the router at the
+// router's own hostname.
 // Until then a cookie-authenticated caller had a working alternative: call the
 // router directly. Once the gateway IS the router's hostname there is no
 // "directly", and the first-party web app's chat requests — which carry no

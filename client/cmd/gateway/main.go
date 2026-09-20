@@ -167,6 +167,15 @@ func main() {
 			"\""+sealPolicyOff+"\" for the global-entry cutover, so pointing the router's hostname "+
 			"here is a deploy and not also a release of default encryption "+
 			"(env ZG_GATEWAY_SEAL_POLICY)")
+	// Which models this deployment seals. See sealModels for why the dial is the
+	// model and deliberately not a percentage.
+	sealModelsCSV := flag.String("seal-models", proxycli.EnvOr("ZG_GATEWAY_SEAL_MODELS", ""),
+		"comma-separated model ids to seal; every other model is proxied to the router in "+
+			"the clear, marked "+openaiproxy.HeaderE2EE+": "+openaiproxy.E2EEValueNone+". EMPTY "+
+			"(the default) seals every model, which is the behaviour before this existed. Only "+
+			"a couple of chat models have E2EE support on the network, so this is the rollout "+
+			"dial: add a model, watch, add the next. Inert while -seal-policy is off "+
+			"(env ZG_GATEWAY_SEAL_MODELS)")
 	// What happens to a sealed surface's NAMESPACE — its subtree, and its own path on
 	// every method but the sealed POST. See the endpoint.All loop in newHandler for
 	// the invariant, and unsealedSubtree* below for what each value means.
@@ -527,6 +536,7 @@ func main() {
 			withEntryPolicy(entryPolicy{
 				openOrigins:     openOrigins,
 				sealPolicy:      *sealPolicy,
+				sealModels:      parseSealModels(*sealModelsCSV),
 				unsealedSubtree: *unsealedSubtree,
 				// The flag says "0 disables" (the conventional spelling for an
 				// operator); entryPolicy says "0 means the default" (so its zero value
@@ -574,7 +584,7 @@ func main() {
 	// and "asked for but silently absent" is precisely the diagnosis an operator would
 	// otherwise have to reconstruct from two other flags.
 	logger.Info("gateway listening", "listen", *f.Listen, "router_url", *f.RouterURL,
-		"seal_policy", *sealPolicy, "unsealed_subtree", *unsealedSubtree,
+		"seal_policy", *sealPolicy, "seal_models", *sealModelsCSV, "unsealed_subtree", *unsealedSubtree,
 		"cors_allowed_origins", origins, "max_inflight", *maxInFlight,
 		"evidence_dir", *evidenceDir, "identity_endpoint", *identityOn,
 		"provider_identity_endpoint", providerIdentities != nil,
@@ -750,8 +760,7 @@ func runHealthCheck(listen string) int {
 // model with none gets an empty route-preview, which the client treats as
 // terminal), web search and file attachments break by construction
 // (SealedPromptInjectionConflict), and every request pays a route-preview plus an
-// HPKE seal. DNS cutover is a deploy; the sealing default is a release. See
-// 0g-router docs/e2ee-global-entry-design.zh.md §2.
+// HPKE seal. DNS cutover is a deploy; the sealing default is a release.
 //
 // This is the GLOBAL switch, deliberately built before the per-request and
 // per-model ones. Only a couple of chat models have E2EE support on the network
@@ -777,8 +786,6 @@ const (
 // option (every test that is about something else, and any future call site) gets
 // the configuration a real gateway runs, not a stripped-down one. Getting that
 // backwards is how a test ends up asserting against a shape nothing deploys.
-//
-// Design: 0g-router, e2ee-global-entry-design.zh.md §3.
 type entryPolicy struct {
 	// openOrigins reports that the allowlist contains "*", i.e. every browser origin
 	// is allowed. It turns AMBIENT CREDENTIALS OFF — no cookie admission
@@ -796,6 +803,10 @@ type entryPolicy struct {
 	// deployment, and the ordinary deployment (today, and every deployment before
 	// the cutover) seals. Only an explicit "off" turns sealing off.
 	sealPolicy string
+	// sealModels narrows WHICH models sealPolicy applies to. Its zero value is the
+	// empty set, which means ALL — the same zero-value-is-the-ordinary-deployment
+	// rule as the fields above, and the reason the list can only ever subtract.
+	sealModels sealModels
 	// catalogCacheTTL is how long a public catalog read is reused (catalogcache.go).
 	//
 	// ZERO MEANS defaultCatalogCacheTTL, not "off". That reads backwards for a
@@ -1047,8 +1058,28 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	// recognise into one it does. It is mounted for every deployment except one whose
 	// allowlist is "*", where the origin gate it depends on would admit everything.
 	sealed := http.NewServeMux()
+	// Per-model routing goes INSIDE the credential gate and the in-flight cap, and
+	// the ordering is the point rather than a detail.
+	//
+	// The dispatcher has to read the body to find the model. Mounted outside, that
+	// read happens before either guard, so an unauthenticated caller could make
+	// this process buffer a 9 MiB body and only then receive its 401 — which
+	// contradicts LimitInFlight's own contract ("rejected on shape alone … must
+	// not consume a slot") and invalidates computeMaxInFlight, whose ceiling is
+	// derived from how many requests can be buffering at once. These servers set
+	// no ReadTimeout (only ReadHeaderTimeout) and no global MaxBytesHandler, so a
+	// body fed in slowly could hold that buffer indefinitely while holding no slot
+	// and carrying no credential.
+	//
+	// Both branches sit inside the cap, cleartext included: that branch buffers
+	// exactly as much as the sealed one, so leaving it outside would put the same
+	// memory beyond the ceiling by another door.
+	//
+	// Built ONCE here rather than per row — it does not depend on the endpoint —
+	// and it returns the mux unchanged when no model list is configured, so the
+	// ordinary deployment keeps the exact chain it had.
 	var sealedGate http.Handler = openaiproxy.RequireInferenceCredential(
-		openaiproxy.LimitInFlight(maxInFlight, sealed))
+		openaiproxy.LimitInFlight(maxInFlight, policy.sealModels.dispatch(sealed, passthrough)))
 	if policy.credentialsAllowed() {
 		sealedGate = openaiproxy.AcceptCookieCredential(allowedOrigins, sealedGate)
 	}

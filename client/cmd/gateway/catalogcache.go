@@ -34,8 +34,6 @@ import (
 // It is also worth having on its own: today every browser page load crosses
 // this gateway and hits the router for a catalog that changed in neither.
 //
-// See 0g-router docs/e2ee-global-entry-design.zh.md §3.6.
-//
 // # What it must never touch
 //
 // Only the paths in cacheableCatalogPaths, only GET, only 200. The allowlist is

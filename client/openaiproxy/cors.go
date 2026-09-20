@@ -65,9 +65,8 @@ const corsAllowMethods = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
 //   - X-0G-Provider-Identity is the second half of the provider pin (the router
 //     keys a provider row by address AND provider_identity), so an address listed
 //     without it advertises a pin a browser cannot fully express. It was missing
-//     here for the same reason it was missing from the router's own preflight list
-//     (0g-router#772): the header was added to the pin and not to the lists that
-//     describe it.
+//     here for the same reason it was missing from the router's own preflight
+//     list: the header was added to the pin and not to the lists that describe it.
 //
 // This list is the BASELINE advertisement, not the limit: allowHeadersFor also
 // grants whatever else a preflight asks for (see there for why that is safe, and
