@@ -292,6 +292,24 @@ services:
       # router's hostname, and the setting could only ever be forgotten in the
       # direction that breaks the whole first-party app with a CORS error rather than
       # a 401.
+      # ZG_GATEWAY_SEAL_POLICY decides whether this gateway SEALS at all.
+      # "always" (the default, and today's behaviour) seals every sealed surface's
+      # POST; "off" seals nothing and proxies those paths to the router in the clear,
+      # marked X-0G-E2EE: none — behaviourally the plain router.
+      #
+      # ⚠️ The global-entry cutover sets this to "off", and that is the whole point:
+      # pointing router-api.0g.ai at a gateway that seals unconditionally would, in
+      # one DNS change, also turn default encryption on for everybody — the provider
+      # pool narrows to the sealable endpoints, web search and file attachments break
+      # by construction, and every request pays a route-preview plus an HPKE seal.
+      # DNS cutover is a deploy; the sealing default is a release, and they get
+      # separate decisions. See 0g-router docs/e2ee-global-entry-design.zh.md §2.
+      #
+      # The default stays "always" so that nothing changes for the deployments
+      # running today: a gateway that says nothing keeps sealing. An unrecognised
+      # value fails startup rather than guessing — there is no safe direction to
+      # guess in when the question is "is this encrypted".
+      - "ZG_GATEWAY_SEAL_POLICY=${ZG_GATEWAY_SEAL_POLICY:-always}"
       # ZG_GATEWAY_UNSEALED_SUBTREE decides what a sealed surface's sub-resources and
       # non-sealed methods answer: "refuse" (501, the default — right while a caller
       # who wants the router's own handling can call the router directly) or
@@ -299,6 +317,9 @@ services:
       # IS the only entry, where a 501 removes the feature rather than redirecting).
       # An unrecognised value fails startup instead of guessing: one of the two answers
       # forwards content in the clear, and that is not a thing to infer from a typo.
+      # Inert while ZG_GATEWAY_SEAL_POLICY=off — with nothing sealed there is no
+      # sealed namespace left to decide about, and the gateway logs a warning if the
+      # two are set in a combination that reads as if there were.
       - "ZG_GATEWAY_UNSEALED_SUBTREE=${ZG_GATEWAY_UNSEALED_SUBTREE:-refuse}"
       # There is deliberately NO variable for the catalog cache TTL
       # (-catalog-cache-ttl, default 10s), even though the flag exists for local runs
