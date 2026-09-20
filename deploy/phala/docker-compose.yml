@@ -247,7 +247,13 @@ services:
       # measured text is the ${…} form, so staging and prod share app_id: attestation
       # does not distinguish which router was used, which is acceptable only because
       # the router is untrusted by construction.
-      - "ZG_GATEWAY_ROUTER_URL=${ZG_GATEWAY_ROUTER_URL:-https://router-api.0g.ai}"
+      #
+      # ⚠️ This is the router's ORIGIN name, and it must never be router-api.0g.ai.
+      # That name is the PUBLIC ENTRY, i.e. this gateway: pointed there, every
+      # passthrough request and every route-preview re-enters our own front door and
+      # recurses. The router is reachable directly at the name below, which is what
+      # this must stay — including in whatever you inject for staging.
+      - "ZG_GATEWAY_ROUTER_URL=${ZG_GATEWAY_ROUTER_URL:-https://router-api-cloud.0g.ai}"
       # Browser origin allowlist (CORS): the 0G first-party app origins, and
       # deliberately not every origin the router accepts. An empty value turns browser
       # access off entirely; SDK and server-side callers send no Origin header and are

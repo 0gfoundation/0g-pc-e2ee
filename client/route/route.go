@@ -96,7 +96,41 @@ const (
 	// DefaultRouterURL is the 0G router's base URL. The route-preview and
 	// chat-completions paths are appended to it; callers configure the router
 	// domain, not the full endpoint.
+	//
+	// This is the PUBLIC ENTRY, which is what a client outside the deployment
+	// should talk to — after the global-entry cutover that name resolves to the
+	// gateway, which seals what it can and passes the rest through, so a client
+	// pointed here keeps working and gets E2EE for free. The sidecar uses it.
+	//
+	// The gateway itself must NOT: see DefaultRouterCloudURL.
 	DefaultRouterURL = "https://router-api.0g.ai"
+	// DefaultRouterCloudURL is the router's own hostname, bypassing the public
+	// entry — the gateway's upstream.
+	//
+	// "Cloud" because that is what the hostname says, and the hostname was named
+	// for where the router runs (a cloud provider) as opposed to the gateway's
+	// enclave. It is deliberately not "origin", the usual word for what sits
+	// behind an entry: in this codebase "origin" means a CORS origin in ~80
+	// places, several of them in the same files that consume this constant
+	// (openaiproxy.originAllowed, the allowlist, the Origin header).
+	//
+	// The two exist because after the global-entry cutover they stop being the
+	// same machine. `router-api.0g.ai` is the gateway; the router moved to this
+	// name and is reachable at it directly. A gateway configured with
+	// DefaultRouterURL would therefore proxy to ITSELF: every passthrough request
+	// and every route-preview would re-enter the front door, recurse until
+	// something runs out (sockets, the in-flight limiter, the client's patience),
+	// and do it under the deployment's own TLS so nothing in between reports a
+	// loop. That is the failure this constant exists to make unreachable by
+	// default, so do not "simplify" the two back into one.
+	//
+	// Nothing verifies this name at startup: the gateway cannot tell "the router"
+	// from "me" by looking at a URL, and teaching it to would mean reading its own
+	// served hostname (DOMAIN), i.e. a new entry in allowed_envs on every
+	// blue/green side for a check that only catches a misconfiguration this
+	// default already avoids. Verify it the way the deploy does — that the name
+	// serves the ROUTER's answer, not the gateway's (deploy/phala/README.md).
+	DefaultRouterCloudURL = "https://router-api-cloud.0g.ai"
 	// previewPath is the router's route-preview endpoint, appended to the router
 	// base URL. It is owned here because this package owns that API contract.
 	previewPath = "/v1/routing/preview"

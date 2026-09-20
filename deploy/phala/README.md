@@ -965,13 +965,27 @@ and warmer liveness).
   [`cloud-gateway.md`](../../docs/design/cloud-gateway.md) §6.
 - The gateway holds no pinned provider key: it routes per request and derives
   each provider's enc key + signer from the broker. The router base URL is
-  `${ZG_GATEWAY_ROUTER_URL:-https://router-api.0g.ai}` — unset it (production) to
+  `${ZG_GATEWAY_ROUTER_URL:-https://router-api-cloud.0g.ai}` — unset it (production) to
   use the 0G production router, or inject `ZG_GATEWAY_ROUTER_URL` via the CVM's
   **encrypted environment** (staging) to point at a different router. The
   variable must be listed in the app's `allowed_envs` for the override to reach
   the container. Since the *measured* text is the `${…}` form, staging and
   production share `app_id`; that is safe only because the router is untrusted by
   construction (see the provider-verification note below).
+
+  > ⚠️ **Never point this at `router-api.0g.ai`.** That is the *public entry* —
+  > after the global-entry cutover it resolves to this gateway, so the gateway
+  > would proxy to itself: every passthrough request and every route-preview
+  > re-enters the front door and recurses until sockets or the in-flight limiter
+  > run out. The failure is invisible from outside (it all happens inside the
+  > deployment's own TLS) and it applies to the staging override too, not just the
+  > default. `router-api-cloud.0g.ai` is the router's own name, which reaches it
+  > directly.
+  >
+  > Verify the name before a cutover the same way a client would: it must answer
+  > with the **router's** `GET /v1/health`, not the gateway's. If it answers the
+  > gateway's, the DNS record or the Cloud Run domain mapping is pointing at the
+  > wrong service and the loop above is exactly what you will get.
 - **Browser origins (CORS).** The gateway answers cross-origin browser calls only
   from the origins in `ZG_GATEWAY_ALLOWED_ORIGINS`, whose compose default is the 0G
   first-party app origins — a page allowed to call the router directly can point its

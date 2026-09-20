@@ -212,11 +212,18 @@ const defaultCollateralTTL = time.Hour
 // _COLLATERAL_TTL.
 // defaultListen is the built-in listen address used when neither the flag nor
 // <envPrefix>_LISTEN is set.
-func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen string) *Flags {
+//
+// defaultRouterURL is the same for -router-url, and it is a parameter for the
+// same reason defaultListen is: the two binaries need different values and
+// neither can be derived from envPrefix. The sidecar wants the public entry
+// (route.DefaultRouterURL); the gateway IS the public entry, so it wants the
+// router's own name (route.DefaultRouterCloudURL) and would otherwise
+// proxy to itself. Both constants document the split.
+func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen, defaultRouterURL string) *Flags {
 	env := func(name string) string { return envPrefix + "_" + name }
 	return &Flags{
 		Listen:    fs.String("listen", envOr(env("LISTEN"), defaultListen), fmt.Sprintf("address to listen on (env %s)", env("LISTEN"))),
-		RouterURL: fs.String("router-url", envOr(env("ROUTER_URL"), route.DefaultRouterURL), fmt.Sprintf("0G router base URL/domain (the route-preview path is appended) (env %s)", env("ROUTER_URL"))),
+		RouterURL: fs.String("router-url", envOr(env("ROUTER_URL"), defaultRouterURL), fmt.Sprintf("0G router base URL/domain (the route-preview path is appended) (env %s)", env("ROUTER_URL"))),
 		providerURL: fs.String("provider-url", envOr(env("PROVIDER_URL"), ""),
 			fmt.Sprintf("direct-broker mode: seal each request straight to this provider endpoint, skipping the router's route-preview (for an environment with a broker but no centralized router, e.g. dev); the provider's enc key + signer are fetched from its broker's /v1/e2ee/pubkey. Empty keeps the default router mode (env %s)", env("PROVIDER_URL"))),
 		attestOn: fs.Bool("attest", envBool(env("ATTEST"), false),

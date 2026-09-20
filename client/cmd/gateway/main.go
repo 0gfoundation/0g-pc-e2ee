@@ -86,8 +86,18 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/client/route"
 )
 
+// defaultRouterURL is what -router-url falls back to: the router's OWN name,
+// NOT the public entry.
+//
+// This gateway serves the public entry, so pointing it at that name would make
+// every passthrough request and every route-preview re-enter its own front door
+// and recurse. It is a named constant rather than the call-site argument so a
+// test can assert the binary's default without running it — see
+// TestGatewayDefaultsToTheRouterCloudNameNotThePublicEntry.
+const defaultRouterURL = route.DefaultRouterCloudURL
+
 func main() {
-	f := proxycli.RegisterFlags(flag.CommandLine, "ZG_GATEWAY", ":8443")
+	f := proxycli.RegisterFlags(flag.CommandLine, "ZG_GATEWAY", ":8443", defaultRouterURL)
 	// Prometheus /metrics is a gateway-only concern (the sidecar shares the
 	// instrumentation but never exposes it), so its listen address is registered
 	// here rather than in the shared proxycli flags. Empty (the default) disables
