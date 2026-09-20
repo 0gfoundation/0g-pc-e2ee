@@ -249,12 +249,24 @@ services:
       # the router is untrusted by construction.
       - "ZG_GATEWAY_ROUTER_URL=${ZG_GATEWAY_ROUTER_URL:-https://router-api.0g.ai}"
       # Browser origin allowlist (CORS): the 0G first-party app origins, and
-      # deliberately not every origin the router accepts. Keep in sync with
-      # openaiproxy.DefaultAllowedOriginsCSV. An empty value turns browser access off
-      # entirely; SDK and server-side callers send no Origin header and are
-      # unaffected. The localhost entries are development conveniences — drop them via
-      # the override on any deployment that does not need them.
-      - "ZG_GATEWAY_ALLOWED_ORIGINS=${ZG_GATEWAY_ALLOWED_ORIGINS:-https://0g.ai,https://*.0g.ai,http://localhost:3000,http://localhost:5173}"
+      # deliberately not every origin the router accepts. An empty value turns browser
+      # access off entirely; SDK and server-side callers send no Origin header and are
+      # unaffected.
+      #
+      # This list is also what decides whether AMBIENT CREDENTIALS are on: a named
+      # allowlist (this) admits the router's `jwt` cookie and answers
+      # Access-Control-Allow-Credentials, while a value of "*" turns both off. So each
+      # entry now means "this page may act as a logged-in visitor", not merely "this
+      # page may call us with its own key" — the router issues that cookie with
+      # SameSite=None, so the browser attaches it cross-site and this list is the only
+      # thing standing in the way.
+      #
+      # It therefore deliberately does NOT mirror openaiproxy.DefaultAllowedOriginsCSV
+      # any more: the two localhost entries in that constant are a convenience for a
+      # local `go run`, and on a public deployment they would extend the session to
+      # whatever a developer happens to be serving on those ports. Keep prod to the
+      # first-party origins.
+      - "ZG_GATEWAY_ALLOWED_ORIGINS=${ZG_GATEWAY_ALLOWED_ORIGINS:-https://0g.ai,https://*.0g.ai}"
       # The global-entry knob (design: 0g-router, e2ee-global-entry-design.zh.md §3).
       # Referenced with its OFF default rather than left out, for the same reason
       # ACME_STAGING is referenced: a variable this file does not mention can never

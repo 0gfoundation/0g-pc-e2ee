@@ -126,17 +126,24 @@ const composePath = "../../../deploy/phala/docker-compose.yml"
 var composeAllowedOrigins = regexp.MustCompile(
 	`ZG_GATEWAY_ALLOWED_ORIGINS=\$\{ZG_GATEWAY_ALLOWED_ORIGINS:-([^}]*)\}`)
 
-// TestComposeAllowedOriginsMatchesDefault enforces the "keep in sync" note in
-// deploy/phala/docker-compose.yml. The compose spells the allowlist out instead of
-// inheriting it, because that block is measured into compose_hash and app_id should
-// commit to which web origins may drive sealed inference through the enclave. That
-// is only sound while the two agree: a change to DefaultAllowedOriginsCSV alone
-// would leave the deployed enclave on the old list with nothing to say so, and the
-// note asking a human to remember is not a mechanism.
+// TestComposeAllowedOriginsAreASubsetOfTheDefault keeps the deployed allowlist from
+// drifting WIDER than the shipped constant. The compose spells the allowlist out
+// instead of inheriting it, because that block is measured into compose_hash and
+// app_id should commit to which web origins may drive sealed inference through the
+// enclave — and, since a named allowlist is also what admits the router's session
+// cookie, to which origins may act as a logged-in visitor.
+//
+// It is a SUBSET check rather than equality, and the asymmetry is the point. An
+// origin in the compose but not in the constant is drift in the dangerous direction:
+// the deployed enclave would grant something the code never documents, silently.
+// Narrower is a legitimate deployment choice and deploy/phala makes it — the
+// constant's two localhost entries are a convenience for a local `go run`, and on a
+// public deployment they would extend the session to whatever a developer serves on
+// those ports.
 //
 // Deliberately compared against the shipped constant, not corsTestOrigins — this is
 // the one test whose subject IS the default list.
-func TestComposeAllowedOriginsMatchesDefault(t *testing.T) {
+func TestComposeAllowedOriginsAreASubsetOfTheDefault(t *testing.T) {
 	compose, err := os.ReadFile(composePath)
 	if err != nil {
 		t.Fatalf("read %s: %v", composePath, err)
@@ -146,9 +153,21 @@ func TestComposeAllowedOriginsMatchesDefault(t *testing.T) {
 		t.Fatalf("no ZG_GATEWAY_ALLOWED_ORIGINS=${...:-<default>} entry in %s; if the entry was "+
 			"reshaped deliberately, update this test rather than dropping it", composePath)
 	}
-	if got := string(m[1]); got != openaiproxy.DefaultAllowedOriginsCSV {
-		t.Errorf("compose allowlist and the built-in default disagree:\n compose: %q\n default: %q\n"+
-			"update whichever is stale — the deployed enclave serves the compose value", got,
-			openaiproxy.DefaultAllowedOriginsCSV)
+	known := make(map[string]bool)
+	for _, o := range openaiproxy.ParseOrigins(openaiproxy.DefaultAllowedOriginsCSV) {
+		known[o] = true
+	}
+	deployed := openaiproxy.ParseOrigins(string(m[1]))
+	if len(deployed) == 0 {
+		t.Fatalf("the compose allowlist is empty, which turns browser access off entirely; if that "+
+			"is deliberate, say so here rather than leaving it to look like a typo (%q)", m[1])
+	}
+	for _, o := range deployed {
+		if !known[o] {
+			t.Errorf("compose allows origin %q, which is not in DefaultAllowedOriginsCSV (%q).\n"+
+				"The deployed enclave would grant it ambient credentials with nothing in the code "+
+				"to say so — add it to the constant if it is meant, or drop it from the compose",
+				o, openaiproxy.DefaultAllowedOriginsCSV)
+		}
 	}
 }

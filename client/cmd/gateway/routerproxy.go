@@ -21,14 +21,28 @@ import (
 // instead of getting a 404 from the mux.
 //
 // SECURITY: this is a CLEARTEXT passthrough — it carries no E2EE seal, so the
-// router sees whatever transits it in the clear. That is fine for metadata and
-// discovery, which carry no prompt, and is the ONLY thing this path is for. If a
-// content-bearing endpoint that must stay end-to-end encrypted is later added to
-// the router (e.g. /v1/completions or /v1/embeddings, which carry the
-// prompt/input), it MUST get its own seal path in openaiproxy — routing it
-// through this proxy would hand that content to the untrusted router in the
-// clear, defeating the gateway's whole purpose. Keep the catch-all for metadata;
-// never let it become the path for sealed content.
+// router sees whatever transits it in the clear. Every response it produces is
+// marked X-0G-E2EE: none (openaiproxy.MarkE2EE, applied where this handler is
+// mounted), so "the router read this one" is something a caller can see rather
+// than infer.
+//
+// What may travel it is one of two things, and the difference is whether anybody
+// DECIDED:
+//
+//   - Metadata and discovery, always. The model catalog and the provider list
+//     carry no prompt, and this path exists for them.
+//   - A sealed surface's sub-resources, only under -unsealed-subtree=passthrough,
+//     and only because the global-entry topology leaves a caller no other door
+//     (see the endpoint.All loop in main.go). That content IS read by the router;
+//     the marker is what keeps it disclosed rather than silent.
+//
+// Everything else must not. If a content-bearing endpoint that must stay
+// end-to-end encrypted is later added to the router (e.g. /v1/completions or
+// /v1/embeddings, which carry the prompt/input), it MUST get its own row in
+// endpoint.All and its own seal path — routing it through this proxy would hand
+// that content to the untrusted router in the clear, defeating the gateway's whole
+// purpose. A sealed surface's own POST, in either spelling (with or without a
+// trailing slash), never reaches here: main.go claims both, and a test pins it.
 func newRouterProxy(target *url.URL, logger *slog.Logger) http.Handler {
 	return &httputil.ReverseProxy{
 		// Every request this proxy makes goes to the one router host, so it needs the

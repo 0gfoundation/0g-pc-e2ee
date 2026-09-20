@@ -166,8 +166,11 @@ func TestUnsealedSubtreePassthroughStillSealsThePost(t *testing.T) {
 	}
 }
 
-// Every response declares whether it was end-to-end encrypted — on the sealed
-// path and on the cleartext catch-all alike.
+// Every response from a CONTENT-CARRYING path declares whether it was end-to-end
+// encrypted — on the sealed path and on the cleartext catch-all alike.
+//
+// Operational and evidence routes are deliberately outside that set (see
+// openaiproxy.HeaderE2EE): they have no content to make a claim about.
 //
 // Stamping both is what makes the header a check rather than a hint. If only
 // cleartext responses carried it, absence would be ambiguous between "sealed" and
@@ -178,7 +181,7 @@ func TestUnsealedSubtreePassthroughStillSealsThePost(t *testing.T) {
 // still an answer from the sealed path, and the marker has to survive the
 // front-door refusals (gate 401/403, limiter 503) or a client keying on it reads
 // every error as cleartext.
-func TestEveryResponseDeclaresItsE2EEStatus(t *testing.T) {
+func TestServedPathsDeclareTheirE2EEStatus(t *testing.T) {
 	rr := &recordingRouter{}
 	router := rr.server(nil)
 	defer router.Close()
@@ -382,6 +385,68 @@ func TestCookieCredentialWiring(t *testing.T) {
 			}
 			if !found {
 				t.Errorf("the router never saw a route-preview call; it saw %v", paths)
+			}
+		})
+	}
+}
+
+// The surface's own TRAILING-SLASH form is sealed, not proxied — under both values
+// of -unsealed-subtree.
+//
+// This is the same invariant as TestUnsealedSubtreePassthroughStillSealsThePost,
+// reached by the one spelling that slipped past it. To Go's ServeMux,
+// `POST /v1/chat/completions/` matches the SUBTREE pattern, not `POST
+// /v1/chat/completions` — so under `passthrough` the subtree handler was the
+// reverse proxy, and the whole prompt went to the router in the clear with a 200.
+// One character, and the caller could not tell: the router's gin 307s the retry
+// onto the canonical path, so the request works and nothing looks wrong.
+//
+// The assertion is on what the ROUTER RECEIVED, for the reason the sibling test
+// gives: a status code cannot distinguish "sealed" from "already forwarded".
+func TestSealedSurfaceTrailingSlashIsNeverProxied(t *testing.T) {
+	for _, mode := range []string{unsealedSubtreeRefuse, unsealedSubtreePassthrough} {
+		t.Run(mode, func(t *testing.T) {
+			rr := &recordingRouter{}
+			router := rr.server(nil)
+			defer router.Close()
+
+			// The sealed client points at a DIFFERENT (dead) router, so anything the
+			// recording router sees arrived through the passthrough and nothing else.
+			gw := httptest.NewServer(newHandler(allSealedClients(), mustURL(t, router.URL), testOrigins(), "", "",
+				noInFlightCap, nil, nil, nil, discardLogger(),
+				withEntryPolicy(entryPolicy{unsealedSubtree: mode})))
+			defer gw.Close()
+
+			const secret = "my secret prompt"
+			for _, ep := range endpoint.All {
+				req, _ := http.NewRequest(http.MethodPost, gw.URL+ep.Path+"/", strings.NewReader(
+					`{"model":"m","prompt":"`+secret+`","messages":[{"role":"user","content":"`+secret+`"}]}`))
+				req.Header.Set("Content-Type", "application/json")
+				req.Header.Set("Authorization", "Bearer sk-user-key")
+				// Do not follow redirects: the point is what THIS gateway answered.
+				client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+					return http.ErrUseLastResponse
+				}}
+				resp, err := client.Do(req)
+				if err != nil {
+					t.Fatalf("post %s/: %v", ep.Path, err)
+				}
+				_ = resp.Body.Close()
+				if got := resp.Header.Get(openaiproxy.HeaderE2EE); got != openaiproxy.E2EEValueSealed {
+					t.Errorf("POST %s/: %s = %q, want %q — the trailing-slash form belongs to the "+
+						"sealed surface, not to its subtree", ep.Path, openaiproxy.HeaderE2EE, got,
+						openaiproxy.E2EEValueSealed)
+				}
+			}
+
+			paths, _, bodies := rr.snapshot()
+			for i, b := range bodies {
+				if strings.Contains(b, secret) {
+					t.Fatalf("the prompt reached the router in the clear at %s: %s", paths[i], b)
+				}
+			}
+			if len(paths) != 0 {
+				t.Errorf("the trailing-slash form was forwarded to the router: %v", paths)
 			}
 		})
 	}

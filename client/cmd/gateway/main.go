@@ -710,6 +710,24 @@ type entryPolicy struct {
 // is the hardest shape to diagnose.
 func (p entryPolicy) credentialsAllowed() bool { return !p.openOrigins }
 
+// canonicalPath serves r through h with r.URL.Path replaced by path, for the one
+// case where two spellings name one resource and only one of them is registered
+// downstream (a sealed surface and its trailing-slash form).
+//
+// It copies the request and the URL rather than assigning to r.URL.Path: the
+// middleware above still holds the original — the access log reads it after h
+// returns — and a handler that edits its caller's request in place is the kind of
+// action at a distance that is fine until something else reads the field.
+func canonicalPath(path string, h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r2 := *r
+		u := *r.URL
+		u.Path = path
+		r2.URL = &u
+		h.ServeHTTP(w, &r2)
+	})
+}
+
 // handlerOption configures newHandler's entryPolicy. It is variadic and last so
 // the callers with no opinion — every test that is about something else — keep
 // naming only what they care about.
@@ -897,6 +915,25 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 		if c := clients[ep.Path]; c != nil {
 			openaiproxy.Register(sealed, ep, c)
 			mux.Handle("POST "+ep.Path, sealedGate)
+			// ...and the surface's own TRAILING-SLASH form, which belongs to the sealed
+			// POST and not to the subtree however much it looks like the latter.
+			//
+			// To Go's ServeMux, `POST /v1/chat/completions/` matches the subtree pattern
+			// `/v1/chat/completions/` — `POST /v1/chat/completions` does not match a path
+			// with a trailing slash. Under `refuse` that was a loud 501 and merely
+			// unhelpful. Under `passthrough` it made the subtree handler the reverse
+			// proxy, so the request was answered 200 with the WHOLE PROMPT forwarded to
+			// the router in the clear: exactly the leak the subtree claim exists to
+			// prevent, reached by a single character, and invisible to the caller because
+			// the router's gin then 307s the retry onto the real path and it works.
+			//
+			// `{$}` anchors the pattern to that one path (Go 1.22), so this claims the
+			// surface's own slashed form and nothing beneath it. The path is rewritten to
+			// the canonical form rather than redirected: the inner sealed mux registers
+			// only `POST <path>`, a 308 would make every caller re-send its body, and a
+			// caller that reached this surface through the router got the request SERVED
+			// rather than refused — which is the behaviour the cutover has to preserve.
+			mux.Handle("POST "+ep.Path+"/{$}", canonicalPath(ep.Path, sealedGate))
 			continue
 		}
 		// The same envelope every other gateway-origin error uses (WriteError:
@@ -904,11 +941,17 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 		// "gateway" in _0g.source so a thin client keys fault attribution off one
 		// field). The old hand-rolled body was type "invalid_request_error" with no
 		// attribution — the one gateway error a client could not attribute.
+		//
+		// Registered on the trailing-slash form too, for the reason above: an unserved
+		// row must refuse BOTH spellings, or `passthrough` would forward the prompt of
+		// a surface this build cannot seal.
 		path := ep.Path
-		mux.Handle("POST "+path, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		unserved := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			openaiproxy.WriteError(w, http.StatusNotImplemented, "gateway",
 				fmt.Sprintf("sealed POST %s is not served by this gateway build", path))
-		}))
+		})
+		mux.Handle("POST "+path, unserved)
+		mux.Handle("POST "+path+"/{$}", unserved)
 	}
 	// /healthz answers "is this process serving?" and nothing more. It is the
 	// container healthcheck, and compose gates dstack-ingress's STARTUP on it

@@ -131,6 +131,11 @@ func TestCookieCredentialYieldsToExplicitCredential(t *testing.T) {
 	}{
 		{"authorization wins", "Authorization", "Bearer sk-explicit", "Bearer sk-explicit"},
 		{"x-api-key is left untouched", "x-api-key", "sk-explicit", ""},
+		// A non-bearer Authorization is still the caller's credential, and the cookie
+		// must not overwrite it. The gate rejects this request a moment later, which is
+		// the right answer — but "rejected" and "silently re-authenticated as somebody
+		// else" are very different wrong answers, and only one of them bills a stranger.
+		{"a non-bearer scheme is still explicit", "Authorization", "Basic dXNlcjpwdw==", "Basic dXNlcjpwdw=="},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -232,5 +237,33 @@ func TestCookieCredentialThroughTheGate(t *testing.T) {
 				t.Errorf("reached inner = %v, want %v", reached, tt.wantStatus == http.StatusOK)
 			}
 		})
+	}
+}
+
+// The divergence that made bearerToken the wrong test: an explicit x-api-key
+// alongside a non-bearer Authorization.
+//
+// bearerToken returns "" for a present-but-non-bearer Authorization and stops
+// there, never reaching its x-api-key branch — so gating on it let the cookie
+// overwrite an API key the caller supplied. The router's own extractBearerToken
+// falls THROUGH that Authorization to x-api-key and would have honored the key, so
+// the two sides would have billed two different accounts for one request.
+func TestCookieCredentialDoesNotOverrideAPIKeyBehindANonBearerHeader(t *testing.T) {
+	h, auth, reached := cookieHandler(cookieOrigins())
+	req := cookieRequest("https://pc.0g.ai", "jwt-value")
+	req.Header.Set("Authorization", "Basic dXNlcjpwdw==")
+	req.Header.Set("x-api-key", "sk-caller-key")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if !*reached {
+		t.Fatalf("status %d: the request never reached the sealed path", rec.Code)
+	}
+	if *auth == "Bearer jwt-value" {
+		t.Fatal("the cookie replaced the caller's own credential: this request would be " +
+			"billed to the cookie's account while the router would have billed the API key's")
+	}
+	if *auth != "Basic dXNlcjpwdw==" {
+		t.Errorf("Authorization: got %q, want the caller's header untouched", *auth)
 	}
 }

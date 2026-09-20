@@ -4,13 +4,20 @@ import (
 	"net/http"
 )
 
-// HeaderE2EE declares, on every response this gateway sends, whether that
-// exchange was end-to-end encrypted to a provider enclave.
+// HeaderE2EE declares whether an exchange was end-to-end encrypted to a provider
+// enclave.
 //
-// It is stamped on BOTH branches on purpose. A marker that appears only on
-// cleartext responses tells a client nothing it can act on — absence would be
-// ambiguous between "sealed" and "an older gateway that does not say" — so a
-// client could never assert sealing, only hope for it. Present on every response,
+// It is stamped on every response from the two paths that carry, or could carry,
+// inference content: the sealed path and the cleartext passthrough. Operational
+// and evidence routes (/healthz, /readyz, /evidences/, the identity endpoints) are
+// NOT marked, and a CORS preflight is answered before the mux and so is not
+// either. Those responses have no content to make a claim about, and marking them
+// would dilute a header whose whole use is "what happened to my prompt".
+//
+// Within that set it is stamped on BOTH branches on purpose. A marker that
+// appeared only on cleartext responses would tell a client nothing it can act on —
+// absence would be ambiguous between "sealed" and "an older gateway that does not
+// say" — so a client could never assert sealing, only hope for it. Present on both,
 // with one of the two values below, it becomes a check: a caller that requires
 // privacy can refuse anything that is not E2EEValueSealed, and refuse it on the
 // response it actually got rather than on configuration it cannot see.

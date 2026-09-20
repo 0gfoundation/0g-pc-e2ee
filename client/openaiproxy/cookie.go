@@ -63,15 +63,35 @@ const cookieCredentialName = "jwt"
 // here would only make that one look optional.
 //
 // Mounted by the gateway OUTSIDE RequireInferenceCredential — it has to run before
-// the gate, or the gate 401s the request this exists to admit — and only when the
-// deployment opts in (-allow-cookie-credential). The sidecar is a single-user
-// localhost process with no browser and no cookies, so it never mounts this.
+// the gate, or the gate 401s the request this exists to admit. There is no flag: it
+// is mounted whenever the origin allowlist can vouch for a request, i.e. for every
+// allowlist except one containing "*", where the gateway leaves it off because a
+// gate that admits every origin is not a CSRF defense at all. The sidecar is a
+// single-user localhost process with no browser and no cookies, so it never mounts
+// this.
 func AcceptCookieCredential(origins []string, h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if bearerToken(r) != "" {
-			// An explicit credential is present (or an Authorization header in some
-			// other scheme, which bearerToken reports as absent and the router would
-			// reject too). Either way the cookie is not consulted.
+		if credential(r) != "" {
+			// An explicit credential is present, so the cookie is not consulted.
+			//
+			// The test is credential() — the same function that decides what actually
+			// travels upstream — and NOT bearerToken(), which the front-door gate uses.
+			// They disagree on two inputs, and on both of them bearerToken would have let
+			// the cookie win over a credential the caller supplied:
+			//
+			//   - `Authorization` in a non-bearer scheme: bearerToken returns "" and
+			//     stops there, so this header would be OVERWRITTEN with the cookie's
+			//     bearer. The caller's credential does not just lose, it disappears.
+			//   - `x-api-key` alongside such an `Authorization`: bearerToken's early
+			//     return never reaches its x-api-key branch, so an explicit API key would
+			//     lose to the cookie — while the router, whose own extractBearerToken
+			//     falls THROUGH a non-bearer Authorization to x-api-key, would have
+			//     honored the key. Same request, two principals, two billing accounts.
+			//
+			// credential() has neither gap: it returns the Authorization header verbatim
+			// whatever its scheme, and otherwise wraps x-api-key. So "would this request
+			// already carry a credential upstream?" is exactly the question, and it is
+			// asked of the thing that answers it.
 			h.ServeHTTP(w, r)
 			return
 		}
