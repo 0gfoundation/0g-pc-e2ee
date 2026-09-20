@@ -300,6 +300,14 @@ services:
       # An unrecognised value fails startup instead of guessing: one of the two answers
       # forwards content in the clear, and that is not a thing to infer from a typo.
       - "ZG_GATEWAY_UNSEALED_SUBTREE=${ZG_GATEWAY_UNSEALED_SUBTREE:-refuse}"
+      # There is deliberately NO variable for the catalog cache TTL
+      # (-catalog-cache-ttl, default 10s), even though the flag exists for local runs
+      # and the loadtest compose. Inside the CVM it would buy nothing: the measured
+      # compose text is what fixes app_id, so changing this value here is a redeploy
+      # either way — the variable would only add an allowed_envs entry that has to be
+      # carried on EVERY blue/green side, for a knob that can never be turned without
+      # a redeploy anyway. Add one the day a value here can actually be changed
+      # without one.
       # DCAP-verify each provider's TDX quote and seal only to the verified enc key,
       # instead of trusting the router-supplied pubkey endpoint. Enforced per request:
       # a provider that fails is rejected.

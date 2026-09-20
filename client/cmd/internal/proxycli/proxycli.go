@@ -771,6 +771,11 @@ func EnvBool(key string, def bool) bool { return envBool(key, def) }
 // treatment of a set-but-unparseable value.
 func EnvIntOr(key string, def int) int { return envInt(key, def) }
 
+// EnvDurationOr is EnvOr's duration counterpart, for a binary registering its
+// OWN duration flag (the gateway's -catalog-cache-ttl): same precedence, same
+// fail-loud treatment of a set-but-unparseable value.
+func EnvDurationOr(key string, def time.Duration) time.Duration { return envDuration(key, def) }
+
 // envInt parses an integer environment variable. An unset variable falls back to
 // def; a set-but-unparseable one is fatal rather than silently defaulting, so a
 // typo in a concurrency ceiling cannot quietly restore the built-in value while
