@@ -167,6 +167,16 @@ func main() {
 			unsealedSubtreePassthrough+"\" forwards them to the router like any other unsealed path, marked "+
 			openaiproxy.HeaderE2EE+": "+openaiproxy.E2EEValueNone+". Required by the global-entry topology, "+
 			"where calling the router directly is no longer an option (env ZG_GATEWAY_UNSEALED_SUBTREE)")
+	// How long to reuse a public catalog read (catalogcache.go). Not a mere
+	// optimization in the global-entry topology: the router rate-limits these paths
+	// PER CLIENT IP, and this gateway forwards no client IP, so without the cache
+	// every user on earth shares one 120/min bucket.
+	catalogCacheTTL := flag.Duration("catalog-cache-ttl", proxycli.EnvDurationOr("ZG_GATEWAY_CATALOG_CACHE_TTL", defaultCatalogCacheTTL),
+		"how long to reuse the router's public catalog reads (/v1/models, /v1/providers, "+
+			"/v1/service-types, /status, the public stats groups) across callers, collapsing "+
+			"concurrent misses onto one upstream request. The router rate-limits these per "+
+			"client IP and this gateway forwards none, so the cache is what keeps that budget "+
+			"from becoming one global limit. 0 disables it (env ZG_GATEWAY_CATALOG_CACHE_TTL)")
 	// Directory holding the public attestation evidence bundle to serve at
 	// /evidences/ — in the TEE deployment, the `evidences` volume dstack-ingress
 	// writes, mounted read-only. Empty (the default) mounts no such route, which is
@@ -486,6 +496,11 @@ func main() {
 			withEntryPolicy(entryPolicy{
 				openOrigins:     openOrigins,
 				unsealedSubtree: *unsealedSubtree,
+				// The flag says "0 disables" (the conventional spelling for an
+				// operator); entryPolicy says "0 means the default" (so its zero value
+				// is the ordinary deployment). Both are right for their own reader, and
+				// this is the one line that translates — see entryPolicy.catalogCacheTTL.
+				catalogCacheTTL: disabledIfZero(*catalogCacheTTL),
 			})),
 		ReadHeaderTimeout: 10 * time.Second,     // mitigate slow-header (Slowloris) clients
 		IdleTimeout:       proxycli.IdleTimeout, // bound idle keep-alives; unset means unbounded
@@ -711,6 +726,38 @@ type entryPolicy struct {
 	// startup validation makes unreachable in a real deployment — reads as refuse,
 	// because of the two, refusing is the one that cannot leak.
 	unsealedSubtree string
+	// catalogCacheTTL is how long a public catalog read is reused (catalogcache.go).
+	//
+	// ZERO MEANS defaultCatalogCacheTTL, not "off". That reads backwards for a
+	// duration, and it is the point: the ordinary deployment caches, so per this
+	// type's contract the zero value has to be the one that does. A NEGATIVE value
+	// turns it off, and is what -catalog-cache-ttl=0 maps to — the flag keeps the
+	// conventional "0 disables" spelling for the operator, and the translation
+	// happens once, at the flag, rather than being a second meaning for zero here.
+	catalogCacheTTL time.Duration
+}
+
+// disabledIfZero maps a flag's "0 disables" convention onto entryPolicy's
+// "0 means the default" one. A negative value passes through, so
+// -catalog-cache-ttl=-1s disables it just as 0 does rather than quietly
+// becoming the default.
+func disabledIfZero(d time.Duration) time.Duration {
+	if d == 0 {
+		return -1
+	}
+	return d
+}
+
+// newCatalogCache builds this deployment's catalog cache, resolving the zero
+// value to the default TTL. One cache per handler: it holds no cross-handler
+// state, and a package-level one would leak entries between the gateways a test
+// binary stands up.
+func (p entryPolicy) newCatalogCache() *catalogCache {
+	ttl := p.catalogCacheTTL
+	if ttl == 0 {
+		ttl = defaultCatalogCacheTTL
+	}
+	return newCatalogCache(ttl) // nil when ttl < 0, i.e. explicitly disabled
 }
 
 // credentialsAllowed reports whether this deployment participates in ambient
@@ -873,7 +920,16 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	// under unsealedSubtreePassthrough it is also what a sealed surface's namespace
 	// resolves to. Marked as unencrypted at the one place every cleartext response
 	// leaves this process, so no route can forget to say so.
-	passthrough := openaiproxy.MarkE2EE(openaiproxy.E2EEValueNone, newRouterProxy(routerTarget, logger))
+	//
+	// Two wrappings of ONE proxy (one connection pool): the namespace handler gets
+	// the plain one, the catch-all gets the catalog cache. The marker is the OUTER
+	// layer in both, so it is applied per request rather than stored and replayed —
+	// a cached response that carried its own marker would be a second place the
+	// cleartext claim is made, and the one that could go stale.
+	routerProxy := newRouterProxy(routerTarget, logger)
+	passthrough := openaiproxy.MarkE2EE(openaiproxy.E2EEValueNone, routerProxy)
+	cachedPassthrough := openaiproxy.MarkE2EE(openaiproxy.E2EEValueNone,
+		policy.newCatalogCache().wrap(routerProxy))
 	mux := http.NewServeMux()
 	// Mount the sealed inference path behind the gateway's front-door credential
 	// gate. The gate is a cheap presence/shape check (reject missing credentials
@@ -1123,7 +1179,12 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	// ServeMux keeps serving them; only unmatched paths fall through here. This is a
 	// cleartext passthrough — safe for metadata, never for sealed content (see
 	// newRouterProxy).
-	mux.Handle("/", passthrough)
+	//
+	// The cached wrapping is mounted HERE and nowhere else. The namespace handler
+	// under -unsealed-subtree=passthrough carries prompts, so it gets the uncached
+	// `passthrough`: keeping them separate means that path's safety rests on the
+	// cache not being there at all, rather than on the allowlist being right.
+	mux.Handle("/", cachedPassthrough)
 	// CORS wraps the whole mux, INSIDE the access log: a preflight must be answered
 	// here — before the mux would hand it to the credential gate (which 401s a
 	// preflight, since a browser sends no credentials on one) or to the catch-all
