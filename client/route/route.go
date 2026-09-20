@@ -102,10 +102,17 @@ const (
 	// gateway, which seals what it can and passes the rest through, so a client
 	// pointed here keeps working and gets E2EE for free. The sidecar uses it.
 	//
-	// The gateway itself must NOT: see DefaultRouterOriginURL.
+	// The gateway itself must NOT: see DefaultRouterCloudURL.
 	DefaultRouterURL = "https://router-api.0g.ai"
-	// DefaultRouterOriginURL is the router's own hostname, bypassing the public
+	// DefaultRouterCloudURL is the router's own hostname, bypassing the public
 	// entry — the gateway's upstream.
+	//
+	// "Cloud" because that is what the hostname says, and the hostname was named
+	// for where the router runs (a cloud provider) as opposed to the gateway's
+	// enclave. It is deliberately not "origin", the usual word for what sits
+	// behind an entry: in this codebase "origin" means a CORS origin in ~80
+	// places, several of them in the same files that consume this constant
+	// (openaiproxy.originAllowed, the allowlist, the Origin header).
 	//
 	// The two exist because after the global-entry cutover they stop being the
 	// same machine. `router-api.0g.ai` is the gateway; the router moved to this
@@ -123,7 +130,7 @@ const (
 	// blue/green side for a check that only catches a misconfiguration this
 	// default already avoids. Verify it the way the deploy does — that the name
 	// serves the ROUTER's answer, not the gateway's (deploy/phala/README.md).
-	DefaultRouterOriginURL = "https://router-api-cloud.0g.ai"
+	DefaultRouterCloudURL = "https://router-api-cloud.0g.ai"
 	// previewPath is the router's route-preview endpoint, appended to the router
 	// base URL. It is owned here because this package owns that API contract.
 	previewPath = "/v1/routing/preview"

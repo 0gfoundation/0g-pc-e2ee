@@ -86,15 +86,15 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/client/route"
 )
 
-// defaultRouterURL is what -router-url falls back to: the router's ORIGIN name,
+// defaultRouterURL is what -router-url falls back to: the router's OWN name,
 // NOT the public entry.
 //
 // This gateway serves the public entry, so pointing it at that name would make
 // every passthrough request and every route-preview re-enter its own front door
 // and recurse. It is a named constant rather than the call-site argument so a
 // test can assert the binary's default without running it — see
-// TestGatewayDefaultsToTheRouterOriginNotThePublicEntry.
-const defaultRouterURL = route.DefaultRouterOriginURL
+// TestGatewayDefaultsToTheRouterCloudNameNotThePublicEntry.
+const defaultRouterURL = route.DefaultRouterCloudURL
 
 func main() {
 	f := proxycli.RegisterFlags(flag.CommandLine, "ZG_GATEWAY", ":8443", defaultRouterURL)

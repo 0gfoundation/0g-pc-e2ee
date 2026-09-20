@@ -42,7 +42,7 @@ func main() {
 	// The public entry, which is where a client belongs: it resolves to the
 	// gateway, so a sidecar pointed here gets the gateway's sealing on everything
 	// it does not seal itself. (The gateway's own default is different — see
-	// route.DefaultRouterOriginURL.)
+	// route.DefaultRouterCloudURL.)
 	f := proxycli.RegisterFlags(flag.CommandLine, "ZG_SIDECAR", "localhost:8787", route.DefaultRouterURL)
 	flag.Parse()
 

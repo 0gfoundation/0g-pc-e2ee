@@ -217,7 +217,7 @@ const defaultCollateralTTL = time.Hour
 // same reason defaultListen is: the two binaries need different values and
 // neither can be derived from envPrefix. The sidecar wants the public entry
 // (route.DefaultRouterURL); the gateway IS the public entry, so it wants the
-// router's own origin name (route.DefaultRouterOriginURL) and would otherwise
+// router's own name (route.DefaultRouterCloudURL) and would otherwise
 // proxy to itself. Both constants document the split.
 func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen, defaultRouterURL string) *Flags {
 	env := func(name string) string { return envPrefix + "_" + name }
