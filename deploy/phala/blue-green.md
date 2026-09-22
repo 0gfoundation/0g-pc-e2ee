@@ -130,6 +130,21 @@ is minutes (see
 > Don't run step 4 until you've confirmed b — while a is alive, `./switch.sh
 > rollback` is an instant undo.
 
+> **Standing a name up for the first time: use `--no-verify` on step 3.** The fast
+> path above assumes the served name already CNAMEs into the delegation zone, so
+> flipping the switch changes what that name serves and the post-switch
+> health-check means something. It does not yet on a name whose public CNAME still
+> points at the old origin: the check reaches the OLD origin no matter which side
+> the switch points at, so it cannot fail correctly — and cannot pass correctly
+> either, since a pass would only say the old origin is up. Worse, `switch` treats
+> the failure as a bad cutover and auto-rolls-back when there is a previous side.
+>
+> `HEALTH_PATH` is worth a look at the same time: it defaults to `/healthz`, which
+> every gateway serves, but the origin behind the name may not. Ours answered
+> `404` there, so the pre-cutover verify failed on the path rather than on
+> anything real. Once the name points here, the default is correct again — the
+> gateway is what answers it.
+
 ## The record architecture
 
 The served zone (`0g.ai`) is operator-delegated and we hold no token for it, so
