@@ -1,0 +1,377 @@
+# Reassembled from cn-20's canonical service blocks — provider
+# 0x4870CbC4D07d6Ac2EE5aA865588e5985FE77a4E9, compose_hash 720530b4…, read 2026-08-28.
+#
+# NOT that provider's docker_compose_file. It is the twelve service bodies `pcverify
+# -provider -blocks` printed for it, in their FULL form (real image references, not the
+# held-out ones brokercompose.json stores for three of them), wrapped back into a
+# document. Everything outside `services:` is therefore absent — no top-level `volumes:`
+# or `networks:` declarations — so the review reports more shared-mount justifies against
+# this file than against the real manifest. That does not affect what it is here for:
+# the per-service blocks are byte-identical to the authenticated ones, which is the only
+# thing the baseline comparison reads.
+#
+# Regenerate together with brokercompose.json from one `-blocks` run. They are two
+# projections of the same observation and must never be updated separately.
+services:
+  broker-ingress:
+    image: dstacktee/dstack-ingress:2.2@sha256:d05a7b343c37c1cca1bba8dbf7e8f3c6d2118158af2d41c455103796db4f67f0
+    ports:
+        - 443:443
+    environment:
+        - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
+        - DOMAIN=${DOMAIN:?set DOMAIN — there is no default, so that a missing value cannot point this deployment at production}
+        - TARGET_ENDPOINT=http://0g-serving-provider-broker:3080
+        - CERTBOT_EMAIL=${CERTBOT_EMAIL}
+        - GATEWAY_DOMAIN=_.${DSTACK_GATEWAY_DOMAIN}
+        - SET_CAA=true
+        - PORT=443
+        - TIMEOUT_CONNECT=10s
+        - TIMEOUT_SERVER=900s
+    volumes:
+        - /var/run/dstack.sock:/var/run/dstack.sock
+        - cert-data:/etc/letsencrypt
+    restart: unless-stopped
+    depends_on:
+        0g-serving-provider-broker:
+            condition: service_healthy
+  0gm-sglang:
+    image: lmsysorg/sglang:v0.5.17-cu129@sha256:220bb1a1a4b38e604ebd33c876a279f6d2519035de141200720417407c9b967d
+    container_name: 0gm-sglang
+    restart: unless-stopped
+    init: true
+    ipc: host
+    shm_size: 32gb
+    runtime: nvidia
+    environment:
+        NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+        NVIDIA_DRIVER_CAPABILITIES: compute,utility
+        HF_HOME: /dstack/persistent/hf-cache
+        HF_TOKEN: ${HF_TOKEN:-}
+    volumes:
+        - /dstack/persistent/hf-cache:/dstack/persistent/hf-cache
+        - /dstack/persistent/benchmark/sglang_0gm_logs:/logs
+    command:
+        - python3
+        - -m
+        - sglang.launch_server
+        - --model-path
+        - 0G-AI/0GM-1.0-35B-A3B-0427
+        - --revision
+        - 802e58f5c8211f04079bfb5c27fb2c6ab629b686
+        - --served-model-name
+        - 0GM-1.0-35B-A3B-0427
+        - --host
+        - 0.0.0.0
+        - --port
+        - "8000"
+        - --tp-size
+        - "1"
+        - --mem-fraction-static
+        - "0.90"
+        - --context-length
+        - "262144"
+        - --reasoning-parser
+        - qwen3
+        - --tool-call-parser
+        - qwen3_coder
+        - --speculative-algorithm
+        - NEXTN
+        - --speculative-num-steps
+        - "3"
+        - --speculative-eagle-topk
+        - "1"
+        - --speculative-num-draft-tokens
+        - "4"
+        - --mamba-scheduler-strategy
+        - extra_buffer
+        - --enable-metrics
+        - --enable-cache-report
+    healthcheck:
+        test:
+            - CMD-SHELL
+            - python3 -c "import urllib.request;urllib.request.urlopen('http://localhost:8000/health_generate',timeout=15)"
+        interval: 30s
+        timeout: 20s
+        start_period: 90m
+        retries: 3
+    ulimits:
+        memlock: -1
+        stack: 67108864
+    logging:
+        driver: json-file
+        options:
+            max-size: 100m
+            max-file: "5"
+    networks:
+        default:
+            aliases:
+                - sglang
+                - vllm
+  mysql:
+    image: mysql:8.0@sha256:7dcddc01f13bab2f15cde676d44d01f61fc9f99fe7785e86196dfc07d358ae2b
+    restart: unless-stopped
+    environment:
+        - MYSQL_ROOT_PASSWORD=123456
+        - MYSQL_DATABASE=provider
+        - MYSQL_USER=provider
+        - MYSQL_PASSWORD=provider
+    volumes:
+        - mysql-data:/var/lib/mysql
+    healthcheck:
+        test:
+            - CMD-SHELL
+            - mysql -uroot -p123456 -e 'USE provider'
+        interval: 15s
+        timeout: 5s
+        retries: 15
+        start_period: 60s
+    networks:
+        - default
+  broker-config-init:
+    image: alpine:3.18@sha256:de0eb0b3f2a47ba1eb89389859a9bd88b28e82f5826b6969ad604979713c2d4f
+    environment:
+        - BROKER_CONFIG=${BROKER_CONFIG:-}
+        - PRIVATE_KEY=${PRIVATE_KEY:-}
+        - COINGECKO_API_KEY=${COINGECKO_API_KEY:-}
+    volumes:
+        - broker-config:/config
+    command:
+        - sh
+        - -c
+        - |
+          set -e
+          # First boot only. The controller's PUT /v1/config/core writes this same
+          # file and records the change in RTMR3, so rewriting it on every start
+          # would silently undo an operator change that is already on-chain — the
+          # same guard dstack's own boot script puts on docker-compose.yaml.
+          if [ ! -f /config/config.yaml ]; then
+            if [ -z "$$BROKER_CONFIG" ]; then
+              echo "BROKER_CONFIG is empty and no config exists yet" >&2
+              exit 1
+            fi
+            printf '%s' "$$BROKER_CONFIG" | base64 -d \
+              | sed -e "s#\$${PRIVATE_KEY}#$$PRIVATE_KEY#" \
+                    -e "s#\$${COINGECKO_API_KEY}#$$COINGECKO_API_KEY#" \
+              > /config/config.yaml.tmp
+            # Rename last, so a container killed mid-write leaves no half-file that
+            # the guard above would then accept as complete.
+            mv /config/config.yaml.tmp /config/config.yaml
+          fi
+    restart: no
+  0g-serving-provider-broker:
+    container_name: 0g-serving-provider-broker
+    image: ghcr.io/0gfoundation/0g-serving-broker@sha256:ec5df8347f91c3b28a6638db4e24dba343799c0a3a7e2cdd44845a3a27f2e734
+    ports:
+        - 80:3080
+    environment:
+        - PORT=3080
+        - CONFIG_FILE=/etc/config/config.yaml
+        - TARGET_URL=http://0gm-sglang:8000/v1
+        - NETWORK=phala
+        - IMAGE_REPO=ghcr.io/0gfoundation/0g-serving-broker
+        - IMAGE_DIGEST=sha256:ec5df8347f91c3b28a6638db4e24dba343799c0a3a7e2cdd44845a3a27f2e734
+        - TEE_SOCKET=/var/run/zg-tee/tee.sock
+    volumes:
+        - broker-config:/etc/config:ro
+        - ./logs/broker:/var/log/inference
+        - ./logs/event:/var/log/event
+        - zg-tee:/var/run/zg-tee
+    command: 0g-inference-server
+    networks:
+        - default
+    healthcheck:
+        test:
+            - CMD-SHELL
+            - test -L /proc/1/exe && readlink /proc/1/exe | grep -q broker
+        interval: 30s
+        timeout: 10s
+        retries: 3
+        start_period: 60s
+    deploy:
+        resources:
+            reservations:
+                devices:
+                    - driver: nvidia
+                      count: all
+                      capabilities:
+                        - gpu
+    restart: unless-stopped
+    depends_on:
+        0g-controller:
+            condition: service_started
+        mysql:
+            condition: service_healthy
+        0gm-sglang:
+            condition: service_healthy
+        broker-config-init:
+            condition: service_completed_successfully
+  0g-serving-provider-event:
+    container_name: 0g-serving-provider-event
+    image: ghcr.io/0gfoundation/0g-serving-broker@sha256:ec5df8347f91c3b28a6638db4e24dba343799c0a3a7e2cdd44845a3a27f2e734
+    environment:
+        - CONFIG_FILE=/etc/config/config.yaml
+        - NETWORK=phala
+        - IMAGE_REPO=ghcr.io/0gfoundation/0g-serving-broker
+        - IMAGE_DIGEST=sha256:ec5df8347f91c3b28a6638db4e24dba343799c0a3a7e2cdd44845a3a27f2e734
+        - TEE_SOCKET=/var/run/zg-tee/tee.sock
+    volumes:
+        - broker-config:/etc/config:ro
+        - ./logs/event:/var/log/inference
+        - zg-tee:/var/run/zg-tee
+    command: 0g-inference-event
+    networks:
+        - default
+    healthcheck:
+        test:
+            - CMD-SHELL
+            - grep -q '0g-inference-event' /proc/1/cmdline
+        interval: 30s
+        timeout: 5s
+        retries: 3
+        start_period: 30s
+    logging:
+        driver: json-file
+        options:
+            max-size: 100m
+            max-file: "5"
+    restart: unless-stopped
+    depends_on:
+        0g-controller:
+            condition: service_started
+        0g-serving-provider-broker:
+            condition: service_healthy
+  0g-controller:
+    container_name: 0g-controller
+    ports:
+        - 3090:3090
+    image: ghcr.io/0gfoundation/0g-serving-broker@sha256:ec5df8347f91c3b28a6638db4e24dba343799c0a3a7e2cdd44845a3a27f2e734
+    environment:
+        - CONFIG_FILE=/etc/config/config.yaml
+        - ATTEST_PROXY_SOCKET=/var/run/zg-tee/tee.sock
+    volumes:
+        - broker-config:/etc/config
+        - /var/run/dstack.sock:/var/run/dstack.sock
+        - /var/run/docker.sock:/var/run/docker.sock
+        - zg-tee:/var/run/zg-tee
+        - ./logs/controller:/var/log/inference
+    depends_on:
+        broker-config-init:
+            condition: service_completed_successfully
+    command: 0g-controller
+    networks:
+        - default
+    healthcheck:
+        test:
+            - CMD-SHELL
+            - grep -q '0g-controller' /proc/1/cmdline
+        interval: 30s
+        timeout: 5s
+        retries: 3
+        start_period: 30s
+    logging:
+        driver: json-file
+        options:
+            max-size: 100m
+            max-file: "5"
+    restart: unless-stopped
+  prometheus-init:
+    image: alpine:3.18@sha256:de0eb0b3f2a47ba1eb89389859a9bd88b28e82f5826b6969ad604979713c2d4f
+    environment:
+        - PROMETHEUS_CONFIG=${PROMETHEUS_CONFIG:-}
+    volumes:
+        - prometheus-config:/tmp
+    command: |
+        sh -c 'if [ -n "$$PROMETHEUS_CONFIG" ]; then
+          echo "$$PROMETHEUS_CONFIG" | base64 -d > /tmp/prometheus.yml
+        else
+          cat > /tmp/prometheus.yml << "EOF"
+        global:
+          scrape_interval: 15s
+        scrape_configs:
+          - job_name: "0g-serving"
+            static_configs:
+              - targets: ["0g-serving-provider-broker:3080", "0g-serving-provider-event:3081"]
+          - job_name: "node-exporter"
+            static_configs:
+              - targets: ["prometheus-node-exporter:9100"]
+        EOF
+        fi'
+  prometheus:
+    image: prom/prometheus:v2.45.2
+    restart: unless-stopped
+    volumes:
+        - prometheus-config:/etc/prometheus
+    networks:
+        - default
+    healthcheck:
+        test:
+            - CMD
+            - wget
+            - --no-verbose
+            - --tries=1
+            - --spider
+            - http://localhost:9090/-/healthy
+        interval: 30s
+        timeout: 10s
+        retries: 3
+        start_period: 30s
+    depends_on:
+        prometheus-init:
+            condition: service_completed_successfully
+  grafana:
+    image: grafana/grafana-oss:11.4.0
+    restart: unless-stopped
+    volumes:
+        - ./grafana/provisioning:/etc/grafana/provisioning
+        - ./grafana/dashboards:/var/lib/grafana/dashboards
+    environment:
+        - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+    networks:
+        - default
+    healthcheck:
+        test:
+            - CMD-SHELL
+            - curl -f http://localhost:3000/api/health || wget -q --spider http://localhost:3000/api/health
+        interval: 30s
+        timeout: 10s
+        retries: 3
+        start_period: 60s
+    depends_on:
+        prometheus:
+            condition: service_healthy
+  prometheus-node-exporter:
+    image: prom/node-exporter:v1.7.0
+    restart: always
+    volumes:
+        - /proc:/host/proc:ro
+        - /sys:/host/sys:ro
+        - /:/rootfs:ro
+    command:
+        - --path.procfs=/host/proc
+        - --path.sysfs=/host/sys
+        - --collector.filesystem.ignored-mount-points
+        - ^/(sys|proc|dev|host|etc|rootfs/var/lib/docker/containers|rootfs/var/lib/docker/overlay2|rootfs/run/docker/netns|rootfs/var/lib/docker/aufs)($$|/)
+    networks:
+        - default
+    privileged: true
+    depends_on:
+        prometheus:
+            condition: service_healthy
+    expose:
+        - 9100
+  dcgm-exporter:
+    image: nvcr.io/nvidia/k8s/dcgm-exporter:3.3.5-3.4.0-ubuntu22.04
+    restart: unless-stopped
+    runtime: nvidia
+    environment:
+        - NVIDIA_VISIBLE_DEVICES=all
+        - DCGM_EXPORTER_NO_HOSTNAME=1
+    cap_add:
+        - SYS_ADMIN
+    networks:
+        - default
+    expose:
+        - 9400
+    depends_on:
+        prometheus:
+            condition: service_healthy

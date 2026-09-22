@@ -17,6 +17,7 @@ package evidence
 // operator reading a report should not have to learn a second vocabulary for it.
 
 import (
+	"bytes"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -46,8 +47,9 @@ type BaselineService struct {
 	Block string
 	// Image is how much the image is allowed to move. A ZERO VALUE means the recorded
 	// Block above pins it as written — a digest, a bare tag, or no image at all,
-	// whichever the recorded text says — which is how every service is recorded except
-	// one whose image is meant to move within a repository. See ImageRule.
+	// whichever the recorded text says — which is how nine of the twelve recorded
+	// services stand; the other three run 0G's own broker image, whose release cadence
+	// is the one case a recorded text cannot express. See ImageRule.
 	Image ImageRule
 }
 
@@ -85,9 +87,23 @@ func (r ImageRule) pinsImageInBlock() bool { return r.Repository == "" }
 // array of lines because a JSON string with embedded newlines is unreadable and
 // undiffable, and the entire argument for storing text rather than a digest was that a
 // human can review it.
+//
+// Every key the file may carry is declared here, INCLUDING the two this code never reads,
+// because the decode rejects unknown fields (see ParseComposeBaseline). Prose lives in the
+// file itself rather than only in this package: an author editing a baseline is reading
+// JSON, not Go.
 type composeBaselineFile struct {
+	// Comment is the file's own header. Declared so the decode can reject unknown keys
+	// while the file keeps explaining itself; never read.
+	Comment  []string `json:"_comment"`
 	Services []struct {
-		Name  string   `json:"name"`
+		Name string `json:"name"`
+		// Note is the audit record for one entry — why it is recorded as it stands, and
+		// what the review says about it. Declared, never read: a justification that
+		// changed the comparison would be a rule, and rules belong in code where they can
+		// be tested. It sits next to the entry rather than in the header so a renamed or
+		// deleted service takes its justification with it.
+		Note  []string `json:"note"`
 		Block []string `json:"block"`
 		Image *struct {
 			Repository string `json:"repository"`
@@ -126,10 +142,27 @@ func BuiltinComposeBaseline() ([]BaselineService, error) {
 // process, so whatever that library's indent or quoting choices are, they apply equally.
 // It is also what lets an entry be hand-edited — re-indented, re-quoted, a comment added
 // — without breaking the match.
+//
+// UNKNOWN KEYS ARE REFUSED, which matters most for the one that is easiest to mistype.
+// A file whose top-level key reads "servcies" decodes cleanly into zero entries under a
+// permissive decoder, and zero entries means NOT CONFIGURED — so a typo would silently
+// turn the adjudicating check off and every report would say the comparison did not run,
+// which is a sentence nobody reads twice. The same holds one level down: "blocks" for
+// "block", or an image rule spelled "repo". A baseline that pins less than its author
+// wrote is the one failure mode this format cannot tolerate, since the whole file exists
+// to be trusted without being re-derived.
 func ParseComposeBaseline(raw []byte) ([]BaselineService, error) {
 	var f composeBaselineFile
-	if err := json.Unmarshal(raw, &f); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&f); err != nil {
 		return nil, fmt.Errorf("compose baseline is not valid JSON: %w", err)
+	}
+	// A Decoder stops at the end of the first value, where json.Unmarshal would have
+	// rejected what followed. Restore that: a second object in the file means the
+	// author's edits may be sitting in the half nothing decoded.
+	if dec.More() {
+		return nil, fmt.Errorf("compose baseline is not valid JSON: trailing content after the first object")
 	}
 	out := make([]BaselineService, 0, len(f.Services))
 	seen := make(map[string]bool, len(f.Services))
