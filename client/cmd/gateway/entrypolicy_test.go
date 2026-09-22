@@ -4,6 +4,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -449,5 +451,50 @@ func TestSealedSurfaceTrailingSlashIsNeverProxied(t *testing.T) {
 				t.Errorf("the trailing-slash form was forwarded to the router: %v", paths)
 			}
 		})
+	}
+}
+
+// composeUnsealedSubtree reads the deployed default out of the compose manifest.
+var composeUnsealedSubtree = regexp.MustCompile(
+	`ZG_GATEWAY_UNSEALED_SUBTREE=\$\{ZG_GATEWAY_UNSEALED_SUBTREE:-([^}]*)\}`)
+
+// The deployed default is pinned because it decides whether a sealed surface's
+// sub-resources reach the untrusted router IN THE CLEAR, and because it
+// deliberately disagrees with the binary's own default.
+//
+// The flag defaults to "refuse", which is right for a gateway beside a router a
+// caller can still reach — a 501 there points at an open door. The deployment
+// whose endpoint becomes the network's only entry needs "passthrough", because
+// on the only entry a 501 deletes the feature instead of redirecting. Two
+// correct answers for two topologies, and the file has to pick one.
+//
+// Neither direction of a wrong value announces itself: "refuse" on the sole
+// entry looks like an endpoint that was never implemented, and "passthrough"
+// beside a router forwards content nobody decided to forward. So this asserts
+// the value rather than merely that it parses — changing it should mean editing
+// this test and saying which topology changed.
+func TestComposeUnsealedSubtreeIsPassthrough(t *testing.T) {
+	compose, err := os.ReadFile(composePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", composePath, err)
+	}
+	m := composeUnsealedSubtree.FindSubmatch(compose)
+	if m == nil {
+		t.Fatalf("no ZG_GATEWAY_UNSEALED_SUBTREE=${...:-<default>} entry in %s; if the entry was "+
+			"reshaped deliberately, update this test rather than dropping it", composePath)
+	}
+	switch got := string(m[1]); got {
+	case unsealedSubtreePassthrough:
+		// The global-entry deployment's answer.
+	case unsealedSubtreeRefuse:
+		t.Errorf("the compose default is %q, the binary's default and the one for a gateway "+
+			"running BESIDE a reachable router. On the sole entry it turns "+
+			"POST /v1/messages/count_tokens and GET /v1/chat/completions into 501s that "+
+			"look like endpoints nobody implemented. If this deployment is no longer the "+
+			"sole entry, say so here", got)
+	default:
+		t.Errorf("the compose default is %q, which is neither %q nor %q — the gateway refuses "+
+			"to start on it, so this would be a deploy that never comes up",
+			got, unsealedSubtreeRefuse, unsealedSubtreePassthrough)
 	}
 }

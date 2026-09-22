@@ -12,6 +12,18 @@
 # blocks. Editing this file, comments included, changes compose_hash, and so the
 # mr_config_id every quote from this CVM commits to.
 #
+# AN EDIT ALSO COSTS A CERTIFICATE. A new compose_hash is an upgrade, an upgrade
+# brings up a fresh CVM, and a fresh CVM has an EMPTY cert-data volume — so
+# dstack-ingress issues again, against the budget of 5 duplicate certificates per
+# hostname per rolling week. Batch edits rather than trickling them.
+#
+# The same fact is the ONLY way to move a hostname from the staging CA to the real
+# one: with the volume intact, `certbot renew` finds a certificate that is not near
+# expiry and exits before contacting any CA, so flipping ACME_STAGING to false
+# changes nothing and the staging certificate keeps being served, silently. Set
+# ACME_STAGING=false first, THEN make the edit, so the fresh CVM issues once and
+# against the right CA. Measured on a live deployment — see README "Serving domain".
+#
 # It does NOT change app_id. dstack assigns an app its id when the app is CREATED and
 # then keeps it for the app's life (dstack-util system_setup.rs: the derivation
 # `truncate(compose_hash, 20)` runs only when nothing assigned one, which for a
@@ -344,16 +356,40 @@ services:
       # gains E2EE support.
       - "ZG_GATEWAY_SEAL_MODELS=${ZG_GATEWAY_SEAL_MODELS:-0gm-1.0-35b-a3b}"
       # ZG_GATEWAY_UNSEALED_SUBTREE decides what a sealed surface's sub-resources and
-      # non-sealed methods answer: "refuse" (501, the default — right while a caller
-      # who wants the router's own handling can call the router directly) or
-      # "passthrough" (forward them, marked X-0G-E2EE: none — right once this gateway
-      # IS the only entry, where a 501 removes the feature rather than redirecting).
-      # An unrecognised value fails startup instead of guessing: one of the two answers
-      # forwards content in the clear, and that is not a thing to infer from a typo.
-      # Inert while ZG_GATEWAY_SEAL_POLICY=off — with nothing sealed there is no
-      # sealed namespace left to decide about, and the gateway logs a warning if the
-      # two are set in a combination that reads as if there were.
-      - "ZG_GATEWAY_UNSEALED_SUBTREE=${ZG_GATEWAY_UNSEALED_SUBTREE:-refuse}"
+      # non-sealed methods answer — POST /v1/messages/count_tokens,
+      # GET /v1/chat/completions and the like: "refuse" (501) or "passthrough"
+      # (forward them to the router, marked X-0G-E2EE: none).
+      #
+      # DEFAULTED HERE TO "passthrough", WHICH IS NOT THE BINARY'S DEFAULT. The flag
+      # defaults to "refuse", and that is right for a gateway used as a library or
+      # run beside a router a caller can still reach directly: a 501 there points at
+      # a door that is open. This file is not that. It is the 0G-operated deployment
+      # whose endpoint becomes the network's ONLY entry, and on the only entry a 501
+      # does not redirect — it deletes the feature.
+      #
+      # Defaulting rather than leaving it to each deployment's encrypted env is the
+      # point: a value nobody remembers to set is the failure mode this deployment
+      # keeps hitting (an allowed_envs key never entered, a flag whose flip does
+      # nothing), and every one of them is silent. Encoding the intended topology
+      # here means the cutover has one less thing to get right on the day.
+      #
+      # WHAT IT COSTS, PLAINLY: those sub-resources reach the untrusted router in
+      # the CLEAR. That is the trade, and X-0G-E2EE: none on the response is what
+      # keeps it disclosed instead of silent. It does not touch the sealed surfaces
+      # themselves — POST on a sealed path is sealed exactly as before.
+      #
+      # A deployment that IS beside a reachable router sets "refuse" in its
+      # encrypted env; the key is declared, so that is a value change.
+      #
+      # An unrecognised value fails startup instead of guessing: one of the two
+      # answers forwards content in the clear, and that is not a thing to infer from
+      # a typo. Inert while ZG_GATEWAY_SEAL_POLICY=off — with nothing sealed there is
+      # no sealed namespace left to decide about — and note that with this default
+      # the gateway's "ignored while seal-policy is off" warning now fires from the
+      # default rather than from something an operator typed. The warning is still
+      # true (everything is proxied in the clear when sealing is off); it is just no
+      # longer evidence that anyone set this.
+      - "ZG_GATEWAY_UNSEALED_SUBTREE=${ZG_GATEWAY_UNSEALED_SUBTREE:-passthrough}"
       # There is deliberately NO variable for the catalog cache TTL
       # (-catalog-cache-ttl, default 10s), even though the flag exists for local runs
       # and the loadtest compose. Inside the CVM it would buy nothing: the measured
