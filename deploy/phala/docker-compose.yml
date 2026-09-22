@@ -12,6 +12,18 @@
 # blocks. Editing this file, comments included, changes compose_hash, and so the
 # mr_config_id every quote from this CVM commits to.
 #
+# AN EDIT ALSO COSTS A CERTIFICATE. A new compose_hash is an upgrade, an upgrade
+# brings up a fresh CVM, and a fresh CVM has an EMPTY cert-data volume — so
+# dstack-ingress issues again, against the budget of 5 duplicate certificates per
+# hostname per rolling week. Batch edits rather than trickling them.
+#
+# The same fact is the ONLY way to move a hostname from the staging CA to the real
+# one: with the volume intact, `certbot renew` finds a certificate that is not near
+# expiry and exits before contacting any CA, so flipping ACME_STAGING to false
+# changes nothing and the staging certificate keeps being served, silently. Set
+# ACME_STAGING=false first, THEN make the edit, so the fresh CVM issues once and
+# against the right CA. Measured on a live deployment — see README "Serving domain".
+#
 # It does NOT change app_id. dstack assigns an app its id when the app is CREATED and
 # then keeps it for the app's life (dstack-util system_setup.rs: the derivation
 # `truncate(compose_hash, 20)` runs only when nothing assigned one, which for a
@@ -353,6 +365,23 @@ services:
       # Inert while ZG_GATEWAY_SEAL_POLICY=off — with nothing sealed there is no
       # sealed namespace left to decide about, and the gateway logs a warning if the
       # two are set in a combination that reads as if there were.
+      #
+      # THE DEFAULT STAYS "refuse", AND THE GLOBAL-ENTRY DEPLOYMENT OVERRIDES IT.
+      # Which answer is correct is a property of the TOPOLOGY, not of the build, and
+      # the two topologies are live at the same time during the migration: a gateway
+      # on its own hostname beside the router is optional, and 501 points a caller at
+      # the door they can still use; a gateway that has taken over the router's
+      # hostname is the only door, and 501 removes POST /v1/messages/count_tokens and
+      # GET /v1/chat/completions outright.
+      #
+      # So a deployment that has become the sole entry sets
+      # ZG_GATEWAY_UNSEALED_SUBTREE=passthrough in its encrypted env (the key is
+      # already declared here, so that is a value change and costs no compose_hash).
+      # Shipping "passthrough" as the default instead would widen what reaches the
+      # untrusted router in the clear on every deployment at its next redeploy,
+      # ahead of any topology that needs it — the wrong direction to be early in.
+      # Flip this default in the milestone that retires the last optional-entry
+      # deployment, not before.
       - "ZG_GATEWAY_UNSEALED_SUBTREE=${ZG_GATEWAY_UNSEALED_SUBTREE:-refuse}"
       # There is deliberately NO variable for the catalog cache TTL
       # (-catalog-cache-ttl, default 10s), even though the flag exists for local runs
