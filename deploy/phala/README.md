@@ -156,6 +156,33 @@ explain:
   (`DNS_SETUP_MODE=wait`) but gives up after `DNS_SETUP_TIMEOUT`, 30 minutes by
   default, and then exits without a certificate.
 
+> ⚠️ **Under blue/green, three CNAMEs are not enough.** The paragraph above is the
+> single-instance layout, where the container owns every hop below the served zone.
+> Blue/green puts each side in its own sub-zone, so two records in the BASE
+> delegation zone sit between your CNAMEs and the per-side records the container
+> writes — and **neither `switch.sh setup` nor the container creates them**:
+>
+> ```
+> _acme-challenge.<DOMAIN>                        CNAME → ….<DZ>        you, once
+> _acme-challenge.<DOMAIN>.<DZ>                   CNAME → ….<side>.<DZ>  ./switch.sh acme <side>
+> _acme-challenge.<DOMAIN>.<side>.<DZ>            TXT   = <token>        the container
+> ```
+>
+> `_dstack-app-address` has the same three-hop shape, and its middle hop is
+> `./switch.sh switch <side>`. `setup` writes only the serving alias.
+>
+> Miss the `acme` hop on a new hostname and Let's Encrypt cannot reach the token:
+> certbot retries, gives up, dstack-ingress exits without a certificate, and
+> `restart: unless-stopped` brings it back — a crash loop, while **everything an
+> operator would think to check looks fine**: the token IS published, the
+> Cloudflare token DOES have access, `GATEWAY_DOMAIN` IS correct, and the gateway
+> container is healthy. That cost about an hour the first time.
+>
+> So for a new hostname: `setup` → `acme <side>` → wait for the certificate →
+> `switch <side>`. [blue-green.md](./blue-green.md)'s release fast path already
+> puts `acme` first for the same reason; this note is for the first deployment,
+> which does not go through that path.
+
 ## Deploy
 
 Reference [`docker-compose.yml`](./docker-compose.yml) from the Phala Cloud
@@ -217,12 +244,42 @@ editing the list changes `compose_hash`. Every *successful* issuance for the sam
 hostname counts against the 5-duplicate-certificates-per-week limit, and each
 fresh CVM issues again from an empty `cert-data` volume, so iterating on
 production directly can leave the hostname uncertifiable for days. Staging's
-limits are far higher; its certs are untrusted, so use them for smoke tests only,
-then set `ACME_STAGING=false` (or drop the value) for the real certificate.
-Because only the injected *value* changes and `allowed_envs` stays constant, the
-measured compose is identical either way — a staging run and the production run
-share `app_id`, and the served cert's issuer (LE staging vs real) is what tells
-them apart.
+limits are far higher, and its certs are untrusted, so use them for smoke tests
+only. A staging run and the production run share `app_id`, and the served cert's
+issuer (LE staging vs real) is what tells them apart.
+
+> ⚠️ **Going from the staging CA to the real one is NOT a value flip.** An earlier
+> version of this section said to "set `ACME_STAGING=false` for the real
+> certificate", and then explained, one sentence later, exactly why that cannot
+> work: only the *value* changes, so the measured compose is identical — **same
+> CVM, same `cert-data` volume**. The container runs `certbot renew`, which is
+> driven by EXPIRY, finds a certificate with months left, prints `No certificates
+> need renewal`, and exits before it ever contacts a CA. Dropping `--staging` from
+> the command line changes nothing, because nothing is issued at all. Measured on
+> a live deployment, twice:
+>
+> ```
+> change SEAL_MODELS (power cycle) → certbot renew … --staging → No certificates need renewal
+> change ACME_STAGING=false        → certbot renew …           → No certificates need renewal
+>                                                  ↑ flag gone, so the value DID take effect
+> ```
+>
+> You keep serving the staging certificate, and nothing in the logs says so. In a
+> browser that is a full-page interstitial; in an SDK it is a verification failure.
+>
+> **To actually get the production certificate, `cert-data` has to be empty**, and
+> it is a named volume — only a fresh CVM gets an empty one. That means a
+> `compose_hash` change: edit any byte of `docker-compose.yml`, or add/remove an
+> `allowed_envs` key. Set `ACME_STAGING=false` FIRST, then make that change, so the
+> new CVM issues once, against the real CA, instead of twice.
+>
+> Two things that do NOT change across it, so nothing downstream needs redoing:
+> `app_id` (an in-place upgrade keeps it), and therefore the `_dstack-app-address`
+> TXT and any traffic switch already pointed at this side.
+>
+> This is also why "pre-issue the certificate before moving traffic" is a deploy
+> step and not a config step: the pre-issued certificate must come from the real CA
+> on the CVM that will serve it.
 
 ## Verify
 
@@ -231,6 +288,25 @@ Liveness — does traffic reach the gateway at all:
 ```sh
 curl https://<DOMAIN>/healthz
 ```
+
+> ⚠️ **Before `<DOMAIN>` points here, every check has to pin the address — and a
+> local proxy will quietly defeat that.** Pre-cutover you reach the CVM with
+> `curl --resolve <DOMAIN>:443:<gateway ip>` or `openssl s_client -connect <gateway
+> ip>:443 -servername <DOMAIN>`, taking the address from the serving alias
+> (`<DOMAIN>.<DELEGATION_ZONE>`).
+>
+> A proxy that routes by SNI ignores the address you gave. Clash in its default
+> fake-ip mode with sniffing is the case we hit: names resolved to its synthetic
+> `198.18.0.0/16` pool, and connections to the real gateway IP were re-routed by
+> the hostname in the SNI. **The symptom is the ORIGIN's certificate coming back**
+> — which reads as "the deployment is wrong" rather than "the test never left the
+> laptop". `curl` also drops `--resolve` outright when `http_proxy`/`https_proxy`
+> is set, since the name is then resolved at the proxy.
+>
+> Check `env | grep -i proxy`, exempt the served and delegation zones from the
+> proxy, or run the check from a clean network — mobile data with Termux works.
+> Only address-pinning breaks; once `<DOMAIN>` resolves here, ordinary checks are
+> fine through a proxy.
 
 Attestation — this is the part that actually proves something. Fetching the
 bundle is not enough; the load-bearing step is comparing the **served**
