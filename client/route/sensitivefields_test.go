@@ -52,6 +52,12 @@ func TestSensitiveFieldsFollowTheServiceType(t *testing.T) {
 			mustPassThrough: []string{"model", "n", "size"},
 		},
 		{
+			name:            "embedding withholds the input",
+			ep:              endpoint.Embedding,
+			mustWithhold:    []string{"input"},
+			mustPassThrough: []string{"model", "encoding_format", "dimensions"},
+		},
+		{
 			// A row whose profile wire does not know — the zero Endpoint is the
 			// reachable case — withholds every payload field any profile has.
 			// Over-stripping only costs routing fidelity; under-stripping leaks, and
@@ -64,7 +70,7 @@ func TestSensitiveFieldsFollowTheServiceType(t *testing.T) {
 			// sketched yet.
 			name:            "a row with an unknown profile withholds every payload field",
 			ep:              endpoint.Endpoint{ServiceType: "video-to-text"},
-			mustWithhold:    []string{"messages", "tools", "prompt", "file_base64", "system"},
+			mustWithhold:    []string{"messages", "tools", "prompt", "file_base64", "system", "input"},
 			mustPassThrough: []string{"model"},
 		},
 	}
@@ -380,6 +386,7 @@ func TestUpstreamURLFollowsTheServiceType(t *testing.T) {
 		// could not express.
 		{endpoint.Anthropic, "http://router.example/v1/messages"},
 		{endpoint.Image, "http://router.example/v1/images/generations"},
+		{endpoint.Embedding, "http://router.example/v1/embeddings"},
 	} {
 		t.Run(tc.ep.Path, func(t *testing.T) {
 			got, err := r.upstreamURL(tc.ep)

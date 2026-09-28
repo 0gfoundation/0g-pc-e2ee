@@ -308,29 +308,26 @@ func TestEmptyListDoesNotParseMultipart(t *testing.T) {
 }
 
 // A name for a path the dispatcher is not mounted on does nothing, and nothing
-// says so. Pinned because it is the shape of a plausible mistake: adding an
-// embedding or completion model to the list ahead of the surface, seeing no
-// error, and reading that as "configured".
+// says so. Pinned because it is the shape of a plausible mistake: adding a
+// completion model to the list ahead of the surface, seeing no error, and
+// reading that as "configured".
 func TestSealModelsOnlyAppliesToSealedSurfaces(t *testing.T) {
-	sealedPaths := map[string]bool{}
+	const unsealedPath = "/v1/completions"
 	for _, ep := range endpoint.All {
-		sealedPaths[ep.Path] = true
-	}
-	for _, p := range []string{"/v1/embeddings", "/v1/completions"} {
-		if sealedPaths[p] {
-			t.Errorf("%s is now a sealed surface. Naming its models in -seal-models finally "+
-				"does something — update the note on sealModels, which says it cannot", p)
+		if ep.Path == unsealedPath {
+			t.Fatalf("%s is now a sealed surface. Naming its models in -seal-models finally "+
+				"does something — update the note on sealModels, which says it cannot", unsealedPath)
 		}
 	}
 
 	rr := &recordingRouter{}
 	router := rr.server(nil)
 	defer router.Close()
-	// The list names an embeddings model. It must not change what that path does.
-	gw := catalogGateway(t, router, entryPolicy{sealModels: parseSealModels("text-embedding-3-small")})
+	// The list names a completions model. It must not change what that path does.
+	gw := catalogGateway(t, router, entryPolicy{sealModels: parseSealModels("gpt-3.5-turbo-instruct")})
 
-	body := `{"model":"text-embedding-3-small","input":"hello"}`
-	req, _ := http.NewRequest(http.MethodPost, gw.URL+"/v1/embeddings", strings.NewReader(body))
+	body := `{"model":"gpt-3.5-turbo-instruct","prompt":"hello"}`
+	req, _ := http.NewRequest(http.MethodPost, gw.URL+unsealedPath, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer sk-user-key")
 	resp, err := http.DefaultClient.Do(req)
@@ -346,6 +343,59 @@ func TestSealModelsOnlyAppliesToSealedSurfaces(t *testing.T) {
 		t.Errorf("router saw %v, want the one verbatim request: a model named for a surface "+
 			"that is not sealed is a no-op, not a configuration", got)
 	}
+}
+
+// The model list applies to /v1/embeddings like any sealed surface: a listed
+// embedding model is sealed, an unlisted one goes to the router verbatim. A
+// chat-only list therefore seals no embedding traffic.
+func TestSealModelsRoutesEmbeddingsByModel(t *testing.T) {
+	const embeddingModel = "qwen3-embedding-8b"
+	post := func(t *testing.T, gwURL, body string) *http.Response {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodPost, gwURL+endpoint.Embedding.Path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer sk-user-key")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return resp
+	}
+	body := fmt.Sprintf(`{"model":%q,"input":"my secret document"}`, embeddingModel)
+
+	t.Run("a chat-only list leaves embeddings unsealed", func(t *testing.T) {
+		rr := &recordingRouter{}
+		router := rr.server(nil)
+		defer router.Close()
+		gw := catalogGateway(t, router, entryPolicy{sealModels: parseSealModels(sealedModel)})
+
+		resp := post(t, gw.URL, body)
+		if m := resp.Header.Get(openaiproxy.HeaderE2EE); m != openaiproxy.E2EEValueNone {
+			t.Errorf("%s = %q, want %q", openaiproxy.HeaderE2EE, m, openaiproxy.E2EEValueNone)
+		}
+		if got := bodiesOf(rr); len(got) != 1 || got[0] != body {
+			t.Errorf("router saw %v, want the caller's one request verbatim", got)
+		}
+	})
+
+	t.Run("an embedding model on the list is sealed", func(t *testing.T) {
+		rr := &recordingRouter{}
+		router := rr.server(nil)
+		defer router.Close()
+		gw := catalogGateway(t, router, entryPolicy{sealModels: parseSealModels(sealedModel + "," + embeddingModel)})
+
+		resp := post(t, gw.URL, body)
+		if m := resp.Header.Get(openaiproxy.HeaderE2EE); m != openaiproxy.E2EEValueSealed {
+			t.Errorf("%s = %q, want %q", openaiproxy.HeaderE2EE, m, openaiproxy.E2EEValueSealed)
+		}
+		for _, got := range bodiesOf(rr) {
+			if strings.Contains(got, "my secret document") {
+				t.Errorf("the router received the embedding input in the clear: %s", got)
+			}
+		}
+	})
 }
 
 // Matching is case-insensitive in both directions, so a caller's casing cannot

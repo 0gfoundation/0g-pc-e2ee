@@ -207,6 +207,7 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("POST /v1/images/generations", s.handleImages)
 	mux.HandleFunc("POST /v1/messages", s.handleMessages)
 	mux.HandleFunc("POST /v1/audio/transcriptions", s.handleSpeech)
+	mux.HandleFunc("POST /v1/embeddings", s.handleEmbeddings)
 	mux.HandleFunc("GET /v1/providers", s.handleProviders)
 	// Provider-broker surface (reached at the endpoint the preview advertises).
 	mux.HandleFunc("GET /v1/e2ee/pubkey", s.handlePubkey)
@@ -221,6 +222,7 @@ func (s *server) handler() http.Handler {
 	mux.HandleFunc("POST /v1/proxy/chat/completions", s.handleCompletions)
 	mux.HandleFunc("POST /v1/proxy/images/generations", s.handleImages)
 	mux.HandleFunc("POST /v1/proxy/audio/transcriptions", s.handleSpeech)
+	mux.HandleFunc("POST /v1/proxy/embeddings", s.handleEmbeddings)
 	// There is deliberately no GET /v1/quote: the fixture cannot produce a genuine
 	// TDX quote, so a gateway pointed at it must run with -attest=false. Leaving
 	// the route absent makes that a loud 404 at startup rather than a confusing

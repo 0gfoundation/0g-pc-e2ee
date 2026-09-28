@@ -157,6 +157,19 @@ var Image = Endpoint{
 	PreSeal:      imagePreSeal,
 }
 
+// Embedding is POST /v1/embeddings: the OpenAI embeddings surface.
+//
+// No PreSeal: ProfileEmbedding pins nothing (SPEC §7.4). `encoding_format`
+// selects an encoding of the sealed `data`, not a destination, so there is
+// nothing to default. No streaming shape, so `"stream": true` is refused.
+var Embedding = Endpoint{
+	ServiceType:  "embedding",
+	Profile:      wire.ProfileEmbedding,
+	Path:         "/v1/embeddings",
+	UpstreamPath: "/v1/embeddings",
+	Streams:      false,
+}
+
 // All is every surface this module knows how to seal, and adding a row here is
 // what makes a surface exist. The gateway mounts every row — as the sealed
 // handler when its build serves it, as an explicit refusal when not, never left
@@ -176,7 +189,7 @@ var Image = Endpoint{
 // silently confused with another. A ByServiceType("chatbot") would have returned
 // whichever chat row came first in this slice and shadowed the other with no
 // error anywhere.
-var All = []Endpoint{Chat, Anthropic, Image, Speech}
+var All = []Endpoint{Chat, Anthropic, Image, Speech, Embedding}
 
 // fieldResponseFormat is the image profile's pinned cleartext field (SPEC §7.1).
 const fieldResponseFormat = "response_format"
