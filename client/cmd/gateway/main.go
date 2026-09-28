@@ -73,6 +73,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"time"
 
@@ -174,7 +175,8 @@ func main() {
 			"the clear, marked "+openaiproxy.HeaderE2EE+": "+openaiproxy.E2EEValueNone+". EMPTY "+
 			"(the default) seals every model, which is the behaviour before this existed. Only "+
 			"a couple of chat models have E2EE support on the network, so this is the rollout "+
-			"dial: add a model, watch, add the next. Inert while -seal-policy is off "+
+			"dial: add a model, watch, add the next. An entry '<service type>:*' (e.g. "+
+			"'embedding:*') seals every model on that service type's surfaces. Inert while -seal-policy is off "+
 			"(env ZG_GATEWAY_SEAL_MODELS)")
 	// What happens to a sealed surface's NAMESPACE — its subtree, and its own path on
 	// every method but the sealed POST. See the endpoint.All loop in newHandler for
@@ -424,6 +426,20 @@ func main() {
 			"want", []string{sealPolicyAlways, sealPolicyOff})
 		os.Exit(1)
 	}
+	// A `<service type>:*` entry naming no surface would leave that surface in the
+	// clear while reading as configured, so it fails the deploy like the others.
+	sealModelsList := parseSealModels(*sealModelsCSV)
+	if len(sealModelsList.unknown) > 0 {
+		var known []string
+		for _, ep := range endpoint.All {
+			if e := ep.ServiceType + surfaceWildcard; !slices.Contains(known, e) {
+				known = append(known, e)
+			}
+		}
+		logger.Error("invalid -seal-models: no sealed surface has this service type",
+			"entries", sealModelsList.unknown, "want_one_of", known)
+		os.Exit(1)
+	}
 	// -unsealed-subtree only decides what a SEALED surface's namespace answers, so
 	// with sealing off it has nothing to decide — every one of those paths is
 	// proxied. Say so rather than letting an operator read the two settings and
@@ -536,7 +552,7 @@ func main() {
 			withEntryPolicy(entryPolicy{
 				openOrigins:     openOrigins,
 				sealPolicy:      *sealPolicy,
-				sealModels:      parseSealModels(*sealModelsCSV),
+				sealModels:      sealModelsList,
 				unsealedSubtree: *unsealedSubtree,
 				// The flag says "0 disables" (the conventional spelling for an
 				// operator); entryPolicy says "0 means the default" (so its zero value

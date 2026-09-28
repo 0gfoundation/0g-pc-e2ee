@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 )
@@ -81,30 +82,71 @@ import (
 // That ordering is not an oversight to work around by adding the name early. A
 // surface gets sealed by gaining a row in endpoint.All and a seal path (see the
 // note on newRouterProxy); only then does naming its models mean anything.
+//
+// # A whole service type: `<service type>:*`
+//
+// An entry such as `embedding:*` seals every request on the surfaces of that
+// router service type, whatever the model. It is for a service type whose whole
+// fleet serves the profile, so listing its models one by one would only add a
+// way to forget one. The decision is made on the path, before the body is read.
+//
+// `*` never appears in a model id, so a model id containing `:` (`qwen3:8b`)
+// is still an ordinary entry. A `:*` entry naming no row's service type is
+// refused at startup rather than ignored: a typo there would leave the whole
+// surface in the clear.
 type sealModels struct {
-	// allow is the lower-cased set of models to seal. Nil/empty means "all".
+	// allow is the lower-cased set of models to seal. See all() for what an
+	// empty list means.
 	allow map[string]struct{}
+	// surfaces maps a sealed surface's path to the `<service type>:*` entry that
+	// claimed it, which is also the entry's metric label.
+	surfaces map[string]string
+	// unknown lists `:*` entries whose service type no row has.
+	unknown []string
 }
+
+// surfaceWildcard is the suffix that turns an entry into a whole-service-type one.
+const surfaceWildcard = ":*"
 
 // parseSealModels builds the set from a comma-separated list. Entries are
 // trimmed and lower-cased (model ids are matched case-insensitively, the way the
 // router's own canonical-id comparison does), and empty entries are dropped so a
 // trailing comma is not a model named "".
 func parseSealModels(csv string) sealModels {
-	allow := map[string]struct{}{}
+	var s sealModels
 	for _, part := range strings.Split(csv, ",") {
-		if m := strings.ToLower(strings.TrimSpace(part)); m != "" {
-			allow[m] = struct{}{}
+		m := strings.ToLower(strings.TrimSpace(part))
+		switch {
+		case m == "":
+		case strings.HasSuffix(m, surfaceWildcard):
+			serviceType := strings.TrimSuffix(m, surfaceWildcard)
+			matched := false
+			for _, ep := range endpoint.All {
+				if ep.ServiceType == serviceType {
+					if s.surfaces == nil {
+						s.surfaces = map[string]string{}
+					}
+					s.surfaces[ep.Path] = m
+					matched = true
+				}
+			}
+			if !matched {
+				s.unknown = append(s.unknown, m)
+			}
+		default:
+			if s.allow == nil {
+				s.allow = map[string]struct{}{}
+			}
+			s.allow[m] = struct{}{}
 		}
 	}
-	if len(allow) == 0 {
-		return sealModels{}
-	}
-	return sealModels{allow: allow}
+	return s
 }
 
 // all reports whether every model is sealed, i.e. no list was configured.
-func (s sealModels) all() bool { return len(s.allow) == 0 }
+func (s sealModels) all() bool {
+	return len(s.allow) == 0 && len(s.surfaces) == 0 && len(s.unknown) == 0
+}
 
 // seals reports whether this model is one the deployment seals.
 func (s sealModels) seals(model string) bool {
@@ -171,6 +213,13 @@ func (s sealModels) dispatch(sealed, cleartext http.Handler) http.Handler {
 		return sealed
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// The path is canonical here: sealedNamespaceGuard folds its spellings
+		// before the mux, and the trailing-slash route rewrites to the bare path.
+		if entry, ok := s.surfaces[r.URL.Path]; ok {
+			metrics.RecordSealDecision(entry, "sealed", "surface_in_allowlist")
+			sealed.ServeHTTP(w, r)
+			return
+		}
 		buf, err := io.ReadAll(io.LimitReader(r.Body, openaiproxy.MaxRequestBytes+1))
 		// Rewind before any branch returns: whichever handler runs must see the
 		// body byte-for-byte as it arrived. MultiReader covers the oversize case,

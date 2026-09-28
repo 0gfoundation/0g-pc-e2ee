@@ -398,6 +398,85 @@ func TestSealModelsRoutesEmbeddingsByModel(t *testing.T) {
 	})
 }
 
+// `<service type>:*` claims every row of that service type, and nothing else is
+// read as one: a model id may contain `:`, but never `*`.
+func TestParseSealModelsServiceTypeEntries(t *testing.T) {
+	s := parseSealModels("glm-5, Embedding:* ,chatbot:*,qwen3:8b,video-to-text:*,embedding:x")
+
+	wantSurfaces := map[string]string{
+		endpoint.Embedding.Path: "embedding:*",
+		endpoint.Chat.Path:      "chatbot:*",
+		endpoint.Anthropic.Path: "chatbot:*",
+	}
+	if len(s.surfaces) != len(wantSurfaces) {
+		t.Errorf("surfaces = %v, want %v", s.surfaces, wantSurfaces)
+	}
+	for path, entry := range wantSurfaces {
+		if got := s.surfaces[path]; got != entry {
+			t.Errorf("surfaces[%s] = %q, want %q", path, got, entry)
+		}
+	}
+	for _, model := range []string{"glm-5", "qwen3:8b", "embedding:x"} {
+		if !s.seals(model) {
+			t.Errorf("seals(%q) = false: an entry without the `:*` suffix is a model id", model)
+		}
+	}
+	if len(s.unknown) != 1 || s.unknown[0] != "video-to-text:*" {
+		t.Errorf("unknown = %v, want [video-to-text:*]: startup must refuse it", s.unknown)
+	}
+
+	// A list of service-type entries only is still a list.
+	if parseSealModels("embedding:*").all() {
+		t.Error("a list naming only `embedding:*` must not read as \"seal every model\"")
+	}
+}
+
+// With `embedding:*` on the list, every embedding model is sealed, including a
+// case- or slash-variant spelling of the path, while other surfaces keep routing
+// by model.
+func TestServiceTypeEntrySealsEveryModelOnItsSurface(t *testing.T) {
+	rr := &recordingRouter{}
+	router := rr.server(nil)
+	defer router.Close()
+	gw := catalogGateway(t, router, entryPolicy{sealModels: parseSealModels(sealedModel + ",embedding:*")})
+
+	post := func(t *testing.T, path, body string) *http.Response {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodPost, gw.URL+path, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer sk-user-key")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("post %s: %v", path, err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return resp
+	}
+
+	for _, path := range []string{endpoint.Embedding.Path, endpoint.Embedding.Path + "/", "/V1/Embeddings"} {
+		for _, model := range []string{"qwen3-embedding-8b", "some-unlisted-embedder"} {
+			resp := post(t, path, fmt.Sprintf(`{"model":%q,"input":"my secret document"}`, model))
+			if m := resp.Header.Get(openaiproxy.HeaderE2EE); m != openaiproxy.E2EEValueSealed {
+				t.Errorf("POST %s model %s: %s = %q, want %q",
+					path, model, openaiproxy.HeaderE2EE, m, openaiproxy.E2EEValueSealed)
+			}
+		}
+	}
+	for _, got := range bodiesOf(rr) {
+		if strings.Contains(got, "my secret document") {
+			t.Errorf("the router received the embedding input in the clear: %s", got)
+		}
+	}
+
+	// The entry names the embedding surface only: an unlisted chat model still
+	// goes to the router.
+	resp := post(t, endpoint.Chat.Path, modelBody("some-other-model"))
+	if m := resp.Header.Get(openaiproxy.HeaderE2EE); m != openaiproxy.E2EEValueNone {
+		t.Errorf("unlisted chat model: %s = %q, want %q", openaiproxy.HeaderE2EE, m, openaiproxy.E2EEValueNone)
+	}
+}
+
 // Matching is case-insensitive in both directions, so a caller's casing cannot
 // silently drop a model out of the sealed set.
 func TestSealModelsMatchingIsCaseInsensitive(t *testing.T) {
@@ -507,6 +586,12 @@ func TestComposeSealModelsSealsTheIntendedModel(t *testing.T) {
 			"ones with no sealable provider, whose route-preview comes back empty and is "+
 			"terminal. If that is deliberate, say so here rather than leaving it to look "+
 			"like a deletion (%q)", m[1])
+	}
+
+	// Startup refuses an unknown `<service type>:*` entry, so one here would fail
+	// the deploy rather than just this test.
+	if len(deployed.unknown) > 0 {
+		t.Errorf("the deployed list %q names service types no surface has: %v", m[1], deployed.unknown)
 	}
 
 	// The 0G in-house model, and its only registry alias — the on-chain spelling,
