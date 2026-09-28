@@ -73,10 +73,10 @@ import (
 // # A name only does something on a SEALED SURFACE
 //
 // The list is consulted by the dispatcher, and the dispatcher is mounted only on
-// the surfaces in endpoint.All. A name for anything else — /v1/embeddings,
-// /v1/completions — is a silent no-op: those paths go to the catch-all proxy,
-// which never asks this type anything, so the entry sits in the set and is never
-// matched. Nothing logs it and no metric moves.
+// the surfaces in endpoint.All. A name for anything else — /v1/completions,
+// say — is a silent no-op: such paths go to the catch-all proxy, which never
+// asks this type anything, so the entry sits in the set and is never matched.
+// Nothing logs it and no metric moves.
 //
 // That ordering is not an oversight to work around by adding the name early. A
 // surface gets sealed by gaining a row in endpoint.All and a seal path (see the

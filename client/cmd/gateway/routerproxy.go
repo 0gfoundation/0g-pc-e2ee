@@ -37,11 +37,10 @@ import (
 //     the marker is what keeps it disclosed rather than silent.
 //
 // Everything else must not. If a content-bearing endpoint that must stay
-// end-to-end encrypted is later added to the router (e.g. /v1/completions or
-// /v1/embeddings, which carry the prompt/input), it MUST get its own row in
-// endpoint.All and its own seal path — routing it through this proxy would hand
-// that content to the untrusted router in the clear, defeating the gateway's whole
-// purpose.
+// end-to-end encrypted is later added to the router (e.g. /v1/completions, which
+// carries the prompt), it MUST get its own row in endpoint.All and its own seal
+// path — routing it through this proxy would hand that content to the untrusted
+// router in the clear, defeating the gateway's whole purpose.
 //
 // A sealed surface's own POST never reaches here, in ANY spelling of its path. An
 // earlier version of this note claimed that for "either spelling (with or without
