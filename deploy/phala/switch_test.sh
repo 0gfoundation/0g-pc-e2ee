@@ -15,12 +15,16 @@
 #                  consume the codes in turn and the last one repeats
 #   stale          if present, holds an app_id the public name keeps resolving to,
 #                  standing in for a dstack gateway route cache that has not flushed
+#   cluster.<app>  the cluster that app lives in (in1.phala.network if absent)
+#   down.<base>    if present, that whole cluster is unreachable
+#   cert.<app>     days of validity left on that app's cert (80 if absent)
 #
-# The public name serves whichever app the traffic switch currently resolves to,
-# read from records.json on every request, exactly as the dstack gateway would.
-# A per-side probe host `<app_id>-443s.<base>` answers only when <base> is the
-# cluster that app lives in (in1.phala.network unless `cluster.<app_id>` says
-# otherwise) — a dstack gateway cannot route an app_id from another cluster.
+# Routing follows dstack. A connection to the public name goes to the cluster the
+# serving alias names (`_.<base>`); that cluster's gateway follows the traffic
+# switch to a per-side TXT and can only route the app if it lives in that same
+# cluster. A per-side probe host `<app_id>-443s.<base>` is routed by the app_id in
+# the hostname, so it answers only when <base> is that app's cluster. Both are
+# re-read from the state directory on every request.
 #
 # Run: ./deploy/phala/switch_test.sh   (needs bash, jq)
 set -euo pipefail
@@ -44,10 +48,54 @@ acme_side() { echo "_acme-challenge.${DOMAIN}.$1.${DZ}"; }
 # ---------------------------------------------------------------------------
 mkdir -p "$WORK/bin"
 
+# The routing model both fakes share, sourced by each.
+cat >"$WORK/bin/fakeworld" <<'FAKE_WORLD'
+S="$FAKE_DIR"
+rec() { # name type -> first content at that name
+  jq -r --arg n "$1" --arg t "$2" '.[] | select(.name==$n and .type==$t) | .content' "$S/records.json" | head -n1
+}
+home_of() { cat "$S/cluster.$1" 2>/dev/null || echo in1.phala.network; }
+is_down() { [ -f "$S/down.$1" ]; }
+
+# The app a connection to the public name reaches, or nothing: the serving alias
+# picks the cluster, that cluster's gateway looks up the traffic switch, and it
+# can only route an app that lives in its own cluster.
+public_app() {
+  local alias base tgt app
+  alias="$(rec "$FAKE_ALIAS" CNAME)"; base="${alias#_.}"
+  [ -n "$alias" ] && [ "$alias" != "$base" ] || return 0
+  is_down "$base" && return 0
+  if [ -f "$S/stale" ]; then app="$(cat "$S/stale")"
+  else
+    tgt="$(rec "$FAKE_ADDR_SWITCH" CNAME)"
+    [ -n "$tgt" ] || return 0
+    app="$(rec "$tgt" TXT | sed 's/^"//; s/"$//; s/:.*//')"
+  fi
+  [ -n "$app" ] && [ "$(home_of "$app")" = "$base" ] && echo "$app"
+  return 0
+}
+
+# The app `<app_id>-443s.<base>` reaches: routed by the id in the hostname, so
+# only the cluster has to match.
+side_app() { # host
+  local app="${1%%-443s.*}" base="${1#*-443s.}"
+  is_down "$base" && return 0
+  [ "$(home_of "$app")" = "$base" ] && echo "$app"
+  return 0
+}
+
+app_for_host() { # host
+  if [ "$1" = "$FAKE_DOMAIN" ]; then public_app
+  elif [[ "$1" == *-443s.* ]]; then side_app "$1"
+  fi
+}
+FAKE_WORLD
+
 cat >"$WORK/bin/curl" <<'FAKE_CURL'
 #!/usr/bin/env bash
 set -euo pipefail
-S="$FAKE_DIR"
+# shellcheck disable=SC1091
+. "$(dirname "$0")/fakeworld"
 method=GET url="" data="" wfmt=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -60,17 +108,6 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-
-# The app the public name currently lands on: follow the traffic switch CNAME to
-# a per-side TXT, unless a stale route is pinned.
-live_app() {
-  if [ -f "$S/stale" ]; then cat "$S/stale"; return; fi
-  local tgt
-  tgt="$(jq -r --arg n "$FAKE_ADDR_SWITCH" '.[] | select(.name==$n and .type=="CNAME") | .content' "$S/records.json" | head -n1)"
-  [ -n "$tgt" ] || return 0
-  jq -r --arg n "$tgt" '.[] | select(.name==$n and .type=="TXT") | .content' "$S/records.json" \
-    | head -n1 | sed 's/^"//; s/"$//; s/:.*//'
-}
 
 # Next scripted status for host+path, or the given default.
 scripted() { # host path default
@@ -120,13 +157,10 @@ case "$url" in
   https://*)
     rest="${url#https://}"; host="${rest%%/*}"; hpath="/${rest#*/}"
     code=000
-    if [ "$host" = "$FAKE_DOMAIN" ]; then
-      app="$(live_app)"
-      [ -n "$app" ] && code="$(scripted "public:$app" "$hpath" 200)"
-    elif [[ "$host" == *-443s.* ]]; then
-      app="${host%%-443s.*}"; base="${host#*-443s.}"
-      home="$(cat "$S/cluster.$app" 2>/dev/null || echo in1.phala.network)"
-      [ "$base" = "$home" ] && code="$(scripted "$host" "$hpath" 200)"
+    app="$(app_for_host "$host")"
+    if [ -n "$app" ]; then
+      if [ "$host" = "$FAKE_DOMAIN" ]; then code="$(scripted "public:$app" "$hpath" 200)"
+      else code="$(scripted "$host" "$hpath" 200)"; fi
     fi
     echo "$(date +%s) $host$hpath $code" >>"$S/http.log"
     [ -n "$wfmt" ] && printf '%s' "$code"
@@ -136,24 +170,35 @@ case "$url" in
 esac
 FAKE_CURL
 
-# `echo | openssl s_client … | openssl x509 -fingerprint` — the served cert is
-# identified by whichever app the public name currently lands on.
+# `echo | openssl s_client -connect <host>:443 … | openssl x509 …` — the cert is
+# whichever app that host reaches. Its remaining validity is `cert.<app_id>`
+# days (80 unless set), which is what -enddate prints and -checkend tests.
 cat >"$WORK/bin/openssl" <<'FAKE_OPENSSL'
 #!/usr/bin/env bash
 set -euo pipefail
+# shellcheck disable=SC1091
+. "$(dirname "$0")/fakeworld"
 case "${1:-}" in
   s_client)
     cat >/dev/null
-    if [ -f "$FAKE_DIR/stale" ]; then app="$(cat "$FAKE_DIR/stale")"
-    else
-      tgt="$(jq -r --arg n "$FAKE_ADDR_SWITCH" '.[] | select(.name==$n and .type=="CNAME") | .content' "$FAKE_DIR/records.json" | head -n1)"
-      app="$(jq -r --arg n "$tgt" '.[] | select(.name==$n and .type=="TXT") | .content' "$FAKE_DIR/records.json" | head -n1 | sed 's/^"//; s/"$//; s/:.*//')"
-    fi
+    host=""
+    while [ $# -gt 0 ]; do [ "$1" = -connect ] && host="${2%:*}"; shift; done
+    app="$(app_for_host "$host")"
     [ -n "$app" ] || exit 1
     echo "CERT $app" ;;
   x509)
     read -r _ app || exit 1
-    echo "sha256 Fingerprint=FP:${app}" ;;
+    days="$(cat "$S/cert.$app" 2>/dev/null || echo 80)"
+    shift
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -fingerprint) echo "sha256 Fingerprint=FP:${app}" ;;
+        -enddate) echo "notAfter=in ${days} days (fake)" ;;
+        -checkend) [ $((days * 86400)) -gt "$2" ] || { echo "Certificate will expire"; exit 1; }
+                   echo "Certificate will not expire"; shift ;;
+      esac
+      shift
+    done ;;
   *) exit 1 ;;
 esac
 FAKE_OPENSSL
@@ -191,7 +236,7 @@ run() {
   shift
   set +e
   OUT="$(env -i PATH="$WORK/bin:$PATH" HOME="$WORK" \
-    FAKE_DIR="$S" FAKE_DOMAIN="$DOMAIN" FAKE_ADDR_SWITCH="$ADDR_SWITCH" \
+    FAKE_DIR="$S" FAKE_DOMAIN="$DOMAIN" FAKE_ADDR_SWITCH="$ADDR_SWITCH" FAKE_ALIAS="$ALIAS" \
     CF_API_TOKEN=test PROBE_RETRIES=3 PROBE_INTERVAL=0 VERIFY_RETRIES=3 VERIFY_INTERVAL=0 \
     "${envs[@]}" bash "$SWITCH" --env-file "$S/env" "$@" 2>&1)"
   RC=$?
