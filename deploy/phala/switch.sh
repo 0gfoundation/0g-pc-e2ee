@@ -73,12 +73,12 @@
 #   CF_ZONE          delegation zone name           (default: integratenetwork.work)
 #   DOMAIN           served hostname                (default: router-api-tee.0g.ai)
 #   DELEGATION_ZONE  base delegation zone           (default: same as CF_ZONE)
-#   PLATFORM_BASE    dstack platform base domain    (e.g. in1.phala.network) — enables the
-#                    per-side app-id probe before a switch (<app_id>-443s.<PLATFORM_BASE>),
-#                    and `setup` points the serving alias at the cluster's gateway,
-#                    _.<PLATFORM_BASE>. A leading `_.` is accepted and stripped on
-#                    read. `status` warns if the live alias drifts from it or is not
-#                    a `_.<base>` hop.
+#   PLATFORM_BASE    dstack platform base domain    (e.g. in1.phala.network; required by
+#                    setup, switch and rollback). `setup` points the serving alias at
+#                    the cluster's gateway, _.<PLATFORM_BASE>; `switch`/`rollback`
+#                    probe the target side at <app_id>-443s.<PLATFORM_BASE> before
+#                    cutting over, and refuse if the live alias names another cluster.
+#                    A leading `_.` is accepted and stripped on read.
 #   SIDE_A_LABEL     sub-zone label for side a      (default: a)
 #   SIDE_B_LABEL     sub-zone label for side b      (default: b)
 #   TXT_PREFIX       app-address record prefix      (default: _dstack-app-address)
@@ -333,6 +333,20 @@ confirm() {
   [[ "$reply" =~ ^[Yy]$ ]]
 }
 
+# `switch`/`rollback` refuse to run without a standby probe they can trust.
+# PLATFORM_BASE is what builds that probe (gate 2), and it must be the cluster
+# the serving alias actually sends traffic to: probing a side on one cluster
+# while the alias points at another would pass the gate and then cut over to a
+# side the live path cannot reach.
+need_platform_base() {
+  [ -n "$PLATFORM_BASE" ] ||
+    die "set PLATFORM_BASE (<cluster>.phala.network): it builds the pre-switch probe of the target side"
+  local alias_now; alias_now="$(current_cname "$SERVING_ALIAS")"
+  if [ -n "$alias_now" ] && [ "${alias_now#_.}" != "$PLATFORM_BASE" ]; then
+    die "serving alias ${SERVING_ALIAS} -> ${alias_now} is not on PLATFORM_BASE=${PLATFORM_BASE}; the probe would test a cluster traffic does not go to"
+  fi
+}
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -423,6 +437,7 @@ cmd_switch() {
   [ -n "${1:-}" ] || die "usage: $0 switch <a|b>"
   local target; target="$(side_name "$1")"
   resolve_zone_id
+  need_platform_base
 
   local cur_target cur_side
   cur_target="$(current_cname "$ADDR_SWITCH")"
@@ -465,8 +480,8 @@ cmd_switch() {
 
   # Gate 2: verify the TARGET side can actually SERVE before we send it any
   # traffic — /readyz, not /healthz (see platform_probe_url). Prefer an explicit
-  # --probe-url; otherwise, if PLATFORM_BASE is set, probe the target's own app-id
-  # endpoint, which reaches it directly regardless of where traffic currently points.
+  # --probe-url; otherwise probe the target's own app-id endpoint on PLATFORM_BASE,
+  # which reaches it directly regardless of where traffic currently points.
   #
   # The window (PROBE_RETRIES x PROBE_INTERVAL, ~5min by default) is sized to a COLD
   # FIRST WARMER SWEEP on the standby, not to a DNS TTL: that sweep DCAP-verifies
@@ -519,8 +534,6 @@ cmd_switch() {
     done
     [ "$probe_ok" = 1 ] || die "target-side probe failed after ${PROBE_RETRIES} attempts ($probe) — refusing to switch"
     info "target-side probe OK"
-  else
-    warn "no --probe-url and no PLATFORM_BASE: cannot health-check side ${target} before cutover (see blue-green.md)"
   fi
 
   confirm "Switch traffic ${cur_side:-<none>} -> ${target} for ${DOMAIN}?" || { warn "aborted"; exit 1; }
@@ -605,6 +618,7 @@ cmd_switch() {
 
 cmd_rollback() {
   resolve_zone_id
+  need_platform_base
   # Stateless by design: with two sides, "roll back" is just "switch to the other
   # one", and which side is live is read from the shared switch record — not a
   # local file. So every operator, on any machine, computes the same target and

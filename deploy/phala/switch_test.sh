@@ -308,6 +308,23 @@ echo "prod5.phala.network" >"$S/cluster.appb"
 run PLATFORM_BASE=$BASE -- switch b --yes
 expect_fail && expect_out "refusing to switch" && expect_no_writes && ok
 
+t "switch: refuses without PLATFORM_BASE"
+run -- switch b --yes
+expect_fail && expect_out "set PLATFORM_BASE" && expect_not_probed && expect_no_writes && ok
+
+t "switch: refuses without PLATFORM_BASE even with --probe-url"
+run -- switch b --yes --probe-url https://custom.example/readyz
+expect_fail && expect_out "set PLATFORM_BASE" && expect_no_writes && ok
+
+t "switch: refuses when the serving alias is on another cluster"
+run PLATFORM_BASE=prod5.phala.network -- switch b --yes
+expect_fail && expect_out "is not on PLATFORM_BASE=prod5.phala.network" && expect_not_probed && expect_no_writes && ok
+
+t "switch: runs before setup (no serving alias yet)"
+drop "$ALIAS"
+run PLATFORM_BASE=$BASE -- switch b --yes --no-verify
+expect_rc 0 && expect_cname "$ADDR_SWITCH" "$(addr_side b)" && ok
+
 t "switch: refuses when the traffic switch points at neither side"
 jq --arg n "$ADDR_SWITCH" 'map(if .name==$n then .content="elsewhere.example" else . end)' "$S/records.json" >"$S/r.tmp" && mv "$S/r.tmp" "$S/records.json"
 run PLATFORM_BASE=$BASE -- switch b --yes
@@ -345,6 +362,10 @@ expect_rc 0 && expect_out "rolling back: a -> b" && expect_cname "$ADDR_SWITCH" 
 t "rollback: ignores --probe-url and probes the target side itself"
 run PLATFORM_BASE=$BASE -- rollback --yes --probe-url https://custom.example/readyz
 expect_rc 0 && expect_probed "appb-443s.${BASE}/readyz" && ok
+
+t "rollback: refuses without PLATFORM_BASE"
+run -- rollback --yes
+expect_fail && expect_out "set PLATFORM_BASE" && expect_no_writes && ok
 
 t "rollback: refuses when no side is live"
 drop "$ADDR_SWITCH"
