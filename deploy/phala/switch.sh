@@ -482,51 +482,49 @@ gate_target() { # target-side
   # finished proving it can serve anyone.
   local probe="$PROBE_URL"
   [ -z "$probe" ] && probe="$(platform_probe_url "$target")"
-  if [ -n "$probe" ]; then
-    info "probing target side ${target} directly: $probe"
-    info "  (up to ${PROBE_RETRIES} attempts ${PROBE_INTERVAL}s apart — a cold side must finish its first warmer sweep)"
-    local pi probe_ok=0 status fell_back=0
-    for ((pi=1; pi<=PROBE_RETRIES; pi++)); do
-      status="$(http_status "$probe")"
-      case "$status" in
-        2*) probe_ok=1; break ;;
-        404)
-          # A side that PREDATES readiness gating does not serve PROBE_PATH at all: the
-          # path falls through its catch-all to the router, which answers about itself.
-          # That must not read as "not ready" — the target of a ROLLBACK is an older
-          # image by definition, and the emergency path is the worst place to be strict.
-          # Checked on EVERY attempt, not once up front: a standby that has not finished
-          # booting answers 000, and a single early probe would miss the 404 entirely and
-          # then burn the whole window on an image that was never going to serve it.
-          # A 503 is different — the route exists and says not-ready, a real verdict.
-          if [ -n "$PROBE_URL" ]; then break; fi   # operator chose this URL; respect it
-          # Fall back ONCE. The immediate retry below skips the interval on purpose, so
-          # re-entering this arm every attempt would spend the whole PROBE_RETRIES budget
-          # in a tight loop — the ~5min window collapsing into about a second, and the
-          # three warnings printed once per attempt. Past the first fallback a 404 is an
-          # ordinary failure of HEALTH_PATH (a custom HEALTH_PATH that side does not
-          # serve, say), so it falls through to the interval sleep and keeps waiting.
-          if [ "$fell_back" = 1 ]; then
-            log "  probe attempt ${pi}/${PROBE_RETRIES} got 404 on the ${HEALTH_PATH} fallback too"
-          else
-            fell_back=1
-            warn "side ${target} does not serve ${PROBE_PATH} (404) — it predates readiness gating"
-            warn "falling back to ${HEALTH_PATH}: this only checks the process is up, NOT that it can"
-            warn "serve. It cannot tell you whether that side can reach providers or the chain."
-            probe="$(platform_probe_url "$target" "$HEALTH_PATH")"
-            continue   # retry immediately against the fallback, without burning an interval
-          fi
-          ;;
-      esac
-      if [ "$pi" -lt "$PROBE_RETRIES" ]; then
-        log "  probe attempt ${pi}/${PROBE_RETRIES} got ${status}, retrying in ${PROBE_INTERVAL}s"
-        sleep "$PROBE_INTERVAL"
-      fi
-    done
-    [ "$probe_ok" = 1 ] || die "target-side probe failed after ${PROBE_RETRIES} attempts ($probe) — refusing to switch"
-    info "target-side probe OK"
-  fi
-
+  [ -n "$probe" ] || die "no probe URL for side ${target} (PLATFORM_BASE unset?)"
+  info "probing target side ${target} directly: $probe"
+  info "  (up to ${PROBE_RETRIES} attempts ${PROBE_INTERVAL}s apart — a cold side must finish its first warmer sweep)"
+  local pi probe_ok=0 status fell_back=0
+  for ((pi=1; pi<=PROBE_RETRIES; pi++)); do
+    status="$(http_status "$probe")"
+    case "$status" in
+      2*) probe_ok=1; break ;;
+      404)
+        # A side that PREDATES readiness gating does not serve PROBE_PATH at all: the
+        # path falls through its catch-all to the router, which answers about itself.
+        # That must not read as "not ready" — the target of a ROLLBACK is an older
+        # image by definition, and the emergency path is the worst place to be strict.
+        # Checked on EVERY attempt, not once up front: a standby that has not finished
+        # booting answers 000, and a single early probe would miss the 404 entirely and
+        # then burn the whole window on an image that was never going to serve it.
+        # A 503 is different — the route exists and says not-ready, a real verdict.
+        if [ -n "$PROBE_URL" ]; then break; fi   # operator chose this URL; respect it
+        # Fall back ONCE. The immediate retry below skips the interval on purpose, so
+        # re-entering this arm every attempt would spend the whole PROBE_RETRIES budget
+        # in a tight loop — the ~5min window collapsing into about a second, and the
+        # three warnings printed once per attempt. Past the first fallback a 404 is an
+        # ordinary failure of HEALTH_PATH (a custom HEALTH_PATH that side does not
+        # serve, say), so it falls through to the interval sleep and keeps waiting.
+        if [ "$fell_back" = 1 ]; then
+          log "  probe attempt ${pi}/${PROBE_RETRIES} got 404 on the ${HEALTH_PATH} fallback too"
+        else
+          fell_back=1
+          warn "side ${target} does not serve ${PROBE_PATH} (404) — it predates readiness gating"
+          warn "falling back to ${HEALTH_PATH}: this only checks the process is up, NOT that it can"
+          warn "serve. It cannot tell you whether that side can reach providers or the chain."
+          probe="$(platform_probe_url "$target" "$HEALTH_PATH")"
+          continue   # retry immediately against the fallback, without burning an interval
+        fi
+        ;;
+    esac
+    if [ "$pi" -lt "$PROBE_RETRIES" ]; then
+      log "  probe attempt ${pi}/${PROBE_RETRIES} got ${status}, retrying in ${PROBE_INTERVAL}s"
+      sleep "$PROBE_INTERVAL"
+    fi
+  done
+  [ "$probe_ok" = 1 ] || die "target-side probe failed after ${PROBE_RETRIES} attempts ($probe) — refusing to switch"
+  info "target-side probe OK"
 }
 
 # Wait for the public endpoint to be served by side $1. Returns 0 once verified,
@@ -689,7 +687,7 @@ cmd_setup() {
   resolve_zone_id
   local cur; cur="$(current_cname "$SERVING_ALIAS")"
   if [ -z "$PLATFORM_BASE" ]; then
-    # Help the operator "freeze" whatever the single-instance container wrote.
+    # Show where the alias points today, so the cluster can be read off it.
     [ -n "$cur" ] && info "serving alias ${SERVING_ALIAS} currently -> ${cur}"
     die "set PLATFORM_BASE (<cluster>.phala.network, read off a CVM's kms_info.gateway_app_url)"
   fi
