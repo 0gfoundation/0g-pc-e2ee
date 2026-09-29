@@ -37,3 +37,15 @@ jobs:
             ( cd "$m" && go vet ./... && go build ./... && go test -race ./... )
             echo "::endgroup::"
           done
+
+  switch-sh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # shellcheck and jq ship on the ubuntu-latest image.
+      - name: shellcheck
+        run: shellcheck deploy/phala/switch.sh deploy/phala/switch_test.sh
+
+      - name: switch.sh tests
+        run: deploy/phala/switch_test.sh
