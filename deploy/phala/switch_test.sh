@@ -188,6 +188,7 @@ case "${1:-}" in
     echo "CERT $app" ;;
   x509)
     read -r _ app || exit 1
+    [ -n "${app:-}" ] || exit 1   # no certificate on stdin, as real openssl would fail
     days="$(cat "$S/cert.$app" 2>/dev/null || echo 80)"
     shift
     while [ $# -gt 0 ]; do
@@ -289,6 +290,28 @@ expect_rc 0 && expect_out "-> _.${BASE}" && expect_out "[a]" \
   && expect_out "appa:443" && expect_out "appb:443" \
   && expect_out "https://appb-443s.${BASE}/readyz" && expect_out "live side       : a" \
   && expect_no_writes && ok
+
+t "status: shows each side's cluster and certificate"
+cross
+run "${X[@]}" -- status
+expect_rc 0 && expect_out "cluster=${BASE}" && expect_out "cluster=${BB}" \
+  && expect_out "probe=https://appb-443s.${BB}/readyz" && expect_out "cert  : OK   expires in 80 days" && ok
+
+t "status: a standby cert close to expiry says how to renew it"
+echo 10 >"$S/cert.appb"
+run PLATFORM_BASE=$BASE -- status
+expect_rc 0 && expect_out "cert  : SOON expires in 10 days" && expect_out "it cannot renew: issuance points at a" \
+  && expect_out "acme b, wait for it to issue, then" && ok
+
+t "status: the live side close to expiry points at its own renewal"
+echo 10 >"$S/cert.appa"
+run PLATFORM_BASE=$BASE -- status
+expect_rc 0 && expect_out "it should be renewing" && ok
+
+t "status: a side in a down cluster has an unreadable cert"
+cross; touch "$S/down.${BB}"
+run "${X[@]}" -- status
+expect_rc 0 && expect_out "cert  : unreadable" && ok
 
 t "status: reads each side's app-address once"
 run PLATFORM_BASE=$BASE -- status
