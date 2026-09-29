@@ -273,10 +273,43 @@ which_side() { # current-target
 # ---------------------------------------------------------------------------
 # The app_id:port a side currently publishes, read straight from the delegation
 # zone (authoritative, no public-DNS propagation lag). Each side's dstack-ingress
-# writes this per-side TXT itself; we only read it.
-side_app_addr() { # a|b
+# writes this per-side TXT itself; we only read it — so within one run it cannot
+# change under us, and load_side_addrs reads both once. It must be called
+# directly, not in `$(...)`, for the cache to reach the caller; side_app_addr
+# still works uncached if it was not.
+SIDE_ADDRS_LOADED=0 SIDE_ADDR_a="" SIDE_ADDR_b=""
+read_side_app_addr() { # a|b
   cf_records_at "$(addr_target "$1")" \
     | awk -F'\t' '$2=="TXT"{print $3; exit}' | sed 's/^"//; s/"$//'
+}
+load_side_addrs() {
+  [ "$SIDE_ADDRS_LOADED" = 1 ] && return 0
+  SIDE_ADDR_a="$(read_side_app_addr a)"
+  SIDE_ADDR_b="$(read_side_app_addr b)"
+  SIDE_ADDRS_LOADED=1
+}
+side_app_addr() { # a|b
+  if [ "$SIDE_ADDRS_LOADED" != 1 ]; then read_side_app_addr "$1"; return; fi
+  case "$(side_name "$1")" in a) echo "$SIDE_ADDR_a" ;; b) echo "$SIDE_ADDR_b" ;; esac
+}
+
+# Warn when both sides publish the same app_id. A side's identity is its app_id,
+# which is assigned when the app is CREATED, not derived from the compose text —
+# so two sides created as separate apps are distinct even when byte-identical,
+# and conversely a CVM created UNDER an existing app_id joins that app as an
+# instance. Both sides publishing the SAME app_id therefore means one app is
+# behind both records, and dstack will route to either instance, so the switch
+# cannot isolate the target. That defeats the purpose; make it loud.
+warn_if_same_app_id() {
+  local app_a app_b
+  app_a="$(side_app_addr a)"; app_b="$(side_app_addr b)"
+  [ -n "$app_a" ] && [ "$app_a" = "$app_b" ] || return 0
+  warn "both sides publish the same app_id (${app_a}) — dstack treats them as instances"
+  warn "of ONE app and routes to either, so the switch cannot select between them."
+  warn "Usually one side was created under the other's app_id (an instance or an"
+  warn "in-place upgrade) instead of as its own app; a stale record left by a"
+  warn "replaced CVM does it too. Each side must be a separately created app —"
+  warn "adding instances to a side is scaling, not a second side."
 }
 
 http_status() { # url -> the HTTP status code, or 000 if unreachable
@@ -289,9 +322,7 @@ http_status() { # url -> the HTTP status code, or 000 if unreachable
 http_ok() { # url -> 0 if HTTP 2xx. -k: we check reachability/health, not cert
   # validity (that is covered by the evidence bundle and the fingerprint check),
   # and staging/per-side endpoints legitimately serve a cert for another name.
-  local code
-  code="$(curl -sSk -o /dev/null -w '%{http_code}' --max-time 10 "$1" 2>/dev/null || echo 000)"
-  [[ "$code" =~ ^2[0-9][0-9]$ ]]
+  [[ "$(http_status "$1")" =~ ^2[0-9][0-9]$ ]]
 }
 
 # A per-side READINESS URL that reaches THAT side directly, by app-id, via the
@@ -387,21 +418,13 @@ cmd_status() {
   printf 'issuance switch : _acme-challenge.%s\n' "$DOMAIN"
   printf '   -> %s  [%s]\n\n' "${acme_now:-<unset>}" "${acme_side:-none}"
 
-  local s app_a app_b
-  app_a="$(side_app_addr a || true)"
-  app_b="$(side_app_addr b || true)"
+  local s
+  load_side_addrs
   for s in a b; do
     printf 'side %s : app_id=%-45s probe=%s\n' \
-      "$s" "$(side_app_addr "$s" || true)" "$(platform_probe_url "$s" || true)"
+      "$s" "$(side_app_addr "$s")" "$(platform_probe_url "$s")"
   done
-  if [ -n "$app_a" ] && [ "$app_a" = "$app_b" ]; then
-    warn "both sides publish the same app_id — dstack treats them as instances of"
-    warn "ONE app and routes to either, so the switch cannot select between them."
-    warn "Usually one side was created under the other's app_id (an instance or an"
-    warn "in-place upgrade) instead of as its own app; a stale record left by a"
-    warn "replaced CVM does it too. Each side must be a separately created app —"
-    warn "adding instances to a side is scaling, not a second side."
-  fi
+  warn_if_same_app_id
   printf '\n'
 
   if public_health_ok; then
@@ -437,28 +460,14 @@ move_switches() { # target-side  [--acme-only]
 # app-address — and gate 2 — it answers its readiness probe.
 gate_target() { # target-side
   local target="$1"
+  load_side_addrs
   # Gate 1: the target side must actually be publishing an app-address.
   local tgt_addr; tgt_addr="$(side_app_addr "$target")"
   if [ -z "$tgt_addr" ]; then
     die "side ${target} publishes no app-address TXT at $(addr_target "$target") — is that CVM up and did its ingress publish?"
   fi
   info "side ${target} publishes app_id: ${tgt_addr}"
-
-  # A side's identity is its app_id, which is assigned when the app is CREATED,
-  # not derived from the compose text — so two sides created as separate apps are
-  # distinct even when byte-identical, and conversely a CVM created UNDER an
-  # existing app_id joins that app as an instance. Both sides publishing the SAME
-  # app_id therefore means one app is behind both records, and dstack will route
-  # to either instance, so the switch cannot isolate the target. That defeats the
-  # purpose; make it loud.
-  local other_addr; other_addr="$(side_app_addr "$(other_side "$target")")"
-  if [ -n "$other_addr" ] && [ "$other_addr" = "$tgt_addr" ]; then
-    warn "both sides publish the same app_id (${tgt_addr}) — one app is behind"
-    warn "both records, so dstack treats them as its instances and this switch"
-    warn "cannot select between them. Check that each side was created as its OWN"
-    warn "app rather than under the other's app_id, and that neither record is a"
-    warn "leftover from a replaced CVM."
-  fi
+  warn_if_same_app_id
 
   # Gate 2: verify the TARGET side can actually SERVE before we send it any
   # traffic — /readyz, not /healthz (see platform_probe_url). Prefer an explicit
