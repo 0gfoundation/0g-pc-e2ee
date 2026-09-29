@@ -227,6 +227,14 @@ reset() {
 
 # Drop the record(s) at a name.
 drop() { jq --arg n "$1" 'map(select(.name!=$n))' "$S/records.json" >"$S/r.tmp" && mv "$S/r.tmp" "$S/records.json"; }
+# Repoint the CNAME at a name.
+point() { jq --arg n "$1" --arg c "$2" 'map(if .name==$n and .type=="CNAME" then .content=$c else . end)' "$S/records.json" >"$S/r.tmp" && mv "$S/r.tmp" "$S/records.json"; }
+# Side b in a second cluster; X is the matching config.
+BB=prod5.phala.network
+X=("PLATFORM_BASE_A=$BASE" "PLATFORM_BASE_B=$BB")
+cross() { echo "$BB" >"$S/cluster.appb"; }
+# The state a completed cross-cluster move to b leaves.
+on_b() { cross; point "$ADDR_SWITCH" "$(addr_side b)"; point "$ACME_SWITCH" "$(acme_side b)"; point "$ALIAS" "_.${BB}"; }
 health() { echo "$*" >>"$S/health"; }
 
 # run [VAR=val …] -- switch.sh args…   → sets OUT and RC
@@ -264,6 +272,10 @@ expect_reads() { # name count — Cloudflare lookups of that name
   [ "$n" = "$2" ] || { fail "$1 read ${n} times, want $2"; return 1; }
 }
 expect_probed()     { grep -qF -- " $1 " "$S/http.log" || { fail "never requested $1"; return 1; }; }
+expect_writes() { # expected write lines, in order, and nothing else
+  local want; want="$(printf '%s\n' "$@")"
+  [ "$(cat "$S/writes.log")" = "$want" ] || { fail "writes were: $(tr '\n' ';' <"$S/writes.log") want: $(tr '\n' ';' <<<"$want")"; return 1; }
+}
 expect_not_probed() { ! grep -q -- "-443s\." "$S/http.log" || { fail "probed a side: $(grep -- '-443s\.' "$S/http.log" | head -n1)"; return 1; }; }
 
 # ---------------------------------------------------------------------------
@@ -292,9 +304,10 @@ jq --arg n "$ALIAS" 'map(if .name==$n then .content="in1.phala.network" else . e
 run PLATFORM_BASE=$BASE -- status
 expect_rc 0 && expect_out "serving alias is not a gateway hop" && ok
 
-t "status: warns when the alias and PLATFORM_BASE name different clusters"
+t "status: warns when the alias is not on the live side's cluster (split state)"
 run PLATFORM_BASE=prod5.phala.network -- status
-expect_rc 0 && expect_out "name different clusters" && ok
+expect_rc 0 && expect_out "split state: the serving alias ${ALIAS} -> _.${BASE}, but side a runs on _.prod5.phala.network" \
+  && expect_out "failover a" && ok
 
 t "setup: writes the serving alias as _.<PLATFORM_BASE>"
 drop "$ALIAS"
@@ -377,14 +390,15 @@ t "switch: refuses without PLATFORM_BASE even with --probe-url"
 run -- switch b --yes --probe-url https://custom.example/readyz
 expect_fail && expect_out "set PLATFORM_BASE" && expect_no_writes && ok
 
-t "switch: refuses when the serving alias is on another cluster"
+t "switch: refuses when the serving alias is not on the live side's cluster"
 run PLATFORM_BASE=prod5.phala.network -- switch b --yes
-expect_fail && expect_out "is not on PLATFORM_BASE=prod5.phala.network" && expect_not_probed && expect_no_writes && ok
+expect_fail && expect_out "side a is not reachable now" && expect_out "failover <a|b>" \
+  && expect_not_probed && expect_no_writes && ok
 
-t "switch: runs before setup (no serving alias yet)"
+t "switch: runs before setup, and creates the serving alias"
 drop "$ALIAS"
 run PLATFORM_BASE=$BASE -- switch b --yes --no-verify
-expect_rc 0 && expect_cname "$ADDR_SWITCH" "$(addr_side b)" && ok
+expect_rc 0 && expect_cname "$ADDR_SWITCH" "$(addr_side b)" && expect_cname "$ALIAS" "_.${BASE}" && ok
 
 t "switch: refuses when the traffic switch points at neither side"
 jq --arg n "$ADDR_SWITCH" 'map(if .name==$n then .content="elsewhere.example" else . end)' "$S/records.json" >"$S/r.tmp" && mv "$S/r.tmp" "$S/records.json"
@@ -448,6 +462,109 @@ t "acme: moves only the issuance switch"
 run -- acme b --yes
 expect_rc 0 && expect_cname "$ACME_SWITCH" "$(acme_side b)" && expect_cname "$ADDR_SWITCH" "$(addr_side a)" \
   && expect_not_probed && ok
+
+t "switch: within one cluster, the serving alias is not written"
+run PLATFORM_BASE=$BASE -- switch b --yes
+expect_rc 0 && expect_writes "PUT ${ACME_SWITCH} CNAME $(acme_side b)" "PUT ${ADDR_SWITCH} CNAME $(addr_side b)" && ok
+
+t "switch: refuses without a cluster for every side"
+run PLATFORM_BASE_A=$BASE -- switch b --yes
+expect_fail && expect_out "set PLATFORM_BASE" && expect_no_writes && ok
+
+t "cross-cluster switch: probes b on its own cluster, then moves issuance, traffic, alias"
+cross
+run "${X[@]}" -- switch b --yes
+expect_rc 0 && expect_probed "appb-443s.${BB}/readyz" && expect_out "cross-cluster: the serving alias moves _.${BASE} -> _.${BB}" \
+  && expect_writes "PUT ${ACME_SWITCH} CNAME $(acme_side b)" "PUT ${ADDR_SWITCH} CNAME $(addr_side b)" "PUT ${ALIAS} CNAME _.${BB}" \
+  && expect_out "now served by b (cert changed)" && ok
+
+t "cross-cluster switch: gate 2 fails when b is not in the cluster configured for it"
+cross
+run PLATFORM_BASE=$BASE -- switch b --yes
+expect_fail && expect_out "refusing to switch" && expect_no_writes && ok
+
+t "cross-cluster switch: auto-rollback restores the serving alias too"
+cross
+health "public:appb /healthz 500"
+run "${X[@]}" -- switch b --yes
+expect_fail && expect_out "AUTO-ROLLBACK" && expect_cname "$ADDR_SWITCH" "$(addr_side a)" \
+  && expect_cname "$ALIAS" "_.${BASE}" && expect_cname "$ACME_SWITCH" "$(acme_side a)" && ok
+
+t "cross-cluster rollback: moves traffic and alias back to a"
+on_b
+run "${X[@]}" -- rollback --yes
+expect_rc 0 && expect_cname "$ADDR_SWITCH" "$(addr_side a)" && expect_cname "$ALIAS" "_.${BASE}" && ok
+
+t "switch: completes a move left split between its writes"
+cross; point "$ADDR_SWITCH" "$(addr_side b)"   # traffic names b, alias still on a's cluster
+run "${X[@]}" -- switch b --yes
+expect_rc 0 && expect_out "split state" && expect_writes "PUT ${ACME_SWITCH} CNAME $(acme_side b)" "PUT ${ALIAS} CNAME _.${BB}" \
+  && expect_no_out "AUTO-ROLLBACK" && ok
+
+t "switch: refuses to leave a split state for the other side"
+cross; point "$ALIAS" "_.${BB}"   # traffic on a, alias on b's cluster
+run "${X[@]}" -- switch b --yes
+expect_fail && expect_out "side a is not reachable now" && expect_no_writes && ok
+
+t "setup: follows the live side's cluster"
+cross; on_b; drop "$ALIAS"
+run "${X[@]}" -- setup --yes
+expect_rc 0 && expect_cname "$ALIAS" "_.${BB}" && ok
+
+t "setup: refuses to point the alias away from the live side"
+cross
+run "${X[@]}" -- setup b --yes
+expect_fail && expect_out "would strand it" && expect_no_writes && ok
+
+t "setup: with no live side and two clusters, the side must be named"
+cross; drop "$ADDR_SWITCH"; drop "$ALIAS"
+run "${X[@]}" -- setup --yes
+if expect_fail && expect_out "name the one to serve from"; then
+  run "${X[@]}" -- setup b --yes
+  expect_rc 0 && expect_cname "$ALIAS" "_.${BB}" && ok
+fi
+
+t "failover: to b while a's whole cluster is down"
+cross; touch "$S/down.${BASE}"
+run "${X[@]}" -- failover b --yes
+expect_rc 0 && expect_out "verifying /healthz only" && expect_out "public health OK after switch to b" \
+  && expect_cname "$ADDR_SWITCH" "$(addr_side b)" && expect_cname "$ALIAS" "_.${BB}" && expect_cname "$ACME_SWITCH" "$(acme_side b)" && ok
+
+t "failover: a failed verify does not roll back"
+cross; touch "$S/down.${BASE}"
+health "public:appb /healthz 500"
+run "${X[@]}" -- failover b --yes
+expect_fail && expect_out "NOT rolling back" && expect_no_out "AUTO-ROLLBACK" \
+  && expect_cname "$ADDR_SWITCH" "$(addr_side b)" && expect_cname "$ALIAS" "_.${BB}" && ok
+
+t "failover: still refuses a target that is not ready"
+cross; touch "$S/down.${BASE}"
+health "appb-443s.${BB} /readyz 503"
+run "${X[@]}" -- failover b --yes
+expect_fail && expect_out "refusing to switch" && expect_no_writes && ok
+
+t "failover: to the side already live and consistent is a no-op"
+run "${X[@]}" -- failover a --yes
+expect_rc 0 && expect_out "nothing to do" && expect_no_writes && ok
+
+t "failover: overwrites an unrecognized traffic switch"
+cross; point "$ADDR_SWITCH" "elsewhere.example"
+run "${X[@]}" -- failover b --yes
+expect_rc 0 && expect_out "overwriting it" && expect_cname "$ADDR_SWITCH" "$(addr_side b)" && ok
+
+t "failover: same cluster, a still up — the cert check still applies"
+run PLATFORM_BASE=$BASE -- failover b --yes
+expect_rc 0 && expect_out "now served by b (cert changed)" && ok
+
+t "failover: --dry-run changes nothing"
+cross; touch "$S/down.${BASE}"
+run "${X[@]}" -- failover b --dry-run
+expect_rc 0 && expect_out "[dry-run] update ${ALIAS} CNAME -> _.${BB}" && expect_no_writes && ok
+
+t "rollback: after a failover, refuses while a's cluster is still down"
+on_b; touch "$S/down.${BASE}"
+run "${X[@]}" -- rollback --yes
+expect_fail && expect_out "refusing to switch" && expect_no_writes && ok
 
 t "env file: values load, the real environment wins"
 echo "PLATFORM_BASE=prod5.phala.network" >"$S/env"
