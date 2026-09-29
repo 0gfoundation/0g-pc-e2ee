@@ -95,6 +95,7 @@
 #   VERIFY_INTERVAL  seconds between attempts       (default: 6)
 #   PROBE_RETRIES    pre-switch target probe tries  (default: 30, PROBE_INTERVAL apart)
 #   PROBE_INTERVAL   seconds between probe attempts (default: 10)
+#   CERT_WARN_DAYS   `status` flags a side cert valid for fewer days (default: 21)
 #
 # The two probes measure different things on purpose. The post-switch check
 # (HEALTH_PATH + VERIFY_*) asks "did traffic land on the new side yet", so its
@@ -370,6 +371,29 @@ served_cert_fp() {
     | openssl x509 -noout -fingerprint -sha256 2>/dev/null | sed 's/.*=//'
 }
 
+# A side's own certificate, read through its `-443s` platform hostname (routed
+# by app_id, so this reaches a standby too; the ingress presents the cert it
+# holds for DOMAIN whatever the SNI). Prints its notAfter date and returns 0 if
+# it is valid for more than CERT_WARN_DAYS, 1 if it expires sooner, 2 if it
+# could not be read (side or cluster down, no openssl, no cluster configured).
+#
+# This is the check that matters for a standby: only the side the issuance
+# switch points at can renew, so a side kept in reserve ages until its cert runs
+# out, and a failover onto it would then serve an expired certificate.
+side_cert_expiry() { # a|b
+  command -v openssl >/dev/null 2>&1 || return 2
+  local base addr host pem end
+  base="$(side_base "$1")"; addr="$(side_app_addr "$1")"
+  [ -n "$base" ] && [ -n "$addr" ] || return 2
+  host="${addr%%:*}-443s.${base}"
+  pem="$(echo | openssl s_client -servername "$host" -connect "${host}:443" 2>/dev/null || true)"
+  end="$(openssl x509 -noout -enddate <<<"$pem" 2>/dev/null || true)"
+  end="${end#notAfter=}"
+  [ -n "$end" ] || return 2
+  echo "$end"
+  openssl x509 -noout -checkend $((CERT_WARN_DAYS * 86400)) <<<"$pem" >/dev/null 2>&1 || return 1
+}
+
 confirm() {
   [ "$DRY_RUN" = 1 ] && return 0        # dry-run changes nothing; never prompt
   [ "$ASSUME_YES" = 1 ] && return 0
@@ -439,11 +463,24 @@ cmd_status() {
   printf 'issuance switch : _acme-challenge.%s\n' "$DOMAIN"
   printf '   -> %s  [%s]\n\n' "${acme_now:-<unset>}" "${acme_side:-none}"
 
-  local s
+  local s end rc
   load_side_addrs
   for s in a b; do
-    printf 'side %s : app_id=%-45s probe=%s\n' \
-      "$s" "$(side_app_addr "$s")" "$(platform_probe_url "$s")"
+    printf 'side %s : app_id=%-45s cluster=%s\n' \
+      "$s" "$(side_app_addr "$s")" "$(side_base "$s")"
+    printf '         probe=%s\n' "$(platform_probe_url "$s")"
+    rc=0; end="$(side_cert_expiry "$s")" || rc=$?
+    case "$rc" in
+      0) printf '         cert  : %sOK%s   expires %s\n' "$c_grn" "$c_rst" "$end" ;;
+      1) printf '         cert  : %sSOON%s expires %s\n' "$c_red" "$c_rst" "$end"
+         if [ "$acme_side" = "$s" ]; then
+           warn "side ${s}'s cert expires within ${CERT_WARN_DAYS} days although issuance points at it — it should be renewing; check its dstack-ingress log."
+         else
+           warn "side ${s}'s cert expires within ${CERT_WARN_DAYS} days and it cannot renew: issuance points at ${acme_side:-no side}."
+           warn "  Renew it: $0 acme ${s}, wait for it to issue, then $0 acme ${acme_side:-<live side>}."
+         fi ;;
+      *) printf '         cert  : unreadable\n' ;;
+    esac
   done
   warn_if_same_app_id
   printf '\n'
@@ -898,6 +935,7 @@ VERIFY_INTERVAL="${VERIFY_INTERVAL:-6}"
 PROBE_PATH="${PROBE_PATH:-/readyz}"      # standby readiness path (gate 2); /healthz is liveness only
 PROBE_RETRIES="${PROBE_RETRIES:-30}"     # pre-switch target probe attempts before refusing to switch
 PROBE_INTERVAL="${PROBE_INTERVAL:-10}"   # seconds between them: 30x10s ≈ 5min, enough for a cold first sweep
+CERT_WARN_DAYS="${CERT_WARN_DAYS:-21}"   # `status` warns when a side's cert is valid for fewer days than this
 
 # Switch-layer record names (in the delegation zone) that this script owns.
 SERVING_ALIAS="${DOMAIN}.${DELEGATION_ZONE}"           # -> _.<live side's cluster> (`setup`, and moved by `switch`/`failover`)
