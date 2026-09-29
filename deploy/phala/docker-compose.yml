@@ -107,8 +107,7 @@ services:
       # Publishes 443 on the CVM so the dstack gateway can reach HAProxy in here. It
       # passes SNI it holds no wildcard cert for straight through at L4, taking the
       # target from the `_dstack-app-address` TXT record, so TLS is never terminated
-      # outside this CVM. Any SNI outside the gateway's base domain takes that
-      # path; there is no per-domain registration with the platform.
+      # outside this CVM.
       - "443:443"
     environment:
       - DNS_PROVIDER=cloudflare
