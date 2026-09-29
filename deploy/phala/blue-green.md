@@ -296,11 +296,11 @@ provider rejects it, and that container crash-loops with the reason in its log
 while the gateway keeps serving. The `docker-compose.yml` comment on that line has
 why it is deliberately unguarded.)
 
-Across clusters this record does matter to the switch layer, but only as a
-check: `switch.sh` writes the serving alias from `PLATFORM_BASE_A`/`_B`, and the
-per-side probe (`<app_id>-443s.<that side's base>`) only answers if the side
-really runs in the cluster configured for it. See
-[Cross-cluster fallback](#cross-cluster-fallback).
+Across clusters this record is still not read. `switch.sh` writes the serving
+alias from `PLATFORM_BASE_A`/`_B` instead, and a wrong value there is caught
+before anything is written: the per-side probe
+(`<app_id>-443s.<that side's base>`) only answers if the side really runs in the
+cluster configured for it. See [Cross-cluster fallback](#cross-cluster-fallback).
 
 ## One-time setup
 
