@@ -28,20 +28,24 @@
 #     <DOMAIN>                      CNAME -> <DOMAIN>.<DZ>
 #
 #   delegation zone <DZ>=integratenetwork.work — the SWITCH LAYER (this script):
-#     _dstack-app-address.<DOMAIN>.<DZ>  CNAME -> _dstack-app-address.<DOMAIN>.a.<DZ>  | .b.<DZ>   <-- traffic
-#     _acme-challenge.<DOMAIN>.<DZ>      CNAME -> _acme-challenge.<DOMAIN>.a.<DZ>      | .b.<DZ>   <-- issuance
+#     _dstack-app-address.<DOMAIN>.<DZ>  CNAME -> _dstack-app-address.<DOMAIN>.a.<DZ>  | .b. | .c.  <-- traffic
+#     _acme-challenge.<DOMAIN>.<DZ>      CNAME -> _acme-challenge.<DOMAIN>.a.<DZ>      | .b. | .c.  <-- issuance
 #     <DOMAIN>.<DZ>                      CNAME -> _.<live side's cluster>                             <-- serving alias
 #
 #   delegation zone <DZ> — PER-SIDE records, written by each CVM's dstack-ingress:
 #     a side (DELEGATION_ZONE=a.<DZ>):  _dstack-app-address.<DOMAIN>.a.<DZ> TXT = <app_id_a>:443
 #     b side (DELEGATION_ZONE=b.<DZ>):  _dstack-app-address.<DOMAIN>.b.<DZ> TXT = <app_id_b>:443
+#     c side (DELEGATION_ZONE=c.<DZ>):  _dstack-app-address.<DOMAIN>.c.<DZ> TXT = <app_id_c>:443
 #
+# a and b are the main pair, in the main cluster (PLATFORM_BASE); releases flip
+# between them. c is an optional cold standby in another cluster
+# (PLATFORM_BASE_COLD), used only if the main cluster is lost (or in a drill).
 # So `switch a|b` repoints the two switch-layer CNAMEs at the chosen side's
-# per-side records, and the serving alias at that side's cluster — which is a
-# no-op unless the sides run in different clusters (PLATFORM_BASE_A/_B).
-# dstack-ingress on the Cloudflare provider resolves the longest parent zone it
-# can access, so a.<DZ>/b.<DZ> need NOT be real Cloudflare
-# zones — one token scoped to <DZ> covers them.
+# per-side records; moving onto or off c also repoints the serving alias at that
+# side's cluster, which within the main pair is a no-op. dstack-ingress on the
+# Cloudflare provider resolves the longest parent zone it can access, so
+# a.<DZ>/b.<DZ>/c.<DZ> need NOT be real Cloudflare zones — one token scoped to
+# <DZ> covers them.
 #
 # See deploy/phala/blue-green.md for the full runbook (one-time setup, migration
 # from a single instance, certificate issuance, and the standby-probe options).
@@ -55,13 +59,15 @@
 #
 # Usage:
 #   ./switch.sh status                               # (reads switch.env if present)
-#   ./switch.sh setup [a|b]                          # one-time: serving alias -> the live
+#   ./switch.sh setup [a|b|c]                        # one-time: serving alias -> the live
 #                                                    # (or named) side's cluster
-#   ./switch.sh switch b                             # flip traffic (+ acme, + alias) to side b;
+#   ./switch.sh switch b                             # flip traffic (+ acme) to side b;
 #                                                    # auto-rollback if b does not verify
-#   ./switch.sh failover b                           # same flip when the live side is gone:
+#   ./switch.sh switch c                             # planned move onto the cold standby (a drill)
+#   ./switch.sh failover c                           # same flip when the live side is gone:
 #                                                    # no rollback, old side need not answer
-#   ./switch.sh rollback                             # flip to the other side (live side read from DNS; stateless)
+#   ./switch.sh rollback                             # flip to the other main side (live side read
+#                                                    # from DNS; stateless). Refused while c is live
 #   ./switch.sh acme b                               # point ONLY the issuance switch at b
 #   CF_API_TOKEN=... ./switch.sh status              # or supply config via the environment
 #
@@ -78,16 +84,17 @@
 #   CF_ZONE          delegation zone name           (default: integratenetwork.work)
 #   DOMAIN           served hostname                (default: router-api-tee.0g.ai)
 #   DELEGATION_ZONE  base delegation zone           (default: same as CF_ZONE)
-#   PLATFORM_BASE    dstack platform base domain    (e.g. in1.phala.network) — the cluster
-#                    both sides run in. Required by setup, switch, failover and
-#                    rollback, unless PLATFORM_BASE_A and PLATFORM_BASE_B are both set.
-#   PLATFORM_BASE_A  side a's / side b's cluster    (default: PLATFORM_BASE) — set them
-#   PLATFORM_BASE_B  when the sides run in different clusters. A side's cluster is
-#                    where its pre-switch probe goes (<app_id>-443s.<base>) and what
-#                    the serving alias names (_.<base>) while it is live. A leading
-#                    `_.` is accepted and stripped on read.
+#   PLATFORM_BASE    dstack platform base domain    (e.g. in1.phala.network) — the main
+#                    cluster, where a and b run. Required by setup, switch, failover
+#                    and rollback.
+#   PLATFORM_BASE_COLD  the cold standby's cluster  (unset = no cold standby) — where
+#                    side c runs. Required by any command that moves traffic onto or
+#                    off c. A side's cluster is where its pre-switch probe goes
+#                    (<app_id>-443s.<base>) and what the serving alias names
+#                    (_.<base>) while it is live. A leading `_.` is accepted on both.
 #   SIDE_A_LABEL     sub-zone label for side a      (default: a)
 #   SIDE_B_LABEL     sub-zone label for side b      (default: b)
+#   SIDE_C_LABEL     sub-zone label for side c      (default: c)
 #   TXT_PREFIX       app-address record prefix      (default: _dstack-app-address)
 #   HEALTH_PATH      public health path             (default: /healthz — post-switch check)
 #   PROBE_PATH       standby readiness path         (default: /readyz — pre-switch gate 2)
@@ -161,23 +168,35 @@ load_env_file() { # path
 }
 
 # side label helpers ---------------------------------------------------------
-side_label() { # a|b|blue|green -> configured label
+# Three sides, two roles. a and b are the MAIN pair: they run in the main
+# cluster (PLATFORM_BASE) and take turns serving, one release at a time. c is the
+# COLD standby: one CVM in another cluster (PLATFORM_BASE_COLD) that serves only
+# when failed over to, because the main cluster is gone or for a drill.
+side_label() { # a|b|c (or blue|green|cold) -> configured label
   case "$1" in
     a|A|blue)  echo "$SIDE_A_LABEL" ;;
     b|B|green) echo "$SIDE_B_LABEL" ;;
-    *) die "unknown side '$1' (want: a|b, or blue|green)" ;;
+    c|C|cold)  echo "$SIDE_C_LABEL" ;;
+    *) die "unknown side '$1' (want: a|b|c, or blue|green|cold)" ;;
   esac
 }
-# Normalize a side to a|b. Die (don't echo it back) on anything else, so a typo
-# like `switch c` fails at the argument instead of flowing into a record name.
-side_name() { case "$1" in a|A|blue) echo "a";; b|B|green) echo "b";; *) die "unknown side '$1' (want: a|b, or blue|green)";; esac; }
-other_side() { case "$(side_name "$1")" in a) echo b;; b) echo a;; esac; }
+# Normalize a side to a|b|c. Die (don't echo it back) on anything else, so a typo
+# like `switch d` fails at the argument instead of flowing into a record name.
+side_name() {
+  case "$1" in
+    a|A|blue) echo "a";; b|B|green) echo "b";; c|C|cold) echo "c";;
+    *) die "unknown side '$1' (want: a|b|c, or blue|green|cold)";;
+  esac
+}
+# The other side of the main pair. The cold standby has none: it is not half of
+# a pair, so "the other one" is not defined for it.
+other_side() { case "$(side_name "$1")" in a) echo b;; b) echo a;; c) return 1;; esac; }
 
 # The cluster (dstack platform base domain) a side runs in, and the serving-alias
 # value that sends traffic to that cluster's gateway: its wildcard hop `_.<base>`,
 # never the bare base — `pcverify` rejects a CNAME chain that does not end at
 # `_.<base>` (client/evidence/appcompose.go, deriveBaseDomain).
-side_base() { case "$(side_name "$1")" in a) echo "$PLATFORM_BASE_A" ;; b) echo "$PLATFORM_BASE_B" ;; esac; }
+side_base() { case "$(side_name "$1")" in a|b) echo "$PLATFORM_BASE" ;; c) echo "$PLATFORM_BASE_COLD" ;; esac; }
 side_gateway() { local b; b="$(side_base "$1")" || return 1; [ -n "$b" ] && echo "_.${b}"; }
 
 # per-side target names for a side label. side_label's die runs in the `$(...)`
@@ -279,6 +298,7 @@ which_side() { # current-target
   case "$t" in
     "$(addr_target a)"|"$(acme_target a)") echo a ;;
     "$(addr_target b)"|"$(acme_target b)") echo b ;;
+    "$(addr_target c)"|"$(acme_target c)") echo c ;;
     *) echo "?" ;;
   esac
 }
@@ -292,8 +312,8 @@ which_side() { # current-target
 # change under us, and load_side_addrs reads both once. It must be called
 # directly, not in `$(...)`, for the cache to reach the caller; side_app_addr
 # still works uncached if it was not.
-SIDE_ADDRS_LOADED=0 SIDE_ADDR_a="" SIDE_ADDR_b=""
-read_side_app_addr() { # a|b
+SIDE_ADDRS_LOADED=0 SIDE_ADDR_a="" SIDE_ADDR_b="" SIDE_ADDR_c=""
+read_side_app_addr() { # a|b|c
   cf_records_at "$(addr_target "$1")" \
     | awk -F'\t' '$2=="TXT"{print $3; exit}' | sed 's/^"//; s/"$//'
 }
@@ -301,30 +321,39 @@ load_side_addrs() {
   [ "$SIDE_ADDRS_LOADED" = 1 ] && return 0
   SIDE_ADDR_a="$(read_side_app_addr a)"
   SIDE_ADDR_b="$(read_side_app_addr b)"
+  SIDE_ADDR_c="$(read_side_app_addr c)"
   SIDE_ADDRS_LOADED=1
 }
-side_app_addr() { # a|b
+side_app_addr() { # a|b|c
   if [ "$SIDE_ADDRS_LOADED" != 1 ]; then read_side_app_addr "$1"; return; fi
-  case "$(side_name "$1")" in a) echo "$SIDE_ADDR_a" ;; b) echo "$SIDE_ADDR_b" ;; esac
+  case "$(side_name "$1")" in a) echo "$SIDE_ADDR_a" ;; b) echo "$SIDE_ADDR_b" ;; c) echo "$SIDE_ADDR_c" ;; esac
 }
+# The cold standby is optional: a deployment without one configures no cluster
+# for it and publishes nothing under its label.
+cold_configured() { [ -n "$PLATFORM_BASE_COLD" ] || [ -n "$(side_app_addr c)" ]; }
 
-# Warn when both sides publish the same app_id. A side's identity is its app_id,
+# Warn when two sides publish the same app_id. A side's identity is its app_id,
 # which is assigned when the app is CREATED, not derived from the compose text —
-# so two sides created as separate apps are distinct even when byte-identical,
-# and conversely a CVM created UNDER an existing app_id joins that app as an
-# instance. Both sides publishing the SAME app_id therefore means one app is
+# so sides created as separate apps are distinct even when byte-identical, and
+# conversely a CVM created UNDER an existing app_id joins that app as an
+# instance. Two sides publishing the SAME app_id therefore means one app is
 # behind both records, and dstack will route to either instance, so the switch
 # cannot isolate the target. That defeats the purpose; make it loud.
 warn_if_same_app_id() {
-  local app_a app_b
-  app_a="$(side_app_addr a)"; app_b="$(side_app_addr b)"
-  [ -n "$app_a" ] && [ "$app_a" = "$app_b" ] || return 0
-  warn "both sides publish the same app_id (${app_a}) — dstack treats them as instances"
-  warn "of ONE app and routes to either, so the switch cannot select between them."
-  warn "Usually one side was created under the other's app_id (an instance or an"
-  warn "in-place upgrade) instead of as its own app; a stale record left by a"
-  warn "replaced CVM does it too. Each side must be a separately created app —"
-  warn "adding instances to a side is scaling, not a second side."
+  local x y ax ay
+  for x in a b c; do
+    for y in a b c; do
+      [[ "$x" < "$y" ]] || continue
+      ax="$(side_app_addr "$x")"; ay="$(side_app_addr "$y")"
+      if [ -z "$ax" ] || [ "$ax" != "$ay" ]; then continue; fi
+      warn "sides ${x} and ${y} publish the same app_id (${ax}) — dstack treats them as"
+      warn "instances of ONE app and routes to either, so the switch cannot select between them."
+      warn "Usually one side was created under the other's app_id (an instance or an"
+      warn "in-place upgrade) instead of as its own app; a stale record left by a"
+      warn "replaced CVM does it too. Each side must be a separately created app —"
+      warn "adding instances to a side is scaling, not a second side."
+    done
+  done
 }
 
 http_status() { # url -> the HTTP status code, or 000 if unreachable
@@ -404,13 +433,18 @@ confirm() {
   [[ "$reply" =~ ^[Yy]$ ]]
 }
 
-# Commands that move traffic need both sides' clusters: the target's builds its
-# pre-switch probe (gate 2) and is what the serving alias moves to, and the live
-# side's is what a rollback moves the alias back to.
-need_side_bases() {
-  if [ -z "$PLATFORM_BASE_A" ] || [ -z "$PLATFORM_BASE_B" ]; then
-    die "set PLATFORM_BASE (<cluster>.phala.network) — or PLATFORM_BASE_A and PLATFORM_BASE_B when the sides run in different clusters. They build the pre-switch probe and the serving alias."
-  fi
+# Commands that move traffic need the cluster of every side they touch: the
+# target's builds its pre-switch probe (gate 2) and is what the serving alias
+# moves to, and the live side's is what a rollback moves the alias back to.
+need_bases() { # side…
+  [ -n "$PLATFORM_BASE" ] ||
+    die "set PLATFORM_BASE (<cluster>.phala.network): the main cluster. It builds the pre-switch probe and the serving alias."
+  local x
+  for x in "$@"; do
+    if [ "$x" = c ] && [ -z "$PLATFORM_BASE_COLD" ]; then
+      die "set PLATFORM_BASE_COLD (<cluster>.phala.network): the cluster the cold standby c runs in."
+    fi
+  done
 }
 
 # "" if the serving alias sends traffic to side $1's cluster, else a one-line
@@ -444,7 +478,7 @@ cmd_status() {
   # route the live side if the live side runs there. A mismatch is a split state
   # (a cutover interrupted between its writes, or a hand edit): live traffic is
   # failing right now.
-  if { [ "$addr_side" = a ] || [ "$addr_side" = b ]; } && [ -n "$(side_base "$addr_side")" ]; then
+  if { [ "$addr_side" = a ] || [ "$addr_side" = b ] || [ "$addr_side" = c ]; } && [ -n "$(side_base "$addr_side")" ]; then
     local split; split="$(alias_mismatch "$addr_side" "$alias_now")"
     if [ -n "$split" ]; then
       warn "split state: ${split}."
@@ -465,12 +499,33 @@ cmd_status() {
   printf 'issuance switch : _acme-challenge.%s\n' "$DOMAIN"
   printf '   -> %s  [%s]\n\n' "${acme_now:-<unset>}" "${acme_side:-none}"
 
-  local s end rc
+  local s end rc sides="a b" ready
   load_side_addrs
-  for s in a b; do
-    printf 'side %s : app_id=%-45s cluster=%s\n' \
-      "$s" "$(side_app_addr "$s")" "$(side_base "$s")"
-    printf '         probe=%s\n' "$(platform_probe_url "$s")"
+  cold_configured && sides="a b c"
+  for s in $sides; do
+    if [ "$s" = c ]; then
+      printf 'side %s : app_id=%-45s cluster=%s  (cold standby)\n' \
+        "$s" "$(side_app_addr "$s")" "$(side_base "$s")"
+    else
+      printf 'side %s : app_id=%-45s cluster=%s\n' \
+        "$s" "$(side_app_addr "$s")" "$(side_base "$s")"
+    fi
+    # Can it serve right now — the same question gate 2 asks before a cutover,
+    # asked once. Mostly for the cold standby: nothing else exercises it, and an
+    # old build that can no longer verify providers looks fine until a failover
+    # onto it is refused.
+    ready="$(platform_probe_url "$s")"
+    if [ -z "$ready" ]; then
+      printf '         ready : -\n'
+    else
+      case "$(http_status "$ready")" in
+        2*)  printf '         ready : %sOK%s   %s\n' "$c_grn" "$c_rst" "$ready" ;;
+        404) printf '         ready : ?    %s does not serve %s (older build); /healthz only\n' "$s" "$PROBE_PATH" ;;
+        000) printf '         ready : %sDOWN%s unreachable at %s\n' "$c_red" "$c_rst" "$ready" ;;
+        *)   printf '         ready : %sNO%s   %s answers not-ready\n' "$c_red" "$c_rst" "$ready"
+             [ "$s" = c ] && warn "the cold standby is not ready: a failover to c would be refused now." ;;
+      esac
+    fi
     rc=0; end="$(side_cert_expiry "$s")" || rc=$?
     case "$rc" in
       0) printf '         cert  : %sOK%s   expires %s\n' "$c_grn" "$c_rst" "$end" ;;
@@ -735,11 +790,13 @@ cutover() { # target-side previous-side rollback|stay
   auto_rollback "$target" "$cur_side" "$verdict"
 }
 
+# `switch c` is the planned way onto the cold standby — a drill, with the main
+# side still up, so a failed verify rolls back to it. `failover` is for when it
+# is not up.
 cmd_switch() {
-  [ -n "${1:-}" ] || die "usage: $0 switch <a|b>"
+  [ -n "${1:-}" ] || die "usage: $0 switch <a|b|c>"
   local target; target="$(side_name "$1")"
   resolve_zone_id
-  need_side_bases
 
   local cur_target cur_side
   cur_target="$(current_cname "$ADDR_SWITCH")"
@@ -748,8 +805,9 @@ cmd_switch() {
   # "?" = the traffic switch points at something that is neither side's record.
   # Refuse rather than proceed: auto-rollback would have no valid side to restore.
   if [ "$cur_side" = "?" ]; then
-    die "traffic switch points at an unrecognized target (${cur_target}); resolve it manually (./switch.sh status), or force a state with: $0 failover <a|b>"
+    die "traffic switch points at an unrecognized target (${cur_target}); resolve it manually (./switch.sh status), or force a state with: $0 failover <a|b|c>"
   fi
+  need_bases "$target" "$cur_side"
 
   info "current live side: ${cur_side:-<none>}  ->  target: ${target}"
   local alias_now split=""
@@ -773,7 +831,7 @@ cmd_switch() {
   # `setup`) is not a broken state: the cutover creates it.
   [ -n "$cur_side" ] && [ -n "$alias_now" ] && split="$(alias_mismatch "$cur_side" "$alias_now")"
   if [ -n "$split" ]; then
-    die "${split}, so side ${cur_side} is not reachable now and a rollback would restore a broken state. Force a state with: $0 failover <a|b>"
+    die "${split}, so side ${cur_side} is not reachable now and a rollback would restore a broken state. Force a state with: $0 failover <a|b|c>"
   fi
 
   cutover "$target" "$cur_side" rollback
@@ -784,10 +842,10 @@ cmd_switch() {
 # and no need for the old side to answer. The target still has to pass gates 1
 # and 2 — failing over to a side that cannot serve helps no one.
 cmd_failover() {
-  [ -n "${1:-}" ] || die "usage: $0 failover <a|b>"
+  [ -n "${1:-}" ] || die "usage: $0 failover <a|b|c>"
   local target; target="$(side_name "$1")"
   resolve_zone_id
-  need_side_bases
+  need_bases "$target"
 
   local cur_target cur_side
   cur_target="$(current_cname "$ADDR_SWITCH")"
@@ -807,16 +865,22 @@ cmd_failover() {
 
 cmd_rollback() {
   resolve_zone_id
-  need_side_bases
-  # Stateless by design: with two sides, "roll back" is just "switch to the other
-  # one", and which side is live is read from the shared switch record — not a
-  # local file. So every operator, on any machine, computes the same target and
+  # Stateless by design: within the main pair, "roll back" is just "switch to the
+  # other one", and which side is live is read from the shared switch record — not
+  # a local file. So every operator, on any machine, computes the same target and
   # there is no stale per-machine state to get it wrong.
   local cur_side
   cur_side="$(which_side "$(current_cname "$ADDR_SWITCH")")"
   if [ -z "$cur_side" ] || [ "$cur_side" = "?" ]; then
     die "traffic switch points at neither side; nothing to roll back — use: $0 switch <a|b>"
   fi
+  # On the cold standby "the other side" is not defined, and which main side to
+  # return to is the operator's call (the one that was live may be the one that
+  # broke). Keeping this stateless means asking rather than remembering.
+  if [ "$cur_side" = c ]; then
+    die "the cold standby c is live; move traffic back to the main cluster explicitly: $0 switch a  (or b)"
+  fi
+  need_bases "$cur_side"
   local target; target="$(other_side "$cur_side")"
   info "rolling back: ${cur_side} -> ${target} (live side read from DNS)"
   # A --probe-url passed to `rollback` would be for the wrong side (it names some
@@ -827,7 +891,7 @@ cmd_rollback() {
 }
 
 cmd_acme() {
-  [ -n "${1:-}" ] || die "usage: $0 acme <a|b>"
+  [ -n "${1:-}" ] || die "usage: $0 acme <a|b|c>"
   local target; target="$(side_name "$1")"
   info "pointing issuance switch (_acme-challenge.${DOMAIN}) at side ${target}"
   info "this lets side ${target}'s dstack-ingress answer the ACME dns-01 challenge"
@@ -842,24 +906,26 @@ cmd_setup() { # [side]
   local cur; cur="$(current_cname "$SERVING_ALIAS")"
   local live; live="$(which_side "$(current_cname "$ADDR_SWITCH")")"
   # Which side's cluster the alias should name: the one asked for, else the live
-  # side's. With both sides in one cluster it makes no difference.
+  # side's, else the main cluster (a and b share it).
   local side="${1:-}"
   if [ -n "$side" ]; then side="$(side_name "$side")"
-  elif [ "$PLATFORM_BASE_A" = "$PLATFORM_BASE_B" ]; then side=a
-  elif [ "$live" = a ] || [ "$live" = b ]; then side="$live"
-  else die "the sides run in different clusters and neither is live; name the one to serve from: $0 setup <a|b>"
+  elif [ "$live" = a ] || [ "$live" = b ] || [ "$live" = c ]; then side="$live"
+  else side=a
   fi
   local gateway; gateway="$(side_gateway "$side" || true)"
   if [ -z "$gateway" ]; then
     # Show where the alias points today, so the cluster can be read off it.
     [ -n "$cur" ] && info "serving alias ${SERVING_ALIAS} currently -> ${cur}"
-    die "set PLATFORM_BASE (<cluster>.phala.network, read off a CVM's kms_info.gateway_app_url), or PLATFORM_BASE_A / PLATFORM_BASE_B for side ${side}"
+    if [ "$side" = c ]; then
+      die "set PLATFORM_BASE_COLD (<cluster>.phala.network, read off c's kms_info.gateway_app_url)"
+    fi
+    die "set PLATFORM_BASE (<cluster>.phala.network, read off a CVM's kms_info.gateway_app_url)"
   fi
   # Pointing the alias away from the live side's cluster takes the service down:
   # that cluster's gateway cannot route the live app_id. Moving traffic across
   # clusters is `switch`/`failover`, which move the alias and the traffic switch
   # together.
-  if { [ "$live" = a ] || [ "$live" = b ]; } && [ "$gateway" != "$(side_gateway "$live" || true)" ]; then
+  if { [ "$live" = a ] || [ "$live" = b ] || [ "$live" = c ]; } && [ "$gateway" != "$(side_gateway "$live" || true)" ]; then
     die "side ${live} is live and runs on $(side_gateway "$live" || echo '<unknown>'); pointing the alias at ${gateway} would strand it. Use: $0 switch ${side}  (or failover)"
   fi
   info "one-time setup: the serving alias in the delegation zone"
@@ -923,12 +989,11 @@ PLATFORM_BASE="${PLATFORM_BASE:-}"     # dstack platform base domain (e.g. in1.p
 # `switch` AND on `rollback`. Accepting the `_.` form is deliberate: it is how
 # the serving alias spells the same cluster, and operators copy it from there.
 PLATFORM_BASE="${PLATFORM_BASE#_.}"
-# Per-side clusters, for sides that run in different ones; each defaults to
-# PLATFORM_BASE, so a same-cluster deployment sets only that.
-PLATFORM_BASE_A="${PLATFORM_BASE_A:-$PLATFORM_BASE}"; PLATFORM_BASE_A="${PLATFORM_BASE_A#_.}"
-PLATFORM_BASE_B="${PLATFORM_BASE_B:-$PLATFORM_BASE}"; PLATFORM_BASE_B="${PLATFORM_BASE_B#_.}"
+# The cold standby's cluster (side c). Empty = no cold standby.
+PLATFORM_BASE_COLD="${PLATFORM_BASE_COLD:-}"; PLATFORM_BASE_COLD="${PLATFORM_BASE_COLD#_.}"
 SIDE_A_LABEL="${SIDE_A_LABEL:-a}"
 SIDE_B_LABEL="${SIDE_B_LABEL:-b}"
+SIDE_C_LABEL="${SIDE_C_LABEL:-c}"
 TXT_PREFIX="${TXT_PREFIX:-_dstack-app-address}"
 HEALTH_PATH="${HEALTH_PATH:-/healthz}"
 TTL="${TTL:-60}"
@@ -956,5 +1021,5 @@ case "$cmd" in
   rollback) cmd_rollback ;;
   acme)     cmd_acme "${2:-}" ;;
   ""|-h|--help|help) usage 0 ;;
-  *) die "unknown command '$cmd' (want: setup [a|b] | status | switch <a|b> | failover <a|b> | rollback | acme <a|b>)" ;;
+  *) die "unknown command '$cmd' (want: setup [a|b|c] | status | switch <a|b|c> | failover <a|b|c> | rollback | acme <a|b|c>)" ;;
 esac
