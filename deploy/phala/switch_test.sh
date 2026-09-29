@@ -255,6 +255,10 @@ drop "$ALIAS"
 run -- setup --yes
 expect_fail && expect_out "PLATFORM_BASE" && expect_no_writes && ok
 
+t "setup: GATEWAY_DOMAIN is no longer read"
+run GATEWAY_DOMAIN=_.prod5.phala.network -- setup --yes
+expect_fail && expect_out "currently -> _.${BASE}" && expect_out "set PLATFORM_BASE" && expect_no_writes && ok
+
 t "switch: moves issuance, then traffic, and verifies the new side"
 run PLATFORM_BASE=$BASE -- switch b --yes
 expect_rc 0 && expect_cname "$ADDR_SWITCH" "$(addr_side b)" && expect_cname "$ACME_SWITCH" "$(acme_side b)" \
