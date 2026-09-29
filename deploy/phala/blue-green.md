@@ -162,8 +162,8 @@ collide with the other side's:
 
 ② delegation zone integratenetwork.work — the SWITCH LAYER (switch.sh owns these):
      router-api-tee.0g.ai.integratenetwork.work                     CNAME → _.<live side's cluster> ← serving alias
-     _dstack-app-address.router-api-tee.0g.ai.integratenetwork.work CNAME → …a… | …b…            ← ★ traffic switch
-     _acme-challenge.router-api-tee.0g.ai.integratenetwork.work     CNAME → …a… | …b…            ← issuance switch
+     _dstack-app-address.router-api-tee.0g.ai.integratenetwork.work CNAME → …a… | …b… (| …c…)    ← ★ traffic switch
+     _acme-challenge.router-api-tee.0g.ai.integratenetwork.work     CNAME → …a… | …b… (| …c…)    ← issuance switch
 
 ③ delegation zone — PER-SIDE, each CVM's dstack-ingress writes ITS OWN:
      side a (DELEGATION_ZONE=a.integratenetwork.work):
@@ -174,6 +174,8 @@ collide with the other side's:
        _dstack-app-address.router-api-tee.0g.ai.b.integratenetwork.work  TXT = <app_id_b>:443
        _acme-challenge.router-api-tee.0g.ai.b.integratenetwork.work      TXT = <acme token, during issuance>
        router-api-tee.0g.ai.b.integratenetwork.work                      CNAME → <that side's GATEWAY_DOMAIN>   ← written, never read
+     side c, the optional cold standby (DELEGATION_ZONE=c.integratenetwork.work): the same three records
+       — see Cross-cluster fallback
 ```
 
 A client connecting to `router-api-tee.0g.ai` resolves ① → ② → ③, so the dstack
@@ -297,7 +299,7 @@ while the gateway keeps serving. The `docker-compose.yml` comment on that line h
 why it is deliberately unguarded.)
 
 Across clusters this record is still not read. `switch.sh` writes the serving
-alias from `PLATFORM_BASE_A`/`_B` instead, and a wrong value there is caught
+alias from `PLATFORM_BASE` / `PLATFORM_BASE_COLD` instead, and a wrong value there is caught
 before anything is written: the per-side probe
 (`<app_id>-443s.<that side's base>`) only answers if the side really runs in the
 cluster configured for it. See [Cross-cluster fallback](#cross-cluster-fallback).
@@ -323,8 +325,8 @@ the cluster is named on the operator side**: `setup` writes the serving alias fr
 it, and `switch` builds the per-side pre-switch probe from it
 ([Health-checking the standby](#health-checking-the-standby-side)) and refuses if
 the live alias names a different cluster, so the alias and the probe cannot drift
-apart. (Sides in two different clusters set `PLATFORM_BASE_A` and `PLATFORM_BASE_B`
-instead — see [Cross-cluster fallback](#cross-cluster-fallback).) Read `<cluster>` off a CVM's
+apart. (A cold standby in another cluster adds `PLATFORM_BASE_COLD` — see
+[Cross-cluster fallback](#cross-cluster-fallback).) Read `<cluster>` off a CVM's
 `kms_info.gateway_app_url` (`https://gateway.<cluster>.phala.network`) rather than
 from memory.
 
@@ -471,92 +473,113 @@ destroyed side is no longer a rollback target.
 
 ## Cross-cluster fallback
 
-Both sides can also run in **different dstack clusters**, so that losing one
-cluster does not take the service with it: side a serves from one, side b waits in
-the other. The same three switch-layer records carry it; what changes is that the
-serving alias moves too.
+The main pair, a and b, runs in one dstack cluster, and releases flip between
+them there. Losing that cluster would still take the service down, so there can
+be a third side, **c, a cold standby in another cluster**. It is one CVM that takes
+no part in releases and serves only when traffic is moved onto it: a drill, or
+the main cluster going down.
+
+```
+main cluster (PLATFORM_BASE)            cold cluster (PLATFORM_BASE_COLD)
+  side a  ⇄  side b   releases here       side c   switch c (drill) / failover c
+```
 
 ### Why the serving alias has to move
 
 A dstack gateway only routes `app_id`s that run in its own cluster, and it finds
 the `app_id` by looking up `_dstack-app-address.<DOMAIN>` — one global record,
 which only ever holds one value. So the live side and the cluster the serving
-alias names must always be the same cluster, and moving traffic across clusters
+alias names must always be the same cluster, and moving traffic onto or off c
 means moving both records:
 
 ```
-before     serving alias → _.<cluster A>    traffic switch → …a…    (app_a runs in A ✔)
-after      serving alias → _.<cluster B>    traffic switch → …b…    (app_b runs in B ✔)
+on the main pair   serving alias → _.<main cluster>   traffic switch → …a… | …b…
+on c               serving alias → _.<cold cluster>   traffic switch → …c…
 ```
+
+Between a and b the alias write is a no-op, so releases are unchanged.
 
 That is also why the two clusters cannot serve **at the same time**: both gateways
 would read the same record and get the same `app_id`, which only one of them hosts.
 Upstream `parse_lookup` (gateway/src/proxy/tls_passthough.rs) takes the first TXT
 answer, so publishing two values does not help either.
 
-### Configuration
+### Setting it up
 
-```sh
-# switch.env
-PLATFORM_BASE_A=in1.phala.network       # side a's cluster
-PLATFORM_BASE_B=<other>.phala.network   # side b's cluster
-```
+1. Deploy c from the same compose into the cold cluster as its **own app** (its own
+   `app_id`), with `DELEGATION_ZONE=c.integratenetwork.work` and the same keys as a
+   and b ([One-time setup](#one-time-setup), step 2). Lend it issuance first so it
+   can get its certificate: `./switch.sh acme c`, wait for it to issue,
+   `./switch.sh acme <live side>`.
+2. Name its cluster in `switch.env`, read off **c's** CVM (`kms_info.gateway_app_url`):
 
-Both default to `PLATFORM_BASE`, so a same-cluster deployment sets only that and
-nothing below changes for it: the serving alias is already `_.<base>` and its write
-is a no-op. Read each side's cluster off **that side's** CVM
-(`kms_info.gateway_app_url`). A wrong value is caught before anything is written:
-the per-side probe cannot reach an `app_id` on a cluster it does not run in, so
-gate 2 refuses.
+   ```sh
+   PLATFORM_BASE=in1.phala.network            # main cluster: a and b
+   PLATFORM_BASE_COLD=<other>.phala.network   # cold cluster: c
+   ```
 
-**Prerequisites the script cannot check:**
+   A wrong value is caught before anything is written: the per-side probe cannot
+   reach an `app_id` on a cluster it does not run in, so gate 2 refuses.
+3. Ask Phala to allow `<DOMAIN>`'s SNI suffix on the cold cluster too (README,
+   "Serving domain"). The script cannot check this: the `-443s` probe travels under
+   the platform hostname, not `<DOMAIN>`, so it passes either way.
+4. `./switch.sh status` now lists c with its cluster, readiness and certificate.
 
-- **Phala's SNI allowlist on both clusters.** Each cluster's host front end only
-  forwards SNI suffixes it has been configured for (README, "Serving domain"). The
-  `-443s` probe travels under the platform hostname, not `<DOMAIN>`, so it passes
-  whether or not `<DOMAIN>` is allowed there. Only a real cutover (a drill) proves it.
-- **A valid certificate on the standby.** Only the side the issuance switch points
-  at can renew, so a standby held in reserve ages. `./switch.sh status` reads each
-  side's certificate through its `-443s` hostname and warns when fewer than
-  `CERT_WARN_DAYS` (21) remain. To renew the standby, lend it issuance for the few
-  minutes it needs: `acme b`, wait for it to issue, `acme a`. See
+### Keeping c able to serve
+
+Nothing exercises c between drills, and it does not have to track releases. Two
+things decay while it waits, and `status` checks both:
+
+- **Its certificate.** Only the side the issuance switch points at can renew, so
+  c's certificate runs down. `status` warns when fewer than `CERT_WARN_DAYS` (21)
+  remain; renew it by lending c issuance for the few minutes it needs
+  (`acme c`, wait, `acme <live side>`). With Let's Encrypt's 90-day certificates
+  that is roughly every two months. See
   [Certificates](#certificates-the-issuance-switch-and-rate-limits).
+- **Its build.** An old build keeps looking healthy until something it depends on
+  changes underneath it — a provider or router it can no longer verify — and then
+  a failover onto it is refused by gate 2 at the worst moment. `status` probes every
+  side's `/readyz` once, so a cold standby that could no longer serve shows up as
+  `ready : NO` while there is still time to redeploy it. Redeploying c is a fresh
+  app and a fresh certificate, which counts against Let's Encrypt's 5 per week for
+  the hostname; do it when `status` or a release note calls for it, not per release.
 
-### Planned move: `switch`
+### Drill: `switch c`
 
-`./switch.sh switch b` works across clusters unchanged: gates 1 and 2 (probing b on
-b's own cluster), then issuance → traffic switch → serving alias, then the
-cache-proof verify, and auto-rollback restores **all three** records if b does not
-verify. It warns before it starts when the alias is about to move.
+`./switch.sh switch c` is the planned move onto c, made while the main side is still
+up: gates 1 and 2 (probing c on its own cluster), then issuance → traffic switch →
+serving alias, then the cache-proof verify, and **auto-rollback restores all three
+records** if c does not verify. It warns before it starts that the alias is about
+to move. Come back with `./switch.sh switch a` (or `b`). `rollback` is refused while
+c is live: which main side to return to is the operator's call, and asking keeps
+the script stateless.
 
-A planned cross-cluster move **has a short outage window**, which a same-cluster
-switch does not. A new connection needs two lookups to agree — the client's cached
-serving alias (which cluster) and that cluster's gateway's cached app-address (which
-`app_id`) — and after the flip they expire independently. The failing combination
-is a client still holding the old alias, reaching the old cluster, whose gateway has
-already refreshed to `app_b`, which it does not host. It lasts until that client's
-alias cache expires: at most about one `TTL` (60 s), usually less. Open connections
-are unaffected, and so are clients whose cache happens to fall outside the window.
+**A move between clusters has a short outage window**, which a switch within the
+main pair does not. A new connection needs two lookups to agree — the client's
+cached serving alias (which cluster) and that cluster's gateway's cached
+app-address (which `app_id`) — and after the flip they expire independently. The
+failing combination is a client still holding the old alias, reaching the old
+cluster, whose gateway has already refreshed to the new `app_id`, which it does not
+host. It lasts until that client's alias cache expires: at most about one `TTL`
+(60 s), usually less. Open connections are unaffected, and so are clients whose
+cache falls outside the window. The same window applies on the way back.
 
 The write order keeps the window that small. With the alias written **last**, the
-new cluster's gateway sees `app_b` from its very first lookup, and the old
-cluster's gateway keeps serving `app_a` from its cache for a while. Written the
+new cluster's gateway sees the new `app_id` from its very first lookup, and the old
+cluster's gateway keeps serving the old one from its cache for a while. Written the
 other way round, every client sent to the new cluster before the traffic switch
-lands would make its gateway cache `app_a` — which it cannot route — for all of
-them. dstack caches the lookup for the record's TTL (Hickory's TTL-aware cache;
-~30 s was observed on `in1.phala.network`). `TTL` is already 60 s, Cloudflare's
-minimum outside Enterprise plans, so it cannot be lowered further.
+lands would make its gateway cache the old `app_id` — which it cannot route — for
+all of them. dstack caches the lookup for the record's TTL (Hickory's TTL-aware
+cache; ~30 s was observed on `in1.phala.network`). `TTL` is already 60 s,
+Cloudflare's minimum outside Enterprise plans, so it cannot be lowered further.
 
-A cutover interrupted between its two traffic writes (a Cloudflare error, a
-killed shell) leaves the traffic switch on one side and the alias on the other
-side's cluster. `status` flags that as a **split state**, and re-running the same
-command completes it; `switch` refuses to start *from* a split state towards the
-other side, since its rollback would restore a broken state.
+A drill is the only proof of the SNI allowlist on the cold cluster, so run one
+after setting c up and after any change to it, at a quiet time.
 
-### Emergency: `failover`
+### Emergency: `failover c`
 
 ```sh
-./switch.sh failover b      # the cluster side a runs in is gone
+./switch.sh failover c      # the main cluster is gone
 ```
 
 `failover` writes exactly what `switch` writes, with three differences:
@@ -564,25 +587,27 @@ other side, since its rollback would restore a broken state.
 - the old side does not have to answer — its cert is read only if it can be;
 - a failed verify is **reported, never rolled back**: there is nothing to go back
   to, and restoring records that point at a dead cluster would not help anyone;
-- it will overwrite a traffic switch that names neither side.
+- it will overwrite a traffic switch that names no known side.
 
-The target still has to pass gates 1 and 2 — failing over to a side that cannot
-serve helps no one. The outage window above costs nothing here, because the old
-cluster was not serving anyway. Afterwards, `rollback` is refused for as long as
-side a does not answer its probe, which is the behaviour you want; once a's cluster
-is back and a is ready, `switch a` (or `rollback`) moves traffic home.
+c still has to pass gates 1 and 2 — failing over to a side that cannot serve helps
+no one. The outage window above costs nothing here, because the main cluster was
+not serving anyway. Once the main cluster is back and a side there is ready,
+`switch a` (or `b`) moves traffic home; until then the gate refuses it.
 
-`failover --yes` is also the building block for automated failover, which is not
-part of this script: a watchdog outside **both** clusters, several vantage points
-and several consecutive failures before it acts, one-way (no automatic failback),
-and a Cloudflare token limited to the delegation zone.
+`failover` works for any side (`failover b` within the main pair, say, when a has
+died and a normal switch would try to read its cert first). `failover --yes` is also
+the building block for automated failover, which is not part of this script: a
+watchdog outside **both** clusters, several vantage points and several consecutive
+failures before it acts, one-way (no automatic failback), and a Cloudflare token
+limited to the delegation zone.
 
-### Drills
+### Split states
 
-Nothing above proves the standby can take real traffic until it does. Rehearse a
-planned `switch b` and `switch a` on a quiet period, regularly (monthly is a
-reasonable default) — that is the only check of the SNI allowlist on b's cluster,
-and it renews b's certificate on the way.
+A cutover interrupted between its two traffic writes (a Cloudflare error, a killed
+shell) leaves the traffic switch on one side and the alias on another side's
+cluster. `status` flags that as a **split state**, and re-running the same command
+completes it; `switch` refuses to start *from* a split state towards another side,
+since its rollback would restore a broken state — `failover` forces a state instead.
 
 ## Health-checking the standby side
 
@@ -767,14 +792,14 @@ Two consequences for testing it:
 ## Limitations & things to confirm in your environment
 
 - **No weighted/percentage canary** — atomic flip only (see the top section).
-- **One cluster serves at a time.** The sides may run in different clusters, but
-  only the one the serving alias names carries traffic, and a planned move between
-  them has a short outage window — see
+- **One cluster serves at a time.** The cold standby runs in another cluster, but
+  only the cluster the serving alias names carries traffic, and a move between
+  clusters has a short outage window — see
   [Cross-cluster fallback](#cross-cluster-fallback). `setup` refuses to point the
   alias away from the live side's cluster; move traffic with `switch`/`failover`.
-- **`switch`/`failover`/`rollback` need every side's cluster** — `PLATFORM_BASE`,
-  or `PLATFORM_BASE_A` and `PLATFORM_BASE_B` — to probe the standby, and refuse
-  without it — see [Health-checking the standby](#health-checking-the-standby-side).
+- **`switch`/`failover`/`rollback` need `PLATFORM_BASE`**, and `PLATFORM_BASE_COLD`
+  for any move onto or off c, to probe the target — see
+  [Health-checking the standby](#health-checking-the-standby-side).
 - **Cutover latency** is the switch-layer `TTL` (default 60 s) plus the dstack
   gateway's cache of `_dstack-app-address`, which follows the record's TTL
   (**observed ~30 s** on `in1.phala.network`).
