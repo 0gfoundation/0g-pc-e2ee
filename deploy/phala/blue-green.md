@@ -107,7 +107,7 @@ phala cvm create ...         # 2. deploy side b — a NEW app (=> its own app_id
 phala cvm delete <side a>    # 4. once b is confirmed live, retire a to free resources
 ```
 
-With `PLATFORM_BASE` set in `switch.env`, step 3 checks side b's **readiness**
+Step 3 checks side b's **readiness** (on `PLATFORM_BASE`, which `switch` requires)
 before the flip — can it actually serve, not just is it listening — so a b that
 cannot verify any provider is rejected instead of briefly taking traffic. Allow it
 time: a cold side must finish its first warmer sweep, which is why the probe window
@@ -161,7 +161,7 @@ collide with the other side's:
      _acme-challenge.router-api-tee.0g.ai      CNAME → _acme-challenge.router-api-tee.0g.ai.integratenetwork.work
 
 ② delegation zone integratenetwork.work — the SWITCH LAYER (switch.sh owns these):
-     router-api-tee.0g.ai.integratenetwork.work                     CNAME → <GATEWAY_DOMAIN>     (static; set once)
+     router-api-tee.0g.ai.integratenetwork.work                     CNAME → _.<PLATFORM_BASE>    (static; set once by `setup`)
      _dstack-app-address.router-api-tee.0g.ai.integratenetwork.work CNAME → …a… | …b…            ← ★ traffic switch
      _acme-challenge.router-api-tee.0g.ai.integratenetwork.work     CNAME → …a… | …b…            ← issuance switch
 
@@ -221,7 +221,7 @@ Cloudflare zones. One token scoped to `integratenetwork.work` covers both sides
 
 **What actually moves on a release.** Only the **traffic switch** (② line 2).
 The **issuance switch** moves only when a side needs to obtain/renew its cert;
-the **serving alias** (② line 1) is set once to `GATEWAY_DOMAIN` and never moves.
+the **serving alias** (② line 1) is set once to `_.<PLATFORM_BASE>` and never moves.
 
 **Each side must run `DNS_SETUP_MODE=print`.** dstack-ingress boots with a strict
 pre-check (default `DNS_SETUP_MODE=wait`): it blocks until the served
@@ -314,11 +314,13 @@ cp deploy/phala/switch.env.example deploy/phala/switch.env
 
 Or supply it via the environment instead (`CF_API_TOKEN=... ./switch.sh …`); the
 real environment overrides `switch.env`, and `--env-file PATH` points elsewhere.
-Also set `PLATFORM_BASE` (e.g. `in1.phala.network`) in `switch.env`: it is the
-**one place the cluster is named on the operator side**. It enables the per-side
-pre-switch probe ([Health-checking the standby](#health-checking-the-standby-side)),
-and `setup` derives the serving alias from it, so the alias and the probe cannot
-name different clusters. Read `<cluster>` off a CVM's
+Also set `PLATFORM_BASE` (e.g. `in1.phala.network`) in `switch.env` — `setup`,
+`switch` and `rollback` refuse to run without it. It is the **one place the
+cluster is named on the operator side**: `setup` writes the serving alias from it,
+and `switch` builds the per-side pre-switch probe from it
+([Health-checking the standby](#health-checking-the-standby-side)) and refuses if
+the live alias names a different cluster, so the alias and the probe cannot drift
+apart. Read `<cluster>` off a CVM's
 `kms_info.gateway_app_url` (`https://gateway.<cluster>.phala.network`) rather than
 from memory.
 
@@ -327,17 +329,16 @@ from memory.
    gateway, `_.<cluster>.phala.network`. This is the hop that carries traffic (②
    above), and it is the operator's to set — the CVMs no longer take a cluster
    value from you at all. It never changes, and both sides route through the same
-   cluster, so one static value serves both. With `PLATFORM_BASE` set as above,
-   `switch.sh setup` derives it:
+   cluster, so one static value serves both. `switch.sh setup` writes it from
+   `PLATFORM_BASE`:
 
    ```sh
    ./switch.sh setup            # serving alias -> _.${PLATFORM_BASE}
    ```
 
-   Passing `GATEWAY_DOMAIN` explicitly still works and wins, but `setup` refuses
-   if the two name different clusters, and `status` warns if the live alias later
-   drifts from `PLATFORM_BASE`. With neither set, `setup` prints whatever the
-   alias currently points at so you can pin it as-is.
+   `status` warns if the live alias later drifts from `PLATFORM_BASE`. Without
+   `PLATFORM_BASE`, `setup` refuses and prints whatever the alias currently points
+   at, so you can read the cluster off it.
 
    Everything else in `integratenetwork.work` is automatic: the two switch records
    (`_dstack-app-address.…` and `_acme-challenge.…`) are created and flipped by
@@ -426,7 +427,8 @@ switch to the production compose only once it works.
 2. **gate 1** — reads side b's published `app_id` from the delegation zone;
    aborts if b has not published one (its CVM is not up);
 3. **gate 2** — probes side b's **readiness** (`/readyz`) **directly** before
-   sending it any traffic (via `PLATFORM_BASE`, or an explicit `--probe-url`),
+   sending it any traffic (at `<app_id>-443s.<PLATFORM_BASE>`, or an explicit
+   `--probe-url`),
    retrying up to `PROBE_RETRIES` times `PROBE_INTERVAL` apart; refuses to switch
    if b never becomes ready. This asks whether b can actually *serve* — not merely
    whether its process is up — so a side that cannot verify any provider never
@@ -534,8 +536,8 @@ gives you one, and it works alongside the custom domain:
 > custom domain's `_dstack-app-address` — so it hits the standby even though no
 > traffic points at it yet. (Validated on `in1.phala.network`.)
 
-Set `PLATFORM_BASE` (e.g. `in1.phala.network`) in `switch.env` and `switch.sh`
-builds this URL from the target side's published `app_id` and probes it
+`switch.sh` builds this URL from `PLATFORM_BASE` (e.g. `in1.phala.network`,
+required) and the target side's published `app_id`, and probes it
 automatically before every switch, refusing to cut over unless the standby reports
 ready (retrying `PROBE_RETRIES` times, `PROBE_INTERVAL` apart). `./switch.sh status`
 prints each side's probe URL. An explicit `--probe-url` overrides it — including to
@@ -546,12 +548,6 @@ gateway port (8443) is deliberately **not** published (a published 8443 would
 serve plaintext outside the enclave); `<app_id>-443` **without** the `s` fails
 because the gateway would terminate TLS and hand plaintext to the ingress, which
 expects TLS. The `s` (passthrough) is the working form.
-
-Even without `PLATFORM_BASE`, `switch.sh` always does **gate 1** (the standby
-must be publishing an `app_id`) and the **cache-proof post-switch check +
-auto-rollback**, so a dead or broken standby is caught and reverted — just after
-a brief blip rather than before. Set `PLATFORM_BASE` to turn that into
-verify-before-cut.
 
 ## Migrating the current single instance into this scheme
 
@@ -667,8 +663,18 @@ Two consequences for testing it:
   Because the client's gateway and the app-address then live in two records with
   independent DNS caches, that cutover has a brief inconsistency window (shrink it
   by lowering the TTLs first). Defer until a cluster move is actually needed.
-- **Standby probe needs `PLATFORM_BASE`** (the dstack platform base domain, e.g.
-  `in1.phala.network`) — see [Health-checking the standby](#health-checking-the-standby-side).
+
+  > **Do not hand-assemble a cluster move from `setup` + `switch`.** With the
+  > alias on the old cluster, `switch` to a side on the new one is refused (its
+  > probe cannot reach an `app_id` the alias's cluster does not have). Re-running
+  > `setup` against the new cluster first gets past that, but the service is down
+  > from that write until the `switch` lands — the new cluster's gateway is handed
+  > the old side's `app_id` — and a failed `switch` then auto-rolls-back the
+  > app-address alone, onto a cluster the alias no longer points at, which leaves
+  > nothing serving.
+- **`switch`/`rollback` need `PLATFORM_BASE`** (the dstack platform base domain, e.g.
+  `in1.phala.network`) to probe the standby, and refuse without it — see
+  [Health-checking the standby](#health-checking-the-standby-side).
 - **Cutover latency** is the switch-layer `TTL` (default 60 s) plus the dstack
   gateway's cache of `_dstack-app-address` (**observed ~30 s** on `in1.phala.network`).
   The flip is not sub-second; the post-switch verify window
