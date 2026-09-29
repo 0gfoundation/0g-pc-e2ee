@@ -97,7 +97,8 @@ case "$url" in
         echo "GET $name" >>"$S/api.log"
         jq -c --arg n "$name" '{success:true,result:[.[] | select(.name==$n)]}' "$S/records.json" ;;
       "POST /zones/zone1/dns_records")
-        id="rec$(( $(jq length "$S/records.json") + 100 + RANDOM ))"
+        n="$(cat "$S/next_id" 2>/dev/null || echo 100)"; echo $((n + 1)) >"$S/next_id"
+        id="rec$n"
         jq --arg id "$id" --argjson r "$data" '. + [$r + {id:$id} | {id,type,name,content}]' \
           "$S/records.json" >"$S/r.tmp" && mv "$S/r.tmp" "$S/records.json"
         echo "POST $(jq -r '.name + " " + .type + " " + .content' <<<"$data")" >>"$S/writes.log"

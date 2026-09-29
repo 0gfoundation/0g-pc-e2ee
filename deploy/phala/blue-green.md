@@ -665,8 +665,10 @@ Two consequences for testing it:
   by lowering the TTLs first). Defer until a cluster move is actually needed.
 
   > **Do not hand-assemble a cluster move from `setup` + `switch`.** With the
-  > alias on the old cluster, `switch` to a side on the new one is refused (its
-  > probe cannot reach an `app_id` the alias's cluster does not have). Re-running
+  > alias on the old cluster, `switch` to a side on the new one is refused —
+  > outright if `PLATFORM_BASE` names the new cluster (it disagrees with the
+  > alias), and by gate 2 if it names the old one (that cluster's gateway cannot
+  > reach the new side's `app_id`). Re-running
   > `setup` against the new cluster first gets past that, but the service is down
   > from that write until the `switch` lands — the new cluster's gateway is handed
   > the old side's `app_id` — and a failed `switch` then auto-rolls-back the
