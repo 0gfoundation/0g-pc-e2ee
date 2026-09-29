@@ -30,7 +30,7 @@
 #   delegation zone <DZ>=integratenetwork.work — the SWITCH LAYER (this script):
 #     _dstack-app-address.<DOMAIN>.<DZ>  CNAME -> _dstack-app-address.<DOMAIN>.a.<DZ>  | .b.<DZ>   <-- traffic
 #     _acme-challenge.<DOMAIN>.<DZ>      CNAME -> _acme-challenge.<DOMAIN>.a.<DZ>      | .b.<DZ>   <-- issuance
-#     <DOMAIN>.<DZ>                      CNAME -> <GATEWAY_DOMAIN>  (static; set once, not by this script)
+#     <DOMAIN>.<DZ>                      CNAME -> _.<PLATFORM_BASE> (static; set once by `setup`)
 #
 #   delegation zone <DZ> — PER-SIDE records, written by each CVM's dstack-ingress:
 #     a side (DELEGATION_ZONE=a.<DZ>):  _dstack-app-address.<DOMAIN>.a.<DZ> TXT = <app_id_a>:443
@@ -75,14 +75,10 @@
 #   DELEGATION_ZONE  base delegation zone           (default: same as CF_ZONE)
 #   PLATFORM_BASE    dstack platform base domain    (e.g. in1.phala.network) — enables the
 #                    per-side app-id probe before a switch (<app_id>-443s.<PLATFORM_BASE>),
-#                    and `setup` derives GATEWAY_DOMAIN from it as _.<PLATFORM_BASE>.
-#                    Either spelling is accepted; a leading `_.` is stripped on read.
-#   GATEWAY_DOMAIN   cluster dstack gateway         (used only by `setup`; defaults to
-#                    _.<PLATFORM_BASE>, and a missing `_.` is added — the alias must
-#                    name the gateway's wildcard hop. Setting both to different
-#                    clusters is refused; they are two spellings of one value and
-#                    nothing else cross-checks them. `status` warns if the live alias
-#                    drifts from PLATFORM_BASE or is not a `_.<base>` hop.)
+#                    and `setup` points the serving alias at the cluster's gateway,
+#                    _.<PLATFORM_BASE>. A leading `_.` is accepted and stripped on
+#                    read. `status` warns if the live alias drifts from it or is not
+#                    a `_.<base>` hop.
 #   SIDE_A_LABEL     sub-zone label for side a      (default: a)
 #   SIDE_B_LABEL     sub-zone label for side b      (default: b)
 #   TXT_PREFIX       app-address record prefix      (default: _dstack-app-address)
@@ -354,12 +350,12 @@ cmd_status() {
   local alias_now; alias_now="$(current_cname "$SERVING_ALIAS" || true)"
   printf 'serving alias   : %s\n' "$SERVING_ALIAS"
   printf '   -> %s\n' "${alias_now:-<unset>}"
-  # The serving alias and PLATFORM_BASE are two hand-typed spellings of one
-  # cluster, and nothing else cross-checks them: a mismatch means the standby
-  # probe health-checks a side on one cluster while traffic goes to another, so
-  # `switch` would pass its gate and then cut over to an unreachable side.
+  # Traffic goes to the alias's cluster; the standby probe goes to PLATFORM_BASE.
+  # A mismatch means the probe health-checks a side on one cluster while traffic
+  # goes to another, so `switch` would pass its gate and then cut over to an
+  # unreachable side.
   if [ -n "$PLATFORM_BASE" ] && [ -n "$alias_now" ] &&
-     [ "${alias_now#_.}" != "${PLATFORM_BASE#_.}" ]; then
+     [ "${alias_now#_.}" != "$PLATFORM_BASE" ]; then
     warn "serving alias and PLATFORM_BASE name different clusters:"
     warn "  alias -> ${alias_now} vs PLATFORM_BASE=${PLATFORM_BASE}"
     warn "  the pre-switch probe would test a side the live path cannot reach."
@@ -641,48 +637,22 @@ cmd_acme() {
 cmd_setup() {
   resolve_zone_id
   local cur; cur="$(current_cname "$SERVING_ALIAS")"
-  # One cluster, two operator-side spellings: GATEWAY_DOMAIN for the serving
-  # alias here, and PLATFORM_BASE for the standby probe
-  # (`<app_id>-443s.<PLATFORM_BASE>`). The CVMs no longer take a hand-typed
-  # cluster at all, so these are the last two that can drift apart — and drifting
-  # is not harmless: the probe would health-check a side on one cluster while the
-  # serving alias hands traffic to another. So derive one from the other when
-  # only PLATFORM_BASE is set, and refuse when both are set and disagree.
-  # PLATFORM_BASE is already normalised to the bare base where it is read; the
-  # `#_.` here is a fuse, and the one on GATEWAY_DOMAIN does the real work since
-  # that one is not normalised until after this comparison.
-  if [ -z "$GATEWAY_DOMAIN" ] && [ -n "$PLATFORM_BASE" ]; then
-    GATEWAY_DOMAIN="_.${PLATFORM_BASE#_.}"
-    info "GATEWAY_DOMAIN unset; derived from PLATFORM_BASE -> ${GATEWAY_DOMAIN}"
-  elif [ -n "$GATEWAY_DOMAIN" ] && [ -n "$PLATFORM_BASE" ] &&
-       [ "${GATEWAY_DOMAIN#_.}" != "${PLATFORM_BASE#_.}" ]; then
-    info "GATEWAY_DOMAIN : ${GATEWAY_DOMAIN}"
-    info "PLATFORM_BASE  : ${PLATFORM_BASE}"
-    die "these name different clusters — the serving alias and the standby probe would disagree"
-  fi
-  if [ -z "$GATEWAY_DOMAIN" ]; then
+  if [ -z "$PLATFORM_BASE" ]; then
     # Help the operator "freeze" whatever the single-instance container wrote.
-    if [ -n "$cur" ]; then
-      info "serving alias ${SERVING_ALIAS} currently -> ${cur}"
-      die "set GATEWAY_DOMAIN to pin it (e.g. GATEWAY_DOMAIN=${cur} $0 setup)"
-    fi
-    die "set PLATFORM_BASE (<cluster>.phala.network) and it is derived, or set GATEWAY_DOMAIN (_.<cluster>.phala.network) directly"
+    [ -n "$cur" ] && info "serving alias ${SERVING_ALIAS} currently -> ${cur}"
+    die "set PLATFORM_BASE (<cluster>.phala.network, read off a CVM's kms_info.gateway_app_url)"
   fi
-  # Normalise the FORM, not just the cluster. The check above strips `_.` from
-  # both sides on purpose — it asks "same cluster?" — so a GATEWAY_DOMAIN given
-  # without the prefix agrees with PLATFORM_BASE and would otherwise be written
-  # bare. Bare is not a harmless variant: the alias must name the gateway's
-  # wildcard hop, this hop carries traffic in the single-instance layout, and
-  # `pcverify` rejects a CNAME chain that does not end at `_.<base>`
-  # (client/evidence/appcompose.go, deriveBaseDomain). Idempotent on a value that
-  # already has it.
-  GATEWAY_DOMAIN="_.${GATEWAY_DOMAIN#_.}"
+  # The alias must name the gateway's WILDCARD hop, `_.<base>`, not the bare base:
+  # this hop carries traffic, and `pcverify` rejects a CNAME chain that does not
+  # end at `_.<base>` (client/evidence/appcompose.go, deriveBaseDomain).
+  # PLATFORM_BASE is already normalised to the bare base where it is read.
+  local gateway="_.${PLATFORM_BASE}"
   info "one-time setup: the static serving alias in the delegation zone"
-  info "  ${SERVING_ALIAS}  CNAME ->  ${GATEWAY_DOMAIN}"
+  info "  ${SERVING_ALIAS}  CNAME ->  ${gateway}"
   info "the two switch records are created by 'acme'/'switch'; the per-side"
   info "records are written by each CVM's dstack-ingress — none are set here."
-  confirm "Create/point ${SERVING_ALIAS} at ${GATEWAY_DOMAIN}?" || { warn "aborted"; exit 1; }
-  put_cname "$SERVING_ALIAS" "$GATEWAY_DOMAIN"
+  confirm "Create/point ${SERVING_ALIAS} at ${gateway}?" || { warn "aborted"; exit 1; }
+  put_cname "$SERVING_ALIAS" "$gateway"
   info "done. Next: point issuance at a side and deploy it (see blue-green.md fast path)."
 }
 
@@ -730,15 +700,13 @@ fi
 CF_ZONE="${CF_ZONE:-integratenetwork.work}"
 DOMAIN="${DOMAIN:-router-api-tee.0g.ai}"
 DELEGATION_ZONE="${DELEGATION_ZONE:-$CF_ZONE}"
-GATEWAY_DOMAIN="${GATEWAY_DOMAIN:-}"   # dstack gateway of the cluster; needed only by `setup`
 PLATFORM_BASE="${PLATFORM_BASE:-}"     # dstack platform base domain (e.g. in1.phala.network) for per-side app-id probes
 # Normalise to the BARE base once, here, because platform_probe_url interpolates
 # this value straight into `<app_id>-443s.${PLATFORM_BASE}` and a `_.` in it makes
 # an unresolvable host — a failure that only shows up as gate 2 timing out for
 # PROBE_RETRIES x PROBE_INTERVAL (~5 min by default) and then refusing, on
-# `switch` AND on `rollback`. Accepting the `_.` form is deliberate: `setup`
-# derives GATEWAY_DOMAIN from this, and the two are one cluster written two ways.
-# The `#_.` in setup/status stays as a fuse, but this is what actually holds.
+# `switch` AND on `rollback`. Accepting the `_.` form is deliberate: it is how
+# the serving alias spells the same cluster, and operators copy it from there.
 PLATFORM_BASE="${PLATFORM_BASE#_.}"
 SIDE_A_LABEL="${SIDE_A_LABEL:-a}"
 SIDE_B_LABEL="${SIDE_B_LABEL:-b}"
@@ -752,7 +720,7 @@ PROBE_RETRIES="${PROBE_RETRIES:-30}"     # pre-switch target probe attempts befo
 PROBE_INTERVAL="${PROBE_INTERVAL:-10}"   # seconds between them: 30x10s ≈ 5min, enough for a cold first sweep
 
 # Switch-layer record names (in the delegation zone) that this script owns.
-SERVING_ALIAS="${DOMAIN}.${DELEGATION_ZONE}"           # static -> GATEWAY_DOMAIN (set by `setup`)
+SERVING_ALIAS="${DOMAIN}.${DELEGATION_ZONE}"           # static -> _.<PLATFORM_BASE> (set by `setup`)
 ADDR_SWITCH="${TXT_PREFIX}.${DOMAIN}.${DELEGATION_ZONE}"
 ACME_SWITCH="_acme-challenge.${DOMAIN}.${DELEGATION_ZONE}"
 
