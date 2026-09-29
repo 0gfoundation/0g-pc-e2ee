@@ -38,8 +38,9 @@
 #
 # So `switch a|b` repoints the two switch-layer CNAMEs at the chosen side's
 # per-side records, and the serving alias at that side's cluster — which is a
-# no-op unless the sides run in different clusters (PLATFORM_BASE_A/_B). dstack-ingress on the Cloudflare provider resolves the
-# longest parent zone it can access, so a.<DZ>/b.<DZ> need NOT be real Cloudflare
+# no-op unless the sides run in different clusters (PLATFORM_BASE_A/_B).
+# dstack-ingress on the Cloudflare provider resolves the longest parent zone it
+# can access, so a.<DZ>/b.<DZ> need NOT be real Cloudflare
 # zones — one token scoped to <DZ> covers them.
 #
 # See deploy/phala/blue-green.md for the full runbook (one-time setup, migration
@@ -510,7 +511,7 @@ move_switches() { # target-side  [--acme-only]
   # target's gateway while the switch still names the old side, and that gateway
   # would cache the old app_id (which it cannot route) for every client it
   # serves. Written last, only clients still holding the old alias fail, and only
-  # once the old cluster's gateway refreshes — see blue-green.md, "Cross-cluster".
+  # once the old cluster's gateway refreshes — see blue-green.md, "Cross-cluster fallback".
   # A failure between the two leaves them split; `status` flags it and re-running
   # the same command repairs it.
   put_cname "$ACME_SWITCH" "$tgt_acme"
@@ -682,7 +683,7 @@ cutover() { # target-side previous-side rollback|stay
     warn "cross-cluster: the serving alias moves ${from_gw} -> ${to_gw}."
     warn "  New connections from clients still holding the old alias fail once the old"
     warn "  cluster's gateway refreshes its app-address, until their DNS cache (TTL ${TTL}s)"
-    warn "  expires. Open connections are unaffected. See blue-green.md, \"Cross-cluster\"."
+    warn "  expires. Open connections are unaffected. See blue-green.md, \"Cross-cluster fallback\"."
   fi
 
   if [ "$on_fail" = stay ]; then
