@@ -522,12 +522,9 @@ answer, so publishing two values does not help either.
    reach an `app_id` on a cluster it does not run in, so gate 2 refuses.
 3. `./switch.sh status` now lists c with its cluster, readiness and certificate.
 
-Nothing has to be registered with Phala for the cold cluster to accept `<DOMAIN>`:
-the dstack gateway routes any SNI outside its base domain by the TXT lookup, with
-no allowlist (README, "Serving domain"). What `status` cannot show is that a real
-connection to `<DOMAIN>` works end to end on that cluster — the `-443s` probe
-travels under the platform hostname, not `<DOMAIN>` — which is what the first
-drill is for.
+What `status` cannot show is that a real connection to `<DOMAIN>` works end to
+end on that cluster — the `-443s` probe travels under the platform hostname, not
+`<DOMAIN>` — which is what the first drill is for.
 
 ### Keeping c able to serve
 

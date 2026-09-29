@@ -144,22 +144,10 @@ the DNS token); the second is how the dstack gateway learns which app to route t
 the third delegates certificate issuance. That is the point of the delegation: the
 enclave's DNS token never needs access to the served domain's own zone.
 
-Two platform-side notes, one a prerequisite that fails in a way the logs do not
-explain:
-
-- **No SNI registration with Phala.** An earlier version of this page said the
-  platform only forwards SNI suffixes Phala has allowlisted. Nothing supports
-  that: the dstack gateway routes any SNI outside its own base domain through
-  the custom-domain path (`_dstack-app-address` TXT lookup, upstream
-  `gateway/src/proxy.rs`) with no allowlist, Phala's custom-domain guide
-  (dstack-examples, `custom-domain/dstack-ingress`) has no such step, and new
-  hostnames have gone live without one. If a filter in front of the gateway ever
-  does drop a name, the symptom is a bare TLS handshake failure while the DNS
-  records and the certificate all look fine — so the first connection to a new
-  name, or to a new cluster, is the check.
-- The three CNAMEs must exist before the container starts. It waits for them
-  (`DNS_SETUP_MODE=wait`) but gives up after `DNS_SETUP_TIMEOUT`, 30 minutes by
-  default, and then exits without a certificate.
+The three CNAMEs must exist before the container starts, and missing them fails in
+a way the logs do not explain: it waits for them (`DNS_SETUP_MODE=wait`) but gives
+up after `DNS_SETUP_TIMEOUT`, 30 minutes by default, and then exits without a
+certificate.
 
 > ⚠️ **Under blue/green, three CNAMEs are not enough.** The paragraph above is the
 > single-instance layout, where the container owns every hop below the served zone.
