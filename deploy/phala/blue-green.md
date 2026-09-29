@@ -520,10 +520,14 @@ answer, so publishing two values does not help either.
 
    A wrong value is caught before anything is written: the per-side probe cannot
    reach an `app_id` on a cluster it does not run in, so gate 2 refuses.
-3. Ask Phala to allow `<DOMAIN>`'s SNI suffix on the cold cluster too (README,
-   "Serving domain"). The script cannot check this: the `-443s` probe travels under
-   the platform hostname, not `<DOMAIN>`, so it passes either way.
-4. `./switch.sh status` now lists c with its cluster, readiness and certificate.
+3. `./switch.sh status` now lists c with its cluster, readiness and certificate.
+
+Nothing has to be registered with Phala for the cold cluster to accept `<DOMAIN>`:
+the dstack gateway routes any SNI outside its base domain by the TXT lookup, with
+no allowlist (README, "Serving domain"). What `status` cannot show is that a real
+connection to `<DOMAIN>` works end to end on that cluster — the `-443s` probe
+travels under the platform hostname, not `<DOMAIN>` — which is what the first
+drill is for.
 
 ### Keeping c able to serve
 
@@ -573,8 +577,8 @@ all of them. dstack caches the lookup for the record's TTL (Hickory's TTL-aware
 cache; ~30 s was observed on `in1.phala.network`). `TTL` is already 60 s,
 Cloudflare's minimum outside Enterprise plans, so it cannot be lowered further.
 
-A drill is the only proof of the SNI allowlist on the cold cluster, so run one
-after setting c up and after any change to it, at a quiet time.
+A drill is the only end-to-end proof that the cold cluster serves `<DOMAIN>`, so
+run one after setting c up and after any change to it, at a quiet time.
 
 ### Emergency: `failover c`
 

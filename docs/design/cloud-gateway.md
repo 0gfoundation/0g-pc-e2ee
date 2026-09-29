@@ -437,9 +437,9 @@ managed features:
 - **What we deploy instead**: dstack-ingress inside our own CVM, on our own
   domain, with dstack-gateway doing **L4 passthrough** (the `…-<port>s` form, and
   the default for any SNI the gateway holds no cert for). TLS then terminates in
-  *our* enclave and the cert is bound to *our* `app_id` (§6.1). One platform-side
-  prerequisite: the host front end forwards only SNI suffixes Phala has
-  allowlisted. See `deploy/phala/README.md`.
+  *our* enclave and the cert is bound to *our* `app_id` (§6.1). The gateway takes
+  any SNI outside its base domain down this path, with no per-domain registration
+  (see `deploy/phala/README.md`, "Serving domain").
 - **Fleet + LB**: dstack selects among replicas by app id, with TLS passthrough
   available — so the "which instance holds the key" routing problem is handled by
   the runtime rather than by us. **Verified in the gateway source, with a caveat
