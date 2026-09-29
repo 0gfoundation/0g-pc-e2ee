@@ -408,8 +408,9 @@ confirm() {
 # pre-switch probe (gate 2) and is what the serving alias moves to, and the live
 # side's is what a rollback moves the alias back to.
 need_side_bases() {
-  [ -n "$PLATFORM_BASE_A" ] && [ -n "$PLATFORM_BASE_B" ] ||
+  if [ -z "$PLATFORM_BASE_A" ] || [ -z "$PLATFORM_BASE_B" ]; then
     die "set PLATFORM_BASE (<cluster>.phala.network) — or PLATFORM_BASE_A and PLATFORM_BASE_B when the sides run in different clusters. They build the pre-switch probe and the serving alias."
+  fi
 }
 
 # "" if the serving alias sends traffic to side $1's cluster, else a one-line
