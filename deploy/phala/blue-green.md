@@ -161,7 +161,7 @@ collide with the other side's:
      _acme-challenge.router-api-tee.0g.ai      CNAME → _acme-challenge.router-api-tee.0g.ai.integratenetwork.work
 
 ② delegation zone integratenetwork.work — the SWITCH LAYER (switch.sh owns these):
-     router-api-tee.0g.ai.integratenetwork.work                     CNAME → _.<PLATFORM_BASE>    (static; set once by `setup`)
+     router-api-tee.0g.ai.integratenetwork.work                     CNAME → _.<live side's cluster> ← serving alias
      _dstack-app-address.router-api-tee.0g.ai.integratenetwork.work CNAME → …a… | …b…            ← ★ traffic switch
      _acme-challenge.router-api-tee.0g.ai.integratenetwork.work     CNAME → …a… | …b…            ← issuance switch
 
@@ -221,7 +221,9 @@ Cloudflare zones. One token scoped to `integratenetwork.work` covers both sides
 
 **What actually moves on a release.** Only the **traffic switch** (② line 2).
 The **issuance switch** moves only when a side needs to obtain/renew its cert;
-the **serving alias** (② line 1) is set once to `_.<PLATFORM_BASE>` and never moves.
+the **serving alias** (② line 1) names the live side's cluster, `_.<base>`, so it
+moves only when the target side runs in a different cluster — see
+[Cross-cluster fallback](#cross-cluster-fallback).
 
 **Each side must run `DNS_SETUP_MODE=print`.** dstack-ingress boots with a strict
 pre-check (default `DNS_SETUP_MODE=wait`): it blocks until the served
@@ -294,10 +296,11 @@ provider rejects it, and that container crash-loops with the reason in its log
 while the gateway keeps serving. The `docker-compose.yml` comment on that line has
 why it is deliberately unguarded.)
 
-Cross-cluster blue/green remains unsupported for the separate reason in
-[Limitations](#limitations--things-to-confirm-in-your-environment): the serving
-alias is static, so a side in another cluster would be selected by the traffic
-switch and then handed to a gateway that cannot route its `app_id`.
+Across clusters this record does matter to the switch layer, but only as a
+check: `switch.sh` writes the serving alias from `PLATFORM_BASE_A`/`_B`, and the
+per-side probe (`<app_id>-443s.<that side's base>`) only answers if the side
+really runs in the cluster configured for it. See
+[Cross-cluster fallback](#cross-cluster-fallback).
 
 ## One-time setup
 
@@ -315,12 +318,13 @@ cp deploy/phala/switch.env.example deploy/phala/switch.env
 Or supply it via the environment instead (`CF_API_TOKEN=... ./switch.sh …`); the
 real environment overrides `switch.env`, and `--env-file PATH` points elsewhere.
 Also set `PLATFORM_BASE` (e.g. `in1.phala.network`) in `switch.env` — `setup`,
-`switch` and `rollback` refuse to run without it. It is the **one place the
-cluster is named on the operator side**: `setup` writes the serving alias from it,
-and `switch` builds the per-side pre-switch probe from it
+`switch`, `failover` and `rollback` refuse to run without it. It is the **one place
+the cluster is named on the operator side**: `setup` writes the serving alias from
+it, and `switch` builds the per-side pre-switch probe from it
 ([Health-checking the standby](#health-checking-the-standby-side)) and refuses if
 the live alias names a different cluster, so the alias and the probe cannot drift
-apart. Read `<cluster>` off a CVM's
+apart. (Sides in two different clusters set `PLATFORM_BASE_A` and `PLATFORM_BASE_B`
+instead — see [Cross-cluster fallback](#cross-cluster-fallback).) Read `<cluster>` off a CVM's
 `kms_info.gateway_app_url` (`https://gateway.<cluster>.phala.network`) rather than
 from memory.
 
@@ -328,15 +332,14 @@ from memory.
    zone: `router-api-tee.0g.ai.integratenetwork.work` CNAME → the cluster's dstack
    gateway, `_.<cluster>.phala.network`. This is the hop that carries traffic (②
    above), and it is the operator's to set — the CVMs no longer take a cluster
-   value from you at all. It never changes, and both sides route through the same
-   cluster, so one static value serves both. `switch.sh setup` writes it from
-   `PLATFORM_BASE`:
+   value from you at all. With both sides in one cluster it never changes, and one
+   static value serves both. `switch.sh setup` writes it from `PLATFORM_BASE`:
 
    ```sh
    ./switch.sh setup            # serving alias -> _.${PLATFORM_BASE}
    ```
 
-   `status` warns if the live alias later drifts from `PLATFORM_BASE`. Without
+   `status` warns if the live alias later drifts from the live side's cluster. Without
    `PLATFORM_BASE`, `setup` refuses and prints whatever the alias currently points
    at, so you can read the cluster off it.
 
@@ -465,6 +468,121 @@ machine computes the same target. Because the old side is still running with a
 valid cert, rollback is effectively instant (bounded by `TTL` + the gateway route
 cache). **Keep the old side running until you are confident in the new one** — a
 destroyed side is no longer a rollback target.
+
+## Cross-cluster fallback
+
+Both sides can also run in **different dstack clusters**, so that losing one
+cluster does not take the service with it: side a serves from one, side b waits in
+the other. The same three switch-layer records carry it; what changes is that the
+serving alias moves too.
+
+### Why the serving alias has to move
+
+A dstack gateway only routes `app_id`s that run in its own cluster, and it finds
+the `app_id` by looking up `_dstack-app-address.<DOMAIN>` — one global record,
+which only ever holds one value. So the live side and the cluster the serving
+alias names must always be the same cluster, and moving traffic across clusters
+means moving both records:
+
+```
+before     serving alias → _.<cluster A>    traffic switch → …a…    (app_a runs in A ✔)
+after      serving alias → _.<cluster B>    traffic switch → …b…    (app_b runs in B ✔)
+```
+
+That is also why the two clusters cannot serve **at the same time**: both gateways
+would read the same record and get the same `app_id`, which only one of them hosts.
+Upstream `parse_lookup` (gateway/src/proxy/tls_passthough.rs) takes the first TXT
+answer, so publishing two values does not help either.
+
+### Configuration
+
+```sh
+# switch.env
+PLATFORM_BASE_A=in1.phala.network       # side a's cluster
+PLATFORM_BASE_B=<other>.phala.network   # side b's cluster
+```
+
+Both default to `PLATFORM_BASE`, so a same-cluster deployment sets only that and
+nothing below changes for it: the serving alias is already `_.<base>` and its write
+is a no-op. Read each side's cluster off **that side's** CVM
+(`kms_info.gateway_app_url`). A wrong value is caught before anything is written:
+the per-side probe cannot reach an `app_id` on a cluster it does not run in, so
+gate 2 refuses.
+
+**Prerequisites the script cannot check:**
+
+- **Phala's SNI allowlist on both clusters.** Each cluster's host front end only
+  forwards SNI suffixes it has been configured for (README, "Serving domain"). The
+  `-443s` probe travels under the platform hostname, not `<DOMAIN>`, so it passes
+  whether or not `<DOMAIN>` is allowed there. Only a real cutover (a drill) proves it.
+- **A valid certificate on the standby.** Only the side the issuance switch points
+  at can renew, so a standby held in reserve ages. `./switch.sh status` reads each
+  side's certificate through its `-443s` hostname and warns when fewer than
+  `CERT_WARN_DAYS` (21) remain. To renew the standby, lend it issuance for the few
+  minutes it needs: `acme b`, wait for it to issue, `acme a`. See
+  [Certificates](#certificates-the-issuance-switch-and-rate-limits).
+
+### Planned move: `switch`
+
+`./switch.sh switch b` works across clusters unchanged: gates 1 and 2 (probing b on
+b's own cluster), then issuance → traffic switch → serving alias, then the
+cache-proof verify, and auto-rollback restores **all three** records if b does not
+verify. It warns before it starts when the alias is about to move.
+
+A planned cross-cluster move **has a short outage window**, which a same-cluster
+switch does not. A new connection needs two lookups to agree — the client's cached
+serving alias (which cluster) and that cluster's gateway's cached app-address (which
+`app_id`) — and after the flip they expire independently. The failing combination
+is a client still holding the old alias, reaching the old cluster, whose gateway has
+already refreshed to `app_b`, which it does not host. It lasts until that client's
+alias cache expires: at most about one `TTL` (60 s), usually less. Open connections
+are unaffected, and so are clients whose cache happens to fall outside the window.
+
+The write order keeps the window that small. With the alias written **last**, the
+new cluster's gateway sees `app_b` from its very first lookup, and the old
+cluster's gateway keeps serving `app_a` from its cache for a while. Written the
+other way round, every client sent to the new cluster before the traffic switch
+lands would make its gateway cache `app_a` — which it cannot route — for all of
+them. dstack caches the lookup for the record's TTL (Hickory's TTL-aware cache;
+~30 s was observed on `in1.phala.network`). `TTL` is already 60 s, Cloudflare's
+minimum outside Enterprise plans, so it cannot be lowered further.
+
+A cutover interrupted between its two traffic writes (a Cloudflare error, a
+killed shell) leaves the traffic switch on one side and the alias on the other
+side's cluster. `status` flags that as a **split state**, and re-running the same
+command completes it; `switch` refuses to start *from* a split state towards the
+other side, since its rollback would restore a broken state.
+
+### Emergency: `failover`
+
+```sh
+./switch.sh failover b      # the cluster side a runs in is gone
+```
+
+`failover` writes exactly what `switch` writes, with three differences:
+
+- the old side does not have to answer — its cert is read only if it can be;
+- a failed verify is **reported, never rolled back**: there is nothing to go back
+  to, and restoring records that point at a dead cluster would not help anyone;
+- it will overwrite a traffic switch that names neither side.
+
+The target still has to pass gates 1 and 2 — failing over to a side that cannot
+serve helps no one. The outage window above costs nothing here, because the old
+cluster was not serving anyway. Afterwards, `rollback` is refused for as long as
+side a does not answer its probe, which is the behaviour you want; once a's cluster
+is back and a is ready, `switch a` (or `rollback`) moves traffic home.
+
+`failover --yes` is also the building block for automated failover, which is not
+part of this script: a watchdog outside **both** clusters, several vantage points
+and several consecutive failures before it acts, one-way (no automatic failback),
+and a Cloudflare token limited to the delegation zone.
+
+### Drills
+
+Nothing above proves the standby can take real traffic until it does. Rehearse a
+planned `switch b` and `switch a` on a quiet period, regularly (monthly is a
+reasonable default) — that is the only check of the SNI allowlist on b's cluster,
+and it renews b's certificate on the way.
 
 ## Health-checking the standby side
 
@@ -649,36 +767,17 @@ Two consequences for testing it:
 ## Limitations & things to confirm in your environment
 
 - **No weighted/percentage canary** — atomic flip only (see the top section).
-- **Both sides must be in the same dstack cluster.** The serving alias is one
-  static value pointing at one cluster's gateway, and a gateway only routes to
-  `app_id`s in its **own** cluster — so flipping `_dstack-app-address` to a side in
-  another cluster would point the serving gateway at an `app_id` it cannot reach.
-  This scheme flips `_dstack-app-address` (+ `_acme-challenge`) only and treats the
-  serving alias as fixed. **Migrating to a new cluster** (or running the sides
-  across clusters) is not supported as-is; it additionally needs the serving alias
-  to become a *switched* record (→ the target side's own gateway pointer, i.e. ③'s
-  last line, which each side already publishes correctly for its own cluster now
-  that the value comes from the platform), a per-side `PLATFORM_BASE` for the
-  standby probe, and Phala's SNI allowlist on both clusters.
-  Because the client's gateway and the app-address then live in two records with
-  independent DNS caches, that cutover has a brief inconsistency window (shrink it
-  by lowering the TTLs first). Defer until a cluster move is actually needed.
-
-  > **Do not hand-assemble a cluster move from `setup` + `switch`.** With the
-  > alias on the old cluster, `switch` to a side on the new one is refused —
-  > outright if `PLATFORM_BASE` names the new cluster (it disagrees with the
-  > alias), and by gate 2 if it names the old one (that cluster's gateway cannot
-  > reach the new side's `app_id`). Re-running
-  > `setup` against the new cluster first gets past that, but the service is down
-  > from that write until the `switch` lands — the new cluster's gateway is handed
-  > the old side's `app_id` — and a failed `switch` then auto-rolls-back the
-  > app-address alone, onto a cluster the alias no longer points at, which leaves
-  > nothing serving.
-- **`switch`/`rollback` need `PLATFORM_BASE`** (the dstack platform base domain, e.g.
-  `in1.phala.network`) to probe the standby, and refuse without it — see
-  [Health-checking the standby](#health-checking-the-standby-side).
+- **One cluster serves at a time.** The sides may run in different clusters, but
+  only the one the serving alias names carries traffic, and a planned move between
+  them has a short outage window — see
+  [Cross-cluster fallback](#cross-cluster-fallback). `setup` refuses to point the
+  alias away from the live side's cluster; move traffic with `switch`/`failover`.
+- **`switch`/`failover`/`rollback` need every side's cluster** — `PLATFORM_BASE`,
+  or `PLATFORM_BASE_A` and `PLATFORM_BASE_B` — to probe the standby, and refuse
+  without it — see [Health-checking the standby](#health-checking-the-standby-side).
 - **Cutover latency** is the switch-layer `TTL` (default 60 s) plus the dstack
-  gateway's cache of `_dstack-app-address` (**observed ~30 s** on `in1.phala.network`).
+  gateway's cache of `_dstack-app-address`, which follows the record's TTL
+  (**observed ~30 s** on `in1.phala.network`).
   The flip is not sub-second; the post-switch verify window
   (`VERIFY_RETRIES` × `VERIFY_INTERVAL`) must exceed this cache or a slow flush
   reads as a failed switch and triggers an unnecessary rollback.
