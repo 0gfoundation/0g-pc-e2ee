@@ -10,6 +10,7 @@
 #
 #   records.json   the delegation zone, as a JSON array of {id,type,name,content}
 #   writes.log     one line per POST/PUT/DELETE the script sent
+#   api.log        one line per record lookup (GET <name>)
 #   health         lines of `<host> <path> <code> [<code>…]`; successive requests
 #                  consume the codes in turn and the last one repeats
 #   stale          if present, holds an app_id the public name keeps resolving to,
@@ -93,6 +94,7 @@ case "$url" in
         echo '{"success":true,"result":[{"id":"zone1"}]}' ;;
       "GET /zones/zone1/dns_records?"*)
         q="${path#*\?}"; name="${q#name=}"; name="${name%%&*}"
+        echo "GET $name" >>"$S/api.log"
         jq -c --arg n "$name" '{success:true,result:[.[] | select(.name==$n)]}' "$S/records.json" ;;
       "POST /zones/zone1/dns_records")
         id="rec$(( $(jq length "$S/records.json") + 100 + RANDOM ))"
@@ -165,7 +167,7 @@ S=""
 # A fresh zone: serving alias set, both sides published, traffic + issuance on a.
 reset() {
   S="$WORK/state.$RANDOM$RANDOM"; mkdir -p "$S"
-  : >"$S/writes.log"; : >"$S/health"; : >"$S/http.log"; : >"$S/env"
+  : >"$S/writes.log"; : >"$S/health"; : >"$S/http.log"; : >"$S/api.log"; : >"$S/env"
   jq -n \
     --arg alias "$ALIAS" --arg base "_.${BASE}" \
     --arg as "$ADDR_SWITCH" --arg aa "$(addr_side a)" --arg ab "$(addr_side b)" \
@@ -211,6 +213,10 @@ expect_cname() { # name target
   [ "$got" = "$2" ] || { fail "$1 -> '${got}', want '$2'"; return 1; }
 }
 expect_first_write() { [ "$(head -n1 "$S/writes.log")" = "$1" ] || { fail "first write '$(head -n1 "$S/writes.log")', want '$1'"; return 1; }; }
+expect_reads() { # name count — Cloudflare lookups of that name
+  local n; n="$(grep -cxF "GET $1" "$S/api.log" || true)"
+  [ "$n" = "$2" ] || { fail "$1 read ${n} times, want $2"; return 1; }
+}
 expect_probed()     { grep -qF -- " $1 " "$S/http.log" || { fail "never requested $1"; return 1; }; }
 expect_not_probed() { ! grep -q -- "-443s\." "$S/http.log" || { fail "probed a side: $(grep -- '-443s\.' "$S/http.log" | head -n1)"; return 1; }; }
 
@@ -225,6 +231,10 @@ expect_rc 0 && expect_out "-> _.${BASE}" && expect_out "[a]" \
   && expect_out "appa:443" && expect_out "appb:443" \
   && expect_out "https://appb-443s.${BASE}/readyz" && expect_out "live side       : a" \
   && expect_no_writes && ok
+
+t "status: reads each side's app-address once"
+run PLATFORM_BASE=$BASE -- status
+expect_rc 0 && expect_reads "$(addr_side a)" 1 && expect_reads "$(addr_side b)" 1 && ok
 
 t "status: warns when both sides publish the same app_id"
 jq 'map(if .content=="\"appb:443\"" then .content="\"appa:443\"" else . end)' "$S/records.json" >"$S/r.tmp" && mv "$S/r.tmp" "$S/records.json"
@@ -281,6 +291,11 @@ t "switch: gate 1 refuses a side that publishes no app-address"
 drop "$(addr_side b)"
 run PLATFORM_BASE=$BASE -- switch b --yes
 expect_fail && expect_out "publishes no app-address TXT" && expect_no_writes && ok
+
+t "switch: warns when both sides publish the same app_id"
+jq 'map(if .content=="\"appa:443\"" then .content="\"appb:443\"" else . end)' "$S/records.json" >"$S/r.tmp" && mv "$S/r.tmp" "$S/records.json"
+run PLATFORM_BASE=$BASE -- switch b --yes --no-verify
+expect_rc 0 && expect_out "both sides publish the same app_id (appb:443)" && ok
 
 t "switch: gate 2 refuses a side that never becomes ready"
 health "appb-443s.${BASE} /readyz 503"
