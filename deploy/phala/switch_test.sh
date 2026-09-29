@@ -310,6 +310,12 @@ cold; health "appc-443s.${BB} /readyz 503"
 run "${Y[@]}" -- status
 expect_rc 0 && expect_out "ready : NO" && expect_out "a failover to c would be refused now" && ok
 
+t "status: a main side answering not-ready is reported, and status carries on"
+health "appb-443s.${BASE} /readyz 503"
+run PLATFORM_BASE=$BASE -- status
+expect_rc 0 && expect_out "ready : NO   https://appb-443s.${BASE}/readyz answers not-ready" \
+  && expect_no_out "cold standby is not ready" && expect_out "live side       : a" && ok
+
 t "status: a cold standby in a down cluster is unreachable, its cert unreadable"
 cold; touch "$S/down.${BB}"
 run "${Y[@]}" -- status
