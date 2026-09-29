@@ -989,6 +989,59 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 	}, nil
 }
 
+// RefreshProvider implements core.KeyRefresher: the provider refused a request
+// sealed to stale.EncPubKey as not its current key, so drop that cached key and
+// materialize candidate i again. It goes back through Provider, so the fresh key
+// passes the same quote verification and on-chain grounding a first fetch does.
+func (c *routeCandidates) RefreshProvider(ctx context.Context, i int, stale core.Provider) (p core.Provider, err error) {
+	result := "refreshed"
+	if err = c.router.dropStaleKey(c.providers[i].Endpoint, stale.EncPubKey); err != nil {
+		result = "throttled"
+	} else if p, err = c.Provider(ctx, i); err != nil {
+		result = "failed"
+	} else if bytes.Equal(p.EncPubKey, stale.EncPubKey) {
+		result = "unchanged"
+	}
+	metrics.KeyRefresh(result)
+	// The logger is set only with quote or on-chain verification configured.
+	if l := c.router.logger; l != nil {
+		l.Info("re-fetched provider e2ee key after a key mismatch",
+			"provider", c.providers[i].Address, "result", result, "err", err)
+	}
+	return p, err
+}
+
+// dropStaleKey evicts endpoint's cached enc key if it is still stale, so the next
+// materialization fetches a fresh one. A key another request already refreshed is
+// left alone, which keeps a burst of mismatches (every request in flight across
+// a rotation) to one re-fetch. On the quote path the eviction costs a live DCAP
+// verify and the 409 that asked for it came through the untrusted router, so it
+// shares the once-per-TTL re-verification allowance (mayReverifyQuote); the
+// legacy pubkey path already trusts the router and a GET is cheap, so it is not
+// throttled.
+func (r *Router) dropStaleKey(endpoint string, stale crypto.PublicKey) error {
+	if r.verifier == nil {
+		pubkeyURL, err := derivePubkeyURL(endpoint)
+		if err != nil {
+			return upstream(0, fmt.Errorf("provider endpoint: %w", err))
+		}
+		r.cache.dropIfKey(pubkeyURL, stale)
+		return nil
+	}
+	quoteURL, err := deriveQuoteURL(endpoint)
+	if err != nil {
+		return upstream(0, fmt.Errorf("provider endpoint: %w", err))
+	}
+	if res, ok := r.quoteCache.get(quoteURL); !ok || !bytes.Equal(res.encPub, stale) {
+		return nil
+	}
+	if !r.mayReverifyQuote(quoteURL) {
+		return upstream(0, fmt.Errorf("quote re-verification for %s throttled", quoteURL))
+	}
+	r.quoteCache.dropIfKey(quoteURL, stale)
+	return nil
+}
+
 // verifiedKeys is the keys-only form, for the callers that seal but report nothing:
 // the direct-broker resolver (which pins no on-chain address, so it has no provider
 // identity to record) and tests. It also discards the provenance flag — see
@@ -2081,6 +2134,15 @@ func (c *pubkeyCache) get(key string) (crypto.PublicKey, string, bool) {
 		return nil, "", false
 	}
 	return e.encPub, e.signer, true
+}
+
+// dropIfKey evicts key's entry if it still holds encPub.
+func (c *pubkeyCache) dropIfKey(key string, encPub crypto.PublicKey) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.m[key]; ok && bytes.Equal(e.encPub, encPub) {
+		delete(c.m, key)
+	}
 }
 
 func (c *pubkeyCache) put(key string, encPub crypto.PublicKey, signer string) {

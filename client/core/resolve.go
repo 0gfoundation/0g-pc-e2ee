@@ -61,6 +61,17 @@ type Candidates interface {
 	Provider(ctx context.Context, i int) (Provider, error)
 }
 
+// KeyRefresher is implemented by Candidates that cache provider enc keys. A
+// broker upgrade rotates the enclave's enc key, and until the cached copy expires
+// every request sealed to the old one is refused with a 409 e2ee_key_mismatch.
+// On that refusal the client calls RefreshProvider ONCE for the candidate: it
+// drops candidate i's cached key if it is still stale's, and materializes the
+// candidate again through the same verification Provider runs — so a re-fetched
+// key is trusted exactly as far as a first fetch would be.
+type KeyRefresher interface {
+	RefreshProvider(ctx context.Context, i int, stale Provider) (Provider, error)
+}
+
 // resolveBudget bounds the TOTAL time one Complete/CompleteStream call may spend
 // on WASTED work while walking the candidate chain: materializing candidates, plus
 // attempts that failed. Time inside the attempt that ultimately succeeds is not
@@ -131,6 +142,17 @@ func (w *candidateWalk) limit() time.Duration {
 // A caller that gets an error checks exhausted() to tell "this candidate failed"
 // from "there is nothing left to try one with".
 func (w *candidateWalk) provider(ctx context.Context, cands Candidates, i int) (Provider, error) {
+	return w.metered(ctx, i, func(ctx context.Context) (Provider, error) { return cands.Provider(ctx, i) })
+}
+
+// refresh re-materializes candidate i after a key mismatch, metered like provider.
+func (w *candidateWalk) refresh(ctx context.Context, r KeyRefresher, i int, stale Provider) (Provider, error) {
+	return w.metered(ctx, i, func(ctx context.Context) (Provider, error) { return r.RefreshProvider(ctx, i, stale) })
+}
+
+// metered runs one materialization of candidate i under what is left of the
+// budget, charging what it takes.
+func (w *candidateWalk) metered(ctx context.Context, i int, materialize func(context.Context) (Provider, error)) (Provider, error) {
 	remaining := w.limit() - w.spent
 	if remaining <= 0 {
 		return Provider{}, &Error{Stage: StageUpstream, Err: fmt.Errorf(
@@ -147,7 +169,7 @@ func (w *candidateWalk) provider(ctx context.Context, cands Candidates, i int) (
 	start := time.Now()
 	ctx, cancel := context.WithDeadline(ctx, start.Add(remaining))
 	defer cancel()
-	p, err := cands.Provider(ctx, i)
+	p, err := materialize(ctx)
 	w.spent += time.Since(start)
 	return p, err
 }

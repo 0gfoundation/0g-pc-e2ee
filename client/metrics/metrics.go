@@ -316,6 +316,14 @@ var (
 			"evidence, by what the fresh evidence then said (ok|negative|lookup_failed).",
 	}, []string{"result"})
 
+	keyRefresh = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "e2ee_key_refresh_total",
+		Help: "Provider enc-key re-fetches forced by a 409 e2ee_key_mismatch (the provider " +
+			"rotated its key, e.g. a broker upgrade), by result: refreshed (a new key; the " +
+			"request is re-sealed and retried once), unchanged (same key; not retried), " +
+			"failed (the re-fetch or its verification failed) or throttled.",
+	}, []string{"result"})
+
 	// Warmer (route/warmer.go) — the background sweep keeping the quote cache hot.
 	warmerSweeps = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "warmer_sweeps_total",
@@ -371,7 +379,7 @@ func init() {
 		upstreamAttempts, upstreamDuration, streamTTFF, candidateFallbacks, walkBudgetExhausted,
 		signatureFetchCalls, signatureFetchDuration,
 		quoteVerify, quoteVerifyDuration, quoteCache, measurementUntrusted,
-		onchainGrounding, onchainRevalidations,
+		onchainGrounding, onchainRevalidations, keyRefresh,
 		warmerSweeps, warmerProviderRefresh, warmerSignerRefresh,
 		warmerReadyProviders, warmerLastSuccess,
 		collateralCache, collateralFetch, collateralFetchDuration,
@@ -555,6 +563,9 @@ func OnChainGrounding(outcome string) { onchainGrounding.WithLabelValues(outcome
 // a benign signer rotation), negative (the verdict survived), or lookup_failed
 // (no fresh evidence could be obtained).
 func OnChainRevalidation(result string) { onchainRevalidations.WithLabelValues(result).Inc() }
+
+// KeyRefresh records one enc-key re-fetch after a key mismatch; see keyRefresh.
+func KeyRefresh(result string) { keyRefresh.WithLabelValues(result).Inc() }
 
 // WarmerSignerRefresh records one provider's on-chain signer refresh by the
 // warmer: ok, failed (our chain RPC could not be read), or mismatch (it was read

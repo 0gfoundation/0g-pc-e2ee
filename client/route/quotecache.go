@@ -1,6 +1,7 @@
 package route
 
 import (
+	"bytes"
 	"sync"
 	"time"
 
@@ -105,4 +106,14 @@ func (c *quoteCache) del(key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	delete(c.m, key)
+}
+
+// dropIfKey evicts key's entry if it still binds encPub — an atomic
+// compare-and-delete, so an entry another request just refreshed survives.
+func (c *quoteCache) dropIfKey(key string, encPub crypto.PublicKey) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.m[key]; ok && bytes.Equal(e.res.encPub, encPub) {
+		delete(c.m, key)
+	}
 }
