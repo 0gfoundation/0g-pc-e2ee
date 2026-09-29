@@ -433,28 +433,10 @@ move_switches() { # target-side  [--acme-only]
   fi
 }
 
-cmd_switch() {
-  [ -n "${1:-}" ] || die "usage: $0 switch <a|b>"
-  local target; target="$(side_name "$1")"
-  resolve_zone_id
-  need_platform_base
-
-  local cur_target cur_side
-  cur_target="$(current_cname "$ADDR_SWITCH")"
-  cur_side="$(which_side "$cur_target")"
-
-  # "?" = the traffic switch points at something that is neither side's record.
-  # Refuse rather than proceed: auto-rollback would have no valid side to restore.
-  if [ "$cur_side" = "?" ]; then
-    die "traffic switch points at an unrecognized target (${cur_target}); resolve it manually (./switch.sh status) before switching"
-  fi
-
-  info "current live side: ${cur_side:-<none>}  ->  target: ${target}"
-  if [ "$cur_side" = "$target" ]; then
-    warn "traffic switch already points at side ${target}; nothing to do"
-    exit 0
-  fi
-
+# Refuse (die) unless side $1 can take traffic: gate 1 — it publishes an
+# app-address — and gate 2 — it answers its readiness probe.
+gate_target() { # target-side
+  local target="$1"
   # Gate 1: the target side must actually be publishing an app-address.
   local tgt_addr; tgt_addr="$(side_app_addr "$target")"
   if [ -z "$tgt_addr" ]; then
@@ -536,6 +518,92 @@ cmd_switch() {
     info "target-side probe OK"
   fi
 
+}
+
+# Wait for the public endpoint to be served by side $1. Returns 0 once verified,
+# 1 if /healthz never turned healthy, 2 if it did but the old side's cert
+# ($2, the fingerprint read before the flip) kept being served.
+verify_switched() { # target-side cert-before
+  local target="$1" cert_before="$2"
+  # Verify the public endpoint recovers AND is actually being served by ${target}
+  # (cert fingerprint changed) within the window.
+  # The window must exceed the gateway's routing-cache TTL or a slow cache flush
+  # reads as a failure — see VERIFY_RETRIES/VERIFY_INTERVAL.
+  info "waiting for the public endpoint to serve from ${target} (record TTL ${TTL}s)..."
+  local i cert_now healthz_seen=0
+  for ((i=1; i<=VERIFY_RETRIES; i++)); do
+    if public_health_ok; then
+      healthz_seen=1
+      # `|| true`: never let a transient openssl/TLS hiccup abort mid-verify-loop —
+      # traffic is already switched, so aborting here would skip the auto-rollback.
+      # An empty cert_now just means "not confirmed yet", handled by the else below.
+      cert_now="$(served_cert_fp || true)"
+      if [ -z "$cert_before" ]; then
+        # No baseline to compare (no prior side, or no openssl): /healthz is all we have.
+        info "public health OK after switch to ${target} (attempt ${i})"
+        return 0
+      elif [ -n "$cert_now" ] && [ "$cert_now" != "$cert_before" ]; then
+        info "verified: ${DOMAIN} now served by ${target} (cert changed) and /healthz OK"
+        return 0
+      else
+        log "  attempt ${i}/${VERIFY_RETRIES}: /healthz OK but still the old cert — gateway route cache not flushed yet, waiting ${VERIFY_INTERVAL}s"
+      fi
+    else
+      log "  attempt ${i}/${VERIFY_RETRIES}: not healthy yet, sleeping ${VERIFY_INTERVAL}s"
+    fi
+    # Don't sleep after the final attempt — go straight to the failure path.
+    if [ "$i" -lt "$VERIFY_RETRIES" ]; then sleep "$VERIFY_INTERVAL"; fi
+  done
+
+  [ "$healthz_seen" = 1 ] && return 2
+  return 1
+}
+
+# Explain a failed verify ($3: verify_switched's status), restore traffic to the
+# previous side $2 if there was one, and die either way.
+auto_rollback() { # target-side previous-side verdict
+  local target="$1" cur_side="$2" verdict="$3"
+  # Two distinct failure modes, handled differently:
+  if [ "$verdict" = 2 ]; then
+    warn "after ${VERIFY_RETRIES} attempts ${DOMAIN} /healthz is OK but still serving ${cur_side}'s cert"
+    warn "— the gateway route cache has not flushed to ${target} within the verify window."
+    warn "This usually means the window is shorter than the cache, not that ${target} is broken;"
+    warn "raise VERIFY_RETRIES (or lower TTL) and re-run before concluding the switch failed."
+  else
+    warn "after ${VERIFY_RETRIES} attempts ${DOMAIN} /healthz never became healthy on ${target}"
+  fi
+  if [ -n "$cur_side" ]; then
+    warn "AUTO-ROLLBACK: restoring traffic to ${cur_side}"
+    move_switches "$cur_side"
+    die "rolled back to ${cur_side}. Investigate side ${target} (or the cache window) before retrying."
+  fi
+  die "no previous side to roll back to; the switch points at ${target} but was not confirmed"
+}
+
+cmd_switch() {
+  [ -n "${1:-}" ] || die "usage: $0 switch <a|b>"
+  local target; target="$(side_name "$1")"
+  resolve_zone_id
+  need_platform_base
+
+  local cur_target cur_side
+  cur_target="$(current_cname "$ADDR_SWITCH")"
+  cur_side="$(which_side "$cur_target")"
+
+  # "?" = the traffic switch points at something that is neither side's record.
+  # Refuse rather than proceed: auto-rollback would have no valid side to restore.
+  if [ "$cur_side" = "?" ]; then
+    die "traffic switch points at an unrecognized target (${cur_target}); resolve it manually (./switch.sh status) before switching"
+  fi
+
+  info "current live side: ${cur_side:-<none>}  ->  target: ${target}"
+  if [ "$cur_side" = "$target" ]; then
+    warn "traffic switch already points at side ${target}; nothing to do"
+    exit 0
+  fi
+
+  gate_target "$target"
+
   confirm "Switch traffic ${cur_side:-<none>} -> ${target} for ${DOMAIN}?" || { warn "aborted"; exit 1; }
 
   # Fingerprint the cert the live side is serving BEFORE we flip. After the flip
@@ -567,53 +635,13 @@ cmd_switch() {
     info "switched to ${target} (post-switch verification skipped)"; exit 0
   fi
 
-  # Verify the public endpoint recovers AND is actually being served by ${target}
-  # (cert fingerprint changed); auto-rollback if it does not within the window.
-  # The window must exceed the gateway's routing-cache TTL or a slow cache flush
-  # reads as a failure — see VERIFY_RETRIES/VERIFY_INTERVAL.
-  info "waiting for the public endpoint to serve from ${target} (record TTL ${TTL}s)..."
-  local i cert_now healthz_seen=0
-  for ((i=1; i<=VERIFY_RETRIES; i++)); do
-    if public_health_ok; then
-      healthz_seen=1
-      # `|| true`: never let a transient openssl/TLS hiccup abort mid-verify-loop —
-      # traffic is already switched, so aborting here would skip the auto-rollback.
-      # An empty cert_now just means "not confirmed yet", handled by the else below.
-      cert_now="$(served_cert_fp || true)"
-      if [ -z "$cert_before" ]; then
-        # No baseline to compare (no prior side, or no openssl): /healthz is all we have.
-        info "public health OK after switch to ${target} (attempt ${i})"
-        info "done. rollback with:  $0 switch ${cur_side:-<other>}"
-        exit 0
-      elif [ -n "$cert_now" ] && [ "$cert_now" != "$cert_before" ]; then
-        info "verified: ${DOMAIN} now served by ${target} (cert changed) and /healthz OK"
-        info "done. rollback with:  $0 switch ${cur_side:-<other>}"
-        exit 0
-      else
-        log "  attempt ${i}/${VERIFY_RETRIES}: /healthz OK but still the old cert — gateway route cache not flushed yet, waiting ${VERIFY_INTERVAL}s"
-      fi
-    else
-      log "  attempt ${i}/${VERIFY_RETRIES}: not healthy yet, sleeping ${VERIFY_INTERVAL}s"
-    fi
-    # Don't sleep after the final attempt — go straight to the failure path.
-    if [ "$i" -lt "$VERIFY_RETRIES" ]; then sleep "$VERIFY_INTERVAL"; fi
-  done
-
-  # Two distinct failure modes, handled differently:
-  if [ "$healthz_seen" = 1 ]; then
-    warn "after ${VERIFY_RETRIES} attempts ${DOMAIN} /healthz is OK but still serving ${cur_side}'s cert"
-    warn "— the gateway route cache has not flushed to ${target} within the verify window."
-    warn "This usually means the window is shorter than the cache, not that ${target} is broken;"
-    warn "raise VERIFY_RETRIES (or lower TTL) and re-run before concluding the switch failed."
-  else
-    warn "after ${VERIFY_RETRIES} attempts ${DOMAIN} /healthz never became healthy on ${target}"
+  local verdict=0
+  verify_switched "$target" "$cert_before" || verdict=$?
+  if [ "$verdict" = 0 ]; then
+    info "done. rollback with:  $0 switch ${cur_side:-<other>}"
+    exit 0
   fi
-  if [ -n "$cur_side" ]; then
-    warn "AUTO-ROLLBACK: restoring traffic to ${cur_side}"
-    move_switches "$cur_side"
-    die "rolled back to ${cur_side}. Investigate side ${target} (or the cache window) before retrying."
-  fi
-  die "no previous side to roll back to; the switch points at ${target} but was not confirmed"
+  auto_rollback "$target" "$cur_side" "$verdict"
 }
 
 cmd_rollback() {

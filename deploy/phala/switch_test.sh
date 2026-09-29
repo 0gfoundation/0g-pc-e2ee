@@ -342,6 +342,17 @@ run PLATFORM_BASE=$BASE -- switch b --yes
 expect_fail && expect_out "still serving a's cert" && expect_out "AUTO-ROLLBACK" \
   && expect_cname "$ADDR_SWITCH" "$(addr_side a)" && ok
 
+t "switch: from no live side, a failed verify has nothing to roll back to"
+drop "$ADDR_SWITCH"
+health "public:appb /healthz 500"
+run PLATFORM_BASE=$BASE -- switch b --yes
+expect_fail && expect_out "no previous side to roll back to" && expect_cname "$ADDR_SWITCH" "$(addr_side b)" && ok
+
+t "switch: from no live side, /healthz alone verifies"
+drop "$ADDR_SWITCH"
+run PLATFORM_BASE=$BASE -- switch b --yes
+expect_rc 0 && expect_out "public health OK after switch to b" && ok
+
 t "switch: --no-verify skips the post-switch check"
 health "public:appb /healthz 500"
 run PLATFORM_BASE=$BASE -- switch b --yes --no-verify
