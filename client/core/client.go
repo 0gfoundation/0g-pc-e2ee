@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
@@ -712,6 +713,16 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 
 		attemptStart := time.Now()
 		out, retry, err := c.completeOnce(ctx, provider, req, ephPub, ephPriv)
+		if isKeyMismatch(err) {
+			// Sealed to a key the provider has since rotated: re-fetch it and re-seal
+			// to the same provider, once (see rekeyed).
+			walk.charge(time.Since(attemptStart))
+			fresh, ok := c.rekeyed(ctx, &walk, cands, i, provider)
+			attemptStart = time.Now()
+			if ok {
+				out, retry, err = c.completeOnce(ctx, fresh, req, ephPub, ephPriv)
+			}
+		}
 		if err == nil {
 			return out, nil
 		}
@@ -836,6 +847,39 @@ func (c *Client) completeOnce(parent context.Context, provider Provider, req wir
 	// stale metadata behind.
 	recordMeta(ctx, provider, resp.Header)
 	return out, false, nil
+}
+
+// keyMismatchCode is the stable token the broker prefixes its 409 message with
+// when a sealed request names an enc key that is not the enclave's current one
+// (0g-serving-broker ctrl.ErrE2EEKeyMismatch; body {"error":"e2ee_key_mismatch: ..."}).
+// Matched as a token rather than by parsing the JSON so a router that wraps the
+// broker's error in its own envelope still carries it.
+const keyMismatchCode = "e2ee_key_mismatch"
+
+// isKeyMismatch reports whether err is a provider's 409 refusing a request sealed
+// to a stale enc key — the one 4xx that re-fetching the key can fix. The body is
+// untrusted, so a forged one buys at most one refresh + retry per request, and
+// the refresh itself is throttled (see route.Router.dropStaleKey).
+func isKeyMismatch(err error) bool {
+	var e *Error
+	return errors.As(err, &e) && e.Status == http.StatusConflict && strings.Contains(e.Body, keyMismatchCode)
+}
+
+// rekeyed re-materializes candidate i with a freshly fetched enc key after a key
+// mismatch, for one retry against the same provider. ok is false — surface the
+// 409 as-is — when the candidates cannot refresh, the refresh fails, or it
+// yields the same key (the retry would be refused identically). One call per
+// attempt, and the retry's own result is never fed back here: no loop.
+func (c *Client) rekeyed(ctx context.Context, walk *candidateWalk, cands Candidates, i int, stale Provider) (Provider, bool) {
+	r, ok := cands.(KeyRefresher)
+	if !ok {
+		return Provider{}, false
+	}
+	fresh, err := walk.refresh(ctx, r, i, stale)
+	if err != nil || bytes.Equal(fresh.EncPubKey, stale.EncPubKey) {
+		return Provider{}, false
+	}
+	return fresh, true
 }
 
 // retryableStatus reports whether a provider (data-plane) HTTP status is worth

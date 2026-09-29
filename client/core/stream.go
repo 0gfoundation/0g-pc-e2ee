@@ -88,6 +88,19 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 		}
 		attemptStart := time.Now()
 		retry, err := c.streamOnce(ctx, provider, sealed, ephPriv, onFrame)
+		if isKeyMismatch(err) {
+			// Refused before any frame: re-fetch the rotated key and re-seal to the
+			// same provider, once (see rekeyed).
+			walk.charge(time.Since(attemptStart))
+			fresh, ok := c.rekeyed(ctx, &walk, cands, i, provider)
+			attemptStart = time.Now()
+			if ok {
+				if sealed, err = c.seal(fresh, req, ephPub); err != nil {
+					return stageErr(StageRequest, fmt.Errorf("seal request: %w", err))
+				}
+				retry, err = c.streamOnce(ctx, fresh, sealed, ephPriv, onFrame)
+			}
+		}
 		if err == nil {
 			return nil
 		}
