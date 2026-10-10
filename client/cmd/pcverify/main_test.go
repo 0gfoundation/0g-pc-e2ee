@@ -557,7 +557,10 @@ func TestReport_Manifest(t *testing.T) {
 	// A block with no canonical form must say so where its fingerprint would be, not go
 	// blank — a missing line reads as "nothing to report".
 	t.Run("a block that cannot be pinned says so", func(t *testing.T) {
-		doc := "x-base: &base\n  privileged: true\nservices:\n  broker:\n    <<: *base\n    image: mysql:8.0\n"
+		// A scalar body. This used to be a merge key, which is now RESOLVED rather than
+		// refused (client/evidence/composeanchor.go) — a body that is not a mapping is
+		// what is left that has no canonical form.
+		doc := "services:\n  broker: notamapping\n"
 		_, got := runReport(t, base.withManifest(t, doc, nil), false, nil)
 		if !strings.Contains(got, "cannot be pinned") {
 			t.Errorf("an unpinnable block printed no reason:\n%s", got)

@@ -622,63 +622,101 @@ func TestServiceBlock_QuotingIsDroppedButMeaningIsNot(t *testing.T) {
 	}
 }
 
-// --- indirection is refused, not digested ---------------------------------------
+// --- indirection is resolved, not refused ---------------------------------------
 
-// A block whose keys live behind an anchor would marshal to `*base` — a perfectly
-// stable digest of a pointer. Pinning that pins the reference and not the content, which
-// is the one thing this file exists to prevent, so it is refused rather than reduced.
-func TestServiceBlock_RefusesIndirection(t *testing.T) {
-	for _, tc := range []struct{ name, doc, says string }{
+// The behaviour this replaced refused any block containing an anchor, which made three of
+// the four providers on the 2026-10-10 sweep produce no comparable block at all — every
+// service, because they all write `logging: *default-logging`. An anchor is
+// representation, like the quoting and indentation this form already drops, so it is
+// expanded into what it names and the result describes the service that actually runs.
+func TestServiceBlock_ResolvesIndirection(t *testing.T) {
+	for _, tc := range []struct{ name, doc, wantCanonical string }{
 		{
-			"merge key",
-			"x-base: &base\n  privileged: true\nservices:\n  svc:\n    <<: *base\n    image: mysql:8\n",
-			"merged from a YAML anchor",
+			// The fleet's shape: a shared logging anchor referenced as a value.
+			"a nested value is an alias",
+			"x-log: &log\n  driver: json-file\nservices:\n  svc:\n    image: mysql:8\n    logging: *log\n",
+			"image: mysql:8\nlogging:\n    driver: json-file\n",
+		},
+		{
+			// A merge key, and the precedence that goes with it: the service's own
+			// `privileged: false` must beat the anchor's `true`, or resolution would
+			// report the opposite of what runs.
+			"merge key, explicit key wins",
+			"x-base: &base\n  privileged: true\n  restart: always\nservices:\n  svc:\n    <<: *base\n    privileged: false\n    image: mysql:8\n",
+			"privileged: false\nimage: mysql:8\nrestart: always\n",
+		},
+		{
+			// The case the review used to get WRONG rather than merely refuse: cn-39's
+			// laya-w2 was reported as naming no image, because the image was in the anchor.
+			"the image comes from the anchor",
+			"x-base: &base\n  image: mysql:8\nservices:\n  svc:\n    <<: *base\n    command: serve\n",
+			"command: serve\nimage: mysql:8\n",
 		},
 		{
 			"whole body is an alias",
-			"x-base: &base\n  privileged: true\nservices:\n  svc: *base\n",
-			"references a YAML anchor",
+			"x-base: &base\n  image: mysql:8\n  privileged: true\nservices:\n  svc: *base\n",
+			"image: mysql:8\nprivileged: true\n",
 		},
 		{
-			"a nested value is an alias",
-			"x-vols: &vols\n  - /etc:/host-etc\nservices:\n  svc:\n    image: mysql:8\n    volumes: *vols\n",
-			"references a YAML anchor",
+			// `<<: [*a, *b]` — earlier source wins, per the YAML merge spec and per what
+			// docker compose itself resolves.
+			"merge sequence, earlier source wins",
+			"x-a: &a\n  restart: always\nx-b: &b\n  restart: never\n  init: true\nservices:\n  svc:\n    <<: [*a, *b]\n    image: mysql:8\n",
+			"image: mysql:8\nrestart: always\ninit: true\n",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			b := requireBlock(t, tc.doc, "svc")
-			if b.Err == nil {
-				t.Fatalf("indirection was reduced to a canonical form:\n%s", b.Canonical)
+			if b.Err != nil {
+				t.Fatalf("an anchor was refused rather than resolved: %v", b.Err)
 			}
-			if b.Pinnable() {
-				t.Fatal("Pinnable() is true for a block with no canonical form")
+			if !b.Pinnable() {
+				t.Fatal("Pinnable() is false for a block that resolved")
 			}
-			if !strings.Contains(b.Err.Error(), tc.says) {
-				t.Fatalf("err = %v, want it to mention %q", b.Err, tc.says)
-			}
-			// Nothing half-populated: a digest of a partially-read block is worse than none.
-			if b.Canonical != "" || b.Digest != "" || b.CanonicalNoImage != "" || b.DigestNoImage != "" {
-				t.Fatalf("a refused block still carries forms: %+v", b)
+			if b.Canonical != tc.wantCanonical {
+				t.Fatalf("canonical =\n%s\nwant\n%s", b.Canonical, tc.wantCanonical)
 			}
 		})
 	}
 }
 
-// A CYCLE, not just an indirection. yaml.v3 resolves an alias by pointing Node.Alias at
-// the anchored node, so a body that is anchored and references itself gives a node graph
-// with a back-edge — and a deep copy that followed Alias recursed until the runtime
-// killed the process with an unrecoverable stack overflow. The input is entirely the
-// provider's: they write the manifest and hash it themselves, so nothing upstream filters
-// it.
-//
-// The three cases above all put the anchor OUTSIDE the service body (`x-base: &base`),
-// which is why they missed this: those graphs are still trees from the body's point of
-// view. These put the anchor ON the body, which is what closes the loop.
+// Resolution must not make the anchor's SPELLING significant: two manifests that resolve
+// to the same service are the same deployment, and a comparison that separates them is
+// measuring the author's editing habits rather than the code. This is the property that
+// lets one baseline entry match a provider who later refactors their compose file.
+func TestServiceBlock_AnchoredAndInlineReduceAlike(t *testing.T) {
+	anchored := requireBlock(t,
+		"x-log: &log\n  driver: json-file\n  options:\n    max-size: 100m\nservices:\n  svc:\n    image: mysql:8\n    logging: *log\n",
+		"svc")
+	inline := requireBlock(t,
+		"services:\n  svc:\n    image: mysql:8\n    logging:\n      driver: json-file\n      options:\n        max-size: 100m\n",
+		"svc")
+	if anchored.Err != nil || inline.Err != nil {
+		t.Fatalf("errs: anchored=%v inline=%v", anchored.Err, inline.Err)
+	}
+	if anchored.Digest != inline.Digest {
+		t.Fatalf("the same service reduced two ways:\nanchored %s\n%s\ninline   %s\n%s",
+			anchored.Digest, anchored.Canonical, inline.Digest, inline.Canonical)
+	}
+}
+
+// A CYCLE is the one anchor that still cannot be resolved, and the only one — yaml.v3
+// rejects an alias to an undefined anchor at parse time, so a document that parsed has
+// every alias pointing somewhere. yaml.v3 resolves an alias by pointing Node.Alias at the
+// anchored node, so a body that is anchored and references itself gives a node graph with
+// a back-edge, and a deep copy that followed Alias recursed until the runtime killed the
+// process with an unrecoverable stack overflow. The input is entirely the provider's:
+// they write the manifest and hash it themselves, so nothing upstream filters it.
 //
 // Asserted as a normal return rather than with a recover(): a stack overflow is a runtime
 // fatal, so this test can only pass by not crashing — if the bug comes back, the whole
 // test binary dies and no assertion runs.
-func TestServiceBlock_SelfReferencingAnchorDoesNotCrash(t *testing.T) {
+//
+// The report is the WHOLE compose text, not the one service, because resolution happens
+// once for the document (reviewComposeText). That is the accepted cost of resolving where
+// the anchors are defined rather than where they are used; a cycle is a manifest docker
+// compose would itself refuse to start, so there is no good deployment it costs.
+func TestReviewCompose_SelfReferencingAnchorIsRefusedNotCrashed(t *testing.T) {
 	for _, tc := range []struct{ name, doc string }{
 		{
 			"body anchors itself and a value aliases it",
@@ -693,71 +731,89 @@ func TestServiceBlock_SelfReferencingAnchorDoesNotCrash(t *testing.T) {
 			"services:\n  a: &x\n    image: mysql:8.0\n    labels:\n      ? *x\n      : self\n",
 		},
 		{
-			// A later service aliasing an earlier one is legal and is NOT a cycle, but it
-			// is the shape closest to one, so it belongs in this table: the refusal must
-			// cover it too, since its canonical form would be `*x`.
-			"a later service aliases an earlier body",
-			"services:\n  a: &x\n    image: mysql:8.0\n  b: *x\n",
+			"an anchor that merges itself",
+			"x-base: &base\n  <<: *base\nservices:\n  a:\n    <<: *base\n    image: mysql:8.0\n",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			// Every case names the service whose body carries the alias.
-			name := "a"
-			if strings.Contains(tc.doc, "  b: *x") {
-				name = "b"
+			r := reviewOf(t, manifest(tc.doc)) // must terminate
+			if len(r.Blocks) != 0 {
+				t.Fatalf("a cycle produced blocks: %+v", r.Blocks)
 			}
-			b := requireBlock(t, tc.doc, name)
-			if b.Err == nil {
-				t.Fatalf("a self-referencing anchor was reduced to a canonical form:\n%s", b.Canonical)
-			}
-			if !strings.Contains(b.Err.Error(), "anchor") {
-				t.Fatalf("err = %v, want it to name the anchor", b.Err)
+			f := requireFinding(t, r, SeverityBlocking, "", "docker_compose_file")
+			if !strings.Contains(f.Detail, "do not resolve") {
+				t.Fatalf("detail %q does not say the anchors could not be resolved", f.Detail)
 			}
 		})
 	}
-
-	// Mutual cycles between two services are not expressible: YAML requires an anchor to
-	// be defined before it is referenced, so a forward reference is a parse error and the
-	// text never reaches a block at all. Asserted so nobody adds a fixture for it and
-	// mistakes "no block" for "refused".
-	t.Run("a forward anchor reference never becomes a block", func(t *testing.T) {
-		doc := "services:\n  a:\n    image: mysql:8.0\n    depends_on: [*y]\n  b: &y\n    image: redis:7\n"
-		r := reviewOf(t, manifest(doc))
-		if len(r.Blocks) != 0 {
-			t.Fatalf("blocks = %+v, want none — the compose text does not parse", r.Blocks)
-		}
-		requireFinding(t, r, SeverityBlocking, "", "docker_compose_file")
-	})
 }
 
-// The cycle is only reachable through Alias, so clearing it in the clone is what makes
-// cloneNode structurally unable to loop — independently of refuseIndirection running
-// first. Asserted directly, because it is the reason a future caller that forgets the
-// ordering still cannot crash the process.
-func TestCloneNode_DropsAliasAndDoesNotFollowCycles(t *testing.T) {
+// A later service aliasing an earlier one is LEGAL and is not a cycle — it means the two
+// services are the same. It sat in the cycle table while anchors were refused, where the
+// refusal made the distinction invisible; now it has to resolve, and to the same block.
+func TestServiceBlock_OneServiceAliasingAnotherIsTheSameService(t *testing.T) {
+	r := reviewOf(t, manifest("services:\n  a: &x\n    image: mysql:8.0\n  b: *x\n"))
+	a, b := requireBlock(t, "services:\n  a: &x\n    image: mysql:8.0\n  b: *x\n", "a"),
+		requireBlock(t, "services:\n  a: &x\n    image: mysql:8.0\n  b: *x\n", "b")
+	if a.Err != nil || b.Err != nil {
+		t.Fatalf("errs: a=%v b=%v", a.Err, b.Err)
+	}
+	if a.Digest != b.Digest {
+		t.Fatalf("an aliased service reduced differently:\n a %s\n b %s", a.Canonical, b.Canonical)
+	}
+	if len(r.Blocks) != 2 {
+		t.Fatalf("blocks = %d, want 2", len(r.Blocks))
+	}
+}
+
+// A self-referencing anchor is the one input that still cannot be resolved, and the
+// reason it gets a direct test rather than only a fixture is that its old failure was not
+// an error — it was an unrecoverable stack overflow, on a manifest a provider writes
+// freely. Asserted at the resolver so the guarantee does not depend on a caller running
+// something else first.
+func TestResolveAnchors_RefusesACycleInsteadOfLooping(t *testing.T) {
 	var root yaml.Node
 	if err := yaml.Unmarshal([]byte("a: &x\n  self: *x\n"), &root); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	body := root.Content[0].Content[1]
 	alias := body.Content[1]
-	// The premise: yaml.v3 really does close the loop. If this stops holding, the guard
-	// below is no longer testing anything and should be revisited rather than deleted.
+	// The premise: yaml.v3 really does close the loop, and the alias points at the
+	// ANCHORED node rather than at itself — which is why detection has to track the
+	// expansion path. If this stops holding, the guard below tests nothing and should be
+	// revisited rather than deleted.
 	if alias.Kind != yaml.AliasNode || alias.Alias != body {
 		t.Fatalf("yaml.v3 did not build a cycle: alias kind=%d Alias=%p body=%p", alias.Kind, alias.Alias, body)
 	}
 
-	clone := cloneNode(body) // must terminate
-	if clone == body {
-		t.Fatal("cloneNode returned the original node")
+	got, err := resolveAnchors(body) // must terminate
+	if err == nil {
+		t.Fatalf("a self-referencing anchor resolved to %+v", got)
 	}
-	if clone.Content[1].Alias != nil {
-		t.Fatal("the clone still carries an Alias pointer, so the walk can still loop")
+	if !strings.Contains(err.Error(), "itself") {
+		t.Fatalf("err = %v, want it to say the anchor contains a reference to itself", err)
 	}
-	// And it is a real deep copy: mutating the clone must not reach the original.
-	clone.Content[0].Value = "mutated"
-	if body.Content[0].Value == "mutated" {
-		t.Fatal("the clone shares nodes with the original")
+}
+
+// Resolution is also the deep copy blockOf relies on, including when there is nothing to
+// resolve — the case that would otherwise be the one that corrupts the review's view of
+// the same nodes, since every no-anchor manifest takes it.
+func TestResolveAnchors_AlwaysCopies(t *testing.T) {
+	var root yaml.Node
+	if err := yaml.Unmarshal([]byte("a:\n  image: mysql:8.0\n"), &root); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	body := root.Content[0].Content[1]
+	got, err := resolveAnchors(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == body {
+		t.Fatal("resolveAnchors returned the original node")
+	}
+	got.Content[1].Value = "mutated"
+	if body.Content[1].Value == "mutated" {
+		t.Fatal("the copy shares nodes with the original")
 	}
 }
 
