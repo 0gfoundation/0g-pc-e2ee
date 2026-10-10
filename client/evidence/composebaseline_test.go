@@ -3,6 +3,8 @@ package evidence
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -66,19 +68,150 @@ func TestCheckCompose_EmptyBaselineIsNotConfigured(t *testing.T) {
 	}
 }
 
-// The shipped file is empty on purpose — a baseline freezes a manifest, and cn-20's
-// current one carries ten blocking findings. It still has to PARSE, or the "not
-// configured" state would be indistinguishable from a build defect.
-func TestBuiltinComposeBaseline_ParsesAndIsDeliberatelyEmpty(t *testing.T) {
+// --- the shipped file ------------------------------------------------------------
+
+// The embedded baseline records cn-20's twelve services. Asserting the names and the
+// count is not ceremony: the file is the only thing standing between a provider's
+// containers and "unreviewed", and a bad merge that drops entries would leave the
+// remaining ones passing while the dropped services silently become mismatches nobody
+// looks at — or, if all of them go, would turn the whole check off as "not configured".
+func TestBuiltinComposeBaseline_RecordsCn20(t *testing.T) {
 	got, err := BuiltinComposeBaseline()
 	if err != nil {
 		t.Fatalf("the embedded baseline does not parse: %v", err)
 	}
-	if len(got) != 0 {
-		// Not a failure — filling it is the plan. But the file's own header explains why it
-		// is empty, so the two must be changed together.
-		t.Logf("the embedded baseline now has %d entry/entries; brokercompose.json's header "+
-			"must no longer say it is empty", len(got))
+	want := []string{
+		"broker-ingress", "0gm-sglang", "mysql", "broker-config-init",
+		"0g-serving-provider-broker", "0g-serving-provider-event", "0g-controller",
+		"prometheus-init", "prometheus", "grafana", "prometheus-node-exporter",
+		"dcgm-exporter",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("the embedded baseline has %d entries, want %d", len(got), len(want))
+	}
+	for i, w := range want {
+		if got[i].Name != w {
+			t.Errorf("entry %d is %q, want %q", i, got[i].Name, w)
+		}
+	}
+}
+
+// The likeliest transcription error in this file is pasting the WRONG one of the two
+// forms `-blocks` prints, and it is silent in the worst direction: a repository rule
+// compares against the image-held-out form, so an entry that recorded the full block
+// would never match and the service would read as changed on a deployment that had not
+// changed. The two are distinguishable without the manifest — a held-out block has no
+// top-level image line — so check it here rather than waiting for a live run to say so.
+func TestBuiltinComposeBaseline_EachEntryRecordsTheFormItsRuleCompares(t *testing.T) {
+	got, err := BuiltinComposeBaseline()
+	if err != nil {
+		t.Fatal(err)
+	}
+	withRule := 0
+	for _, s := range got {
+		hasImageLine := false
+		for _, line := range strings.Split(s.Block, "\n") {
+			if strings.HasPrefix(line, "image:") {
+				hasImageLine = true
+				break
+			}
+		}
+		if s.Image.pinsImageInBlock() {
+			// Every service in this manifest names an image. A format where one did not
+			// would be legal, so this is an assertion about the FILE, not the format.
+			if !hasImageLine {
+				t.Errorf("%s: no image rule, so the block must pin the image — but it has no "+
+					"image line. The image-held-out form was recorded by mistake", s.Name)
+			}
+			continue
+		}
+		withRule++
+		if hasImageLine {
+			t.Errorf("%s: has a repository rule, which compares the image-held-out form — but "+
+				"the recorded block still carries an image line, so it can never match", s.Name)
+		}
+		if s.Image.Repository != brokerRepo {
+			t.Errorf("%s: repository rule names %q; the only image meant to move is %q",
+				s.Name, s.Image.Repository, brokerRepo)
+		}
+	}
+	// Three services run 0G's own broker image. Guarding the count keeps the rule from
+	// spreading by copy-paste to a service whose image has no release cadence to excuse it.
+	if withRule != 3 {
+		t.Errorf("%d entries let their image move within a repository, want 3", withRule)
+	}
+}
+
+// The shipped baseline against a real manifest, which is the only test here that
+// exercises the file rather than the mechanism. Everything else in this package builds a
+// tiny manifest and a baseline to match it, so all of it would still pass if a block in
+// brokercompose.json were mistyped.
+//
+// The fixture is NOT independent of the baseline — both come from one `-blocks` run — but
+// it is independent in the dimension that can actually go wrong: it carries the FULL
+// blocks with cn-20's real image references, while the baseline stores the image-held-out
+// form for the three broker services. So a match here means the repository rule really
+// does accept a live digest-pinned reference, which no synthetic fixture shows.
+func TestBuiltinComposeBaseline_MatchesTheManifestItWasRecordedFrom(t *testing.T) {
+	doc, err := os.ReadFile(filepath.Join("testdata", "cn20-services.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	review := reviewOf(t, manifest(string(doc)))
+	baseline, err := BuiltinComposeBaseline()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := CheckCompose(baseline, review.Blocks)
+	if !got.Configured {
+		t.Fatal("the embedded baseline reported as not configured")
+	}
+	if !got.OK() {
+		t.Fatalf("the recorded baseline does not match the manifest it was recorded from:\n%s",
+			dumpMismatches(got))
+	}
+	if got.Matched != len(baseline) {
+		t.Errorf("matched %d of %d recorded services", got.Matched, len(baseline))
+	}
+
+	// And the claim the file's header rests on: recording SILENCES NOTHING. The review is
+	// a separate mechanism and goes on reporting the same manifest as unfit. Asserted on
+	// the finding that matters rather than on a count, so a legitimate new review rule
+	// does not fail this test.
+	var found bool
+	for _, f := range review.Findings {
+		if f.Severity == SeverityBlocking && f.Service == "0g-controller" &&
+			strings.Contains(f.Detail, "docker.sock") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("the recorded manifest no longer reports 0g-controller's docker.sock mount as " +
+			"blocking — recording a deployment must not silence the review of it")
+	}
+}
+
+// Every entry carries its audit note. The comparison never reads one, which is exactly
+// why a test has to: a `note` is the only record of why a block with a blocking review
+// finding in it was recorded anyway, and an entry added without one has been frozen
+// without being explained.
+func TestBuiltinComposeBaseline_EveryEntryCarriesItsAuditNote(t *testing.T) {
+	raw, err := composeBaselineFS.ReadFile("brokercompose.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var f composeBaselineFile
+	if err := json.Unmarshal(raw, &f); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.Comment) == 0 {
+		t.Error("the file carries no _comment header; an author editing it has nothing to read")
+	}
+	for _, s := range f.Services {
+		if len(s.Note) == 0 {
+			t.Errorf("%s: no note — the entry freezes this service without recording why", s.Name)
+		}
 	}
 }
 
@@ -387,6 +520,57 @@ func TestParseComposeBaseline_RefusesUnusableEntries(t *testing.T) {
 
 	if _, err := ParseComposeBaseline([]byte("not json")); err == nil {
 		t.Fatal("a non-JSON baseline was accepted")
+	}
+}
+
+// A MISSPELLED KEY must be an error, and the top-level one is the case that matters:
+// under a permissive decoder `{"servcies": [...]}` yields zero entries, zero entries
+// mean NOT CONFIGURED, and the reports then say the comparison did not run — which is a
+// line an operator reads past. A typo that turns the adjudicating check off is worse
+// than any entry this file could get wrong.
+func TestParseComposeBaseline_RefusesUnknownKeys(t *testing.T) {
+	for _, tc := range []struct{ name, doc string }{
+		{
+			"services misspelled — would silently disable the check",
+			`{"servcies": [{"name": "a", "block": ["restart: always"]}]}`,
+		},
+		{
+			"block misspelled",
+			`{"services": [{"name": "a", "blocks": ["restart: always"]}]}`,
+		},
+		{
+			"an image rule key this format does not have",
+			`{"services": [{"name": "a", "block": ["restart: always"], "image": {"repo": "x"}}]}`,
+		},
+		{
+			"a service key this format does not have",
+			`{"services": [{"name": "a", "block": ["restart: always"], "justification": "trust me"}]}`,
+		},
+		{
+			// A Decoder would otherwise stop at the first value, leaving a second object —
+			// and any edits in it — decoded by nothing.
+			"a second object after the first",
+			`{"services": []}{"services": [{"name": "a", "block": ["restart: always"]}]}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := ParseComposeBaseline([]byte(tc.doc)); err == nil {
+				t.Fatal("accepted")
+			}
+		})
+	}
+
+	// The two keys the file carries for humans are DECLARED, so hardening the decode did
+	// not cost the format its ability to explain itself.
+	got, err := ParseComposeBaseline([]byte(`{
+	  "_comment": ["why this file exists"],
+	  "services": [{"name": "a", "note": ["why this entry stands"], "block": ["restart: always"]}]
+	}`))
+	if err != nil {
+		t.Fatalf("_comment or note was refused: %v", err)
+	}
+	if len(got) != 1 || got[0].Name != "a" {
+		t.Fatalf("got %+v, want the one entry", got)
 	}
 }
 
