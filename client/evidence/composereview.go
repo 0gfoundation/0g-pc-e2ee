@@ -6,9 +6,11 @@ package evidence
 // WHY IT EXISTS. Hop 3 (brokerimages.json) pins the OS a provider boots; it says
 // nothing about what runs inside. Two providers on the same audited image can run
 // entirely different containers, because mr_config_id commits to the app-compose the
-// OPERATOR chose, not to one we approved. Closing that needs a per-service baseline,
-// and a baseline needs a manifest worth pinning. This is the tool that says how far a
-// given manifest is from being one.
+// OPERATOR chose, not to one we approved. Closing that needs a per-service baseline
+// (composebaseline.go, brokercompose.json), which records a manifest exactly as observed
+// — and recording is not approving. This is the tool that says how far a recorded
+// manifest still is from one worth approving, and it keeps saying so after the manifest
+// has been recorded.
 //
 // WHAT IT IS NOT is a gate. Nothing here returns a verdict, and no caller may derive
 // one: every rule below is a heuristic about a manifest we did not write, and a
