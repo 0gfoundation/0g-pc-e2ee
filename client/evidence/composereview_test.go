@@ -377,22 +377,63 @@ func TestReviewCompose_FlagsServiceConstructsToJustify(t *testing.T) {
 	}
 }
 
-// A YAML merge key hides the keys that actually apply to the service, so the review
-// cannot describe it — and must say so rather than reporting a vague "no rule for this
-// key". Without this, `privileged: true` in an anchor comes out as a Justify note.
-func TestReviewCompose_MergeKeyHidesTheServiceBody(t *testing.T) {
+// Keys a service MERGES from an anchor are reviewed as if it had written them itself.
+//
+// This is the hole resolution closed, and it was worse than a gap: `privileged: true`
+// behind `<<: *base` used to come back as "this review cannot describe the service",
+// which reads as caution but let the most dangerous key in the schema go unreported. On
+// cn-39 the same blindness reported three services as naming no image when the image was
+// in the anchor. The rules below are the normal ones — the point is that they fire.
+func TestReviewCompose_MergedKeysAreReviewed(t *testing.T) {
 	pinned := "ghcr.io/0gfoundation/broker@sha256:" + strings.Repeat("a", 64)
 	doc := fmt.Sprintf(`x-base: &base
   privileged: true
+  volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
 services:
   broker:
     <<: *base
     image: %s
 `, pinned)
 	r := reviewOf(t, manifest(doc))
-	f := requireFinding(t, r, SeverityBlocking, "broker", "<<")
-	if !strings.Contains(f.Detail, "cannot describe the service") {
-		t.Fatalf("detail %q does not say the review is blind here", f.Detail)
+
+	f := requireFinding(t, r, SeverityBlocking, "broker", "privileged")
+	if !strings.Contains(f.Detail, "every capability") {
+		t.Fatalf("detail %q is not the privileged rule", f.Detail)
+	}
+	v := requireFinding(t, r, SeverityBlocking, "broker", "volumes")
+	if !strings.Contains(v.Detail, "docker.sock") {
+		t.Fatalf("detail %q does not name the runtime socket", v.Detail)
+	}
+	// And nothing is reported against the merge key itself: it is no longer a thing the
+	// manifest has by the time the walk runs.
+	for _, f := range r.Findings {
+		if f.Key == "<<" {
+			t.Fatalf("a merge key survived resolution: %+v", f)
+		}
+	}
+}
+
+// An image the service inherits from an anchor is the service's image. Reported
+// separately from the keys above because the old behaviour did not merely miss it — it
+// asserted the opposite, "the service names no image", on three live cn-39 services.
+func TestReviewCompose_MergedImageIsTheServiceImage(t *testing.T) {
+	pinned := "ghcr.io/0gfoundation/broker@sha256:" + strings.Repeat("a", 64)
+	doc := fmt.Sprintf("x-base: &base\n  image: %s\nservices:\n  broker:\n    <<: *base\n    command: serve\n", pinned)
+	r := reviewOf(t, manifest(doc))
+	if len(r.Services) != 1 {
+		t.Fatalf("services = %+v", r.Services)
+	}
+	if got := r.Services[0].Ref; got != pinned {
+		t.Fatalf("ref = %q, want the one the anchor supplies (%q)", got, pinned)
+	}
+	if !r.Services[0].Pinned() {
+		t.Fatalf("a digest-pinned image inherited from an anchor reads as unpinned: %+v", r.Services[0])
+	}
+	for _, f := range r.Findings {
+		if f.Key == "image" {
+			t.Fatalf("an inherited image was reported as a finding: %+v", f)
+		}
 	}
 }
 

@@ -132,23 +132,24 @@ func (b ServiceBlock) Pinnable() bool { return b.Err == nil }
 // would catch. yaml.v3 has no Clone, hence cloneNode.
 func blockOf(name string, body *yaml.Node) ServiceBlock {
 	b := ServiceBlock{Name: name}
-	// BEFORE the clone, and that order is load-bearing rather than tidy. yaml.v3 resolves
-	// an alias by pointing Node.Alias at the anchored node, so a body that is anchored and
-	// references itself — `a: &x {depends_on: [*x]}` — gives a node graph with a CYCLE, not
-	// a tree. Cloning that first recursed forever and took the process down with an
-	// unrecoverable stack overflow, on input a provider chooses freely (they hash their own
-	// manifest, so the compose_hash gate is no obstacle at all). refuseIndirection walks
-	// only Content, which stays acyclic, and hits the AliasNode before anything follows the
-	// back-edge.
+	// Resolution IS the copy — see resolveAnchors, which always returns a fresh tree. It
+	// also has to come before anything else walks the body, for two reasons that outlived
+	// the refusal it replaced.
 	//
-	// It also still has the reason it was moved ahead of the mapping check: an alias body
-	// is not a mapping either, and "the body is not a mapping" would send a reader looking
-	// for a syntax error in a file that has none.
-	if err := refuseIndirection(body); err != nil {
+	// A body that is anchored and references itself — `a: &x {depends_on: [*x]}` — gives a
+	// node graph with a CYCLE, not a tree, and once took the process down with an
+	// unrecoverable stack overflow on input a provider chooses freely (they hash their own
+	// manifest, so the compose_hash gate is no obstacle at all). resolveNode bounds
+	// expansion by the path it is on, so that input now yields an error.
+	//
+	// And an alias body is not a mapping, so running the mapping check first would answer
+	// "the service body is not a mapping" for a document that has no syntax error at all.
+	resolved, err := resolveAnchors(body)
+	if err != nil {
 		b.Err = err
 		return b
 	}
-	body = cloneNode(body)
+	body = resolved
 	if body == nil || body.Kind != yaml.MappingNode {
 		b.Err = fmt.Errorf("the service body is not a mapping, so it has no canonical form")
 		return b
@@ -162,8 +163,9 @@ func blockOf(name string, body *yaml.Node) ServiceBlock {
 		b.Err = err
 		return b
 	}
-	// A block that already contains the placeholder is REFUSED, for the same reason
-	// indirection is: the substitution below is one-way and unescaped, so a value the
+	// A block that already contains the placeholder is REFUSED — one of the two things
+	// this file still refuses outright, the other being a cyclic anchor. The reason is
+	// that the substitution below is one-way and unescaped, so a value the
 	// provider wrote as the placeholder lands in the reduced form at exactly the position
 	// a real held-out digest would. Two different manifests then reduce identically. The
 	// collision is unlikely and, today, worth nothing to an attacker — the field it would
@@ -184,8 +186,9 @@ func blockOf(name string, body *yaml.Node) ServiceBlock {
 	stripImageIdentity(body, b.ImageRef)
 	noImage, err := canonicalizeNode(body)
 	if err != nil {
-		// Unreachable: the full form already succeeded and removing a key cannot
-		// introduce an alias or a merge key. Reported rather than ignored, because a
+		// Unreachable: the full form already succeeded on this same tree, and deleting a
+		// key and rewriting scalars cannot introduce the one thing resolution rejects —
+		// an anchor that contains itself. Reported rather than ignored, because a
 		// half-populated block is worse than one that says it failed.
 		b.Err = err
 		b.Canonical, b.Digest = "", ""
@@ -197,18 +200,22 @@ func blockOf(name string, body *yaml.Node) ServiceBlock {
 
 // canonicalizeNode renders a node in the canonical form this file defines.
 //
-// It REFUSES a subtree containing a YAML alias or a merge key. Both mean the keys that
-// actually apply to the service are somewhere else in the file, so yaml.Marshal would
-// emit `*base` or `<<: *base` — a stable, reproducible digest of a pointer rather than of
-// a service. A baseline built on that would pin the reference and not the content, which
-// is the one failure this whole file exists to avoid. composereview.go blocks the same
-// construct for the same reason.
+// It RESOLVES anchors first (composeanchor.go), so the form describes the service as it
+// will run rather than the indirection its author happened to write. Doing it here rather
+// than only at the caller is what makes the guarantee the baseline rests on literal: both
+// sides of the comparison — stored text and observed manifest — reach the emitter through
+// this one function, so neither can reduce an alias differently from the other.
+//
+// Resolution returns a fresh tree, so this does not mutate its argument. blockOf relies
+// on that: it canonicalizes, then edits its own copy for the image hold-out, and the
+// review walks the same nodes for its own rules.
 func canonicalizeNode(n *yaml.Node) (string, error) {
-	if err := refuseIndirection(n); err != nil {
+	resolved, err := resolveAnchors(n)
+	if err != nil {
 		return "", err
 	}
-	normalize(n)
-	out, err := yaml.Marshal(n)
+	normalize(resolved)
+	out, err := yaml.Marshal(resolved)
 	if err != nil {
 		return "", fmt.Errorf("cannot render the service block: %w", err)
 	}
@@ -218,8 +225,9 @@ func canonicalizeNode(n *yaml.Node) (string, error) {
 // normalize clears everything that is presentation rather than content. Style is not
 // optional here: yaml.v3 records quoting and flow-versus-block on the node, so without
 // clearing it `'secret'` and `"secret"` render differently and two identical deployments
-// compare unequal. Anchor goes too — a defined anchor is formatting; anything that
-// USES it is an alias, which refuseIndirection has already rejected.
+// compare unequal. Anchor goes too — a DEFINED anchor is formatting, and by this point
+// every alias that USED one has been expanded into the content it named, so clearing the
+// name cannot lose anything (resolveAnchors).
 func normalize(n *yaml.Node) {
 	if n == nil {
 		return
@@ -230,59 +238,6 @@ func normalize(n *yaml.Node) {
 	for _, c := range n.Content {
 		normalize(c)
 	}
-}
-
-// refuseIndirection walks the subtree for an alias or a merge key.
-func refuseIndirection(n *yaml.Node) error {
-	if n == nil {
-		return nil
-	}
-	if n.Kind == yaml.AliasNode {
-		return fmt.Errorf("the block references a YAML anchor (*%s), so its canonical form would "+
-			"describe a pointer rather than the service", n.Value)
-	}
-	if n.Kind == yaml.MappingNode {
-		for i := 0; i+1 < len(n.Content); i += 2 {
-			if n.Content[i].Value == "<<" {
-				return fmt.Errorf("the block is merged from a YAML anchor, so the keys that apply to " +
-					"it are not the ones it lists")
-			}
-		}
-	}
-	for _, c := range n.Content {
-		if err := refuseIndirection(c); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// cloneNode deep-copies a node tree. Content is a slice of pointers, so a struct copy
-// alone would leave the clone sharing children with the original — which is the failure
-// mode that makes "I only mutate my own copy" untrue.
-//
-// Alias is DROPPED rather than followed, for two independent reasons. It is the only edge
-// in a yaml.v3 node graph that can point backwards — an anchored node that references
-// itself makes a cycle — so following it is what turned this function into an infinite
-// recursion, and clearing it makes the walk structurally unable to loop regardless of
-// what any future caller does first. And it would be wrong even without the cycle: the
-// clone's Alias would point into a second copy of the tree rather than into the clone,
-// so nothing could use it correctly anyway. Every alias is refused upstream
-// (refuseIndirection), so no caller reaches here needing one.
-func cloneNode(n *yaml.Node) *yaml.Node {
-	if n == nil {
-		return nil
-	}
-	c := *n
-	c.Alias = nil
-	c.Content = nil
-	if len(n.Content) > 0 {
-		c.Content = make([]*yaml.Node, len(n.Content))
-		for i, child := range n.Content {
-			c.Content[i] = cloneNode(child)
-		}
-	}
-	return &c
 }
 
 // imageHeldOut stands in for the image identity the hold-out erases.

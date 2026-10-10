@@ -651,7 +651,28 @@ func (r *ComposeReview) reviewComposeText(doc []byte) {
 		r.add(SeverityBlocking, "", "docker_compose_file", "the compose text is an empty document")
 		return
 	}
-	top := root.Content[0]
+	// Anchors are resolved ONCE, here, for the whole document — before the top-level walk
+	// and before any service is read.
+	//
+	// It belongs at the parse site because an alias is a property of the DOCUMENT, not of
+	// whoever reads it: the anchor a service merges is usually defined outside `services:`
+	// entirely (`x-logging: &default-logging`), so neither this walk nor blockOf could
+	// resolve one on its own without reaching back into the file. Resolving here also
+	// means the review and the canonical block cannot disagree about what a service
+	// contains, which they did while one refused merged services and the other described
+	// them as having no image.
+	//
+	// A failure is the whole compose text, not one service, and that is the cost of doing
+	// it once. Only a cycle can fail (see composeanchor.go — yaml.v3 rejects an undefined
+	// anchor at parse time), which is a manifest docker compose would itself refuse to
+	// start, so the honest report is that nothing below this level could be read.
+	top, err := resolveAnchors(root.Content[0])
+	if err != nil {
+		r.add(SeverityBlocking, "", "docker_compose_file",
+			fmt.Sprintf("the compose text's YAML anchors do not resolve, so what each service "+
+				"actually contains cannot be read: %v", err))
+		return
+	}
 	if top.Kind != yaml.MappingNode {
 		r.add(SeverityBlocking, "", "docker_compose_file", "the compose text is not a mapping")
 		return
@@ -1146,15 +1167,18 @@ func (r *ComposeReview) reviewServiceKey(name, key string, val *yaml.Node) bool 
 		}
 		return true
 
-	case "<<":
-		// A YAML merge key. yaml.v3 does not resolve it when decoding into a Node, so the
-		// keys that actually apply to this service are in the anchor, not in the body this
-		// walk can see. Blocking rather than "no rule for this key": the review cannot
-		// describe the service at all, and `privileged: true` hidden behind an anchor must
-		// not come out as a vague note.
+	case mergeKey:
+		// A merge key cannot reach this walk any more: reviewComposeText resolves the
+		// document before dispatching, so the keys the anchor contributes arrive as the
+		// service's own and are reviewed by the rules above. The case stays as an
+		// INVARIANT, because the failure it would otherwise have is silent — `<<` is not a
+		// compose key, so it would fall through to the unknown-key rule and report a
+		// merged service as merely unusual while `privileged: true` sat unread inside the
+		// anchor. That is the exact misreport resolution was added to end.
 		r.add(SeverityBlocking, name, key,
-			"the service body is merged from a YAML anchor, so the keys that actually apply to it are not "+
-				"the ones read here; this review cannot describe the service")
+			"the service body still carries a YAML merge key after the document was resolved, so the keys "+
+				"that actually apply to it are not the ones read here; this is a defect in this tool, not in "+
+				"the manifest")
 		return true
 
 	case "sysctls":

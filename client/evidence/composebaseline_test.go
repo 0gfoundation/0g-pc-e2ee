@@ -311,7 +311,9 @@ func TestCheckCompose_ChecksEveryDirection(t *testing.T) {
 	})
 
 	t.Run("a block with no canonical form cannot be compared", func(t *testing.T) {
-		doc := "x-base: &b\n  privileged: true\nservices:\n  mysql:\n    <<: *b\n    " + pinned + "\n"
+		// A scalar body. Anchors no longer reach this state — they resolve — so the
+		// remaining way to have no canonical form is a body that is not a mapping at all.
+		doc := "services:\n  mysql: notamapping\n"
 		got := CheckCompose(oneEntry(), reviewOf(t, manifest(doc)).Blocks)
 		if got.OK() {
 			t.Fatal("an unreducible block matched")
