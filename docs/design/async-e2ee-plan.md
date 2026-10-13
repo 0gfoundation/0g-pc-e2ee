@@ -20,7 +20,8 @@
 | Who generates | The broker worker calls the upstream (`wait=true`, holds the connection). The upstream is a native TEE model or a forwarder |
 | Where the result lives | **Broker DB**: `AsyncJob.ResponseBody` (`mediumblob`), provider JSON with plaintext b64, `ResultTTL` 30m |
 | Submit response | `202 {jobId, status, provider_address}` |
-| Poll | `GET /v1/async/jobs/:jobId?provider_address=0x…` (the router requires `provider_address`). Every poll returns the full result |
+| Poll | `GET /v1/async/jobs/:jobId[?provider_address=0x…]`. `provider_address` is needed only when the same job id exists under more than one provider ("pass provider_address to disambiguate"); otherwise the router resolves it. Response `{jobId, status, createdAt, updatedAt, errorMessage?, data?}`, with status `pending` / `processing` / `completed` / `failed`; `data` is the provider JSON, present only when `completed` |
+| Failure text | On a non-200 upstream, the upstream error **body** becomes the client-visible `errorMessage` (`ctrl/async.go:394-406`, sanitized only of forwarder identity fields) |
 | Signature | Signed at completion, **kept only in a 20m in-process cache** (shorter than the 30m TTL, lost on restart) |
 | A sealed request today | Refused on both sides, deliberately. Router: `AsyncGenerateImage` documents the decision not to give async the e2ee exception (`internal/handler/async_inference.go:408-420`); what actually rejects the body is the `prompt`-required check. Broker: `RefuseAsync` 400 |
 | Through the gateway | Falls into `mux.Handle("/")`, cleartext passthrough, marked `X-0G-E2EE: none` |
@@ -70,6 +71,16 @@ user_job_id = router_job_id + "." + b64url(eph_priv)      // 32-byte X25519 scal
 
 The gateway stays stateless and needs **no key of its own**: any replica, on
 either blue-green side, can serve any poll.
+
+Parsing (normative):
+- Split on the **last** `.`.
+- The router part must match the router's job-id charset `[A-Za-z0-9_-]`
+  (`ValidateJobID`).
+- The key part must base64url-decode to **exactly 32 bytes**.
+- Anything else is a 400 that **does not echo the input** (it may hold a key).
+
+Neither charset contains `.` today, so the split is unambiguous. The rules make a
+future job-id format change fail loudly instead of splitting wrongly.
 
 1. The gateway **splits off** the key segment before forwarding to the router,
    so the router never sees it. **The design rests on this.**
@@ -170,9 +181,10 @@ Residual case, accepted: the router replays the victim's *exact* sealed request
 
 ### 3.4 Which provider — and why a wrong answer is safe
 
-The gateway is stateless, so the provider for a poll comes from the client's
-`provider_address` query parameter. The client got it from the 202 the gateway
-relayed, and it passes through the router unchanged.
+The gateway is stateless, so on a poll the provider comes from wherever the
+router takes it:
+- the client's optional `provider_address`, relayed from the 202;
+- otherwise the router's own `async_jobs` lookup.
 
 - **Opening and authenticating the result needs nothing provider-specific**:
   `eph_priv` plus the bind check of §3.3. The gateway does not look up the
@@ -182,44 +194,103 @@ relayed, and it passes through the router unchanged.
   produced a valid one. A wrong `provider_address` gives at worst a refusal,
   never wrong content.
 
-### 3.5 Gateway surface rules
+### 3.5 Poll response format
+
+The **whole terminal poll response is the sealed frame**, so `jobId`, `status`
+and `usage` are all inside the AAD. A completed sealed job polls as:
+
+```json
+{
+  "jobId": "<router/broker job id>",
+  "status": "completed",
+  "createdAt": "…", "updatedAt": "…",
+  "model": "…",
+  "usage": { "output_images": 2 },
+  "_e2ee": { "v": 1, "enc": "…", "sealed_fields": ["data", "_bind"], "final": true, "ciphertext": "…" }
+}
+```
+
+- The sealed `data` is the provider JSON exactly as today's cleartext poll embeds
+  it. After opening, the gateway restores today's shape: `{jobId, status,
+  createdAt, updatedAt, data: {…}}`.
+- **Bound top-level fields:** `jobId`, `status`, `createdAt`, `updatedAt`,
+  `model`, `usage` (and with it `usage.output_images`). `unbound_fields` names
+  top-level fields only, so nothing nested can be unbound.
+- **Declared unbound top-level fields:** whatever the router injects
+  (`x_0g_trace`, and any `provider_address` it adds). The SPEC lists them.
+- The broker builds this frame **once, at completion**: it knows `jobId` and
+  `status=completed` then. It stores the cleartext part next to the raw
+  ciphertext (§3.9) and returns it verbatim on every poll. Fields it would add
+  per poll must be unbound or omitted.
+- **Non-terminal and failed responses are not frames.** They carry no `_e2ee`,
+  and their content is restricted:
+
+| Status | Shape for a sealed job |
+|---|---|
+| `pending` / `processing` | `{jobId, status, createdAt, updatedAt}` only. Cleartext, unauthenticated, carries no content |
+| `failed` | `{jobId, status, createdAt, updatedAt, errorMessage}`, where `errorMessage` is **a fixed error code only**, e.g. `upstream_error:422`, `timeout`, `broker_error`. **The upstream error body is never stored or returned** for a sealed job; moderation errors can echo the prompt. Sealing the error text is a possible later refinement |
+| `completed` | The frame above |
+
+### 3.6 Gateway surface rules
 
 - Register `POST /v1/async/images/generations` and `GET /v1/async/jobs/{id}` as
   sealed surfaces, no longer the `/` passthrough (only for models in
   `-seal-models`, as on sync surfaces).
-- **Rewrite outward ids.** In the 202 and in every poll response, replace
-  `jobId` with `user_job_id`. Leave `provider_address` as is.
-- **Poll matrix** (no silent downgrade):
+- **Submit pinning.** The gateway picked one enclave (preview + quote
+  verification) and sealed to its `enc_pub`. The submit must therefore carry
+  `X-0G-Provider-Address` (+ `X-0G-Provider-Identity` when the candidate has one)
+  and `X-0G-Provider-Allow-Fallbacks: false`. Otherwise the router may route to
+  another provider, whose enclave cannot open the request, and the job is wasted.
+  The gateway also checks that the 202's `provider_address` equals the pin.
+- **Rewrite outward ids.** In the 202 and in every poll response, after opening,
+  replace `jobId` with `user_job_id`. Leave `provider_address` as is.
+- **Poll matrix.** Keyed on the request's key segment and the response's
+  `status`; no silent downgrade.
 
-| Request carries key segment | Response carries `_e2ee` | Gateway answers |
+| Key segment | Response | Gateway answers |
 |---|---|---|
-| yes | yes | Open + bind check → plaintext, `X-0G-E2EE: sealed` (refuse if either fails) |
-| yes | **no** | **Refuse** (`e2ee_downgrade`): a sealed job must come back sealed; a cleartext body here is either a fault or a router-fabricated result |
-| **no** | yes | **Refuse** (`e2ee_key_missing`): never pass a sealed frame through, never pretend it is cleartext |
-| no | no | Cleartext passthrough, `X-0G-E2EE: none` (a job submitted without E2EE) |
+| yes | `pending` / `processing`, no `_e2ee` | Relay `{jobId→user_job_id, status, createdAt, updatedAt}`; drop any other field. `X-0G-E2EE: sealed` |
+| yes | `failed`, no `_e2ee` | Relay with `errorMessage` only if it is a known error code; otherwise replace it with a generic code |
+| yes | `completed` **with** `_e2ee` | Open, then check `_bind` and that the frame's `jobId` equals the id's router part → plaintext in today's shape, `jobId→user_job_id`. Refuse if any check fails |
+| yes | `completed` **without** `_e2ee` | **Refuse** (`e2ee_downgrade`): a fault or a router-fabricated result |
+| yes | anything carrying `_e2ee` with a non-`completed` status | **Refuse** (malformed) |
+| **no** | carries `_e2ee` | **Refuse** (`e2ee_key_missing`): never pass a sealed frame through, never pretend it is cleartext |
+| no | no `_e2ee` | Cleartext passthrough, `X-0G-E2EE: none` (a job submitted without E2EE) |
 
-- Malformed key segment → 400, before anything is forwarded.
+Non-terminal and failed responses are cleartext and unauthenticated, so a router
+can lie about status: hold a job at `processing`, or claim `failed`. That is
+denial of service. It does not expose content and cannot inject content, the same
+as a router simply dropping the request.
 
-### 3.6 Router-side constraints
+### 3.7 Router-side constraints
 
-- **Billing field.** `usage.output_images` stays cleartext, inside the frame's
-  AAD and the §8 signature.
+- **Billing field.** On a sealed completed poll, the image count is the frame's
+  top-level `usage.output_images`, not `len(data.data)`, which is ciphertext now.
+  - Reuse the sync `extractSealedImageCount(body, requested)`
+    (`image_handler.go`) on the whole poll body: it already reads top-level
+    `usage.output_images` and fails closed on missing, negative, or above-request
+    counts.
+  - It needs the requested `n` as its ceiling, and `async_jobs` does not store it
+    today. Add a nullable `requested_n` column (additive migration), written at
+    submit from the cleartext `n` (default 1).
   - Missing or invalid means **fail-closed** (as sync `writeSealedImageCountError`),
     not today's "default to 1".
   - The user poll and the reconcile worker share `processAsyncBilling`, so one
     change covers both.
-- **Bound top-level fields.** `unbound_fields` names top-level fields only, so the
-  profile lists the top-level fields that must stay bound: `usage` (and with it
-  `usage.output_images`), `created`, `model`. Anything the router injects
-  (`x_0g_trace`) must be a declared top-level unbound field.
-- **Do not rewrite sealed responses.** Today the router re-serializes poll
-  responses (`UseNumber`). On a sealed response it may only add declared unbound
-  top-level fields; everything else passes through unchanged.
+- **Do not change any value; inject only declared unbound fields.** The AAD is
+  computed over `JCS(...)` (SPEC §5.2), so re-serialization itself is harmless:
+  key order, HTML escaping, and whitespace from `json.Marshal(respMap)` do not
+  break `Open`, and the router already decodes with `UseNumber`, so numbers keep
+  their literals. The actual rules:
+  - no bound field's value changes;
+  - only the declared unbound top-level fields (§3.5) are added.
+  
+  No byte-for-byte passthrough is needed.
 - **No fallback after acceptance.** The gateway's candidate walk ends at the 202.
   A job accepted by one enclave that later fails must be resubmitted.
 - Auth and the ownership check are unchanged.
 
-### 3.7 Key lifecycle
+### 3.8 Key lifecycle
 
 | Key | Needed when | Lifecycle | Impact |
 |---|---|---|---|
@@ -229,7 +300,7 @@ relayed, and it passes through the router unchanged.
 No key must survive a deploy of the gateway or the broker beyond what already does
 today.
 
-### 3.8 Storage and size limits
+### 3.9 Storage and size limits
 
 Encoding stacks up:
 - The provider returns images as b64 (≈ 4/3 × raw).
@@ -251,7 +322,9 @@ depend on model and content):
 So sealing breaks a case that works today. Fix:
 - Store the ciphertext as **raw bytes** in a new nullable `LONGBLOB` column
   (`sealed_result`), so storage stays ≈ 1.33 × raw, as today.
-- Assemble the JSON frame at poll time.
+- Store the frame's cleartext part (§3.5) separately, fixed at completion.
+- At poll, base64url the ciphertext into `_e2ee.ciphertext`. The frame's bytes
+  are deterministic across polls.
 - Sealed rows leave `ResponseBody` empty.
 
 This is an additive migration: nullable column, idempotent, old binaries
@@ -274,18 +347,27 @@ be stated together in the SPEC.
             fresh eph keypair; bind = HKDF(eph_priv, "0g-pc/v1/async-bind")
             seal {prompt, _bind} to enc_pub
             cleartext: model / n / size / response_format="b64_json"
-   router:  admits sealed (no prompt) → broker: stores the sealed envelope as-is, enqueues → 202 {jobId, …}
-   gateway: rewrites jobId → user_job_id = jobId + "." + b64url(eph_priv)
+            pin: X-0G-Provider-Address (+ -Identity), X-0G-Provider-Allow-Fallbacks: false
+   router:  admits sealed (no prompt), records requested_n
+            → broker: stores the sealed envelope as-is, enqueues → 202 {jobId, provider_address, …}
+   gateway: checks provider_address == pin
+            rewrites jobId → user_job_id = jobId + "." + b64url(eph_priv)
 
 ② broker worker (in enclave)
    open → strip _bind → call upstream → images
-   seal {data, _bind} to client_eph_pub; cleartext usage.output_images
-   §8 signature; sealed ciphertext + signature persisted (no plaintext)
+   build the frame {jobId, status:"completed", …, usage.output_images, _e2ee}:
+   seal {data, _bind} to client_eph_pub with the frame's cleartext in the AAD
+   §8 signature; ciphertext + cleartext part + signature persisted (no plaintext)
+   on failure: status "failed", errorMessage = fixed code only (§3.5)
 
-③ GET /v1/async/jobs/:user_job_id?provider_address=0x…
-   gateway: split off eph_priv; forward GET /v1/async/jobs/:jobId?provider_address=…
-   router:  bills on usage.output_images (fail-closed), passes the frame through
-   gateway: §3.5 matrix → open + bind check → plaintext, jobId rewritten, X-0G-E2EE: sealed
+③ GET /v1/async/jobs/:user_job_id[?provider_address=0x…]   (repeated until terminal)
+   gateway: parse per §3.2; forward GET /v1/async/jobs/:jobId[?provider_address=…]
+   router:  completed → bills via extractSealedImageCount(body, requested_n) (fail-closed);
+            passes the frame through (no value changes, unbound fields only)
+   gateway: §3.6 matrix
+            pending / processing → status only
+            completed → open + bind + jobId check → today's shape, jobId rewritten
+            X-0G-E2EE: sealed
 ```
 
 ## 5. Changes by repo
@@ -294,13 +376,17 @@ be stated together in the SPEC.
 - New profile `async-image`.
   - Request: as `image` (pin `response_format=b64_json`), plus the reserved
     sealed field `_bind` (§3.3).
-  - Result: as §7.1, plus `_bind` echoed in the sealed object. The bound
-    top-level field list is in §3.6. The poll frame is immutable for the TTL.
+  - Poll response: the JSON shapes per status in §3.5 (terminal response = the
+    frame; sealed `data` + `_bind`; bound and unbound top-level field lists;
+    `failed` carries a fixed error code only). The frame is immutable for the TTL.
+  - `user_job_id` format and parsing rules (§3.2).
   - MUSTs:
     - fresh eph per job;
     - the enclave strips `_bind` before the upstream;
-    - the receiver refuses a missing or unequal `_bind`;
-    - the §3.5 poll matrix.
+    - the receiver refuses a missing or unequal `_bind`, or a frame `jobId` that
+      does not match;
+    - the §3.6 poll matrix;
+    - the submit pins the sealed-to provider with fallbacks off.
 
 **Broker (0g-serving-broker)**
 - `RefuseAsync`: admit the `async-image` profile (flag-gated); keep refusing
@@ -311,11 +397,13 @@ be stated together in the SPEC.
 - Worker:
   - Unseal at dispatch, reusing the sync unseal path (`MaybeUnsealRequest`).
   - Strip `_bind`.
-  - At completion, seal `{data, _bind}`, sign, and write ciphertext to
-    `sealed_result` (§3.8).
+  - At completion, build the frame (§3.5), seal `{data, _bind}`, sign, and
+    write ciphertext plus the cleartext part (§3.9).
+  - On failure of a sealed job, store a fixed error code. **Never store the
+    upstream error body.**
 - **Persist the signature.** Add a column on `AsyncJob`; the signature endpoint
   reads the DB first and the cache only accelerates.
-- Poll: assemble the frame from `sealed_result` plus cleartext billing fields.
+- Poll: return the stored frame for `completed`; status-only bodies otherwise (§3.5).
 - Explicitly 400 sealed `/v1/videos` requests now (P0; today only the router's
   `prompt` check stops them, incidentally).
 
@@ -323,14 +411,17 @@ be stated together in the SPEC.
 - `AsyncGenerateImage`:
   - Sealed with no `prompt`: admit.
   - Sealed with a `prompt`: 400, as sync.
-- `processAsyncBilling`: bill sealed results on `usage.output_images`, fail-closed.
-- Poll response: no re-serialization of sealed bodies (§3.6). The 32 MB read cap (§3.8) is sufficient; no change.
+- Record `requested_n` at submit: a new nullable column, additive migration.
+- `processAsyncBilling`: for a sealed body, call `extractSealedImageCount(body,
+  requested_n)`; fail-closed (§3.7).
+- Poll response: change no bound value, inject only declared unbound fields
+  (§3.7). The 32 MB read cap (§3.9) is sufficient; no change.
 - Everything behind `features.e2ee_async` (default off), with an Internal
   Changelog entry.
 - `router_image_request_options_total{sealed}` already covers the async endpoints.
 
 **Gateway (0g-pc-e2ee)**
-- §3.5 in full: surfaces, id rewriting, the poll matrix, key-segment parsing.
+- §3.6 in full: surfaces, submit pinning, id rewriting, the poll matrix; §3.2 parsing.
 - `bind` derivation and the constant-time check.
 - Log redaction for `user_job_id`.
 
@@ -344,7 +435,7 @@ be stated together in the SPEC.
 
 ## 7. Risks and open questions
 
-1. **Typical output sizes per image model.** The §3.8 estimate assumes 1.5–3 MB
+1. **Typical output sizes per image model.** The §3.9 estimate assumes 1.5–3 MB
    PNGs; measure the models actually served before fixing caps.
 
 ## 8. Acceptance
@@ -359,6 +450,17 @@ be stated together in the SPEC.
   - The router returns a cleartext body for a sealed job (`e2ee_downgrade`).
   - A poll without the key segment for a sealed job (`e2ee_key_missing`).
   - A wrong `provider_address` (refused, never wrong content).
+  - The router changes the frame's `jobId` or `status` (open fails).
+  - A `pending` / `processing` body carrying extra fields (dropped, not relayed).
+  - A malformed key segment (400, input not echoed).
+- **Non-terminal polls:** `pending` and `processing` responses pass through the
+  gateway as status-only bodies with `jobId` rewritten; repeated polls through to
+  `completed` succeed.
+- **Failure:** a sealed job whose upstream returns an error that echoes the
+  prompt yields `failed` with a fixed code; the prompt text appears in no
+  response, broker row, or log.
+- **Submit pinning:** with the pinned provider unavailable, the submit fails
+  rather than landing on another provider.
 - **Billing:** the user poll and the reconcile worker charge identically; a
   missing `usage.output_images` fails closed and charges nothing.
 - **Size:** `n=4` at the largest supported size round-trips (storage, router
@@ -403,7 +505,7 @@ design must meet them:
    provider's current `enc_pub`, it must know the provider and obtain its attested
    key. The design must state where that comes from and why a wrong answer is
    safe (it is, given item 2).
-6. **Outward ids.** As §3.5. Video's create and status responses use `id` (and the
+6. **Outward ids.** As §3.6. Video's create and status responses use `id` (and the
    router composes an outward video id).
 7. **Other routes.**
    - `GET /v1/videos` (list) can show only router ids, which cannot retrieve a
