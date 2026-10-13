@@ -246,6 +246,10 @@ func TestProfileDefaults(t *testing.T) {
 	}{
 		wire.ProfileChat:  {request: []string{"messages", "tools", "tool_choice"}, response: []string{"choices"}},
 		wire.ProfileImage: {request: []string{"prompt"}, response: []string{"data"}},
+		// Image's sets plus `_bind` on both sides, both MANDATORY: the binding
+		// value is what ties a result to its request (§7.5), so neither side's
+		// default may be narrowed to omit it.
+		wire.ProfileAsyncImage: {request: []string{"prompt", "_bind"}, response: []string{"data", "_bind"}},
 		wire.ProfileAnthropic: {
 			request:  []string{"messages", "system", "tools", "tool_choice"},
 			response: []string{},

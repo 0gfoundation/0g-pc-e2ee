@@ -31,6 +31,10 @@ func TestNilSealedSetNeverLeavesPayloadCleartext(t *testing.T) {
 		wire.ProfileSpeech: `{"model":"m","file_base64":"AA","filename":"board-meeting.m4a",` +
 			`"language":"en","prompt":"hint","response_format":"json"}`,
 		wire.ProfileImage: `{"model":"m","prompt":"a cat","response_format":"b64_json"}`,
+		// `_bind` is payload here, mandatory like the prompt: a nil set that
+		// narrowed it away would leave the binding value in the clear, where the
+		// router could copy it into a request of its own.
+		wire.ProfileAsyncImage: `{"model":"m","prompt":"a cat","response_format":"b64_json","_bind":"AA"}`,
 		// Embedding's payload is `input` alone, so the cleartext fields here are
 		// carrying their own weight: `encoding_format` and `dimensions` are exactly
 		// the two the profile deliberately does NOT pin, and a filter that started
