@@ -156,8 +156,17 @@ Why this holds:
 
 Residual case, accepted: the router replays the victim's *exact* sealed request
 (same `bind`). The enclave produces a second result for the victim's own prompt.
-The content is not router-chosen, and the router pays for the replay on its own
-account.
+
+- Neither the prompt nor either result is readable by the router: the request
+  is sealed to `enc_pub`, and both results are sealed to the victim's
+  `client_eph_pub`.
+- The most it can do is hand the victim the replay's result instead of the
+  original. That is another sample of the victim's own prompt, never content of
+  the router's choosing.
+- Billing is out of scope. The router sees the user's `sk-` key and is the
+  billing authority, so it could charge the replay to the victim. A malicious
+  router can mis-bill without any replay, though, so this is not something E2EE
+  protects against or makes worse.
 
 ### 3.4 Which provider — and why a wrong answer is safe
 
