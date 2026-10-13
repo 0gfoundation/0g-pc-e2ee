@@ -220,7 +220,7 @@ and `usage` are all inside the AAD. A completed sealed job polls as:
   "model": "…",
   "usage": { "output_images": 2 },
   "_e2ee": { "v": 1, "enc": "…", "sealed_fields": ["data", "_bind"],
-             "unbound_fields": ["x_0g_trace"], "final": true, "ciphertext": "…" }
+             "unbound_fields": ["model", "x_0g_trace"], "final": true, "ciphertext": "…" }
 }
 ```
 
@@ -228,10 +228,12 @@ and `usage` are all inside the AAD. A completed sealed job polls as:
   it. After opening, the gateway restores today's shape: `{jobId, status,
   createdAt, updatedAt, data: {…}}`.
 - **Bound top-level fields:** `jobId`, `status`, `createdAt`, `updatedAt`,
-  `model`, `usage` (and with it `usage.output_images`). `unbound_fields` names
+  `usage` (and with it `usage.output_images`). `unbound_fields` names
   top-level fields only, so nothing nested can be unbound.
-- **Declared unbound top-level fields: exactly `["x_0g_trace"]`.** The router
-  injects it on completed polls (`pkg/inference/async.go:3556-3578`).
+- **Declared unbound top-level fields: exactly `["model", "x_0g_trace"]`.** The
+  router injects `x_0g_trace` on completed polls (`pkg/inference/async.go:3556-3578`).
+  `model` is unbound as on every sync sealed response (the broker's
+  `e2eeResponseUnboundFields`), so the router may restore the client's alias.
   - The AAD is `JCS(frame minus ciphertext minus the unbound_fields-listed
     fields)`, and `unbound_fields` itself sits inside `_e2ee` and is bound. So the
     **broker must declare it in the frame at completion**. It cannot be added
@@ -479,7 +481,7 @@ be stated together in the SPEC.
   - Unseal at dispatch, reusing the sync unseal path (`MaybeUnsealRequest`).
   - Strip `_bind`.
   - At completion, build the frame (§3.5), declaring
-    `unbound_fields: ["x_0g_trace"]`; seal `{data, _bind}`, sign, and write
+    `unbound_fields: ["model", "x_0g_trace"]`; seal `{data, _bind}`, sign, and write
     ciphertext plus the cleartext part (§3.9).
   - On failure of a sealed job, store a fixed error code. **Never store the
     upstream error body.**

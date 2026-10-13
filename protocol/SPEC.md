@@ -9,8 +9,8 @@ MUST agree on it. Keywords MUST / SHOULD / MAY per RFC 2119.
 > Status: draft. This cut covers the **router path**: provider discovery +
 > attestation binding, **field-level request sealing (E2E confidentiality of the
 > sensitive fields)**, **response sealing**, and **response-signature
-> verification**, for the **chat**, **image**, **anthropic**, **speech** and
-> **embedding** request profiles (§5.1).
+> verification**, for the **chat**, **image**, **anthropic**, **speech**,
+> **embedding** and **async-image** request profiles (§5.1).
 > Candidate scoring is the router's own internal concern
 > (surfaced through its candidate API), not part of this protocol.
 >
@@ -263,6 +263,7 @@ signed-text format.)
 | `anthropic` | `/v1/messages` | `messages`, **and `system` / `tools` / `tool_choice` whenever present** | — | `messages`, `system`, `tools`, `tool_choice` | per frame shape (§7.2) |
 | `speech` | `/v1/audio/transcriptions` (JSON-ified, §5.3) | `file_base64`, **and `filename` / `language` / `prompt` whenever present** | `response_format` ∈ {`json`, `verbose_json`} (§5.3.2); `stream` = `false` **when present** (§5.3.3) | `file_base64`, `filename`, `language`, `prompt` | `text`, **and `segments` / `words` / `language` whenever present** (§7.3) |
 | `embedding` | `/v1/embeddings` | `input` | — | `input` | `data` (§7.4) |
+| `async-image` | `/v1/async/images/generations` (result returned by `GET /v1/async/jobs/{id}`) | `prompt` **and `_bind`** | `response_format` = `b64_json` (§7.1) | `prompt`, `_bind` | `data`, `_bind` (§7.5) |
 
 A **pinned cleartext field** is one that stays readable but may hold only a
 **permitted value** in a sealed request — one value, or a small set of them
@@ -1204,6 +1205,166 @@ of it, but not nothing. This is the same floor every profile has (billing needs
 because the inference from "batch sizes and timing" to "corpus shape" is a
 shorter step than the equivalent for a conversation.
 
+### 7.5 Async image responses (deferred results)
+
+Profile `async-image` is the image profile split in time. The request is sealed
+and submitted; the broker answers `202` with a job id and stores the sealed
+envelope; inside the enclave a worker opens it, generates, and seals the result
+**once, at completion**; every later poll returns that stored frame. The HPKE
+is unchanged: the result is a fresh `SetupBaseS(client_eph_pub, "0g-pc/v1/resp")`
+(§7), which needs only the public key from the request envelope, never the
+request's context. This section specifies what the time split breaks.
+
+**Senders.** The rules below are written for a **stateless** sender (the cloud
+gateway): one that holds nothing between the submit and the poll. A sender that
+does keep state MAY additionally check the §8 signature against its `reqH`, but
+MUST still apply every rule here.
+
+#### 7.5.1 Result binding (`_bind`)
+
+`client_eph_pub` is cleartext in the request envelope, and HPKE base mode does
+not authenticate the sender. So a router can submit a request **of its own**,
+with a prompt of its choosing, carrying a victim's `client_eph_pub`. A genuine
+enclave serves it, seals the result to the victim's key, and signs it under the
+router's `reqH`. The router returns that frame on the victim's poll. It opens and
+its signature verifies, but the content is the router's. A sync sender is protected by
+checking `reqH`; a stateless one has no `reqH` at poll time. A fresh eph key per
+job does not help: the attack reuses the victim's key for the same job.
+
+The binding value closes this without state:
+
+```
+bind = HKDF-SHA256(ikm = eph_priv, salt = "" , info = "0g-pc/v1/async-bind", L = 32)
+_bind = base64url(bind)                      // unpadded, a JSON string
+```
+
+- **Request.** The sender adds `_bind` to the request and seals it. It is a
+  **mandatory payload field** of this profile: the sender MUST seal it, and the
+  enclave MUST refuse an envelope whose `sealed_fields` omit it (§5.1 rules).
+- **Enclave.** After Open, the enclave MUST remove `_bind` before the upstream
+  call (it is protocol metadata, not a model parameter), keep it with the job,
+  and put it back, unchanged, into the sealed object of the result.
+- **Result.** `_bind` is a **mandatory response payload field**. The receiver
+  MUST refuse a result frame whose `sealed_fields` omit it.
+- **Receiver.** After Open, the receiver recomputes `bind` from the `eph_priv` it
+  holds and MUST refuse unless the sealed `_bind` decodes to exactly 32 bytes
+  equal to it (constant-time comparison).
+
+Why this holds:
+- Only the victim's request carries the right `_bind`. It is derived from
+  `eph_priv`, which never leaves the sender, and it travels sealed.
+- Only the enclave the request was sealed to can learn it.
+- So a frame that opens under `eph_priv` and carries the right `_bind` was
+  produced by that enclave for that request.
+- The router cannot forge one, cannot substitute its own job's result, and cannot
+  edit a bound cleartext field: it cannot re-seal without `_bind`.
+
+**Content authenticity on this profile therefore does not depend on §8.** The
+signature is still produced, for auditors and as billing evidence.
+
+Known answer (for implementations in other languages): `eph_priv` = bytes
+`00 01 02 … 1f` → `bind` =
+`b52d9b2bf6b7e94c9be3c8b73539ab2dbebfa058562c80c839af86de2a52abb3`.
+
+#### 7.5.2 The poll response
+
+The **whole completed poll response is the result frame**, so the poll
+envelope's own fields are inside the AAD:
+
+```json
+{
+  "jobId": "<broker-assigned job id>",
+  "status": "completed",
+  "createdAt": "…", "updatedAt": "…",
+  "model": "…",
+  "usage": { "output_images": 2 },
+  "_e2ee": { "v": 1, "enc": "…", "sealed_fields": ["data", "_bind"],
+             "unbound_fields": ["model", "x_0g_trace"], "final": true, "ciphertext": "…" }
+}
+```
+
+- The sealed `data` is the provider's image response, exactly as the cleartext
+  poll would embed it. After Open and the `_bind` check the receiver removes
+  `_bind` and returns the poll envelope in its ordinary shape.
+- `usage.output_images` is the billable count, under the same rules as §7.1.
+- **`unbound_fields` is exactly `["model", "x_0g_trace"]`**, declared by the
+  enclave at completion. It lives inside `_e2ee`, which is bound, so nothing can
+  extend it later; the router injects `x_0g_trace` on completed polls, so a frame
+  without it fails to open on the first traced poll. `model` is unbound as on
+  every sealed response (§5.2). A receiver MUST refuse a frame that declares any
+  other field unbound: `jobId` and `status` are what its checks key off.
+- **Which job.** The receiver MUST require `status == "completed"` and `jobId`
+  equal to the broker-assigned id it is polling. Both are bound, so the AEAD
+  authenticates them. This refuses a frame from another job — including a replay
+  of the victim's own request, which carries the same `_bind` but receives a new
+  broker job id.
+  - The comparison is on the **broker-assigned** id. Today the image job id a
+    client sees is that id verbatim. If an outward id format is ever introduced
+    for images (video already composes one), the receiver MUST derive the broker
+    id from it explicitly; it MUST NOT compare the outward form.
+- **The frame is immutable for the job's lifetime.** The enclave seals once and
+  the broker stores the frame (cleartext part and ciphertext); every poll
+  returns the same bytes, modulo the declared unbound fields.
+
+**Non-terminal and failed responses are not frames.** They carry no `_e2ee`, and
+for a sealed job their content is restricted, so that nothing sensitive rides in
+the clear:
+
+| `status` | Body for a sealed job |
+|---|---|
+| `pending` / `processing` | `{jobId, status, createdAt, updatedAt}` only |
+| `failed` | `{jobId, status, createdAt, updatedAt, errorMessage}`, where `errorMessage` is a **fixed error code** (e.g. `upstream_error:422`, `timeout`, `broker_error`). The enclave MUST NOT store or return the upstream error body for a sealed job: moderation errors can echo the prompt |
+| `completed` | the result frame above |
+
+These bodies are cleartext and unauthenticated. A router can misreport status,
+holding a job at `processing` or claiming `failed`. That is denial of service,
+equivalent to dropping the request. It cannot read or inject content.
+
+#### 7.5.3 The user job id
+
+The stateless sender keeps `eph_priv` in the id it returns to the user:
+
+```
+user_job_id = jobId + "." + base64url(eph_priv)        // unpadded; 32 bytes → 43 characters
+```
+
+- **Parsing:** split on the **last** `.`. The job-id half MUST be 1–128 characters
+  of `[A-Za-z0-9_-]`. The key half MUST be unpadded base64url decoding to exactly
+  32 bytes. Anything else is refused, and the refusal MUST NOT echo the input.
+- The sender MUST remove the key segment before forwarding anything to the
+  router, and MUST NOT log a full `user_job_id`.
+- The sender MUST replace `jobId` with `user_job_id` in the submit response and
+  in every poll response it returns.
+- **A job id is a credential.** A third party holding it still cannot fetch the
+  result: the router enforces ownership. The router operator can decrypt that one
+  job, since it relays the frame. Wrapping the key under a sender-held key does
+  not change this. A router holding a leaked id can replay it through the sender,
+  because in zero-client-code deployments the user's credential passes through to
+  the router.
+
+#### 7.5.4 Sender rules at submit and poll
+
+- **Submit pinning.** The sender seals to one attested enclave, so the submit
+  MUST pin that provider (`X-0G-Provider-Address`, plus `X-0G-Provider-Identity`
+  when the candidate has one) with fallbacks disabled. It MUST check that the
+  `202`'s `provider_address` equals the pin. A request routed elsewhere cannot be
+  opened there.
+- **Poll handling** (key segment = present in the polled id):
+
+| Key segment | Response | Sender |
+|---|---|---|
+| present | `pending` / `processing`, no `_e2ee` | relay `jobId`, `status`, `createdAt`, `updatedAt` only |
+| present | `failed`, no `_e2ee` | relay; an `errorMessage` that is not a known code is replaced by a generic one |
+| present | `completed` with `_e2ee` | §7.5.1–§7.5.2 checks → plaintext; refuse if any fails |
+| present | `completed` without `_e2ee` | **refuse** (downgrade) |
+| present | `_e2ee` with any other status | **refuse** |
+| absent | carries `_e2ee` | **refuse**: never pass a sealed frame through, never present it as cleartext |
+| absent | no `_e2ee` | cleartext passthrough |
+
+- A non-2xx response to a keyed poll is relayed as its status and a known error
+  code only. The body is never relayed verbatim (a relayed upstream error may
+  carry request text), and the error never includes `user_job_id`.
+
 ## 8. Response signature
 
 Each response carries a TEE signature that authenticates it as the enclave's
@@ -1388,6 +1549,10 @@ other, that party's column is the load-bearing one.
 | where a billable cleartext has ALTERNATIVE locators, a frame carrying both states the same value — speech (§7.3) | **yes — sealer**, the only side that can compare both against the audio it measured | client (it can detect the disagreement, but not which locator is honest). The sealer's column is load-bearing because the two readers differ: a client opening one locator while a router bills the other would silently transact on different numbers for one response |
 | a conditionally sealed RESPONSE field is sealed when the frame carries it — speech: `segments` / `words` / `language` (§7.3) | yes | **yes — client**. A field still in the received cleartext was never sealed, and that is the receiver's only evidence: a router forwards such a frame unremarkably and the transcript rides through it in the clear. Same shape as the request side's conditional payload field, direction reversed |
 | a required quantity's LOCATOR field is neither sealed nor `unbound` — speech's `duration` as well as its `usage` (§5.2 table) | yes | **yes — client**, on every frame. The floor list is the name `usage`, so nothing else in this document reaches a top-level `duration`: derive the rule from the profile's locators rather than from names. The SEALED half is not redundant with the presence check once a quantity has alternatives — see §5.2 |
+| async-image: `_bind` is sealed in the request and echoed sealed in the result, and equals the value derived from the receiver's `eph_priv` (§7.5.1) | yes — sender attaches and seals it; enclave strips it before the upstream and echoes it | **yes — enclave** refuses a request without it; **yes — sender** refuses a result without it or with a different value. The sender's half is the one that stops a router-submitted request carrying the victim's key: Open and §8 both pass on that frame |
+| async-image: result frame is `completed`, names the polled broker job id, and frees nothing beyond `model` / `x_0g_trace` (§7.5.2) | yes — enclave declares the unbound set at completion | **yes — sender**. `jobId` in the AAD is what refuses a replay's result on the original job; an unbound `jobId` would make that check sender-controlled |
+| async-image: no upstream error text in a sealed job's `failed` body (§7.5.2) | **yes — enclave**, the only side holding the text | sender replaces an unknown `errorMessage`, but cannot tell a code from text that happens to look like one |
+| async-image: the key segment of `user_job_id` never reaches the router or a log (§7.5.3) | **yes — sender** | n/a — no other party sees it |
 | decrypted keys == declared `sealed_fields` (§5.1/§6) | by construction | **yes** |
 | no sealed/cleartext collision (§5.1) | by construction | **yes** |
 | envelope `v` / `kem_id` supported (§9) | by construction | **yes** |

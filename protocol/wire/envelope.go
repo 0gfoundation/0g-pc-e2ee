@@ -146,6 +146,11 @@ const (
 	// clientEphPubLen is the byte length of an X25519 public key — the client's
 	// response ephemeral key (SPEC §3 suite).
 	clientEphPubLen = 32
+	// fieldBind is the async-image profile's result-binding value (SPEC §7.5):
+	// derived from the client's ephemeral PRIVATE key, sealed inside the request,
+	// echoed sealed inside the result. It is a sealed field on both sides and
+	// never reaches the upstream — see async.go.
+	fieldBind = "_bind"
 )
 
 // b64 is base64url without padding — the wire encoding for binary fields (§3).
@@ -205,6 +210,16 @@ const (
 	// destination, so there is nothing for a pin to protect. Same answer for
 	// `dimensions` (it truncates the vector; the vector is sealed regardless).
 	ProfileEmbedding Profile = "embedding"
+	// ProfileAsyncImage is /v1/async/images/generations (SPEC §7.5): the image
+	// profile split in time. The request is image's plus a sealed `_bind`, and
+	// the result — sealed by the enclave when the job completes, returned on every
+	// poll — is image's response plus the echoed `_bind`.
+	//
+	// It is a profile of its own rather than ProfileImage with a flag because the
+	// `_bind` requirement must be checked by name on both ends: a sealed set that
+	// omits it opens cleanly and loses the only thing tying the result to the
+	// request (see async.go for the attack it closes).
+	ProfileAsyncImage Profile = "async-image"
 )
 
 // profileSpec fixes, per profile, which request fields are payload (and so must
@@ -596,6 +611,25 @@ func (s frameShape) sealedFieldsFor(frame Response) []string {
 }
 
 var profiles = map[Profile]profileSpec{
+	ProfileAsyncImage: {
+		// Image's payload plus `_bind`, MANDATORY on both sides. Mandatory rather
+		// than optional because its absence is exactly the attack: a request or a
+		// result without a sealed `_bind` cannot be tied to the other half, and
+		// the receiver-side checks below refuse it by name before anything opens.
+		payload:         []payloadField{{name: fieldPrompt}, {name: fieldBind}},
+		responsePayload: []payloadField{{name: fieldData}, {name: fieldBind}},
+		// Same pin as ProfileImage, for the same reason (§7.1): `url` would have
+		// the broker persist the images and serve them from a plain URL, outside
+		// the sealed channel — and on the async path, for the whole result TTL.
+		pinned: []pinnedField{{field: fieldResponseFormat, permitted: []string{"b64_json"}}},
+		// Same billable count as ProfileImage (§7.1). The router bills the
+		// completed poll on it, on the user's poll and the reconcile worker alike.
+		requiredResponseCleartext: []cleartextQuantity{{
+			locators: []cleartextNumber{{field: fieldUsage, key: fieldOutputImages}},
+			kind:     numberWhole,
+			what:     "the count of images actually delivered",
+		}},
+	},
 	ProfileChat: {
 		// "tools" is optional payload, not a mere default: the schemas name what
 		// the calling application can DO — `transfer_funds`, `get_patient_record` —
