@@ -2,6 +2,7 @@ package endpoint
 
 import (
 	"encoding/json"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -162,7 +163,11 @@ func TestAllRowsAreWellFormed(t *testing.T) {
 		// same (service type, api_format) would preview identically and be
 		// indistinguishable upstream, which is a table bug even though each row
 		// serves its own path.
-		surface := ep.ServiceType + "\x00" + ep.APIFormat
+		//
+		// Async is the third half of that key. AsyncImage previews the SAME pool as
+		// Image on purpose (one fleet answers both), and the rows are told apart by
+		// what the surface does with the provider it gets: complete, or submit.
+		surface := fmt.Sprintf("%s\x00%s\x00%t", ep.ServiceType, ep.APIFormat, ep.Async)
 		if j, dup := bySurface[surface]; dup {
 			t.Errorf("rows %d and %d share (ServiceType %q, APIFormat %q); they would preview the same pool",
 				j, i, ep.ServiceType, ep.APIFormat)

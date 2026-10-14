@@ -1094,8 +1094,19 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	// Built ONCE here rather than per row — it does not depend on the endpoint —
 	// and it returns the mux unchanged when no model list is configured, so the
 	// ordinary deployment keeps the exact chain it had.
+	//
+	// A keyed async poll (SPEC §7.5.4) shares the gate: it carries a credential,
+	// buffers up to a full sealed image result, and opens it, so it belongs under
+	// the same credential check and the same in-flight ceiling. It is routed
+	// AROUND the model dispatcher, not through it — a poll has no body and no
+	// model, and the dispatcher's question ("is this model sealed?") has no
+	// answer for it.
+	gated := http.NewServeMux()
+	gated.Handle("GET "+openaiproxy.AsyncJobsPrefix+"{id}",
+		openaiproxy.AsyncJobPoll(routerTarget, &http.Client{Transport: core.NewPooledTransport()}))
+	gated.Handle("/", policy.sealModels.dispatch(sealed, passthrough))
 	var sealedGate http.Handler = openaiproxy.RequireInferenceCredential(
-		openaiproxy.LimitInFlight(maxInFlight, policy.sealModels.dispatch(sealed, passthrough)))
+		openaiproxy.LimitInFlight(maxInFlight, gated))
 	if policy.credentialsAllowed() {
 		sealedGate = openaiproxy.AcceptCookieCredential(allowedOrigins, sealedGate)
 	}
@@ -1212,7 +1223,9 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 		mux.Handle(surface+"/", namespace)
 		mux.Handle(surface, namespace)
 		if c := clients[ep.Path]; c != nil {
-			openaiproxy.Register(sealed, ep, c)
+			// WithCleartext: an async submit asking for url format goes to the
+			// router in the clear rather than being refused (see the option).
+			openaiproxy.Register(sealed, ep, c, openaiproxy.WithCleartext(passthrough))
 			mux.Handle("POST "+ep.Path, sealedGate)
 			// ...and the surface's own TRAILING-SLASH form, which belongs to the sealed
 			// POST and not to the subtree however much it looks like the latter.
@@ -1252,6 +1265,19 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 		mux.Handle("POST "+path, unserved)
 		mux.Handle("POST "+path+"/{$}", unserved)
 	}
+	// The async poll (SPEC §7.5.4), registered whatever the seal policy or model
+	// list says: a poll carries no model to decide on, and a job sealed by an
+	// earlier configuration must stay readable. The job id decides. With a key
+	// segment it is a job this gateway sealed — opened through the gate; without
+	// one, the cleartext passthrough, which refuses to relay a sealed frame.
+	keylessPoll := openaiproxy.MarkE2EE(openaiproxy.E2EEValueNone, newKeylessPollProxy(routerTarget, logger))
+	mux.Handle("GET "+openaiproxy.AsyncJobsPrefix+"{id}", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if openaiproxy.HasJobKey(r) {
+			sealedGate.ServeHTTP(w, r)
+			return
+		}
+		keylessPoll.ServeHTTP(w, r)
+	}))
 	// /healthz answers "is this process serving?" and nothing more. It is the
 	// container healthcheck, and compose gates dstack-ingress's STARTUP on it
 	// (depends_on: service_healthy), so widening it to cover provider reachability

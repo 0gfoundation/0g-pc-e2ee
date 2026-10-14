@@ -257,7 +257,11 @@ and `usage` are all inside the AAD. A completed sealed job polls as:
 
 - Register `POST /v1/async/images/generations` and `GET /v1/async/jobs/{id}` as
   sealed surfaces, no longer the `/` passthrough (only for models in
-  `-seal-models`, as on sync surfaces).
+  `-seal-models`, as on sync surfaces). `-seal-models` is the rollout switch;
+  there is no separate flag.
+- **`response_format: "url"` on the submit is forwarded in the clear**
+  (`X-0G-E2EE: none`), not refused as on the sync image surface. Interim; the
+  product decision is open, and it lives in one place (`openaiproxy.WithCleartext`).
 - **Submit pinning.** The gateway picked one enclave (preview + quote
   verification) and sealed to its `enc_pub`. The submit must therefore carry
   `X-0G-Provider-Address` (+ `X-0G-Provider-Identity` when the candidate has one)

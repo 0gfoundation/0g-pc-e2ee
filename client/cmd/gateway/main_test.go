@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"net/http/httputil"
 	"net/url"
 	"strings"
 	"sync"
@@ -283,10 +282,7 @@ func TestGatewayRouteMode(t *testing.T) {
 // host, which no functional test would notice — it only shows up as a throughput
 // ceiling under concurrency the load rig does not even drive through this route.
 func TestRouterProxyUsesThePooledTransport(t *testing.T) {
-	proxy, ok := newRouterProxy(mustURL(t, "http://router.unused"), discardLogger()).(*httputil.ReverseProxy)
-	if !ok {
-		t.Fatal("newRouterProxy did not return a *httputil.ReverseProxy")
-	}
+	proxy := newRouterProxy(mustURL(t, "http://router.unused"), discardLogger())
 	if proxy.Transport == nil {
 		t.Fatal("Transport: nil — the proxy would fall back to the process-global http.DefaultTransport")
 	}

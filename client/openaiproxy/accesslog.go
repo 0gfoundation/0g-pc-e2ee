@@ -106,7 +106,9 @@ func LogRequests(logger *slog.Logger, h http.Handler) http.Handler {
 		attrs := []slog.Attr{
 			slog.String("request_id", id),
 			slog.String("method", r.Method),
-			slog.String("path", r.URL.Path),
+			// A polled async job id is a credential (SPEC §7.5.3): its key segment
+			// never reaches the log.
+			slog.String("path", RedactJobPath(r.URL.Path)),
 			slog.Int("status", rec.status),
 			slog.Int64("duration_ms", dur.Milliseconds()),
 			slog.Int("bytes_out", rec.bytes),
