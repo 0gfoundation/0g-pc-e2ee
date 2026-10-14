@@ -273,6 +273,23 @@ type profileSpec struct {
 	// AUTHENTICATED — see protectedCleartext. Empty for a profile whose router
 	// inputs are all covered by the profile-independent floor.
 	protected []protectedCleartext
+	// bound are top-level SCALAR response fields this profile's receiver keys a
+	// check off, so they must stay cleartext and inside the AAD: never sealed,
+	// never unbound. async-image's `jobId` and `status` (§7.5.2) — with either
+	// unbound, a router could relabel a replay's frame as the polled job with Open
+	// still succeeding.
+	//
+	// Separate from `protected` because that one is about OBJECTS: it parses the
+	// field as a JSON object to check the arrays inside it, which a string field
+	// fails on every frame. Declared here, it is enforced on every seal and open
+	// path for the profile — not only in a wrapper a caller might not use.
+	bound []string
+	// resultBinding marks a profile whose response must carry, sealed, the
+	// `_bind` value derived from the client's ephemeral private key (§7.5.1). The
+	// response opener derives the expected value from the key it is given and
+	// compares on every frame, so a caller using the generic open path gets the
+	// check too.
+	resultBinding bool
 }
 
 // payloadField is one sensitive request field of a profile: something the sealed
@@ -629,6 +646,12 @@ var profiles = map[Profile]profileSpec{
 			kind:     numberWhole,
 			what:     "the count of images actually delivered",
 		}},
+		// Which job, and that it is the terminal frame: the receiver compares
+		// both, so both must be authenticated (§7.5.2).
+		bound: []string{fieldJobID, fieldStatus},
+		// The sealed `_bind` must equal the value derived from the receiver's key
+		// (§7.5.1). Enforced in the generic opener, not only OpenAsyncImageResult.
+		resultBinding: true,
 	},
 	ProfileChat: {
 		// "tools" is optional payload, not a mere default: the schemas name what

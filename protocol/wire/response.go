@@ -1,6 +1,7 @@
 package wire
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"slices"
@@ -368,6 +369,12 @@ func validateResponseUnboundFieldsFor(p Profile, unbound []string) error {
 			return fmt.Errorf("%q must stay bound for the %s profile: it carries %s, one level down where the profile-independent rule cannot see it, so an unbound one could be rewritten in transit and still verify", pc.field, p, pc.reads)
 		}
 	}
+	// The profile's bound scalar fields (see profileSpec.bound).
+	for _, f := range spec.bound {
+		if slices.Contains(unbound, f) {
+			return fmt.Errorf("%q must stay bound for the %s profile: the receiver keys a check off it, so an unbound one could be rewritten in transit with Open still succeeding", f, p)
+		}
+	}
 	// And the fields a required quantity is LOCATED in, which is the same trap
 	// once more and in the direction the floor list cannot follow. That list is
 	// `usage` by name, so it protects `usage.output_images` and `usage.seconds`
@@ -562,6 +569,13 @@ func validateResponseSealedFieldsForFrame(p Profile, frame Response, fields []st
 	// therefore what makes the client's half of the agreement rule exist at all.
 	if err := validateQuantityLocatorsNotSealed(p, spec, fields); err != nil {
 		return err
+	}
+	// The profile's bound scalar fields stay cleartext too: sealed, they would
+	// vanish from the half the receiver compares.
+	for _, f := range spec.bound {
+		if slices.Contains(fields, f) {
+			return fmt.Errorf("%s-profile frames must keep %q cleartext: the receiver keys a check off it", p, f)
+		}
 	}
 	rule := spec.responseFrames
 	if rule == nil {
@@ -1019,6 +1033,9 @@ func (rs *ResponseSealer) SealFrame(frame Response, sealedFields []string, final
 type ResponseOpener struct {
 	opener  *crypto.Opener
 	profile Profile
+	// bind is the expected `_bind` for a profile with resultBinding (§7.5.1),
+	// derived from the key the opener was built with; nil otherwise.
+	bind []byte
 }
 
 // NewResponseOpener builds the receive context from the first frame (which
@@ -1062,7 +1079,13 @@ func NewResponseOpenerFor(profile Profile, clientEphPriv crypto.PrivateKey, firs
 	if err != nil {
 		return nil, err
 	}
-	return &ResponseOpener{opener: o, profile: profile}, nil
+	ro := &ResponseOpener{opener: o, profile: profile}
+	if spec, _ := profile.spec(); spec.resultBinding {
+		if ro.bind, err = DeriveAsyncBind(clientEphPriv); err != nil {
+			return nil, err
+		}
+	}
+	return ro, nil
 }
 
 // OpenFrame opens one frame and returns it reconstructed (cleartext ∪
@@ -1118,6 +1141,18 @@ func (ro *ResponseOpener) OpenFrame(frame Response) (Response, error) {
 	}
 	if !sameKeys(sealedObj, e2ee.SealedFields) {
 		return nil, fmt.Errorf("decrypted fields do not match sealed_fields")
+	}
+	// The result binding (§7.5.1): the frame opened under our key, but HPKE base
+	// mode does not say who sealed it, and anyone holding our public key can.
+	// The binding value can only come from the enclave that opened OUR request.
+	if ro.bind != nil {
+		got, err := decodeBind(sealedObj[fieldBind])
+		if err != nil {
+			return nil, err
+		}
+		if subtle.ConstantTimeCompare(got, ro.bind) != 1 {
+			return nil, fmt.Errorf("%s-profile frame's %q does not match this request: it was produced for a different request sealed to the same key", ro.profile, fieldBind)
+		}
 	}
 
 	out := make(Response, len(frame)+len(sealedObj))

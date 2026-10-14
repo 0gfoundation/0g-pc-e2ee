@@ -1,6 +1,7 @@
 package wire_test
 
 import (
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"strings"
@@ -182,5 +183,91 @@ func TestParseUserJobIDRefusesWithoutEchoingTheInput(t *testing.T) {
 				t.Fatalf("error echoes the input: %v", err)
 			}
 		})
+	}
+}
+
+// asyncFrame is a completed async-image poll body, before sealing.
+func asyncFrame(t *testing.T, ephPriv crypto.PrivateKey) wire.Response {
+	t.Helper()
+	bind, err := wire.DeriveAsyncBind(ephPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindJSON, _ := json.Marshal(base64.RawURLEncoding.EncodeToString(bind))
+	return wire.Response{
+		"jobId":  json.RawMessage(`"job_1"`),
+		"status": json.RawMessage(`"completed"`),
+		"usage":  json.RawMessage(`{"output_images":1}`),
+		"data":   json.RawMessage(`{"data":[{"b64_json":"x"}]}`),
+		"_bind":  bindJSON,
+	}
+}
+
+// `jobId` and `status` are bound by PROFILE declaration, so every seal and open
+// path enforces it — not only the OpenAsyncImageResult wrapper. A conforming
+// sealer refuses to free or seal them; a frame a non-conforming sealer emits
+// anyway is refused by the generic opener and by the wrapper.
+func TestAsyncImageJobIDAndStatusAreBoundOnEveryPath(t *testing.T) {
+	ephPriv, ephPub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"jobId", "status"} {
+		t.Run(f, func(t *testing.T) {
+			if _, err := wire.SealResponseFor(wire.ProfileAsyncImage, ephPub, asyncFrame(t, ephPriv), nil, f, "x_0g_trace"); err == nil {
+				t.Fatalf("a conforming sealer declared %q unbound", f)
+			}
+			if _, err := wire.SealResponseFor(wire.ProfileAsyncImage, ephPub, asyncFrame(t, ephPriv), []string{"data", "_bind", f}); err == nil {
+				t.Fatalf("a conforming sealer sealed %q away", f)
+			}
+			// What a non-conforming enclave would emit.
+			sealed, err := wire.SealResponseNonConforming(ephPub, asyncFrame(t, ephPriv), []string{"data", "_bind"}, f, "x_0g_trace")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := wire.OpenResponseFor(wire.ProfileAsyncImage, ephPriv, sealed); err == nil {
+				t.Fatalf("the generic opener accepted a frame with %q unbound", f)
+			}
+			if _, err := wire.OpenAsyncImageResult(ephPriv, sealed, "job_1"); err == nil {
+				t.Fatalf("OpenAsyncImageResult accepted a frame with %q unbound", f)
+			}
+		})
+	}
+}
+
+// The `_bind` comparison runs in the generic opener, so a caller that opens with
+// OpenResponseFor(ProfileAsyncImage, …) instead of the wrapper still refuses a
+// result produced for someone else's request sealed to its key.
+func TestAsyncImageGenericOpenerChecksTheBinding(t *testing.T) {
+	victimPriv, victimPub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	attackerPriv, _, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Sealed to the victim's key, carrying the attacker's binding value — what a
+	// genuine enclave produces for a router-submitted request reusing the
+	// victim's client_eph_pub.
+	forged, err := wire.SealResponseFor(wire.ProfileAsyncImage, victimPub, asyncFrame(t, attackerPriv), nil, wire.AsyncImageResultUnboundFields()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wire.OpenResponseFor(wire.ProfileAsyncImage, victimPriv, forged); err == nil {
+		t.Fatal("the generic opener accepted a frame bound to a different request")
+	}
+	// And the honest frame opens on the generic path too, `_bind` still present
+	// for the caller to drop.
+	honest, err := wire.SealResponseFor(wire.ProfileAsyncImage, victimPub, asyncFrame(t, victimPriv), nil, wire.AsyncImageResultUnboundFields()...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opened, err := wire.OpenResponseFor(wire.ProfileAsyncImage, victimPriv, honest)
+	if err != nil {
+		t.Fatalf("honest frame refused on the generic path: %v", err)
+	}
+	if _, ok := opened["_bind"]; !ok {
+		t.Fatal("generic open dropped _bind; only the wrapper strips it")
 	}
 }

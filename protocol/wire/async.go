@@ -3,7 +3,6 @@ package wire
 import (
 	"crypto/hkdf"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"slices"
@@ -203,9 +202,8 @@ func SealAsyncImageResult(clientEphPub crypto.PublicKey, result Response, bind [
 // The returned response has `_bind` removed: the caller gets the poll envelope
 // in its ordinary shape, `data` restored.
 func OpenAsyncImageResult(ephPriv crypto.PrivateKey, frame Response, wantJobID string) (Response, error) {
-	want, err := DeriveAsyncBind(ephPriv)
-	if err != nil {
-		return nil, err
+	if len(ephPriv) != ephPrivLen {
+		return nil, fmt.Errorf("ephemeral private key must be %d bytes, got %d", ephPrivLen, len(ephPriv))
 	}
 	e2ee, err := frame.E2EE()
 	if err != nil {
@@ -231,16 +229,11 @@ func OpenAsyncImageResult(ephPriv crypto.PrivateKey, frame Response, wantJobID s
 		// Neither id is echoed: the caller's may sit next to a key in its logs.
 		return nil, fmt.Errorf("result frame names a different job than the one polled")
 	}
+	// The profile checks, the AEAD, and the `_bind` comparison (the opener derives
+	// the expected value from ephPriv; see profileSpec.resultBinding).
 	opened, err := OpenResponseFor(ProfileAsyncImage, ephPriv, frame)
 	if err != nil {
 		return nil, err
-	}
-	got, err := decodeBind(opened[fieldBind])
-	if err != nil {
-		return nil, err
-	}
-	if subtle.ConstantTimeCompare(got, want) != 1 {
-		return nil, fmt.Errorf("result frame's %q does not match this request: it was produced for a different request sealed to the same key", fieldBind)
 	}
 	delete(opened, fieldBind)
 	return opened, nil
