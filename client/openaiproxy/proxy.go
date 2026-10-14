@@ -398,6 +398,14 @@ const routingHeaderPrefix = "x-0g-"
 var attributionHeaders = map[string]bool{
 	"http-referer": true,
 	"x-title":      true,
+	// Conversation ids: the router keeps every turn of a conversation on one
+	// provider, and for a sealed request it does so through the routing
+	// preview, whose first candidate this gateway pins. Claude Code sends
+	// X-Claude-Code-Session-Id on its own; X-Session-Id is the generic form.
+	// Opaque client-chosen ids, not conversation content — the router only
+	// hashes them (salted per account) — so they ride cleartext like X-0G-*.
+	"x-session-id":             true,
+	"x-claude-code-session-id": true,
 }
 
 // routingHeaders selects the headers the router legitimately consumes — the
