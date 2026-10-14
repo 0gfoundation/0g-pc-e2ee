@@ -230,7 +230,7 @@ func OpenAsyncImageResult(ephPriv crypto.PrivateKey, frame Response, wantJobID s
 		return nil, fmt.Errorf("result frame names a different job than the one polled")
 	}
 	// The profile checks, the AEAD, and the `_bind` comparison (the opener derives
-	// the expected value from ephPriv; see profileSpec.resultBinding).
+	// the expected value from ephPriv; see profileSpec.bindsResult).
 	opened, err := OpenResponseFor(ProfileAsyncImage, ephPriv, frame)
 	if err != nil {
 		return nil, err

@@ -1033,8 +1033,9 @@ func (rs *ResponseSealer) SealFrame(frame Response, sealedFields []string, final
 type ResponseOpener struct {
 	opener  *crypto.Opener
 	profile Profile
-	// bind is the expected `_bind` for a profile with resultBinding (§7.5.1),
-	// derived from the key the opener was built with; nil otherwise.
+	// bind is the expected `_bind` for a profile whose responses carry one
+	// (profileSpec.bindsResult, §7.5.1), derived from the key the opener was
+	// built with; nil otherwise.
 	bind []byte
 }
 
@@ -1080,7 +1081,7 @@ func NewResponseOpenerFor(profile Profile, clientEphPriv crypto.PrivateKey, firs
 		return nil, err
 	}
 	ro := &ResponseOpener{opener: o, profile: profile}
-	if spec, _ := profile.spec(); spec.resultBinding {
+	if spec, _ := profile.spec(); spec.bindsResult() {
 		if ro.bind, err = DeriveAsyncBind(clientEphPriv); err != nil {
 			return nil, err
 		}
