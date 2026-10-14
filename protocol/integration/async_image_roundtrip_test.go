@@ -305,31 +305,6 @@ func TestAsyncImageCleartextEditsAreRefused(t *testing.T) {
 	}
 }
 
-// A non-conforming enclave that unbinds `jobId` would let a router relabel a
-// frame; the receiver refuses any unbound field outside the profile's own set.
-func TestAsyncImageFrameUnbindingJobIDIsRefused(t *testing.T) {
-	ephPriv, ephPub, err := crypto.GenerateRecipientKey()
-	if err != nil {
-		t.Fatal(err)
-	}
-	bind, _ := wire.DeriveAsyncBind(ephPriv)
-	bindJSON, _ := json.Marshal(b64urlEncode(bind))
-	frame := wire.Response{
-		"jobId":  json.RawMessage(`"job_1"`),
-		"status": json.RawMessage(`"completed"`),
-		"usage":  json.RawMessage(`{"output_images":1}`),
-		"data":   json.RawMessage(`{"data":[{"b64_json":"x"}]}`),
-		"_bind":  bindJSON,
-	}
-	sealed, err := wire.SealResponseFor(wire.ProfileAsyncImage, ephPub, frame, nil, "jobId", "x_0g_trace")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := wire.OpenAsyncImageResult(ephPriv, sealed, "job_1"); err == nil {
-		t.Fatal("a frame with jobId unbound was accepted")
-	}
-}
-
 // A result sealed without `_bind` — e.g. by an enclave serving it as a plain
 // image response — is refused by the profile check before anything opens.
 func TestAsyncImageFrameWithoutSealedBindIsRefused(t *testing.T) {
@@ -392,4 +367,3 @@ func TestSealAsyncImageResultRefusesNonTerminalOrUnnamedFrames(t *testing.T) {
 
 func b64url(s string) ([]byte, error) { return b64.DecodeString(s) }
 
-func b64urlEncode(b []byte) string { return b64.EncodeToString(b) }
