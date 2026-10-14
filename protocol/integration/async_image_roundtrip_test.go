@@ -366,4 +366,3 @@ func TestSealAsyncImageResultRefusesNonTerminalOrUnnamedFrames(t *testing.T) {
 }
 
 func b64url(s string) ([]byte, error) { return b64.DecodeString(s) }
-
