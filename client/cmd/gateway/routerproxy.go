@@ -1,10 +1,15 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
@@ -50,7 +55,7 @@ import (
 // sealedNamespaceGuard (main.go) now folds every spelling to the registered one
 // before the mux matches, so the claim holds by construction rather than by
 // enumeration — do not narrow it back to a list.
-func newRouterProxy(target *url.URL, logger *slog.Logger) http.Handler {
+func newRouterProxy(target *url.URL, logger *slog.Logger) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		// Every request this proxy makes goes to the one router host, so it needs the
 		// same server-sized idle-connection pool as the sealed path. Left nil,
@@ -101,8 +106,71 @@ func newRouterProxy(target *url.URL, logger *slog.Logger) http.Handler {
 			// carry the router host/port — goes only to the enclave log), and the source
 			// is "upstream": like the sealed path, a failure reaching the router is
 			// attributed upstream, not to a fault in this proxy.
-			logger.Error("router passthrough failed", "method", r.Method, "path", r.URL.Path, "err", err)
+			logger.Error("router passthrough failed", "method", r.Method, "path", openaiproxy.RedactJobPath(r.URL.Path), "err", err)
 			openaiproxy.WriteError(w, http.StatusBadGateway, "upstream", "upstream request failed")
 		},
 	}
 }
+
+// maxKeylessPollBytes bounds how much of a keyless poll answer is read to check
+// it. A cleartext completed image job is the provider's JSON (the router reads
+// the broker's answer through a 32 MiB cap); a larger answer is refused rather
+// than relayed unchecked.
+const maxKeylessPollBytes = 48 << 20
+
+// newKeylessPollProxy is the cleartext passthrough for a poll whose job id has
+// no key segment (SPEC §7.5.4): a job this gateway did not seal, relayed as the
+// catch-all would — with one check. A keyless poll answered with a SEALED frame
+// is refused: without the key it cannot be opened, and relaying it would hand
+// the caller ciphertext labelled as a cleartext result.
+func newKeylessPollProxy(target *url.URL, logger *slog.Logger) http.Handler {
+	p := newRouterProxy(target, logger)
+	// Ask the router for an uncompressed answer. The check below reads the body
+	// as JSON; a gzip'd one would not parse, and would be relayed unchecked.
+	// (ReverseProxy forwards the caller's Accept-Encoding, and a Transport only
+	// decompresses what it asked to be compressed itself.)
+	rewrite := p.Rewrite
+	p.Rewrite = func(pr *httputil.ProxyRequest) {
+		rewrite(pr)
+		pr.Out.Header.Del("Accept-Encoding")
+	}
+	strip := p.ModifyResponse
+	p.ModifyResponse = func(resp *http.Response) error {
+		if err := strip(resp); err != nil {
+			return err
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxKeylessPollBytes+1))
+		_ = resp.Body.Close()
+		if err != nil || len(body) > maxKeylessPollBytes {
+			return errKeylessPollUnreadable
+		}
+		var top map[string]json.RawMessage
+		if json.Unmarshal(body, &top) == nil {
+			if _, sealed := top["_e2ee"]; sealed {
+				return errKeylessPollSealed
+			}
+		}
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		resp.ContentLength = int64(len(body))
+		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		return nil
+	}
+	fallback := p.ErrorHandler
+	p.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+		switch {
+		case errors.Is(err, errKeylessPollSealed):
+			openaiproxy.WriteError(w, http.StatusBadGateway, "gateway",
+				"this job's result is end-to-end encrypted; poll it with the job id the submit returned, which carries its key")
+		case errors.Is(err, errKeylessPollUnreadable):
+			openaiproxy.WriteError(w, http.StatusBadGateway, "upstream", "poll response unreadable or too large")
+		default:
+			fallback(w, r, err)
+		}
+	}
+	return p
+}
+
+var (
+	errKeylessPollSealed     = errors.New("keyless poll answered with a sealed frame")
+	errKeylessPollUnreadable = errors.New("keyless poll answer unreadable")
+)

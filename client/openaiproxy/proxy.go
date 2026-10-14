@@ -172,6 +172,9 @@ type Option func(*options)
 
 type options struct {
 	verboseUpstreamErrors bool
+	// cleartext is where an async surface sends a request it will not seal; see
+	// WithCleartext. nil refuses such a request instead.
+	cleartext http.Handler
 }
 
 // WithVerboseUpstreamErrors makes the proxy append the raw upstream response
@@ -290,6 +293,10 @@ func Register(mux *http.ServeMux, ep endpoint.Endpoint, c *core.Client, opts ...
 	var o options
 	for _, opt := range opts {
 		opt(&o)
+	}
+	if ep.Async {
+		registerAsync(mux, ep, c, o)
+		return
 	}
 	mux.HandleFunc("POST "+ep.Path, func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxRequestBytes))

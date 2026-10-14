@@ -115,6 +115,11 @@ type Endpoint struct {
 	// The body arrives already capped by the caller (openaiproxy.MaxRequestBytes),
 	// so a decoder may read it all; it must not read from anywhere else.
 	DecodeMultipart func(body []byte, contentType string) (wire.Request, error)
+	// Async is a submit-and-poll surface (SPEC §7.5): the POST answers 202 with
+	// a job id, and the result is fetched later from GET /v1/async/jobs/{id}.
+	// The sealed POST handler for such a row submits rather than completes, and
+	// the result is opened on the poll.
+	Async bool
 }
 
 // Chat is POST /v1/chat/completions: the OpenAI chat-completions surface.
@@ -157,6 +162,20 @@ var Image = Endpoint{
 	PreSeal:      imagePreSeal,
 }
 
+// AsyncImage is POST /v1/async/images/generations: the router's asynchronous
+// image-generation surface, sealed under the async-image profile (SPEC §7.5).
+// Same pool and same pinned `response_format` as Image; the submit answers 202
+// and the result is opened when GET /v1/async/jobs/{id} is polled.
+var AsyncImage = Endpoint{
+	ServiceType:  "text-to-image",
+	Profile:      wire.ProfileAsyncImage,
+	Path:         "/v1/async/images/generations",
+	UpstreamPath: "/v1/async/images/generations",
+	Streams:      false,
+	PreSeal:      imagePreSeal,
+	Async:        true,
+}
+
 // Embedding is POST /v1/embeddings: the OpenAI embeddings surface.
 //
 // No PreSeal: ProfileEmbedding pins nothing (SPEC §7.4). `encoding_format`
@@ -189,7 +208,7 @@ var Embedding = Endpoint{
 // silently confused with another. A ByServiceType("chatbot") would have returned
 // whichever chat row came first in this slice and shadowed the other with no
 // error anywhere.
-var All = []Endpoint{Chat, Anthropic, Image, Speech, Embedding}
+var All = []Endpoint{Chat, Anthropic, Image, Speech, Embedding, AsyncImage}
 
 // fieldResponseFormat is the image profile's pinned cleartext field (SPEC §7.1).
 const fieldResponseFormat = "response_format"
