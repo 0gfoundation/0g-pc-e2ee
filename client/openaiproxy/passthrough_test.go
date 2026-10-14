@@ -17,19 +17,21 @@ func TestRoutingHeaders_ForwardsRouterConsumedOnly(t *testing.T) {
 	// carries them (e.g. "X-0G-…" → "X-0g-…", "HTTP-Referer" → "Http-Referer").
 	in := http.Header{}
 	for k, v := range map[string]string{
-		"X-0G-Provider-Address": "0xabc",
-		"X-0G-Source-Id":        "partner-slug",
-		"HTTP-Referer":          "https://app.example",
-		"X-Title":               "My App",
-		"Authorization":         "Bearer sk-secret",
-		"Cookie":                "session=abc",
-		"X-App-Internal":        "leak-me",
+		"X-0G-Provider-Address":    "0xabc",
+		"X-0G-Source-Id":           "partner-slug",
+		"HTTP-Referer":             "https://app.example",
+		"X-Title":                  "My App",
+		"X-Session-Id":             "conv-1",
+		"X-Claude-Code-Session-Id": "6f1c0d2e-cc",
+		"Authorization":            "Bearer sk-secret",
+		"Cookie":                   "session=abc",
+		"X-App-Internal":           "leak-me",
 	} {
 		in.Set(k, v)
 	}
 	out := routingHeaders(in)
 
-	forwarded := []string{"X-0G-Provider-Address", "X-0G-Source-Id", "HTTP-Referer", "X-Title"}
+	forwarded := []string{"X-0G-Provider-Address", "X-0G-Source-Id", "HTTP-Referer", "X-Title", "X-Session-Id", "X-Claude-Code-Session-Id"}
 	for _, k := range forwarded {
 		if out.Get(k) == "" {
 			t.Errorf("expected %q to be forwarded, but it was dropped", k)
