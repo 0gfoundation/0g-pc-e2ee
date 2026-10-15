@@ -459,7 +459,10 @@ func TestRedactJobPath(t *testing.T) {
 	for in, want := range map[string]string{
 		"/v1/async/jobs/job-a.c2VjcmV0":  "/v1/async/jobs/job-a.<redacted>",
 		"/v1/async/jobs/job-a":           "/v1/async/jobs/job-a",
-		"/v1/async/jobs/a.b.c2VjcmV0":    "/v1/async/jobs/a.b.<redacted>",
+		"/v1/async/jobs/a.b.c2VjcmV0":    "/v1/async/jobs/a.<redacted>",
+		"/V1/Async/Jobs/job-a.c2VjcmV0":  "/V1/Async/Jobs/job-a.<redacted>",
+		"/v1/async/jobs/job-a.c2Vj/x.y":  "/v1/async/jobs/job-a.<redacted>",
+		"/v1/async/jobs/job-a.c2Vj/":     "/v1/async/jobs/job-a.<redacted>",
 		"/v1/chat/completions":           "/v1/chat/completions",
 		"/v1/images/generations/x.y.zzz": "/v1/images/generations/x.y.zzz",
 	} {
