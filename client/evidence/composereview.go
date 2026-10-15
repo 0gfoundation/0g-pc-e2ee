@@ -707,7 +707,8 @@ func (r *ComposeReview) reviewComposeText(doc []byte) {
 		return
 	}
 
-	mounts := &mountIndex{holders: map[string][]string{}, named: map[string]bool{}, volumes: volumes}
+	mounts := &mountIndex{holders: map[string][]string{}, named: map[string]bool{}, volumes: volumes,
+		runtimeSocketAt: map[int]bool{}}
 	for i := 0; i+1 < len(services.Content); i += 2 {
 		name := services.Content[i].Value
 		if name == "" {
@@ -926,11 +927,18 @@ type mountIndex struct {
 	// declared up there, so without this the per-service pass cannot tell an ordinary
 	// empty volume from a host bind wearing a name.
 	volumes map[string]namedVolume
+	// runtimeSocketAt marks the findings that report a DIRECT bind of the docker socket,
+	// by index into ComposeReview.Findings, so the controller exception
+	// (composecontroller.go) finds them by where they were added rather than by matching
+	// their wording.
+	runtimeSocketAt map[int]bool
 }
 
 // reviewService applies the per-service rules and records the service's image.
 func (r *ComposeReview) reviewService(name string, body *yaml.Node, mounts *mountIndex) {
 	svc := ReviewedService{Name: name}
+	// Where this service's findings begin, for the controller exception at the end.
+	start := len(r.Findings)
 	// Appended in the same places Services is, so the two stay index-aligned by
 	// construction rather than by a later lookup. blockOf works on a clone, so it cannot
 	// disturb the node tree the rules below walk.
@@ -1016,6 +1024,10 @@ func (r *ComposeReview) reviewService(name string, body *yaml.Node, mounts *moun
 				"this review has no rule for the key; read it before treating the manifest as a baseline")
 		}
 	}
+
+	// Last, once every rule has spoken: the exception needs to know whether the service
+	// has any OTHER blocking finding.
+	r.justifyControllerRuntimeSocket(name, body, svc, mounts, start)
 }
 
 // reviewServiceKey applies the rule for one privileged-ish service key, returning
@@ -1360,6 +1372,9 @@ func (r *ComposeReview) reviewVolumes(name string, val *yaml.Node, mounts *mount
 			// problems.
 			if sev, clean, why := hostPathVerdict(src); why != "" {
 				mounts.named[src] = true
+				if runtimeDockerSockets[clean] {
+					mounts.runtimeSocketAt[len(r.Findings)] = true
+				}
 				r.add(sev, name, "volumes", fmt.Sprintf("%s%s -> %s (%s): %s",
 					src, normalizedAs(src, clean), target, mode(ro), why))
 			}
