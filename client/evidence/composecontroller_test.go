@@ -1,0 +1,184 @@
+package evidence
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// v054 is the broker release the embedded list carries.
+const v054 = "ghcr.io/0gfoundation/0g-serving-broker@sha256:951f4c7971f87377ab077639a5a84d2aed8945460494da076ff8466ea1ee90b5"
+
+// eligibleController is a controller that meets every condition. Each case below breaks
+// exactly one, so a case that still relaxes the finding has found a hole.
+const eligibleController = `services:
+  0g-controller:
+    image: ` + v054 + `
+    command: 0g-controller
+    environment:
+      - CONFIG_FILE=/etc/config/config.yaml
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - /var/run/docker.sock:/var/run/docker.sock
+      - zg-tee:/var/run/zg-tee
+volumes:
+  zg-tee: {}
+`
+
+// dockerSockFinding returns the finding about a service's docker socket.
+func dockerSockFinding(t *testing.T, r ComposeReview, service string) Finding {
+	t.Helper()
+	for _, f := range r.Findings {
+		if f.Service == service && f.Key == "volumes" && strings.Contains(f.Detail, "docker.sock") {
+			return f
+		}
+	}
+	t.Fatalf("no docker.sock finding for %s:\n%+v", service, r.Findings)
+	return Finding{}
+}
+
+func TestControllerException_Applies(t *testing.T) {
+	f := dockerSockFinding(t, reviewOf(t, manifest(eligibleController)), "0g-controller")
+	if f.Severity != SeverityJustify {
+		t.Fatalf("severity = %s, want justify:\n%s", f.Severity, f.Detail)
+	}
+	// It says what it rests on, so the relaxation is an argument a reader can check
+	// rather than a finding that quietly went away.
+	for _, want := range []string{"v0.5.4", "#759", "controller-design.md", "do not hold on any other build"} {
+		if !strings.Contains(f.Detail, want) {
+			t.Errorf("detail does not mention %q:\n%s", want, f.Detail)
+		}
+	}
+}
+
+// Each condition, broken alone, keeps the finding blocking — and the detail says which.
+func TestControllerException_EachConditionIsLoadBearing(t *testing.T) {
+	sub := func(old, new string) string {
+		if !strings.Contains(eligibleController, old) {
+			t.Fatalf("fixture has no %q", old)
+		}
+		return strings.Replace(eligibleController, old, new, 1)
+	}
+	envLine := "      - CONFIG_FILE=/etc/config/config.yaml\n"
+	for _, tc := range []struct{ name, doc, says string }{
+		{"an unlisted release",
+			sub("sha256:951f4c79", "sha256:ec5df834"), ""},
+		{"v0.5.1, the build cn-20 runs",
+			strings.Replace(eligibleController, "@sha256:951f4c7971f87377ab077639a5a84d2aed8945460494da076ff8466ea1ee90b5",
+				"@sha256:ec5df8347f91c3b28a6638db4e24dba343799c0a3a7e2cdd44845a3a27f2e734", 1), "not a listed release"},
+		{"a tag instead of a digest",
+			sub(v054, "ghcr.io/0gfoundation/0g-serving-broker:v0.5.4"), "not pinned"},
+		{"another repository",
+			sub("ghcr.io/0gfoundation/0g-serving-broker@", "ghcr.io/someone/0g-serving-broker@"), "not 0G's broker image"},
+		// The broker image ships three programs. A service named 0g-controller running
+		// the inference server holds the socket in code #759 does not govern.
+		{"another program from the same image",
+			sub("command: 0g-controller", "command: 0g-inference-server"), "command is not"},
+		{"no command at all",
+			sub("    command: 0g-controller\n", ""), "command is not"},
+		{"an entrypoint override",
+			sub("    command: 0g-controller\n", "    command: 0g-controller\n    entrypoint: [sh, -c]\n"), "entrypoint"},
+		{"privileged",
+			sub("    command: 0g-controller\n", "    command: 0g-controller\n    privileged: true\n"), ""},
+		{"an added capability",
+			sub("    command: 0g-controller\n", "    command: 0g-controller\n    cap_add: [NET_ADMIN]\n"), "capabilities"},
+		{"engines on",
+			sub(envLine, envLine+"      - ZG_CONTROLLER_ENGINES=on\n"), "is enabled"},
+		{"engines on, map form",
+			sub("    environment:\n"+envLine, "    environment:\n      ZG_CONTROLLER_ENGINES: \"on\"\n"), "is enabled"},
+		// The host decides, which is the same as on for this purpose.
+		{"engines passed through from the host",
+			sub(envLine, envLine+"      - ZG_CONTROLLER_ENGINES\n"), "host"},
+		{"engines interpolated from the host",
+			sub(envLine, envLine+"      - ZG_CONTROLLER_ENGINES=${ENGINES}\n"), "host"},
+		{"environment from a file the manifest does not contain",
+			sub("    command: 0g-controller\n", "    command: 0g-controller\n    env_file: ./controller.env\n"), "env_file"},
+		{"another absolute host path",
+			sub("      - zg-tee:/var/run/zg-tee\n", "      - zg-tee:/var/run/zg-tee\n      - /opt/data:/data\n"), "/opt/data"},
+		{"a relative host path",
+			sub("      - zg-tee:/var/run/zg-tee\n", "      - zg-tee:/var/run/zg-tee\n      - ./logs/controller:/var/log\n"), "relative"},
+		// Any other blocking finding on the service: an exception granted to a service
+		// the review already refuses would read as approval of it.
+		{"another blocking finding",
+			sub("    command: 0g-controller\n", "    command: 0g-controller\n    pid: host\n"), "another blocking finding"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := dockerSockFinding(t, reviewOf(t, manifest(tc.doc)), "0g-controller")
+			if f.Severity != SeverityBlocking {
+				t.Fatalf("relaxed to %s:\n%s", f.Severity, f.Detail)
+			}
+			if tc.says != "" && !strings.Contains(f.Detail, tc.says) {
+				t.Errorf("detail does not say why (%q):\n%s", tc.says, f.Detail)
+			}
+		})
+	}
+}
+
+// Engines explicitly off is the default made explicit, and must not cost the exception.
+func TestControllerException_EnginesOffIsFine(t *testing.T) {
+	for _, v := range []string{"off", "false", "0", "OFF", ""} {
+		doc := strings.Replace(eligibleController, "      - CONFIG_FILE=/etc/config/config.yaml\n",
+			"      - CONFIG_FILE=/etc/config/config.yaml\n      - ZG_CONTROLLER_ENGINES="+v+"\n", 1)
+		if f := dockerSockFinding(t, reviewOf(t, manifest(doc)), "0g-controller"); f.Severity != SeverityJustify {
+			t.Errorf("ZG_CONTROLLER_ENGINES=%q: severity %s", v, f.Severity)
+		}
+	}
+}
+
+// The exception is the controller's, not the image's. broker and event run the same
+// release, and neither is a program #759 describes.
+func TestControllerException_IsOnlyForTheController(t *testing.T) {
+	doc := strings.Replace(eligibleController, "  0g-controller:\n", "  0g-serving-provider-broker:\n", 1)
+	f := dockerSockFinding(t, reviewOf(t, manifest(doc)), "0g-serving-provider-broker")
+	if f.Severity != SeverityBlocking {
+		t.Fatalf("the broker service holding the socket was relaxed:\n%s", f.Detail)
+	}
+	if strings.Contains(f.Detail, "exception") {
+		t.Errorf("a service that is not the controller was told about the controller's exception:\n%s", f.Detail)
+	}
+}
+
+// Only a DIRECT bind of the docker socket is covered. The same socket delivered through a
+// named volume, and a containerd socket, are capabilities nobody has accounted for.
+func TestControllerException_CoversOnlyTheDirectDockerBind(t *testing.T) {
+	t.Run("through a named volume", func(t *testing.T) {
+		doc := strings.Replace(eligibleController, "      - /var/run/docker.sock:/var/run/docker.sock\n",
+			"      - dsock:/var/run/docker.sock\n", 1)
+		doc = strings.Replace(doc, "volumes:\n  zg-tee: {}\n",
+			"volumes:\n  zg-tee: {}\n  dsock:\n    driver_opts:\n      type: none\n      o: bind\n      device: /var/run/docker.sock\n", 1)
+		f := dockerSockFinding(t, reviewOf(t, manifest(doc)), "0g-controller")
+		if f.Severity != SeverityBlocking {
+			t.Fatalf("relaxed:\n%s", f.Detail)
+		}
+	})
+	t.Run("containerd", func(t *testing.T) {
+		doc := strings.Replace(eligibleController, "/var/run/docker.sock:/var/run/docker.sock",
+			"/var/run/containerd/containerd.sock:/var/run/containerd/containerd.sock", 1)
+		for _, f := range reviewOf(t, manifest(doc)).Findings {
+			if f.Service == "0g-controller" && strings.Contains(f.Detail, "containerd.sock") && f.Severity != SeverityBlocking {
+				t.Fatalf("relaxed:\n%s", f.Detail)
+			}
+		}
+	})
+}
+
+// The real deployments. testnet runs v0.5.4 and meets every condition; cn-20 runs v0.5.1,
+// and its finding stays blocking and says so.
+func TestControllerException_OnTheRecordedDeployments(t *testing.T) {
+	load := func(name string) ComposeReview {
+		t.Helper()
+		doc, err := os.ReadFile(filepath.Join("testdata", name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return reviewOf(t, manifest(string(doc)))
+	}
+	if f := dockerSockFinding(t, load("testnet-services.yml"), "0g-controller"); f.Severity != SeverityJustify {
+		t.Errorf("testnet: severity %s:\n%s", f.Severity, f.Detail)
+	}
+	f := dockerSockFinding(t, load("cn20-services.yml"), "0g-controller")
+	if f.Severity != SeverityBlocking || !strings.Contains(f.Detail, "not a listed release") {
+		t.Errorf("cn-20: severity %s:\n%s", f.Severity, f.Detail)
+	}
+}

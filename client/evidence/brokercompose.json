@@ -396,7 +396,8 @@
             "The broker team's answer to why the controller holds docker.sock is #759 — it swaps",
             "broker/event images, may create no new container without ZG_CONTROLLER_ENGINES=on,",
             "and records each swap in RTMR3 first — but that is controller CODE from v0.5.4 on.",
-            "cn-20 runs v0.5.1, where those constraints are not known to hold.",
+            "On v0.5.1 those constraints do not hold, which is why the review keeps this finding",
+            "blocking here rather than relaxing it as it does for a listed release.",
             "Also mounts ./logs/controller, a relative bind the review justifies."
           ],
           "image": {
@@ -602,7 +603,9 @@
         "testnet compute-network-20-dev, model 0GM-1.0-35B-A3B, guest OS dstack-nvidia-0.5.9,",
         "compose_hash 9b0de348d56a36391d4474913efd75dcdaf109e4c11ccb79d5cd08f424bcade3, broker",
         "v0.5.4 (sha256:951f4c79…). The deployment the broker team normalized for the v0.5.4",
-        "rollout: one blocking finding (0g-controller's docker.sock) where cn-20 has ten."
+        "rollout. The review reports no blocking finding on it: its one candidate,",
+        "0g-controller's docker.sock, meets every condition of the controller exception and is",
+        "reported at justify. cn-20 has ten."
       ],
       "contract": "0xa79F4c8311FF93C06b8CfB403690cc987c93F91E",
       "providers": [
@@ -927,11 +930,12 @@
           "note": [
             "Same image and repository rule. Holds BOTH host sockets: /var/run/dstack.sock (the",
             "only service that does, after #763 — it serves the zg-tee and read-only zg-tee-ro",
-            "proxies) and /var/run/docker.sock (review BLOCKING). The compose does not set",
-            "ZG_CONTROLLER_ENGINES=on, so per broker #759 the controller may not create new",
-            "containers; what it may do with the socket is listed in the broker repository's",
-            "doc/controller-design.md §3.4. That is a property of the controller's code at this",
-            "digest, which is why the digest has to be in the release list for it to mean anything."
+            "proxies) and /var/run/docker.sock. The review reports the second at JUSTIFY, not",
+            "blocking: this is a listed release, run as the 0g-controller program, with no",
+            "privileges or added capabilities, no host path beyond the two sockets (its logs are on",
+            "a named volume), and ZG_CONTROLLER_ENGINES not set — the conditions under which broker",
+            "#759 limits what it does with the socket (evidence/composecontroller.go). Those limits",
+            "are the controller's code at this digest, which is why the digest has to be listed."
           ],
           "image": {
             "repository": "ghcr.io/0gfoundation/0g-serving-broker"
