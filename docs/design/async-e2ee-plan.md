@@ -1,6 +1,8 @@
-# E2EE for async text-to-image — plan (draft)
+# E2EE for async text-to-image — plan
 
-> Status: **discussion draft**. Touches three repos: `0g-pc-e2ee` (SPEC + cloud
+> Status: **implemented** (P1, async text-to-image), not yet enabled anywhere.
+> Where the code departs from this plan is listed in [As built](#as-built) at the
+> end; read that first. Touches three repos: `0g-pc-e2ee` (SPEC + cloud
 > gateway), `0g-serving-broker` (enclave side), `0g-router` (forwarding + billing).
 > Synchronous E2EE (chat / image / anthropic / speech / embedding) is live.
 >
@@ -581,6 +583,64 @@ be stated together in the SPEC.
   images in gateway or router logs.
 - **Gateway deploy drill:** a blue-green switch with in-flight jobs, all still
   retrievable afterwards.
+
+
+## As built
+
+What shipped, and every place it differs from the plan above.
+
+- **Where it landed:** SPEC §7.5 and the `async-image` profile (#142), router
+  0gfoundation/0g-router#1028, broker 0gfoundation/0g-serving-broker#762,
+  gateway #144.
+- **No feature flags anywhere.** The router flag (`features.e2ee_async`) and the
+  broker switch from §5 were dropped. The gateway is the only sealer, so
+  **`ZG_GATEWAY_SEAL_MODELS` is the rollout switch**: async submits are sealed
+  only for models listed there, exactly as on the sync surfaces. Production
+  lists no image model, so nothing is sealed until one is added.
+- **Broker opens the request at submit, not at dispatch.** A stale enc key
+  (409 `e2ee_key_mismatch`) or a bad envelope (400) is answered on the submit,
+  before any job row or billing record exists. The plaintext rides only the
+  in-memory queue; the row stores the envelope.
+- **The §8 signature is not persisted** (plan §5 said it would be). It stays in
+  the broker's in-process cache, as for plaintext async jobs. The gateway does
+  not need it: a sealed result is authenticated by `_bind`. Persisting it is a
+  separate change covering sealed and plaintext jobs alike.
+- **Storage** is as §3.9: two nullable columns, `sealed_frame` (BLOB, the frame
+  with its ciphertext emptied) and `sealed_result` (LONGBLOB, raw ciphertext).
+  The broker bills on the images actually delivered, which is the
+  `usage.output_images` the frame publishes.
+- **Failure codes** a sealed job stores: `upstream_error:<status>`,
+  `upstream_error`, `timeout`, `broker_error`. The gateway relays those and maps
+  the broker's restart message to `broker_error`; anything else becomes
+  `job_failed`.
+- **Router**, beyond §3.7:
+  - a reported count of `0` is unbillable (the enclave never seals an image-less
+    result);
+  - an unbillable result on a job already `billed` is relayed, not 502'd, so a
+    client that lost the billing poll's response still gets what it paid for;
+  - a sealed submit whose `async_jobs` row cannot be written is refused, since
+    without `requested_n` it could never be billed or failed;
+  - the async submit validates `size` and `n` like the sync one. `n` still has
+    no upper bound on either; that is open.
+- **Gateway**, beyond §3.6:
+  - `response_format: "url"` on an async submit is **forwarded in the clear**,
+    marked `X-0G-E2EE: none`, instead of refused as on sync image. Interim; the
+    product decision is open, and it lives in `openaiproxy.WithCleartext`.
+  - Keyed polls go through the sealed credential gate and in-flight cap. Keyless
+    polls go through the cleartext passthrough, which refuses an answer carrying
+    `_e2ee`, does not forward the caller's `Accept-Encoding`, and refuses an
+    answer in an encoding it did not ask for.
+  - The poll namespace is folded by `sealedNamespaceGuard` (case and `%2F`
+    spellings land on the keyed route), and any other path under
+    `/v1/async/jobs/` that contains a `.` is refused rather than forwarded, so no
+    spelling hands the key to the router. A legacy job id that itself contains a
+    `.` gets a 400 instead of passing through; that is deliberate.
+  - The key segment is redacted from the access log (case-insensitively, from
+    the first `.`) and from the passthrough error log.
+- **Not done:** the P0 broker refusal of sealed `/v1/videos` (dropped for now), and
+  the public docs outside this repository. `deploy/phala/README.md` describes
+  async image for gateway users, including that the job id is a credential and
+  that edits and video are not sealed.
 
 ---
 
