@@ -513,6 +513,27 @@ runs.
 
 Point an OpenAI-compatible client's `base_url` at `https://<DOMAIN>`.
 
+#### Async image generation
+
+`POST /v1/async/images/generations` is sealed like `POST /v1/images/generations`,
+for models listed in `ZG_GATEWAY_SEAL_MODELS` (SPEC §7.5):
+
+- The `202` carries a `jobId` of the form `<job id>.<key>`. **That id is a
+  credential:** the key segment is what opens the result, and this gateway keeps
+  no copy. Do not log or share it. The router never sees the key segment; the
+  router's operator could decrypt a job whose full id leaked to them.
+- Poll `GET /v1/async/jobs/<that jobId>?provider_address=<from the 202>`. A
+  pending job answers with its status only; a completed one with the images, in
+  the same shape as the router's own poll, with `jobId` the id
+  you polled with. A result that fails
+  verification is refused (`502`, `e2ee_verification_failed`), never returned.
+- A failed job reports a fixed code in `errorMessage` (`upstream_error:<status>`,
+  `timeout`, `broker_error`, otherwise `job_failed`), never the upstream's text.
+- `response_format: "url"` is **not** sealed: it is forwarded to the router in the
+  clear and marked `X-0G-E2EE: none`. Check that header if it matters.
+- A job id without a key segment is polled in the clear, as before. Async image
+  edits and video are not sealed.
+
 ### Without a domain (dev / smoke test)
 
 To boot a build in a CVM without owning a zone, deploy the gateway *alone* — drop
