@@ -15,7 +15,8 @@ see there are no gaps — and where the gaps still are.
 >   (`client/evidence/brokerimages.json`, one entry per audited OS image) and enforce is
 >   **on**: an unlisted image is refused, not warned about. Its OS half is closed. The
 >   container half below it is read and adjudicated *in the verifier* — the per-service
->   baseline is populated — but that comparison is not yet in the gateway's sealing path.
+>   baseline records reviewed deployments — but that comparison is not yet in the
+>   gateway's sealing path.
 > - **hop 5** — wired, observed, and enforce is **on**: a provider the registry does not
 >   vouch for is skipped, not warned about.
 > - **hop 11** — enforced, but only because `-verify-responses` is on; it is off by default.
@@ -272,10 +273,12 @@ beside it, the deployment no longer merely seals to "an attested enclave" but to
 
 The code root's OTHER half — hop 3 pins the guest OS and says nothing about the
 containers inside it — is now **read and adjudicated** in `pcverify -provider`: the
-per-service baseline records cn-20's twelve services, and any manifest that is not that
-one is a mismatch rather than a skipped check (see below). What is not done is wiring
-that comparison into the SEALING path, which unlike hop 5's switch waits on the one
-entry in that baseline whose justification is still open.
+per-service baseline records reviewed deployments by contract and provider, a recorded
+provider whose manifest has moved is a mismatch, and a provider nobody recorded is
+reported as not compared (see below). What is not done is wiring that comparison into
+the SEALING path, which unlike hop 5's switch waits on two things: reading RTMR3, since
+the manifest describes what booted and the controller can change what runs afterwards,
+and the fleet moving to a broker release the gateway accepts.
 
 Hop 3 is no longer blocked on either of the two things that used to hold it — the shape
 of an allowlist entry, and having no published source for its values. Its allowlist takes one entry per OS image
@@ -326,34 +329,45 @@ precondition for flipping a switch.
 > which is what the review exists to help write.
 >
 > That comparison now exists: `client/evidence/composebaseline.go` checks an
-> authenticated manifest against the recorded per-service baseline in
-> `brokercompose.json`, in every direction — a recorded service the manifest does not
-> declare, a declared service the baseline does not record, a service declared twice, a
-> differing block, an image outside its rule. A mismatch is not a review finding and
-> carries no severity: either the deployment is the one that was reviewed and recorded,
-> or it is not.
+> authenticated manifest against the DEPLOYMENT `brokercompose.json` records for that
+> provider on that contract, in every direction — a recorded service the manifest does
+> not declare, a declared service the deployment does not record, a service declared
+> twice, a differing block, an image outside its rule. A mismatch is not a review finding
+> and carries no severity: either the deployment is the one that was reviewed and
+> recorded, or it is not. A provider with no recorded deployment is a third state — not
+> compared, exit 3 — because holding it against someone else's record would only say
+> that nobody reviewed it, at length, as if it were a failure.
 >
-> That baseline now has CONTENT: `brokercompose.json` records cn-20's twelve services as
-> of 2026-08-28 (`compose_hash` `720530b4…`), each block taken from that provider's own
-> `-blocks` output and its fingerprint checked back against it. Nine entries pin the image
-> as the deployment has it; three run 0G's own broker image and pin the image-held-out
-> block plus a repository rule.
+> Two deployments are recorded: mainnet compute-network-20 and testnet
+> compute-network-20-dev, each taken from that provider's own `-blocks` output and
+> checked back against it live. Their broker-image services may move without a new
+> record, but only between the builds `brokerreleases.json` lists — v0.5.4 today,
+> resolved against the registry. The first version of that rule accepted any
+> digest-pinned image in the repository, and of the four broker digests the 2026-10-10
+> sweep found, two were pointed at by no release tag at all when the registry was checked
+> on 2026-10-15. v0.5.1 and v0.5.2 are left out
+> on purpose, as predating the controller and ingress fixes v0.5.4 carries, so cn-20 —
+> on v0.5.1 — matches nine of its twelve recorded services and fails on the other three.
 >
 > Recording is not approval, and the distinction is the whole reason the review and the
-> baseline are separate mechanisms. The review still reports ten blocking findings on this
-> manifest and recording silences none of them — four images pinned only by tag,
-> `privileged` plus `/`, `/proc` and `/sys` on prometheus-node-exporter, `SYS_ADMIN` on
-> dcgm-exporter, and the container runtime's socket held by 0g-controller. What recording
-> buys is that the set cannot GROW unseen: a service added, removed, renamed, or changed in
-> any way that changes what runs is now a mismatch. Every entry carries a `note` saying why
-> it stands as it does, and 0g-controller's records its `docker.sock` mount as an open
-> question rather than an accepted risk — a container holding the runtime socket can start
-> any container it likes, which leaves no per-service reasoning in the file worth much.
+> baseline are separate mechanisms. The review reports what it finds on every run; a
+> record only means the services cannot change unseen. Its one exception is
+> 0g-controller's `docker.sock`, every provider's, which the broker team accounts for as
+> #759 — the controller may create no container unless `ZG_CONTROLLER_ENGINES=on`, and
+> swaps an image only as repo@digest after recording the swap in RTMR3. The review
+> reports it as justify rather than blocking only on a listed release, run as the
+> controller program, with no privileges or extra host paths and the engine flag off;
+> anywhere else it stays blocking and names the condition that failed. Those limits are
+> the controller's code, which a manifest review cannot see, so the finding stays —
+> relaxed, not removed.
 >
 > Wiring the comparison into the SEALING path, behind its own enforce switch, waits on
-> that question: enforcing a baseline whose central entry is unexplained would convert an
-> open question into a shipped decision. `-app-baseline` reads a candidate for checking the
-> next revision against a live provider first.
+> two things. The manifest describes what BOOTED, and on v0.5.4 the controller may swap
+> images and change the upstream set at runtime, recorded only in RTMR3 — so a verifier
+> that reads the manifest alone would accept a deployment that booted as recorded and no
+> longer runs that way. And enforcing today would refuse every mainnet provider, none of
+> which runs a listed broker release yet. `-app-baseline` reads a candidate for checking a
+> deployment against a live provider first.
 >
 > The comparison form the baseline uses:
 > `client/evidence/composeblock.go` reduces each service to a **canonical block**, keeping
