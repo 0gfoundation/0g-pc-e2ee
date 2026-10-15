@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"compress/flate"
 	"compress/gzip"
 	"io"
 	"log/slog"
@@ -168,5 +169,22 @@ func TestKeylessPollCheckSurvivesAcceptEncoding(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusBadGateway {
 		t.Errorf("status %d, want 502: a compressed sealed frame was relayed unchecked", resp.StatusCode)
+	}
+}
+
+// A router that answers in an encoding nobody asked for — one the transport
+// does not undo, unlike the gzip it requests itself — is not relayed unchecked.
+func TestKeylessPollRefusesAnUnrequestedEncoding(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Encoding", "deflate")
+		zw, _ := flate.NewWriter(w, flate.DefaultCompression)
+		_, _ = zw.Write([]byte(`{"status":"completed","_e2ee":{"v":1}}`))
+		_ = zw.Close()
+	}))
+	t.Cleanup(srv.Close)
+	gw := pollGateway(t, srv.URL, discardLogger())
+	resp, _ := getPoll(t, gw, "job-1", true)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("status %d, want 502", resp.StatusCode)
 	}
 }
