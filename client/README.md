@@ -194,32 +194,44 @@ wherever they appear in the block — and no further: a value that merely looks 
 digest is left alone, because erasing too much hides a real change while erasing too
 little only churns. See `evidence/composeblock.go`.
 
-Those blocks are then compared against the **recorded per-service baseline**
-(`evidence/brokercompose.json`) — the check that adjudicates, and the only part of the
-manifest section that can fail a run. Every direction: a recorded service the manifest
-does not declare, a declared service the baseline does not record (an unlisted container
-runs in the same guest as the reviewed ones), a service declared twice, a differing
-block, an image outside its rule. A mismatch carries no severity — it is not a review
-finding; either the deployment is the one we recorded or it is not.
+Those blocks are then compared against the **deployment the per-service baseline records
+for this provider** (`evidence/brokercompose.json`, keyed by contract and provider
+address) — the check that adjudicates, and the only part of the manifest section that can
+fail a run. Every direction: a recorded service the manifest does not declare, a declared
+service the deployment does not record (an unlisted container runs in the same guest as
+the reviewed ones), a service declared twice, a differing block, an image outside its
+rule. A mismatch carries no severity — it is not a review finding; either the deployment
+is the one we recorded or it is not.
 
-The baseline **records cn-20's twelve services** as of 2026-08-28 (`compose_hash`
-`720530b4…`), each block taken from that provider's own `-blocks` output and its
-fingerprint checked back against it. Nine entries pin the image exactly as the deployment
-has it; three run 0G's own broker image and pin the image-held-out block plus a repository
-rule, so a broker release does not force a gateway release.
+**A provider with no recorded deployment is not compared**, and the run says so and exits
+3. It is never held against some other provider's record: an earlier version did that, and
+on the 2026-10-10 sweep six healthy providers out of seven exited 1 for the sole reason
+that nobody had recorded them. Not recorded is unverified, not refuted.
 
-**Recording is not approval.** The review still reports ten blocking findings on this
-manifest and recording silences none of them — four tag-only images, `privileged` plus
-`/`, `/proc`, `/sys` on prometheus-node-exporter, `SYS_ADMIN` on dcgm-exporter, and the
-container runtime's socket held by 0g-controller. What the baseline buys is that those
-stop being able to *grow*: from here on, a service added, removed, renamed or changed in
-any way that changes what runs is a mismatch, named per service with the first differing
-line. Each entry carries a `note` recording why it stands as it does; 0g-controller's says
-plainly that its `docker.sock` mount is an open question rather than an accepted risk, and
-until that is answered the baseline must not be wired into the sealing path as a refusal.
+Two deployments are recorded: mainnet **compute-network-20** and testnet
+**compute-network-20-dev**, each taken from that provider's own `-blocks` output and
+checked back against the live provider. The other mainnet providers are deliberately not
+recorded yet — their broker builds are not ones the release list accepts, and the v0.5.4
+rollout will change their manifests anyway.
 
-`-app-baseline <file>` reads a candidate instead of the embedded one, which is how the
-next revision gets checked against a live provider before it is committed.
+0G's broker image is the one image allowed to move without a new record, and only between
+the builds **`evidence/brokerreleases.json`** lists — today v0.5.4, resolved against the
+registry rather than copied off a provider. v0.5.1 and v0.5.2 are real releases left out
+on purpose: v0.5.4 is the first the broker team reports as carrying the controller's
+container-creation limits (#759) and the change that lets broker-ingress drop
+`dstack.sock` (#763). So cn-20, on v0.5.1, matches nine of its twelve recorded services
+and fails on the three that run the broker image.
+
+**Recording is not approval.** The review reports on every run whatever it finds; a
+record only means the services cannot change unseen. The one finding the review relaxes
+is `0g-controller`'s `docker.sock`, reported as *justify* rather than *blocking* when the
+controller runs a listed release as the `0g-controller` program, with no privileges,
+capabilities, extra host paths, `env_file`, or `ZG_CONTROLLER_ENGINES` — the conditions
+under which #759 limits what it does with the socket. On any other build it stays
+blocking and says which condition failed (`evidence/composecontroller.go`).
+
+`-app-baseline <file>` reads a candidate instead of the embedded one, which is how a
+deployment gets checked against a live provider before it is committed.
 
 The gateway mode matters for the third form above, which adds one attested trust
 party: it verifies the dstack-ingress cert-binding quote, confirms the certificate
@@ -242,11 +254,10 @@ Both modes exit non-zero on a failed check, so either works as a deploy gate, an
 separate "failed" (1) from "did not run" (3) so a skipped check cannot read as a full
 pass. `-strict` makes every check mandatory and turns the latter into the former. In
 provider mode a 3 means one of four things — hop 3's allowlist held no entry, the
-provider published no app-compose, no per-service baseline is recorded, or `-no-quote`
-skipped hops 2–4 by request — and the verdict line names every one that applies. The
-third no longer applies as shipped: `evidence/brokercompose.json` records cn-20's
-services, so against that manifest a clean 0 is reachable, and against a different one
-the comparison **fails** rather than skipping. See
+provider published no app-compose, no deployment is recorded for the provider, or
+`-no-quote` skipped hops 2–4 by request — and the verdict line names every one that
+applies. The third applies to most of the fleet as shipped, so `-strict` fails every
+provider nobody has recorded. See
 [`docs/design/cloud-gateway.md`](../docs/design/cloud-gateway.md) §10 for what the
 result does and does not cover.
 
