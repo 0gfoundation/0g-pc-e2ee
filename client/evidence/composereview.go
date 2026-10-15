@@ -704,7 +704,7 @@ func (r *ComposeReview) reviewComposeText(doc []byte) {
 	}
 
 	mounts := &mountIndex{holders: map[string][]string{}, named: map[string]bool{}, volumes: volumes,
-		runtimeSocketAt: map[int]bool{}}
+		runtimeSocketAt: map[int]bool{}, interpolatedVolumes: interpolatedEntries(mapValue(top, "volumes"))}
 	for i := 0; i+1 < len(services.Content); i += 2 {
 		name := services.Content[i].Value
 		if name == "" {
@@ -928,6 +928,10 @@ type mountIndex struct {
 	// (composecontroller.go) finds them by where they were added rather than by matching
 	// their wording.
 	runtimeSocketAt map[int]bool
+	// interpolatedVolumes names the top-level volume declarations that contain a `$`,
+	// so the controller exception can refuse one whose meaning the deployment's .env
+	// decides (composecontroller.go).
+	interpolatedVolumes map[string]bool
 }
 
 // reviewService applies the per-service rules and records the service's image.

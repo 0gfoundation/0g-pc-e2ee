@@ -292,7 +292,7 @@ func TestBuiltinComposeBaseline_AgainstTheManifestsItWasRecordedFrom(t *testing.
 
 	// testnet runs v0.5.4, a listed release: every service matches.
 	t.Run("testnet matches in full", func(t *testing.T) {
-		got := CheckCompose(b, rels, testnetContract, testnetProvider, load("testnet-services.yml").Blocks)
+		got := CheckCompose(b, rels, testnetContract, testnetProvider, reviewTestnet(t).Blocks)
 		if !got.Compared() || !got.OK() {
 			t.Fatalf("the testnet deployment does not match its own record:\n%s", dumpMismatches(got))
 		}

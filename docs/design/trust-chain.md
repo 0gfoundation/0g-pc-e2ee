@@ -356,7 +356,8 @@ precondition for flipping a switch.
 > #759 — the controller may create no container unless `ZG_CONTROLLER_ENGINES=on`, and
 > swaps an image only as repo@digest after recording the swap in RTMR3. The review
 > reports it as justify rather than blocking only on a listed release, run as the
-> controller program, with no privileges or extra host paths and the engine flag off;
+> controller program, with nothing beyond the keys, variables and healthcheck the fleet's
+> controllers use, nothing interpolated, no extra host paths and the engine flag absent;
 > anywhere else it stays blocking and names the condition that failed. Those limits are
 > the controller's code, which a manifest review cannot see, so the finding stays —
 > relaxed, not removed.

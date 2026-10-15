@@ -931,9 +931,10 @@
             "Same image and repository rule. Holds BOTH host sockets: /var/run/dstack.sock (the",
             "only service that does, after #763 — it serves the zg-tee and read-only zg-tee-ro",
             "proxies) and /var/run/docker.sock. The review reports the second at JUSTIFY, not",
-            "blocking: this is a listed release, run as the 0g-controller program, with no",
-            "privileges or added capabilities, no host path beyond the two sockets (its logs are on",
-            "a named volume), and ZG_CONTROLLER_ENGINES not set — the conditions under which broker",
+            "blocking: this is a listed release, run as the 0g-controller program, with only the",
+            "keys, environment variables and healthcheck the exception covers, nothing interpolated,",
+            "no host path beyond the two sockets (its logs are on a declared named volume), and",
+            "ZG_CONTROLLER_ENGINES absent — the conditions under which broker",
             "#759 limits what it does with the socket (evidence/composecontroller.go). Those limits",
             "are the controller's code at this digest, which is why the digest has to be listed."
           ],
