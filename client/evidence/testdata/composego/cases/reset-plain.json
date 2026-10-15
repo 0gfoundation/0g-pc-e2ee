@@ -1,0 +1,13 @@
+{
+  "documents": 1,
+  "model": {
+    "services": {
+      "app": {
+        "image": "app",
+        "volumes": [
+          "/data:/data"
+        ]
+      }
+    }
+  }
+}

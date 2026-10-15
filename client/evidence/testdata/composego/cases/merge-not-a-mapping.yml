@@ -1,0 +1,5 @@
+x-list: &list [a, b]
+services:
+  app:
+    image: app
+    <<: *list

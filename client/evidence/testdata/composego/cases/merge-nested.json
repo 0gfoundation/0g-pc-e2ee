@@ -1,0 +1,32 @@
+{
+  "documents": 1,
+  "model": {
+    "services": {
+      "app": {
+        "image": "app",
+        "logging": {
+          "driver": "json-file",
+          "options": {
+            "max-size": "1m"
+          }
+        },
+        "pid": "host",
+        "restart": "always",
+        "user": "mid"
+      }
+    },
+    "x-log": {
+      "driver": "json-file"
+    },
+    "x-mid": {
+      "pid": "host",
+      "restart": "always",
+      "user": "mid"
+    },
+    "x-root": {
+      "pid": "host",
+      "restart": "always",
+      "user": "root"
+    }
+  }
+}

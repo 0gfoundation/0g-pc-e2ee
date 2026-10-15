@@ -1,0 +1,22 @@
+{
+  "documents": 1,
+  "model": {
+    "more": {
+      "b": {
+        "user": "second"
+      }
+    },
+    "services": {
+      "a": {
+        "image": "app",
+        "user": "first"
+      }
+    },
+    "x-one": {
+      "user": "first"
+    },
+    "x-two": {
+      "user": "second"
+    }
+  }
+}

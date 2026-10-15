@@ -1,0 +1,12 @@
+# A !reset inside an anchored mapping removes the key from the anchor itself, so every
+# alias of it loses the key.
+x-base: &base
+  user: root
+  pid: !reset host
+services:
+  app:
+    image: app
+    <<: *base
+  copy:
+    image: app
+    logging: *base

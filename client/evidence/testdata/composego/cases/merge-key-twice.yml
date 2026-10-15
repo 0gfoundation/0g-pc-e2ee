@@ -1,0 +1,7 @@
+x-a: &a {user: a}
+x-b: &b {pid: host}
+services:
+  app:
+    image: app
+    <<: *a
+    <<: *b

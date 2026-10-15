@@ -1,0 +1,21 @@
+{
+  "documents": 1,
+  "model": {
+    "services": {
+      "app": {
+        "environment": {
+          "B": "2"
+        },
+        "image": "app",
+        "read_only": "true",
+        "user": "root"
+      }
+    },
+    "x-base": {
+      "environment": {
+        "A": "1"
+      },
+      "user": "root"
+    }
+  }
+}

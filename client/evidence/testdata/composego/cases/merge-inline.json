@@ -1,0 +1,17 @@
+{
+  "documents": 1,
+  "model": {
+    "services": {
+      "app": {
+        "image": "app",
+        "privileged": true,
+        "user": "app"
+      },
+      "list": {
+        "image": "app",
+        "ipc": "host",
+        "pid": "host"
+      }
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "documents": 1,
+  "model": {
+    "services": {
+      "app": {
+        "image": "app",
+        "user": "root"
+      },
+      "copy": {
+        "image": "app",
+        "logging": {
+          "user": "root"
+        }
+      }
+    },
+    "x-base": {
+      "user": "root"
+    }
+  }
+}

@@ -1,0 +1,9 @@
+# docker compose merges every document in the file. A reader of the first alone sees
+# an unprivileged service.
+services:
+  app:
+    image: app
+---
+services:
+  app:
+    privileged: true

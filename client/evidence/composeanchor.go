@@ -55,6 +55,14 @@ import (
 // happen before that walk rather than inside it.
 const mergeKey = "<<"
 
+// isMergeKey is yaml.v3's own test (isMerge in its decode.go), so that what merges here
+// is exactly what merges in docker compose. The spelling alone is not enough: a QUOTED
+// "<<", or one tagged !!str, is an ordinary key named "<<" that merges nothing.
+func isMergeKey(k *yaml.Node) bool {
+	return k.Kind == yaml.ScalarNode && k.Value == mergeKey &&
+		(k.Tag == "" || k.Tag == "!" || k.ShortTag() == "!!merge")
+}
+
 // resolveAnchors returns an alias-free, merge-key-free deep copy of n.
 //
 // A COPY, always, even when there is nothing to resolve. Callers mutate what they get
@@ -120,7 +128,8 @@ func resolveNode(n *yaml.Node, expanding map[*yaml.Node]bool) (*yaml.Node, error
 //
 // PRECEDENCE is the spec's: a key written in the mapping beats the same key from any
 // merge, and among merges the earlier source wins (`<<: [*a, *b]` takes a's). That is
-// also the order docker compose itself resolves, so what this produces is what runs.
+// also the order docker compose itself resolves, so what this produces is what runs —
+// checked against docker compose's own loader, not assumed (testdata/composego).
 func resolveMapping(n *yaml.Node, expanding map[*yaml.Node]bool) (*yaml.Node, error) {
 	out := *n
 	out.Alias, out.Anchor = nil, ""
@@ -131,7 +140,7 @@ func resolveMapping(n *yaml.Node, expanding map[*yaml.Node]bool) (*yaml.Node, er
 
 	for i := 0; i+1 < len(n.Content); i += 2 {
 		k, v := n.Content[i], n.Content[i+1]
-		if k.Kind == yaml.ScalarNode && k.Value == mergeKey {
+		if isMergeKey(k) {
 			src, err := mergeSources(v, expanding)
 			if err != nil {
 				return nil, err
@@ -174,8 +183,13 @@ func resolveMapping(n *yaml.Node, expanding map[*yaml.Node]bool) (*yaml.Node, er
 }
 
 // mergeSources resolves a merge key's value into the mappings it names, most significant
-// first. The value is an alias to a mapping, or a sequence of them.
+// first. The value is a mapping or an alias to one, or a sequence of those — but not an
+// alias to a sequence, which yaml.v3 refuses even when the sequence holds mappings.
 func mergeSources(v *yaml.Node, expanding map[*yaml.Node]bool) ([]*yaml.Node, error) {
+	if v.Kind == yaml.AliasNode && v.Alias != nil && v.Alias.Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("a merge key (%s) names something that is not a mapping, so the keys it "+
+			"would contribute cannot be read", mergeKey)
+	}
 	r, err := resolveNode(v, expanding)
 	if err != nil {
 		return nil, err

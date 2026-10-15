@@ -1,0 +1,16 @@
+{
+  "documents": 1,
+  "model": {
+    "services": {
+      "app": {
+        "\u003c\u003c": {
+          "privileged": true
+        },
+        "image": "app"
+      }
+    },
+    "x-base": {
+      "privileged": true
+    }
+  }
+}

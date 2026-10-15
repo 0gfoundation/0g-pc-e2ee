@@ -1,0 +1,4 @@
+{
+  "documents": 1,
+  "error": "yaml: unmarshal errors:\n  line 5: mapping key \"privileged\" already defined at line 4"
+}

@@ -641,36 +641,24 @@ var knownComposeTopKeys = map[string]bool{
 // bind}` makes `- etcbind:/host-etc` mean exactly what `- /etc:/host-etc` means. Reading
 // services alone left every host-path rule one indirection away from being bypassed.
 func (r *ComposeReview) reviewComposeText(doc []byte) {
-	var root yaml.Node
-	if err := yaml.Unmarshal(doc, &root); err != nil {
-		r.add(SeverityBlocking, "", "docker_compose_file",
-			fmt.Sprintf("the compose text does not parse as YAML: %v", err))
-		return
-	}
-	if root.Kind != yaml.DocumentNode || len(root.Content) == 0 {
-		r.add(SeverityBlocking, "", "docker_compose_file", "the compose text is an empty document")
-		return
-	}
-	// Anchors are resolved ONCE, here, for the whole document — before the top-level walk
-	// and before any service is read.
+	// The text is read ONCE, here, for the whole document — compose's tags applied and
+	// anchors resolved before the top-level walk and before any service is read
+	// (composedoc.go).
 	//
 	// It belongs at the parse site because an alias is a property of the DOCUMENT, not of
 	// whoever reads it: the anchor a service merges is usually defined outside `services:`
 	// entirely (`x-logging: &default-logging`), so neither this walk nor blockOf could
-	// resolve one on its own without reaching back into the file. Resolving here also
-	// means the review and the canonical block cannot disagree about what a service
-	// contains, which they did while one refused merged services and the other described
-	// them as having no image.
+	// resolve one on its own without reaching back into the file. Reading here also means
+	// the review and the canonical block cannot disagree about what a service contains,
+	// which they did while one refused merged services and the other described them as
+	// having no image.
 	//
 	// A failure is the whole compose text, not one service, and that is the cost of doing
-	// it once. Only a cycle can fail (see composeanchor.go — yaml.v3 rejects an undefined
-	// anchor at parse time), which is a manifest docker compose would itself refuse to
-	// start, so the honest report is that nothing below this level could be read.
-	top, err := resolveAnchors(root.Content[0])
+	// it once. Everything refused is a text docker compose would read differently or not
+	// at all, so the honest report is that nothing below this level could be read.
+	top, err := readComposeDocument(doc)
 	if err != nil {
-		r.add(SeverityBlocking, "", "docker_compose_file",
-			fmt.Sprintf("the compose text's YAML anchors do not resolve, so what each service "+
-				"actually contains cannot be read: %v", err))
+		r.add(SeverityBlocking, "", "docker_compose_file", err.Error())
 		return
 	}
 	if top.Kind != yaml.MappingNode {
