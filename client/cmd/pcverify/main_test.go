@@ -103,7 +103,7 @@ const cleanCompose = "services:\n  broker:\n    image: ghcr.io/0gfoundation/brok
 // emitted one is settled in composebaseline_test.go against baselines a human wrote. A
 // derived baseline here would be tautological only if it were the sole test of matching,
 // which it is not.
-func baselineFor(t *testing.T, composeText string) []evidence.BaselineService {
+func baselineFor(t *testing.T, composeText string) evidence.ComposeBaseline {
 	t.Helper()
 	raw, err := json.Marshal(map[string]any{
 		"manifest_version": 2, "runner": "docker-compose", "docker_compose_file": composeText,
@@ -126,10 +126,13 @@ func baselineFor(t *testing.T, composeText string) []evidence.BaselineService {
 		}
 		// No image rule: the recorded block contains the image line and pins the reference,
 		// which is how every service is recorded except one whose image is meant to move
-		// within a repository.
+		// between releases.
 		svcs = append(svcs, e)
 	}
-	doc, err := json.Marshal(map[string]any{"services": svcs})
+	// Recorded for prov on contract, the provider every report in this file verifies.
+	doc, err := json.Marshal(map[string]any{"deployments": []any{map[string]any{
+		"name": "test", "contract": contract, "providers": []string{prov}, "services": svcs,
+	}}})
 	if err != nil {
 		t.Fatalf("marshal baseline: %v", err)
 	}
@@ -141,8 +144,11 @@ func baselineFor(t *testing.T, composeText string) []evidence.BaselineService {
 }
 
 const (
-	prov   = "0xaabbccddeeff00112233445566778899aabbccdd"
-	signer = "0x99887766554433221100ffeeddccbbaa99887766"
+	// contract is a well-formed address because the baseline file refuses anything
+	// else; it names no real deployment.
+	contract = "0x00000000000000000000000000000000c0c0c0c0"
+	prov     = "0xaabbccddeeff00112233445566778899aabbccdd"
+	signer   = "0x99887766554433221100ffeeddccbbaa99887766"
 )
 
 // On-chain-only (qc == nil, i.e. -no-quote): the on-chain hop passes, but hops 2–4
@@ -164,7 +170,7 @@ func TestReport_OnChainOnly(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var out bytes.Buffer
-			code := report(context.Background(), &out, tc.svc, nil, prov, "0xcontract", "", tc.expectSigner, providerOpts{})
+			code := report(context.Background(), &out, tc.svc, nil, prov, contract, "", tc.expectSigner, providerOpts{})
 			if code != tc.wantCode {
 				t.Errorf("code = %d, want %d\n%s", code, tc.wantCode, out.String())
 			}
@@ -196,7 +202,7 @@ func TestReport_WithQuote(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var out bytes.Buffer
-			code := report(context.Background(), &out, tc.svc, tc.qc, prov, "0xcontract", "", "", providerOpts{})
+			code := report(context.Background(), &out, tc.svc, tc.qc, prov, contract, "", "", providerOpts{})
 			if code != tc.wantCode {
 				t.Errorf("code = %d, want %d\n%s", code, tc.wantCode, out.String())
 			}
@@ -223,7 +229,7 @@ func TestReport_PrintsTheBootChainInAllowlistShape(t *testing.T) {
 	var out bytes.Buffer
 	code := report(context.Background(), &out, stubService{info: acked},
 		stubQuote{v: attest.Verified{SignerAddr: signer, Measurement: m}, noBaseline: true},
-		prov, "0xcontract", "", "", providerOpts{})
+		prov, contract, "", "", providerOpts{})
 	// An unconfigured allowlist is not a verdict on the provider — nothing FAILED — but
 	// it is a check that did not run, which is exit 3.
 	if code != 3 {
@@ -260,7 +266,7 @@ func TestReport_BootChainMismatchFails(t *testing.T) {
 	// MeasurementTrusted false with a non-empty allowlist: the provider's image is not
 	// one that was audited.
 	code := report(context.Background(), &out, stubService{info: acked},
-		stubQuote{v: attest.Verified{SignerAddr: signer}}, prov, "0xcontract", "", "", providerOpts{})
+		stubQuote{v: attest.Verified{SignerAddr: signer}}, prov, contract, "", "", providerOpts{})
 	if code != 1 {
 		t.Errorf("code = %d, want 1\n%s", code, out.String())
 	}
@@ -286,7 +292,7 @@ func TestReport_ProviderVerdicts(t *testing.T) {
 		trusted := stubQuote{v: attest.Verified{SignerAddr: signer, MeasurementTrusted: true}}.
 			withManifest(t, cleanCompose, nil)
 		if code := report(context.Background(), &out, stubService{info: acked}, trusted,
-			prov, "0xcontract", "", "", providerOpts{baseline: baselineFor(t, cleanCompose)}); code != 0 {
+			prov, contract, "", "", providerOpts{baseline: baselineFor(t, cleanCompose)}); code != 0 {
 			t.Errorf("code = %d, want 0 — every hop ran and passed\n%s", code, out.String())
 		}
 		if strings.Contains(out.String(), "INCOMPLETE") {
@@ -294,17 +300,15 @@ func TestReport_ProviderVerdicts(t *testing.T) {
 		}
 	})
 
-	// The shipped state, and the reason it is worth its own case: brokercompose.json is
-	// empty on purpose, so until it is filled EVERY provider run is incomplete. That is
-	// the honest answer — the containers were not compared against anything — but it is a
-	// visible change for anyone using this as a gate, so it is pinned rather than left to
-	// be discovered.
+	// An empty baseline makes every run incomplete. That is the honest answer — the
+	// containers were not compared against anything — and pinned rather than left to be
+	// discovered by someone using this as a gate.
 	t.Run("no baseline recorded makes the run incomplete", func(t *testing.T) {
 		var out bytes.Buffer
 		trusted := stubQuote{v: attest.Verified{SignerAddr: signer, MeasurementTrusted: true}}.
 			withManifest(t, cleanCompose, nil)
 		code := report(context.Background(), &out, stubService{info: acked}, trusted,
-			prov, "0xcontract", "", "", providerOpts{})
+			prov, contract, "", "", providerOpts{})
 		if code != 3 {
 			t.Fatalf("code = %d, want 3\n%s", code, out.String())
 		}
@@ -316,8 +320,55 @@ func TestReport_ProviderVerdicts(t *testing.T) {
 		// And -strict makes it fatal, which is what a gate wants.
 		var strictOut bytes.Buffer
 		if code := report(context.Background(), &strictOut, stubService{info: acked}, trusted,
-			prov, "0xcontract", "", "", providerOpts{strict: true}); code != 1 {
+			prov, contract, "", "", providerOpts{strict: true}); code != 1 {
 			t.Errorf("-strict: code = %d, want 1\n%s", code, strictOut.String())
+		}
+	})
+
+	// A baseline that records OTHER providers did not compare this one, and says so the
+	// same way: exit 3, not exit 1. This is the case that made six healthy providers out
+	// of seven exit 1 on the 2026-10-10 sweep — their manifests were compared against
+	// cn-20's record and every difference reported as a mismatch, when the truth was that
+	// nobody had reviewed them.
+	t.Run("a provider with no recorded deployment is not compared", func(t *testing.T) {
+		trusted := stubQuote{v: attest.Verified{SignerAddr: signer, MeasurementTrusted: true}}.
+			withManifest(t, cleanCompose, nil)
+		someoneElse := baselineFor(t, cleanCompose)
+		someoneElse.Deployments[0].Providers = []string{"0x" + strings.Repeat("7", 40)}
+
+		var out bytes.Buffer
+		code := report(context.Background(), &out, stubService{info: acked}, trusted,
+			prov, contract, "", "", providerOpts{baseline: someoneElse})
+		if code != 3 {
+			t.Fatalf("code = %d, want 3 — an unrecorded provider was not compared, not refuted\n%s", code, out.String())
+		}
+		got := out.String()
+		for _, want := range []string{"- baseline", "no deployment is recorded for this provider", contract} {
+			if !strings.Contains(got, want) {
+				t.Errorf("output missing %q:\n%s", want, got)
+			}
+		}
+		if strings.Contains(got, "✗ baseline") || strings.Contains(got, "mismatch") {
+			t.Errorf("an unrecorded provider was reported as differing:\n%s", got)
+		}
+
+		var strictOut bytes.Buffer
+		if code := report(context.Background(), &strictOut, stubService{info: acked}, trusted,
+			prov, contract, "", "", providerOpts{strict: true, baseline: someoneElse}); code != 1 {
+			t.Errorf("-strict: code = %d, want 1\n%s", code, strictOut.String())
+		}
+	})
+
+	// The recorded deployment is named on the verdict line, so a reader knows which
+	// record the manifest was held to.
+	t.Run("a match names the deployment", func(t *testing.T) {
+		trusted := stubQuote{v: attest.Verified{SignerAddr: signer, MeasurementTrusted: true}}.
+			withManifest(t, cleanCompose, nil)
+		var out bytes.Buffer
+		report(context.Background(), &out, stubService{info: acked}, trusted,
+			prov, contract, "", "", providerOpts{baseline: baselineFor(t, cleanCompose)})
+		if !strings.Contains(out.String(), `match the recorded deployment "test"`) {
+			t.Errorf("the verdict does not name the deployment:\n%s", out.String())
 		}
 	})
 
@@ -330,7 +381,7 @@ func TestReport_ProviderVerdicts(t *testing.T) {
 		trusted := stubQuote{v: attest.Verified{SignerAddr: signer, MeasurementTrusted: true}}.
 			withManifest(t, cleanCompose, nil)
 		code := report(context.Background(), &out, stubService{info: acked}, trusted,
-			prov, "0xcontract", "", "", providerOpts{baseline: baselineFor(t, other)})
+			prov, contract, "", "", providerOpts{baseline: baselineFor(t, other)})
 		if code != 1 {
 			t.Fatalf("code = %d, want 1\n%s", code, out.String())
 		}
@@ -356,7 +407,7 @@ func TestReport_ProviderVerdicts(t *testing.T) {
 		// No allowlist AND no manifest. The verdict line exists to disclose what went
 		// unchecked, so reporting one of two gaps is the failure mode to guard against.
 		code := report(context.Background(), &out, stubService{info: acked}, good,
-			prov, "0xcontract", "", "", providerOpts{})
+			prov, contract, "", "", providerOpts{})
 		if code != 3 {
 			t.Fatalf("code = %d, want 3\n%s", code, out.String())
 		}
@@ -370,7 +421,7 @@ func TestReport_ProviderVerdicts(t *testing.T) {
 	t.Run("strict turns an unconfigured allowlist into a failure", func(t *testing.T) {
 		var out bytes.Buffer
 		code := report(context.Background(), &out, stubService{info: acked}, good,
-			prov, "0xcontract", "", "", providerOpts{strict: true})
+			prov, contract, "", "", providerOpts{strict: true})
 		if code != 1 {
 			t.Errorf("code = %d, want 1 under -strict\n%s", code, out.String())
 		}
@@ -383,7 +434,7 @@ func TestReport_ProviderVerdicts(t *testing.T) {
 		var out bytes.Buffer
 		bad := stubQuote{v: attest.Verified{SignerAddr: "0x0000000000000000000000000000000000000002"}}
 		if code := report(context.Background(), &out, stubService{info: acked}, bad,
-			prov, "0xcontract", "", "", providerOpts{}); code != 1 {
+			prov, contract, "", "", providerOpts{}); code != 1 {
 			t.Errorf("code = %d, want 1\n%s", code, out.String())
 		}
 		if strings.Contains(out.String(), "INCOMPLETE") {
@@ -400,11 +451,11 @@ func TestReport_Manifest(t *testing.T) {
 	base := stubQuote{v: attest.Verified{SignerAddr: signer, MeasurementTrusted: true}}
 	// baseline nil means "none recorded", which is now a skip — so a subtest asserting
 	// exit 0 has to supply one, and one asserting the skip must not.
-	runReport := func(t *testing.T, qc stubQuote, strict bool, baseline []evidence.BaselineService) (int, string) {
+	runReport := func(t *testing.T, qc stubQuote, strict bool, baseline evidence.ComposeBaseline) (int, string) {
 		t.Helper()
 		var out bytes.Buffer
 		code := report(context.Background(), &out, stubService{info: acked}, qc,
-			prov, "0xcontract", "", "", providerOpts{strict: strict, baseline: baseline})
+			prov, contract, "", "", providerOpts{strict: strict, baseline: baseline})
 		return code, out.String()
 	}
 
@@ -435,7 +486,7 @@ func TestReport_Manifest(t *testing.T) {
 	t.Run("a manifest the quote does not bind fails the run", func(t *testing.T) {
 		qc := base.withManifest(t, cleanCompose, nil)
 		qc.composeHash[0] ^= 0xff
-		code, got := runReport(t, qc, false, nil)
+		code, got := runReport(t, qc, false, evidence.ComposeBaseline{})
 		if code != 1 {
 			t.Fatalf("code = %d, want 1\n%s", code, got)
 		}
@@ -467,7 +518,7 @@ func TestReport_Manifest(t *testing.T) {
 			},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
-				code, got := runReport(t, tc.qc, false, nil)
+				code, got := runReport(t, tc.qc, false, evidence.ComposeBaseline{})
 				if code != 3 {
 					t.Fatalf("code = %d, want 3\n%s", code, got)
 				}
@@ -477,7 +528,7 @@ func TestReport_Manifest(t *testing.T) {
 				if !strings.Contains(got, tc.says) {
 					t.Errorf("output does not say why it was skipped (%q):\n%s", tc.says, got)
 				}
-				if code, got := runReport(t, tc.qc, true, nil); code != 1 {
+				if code, got := runReport(t, tc.qc, true, evidence.ComposeBaseline{}); code != 1 {
 					t.Errorf("-strict: code = %d, want 1\n%s", code, got)
 				}
 			})
@@ -488,7 +539,7 @@ func TestReport_Manifest(t *testing.T) {
 	// the report has to carry them — and has to carry BOTH, because a baseline pins the
 	// block and the image separately (a broker release moves the image and nothing else).
 	t.Run("block fingerprints", func(t *testing.T) {
-		_, got := runReport(t, base.withManifest(t, cleanCompose, nil), false, nil)
+		_, got := runReport(t, base.withManifest(t, cleanCompose, nil), false, evidence.ComposeBaseline{})
 		if !strings.Contains(got, "block          ") {
 			t.Errorf("no block fingerprint in the report:\n%s", got)
 		}
@@ -504,7 +555,7 @@ func TestReport_Manifest(t *testing.T) {
 	t.Run("-blocks prints the canonical text", func(t *testing.T) {
 		var out bytes.Buffer
 		code := report(context.Background(), &out, stubService{info: acked},
-			base.withManifest(t, cleanCompose, nil), prov, "0xcontract", "", "",
+			base.withManifest(t, cleanCompose, nil), prov, contract, "", "",
 			providerOpts{blocks: true, baseline: baselineFor(t, cleanCompose)})
 		if code != 0 {
 			t.Fatalf("code = %d, want 0\n%s", code, out.String())
@@ -532,7 +583,7 @@ func TestReport_Manifest(t *testing.T) {
 			digest + "\n    environment:\n      - IMAGE_DIGEST=sha256:" + digest + "\n"
 		var out bytes.Buffer
 		report(context.Background(), &out, stubService{info: acked},
-			base.withManifest(t, doc, nil), prov, "0xcontract", "", "", providerOpts{blocks: true})
+			base.withManifest(t, doc, nil), prov, contract, "", "", providerOpts{blocks: true})
 		got := out.String()
 		if !strings.Contains(got, "      | no-image: ") {
 			t.Fatalf("the image-held-out text was not printed:\n%s", got)
@@ -548,7 +599,7 @@ func TestReport_Manifest(t *testing.T) {
 		var plain bytes.Buffer
 		report(context.Background(), &plain, stubService{info: acked},
 			base.withManifest(t, "services:\n  a:\n    restart: always\n", nil),
-			prov, "0xcontract", "", "", providerOpts{blocks: true})
+			prov, contract, "", "", providerOpts{blocks: true})
 		if strings.Contains(plain.String(), "no-image: ") {
 			t.Errorf("a service with no image printed a held-out form:\n%s", plain.String())
 		}
@@ -561,7 +612,7 @@ func TestReport_Manifest(t *testing.T) {
 		// refused (client/evidence/composeanchor.go) — a body that is not a mapping is
 		// what is left that has no canonical form.
 		doc := "services:\n  broker: notamapping\n"
-		_, got := runReport(t, base.withManifest(t, doc, nil), false, nil)
+		_, got := runReport(t, base.withManifest(t, doc, nil), false, evidence.ComposeBaseline{})
 		if !strings.Contains(got, "cannot be pinned") {
 			t.Errorf("an unpinnable block printed no reason:\n%s", got)
 		}
