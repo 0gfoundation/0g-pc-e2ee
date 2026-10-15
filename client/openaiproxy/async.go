@@ -127,13 +127,18 @@ func HasJobKey(r *http.Request) bool {
 // RedactJobPath returns path with the key segment of a polled job id removed,
 // for anything that prints a path: a full user job id is a credential (SPEC
 // §7.5.3). Any path that is not a poll is returned unchanged.
+//
+// It matches the prefix case-insensitively and cuts at the FIRST "." after it:
+// the access log sees the path as sent, before any spelling is folded, and a
+// broker job id has no "." of its own, so everything from the first one on may
+// be key material (a trailing slash or a sub-path after the key included).
 func RedactJobPath(path string) string {
-	rest, ok := strings.CutPrefix(path, AsyncJobsPrefix)
-	if !ok {
+	if len(path) <= len(AsyncJobsPrefix) || !strings.EqualFold(path[:len(AsyncJobsPrefix)], AsyncJobsPrefix) {
 		return path
 	}
-	if i := strings.LastIndex(rest, "."); i >= 0 {
-		return AsyncJobsPrefix + rest[:i] + ".<redacted>"
+	rest := path[len(AsyncJobsPrefix):]
+	if i := strings.IndexByte(rest, '.'); i >= 0 {
+		return path[:len(AsyncJobsPrefix)] + rest[:i] + ".<redacted>"
 	}
 	return path
 }

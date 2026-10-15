@@ -188,3 +188,83 @@ func TestKeylessPollRefusesAnUnrequestedEncoding(t *testing.T) {
 		t.Errorf("status %d, want 502", resp.StatusCode)
 	}
 }
+
+// Every spelling of a keyed poll path either reaches the keyed handler (which
+// cuts the key off) or is refused. None may reach the cleartext catch-all,
+// which would forward the full user job id — private key included — to the
+// router. Driven with raw request lines so the spellings arrive as sent.
+func TestKeyedPollSpellingsNeverForwardTheKey(t *testing.T) {
+	key := keyedJobID[strings.LastIndex(keyedJobID, ".")+1:]
+	for _, tc := range []struct {
+		path string
+		want int
+	}{
+		{"/v1/async/jobs/" + keyedJobID, http.StatusOK},
+		{"/V1/async/jobs/" + keyedJobID, http.StatusOK},
+		{"/v1/ASYNC/Jobs/" + keyedJobID, http.StatusOK},
+		{"/v1/async/jobs%2F" + keyedJobID, http.StatusOK},
+		{"/v1/async/jobs/" + keyedJobID + "/", http.StatusBadRequest},
+		{"/V1/async/jobs/" + keyedJobID + "/", http.StatusBadRequest},
+		{"/v1/async/jobs/" + keyedJobID + "/content", http.StatusBadRequest},
+		{"/v1/async/jobs/" + keyedJobID + "%2F", http.StatusBadRequest},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			router := &pollRouter{body: `{"jobId":"job-1","status":"pending"}`}
+			var buf bytes.Buffer
+			var mu sync.Mutex
+			gw := pollGateway(t, router.server(t).URL, slog.New(slog.NewJSONHandler(lockedWriter{&buf, &mu}, nil)))
+
+			for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodDelete} {
+				req, _ := http.NewRequest(method, gw.URL+"/", nil)
+				req.URL.Opaque = tc.path // sent verbatim, no client-side cleaning
+				req.Header.Set("Authorization", "Bearer sk-user-key")
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					t.Fatalf("%s: %v", method, err)
+				}
+				body, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if method == http.MethodGet && resp.StatusCode != tc.want {
+					t.Errorf("GET status %d, want %d (%s)", resp.StatusCode, tc.want, body)
+				}
+				// A served poll hands the caller back their own id; a refusal must not
+				// echo it.
+				if resp.StatusCode != http.StatusOK && strings.Contains(string(body), key) {
+					t.Errorf("%s: refusal echoes the key: %s", method, body)
+				}
+			}
+			router.mu.Lock()
+			for _, u := range router.seen {
+				if strings.Contains(u, key) {
+					t.Errorf("router received the key: %s", u)
+				}
+			}
+			router.mu.Unlock()
+			mu.Lock()
+			if strings.Contains(buf.String(), key) {
+				t.Errorf("access log carries the key:\n%s", buf.String())
+			}
+			mu.Unlock()
+		})
+	}
+}
+
+// A keyless path under the namespace still passes through: async edits and
+// the legacy video poll use it.
+func TestKeylessPollSubpathsStillPassThrough(t *testing.T) {
+	router := &pollRouter{body: `{"ok":true}`}
+	gw := pollGateway(t, router.server(t).URL, discardLogger())
+	resp, err := http.Get(gw.URL + "/v1/async/jobs/job-1/extra")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("status %d", resp.StatusCode)
+	}
+	router.mu.Lock()
+	defer router.mu.Unlock()
+	if len(router.seen) != 1 || router.seen[0] != "/v1/async/jobs/job-1/extra" {
+		t.Errorf("router saw %v", router.seen)
+	}
+}

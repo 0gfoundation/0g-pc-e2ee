@@ -1160,10 +1160,15 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	// Collected for sealedNamespaceGuard, which has to fold every spelling of these
 	// prefixes before the mux matches. Built from the same table the loop registers
 	// from, so a row added later is guarded the day it lands.
-	surfaces := make([]string, 0, len(endpoint.All))
+	surfaces := make([]string, 0, len(endpoint.All)+1)
 	for _, ep := range endpoint.All {
 		surfaces = append(surfaces, ep.Path)
 	}
+	// The async poll namespace too, though it is not a row: a keyed poll's PATH
+	// carries the job's private key, so a spelling that missed the poll route
+	// (/V1/…, %2F) reached the cleartext catch-all and handed the key to the
+	// router. Folded here, every spelling lands on the routes registered below.
+	surfaces = append(surfaces, strings.TrimSuffix(openaiproxy.AsyncJobsPrefix, "/"))
 	for _, ep := range endpoint.All {
 		surface := ep.Path
 		// Seal policy off: this gateway is a transparent proxy for the whole
@@ -1271,6 +1276,21 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	// segment it is a job this gateway sealed — opened through the gate; without
 	// one, the cleartext passthrough, which refuses to relay a sealed frame.
 	keylessPoll := openaiproxy.MarkE2EE(openaiproxy.E2EEValueNone, newKeylessPollProxy(routerTarget, logger))
+	// Everything else under the namespace — another method, a trailing slash, a
+	// sub-path — is not the poll route, and the only other handler that would take
+	// it is the cleartext catch-all. A path there that could carry a key segment
+	// (any "." after the prefix) is refused rather than forwarded, without echoing
+	// it; the rest is ordinary passthrough, as before. The trailing slash is the
+	// quiet case: the router 307s it back to the canonical path and the retry
+	// succeeds, so a client would never notice the first request gave the key away.
+	mux.Handle(openaiproxy.AsyncJobsPrefix, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(strings.TrimPrefix(r.URL.Path, openaiproxy.AsyncJobsPrefix), ".") {
+			openaiproxy.WriteError(w, http.StatusBadRequest, "gateway",
+				"a job id carrying a key is polled with GET "+openaiproxy.AsyncJobsPrefix+"{id} only; this request is refused rather than forwarded")
+			return
+		}
+		passthrough.ServeHTTP(w, r)
+	}))
 	mux.Handle("GET "+openaiproxy.AsyncJobsPrefix+"{id}", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if openaiproxy.HasJobKey(r) {
 			sealedGate.ServeHTTP(w, r)

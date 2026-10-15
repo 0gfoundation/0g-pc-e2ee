@@ -419,7 +419,7 @@ func RouteLabel(path string) string {
 	}
 	// Async job polls, one label for all of them: the job id is caller-chosen
 	// and, for a sealed job, carries the key that opens it.
-	if strings.HasPrefix(path, "/v1/async/jobs/") {
+	if len(path) >= len("/v1/async/jobs/") && strings.EqualFold(path[:len("/v1/async/jobs/")], "/v1/async/jobs/") {
 		return "/v1/async/jobs/"
 	}
 	return "other"
