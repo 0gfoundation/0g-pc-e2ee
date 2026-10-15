@@ -2,9 +2,12 @@ package evidence
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -51,6 +54,32 @@ func builtinReleases(t *testing.T) BrokerReleases {
 		t.Fatalf("embedded release list: %v", err)
 	}
 	return rels
+}
+
+// testnetComposeHash is the compose_hash the testnet provider's verified quote binds
+// (0x1cB95Eb6… on contract 0xa79F4c83…, 2026-10-15).
+const testnetComposeHash = "9b0de348d56a36391d4474913efd75dcdaf109e4c11ccb79d5cd08f424bcade3"
+
+// reviewTestnet reviews testnet's real app-compose. testdata/testnet-app-compose.json is
+// that provider's manifest byte for byte — taken from the broker repository's golden
+// vector (api/common/attest/testdata/vectors/testnet-rehearsal-v0.5.4, tcb_info.app_compose)
+// — and it goes through ReviewCompose's own gate against the hash the live quote binds,
+// so the fixture proves where it came from instead of saying so.
+func reviewTestnet(t *testing.T) ComposeReview {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("testdata", "testnet-app-compose.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hash [32]byte
+	if _, err := hex.Decode(hash[:], []byte(testnetComposeHash)); err != nil {
+		t.Fatal(err)
+	}
+	r, err := ReviewCompose(raw, hash, builtinReleases(t))
+	if err != nil {
+		t.Fatalf("the testnet fixture is not the manifest its quote binds: %v", err)
+	}
+	return r
 }
 
 // reviewOf runs the reviewer over a manifest through the real hash gate.

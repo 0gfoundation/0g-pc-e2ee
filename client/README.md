@@ -234,9 +234,11 @@ and fails on the three that run the broker image.
 **Recording is not approval.** The review reports on every run whatever it finds; a
 record only means the services cannot change unseen. The one finding the review relaxes
 is `0g-controller`'s `docker.sock`, reported as *justify* rather than *blocking* when the
-controller runs a listed release as the `0g-controller` program, with no privileges,
-capabilities, extra host paths, `env_file`, or `ZG_CONTROLLER_ENGINES` — the conditions
-under which #759 limits what it does with the socket. On any other build it stays
+controller runs a listed release as the `0g-controller` program, using only the service
+keys, environment variables and healthcheck every controller on the fleet uses, with
+nothing docker compose interpolates from the `.env`, no host path beyond the two sockets,
+only declared local volumes, and `ZG_CONTROLLER_ENGINES` absent — the conditions under
+which #759 limits what it does with the socket. On any other build it stays
 blocking and says which condition failed (`evidence/composecontroller.go`).
 
 `-app-baseline <file>` reads a candidate instead of the embedded one, which is how a

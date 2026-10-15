@@ -40,6 +40,12 @@ func dockerSockFinding(t *testing.T, r ComposeReview, service string) Finding {
 
 func TestControllerException_Applies(t *testing.T) {
 	f := dockerSockFinding(t, reviewOf(t, manifest(eligibleController)), "0g-controller")
+	// And with the recorded healthcheck, which every controller on the fleet carries.
+	withHC := strings.Replace(eligibleController, "    command: 0g-controller\n", "    command: 0g-controller\n"+
+		"    healthcheck:\n      test: [CMD-SHELL, \"grep -q '0g-controller' /proc/1/cmdline\"]\n      interval: 30s\n", 1)
+	if g := dockerSockFinding(t, reviewOf(t, manifest(withHC)), "0g-controller"); g.Severity != SeverityJustify {
+		t.Fatalf("the recorded healthcheck cost the exception:\n%s", g.Detail)
+	}
 	if f.Severity != SeverityJustify {
 		t.Fatalf("severity = %s, want justify:\n%s", f.Severity, f.Detail)
 	}
@@ -107,7 +113,36 @@ func TestControllerException_EachConditionIsLoadBearing(t *testing.T) {
 		{"engines passed through from the host",
 			sub(envLine, envLine+"      - ZG_CONTROLLER_ENGINES\n"), "host"},
 		{"engines interpolated from the host",
-			sub(envLine, envLine+"      - ZG_CONTROLLER_ENGINES=${ENGINES}\n"), "sets ZG_CONTROLLER_ENGINES"},
+			sub(envLine, envLine+"      - ZG_CONTROLLER_ENGINES=${ENGINES}\n"), "`$`"},
+		// docker compose interpolates before anything runs, and every check reads the text
+		// as written. These three each passed while the .env decided what ran.
+		{"the engine flag's NAME from the .env (K=ZG_CONTROLLER_ENGINES)",
+			sub(envLine, envLine+"      - ${K}=on\n"), "`$`"},
+		{"a host root from the .env (HOSTROOT=/)",
+			sub("      - zg-tee:/var/run/zg-tee\n", "      - zg-tee:/var/run/zg-tee\n      - ${HOSTROOT}:/host\n"), "`$`"},
+		{"an interpolated label",
+			sub("    command: 0g-controller\n", "    command: 0g-controller\n    labels: {a: \"${X}\"}\n"), "labels.a"},
+		{"compose's escaped dollar",
+			sub("    command: 0g-controller\n", "    command: 0g-controller\n    labels: {a: \"$$X\"}\n"), "`$`"},
+		// A healthcheck is a program docker runs inside this container, with the socket.
+		{"a healthcheck that is a second program",
+			sub("    command: 0g-controller\n", "    command: 0g-controller\n    healthcheck:\n      test: [CMD-SHELL, \"curl --unix-socket /var/run/docker.sock http://x/containers/json\"]\n"), "healthcheck runs"},
+		{"the recorded healthcheck in string form",
+			sub("    command: 0g-controller\n", "    command: 0g-controller\n    healthcheck:\n      test: \"grep -q '0g-controller' /proc/1/cmdline\"\n"), "healthcheck runs"},
+		{"a healthcheck key beyond timing",
+			sub("    command: 0g-controller\n", "    command: 0g-controller\n    healthcheck:\n      test: [CMD-SHELL, \"grep -q '0g-controller' /proc/1/cmdline\"]\n      start_interval: 1s\n"), "start_interval"},
+		// A variable can change what the process does without changing the image.
+		{"a variable outside the allowlist",
+			sub(envLine, envLine+"      - LD_PRELOAD=/etc/config/x.so\n"), "LD_PRELOAD"},
+		// Named volumes: declared, local, created by this manifest.
+		{"an undeclared named volume",
+			sub("      - zg-tee:/var/run/zg-tee\n", "      - zg-tee:/var/run/zg-tee\n      - hostroot:/host\n"), "does not declare"},
+		{"an external volume",
+			strings.Replace(sub("      - zg-tee:/var/run/zg-tee\n", "      - zg-tee:/var/run/zg-tee\n      - ext:/ext\n"),
+				"volumes:\n  zg-tee: {}\n", "volumes:\n  zg-tee: {}\n  ext: {external: true}\n", 1), "ordinary local volume"},
+		{"a volume declared from the .env",
+			strings.Replace(sub("      - zg-tee:/var/run/zg-tee\n", "      - zg-tee:/var/run/zg-tee\n      - v:/v\n"),
+				"volumes:\n  zg-tee: {}\n", "volumes:\n  zg-tee: {}\n  v: {name: \"${VOL}\"}\n", 1), "contains `$`"},
 		{"environment from a file the manifest does not contain",
 			sub("    command: 0g-controller\n", "    command: 0g-controller\n    env_file: ./controller.env\n"), "env_file"},
 		{"another absolute host path",
@@ -220,7 +255,7 @@ func TestControllerException_OnTheRecordedDeployments(t *testing.T) {
 		}
 		return reviewOf(t, manifest(string(doc)))
 	}
-	if f := dockerSockFinding(t, load("testnet-services.yml"), "0g-controller"); f.Severity != SeverityJustify {
+	if f := dockerSockFinding(t, reviewTestnet(t), "0g-controller"); f.Severity != SeverityJustify {
 		t.Errorf("testnet: severity %s:\n%s", f.Severity, f.Detail)
 	}
 	f := dockerSockFinding(t, load("cn20-services.yml"), "0g-controller")
