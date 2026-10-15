@@ -357,10 +357,17 @@ precondition for flipping a switch.
 > swaps an image only as repo@digest after recording the swap in RTMR3. The review
 > reports it as justify rather than blocking only on a listed release, run as the
 > controller program, with nothing beyond the keys, variables and healthcheck the fleet's
-> controllers use, nothing interpolated, no extra host paths and the engine flag absent;
-> anywhere else it stays blocking and names the condition that failed. Those limits are
-> the controller's code, which a manifest review cannot see, so the finding stays —
-> relaxed, not removed.
+> controllers use, nothing interpolated in its service, no extra host paths and the
+> engine flag absent; anywhere else it stays blocking and names the condition that
+> failed. Those limits are the controller's code, which a manifest review cannot see, so
+> the finding stays — relaxed, not removed. And "repo@digest" is a repository the
+> provider names: `controller.imageRepo` comes from the controller's config file, which
+> the provider supplies and can rewrite, so only an RTMR3 replay against the release list
+> bounds what broker and event run after boot.
+>
+> A recorded deployment is its services AND its top-level sections (volumes, networks,
+> …): a declaration changed to an `nfs` driver moves the data behind a volume name while
+> every service block still matches, so the sections are recorded and compared too.
 >
 > Wiring the comparison into the SEALING path, behind its own enforce switch, waits on
 > two things. The manifest describes what BOOTED, and on v0.5.4 the controller may swap

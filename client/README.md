@@ -236,10 +236,19 @@ record only means the services cannot change unseen. The one finding the review 
 is `0g-controller`'s `docker.sock`, reported as *justify* rather than *blocking* when the
 controller runs a listed release as the `0g-controller` program, using only the service
 keys, environment variables and healthcheck every controller on the fleet uses, with
-nothing docker compose interpolates from the `.env`, no host path beyond the two sockets,
-only declared local volumes, and `ZG_CONTROLLER_ENGINES` absent — the conditions under
-which #759 limits what it does with the socket. On any other build it stays
-blocking and says which condition failed (`evidence/composecontroller.go`).
+nothing interpolated in its own service, no host path beyond the two sockets, only
+declared local volumes, and `ZG_CONTROLLER_ENGINES` absent — the conditions under which
+#759 limits what it does with the socket. On any other build it stays blocking and says
+which condition failed (`evidence/composecontroller.go`). What it does NOT bound: the
+repository image swaps pull from is `controller.imageRepo` in the controller's config
+file, which the provider supplies and can rewrite at runtime, so what broker and event
+run after boot is bounded only by an RTMR3 replay against the release list.
+
+The baseline also records each deployment's **top-level sections** — `volumes`,
+`networks`, and anything else besides `services` and `x-` extensions — and compares them
+the same way. A service block names a volume; the declaration says what it is, and
+changing only the declaration (to an `nfs` driver, `external: true`, another device)
+would move the data behind the name while every service block still matched.
 
 `-app-baseline <file>` reads a candidate instead of the embedded one, which is how a
 deployment gets checked against a live provider before it is committed.

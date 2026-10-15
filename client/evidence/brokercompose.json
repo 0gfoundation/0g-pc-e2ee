@@ -46,7 +46,8 @@
     "HOW A DEPLOYMENT IS WRITTEN. Run `pcverify -provider <addr> -blocks` (with",
     "-chain-rpc-url and -serving-contract for a non-default chain). It prints, per",
     "service, the canonical block and — labelled `no-image:` — the same block with the",
-    "image identity held out. Copy the one each service's rule needs into `block`, one",
+    "image identity held out, and then each top-level section (`top-level volumes`, …).",
+    "Copy the one each service's rule needs into `block`, one",
     "array element per line, mechanically rather than by hand. Then check the candidate",
     "against the live provider with `-strict -app-baseline <file>` before committing it.",
     "",
@@ -68,15 +69,20 @@
     "present exactly once, every service in the manifest recorded, each block equal after",
     "reduction, and each image satisfying its rule. A service the deployment does not",
     "record is a MISMATCH — an unlisted container is unreviewed code in the same guest.",
+    "The same holds for the top-level sections other than services and `x-` extensions",
+    "(`top_level`): each recorded one present and equal, and none unrecorded. They are",
+    "what a service's volumes and networks resolve to — a declaration changed to an nfs",
+    "driver moves the data behind a name while every service block still matches. A",
+    "deployment with no `top_level` allows none.",
     "",
     "AN EMPTY `deployments` LIST means NOT CONFIGURED: nothing is compared, warn mode",
     "proceeds and says so, enforce refuses every provider and names the configuration. It",
     "never means 'accept anything'.",
     "",
     "Fields. Deployment: `name` (unique), `contract`, `providers` (addresses; any case),",
-    "`note`, `services`. Service: `name` (the compose key), `image` (the rule above),",
+    "`note`, `services`, `top_level`. Service: `name` (the compose key), `image` (the rule above),",
     "`block` (canonical text, one element per line), `note`. Notes are the audit record and",
-    "are never read by the comparison."
+    "are never read by the comparison. Top-level section: `key`, `block`, `note`."
   ],
   "deployments": [
     {
@@ -595,6 +601,36 @@
             "        condition: service_healthy"
           ]
         }
+      ],
+      "top_level": [
+        {
+          "key": "volumes",
+          "note": [
+            "Every named volume the services mount, each a bare declaration: an ordinary local",
+            "volume the CVM creates on its own disk. Recorded because a service block only names",
+            "a volume; a declaration changed to an nfs/cifs driver, a bind of another path, or",
+            "external: true would move the data behind that name — the ingress TLS key, the",
+            "database, the broker config — while every service block still matched."
+          ],
+          "block": [
+            "broker-config:",
+            "mysql-data:",
+            "prometheus-config:",
+            "cert-data:",
+            "zg-tee:"
+          ]
+        },
+        {
+          "key": "networks",
+          "note": [
+            "The one project network, created by this manifest (external: false)."
+          ],
+          "block": [
+            "default:",
+            "    name: 0g-serving-network",
+            "    external: false"
+          ]
+        }
       ]
     },
     {
@@ -932,7 +968,7 @@
             "only service that does, after #763 — it serves the zg-tee and read-only zg-tee-ro",
             "proxies) and /var/run/docker.sock. The review reports the second at JUSTIFY, not",
             "blocking: this is a listed release, run as the 0g-controller program, with only the",
-            "keys, environment variables and healthcheck the exception covers, nothing interpolated,",
+            "keys, environment variables and healthcheck the exception covers, nothing interpolated in its service,",
             "no host path beyond the two sockets (its logs are on a declared named volume), and",
             "ZG_CONTROLLER_ENGINES absent — the conditions under which broker",
             "#759 limits what it does with the socket (evidence/composecontroller.go). Those limits",
@@ -1103,6 +1139,40 @@
             "depends_on:",
             "    prometheus:",
             "        condition: service_healthy"
+          ]
+        }
+      ],
+      "top_level": [
+        {
+          "key": "volumes",
+          "note": [
+            "Every named volume the services mount, each a bare declaration: an ordinary local",
+            "volume the CVM creates on its own disk. Recorded because a service block only names",
+            "a volume; a declaration changed to an nfs/cifs driver, a bind of another path, or",
+            "external: true would move the data behind that name — the ingress TLS key, the",
+            "database, the broker config — while every service block still matched."
+          ],
+          "block": [
+            "testnet-broker-config:",
+            "testnet-broker-logs:",
+            "testnet-event-logs:",
+            "testnet-controller-logs:",
+            "testnet-mysql-data:",
+            "testnet-prometheus-config:",
+            "zg-tee:",
+            "zg-tee-ro:",
+            "testnet-cert-data:"
+          ]
+        },
+        {
+          "key": "networks",
+          "note": [
+            "The one project network, created by this manifest (external: false)."
+          ],
+          "block": [
+            "default:",
+            "    name: 0g-serving-network",
+            "    external: false"
           ]
         }
       ]

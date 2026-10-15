@@ -56,7 +56,7 @@ func parseBaseline(t *testing.T, services ...map[string]any) ComposeBaseline {
 
 // check compares blocks as testProvider, against testReleases.
 func check(b ComposeBaseline, blocks []ServiceBlock) ComposeCheck {
-	return CheckCompose(b, testReleases, testContract, testProvider, blocks)
+	return CheckCompose(b, testReleases, testContract, testProvider, blocks, nil)
 }
 
 // entry is one baseline service, with the block given as the lines a reviewer would
@@ -109,7 +109,7 @@ func TestCheckCompose_UnrecordedProviderIsNotCompared(t *testing.T) {
 	b := parseBaseline(t, entry("a", nil, "image: mysql@"+mysqlDigestC))
 	blocks := reviewOf(t, manifest("services:\n  b:\n    image: redis@"+digestB+"\n")).Blocks
 
-	got := CheckCompose(b, testReleases, testContract, "0x"+strings.Repeat("9", 40), blocks)
+	got := CheckCompose(b, testReleases, testContract, "0x"+strings.Repeat("9", 40), blocks, nil)
 	if !got.Configured {
 		t.Fatal("a baseline with a deployment reported as unconfigured")
 	}
@@ -131,11 +131,11 @@ func TestCheckCompose_TheContractIsPartOfTheKey(t *testing.T) {
 	b := parseBaseline(t, entry("a", nil, "image: mysql@"+mysqlDigestC))
 	blocks := reviewOf(t, manifest("services:\n  a:\n    image: mysql@"+mysqlDigestC+"\n")).Blocks
 
-	if got := CheckCompose(b, testReleases, "0x"+strings.Repeat("1", 40), testProvider, blocks); got.Recorded {
+	if got := CheckCompose(b, testReleases, "0x"+strings.Repeat("1", 40), testProvider, blocks, nil); got.Recorded {
 		t.Fatal("a provider recorded on one contract was looked up on another")
 	}
 	// Case does not matter: the chain and the operator spell addresses differently.
-	got := CheckCompose(b, testReleases, "0x"+strings.ToUpper(testContract[2:]), strings.ToLower(testProvider), blocks)
+	got := CheckCompose(b, testReleases, "0x"+strings.ToUpper(testContract[2:]), strings.ToLower(testProvider), blocks, nil)
 	if !got.Compared() || !got.OK() {
 		t.Fatalf("an EIP-55 / lowercase spelling of the same addresses did not match: %+v", got)
 	}
@@ -155,7 +155,7 @@ func TestComposeBaseline_SeveralProvidersShareADeployment(t *testing.T) {
 	}
 	blocks := reviewOf(t, manifest("services:\n  a:\n    image: mysql@"+mysqlDigestC+"\n")).Blocks
 	for _, p := range []string{testProvider, p2} {
-		if got := CheckCompose(b, testReleases, testContract, p, blocks); !got.Compared() || !got.OK() {
+		if got := CheckCompose(b, testReleases, testContract, p, blocks, nil); !got.Compared() || !got.OK() {
 			t.Fatalf("%s: %+v", p, got)
 		}
 	}
@@ -281,23 +281,18 @@ func TestBuiltinComposeBaseline_AgainstTheManifestsItWasRecordedFrom(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	load := func(name string) ComposeReview {
-		t.Helper()
-		doc, err := os.ReadFile(filepath.Join("testdata", name))
-		if err != nil {
-			t.Fatal(err)
-		}
-		return reviewOf(t, manifest(string(doc)))
-	}
 
 	// testnet runs v0.5.4, a listed release: every service matches.
 	t.Run("testnet matches in full", func(t *testing.T) {
-		got := CheckCompose(b, rels, testnetContract, testnetProvider, reviewTestnet(t).Blocks)
+		got := CheckCompose(b, rels, testnetContract, testnetProvider, reviewTestnet(t).Blocks, reviewTestnet(t).TopLevel)
 		if !got.Compared() || !got.OK() {
 			t.Fatalf("the testnet deployment does not match its own record:\n%s", dumpMismatches(got))
 		}
 		if got.Matched != got.Expected || got.Expected != 11 {
 			t.Fatalf("matched %d of %d", got.Matched, got.Expected)
+		}
+		if got.TopMatched != got.TopExpected || got.TopExpected != 2 {
+			t.Fatalf("top-level sections matched %d of %d", got.TopMatched, got.TopExpected)
 		}
 	})
 
@@ -306,7 +301,7 @@ func TestBuiltinComposeBaseline_AgainstTheManifestsItWasRecordedFrom(t *testing.
 	// their blocks still match. That is the release rule doing its job, and pinning it here
 	// means a release list that started accepting v0.5.1 again would fail this test.
 	t.Run("cn-20 fails only on its unlisted broker release", func(t *testing.T) {
-		got := CheckCompose(b, rels, mainnetContract, cn20Provider, load("cn20-services.yml").Blocks)
+		got := CheckCompose(b, rels, mainnetContract, cn20Provider, reviewCN20(t).Blocks, reviewCN20(t).TopLevel)
 		if !got.Compared() {
 			t.Fatal("cn-20 was not compared")
 		}
@@ -324,7 +319,7 @@ func TestBuiltinComposeBaseline_AgainstTheManifestsItWasRecordedFrom(t *testing.
 	// And recording is not approval: the review still sees cn-20's runtime socket.
 	t.Run("recording silences nothing", func(t *testing.T) {
 		var found bool
-		for _, f := range load("cn20-services.yml").Findings {
+		for _, f := range reviewCN20(t).Findings {
 			if f.Severity == SeverityBlocking && f.Service == "0g-controller" && strings.Contains(f.Detail, "docker.sock") {
 				found = true
 			}
@@ -588,7 +583,7 @@ func TestCheckCompose_RepositoryRule(t *testing.T) {
 	// An empty release list accepts nothing. It must never read as "any digest".
 	t.Run("an empty release list accepts nothing", func(t *testing.T) {
 		got := CheckCompose(baseline, BrokerReleases{Repository: brokerRepo}, testContract, testProvider,
-			reviewOf(t, manifest(svc(digestA))).Blocks)
+			reviewOf(t, manifest(svc(digestA))).Blocks, nil)
 		if got.OK() {
 			t.Fatal("a release list with no entries accepted a build")
 		}
@@ -598,7 +593,7 @@ func TestCheckCompose_RepositoryRule(t *testing.T) {
 	// A release list for some other repository cannot vouch for this one.
 	t.Run("a release list for another repository accepts nothing", func(t *testing.T) {
 		got := CheckCompose(baseline, BrokerReleases{Repository: "ghcr.io/x/y", Releases: testReleases.Releases},
-			testContract, testProvider, reviewOf(t, manifest(svc(digestA))).Blocks)
+			testContract, testProvider, reviewOf(t, manifest(svc(digestA))).Blocks, nil)
 		if got.OK() {
 			t.Fatal("a release list for another repository accepted a build")
 		}
@@ -843,4 +838,117 @@ func dumpMismatches(c ComposeCheck) string {
 		}
 	}
 	return b.String()
+}
+
+// The attack the top-level comparison exists for, on the real testnet manifest: every
+// service block untouched, one volume declaration changed. The ingress's TLS key now lives
+// on an NFS export the provider controls, and a baseline of service blocks alone matched
+// all eleven services and passed.
+func TestCheckCompose_TopLevelSections(t *testing.T) {
+	b, err := BuiltinComposeBaseline()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rels := builtinReleases(t)
+	var ac map[string]any
+	raw, err := os.ReadFile(filepath.Join("testdata", "testnet-app-compose.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &ac); err != nil {
+		t.Fatal(err)
+	}
+	real := ac["docker_compose_file"].(string)
+	check := func(t *testing.T, doc string) ComposeCheck {
+		t.Helper()
+		r := reviewOf(t, manifest(doc))
+		return CheckCompose(b, rels, testnetContract, testnetProvider, r.Blocks, r.TopLevel)
+	}
+	edit := func(t *testing.T, old, new string) string {
+		t.Helper()
+		if !strings.Contains(real, old) {
+			t.Fatalf("the testnet manifest has no %q", old)
+		}
+		return strings.Replace(real, old, new, 1)
+	}
+
+	// The premise: the manifest, as it is, matches in full.
+	if got := check(t, real); !got.OK() || got.TopMatched != 2 {
+		t.Fatalf("the unedited manifest does not match:\n%s", dumpMismatches(got))
+	}
+
+	for _, tc := range []struct{ name, doc, where, says string }{
+		{"a volume moved onto NFS",
+			edit(t, "  testnet-cert-data:\n", "  testnet-cert-data:\n    driver_opts: {type: nfs, o: \"addr=203.0.113.7\", device: \":/x\"}\n"),
+			"top-level volumes", "differs"},
+		{"a volume made external",
+			edit(t, "  testnet-mysql-data:\n", "  testnet-mysql-data:\n    external: true\n"),
+			"top-level volumes", "differs"},
+		{"the network made external",
+			edit(t, "    external: false\n", "    external: true\n"),
+			"top-level networks", "differs"},
+		{"a section nobody recorded",
+			edit(t, "\nnetworks:\n", "\nsecrets:\n  s: {file: /etc/shadow}\nnetworks:\n"),
+			"top-level secrets", "does not record"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := check(t, tc.doc)
+			if got.OK() {
+				t.Fatal("matched")
+			}
+			if got.Matched != 11 {
+				t.Fatalf("the premise: every service block still matches (%d of 11)", got.Matched)
+			}
+			requireMismatch(t, got, tc.where, tc.says)
+		})
+	}
+
+	t.Run("a recorded section removed", func(t *testing.T) {
+		got := CheckCompose(b, rels, testnetContract, testnetProvider, reviewTestnet(t).Blocks,
+			reviewTestnet(t).TopLevel[:1])
+		requireMismatch(t, got, "top-level networks", "does not have it")
+	})
+
+	// Extension fields run nothing, and their anchors are already inside the services.
+	t.Run("an x- section is not compared", func(t *testing.T) {
+		if got := check(t, "x-note: {a: 1}\n"+real); !got.OK() {
+			t.Fatalf("an extension field was compared:\n%s", dumpMismatches(got))
+		}
+	})
+}
+
+func TestParseComposeBaseline_TopLevel(t *testing.T) {
+	svc := entry("a", nil, "restart: always")
+	withTop := func(top ...map[string]any) []byte {
+		d := deployment("d", testContract, []string{testProvider}, svc)
+		d["top_level"] = top
+		return deploymentsJSON(t, d)
+	}
+	got, err := ParseComposeBaseline(withTop(map[string]any{"key": "volumes", "block": []string{"data:", "logs: {}"}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tl := got.Deployments[0].TopLevel; len(tl) != 1 || tl[0].Key != "volumes" || !strings.Contains(tl[0].Block, "logs: {}") {
+		t.Fatalf("top_level = %+v", tl)
+	}
+	for _, tc := range []struct {
+		name string
+		top  []map[string]any
+		says string
+	}{
+		{"no key", []map[string]any{{"block": []string{"a:"}}}, "key is required"},
+		{"services", []map[string]any{{"key": "services", "block": []string{"a:"}}}, "per service"},
+		{"an extension field", []map[string]any{{"key": "x-a", "block": []string{"a:"}}}, "extension field"},
+		{"twice", []map[string]any{{"key": "volumes", "block": []string{"a:"}}, {"key": "volumes", "block": []string{"b:"}}}, "listed twice"},
+		{"no block", []map[string]any{{"key": "volumes"}}, "block is required"},
+		{"a second document", []map[string]any{{"key": "volumes", "block": []string{"a:", "---", "b:"}}}, "does not reduce"},
+		{"a key misspelled", []map[string]any{{"key": "volumes", "blocks": []string{"a:"}}}, "unknown field"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ParseComposeBaseline(withTop(tc.top...))
+			if err == nil || !strings.Contains(err.Error(), tc.says) {
+				t.Fatalf("err = %v, want it to mention %q", err, tc.says)
+			}
+		})
+	}
 }

@@ -56,28 +56,45 @@ func builtinReleases(t *testing.T) BrokerReleases {
 	return rels
 }
 
-// testnetComposeHash is the compose_hash the testnet provider's verified quote binds
-// (0x1cB95Eb6… on contract 0xa79F4c83…, 2026-10-15).
-const testnetComposeHash = "9b0de348d56a36391d4474913efd75dcdaf109e4c11ccb79d5cd08f424bcade3"
+// The compose_hash each recorded deployment's verified quote binds (2026-10-15).
+const (
+	// testnet: provider 0x1cB95Eb6… on contract 0xa79F4c83….
+	testnetComposeHash = "9b0de348d56a36391d4474913efd75dcdaf109e4c11ccb79d5cd08f424bcade3"
+	// mainnet cn-20: provider 0x4870CbC4… on contract 0x47340d90….
+	cn20ComposeHash = "720530b4e2ee997471c59061561606a83aecfb41813b8cb1158b0b979c22b41f"
+)
 
 // reviewTestnet reviews testnet's real app-compose. testdata/testnet-app-compose.json is
 // that provider's manifest byte for byte — taken from the broker repository's golden
-// vector (api/common/attest/testdata/vectors/testnet-rehearsal-v0.5.4, tcb_info.app_compose)
-// — and it goes through ReviewCompose's own gate against the hash the live quote binds,
-// so the fixture proves where it came from instead of saying so.
+// vector (api/common/attest/testdata/vectors/testnet-rehearsal-v0.5.4, tcb_info.app_compose).
 func reviewTestnet(t *testing.T) ComposeReview {
 	t.Helper()
-	raw, err := os.ReadFile(filepath.Join("testdata", "testnet-app-compose.json"))
+	return reviewRecorded(t, "testnet-app-compose.json", testnetComposeHash)
+}
+
+// reviewCN20 reviews cn-20's real app-compose, as its /v1/quote reply served it
+// (tcb_info.app_compose).
+func reviewCN20(t *testing.T) ComposeReview {
+	t.Helper()
+	return reviewRecorded(t, "cn20-app-compose.json", cn20ComposeHash)
+}
+
+// reviewRecorded reviews a recorded deployment's real manifest through ReviewCompose's
+// own gate against the hash its live quote binds — so the fixture proves where it came
+// from instead of saying so.
+func reviewRecorded(t *testing.T, file, composeHash string) ComposeReview {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("testdata", file))
 	if err != nil {
 		t.Fatal(err)
 	}
 	var hash [32]byte
-	if _, err := hex.Decode(hash[:], []byte(testnetComposeHash)); err != nil {
+	if _, err := hex.Decode(hash[:], []byte(composeHash)); err != nil {
 		t.Fatal(err)
 	}
 	r, err := ReviewCompose(raw, hash, builtinReleases(t))
 	if err != nil {
-		t.Fatalf("the testnet fixture is not the manifest its quote binds: %v", err)
+		t.Fatalf("%s is not the manifest its quote binds: %v", file, err)
 	}
 	return r
 }

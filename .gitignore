@@ -1,5 +1,6 @@
 # Go build output (e.g. `go build ./cmd/gateway/` drops the binary here)
 /client/gateway
+/client/pcverify
 
 # Env files: these carry the DNS API token for the TEE deployment (deploy/phala/),
 # and this repository is public. Covers .env, prod.env and .env.production alike.
