@@ -10,6 +10,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
@@ -138,6 +139,11 @@ func newKeylessPollProxy(target *url.URL, logger *slog.Logger) http.Handler {
 	p.ModifyResponse = func(resp *http.Response) error {
 		if err := strip(resp); err != nil {
 			return err
+		}
+		// Not asked for, so not expected; but a body this proxy cannot read as sent
+		// is a body it cannot check, and an unchecked one is not relayed.
+		if ce := resp.Header.Get("Content-Encoding"); ce != "" && !strings.EqualFold(ce, "identity") {
+			return errKeylessPollUnreadable
 		}
 		body, err := io.ReadAll(io.LimitReader(resp.Body, maxKeylessPollBytes+1))
 		_ = resp.Body.Close()
