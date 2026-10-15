@@ -81,6 +81,19 @@ type Deployment struct {
 	Providers []string
 	// Services is the recorded manifest, one entry per compose service.
 	Services []BaselineService
+	// TopLevel is the recorded top-level sections — volumes, networks, and any other key
+	// besides services and `x-` extensions — each compared byte-exact like a service with
+	// no image rule. Empty means the manifest may have none: a section nobody recorded is
+	// a mismatch, never a pass (see TopLevelBlock for why the sections matter).
+	TopLevel []BaselineTopLevel
+}
+
+// BaselineTopLevel is one recorded top-level section.
+type BaselineTopLevel struct {
+	// Key is the top-level key.
+	Key string
+	// Block is the recorded canonical text of its value.
+	Block string
 }
 
 // ComposeBaseline is every recorded deployment.
@@ -167,6 +180,14 @@ type deploymentFile struct {
 	Contract  string                `json:"contract"`
 	Providers []string              `json:"providers"`
 	Services  []baselineServiceFile `json:"services"`
+	TopLevel  []topLevelFile        `json:"top_level"`
+}
+
+type topLevelFile struct {
+	Key string `json:"key"`
+	// Note is the audit record for the section; never read.
+	Note  []string `json:"note"`
+	Block []string `json:"block"`
 }
 
 type baselineServiceFile struct {
@@ -289,6 +310,9 @@ func ParseComposeBaseline(raw []byte) (ComposeBaseline, error) {
 			return ComposeBaseline{}, err
 		}
 		dep.Services = svcs
+		if dep.TopLevel, err = parseTopLevel(label, d.TopLevel); err != nil {
+			return ComposeBaseline{}, err
+		}
 		out.Deployments = append(out.Deployments, dep)
 	}
 	return out, nil
@@ -339,6 +363,37 @@ func parseServices(deployment string, entries []baselineServiceFile) ([]Baseline
 			}
 		}
 		out = append(out, svc)
+	}
+	return out, nil
+}
+
+// parseTopLevel validates and reduces one deployment's top-level sections.
+func parseTopLevel(deployment string, entries []topLevelFile) ([]BaselineTopLevel, error) {
+	out := make([]BaselineTopLevel, 0, len(entries))
+	seen := map[string]bool{}
+	for i, e := range entries {
+		key := strings.TrimSpace(e.Key)
+		label := fmt.Sprintf("%s/top_level %d", deployment, i+1)
+		switch {
+		case key == "":
+			return nil, fmt.Errorf("compose baseline %s: key is required", label)
+		case key == "services":
+			return nil, fmt.Errorf("compose baseline %s: services is recorded per service, under services", label)
+		case strings.HasPrefix(key, "x-"):
+			return nil, fmt.Errorf("compose baseline %s: %s is an extension field, which is not compared — "+
+				"its anchors are already expanded into the services that use them", label, key)
+		case seen[key]:
+			return nil, fmt.Errorf("compose baseline %s: %s is listed twice", label, key)
+		case len(e.Block) == 0:
+			return nil, fmt.Errorf("compose baseline %s: block is required; a section with no recorded text "+
+				"would accept any declaration", label)
+		}
+		seen[key] = true
+		block, err := canonicalizeText([]byte(strings.Join(e.Block, "\n")+"\n"), "the top-level "+key+" section")
+		if err != nil {
+			return nil, fmt.Errorf("compose baseline %s: block does not reduce: %w", label, err)
+		}
+		out = append(out, BaselineTopLevel{Key: key, Block: block})
 	}
 	return out, nil
 }
@@ -395,6 +450,8 @@ type ComposeCheck struct {
 	// Matched counts the services that matched, so a report can say "9 of 12" rather
 	// than only listing what went wrong.
 	Matched int
+	// TopExpected and TopMatched are the same two counts for the top-level sections.
+	TopExpected, TopMatched int
 }
 
 // Compared reports whether a comparison actually ran.
@@ -425,7 +482,12 @@ func (c ComposeCheck) OK() bool { return !c.Compared() || len(c.Mismatches) == 0
 //
 // rels bounds the `repository` rule: a service under it matches only when its digest is
 // a listed release (brokerreleases.json).
-func CheckCompose(b ComposeBaseline, rels BrokerReleases, contract, provider string, blocks []ServiceBlock) ComposeCheck {
+//
+// top is ComposeReview.TopLevel, compared the same way in every direction: a recorded
+// section must be present and identical, and a section the deployment does not record is
+// a mismatch — it is where a service's volumes and networks get their meaning.
+func CheckCompose(b ComposeBaseline, rels BrokerReleases, contract, provider string, blocks []ServiceBlock,
+	top []TopLevelBlock) ComposeCheck {
 	out := ComposeCheck{Configured: len(b.Deployments) > 0}
 	if !out.Configured {
 		return out
@@ -477,7 +539,40 @@ func CheckCompose(b ComposeBaseline, rels BrokerReleases, contract, provider str
 				"so it runs in the same guest as the reviewed containers without having been reviewed", "")
 		}
 	}
+	out.checkTopLevel(dep.TopLevel, top)
 	return out
+}
+
+// checkTopLevel compares the top-level sections, in every direction.
+func (c *ComposeCheck) checkTopLevel(want []BaselineTopLevel, got []TopLevelBlock) {
+	c.TopExpected = len(want)
+	observed := make(map[string]TopLevelBlock, len(got))
+	for _, g := range got {
+		observed[g.Key] = g
+	}
+	recorded := make(map[string]bool, len(want))
+	for _, w := range want {
+		recorded[w.Key] = true
+		where := "top-level " + w.Key
+		g, ok := observed[w.Key]
+		switch {
+		case !ok:
+			c.add(where, "the baseline records this section but the manifest does not have it", "")
+		case g.Err != nil:
+			c.add(where, fmt.Sprintf("the section has no canonical form, so it cannot be compared: %v", g.Err), "")
+		case g.Canonical != w.Block:
+			c.add(where, "the section differs from the baseline, so what the services' volumes or networks "+
+				"resolve to is not what was reviewed", firstDiff(w.Block, g.Canonical))
+		default:
+			c.TopMatched++
+		}
+	}
+	for _, g := range got {
+		if !recorded[g.Key] {
+			c.add("top-level "+g.Key, "the manifest has this section but the baseline does not record it, so "+
+				"what it declares was never reviewed", "")
+		}
+	}
 }
 
 // checkService compares one observed block against its baseline entry.

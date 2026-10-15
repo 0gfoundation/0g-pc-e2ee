@@ -660,7 +660,20 @@ func reportManifest(out io.Writer, pq providerQuote, opts providerOpts, contract
 	// The baseline comparison, which is the check that ADJUDICATES — printed before the
 	// review so a reader meets the verdict before the advice. It is also the only part of
 	// this section that can fail the run, and the one line here that DOES carry a mark.
-	check := evidence.CheckCompose(opts.baseline, opts.releases, contract, provider, review.Blocks)
+	// What the services are wired to: one fingerprint per top-level section, and its text
+	// under -blocks, since a deployment's record holds these too.
+	for _, t := range review.TopLevel {
+		if t.Err != nil {
+			fmt.Fprintf(out, "    top-level %-14s cannot be pinned: %v\n", t.Key, t.Err)
+			continue
+		}
+		fmt.Fprintf(out, "    top-level %-14s %s\n", t.Key, t.Digest)
+		if dumpBlocks {
+			dumpBlock(out, "", t.Canonical)
+		}
+	}
+
+	check := evidence.CheckCompose(opts.baseline, opts.releases, contract, provider, review.Blocks, review.TopLevel)
 	failed = reportBaseline(out, check, contract)
 
 	// Never a mark on the review line: a ✓ or ✗ would read as a verdict, and the review
@@ -715,12 +728,13 @@ func reportBaseline(out io.Writer, check evidence.ComposeCheck, contract string)
 			"contract %s; see client/evidence/brokercompose.json)\n", contract)
 		return false
 	case check.OK():
-		fmt.Fprintf(out, "%s baseline         all %d service(s) match the recorded deployment %q\n",
-			mark(true), check.Matched, check.Deployment)
+		fmt.Fprintf(out, "%s baseline         all %d service(s) and %d top-level section(s) match the recorded "+
+			"deployment %q\n", mark(true), check.Matched, check.TopMatched, check.Deployment)
 		return false
 	}
-	fmt.Fprintf(out, "%s baseline         %d of %d service(s) match the recorded deployment %q; %d mismatch(es)\n",
-		mark(false), check.Matched, check.Expected, check.Deployment, len(check.Mismatches))
+	fmt.Fprintf(out, "%s baseline         %d of %d service(s) and %d of %d top-level section(s) match the "+
+		"recorded deployment %q; %d mismatch(es)\n", mark(false), check.Matched, check.Expected,
+		check.TopMatched, check.TopExpected, check.Deployment, len(check.Mismatches))
 	for _, m := range check.Mismatches {
 		where := m.Service
 		if where == "" {

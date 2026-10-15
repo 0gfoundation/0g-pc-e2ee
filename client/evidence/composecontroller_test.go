@@ -1,8 +1,6 @@
 package evidence
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -247,18 +245,10 @@ func TestControllerException_CoversOnlyTheDirectDockerBind(t *testing.T) {
 // The real deployments. testnet runs v0.5.4 and meets every condition; cn-20 runs v0.5.1,
 // and its finding stays blocking and says so.
 func TestControllerException_OnTheRecordedDeployments(t *testing.T) {
-	load := func(name string) ComposeReview {
-		t.Helper()
-		doc, err := os.ReadFile(filepath.Join("testdata", name))
-		if err != nil {
-			t.Fatal(err)
-		}
-		return reviewOf(t, manifest(string(doc)))
-	}
 	if f := dockerSockFinding(t, reviewTestnet(t), "0g-controller"); f.Severity != SeverityJustify {
 		t.Errorf("testnet: severity %s:\n%s", f.Severity, f.Detail)
 	}
-	f := dockerSockFinding(t, load("cn20-services.yml"), "0g-controller")
+	f := dockerSockFinding(t, reviewCN20(t), "0g-controller")
 	if f.Severity != SeverityBlocking || !strings.Contains(f.Detail, "not a listed release") {
 		t.Errorf("cn-20: severity %s:\n%s", f.Severity, f.Detail)
 	}

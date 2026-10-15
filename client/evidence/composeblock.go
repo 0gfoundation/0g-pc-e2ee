@@ -373,9 +373,63 @@ func digestOf(s string) string {
 // reader and reduced by one renderer; two of either would be two definitions of "the same
 // block". So the text goes through readAsCompose, exactly as a manifest does.
 func CanonicalizeServiceBlock(blockText []byte) (string, error) {
-	n, err := readAsCompose(blockText, "the service block")
+	return canonicalizeText(blockText, "the service block")
+}
+
+// canonicalizeText reads recorded YAML as docker compose would and renders it.
+func canonicalizeText(text []byte, what string) (string, error) {
+	n, err := readAsCompose(text, what)
 	if err != nil {
 		return "", err
 	}
 	return renderCanonical(n)
+}
+
+// TopLevelBlock is one top-level section of the compose text other than services —
+// volumes, networks, secrets, configs, a project name — in the canonical form a baseline
+// records it in.
+//
+// WHY THE BASELINE NEEDS THEM. A service block says `- cert-data:/certs`; what cert-data
+// IS lives up here. A provider that changed only the declaration —
+// `cert-data: {driver_opts: {type: nfs, o: addr=…, device: :/x}}` — left every service
+// block byte-identical while moving the ingress's TLS key, the database and the broker's
+// config onto a machine outside the TEE, and a baseline of service blocks alone matched it
+// in full. A deployment is its services AND what they are wired to.
+//
+// `x-` sections are left out. They are compose's extension fields: docker compose runs
+// nothing from them, and by the time a block is rendered every anchor they held has been
+// expanded into the services that used it — where the comparison already sees it.
+type TopLevelBlock struct {
+	// Key is the top-level key, as written.
+	Key string
+	// Canonical is the section's value in canonical form; Digest is sha256 over it.
+	Canonical string
+	Digest    string
+	// Err is set when the section has no canonical form.
+	Err error
+}
+
+// topLevelBlocks renders every top-level section except services and `x-` extensions,
+// in file order. top must be the resolved document (readComposeDocument); each value is
+// copied before rendering, since rendering normalizes in place.
+func topLevelBlocks(top *yaml.Node) []TopLevelBlock {
+	var out []TopLevelBlock
+	for i := 0; i+1 < len(top.Content); i += 2 {
+		key := top.Content[i].Value
+		if key == "services" || strings.HasPrefix(key, "x-") {
+			continue
+		}
+		b := TopLevelBlock{Key: key}
+		v, err := resolveAnchors(top.Content[i+1])
+		if err == nil {
+			b.Canonical, err = renderCanonical(v)
+		}
+		if err != nil {
+			b.Canonical, b.Err = "", err
+		} else {
+			b.Digest = digestOf(b.Canonical)
+		}
+		out = append(out, b)
+	}
+	return out
 }

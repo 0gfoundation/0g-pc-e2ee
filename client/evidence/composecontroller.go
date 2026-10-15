@@ -14,6 +14,15 @@ package evidence
 // it blocking on every deployment would teach readers to skim past the one finding that
 // matters most when it appears anywhere else.
 //
+// WHAT THE CONFIG FILE CAN AND CANNOT DO. The controller also reads a config file
+// (CONFIG_FILE), which the provider supplies — broker-config-init decodes it from the
+// deployment's environment — and which the controller's own API rewrites at runtime. In
+// v0.5.4 it cannot loosen the container-creation gate: that reads only the controller's
+// environment (ctrl.go: os.Getenv(EnginesEnvVar) == "on"), which this exception pins. It
+// DOES name controller.imageRepo, the repository image swaps pull from, so "repo@digest"
+// is a repository of the provider's choosing; only an RTMR3 replay against the release
+// list bounds what broker and event run after boot. The justification says so.
+//
 // WHY JUSTIFY AND NOT SILENCE. Those limits are the controller's CODE at a particular
 // digest. This review reads a manifest; it cannot see code, and it does not adjudicate.
 // So the finding stays, at Justify, saying what it rests on — and on any build the
@@ -95,12 +104,15 @@ func (r *ComposeReview) justifyControllerRuntimeSocket(name string, body *yaml.N
 		r.Findings[i].Detail += fmt.Sprintf(". JUSTIFIED rather than blocking: this is 0G's controller at listed "+
 			"release %s, running as %s, with no service keys, environment variables or healthcheck beyond the "+
 			"ones the exception covers (so no entrypoint override, privileges, capabilities, devices, host "+
-			"namespaces, env_file or second program), nothing docker compose interpolates, no host path beyond "+
-			"the docker and guest-agent sockets, and %s absent — the conditions under "+
-			"which broker #759 limits what it does with the socket (no new container; an image swap only as "+
-			"repo@digest for broker and event, recorded in RTMR3 first; the full list is the broker repository's "+
-			"doc/controller-design.md §3.4). Those limits are the controller's code at this digest: this review "+
-			"cannot see them, and they do not hold on any other build",
+			"namespaces, env_file or second program), nothing interpolated in its own service, no host path "+
+			"beyond the docker and guest-agent sockets, and %s absent — the conditions under which broker #759 "+
+			"limits what it does with the socket: no new container (gated on that variable alone), and an image "+
+			"swap only as repo@digest for broker and event, recorded in RTMR3 first (the full list is the broker "+
+			"repository's doc/controller-design.md §3.4). The repository in that swap is controller.imageRepo "+
+			"from the controller's config file, which the provider supplies (written by broker-config-init) and "+
+			"can rewrite at runtime, so which images broker and event run after boot is bounded only by replaying "+
+			"RTMR3 against the release list — not by this review. Those limits are the controller's code at this "+
+			"digest: this review cannot see them, and they do not hold on any other build",
 			rel.Version, controllerCommand, controllerEnginesEnv)
 	}
 }

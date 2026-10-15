@@ -252,6 +252,10 @@ type ComposeReview struct {
 	// blocks separately would either re-run the gate or skip it, and only one of those
 	// is merely wasteful.
 	Blocks []ServiceBlock
+	// TopLevel is every top-level section other than services and `x-` extensions, in
+	// canonical form, in file order — what the services' volumes and networks resolve to.
+	// The baseline compares it alongside Blocks (see TopLevelBlock).
+	TopLevel []TopLevelBlock
 	// Findings is sorted most-severe first, then by service and key, so two runs over
 	// one manifest print identically.
 	Findings []Finding
@@ -692,6 +696,7 @@ func (r *ComposeReview) reviewComposeText(doc []byte) {
 				"the compose hash does not commit to it — what actually runs is not described by the measured manifest")
 	}
 
+	r.TopLevel = topLevelBlocks(top)
 	volumes := r.reviewTopLevelVolumes(mapValue(top, "volumes"))
 	r.reviewFileSources(mapValue(top, "secrets"), "secrets")
 	r.reviewFileSources(mapValue(top, "configs"), "configs")
