@@ -12,9 +12,15 @@ package evidence
 // a type — ComposeMismatch is not a Finding, and no severity is attached to it, because
 // there is nothing to rank: either the deployment is what we approved or it is not.
 //
-// The shape follows OSImageCheck exactly (Configured / OK / an unconfigured check is OK
-// but must be disclosed), because it answers the same question one layer down and an
-// operator reading a report should not have to learn a second vocabulary for it.
+// The shape follows OSImageCheck (Configured / OK / an unconfigured check is OK but must
+// be disclosed), because it answers the same question one layer down and an operator
+// reading a report should not have to learn a second vocabulary for it — with one layer
+// OSImageCheck does not need. A fleet runs several deployments, so a baseline records
+// several, each keyed by the providers that run it; and a provider with NO recorded
+// deployment is a third state beside "matches" and "differs". It is reported as not
+// compared, never as a failure: a deployment nobody reviewed is unverified, not refuted,
+// and treating the two alike made six healthy providers out of seven exit 1 on the
+// 2026-10-10 sweep for the sole reason that nobody had recorded them yet.
 
 import (
 	"bytes"
@@ -47,10 +53,57 @@ type BaselineService struct {
 	Block string
 	// Image is how much the image is allowed to move. A ZERO VALUE means the recorded
 	// Block above pins it as written — a digest, a bare tag, or no image at all,
-	// whichever the recorded text says — which is how nine of the twelve recorded
-	// services stand; the other three run 0G's own broker image, whose release cadence
-	// is the one case a recorded text cannot express. See ImageRule.
+	// whichever the recorded text says — which is how every service stands except the
+	// ones running 0G's own broker image, whose release cadence is the one case a
+	// recorded text cannot express. See ImageRule.
 	Image ImageRule
+}
+
+// Deployment is one recorded deployment: the services its manifest must contain, and
+// the providers that run it.
+//
+// Keyed by provider ADDRESS and the CONTRACT that registers it, not by compose_hash.
+// compose_hash moves on any edit to the app-compose, including ones that change nothing
+// about what runs (cn-1 and cn-4 differ only in the app-compose `name`, and their
+// service blocks are byte-identical), and a key that moves on every edit would make the
+// baseline describe the edit history rather than the deployment. The contract is part
+// of the key because an operator may reuse one key on testnet and mainnet, and the same
+// address can then run two different deployments.
+type Deployment struct {
+	// Name labels the deployment in reports. Unique within a baseline.
+	Name string
+	// Contract is the InferenceServing contract the providers are registered on,
+	// lowercased.
+	Contract string
+	// Providers are the provider addresses that run this deployment, lowercased. More
+	// than one when several registrations share an enclave (cn-39 and cn-40 are one
+	// CVM) or share an identical manifest.
+	Providers []string
+	// Services is the recorded manifest, one entry per compose service.
+	Services []BaselineService
+}
+
+// ComposeBaseline is every recorded deployment.
+type ComposeBaseline struct {
+	Deployments []Deployment
+}
+
+// For returns the deployment recorded for a provider on a contract. Addresses compare
+// case-insensitively, since the chain and the operator may spell them in EIP-55 or in
+// lowercase.
+func (b ComposeBaseline) For(contract, provider string) (Deployment, bool) {
+	c, p := normAddr(contract), normAddr(provider)
+	for _, d := range b.Deployments {
+		if d.Contract != c {
+			continue
+		}
+		for _, x := range d.Providers {
+			if x == p {
+				return d, true
+			}
+		}
+	}
+	return Deployment{}, false
 }
 
 // ImageRule is how much an image is allowed to move, and it has exactly one setting
@@ -69,13 +122,16 @@ type BaselineService struct {
 // tag, or no image at all, whichever the recorded text says. Repository is the one case
 // the text cannot express.
 type ImageRule struct {
-	// Repository accepts any DIGEST-PINNED image in this repository, and switches the
-	// block comparison to the image-held-out form so the reference is not pinned twice.
+	// Repository accepts any RELEASED build of this repository — a digest listed in
+	// brokerreleases.json — and switches the block comparison to the image-held-out form
+	// so the reference is not pinned twice.
 	//
 	// It exists for one case: an image whose release cadence would otherwise force a
-	// gateway release per broker release. cn-20 runs 0G's own broker image in three
-	// services, and it moves on every broker ship. It knowingly accepts an older official
-	// build — a risk taken deliberately, to be closed by a denylist later.
+	// gateway release per broker release. Every deployment runs 0G's own broker image in
+	// three services, and it moves on every broker ship. It first accepted any
+	// digest-pinned image in the repository, which turned out to be no bound at all: of the
+	// four broker digests the 2026-10-10 sweep found, two were pointed at by no release tag
+	// when the registry was checked on 2026-10-15. The release list is the bound.
 	Repository string
 }
 
@@ -95,43 +151,59 @@ func (r ImageRule) pinsImageInBlock() bool { return r.Repository == "" }
 type composeBaselineFile struct {
 	// Comment is the file's own header. Declared so the decode can reject unknown keys
 	// while the file keeps explaining itself; never read.
-	Comment  []string `json:"_comment"`
-	Services []struct {
-		Name string `json:"name"`
-		// Note is the audit record for one entry — why it is recorded as it stands, and
-		// what the review says about it. Declared, never read: a justification that
-		// changed the comparison would be a rule, and rules belong in code where they can
-		// be tested. It sits next to the entry rather than in the header so a renamed or
-		// deleted service takes its justification with it.
-		Note  []string `json:"note"`
-		Block []string `json:"block"`
-		Image *struct {
-			Repository string `json:"repository"`
-			// Accepted only to be REJECTED with an explanation. An author reaching for
-			// these has a reasonable model of the format that this one does not use, and
-			// silently ignoring an unknown key would give them a baseline that pins less
-			// than they wrote.
-			Digest    string `json:"digest"`
-			Reference string `json:"reference"`
-		} `json:"image"`
-	} `json:"services"`
+	Comment     []string         `json:"_comment"`
+	Deployments []deploymentFile `json:"deployments"`
+	// Services at the TOP level is the format before deployments existed. Declared only
+	// so a file in that shape is refused with directions rather than with "unknown
+	// field": candidates written against the old format are in people's hands, and the
+	// fix is mechanical once someone says what it is.
+	Services json.RawMessage `json:"services"`
+}
+
+type deploymentFile struct {
+	Name string `json:"name"`
+	// Note is the audit record for the deployment as a whole; never read.
+	Note      []string              `json:"note"`
+	Contract  string                `json:"contract"`
+	Providers []string              `json:"providers"`
+	Services  []baselineServiceFile `json:"services"`
+}
+
+type baselineServiceFile struct {
+	Name string `json:"name"`
+	// Note is the audit record for one entry — why it is recorded as it stands, and
+	// what the review says about it. Declared, never read: a justification that
+	// changed the comparison would be a rule, and rules belong in code where they can
+	// be tested. It sits next to the entry rather than in the header so a renamed or
+	// deleted service takes its justification with it.
+	Note  []string `json:"note"`
+	Block []string `json:"block"`
+	Image *struct {
+		Repository string `json:"repository"`
+		// Accepted only to be REJECTED with an explanation. An author reaching for
+		// these has a reasonable model of the format that this one does not use, and
+		// silently ignoring an unknown key would give them a baseline that pins less
+		// than they wrote.
+		Digest    string `json:"digest"`
+		Reference string `json:"reference"`
+	} `json:"image"`
 }
 
 // BuiltinComposeBaseline returns the embedded baseline. An error means the embedded file
 // is malformed, which is a build-time mistake in this repository rather than anything
 // about the deployment being verified — callers must surface it rather than degrade to
 // "not configured", which would silently drop the check.
-func BuiltinComposeBaseline() ([]BaselineService, error) {
+func BuiltinComposeBaseline() (ComposeBaseline, error) {
 	const file = "brokercompose.json"
 	raw, err := composeBaselineFS.ReadFile(file)
 	if err != nil {
-		return nil, fmt.Errorf("read embedded compose baseline: %w", err)
+		return ComposeBaseline{}, fmt.Errorf("read embedded compose baseline: %w", err)
 	}
-	svcs, err := ParseComposeBaseline(raw)
+	b, err := ParseComposeBaseline(raw)
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", file, err)
+		return ComposeBaseline{}, fmt.Errorf("%s: %w", file, err)
 	}
-	return svcs, nil
+	return b, nil
 }
 
 // ParseComposeBaseline decodes a baseline, REDUCING each recorded block through the same
@@ -151,33 +223,94 @@ func BuiltinComposeBaseline() ([]BaselineService, error) {
 // "block", or an image rule spelled "repo". A baseline that pins less than its author
 // wrote is the one failure mode this format cannot tolerate, since the whole file exists
 // to be trusted without being re-derived.
-func ParseComposeBaseline(raw []byte) ([]BaselineService, error) {
+func ParseComposeBaseline(raw []byte) (ComposeBaseline, error) {
 	var f composeBaselineFile
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&f); err != nil {
-		return nil, fmt.Errorf("compose baseline is not valid JSON: %w", err)
+		return ComposeBaseline{}, fmt.Errorf("compose baseline is not valid JSON: %w", err)
 	}
 	// A Decoder stops at the end of the first value, where json.Unmarshal would have
 	// rejected what followed. Restore that: a second object in the file means the
 	// author's edits may be sitting in the half nothing decoded.
 	if dec.More() {
-		return nil, fmt.Errorf("compose baseline is not valid JSON: trailing content after the first object")
+		return ComposeBaseline{}, fmt.Errorf("compose baseline is not valid JSON: trailing content after the first object")
 	}
-	out := make([]BaselineService, 0, len(f.Services))
-	seen := make(map[string]bool, len(f.Services))
-	for i, e := range f.Services {
+	if f.Services != nil {
+		return ComposeBaseline{}, fmt.Errorf("compose baseline has a top-level \"services\" list, which is " +
+			"the format before deployments existed. Wrap it: {\"deployments\": [{\"name\": ..., " +
+			"\"contract\": \"0x...\", \"providers\": [\"0x...\"], \"services\": [...]}]} — a recorded " +
+			"manifest has to say which providers run it")
+	}
+
+	var out ComposeBaseline
+	names := map[string]bool{}
+	owner := map[string]string{} // contract/provider -> deployment name
+	for i, d := range f.Deployments {
+		label := strings.TrimSpace(d.Name)
+		if label == "" {
+			return ComposeBaseline{}, fmt.Errorf("compose baseline deployment %d: name is required", i+1)
+		}
+		if names[label] {
+			return ComposeBaseline{}, fmt.Errorf("compose baseline: deployment %q is listed twice", label)
+		}
+		names[label] = true
+
+		dep := Deployment{Name: label}
+		if !isAddress(d.Contract) {
+			return ComposeBaseline{}, fmt.Errorf("compose baseline deployment %q: contract %q is not a "+
+				"0x-prefixed 20-byte address", label, d.Contract)
+		}
+		dep.Contract = normAddr(d.Contract)
+		if len(d.Providers) == 0 {
+			return ComposeBaseline{}, fmt.Errorf("compose baseline deployment %q: providers is required; a "+
+				"deployment no provider runs can never be compared", label)
+		}
+		for _, p := range d.Providers {
+			if !isAddress(p) {
+				return ComposeBaseline{}, fmt.Errorf("compose baseline deployment %q: provider %q is not a "+
+					"0x-prefixed 20-byte address", label, p)
+			}
+			key := dep.Contract + "/" + normAddr(p)
+			if prev, ok := owner[key]; ok {
+				// One provider in two deployments would make the comparison depend on
+				// which one the lookup reached first.
+				return ComposeBaseline{}, fmt.Errorf("compose baseline: provider %s on contract %s is listed "+
+					"in both %q and %q", p, d.Contract, prev, label)
+			}
+			owner[key] = label
+			dep.Providers = append(dep.Providers, normAddr(p))
+		}
+		if len(d.Services) == 0 {
+			return ComposeBaseline{}, fmt.Errorf("compose baseline deployment %q: services is required", label)
+		}
+		svcs, err := parseServices(label, d.Services)
+		if err != nil {
+			return ComposeBaseline{}, err
+		}
+		dep.Services = svcs
+		out.Deployments = append(out.Deployments, dep)
+	}
+	return out, nil
+}
+
+// parseServices validates and reduces one deployment's services.
+func parseServices(deployment string, entries []baselineServiceFile) ([]BaselineService, error) {
+	out := make([]BaselineService, 0, len(entries))
+	seen := make(map[string]bool, len(entries))
+	for i, e := range entries {
 		label := e.Name
 		if label == "" {
 			label = fmt.Sprintf("entry %d", i+1)
 		}
+		label = deployment + "/" + label
 		if strings.TrimSpace(e.Name) == "" {
 			return nil, fmt.Errorf("compose baseline %s: name is required", label)
 		}
 		if seen[e.Name] {
 			// Two entries for one service would make the match depend on which one the
 			// comparison happened to reach.
-			return nil, fmt.Errorf("compose baseline: %s is listed twice", e.Name)
+			return nil, fmt.Errorf("compose baseline: %s is listed twice", label)
 		}
 		seen[e.Name] = true
 
@@ -198,8 +331,8 @@ func ParseComposeBaseline(raw []byte) ([]BaselineService, error) {
 			case strings.TrimSpace(e.Image.Digest) != "" || strings.TrimSpace(e.Image.Reference) != "":
 				return nil, fmt.Errorf("compose baseline %s: image sets digest or reference, which this "+
 					"format does not have — the recorded block already contains the image line and pins "+
-					"the reference exactly. Use image.repository only to let the image MOVE within a "+
-					"repository, and record the image-held-out block for it", label)
+					"the reference exactly. Use image.repository only to let the image MOVE between "+
+					"released builds, and record the image-held-out block for it", label)
 			case svc.Image.Repository == "":
 				return nil, fmt.Errorf("compose baseline %s: image is present but states no repository; "+
 					"omit it entirely to let the block pin the image", label)
@@ -209,6 +342,23 @@ func ParseComposeBaseline(raw []byte) ([]BaselineService, error) {
 	}
 	return out, nil
 }
+
+// isAddress reports whether s is a 0x-prefixed 20-byte hex address, in any case.
+func isAddress(s string) bool {
+	s = strings.TrimSpace(s)
+	if len(s) != 42 || !strings.HasPrefix(s, "0x") {
+		return false
+	}
+	for _, c := range s[2:] {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+// normAddr is the comparison form of an address.
+func normAddr(s string) string { return strings.ToLower(strings.TrimSpace(s)) }
 
 // ComposeMismatch is one reason a manifest is not the baseline.
 type ComposeMismatch struct {
@@ -224,23 +374,35 @@ type ComposeMismatch struct {
 
 // ComposeCheck is the result of comparing an authenticated manifest against the baseline.
 type ComposeCheck struct {
-	// Configured reports whether the baseline held any entry. When false the comparison
-	// did not run: the claim it grounds is unavailable, not refuted — so it does not fail
-	// a report, but every summary must say so. Enforce mode treats it as a refusal
-	// naming the unfinished configuration, the same way an unconfigured boot-chain
-	// allowlist does.
+	// Configured reports whether the baseline held any deployment. When false the
+	// comparison did not run: the claim it grounds is unavailable, not refuted — so it
+	// does not fail a report, but every summary must say so. Enforce mode treats it as a
+	// refusal naming the unfinished configuration, the same way an unconfigured
+	// boot-chain allowlist does.
 	Configured bool
-	// Mismatches is why the manifest is not the baseline. Empty, with Configured, means
-	// it is.
+	// Recorded reports whether a deployment is recorded for this provider. When false
+	// (with Configured) the comparison did not run either, for the same reason and with
+	// the same consequence: nobody reviewed this deployment, which is not the same claim
+	// as "this deployment differs from the one we reviewed".
+	Recorded bool
+	// Deployment names the recorded deployment the manifest was compared against.
+	Deployment string
+	// Expected counts the services that deployment records.
+	Expected int
+	// Mismatches is why the manifest is not the recorded deployment. Empty, with
+	// Compared, means it is.
 	Mismatches []ComposeMismatch
 	// Matched counts the services that matched, so a report can say "9 of 12" rather
 	// than only listing what went wrong.
 	Matched int
 }
 
-// OK reports whether the manifest is acceptable. An unconfigured baseline is OK: the
-// check is unavailable, and the caller's summary is where that is disclosed.
-func (c ComposeCheck) OK() bool { return !c.Configured || len(c.Mismatches) == 0 }
+// Compared reports whether a comparison actually ran.
+func (c ComposeCheck) Compared() bool { return c.Configured && c.Recorded }
+
+// OK reports whether the manifest is acceptable. A comparison that did not run is OK:
+// the check is unavailable, and the caller's summary is where that is disclosed.
+func (c ComposeCheck) OK() bool { return !c.Compared() || len(c.Mismatches) == 0 }
 
 // CheckCompose compares an authenticated manifest's blocks against the baseline.
 //
@@ -255,11 +417,25 @@ func (c ComposeCheck) OK() bool { return !c.Configured || len(c.Mismatches) == 0
 // symmetric — a listed service that is absent is a different deployment (dropping the
 // controller that holds the guest-agent socket changes what the CVM does), and a service
 // present twice makes what runs depend on how the runtime resolves a duplicate key.
-func CheckCompose(baseline []BaselineService, blocks []ServiceBlock) ComposeCheck {
-	out := ComposeCheck{Configured: len(baseline) > 0}
+//
+// The provider's deployment is looked up by contract and provider address first. None
+// recorded is reported as not compared rather than as a mismatch against some other
+// deployment: comparing cn-1 against cn-20's record would list twelve differences that
+// say nothing except that nobody recorded cn-1.
+//
+// rels bounds the `repository` rule: a service under it matches only when its digest is
+// a listed release (brokerreleases.json).
+func CheckCompose(b ComposeBaseline, rels BrokerReleases, contract, provider string, blocks []ServiceBlock) ComposeCheck {
+	out := ComposeCheck{Configured: len(b.Deployments) > 0}
 	if !out.Configured {
 		return out
 	}
+	dep, ok := b.For(contract, provider)
+	if !ok {
+		return out
+	}
+	out.Recorded, out.Deployment, out.Expected = true, dep.Name, len(dep.Services)
+	baseline := dep.Services
 
 	// Observed services by name, and the duplicates, in one pass. Blocks arrive in file
 	// order and a name may repeat, which is itself a mismatch rather than a lookup
@@ -287,7 +463,7 @@ func CheckCompose(baseline []BaselineService, blocks []ServiceBlock) ComposeChec
 			continue
 		}
 		before := len(out.Mismatches)
-		out.checkService(want, got)
+		out.checkService(want, got, rels)
 		if len(out.Mismatches) == before {
 			out.Matched++
 		}
@@ -303,7 +479,7 @@ func CheckCompose(baseline []BaselineService, blocks []ServiceBlock) ComposeChec
 }
 
 // checkService compares one observed block against its baseline entry.
-func (c *ComposeCheck) checkService(want BaselineService, got ServiceBlock) {
+func (c *ComposeCheck) checkService(want BaselineService, got ServiceBlock, rels BrokerReleases) {
 	if !got.Pinnable() {
 		c.add(want.Name, fmt.Sprintf("the service has no canonical form, so it cannot be compared: %v", got.Err), "")
 		return
@@ -321,28 +497,64 @@ func (c *ComposeCheck) checkService(want BaselineService, got ServiceBlock) {
 		c.add(want.Name, "the service block differs from the baseline", firstDiff(want.Block, observed))
 		return
 	}
-	c.checkImage(want, got)
+	c.checkImage(want, got, rels)
 }
 
 // checkImage applies the image rule, which only a repository rule has: every other case
 // is already settled by the block comparison, which included the image line.
-func (c *ComposeCheck) checkImage(want BaselineService, got ServiceBlock) {
+func (c *ComposeCheck) checkImage(want BaselineService, got ServiceBlock, rels BrokerReleases) {
 	if want.Image.pinsImageInBlock() {
 		return
 	}
 	repo, _, digest := compose.SplitImageRef(got.ImageRef)
 	switch {
 	case !isDigestShaped(digest):
-		// The rule accepts any image in the repository ONLY when it is pinned by content.
-		// Without that it accepts a tag, whose contents the registry can republish after
-		// the measurement, so "any image in our repository" would mean "whatever is there
-		// now".
-		c.add(want.Name, fmt.Sprintf("the image is %s; the baseline accepts any image in %s but "+
-			"only pinned by digest", describeRef(got.ImageRef), want.Image.Repository), "")
+		// The rule accepts a release ONLY when it is pinned by content. Without that it
+		// accepts a tag, whose contents the registry can republish after the measurement,
+		// so "a release of our repository" would mean "whatever is there now".
+		c.add(want.Name, fmt.Sprintf("the image is %s; the baseline accepts a released build of %s, "+
+			"which has to be pinned by digest", describeRef(got.ImageRef), want.Image.Repository), "")
 	case repo != want.Image.Repository:
 		c.add(want.Name, fmt.Sprintf("the image is in %s; the baseline accepts only %s",
 			repo, want.Image.Repository), "")
+	case rels.Repository != want.Image.Repository:
+		c.add(want.Name, fmt.Sprintf("the baseline accepts released builds of %s, but the release list "+
+			"covers %s, so no build of it can be accepted", want.Image.Repository, describeRepo(rels.Repository)), "")
+	default:
+		if _, ok := rels.Lookup(repo, digest); !ok {
+			c.add(want.Name, fmt.Sprintf("the image is %s@%s, which is not a listed release of %s "+
+				"(brokerreleases.json lists %s)", repo, shortDigest(digest), repo, listedVersions(rels)), "")
+		}
 	}
+}
+
+// describeRepo names a repository for a mismatch line, saying plainly when there is none.
+func describeRepo(r string) string {
+	if r == "" {
+		return "no repository"
+	}
+	return r
+}
+
+// shortDigest abbreviates a digest for a report line; the full value is in the
+// fingerprint section of the same report.
+func shortDigest(d string) string {
+	if len(d) > len("sha256:")+12 {
+		return d[:len("sha256:")+12] + "…"
+	}
+	return d
+}
+
+// listedVersions renders the release list's versions for a mismatch line.
+func listedVersions(r BrokerReleases) string {
+	if len(r.Releases) == 0 {
+		return "none"
+	}
+	vs := make([]string, len(r.Releases))
+	for i, rel := range r.Releases {
+		vs[i] = rel.Version
+	}
+	return strings.Join(vs, ", ")
 }
 
 func (c *ComposeCheck) add(service, reason, diff string) {
