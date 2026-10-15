@@ -1,0 +1,18 @@
+{
+  "documents": 1,
+  "model": {
+    "services": {
+      "app": {
+        "command": "serve",
+        "image": "ghcr.io/example/app:1",
+        "read_only": true,
+        "restart": "always"
+      }
+    },
+    "x-base": {
+      "image": "ghcr.io/example/app:1",
+      "read_only": true,
+      "restart": "always"
+    }
+  }
+}

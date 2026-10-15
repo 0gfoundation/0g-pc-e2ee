@@ -433,9 +433,13 @@ func TestCheckCompose_ChecksEveryDirection(t *testing.T) {
 		}
 	})
 
+	// docker compose refuses a file that declares a service twice, and so does the review
+	// (composedoc.go), so no manifest produces this list any more. CheckCompose refuses
+	// it on its own all the same, so the guarantee does not rest on its caller.
 	t.Run("the same service declared twice", func(t *testing.T) {
-		doc := "services:\n  mysql:\n    " + pinned + "\n  mysql:\n    image: redis@" + digestA + "\n"
-		got := check(oneEntry(), reviewOf(t, manifest(doc)).Blocks)
+		blocks := append(reviewOf(t, manifest("services:\n  mysql:\n    "+pinned+"\n")).Blocks,
+			reviewOf(t, manifest("services:\n  mysql:\n    image: redis@"+digestA+"\n")).Blocks...)
+		got := check(oneEntry(), blocks)
 		if got.OK() {
 			t.Fatal("a duplicate service name matched")
 		}

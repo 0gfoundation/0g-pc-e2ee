@@ -1,0 +1,9 @@
+# !override changes nothing within one file, except that a tagged scalar is no longer
+# resolved: !override true decodes as the string "true".
+x-base: &base {user: root, environment: {A: "1"}}
+services:
+  app:
+    image: app
+    <<: *base
+    environment: !override {B: "2"}
+    read_only: !override true

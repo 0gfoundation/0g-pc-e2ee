@@ -1,0 +1,21 @@
+{
+  "documents": 1,
+  "model": {
+    "services": {
+      "app": {
+        "image": "app",
+        "network_mode": "host",
+        "restart": "always",
+        "user": "a"
+      }
+    },
+    "x-a": {
+      "restart": "always",
+      "user": "a"
+    },
+    "x-b": {
+      "network_mode": "host",
+      "user": "b"
+    }
+  }
+}

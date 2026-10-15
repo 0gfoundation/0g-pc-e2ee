@@ -1,0 +1,20 @@
+{
+  "documents": 1,
+  "model": {
+    "services": {
+      "app": {
+        "cap_add": [
+          "SYS_ADMIN"
+        ],
+        "image": "app",
+        "privileged": true
+      }
+    },
+    "x-base": {
+      "cap_add": [
+        "SYS_ADMIN"
+      ],
+      "privileged": true
+    }
+  }
+}

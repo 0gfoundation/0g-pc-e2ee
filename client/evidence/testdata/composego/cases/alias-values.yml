@@ -1,0 +1,15 @@
+# Aliases of a scalar, a sequence and a mapping, and the ordinary compose idiom of a
+# shared logging block.
+x-image: &img ghcr.io/example/app@sha256:1111111111111111111111111111111111111111111111111111111111111111
+x-caps: &caps [NET_BIND_SERVICE]
+x-logging: &logging
+  driver: json-file
+  options: {max-size: 10m}
+services:
+  app:
+    image: *img
+    cap_add: *caps
+    logging: *logging
+  sidecar:
+    image: *img
+    logging: *logging

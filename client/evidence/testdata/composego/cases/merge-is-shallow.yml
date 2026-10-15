@@ -1,0 +1,8 @@
+# A merge replaces a whole value; it does not merge into a nested mapping or list.
+x-base: &base
+  environment: {A: "1", B: "2"}
+  volumes: [/data:/data]
+services:
+  app:
+    <<: *base
+    environment: {C: "3"}

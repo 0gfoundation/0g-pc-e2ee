@@ -461,10 +461,19 @@ func TestServiceBlock_HoldOutCoversKeysAndSubstrings(t *testing.T) {
 
 // A duplicate `image` key would leave the second one in the reduced form if removeKey
 // stopped at the first — leaving exactly the reference the hold-out exists to remove.
+//
+// docker compose refuses a file with a duplicate key, and so does the review, so a
+// manifest no longer reaches blockOf with one. The hold-out is still held to it directly:
+// blockOf is also how a stored baseline is reduced, and its guarantee should not depend on
+// which caller screened the input.
 func TestServiceBlock_DuplicateImageKey(t *testing.T) {
 	doc := "services:\n  svc:\n    image: mysql@sha256:" + cn20Digest +
 		"\n    restart: always\n    image: redis@sha256:" + nextDigest + "\n"
-	b := requireBlock(t, doc, "svc")
+	var root yaml.Node
+	if err := yaml.Unmarshal([]byte(doc), &root); err != nil {
+		t.Fatal(err)
+	}
+	b := blockOf("svc", mapValue(mapValue(root.Content[0], "services"), "svc"))
 	if b.Err != nil {
 		t.Fatalf("block: %v", b.Err)
 	}
@@ -476,8 +485,11 @@ func TestServiceBlock_DuplicateImageKey(t *testing.T) {
 	if strings.Contains(b.CanonicalNoImage, "redis@") {
 		t.Fatalf("the second image reference survived:\n%s", b.CanonicalNoImage)
 	}
-	// And the review reports the ambiguity, since which image runs is not stated.
-	requireFinding(t, reviewOf(t, manifest(doc)), SeverityBlocking, "svc", "image")
+	// And the review refuses the file, as docker compose does.
+	f := requireFinding(t, reviewOf(t, manifest(doc)), SeverityBlocking, "", "docker_compose_file")
+	if !strings.Contains(f.Detail, "already defined") {
+		t.Fatalf("detail does not say why: %s", f.Detail)
+	}
 }
 
 // Idempotence has to hold for the REDUCED form too, or a stored baseline would not
@@ -741,8 +753,8 @@ func TestReviewCompose_SelfReferencingAnchorIsRefusedNotCrashed(t *testing.T) {
 				t.Fatalf("a cycle produced blocks: %+v", r.Blocks)
 			}
 			f := requireFinding(t, r, SeverityBlocking, "", "docker_compose_file")
-			if !strings.Contains(f.Detail, "do not resolve") {
-				t.Fatalf("detail %q does not say the anchors could not be resolved", f.Detail)
+			if !strings.Contains(f.Detail, "contains itself") {
+				t.Fatalf("detail %q does not say the anchor contains itself", f.Detail)
 			}
 		})
 	}
@@ -986,24 +998,20 @@ func TestServiceBlocks_DoNotDisturbTheReview(t *testing.T) {
 	}
 }
 
-// The reason alignment is by construction rather than by a name lookup. A compose file
-// with the same service name twice is malformed, but yaml.v3 keeps both pairs, so a
-// lookup keyed by name would silently return one block for two services — and the one
-// it returned would describe the wrong container half the time. Positional alignment has
-// no such failure.
+// A compose file with the same service name twice used to be described service by
+// service — yaml.v3's node parser keeps both pairs — which is what made positional
+// alignment of Services and Blocks necessary rather than a lookup by name. docker compose
+// refuses such a file outright (its decoder rejects the duplicate key), so the review now
+// does too, and describes neither: a description of two services that never run is not a
+// conservative report, it is a wrong one.
 func TestServiceBlocks_DuplicateServiceNames(t *testing.T) {
 	r := reviewOf(t, manifest("services:\n  a:\n    image: mysql:8.0\n  a:\n    image: redis:7\n"))
-	if len(r.Services) != 2 || len(r.Blocks) != 2 {
-		t.Fatalf("services=%d blocks=%d, want 2 and 2", len(r.Services), len(r.Blocks))
+	if len(r.Services) != 0 || len(r.Blocks) != 0 {
+		t.Fatalf("services=%d blocks=%d, want none", len(r.Services), len(r.Blocks))
 	}
-	for i, want := range []string{"mysql:8.0", "redis:7"} {
-		if r.Services[i].Ref != want || r.Blocks[i].ImageRef != want {
-			t.Fatalf("index %d: service ref %q, block image %q, want %q",
-				i, r.Services[i].Ref, r.Blocks[i].ImageRef, want)
-		}
-	}
-	if r.Blocks[0].Digest == r.Blocks[1].Digest {
-		t.Fatal("two different bodies under one name produced the same digest")
+	f := requireFinding(t, r, SeverityBlocking, "", "docker_compose_file")
+	if !strings.Contains(f.Detail, "already defined") {
+		t.Fatalf("detail does not say why: %s", f.Detail)
 	}
 }
 

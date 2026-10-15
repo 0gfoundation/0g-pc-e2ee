@@ -1,0 +1,9 @@
+# A merge key may name a mapping written in place, not only an alias.
+services:
+  app:
+    image: app
+    <<: {privileged: true, user: root}
+    user: app
+  list:
+    image: app
+    <<: [{pid: host}, {pid: private, ipc: host}]

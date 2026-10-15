@@ -1,0 +1,14 @@
+{
+  "documents": 1,
+  "model": {
+    "services": {
+      "app": {
+        "environment": {
+          "A": "1",
+          "B": "2"
+        },
+        "image": "app"
+      }
+    }
+  }
+}

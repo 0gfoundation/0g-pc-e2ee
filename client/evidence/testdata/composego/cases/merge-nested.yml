@@ -1,0 +1,13 @@
+# An anchor that itself merges another, and a merge inside a nested mapping.
+x-root: &root {restart: always, user: root, pid: host}
+x-mid: &mid
+  <<: *root
+  user: mid
+x-log: &log {driver: json-file}
+services:
+  app:
+    image: app
+    <<: *mid
+    logging:
+      <<: *log
+      options: {max-size: 1m}

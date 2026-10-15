@@ -1,0 +1,4 @@
+{
+  "documents": 1,
+  "error": "yaml: map merge requires map or sequence of maps as the value"
+}

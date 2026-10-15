@@ -186,6 +186,15 @@ comments, indentation and quoting are dropped, everything that changes what runs
 and the image **identity** is held out separately so a broker release does not force a
 gateway release.
 
+Both the review and the blocks read the compose text **as docker compose reads it**:
+YAML anchors and merge keys resolved, compose's `!reset` / `!override` tags applied, and
+whatever docker compose's YAML reader refuses (duplicate keys, a bad merge, an alias bomb)
+refused. A file with more than one YAML document is refused too, because docker compose
+merges them all and a reader of the first would describe a deployment that does not run.
+This is held to the real loader rather than to a reading of it: the docker compose
+dstack ships (v2.26.0, compose-go v2.0.2) recorded its reading of every case in
+`evidence/testdata/composego`, and the tests compare against that.
+
 Identity rather than the `image` key, because a real manifest defeats the simpler
 version: cn-20's broker services copy the digest into an environment variable
 (`IMAGE_DIGEST=sha256:…`), so deleting the key left the copy behind and the held-out

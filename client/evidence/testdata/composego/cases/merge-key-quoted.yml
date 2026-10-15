@@ -1,0 +1,6 @@
+# Only a plain << is a merge key. A quoted one is an ordinary key named "<<".
+x-base: &base {privileged: true}
+services:
+  app:
+    image: app
+    "<<": *base

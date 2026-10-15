@@ -1,0 +1,7 @@
+# A !reset on the anchored node drops it where it is written, but the anchor still names
+# it, so aliases keep its content.
+x-base: &base !reset {user: root, pid: host}
+services:
+  app:
+    image: app
+    <<: *base

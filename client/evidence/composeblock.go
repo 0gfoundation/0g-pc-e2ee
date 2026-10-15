@@ -129,7 +129,7 @@ func (b ServiceBlock) Pinnable() bool { return b.Err == nil }
 // and styles, and the image hold-out deletes a key. The caller's tree is also read by
 // composereview.go, which walks the same nodes for its own rules — so a mutation here
 // would silently change what the review sees, in a way no test of either file alone
-// would catch. yaml.v3 has no Clone, hence cloneNode.
+// would catch. yaml.v3 has no Clone; resolveAnchors is the copy.
 func blockOf(name string, body *yaml.Node) ServiceBlock {
 	b := ServiceBlock{Name: name}
 	// Resolution IS the copy — see resolveAnchors, which always returns a fresh tree. It

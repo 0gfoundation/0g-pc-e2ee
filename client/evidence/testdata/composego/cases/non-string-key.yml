@@ -1,0 +1,5 @@
+services:
+  app:
+    image: app
+    labels:
+      1: one
