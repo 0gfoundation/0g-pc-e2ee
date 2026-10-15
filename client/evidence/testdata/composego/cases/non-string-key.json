@@ -1,4 +1,5 @@
 {
   "documents": 1,
-  "error": "Non-string key in services.app.labels: 1"
+  "error": "Non-string key in services.app.labels: 1",
+  "load_error": "Non-string key in services.app.labels: 1"
 }

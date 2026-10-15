@@ -6,5 +6,6 @@
         "image": "app"
       }
     }
-  }
+  },
+  "rest_changes_project": true
 }

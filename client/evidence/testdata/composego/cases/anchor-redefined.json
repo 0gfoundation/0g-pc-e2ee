@@ -18,5 +18,6 @@
     "x-two": {
       "user": "second"
     }
-  }
+  },
+  "load_error": "validating docker-compose.yaml: (root) Additional property more is not allowed"
 }

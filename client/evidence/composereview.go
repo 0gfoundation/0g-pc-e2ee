@@ -209,6 +209,10 @@ func (s ReviewedService) Pinned() bool { return isDigestShaped(s.Digest) }
 
 // ComposeReview is everything one authenticated app-compose was found to contain.
 type ComposeReview struct {
+	// releases is the broker release list the controller exception reads (see
+	// ReviewCompose). Not reported.
+	releases BrokerReleases
+
 	// Name and Runner are the app-compose's own labels. Runner decides whether the
 	// compose-text half of this review ran at all.
 	Name   string
@@ -277,7 +281,11 @@ func (r ComposeReview) Summary() string {
 // path. An error means nothing was reviewed: either the bytes are not the manifest
 // the quote binds, or they are not JSON. Everything else, including a manifest with
 // no compose text at all, comes back as a review with findings.
-func ReviewCompose(raw []byte, composeHash [attest.ComposeHashLen]byte) (ComposeReview, error) {
+//
+// releases is the broker release list the run uses, passed in rather than read here so
+// that the controller exception and CheckCompose — two halves of one report — judge a
+// digest against the same list.
+func ReviewCompose(raw []byte, composeHash [attest.ComposeHashLen]byte, releases BrokerReleases) (ComposeReview, error) {
 	// The gate, and ONLY the gate. Deliberately not VerifyAppCompose: its AppCompose
 	// decode is stricter than this review's field reads, so an authenticated manifest
 	// with, say, an `allowed_envs` object would come back as an error — and a caller
@@ -295,7 +303,7 @@ func ReviewCompose(raw []byte, composeHash [attest.ComposeHashLen]byte) (Compose
 		return ComposeReview{}, fmt.Errorf("app-compose is not a JSON object: %w", err)
 	}
 
-	r := ComposeReview{Fields: sortedKeys(fields)}
+	r := ComposeReview{Fields: sortedKeys(fields), releases: releases}
 	r.Name, _ = jsonString(fields["name"]) // a label; an unreadable one is not a finding
 	r.reviewAppComposeFields(fields)
 
@@ -981,14 +989,6 @@ func (r *ComposeReview) reviewService(name string, body *yaml.Node, mounts *moun
 				"answer for its contents, so it needs an upstream answer like any third-party image",
 			svc.Ref, firstPartyNamespace, displayRegistry(reg)))
 	}
-	// Two `image` keys in one body: a compose runtime resolves the duplicate to one of
-	// them, so what actually runs is not what the manifest states — and a baseline reading
-	// the first would describe a container the second replaced.
-	if countKey(body, "image") > 1 {
-		r.add(SeverityBlocking, name, "image",
-			"the service declares image more than once, so which one runs depends on how the "+
-				"runtime resolves a duplicate key rather than on the manifest")
-	}
 	if mapValue(body, "build") != nil && svc.Ref != "" {
 		r.add(SeverityJustify, name, "build",
 			"the service declares both an image and a build; which one ran depends on how the deployment was "+
@@ -1168,17 +1168,17 @@ func (r *ComposeReview) reviewServiceKey(name, key string, val *yaml.Node) bool 
 		return true
 
 	case mergeKey:
-		// A merge key cannot reach this walk any more: reviewComposeText resolves the
-		// document before dispatching, so the keys the anchor contributes arrive as the
-		// service's own and are reviewed by the rules above. The case stays as an
-		// INVARIANT, because the failure it would otherwise have is silent — `<<` is not a
-		// compose key, so it would fall through to the unknown-key rule and report a
-		// merged service as merely unusual while `privileged: true` sat unread inside the
-		// anchor. That is the exact misreport resolution was added to end.
+		// A real merge key cannot reach this walk: the document is resolved before dispatch
+		// (readComposeDocument), so what an anchor contributes arrives as the service's own
+		// keys. What CAN arrive is a key spelled "<<" that is not a merge — quoted, or tagged
+		// !!str — which YAML reads as an ordinary key named "<<" (isMergeKey). That is the
+		// manifest's doing, and docker compose's schema refuses it, so the finding says so
+		// rather than falling through to "no rule for the key", which would read as merely
+		// unusual.
 		r.add(SeverityBlocking, name, key,
-			"the service body still carries a YAML merge key after the document was resolved, so the keys "+
-				"that actually apply to it are not the ones read here; this is a defect in this tool, not in "+
-				"the manifest")
+			"the service has a key named \"<<\" that is not a YAML merge key (it is quoted or tagged as a "+
+				"string), so it merges nothing; docker compose refuses the file (\"Additional property << is "+
+				"not allowed\"), so this is not what runs")
 		return true
 
 	case "sysctls":
@@ -1563,22 +1563,9 @@ func splitRegistry(image string) (registry, repo string) {
 // hand every rule a silent way to pass. The compiler enforces the discipline: there is
 // no single-value form of these to call by accident.
 
-// countKey counts how many times a key appears in a mapping node. YAML permits a
-// duplicate key and yaml.v3 keeps both pairs, so "present" and "present once" are
-// different questions and only one of them is answered by mapValue.
-func countKey(n *yaml.Node, key string) int {
-	if n == nil || n.Kind != yaml.MappingNode {
-		return 0
-	}
-	count := 0
-	for i := 0; i+1 < len(n.Content); i += 2 {
-		if n.Content[i].Value == key {
-			count++
-		}
-	}
-	return count
-}
-
+// mapValue returns the value of key, or nil. The first pair is the only pair: a
+// duplicate key never reaches a reader here, because docker compose's decoder refuses the
+// document and so does readComposeDocument.
 func mapValue(n *yaml.Node, key string) *yaml.Node {
 	if n == nil || n.Kind != yaml.MappingNode {
 		return nil
