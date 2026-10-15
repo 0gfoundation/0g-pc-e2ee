@@ -16,5 +16,6 @@
     "x-base": {
       "user": "root"
     }
-  }
+  },
+  "load_error": "validating docker-compose.yaml: services.copy.logging Additional property user is not allowed"
 }

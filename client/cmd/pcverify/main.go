@@ -582,7 +582,7 @@ func reportManifest(out io.Writer, pq providerQuote, opts providerOpts, contract
 		return false, "the provider's manifest was not read (its /v1/quote reply carries no app_compose)"
 	}
 
-	review, err := evidence.ReviewCompose(pq.AppCompose, pq.ComposeHash)
+	review, err := evidence.ReviewCompose(pq.AppCompose, pq.ComposeHash, opts.releases)
 	if err != nil {
 		// The gate, or bytes that are not JSON. Either way nothing below it may be
 		// believed, so nothing below it is printed.

@@ -437,9 +437,11 @@ func CheckCompose(b ComposeBaseline, rels BrokerReleases, contract, provider str
 	out.Recorded, out.Deployment, out.Expected = true, dep.Name, len(dep.Services)
 	baseline := dep.Services
 
-	// Observed services by name, and the duplicates, in one pass. Blocks arrive in file
-	// order and a name may repeat, which is itself a mismatch rather than a lookup
-	// problem to be papered over.
+	// Observed services by name, and the duplicates, in one pass. Blocks from a manifest
+	// cannot repeat a name — docker compose's decoder refuses a duplicate key, and so does
+	// the review, which then produces no blocks at all. The check stays because blocks is
+	// this function's input, not the review's output: a caller assembling it some other
+	// way gets a mismatch rather than a lookup that silently keeps one of the two.
 	observed := make(map[string]ServiceBlock, len(blocks))
 	dupes := map[string]bool{}
 	for _, b := range blocks {

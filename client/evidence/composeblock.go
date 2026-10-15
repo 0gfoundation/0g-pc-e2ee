@@ -13,7 +13,8 @@ package evidence
 //
 // THE BASELINE STORES TEXT, NOT DIGESTS, and the canonicalizer is why it can. Both
 // sides — the stored baseline and the manifest being checked — go through the SAME
-// function at comparison time, so which version of gopkg.in/yaml.v3 is linked in cancels
+// reader and renderer at comparison time (readAsCompose, renderCanonical), so which
+// version of gopkg.in/yaml.v3 is linked in cancels
 // out entirely. Storing a precomputed digest instead would bake the library's formatting
 // preferences into the file, and a minor-version bump that changed the default indent
 // would invalidate every entry at once, refusing every provider for a dependency
@@ -108,7 +109,7 @@ type ServiceBlock struct {
 	DigestNoImage    string
 	// ImageRef is the image reference as written, or "" when the service names none.
 	ImageRef string
-	// Err is set when this block has no canonical form (see canonicalizeNode). The block
+	// Err is set when this block has no canonical form (see blockOf). The block
 	// is still returned, with empty forms, because "this service cannot be pinned" is
 	// itself what a report needs to say.
 	Err error
@@ -125,25 +126,20 @@ func (b ServiceBlock) Pinnable() bool { return b.Err == nil }
 
 // blockOf canonicalizes one service body, twice — with and without its image.
 //
-// It works on a CLONE, and that is not defensive habit: canonicalization clears comments
+// It works on a COPY, and that is not defensive habit: canonicalization clears comments
 // and styles, and the image hold-out deletes a key. The caller's tree is also read by
 // composereview.go, which walks the same nodes for its own rules — so a mutation here
 // would silently change what the review sees, in a way no test of either file alone
-// would catch. yaml.v3 has no Clone; resolveAnchors is the copy.
+// would catch. yaml.v3 has no Clone; resolveAnchors is the copy, and the only one: both
+// renderings below then work on that copy in place.
 func blockOf(name string, body *yaml.Node) ServiceBlock {
 	b := ServiceBlock{Name: name}
-	// Resolution IS the copy — see resolveAnchors, which always returns a fresh tree. It
-	// also has to come before anything else walks the body, for two reasons that outlived
-	// the refusal it replaced.
-	//
-	// A body that is anchored and references itself — `a: &x {depends_on: [*x]}` — gives a
-	// node graph with a CYCLE, not a tree, and once took the process down with an
-	// unrecoverable stack overflow on input a provider chooses freely (they hash their own
-	// manifest, so the compose_hash gate is no obstacle at all). resolveNode bounds
-	// expansion by the path it is on, so that input now yields an error.
-	//
-	// And an alias body is not a mapping, so running the mapping check first would answer
-	// "the service body is not a mapping" for a document that has no syntax error at all.
+	// The body arrives already resolved (readComposeDocument), so here resolveAnchors is
+	// only the copy. It is still the resolver rather than a plain clone because it is the
+	// one copy that cannot be driven into unbounded recursion: a body that is anchored and
+	// references itself — `a: &x {depends_on: [*x]}` — is a node graph with a CYCLE, and
+	// once took the process down with a stack overflow on input a provider chooses freely.
+	// The review refuses such a document before it gets here; blockOf does not rely on that.
 	resolved, err := resolveAnchors(body)
 	if err != nil {
 		b.Err = err
@@ -158,7 +154,7 @@ func blockOf(name string, body *yaml.Node) ServiceBlock {
 		b.ImageRef = strings.TrimSpace(img.Value)
 	}
 
-	canonical, err := canonicalizeNode(body)
+	canonical, err := renderCanonical(body)
 	if err != nil {
 		b.Err = err
 		return b
@@ -184,12 +180,11 @@ func blockOf(name string, body *yaml.Node) ServiceBlock {
 
 	removeKey(body, "image")
 	stripImageIdentity(body, b.ImageRef)
-	noImage, err := canonicalizeNode(body)
+	noImage, err := renderCanonical(body)
 	if err != nil {
-		// Unreachable: the full form already succeeded on this same tree, and deleting a
-		// key and rewriting scalars cannot introduce the one thing resolution rejects —
-		// an anchor that contains itself. Reported rather than ignored, because a
-		// half-populated block is worse than one that says it failed.
+		// Unreachable: the full form already rendered from this same tree, and deleting a
+		// key and rewriting scalars cannot make it unrenderable. Reported rather than
+		// ignored, because a half-populated block is worse than one that says it failed.
 		b.Err = err
 		b.Canonical, b.Digest = "", ""
 		return b
@@ -198,24 +193,17 @@ func blockOf(name string, body *yaml.Node) ServiceBlock {
 	return b
 }
 
-// canonicalizeNode renders a node in the canonical form this file defines.
+// renderCanonical renders a resolved node in the canonical form this file defines,
+// normalizing it IN PLACE — so it takes a tree its caller owns: blockOf's copy, or a
+// baseline block freshly read by CanonicalizeServiceBlock.
 //
-// It RESOLVES anchors first (composeanchor.go), so the form describes the service as it
-// will run rather than the indirection its author happened to write. Doing it here rather
-// than only at the caller is what makes the guarantee the baseline rests on literal: both
-// sides of the comparison — stored text and observed manifest — reach the emitter through
-// this one function, so neither can reduce an alias differently from the other.
-//
-// Resolution returns a fresh tree, so this does not mutate its argument. blockOf relies
-// on that: it canonicalizes, then edits its own copy for the image hold-out, and the
-// review walks the same nodes for its own rules.
-func canonicalizeNode(n *yaml.Node) (string, error) {
-	resolved, err := resolveAnchors(n)
-	if err != nil {
-		return "", err
-	}
-	normalize(resolved)
-	out, err := yaml.Marshal(resolved)
+// What it does not do is read YAML. Both sides of a baseline comparison get their tree
+// from the same reader (readAsCompose, composedoc.go), which applies compose's tags and
+// resolves anchors the way docker compose does; this function only renders the result.
+// One reader and one renderer for both sides is the guarantee the baseline rests on.
+func renderCanonical(n *yaml.Node) (string, error) {
+	normalize(n)
+	out, err := yaml.Marshal(n)
 	if err != nil {
 		return "", fmt.Errorf("cannot render the service block: %w", err)
 	}
@@ -381,15 +369,13 @@ func digestOf(s string) string {
 // service body as YAML text and returns the same canonical form ServiceBlocks produces.
 //
 // It exists so the two sides of the eventual comparison cannot drift. A baseline stored
-// as text is only meaningful if the stored text and the observed text are reduced by one
-// function; two functions would be two definitions of "the same block".
+// as text is only meaningful if the stored text and the observed text are read by one
+// reader and reduced by one renderer; two of either would be two definitions of "the same
+// block". So the text goes through readAsCompose, exactly as a manifest does.
 func CanonicalizeServiceBlock(blockText []byte) (string, error) {
-	var root yaml.Node
-	if err := yaml.Unmarshal(blockText, &root); err != nil {
-		return "", fmt.Errorf("service block does not parse as YAML: %w", err)
+	n, err := readAsCompose(blockText, "the service block")
+	if err != nil {
+		return "", err
 	}
-	if root.Kind != yaml.DocumentNode || len(root.Content) == 0 {
-		return "", fmt.Errorf("service block is an empty document")
-	}
-	return canonicalizeNode(root.Content[0])
+	return renderCanonical(n)
 }

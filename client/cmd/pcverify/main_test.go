@@ -111,7 +111,7 @@ func baselineFor(t *testing.T, composeText string) evidence.ComposeBaseline {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	review, err := evidence.ReviewCompose(raw, sha256.Sum256(raw))
+	review, err := evidence.ReviewCompose(raw, sha256.Sum256(raw), evidence.BrokerReleases{})
 	if err != nil {
 		t.Fatalf("ReviewCompose: %v", err)
 	}

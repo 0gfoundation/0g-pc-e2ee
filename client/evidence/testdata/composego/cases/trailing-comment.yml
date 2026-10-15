@@ -1,0 +1,6 @@
+# A trailing separator followed only by a comment.
+services:
+  app:
+    image: app
+---
+# nothing else

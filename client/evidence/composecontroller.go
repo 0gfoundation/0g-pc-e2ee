@@ -22,14 +22,16 @@ package evidence
 // WHY THESE CONDITIONS. Each closes a way to put the socket in the hands of something
 // #759 does not govern. The broker image ships three programs, so the service has to RUN
 // the controller, not merely be named after it. The image has to be a listed release,
-// since an unlisted build is unknown code. Privileges, extra host paths and an enabled
-// engine flag each widen what the holder can reach beyond what #759 describes. And any
-// OTHER blocking finding on the service keeps this one blocking too: an exception
-// granted to a service the review already refuses would read as approval of it.
+// since an unlisted build is unknown code. Any service key beyond the few a controller
+// needs (controllerKeys), extra host paths, and any mention of the engine flag each widen
+// what the holder can reach beyond what #759 describes. And any OTHER blocking finding
+// on the service keeps this one blocking too: an exception granted to a service the
+// review already refuses would read as approval of it.
 
 import (
 	"fmt"
 	"path"
+	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -78,7 +80,7 @@ func (r *ComposeReview) justifyControllerRuntimeSocket(name string, body *yaml.N
 		return
 	}
 
-	rel, why := controllerEligible(body, svc, mounts)
+	rel, why := controllerEligible(body, svc, mounts, r.releases)
 	if why == "" && otherBlocking != "" {
 		why = fmt.Sprintf("the service has another blocking finding (%s)", otherBlocking)
 	}
@@ -91,8 +93,9 @@ func (r *ComposeReview) justifyControllerRuntimeSocket(name string, body *yaml.N
 		}
 		r.Findings[i].Severity = SeverityJustify
 		r.Findings[i].Detail += fmt.Sprintf(". JUSTIFIED rather than blocking: this is 0G's controller at listed "+
-			"release %s, running as %s with no entrypoint override, no privileged mode or added capabilities, "+
-			"no host path beyond the docker and guest-agent sockets, and %s not enabled — the conditions under "+
+			"release %s, running as %s, with no service keys beyond the ones the exception covers (so no "+
+			"entrypoint override, privileges, capabilities, devices, host namespaces or env_file), no host path "+
+			"beyond the docker and guest-agent sockets, and %s absent — the conditions under "+
 			"which broker #759 limits what it does with the socket (no new container; an image swap only as "+
 			"repo@digest for broker and event, recorded in RTMR3 first; the full list is the broker repository's "+
 			"doc/controller-design.md §3.4). Those limits are the controller's code at this digest: this review "+
@@ -101,13 +104,28 @@ func (r *ComposeReview) justifyControllerRuntimeSocket(name string, body *yaml.N
 	}
 }
 
+// controllerKeys are the service keys the exception covers: exactly the eleven every
+// controller on the fleet writes (all seven providers, 2026-10-15), plus three that only
+// describe the container's lifecycle. Anything else costs the exception.
+//
+// An ALLOWLIST, not a list of dangerous keys, because the second kind is never finished:
+// `devices`, `ipc: host`, `uts: host` and `userns_mode: host` each reach past what #759
+// describes, and none of them is blocking on its own — GPU services need devices — so
+// "no other blocking finding" did not catch them, and a denylist missed them. With an
+// allowlist, a key nobody has thought about is a reason to stay blocking, not a gap.
+// `volumes` and `environment` are on it because they are checked separately below.
+var controllerKeys = map[string]bool{
+	"image": true, "command": true, "container_name": true, "environment": true, "volumes": true,
+	"depends_on": true, "networks": true, "ports": true, "healthcheck": true, "logging": true,
+	"restart": true,
+	"labels":  true, "stop_grace_period": true, "stop_signal": true,
+}
+
 // controllerEligible reports whether a service meets the exception's conditions, and
-// when it does not, the first condition it fails — phrased as what is wrong.
-func controllerEligible(body *yaml.Node, svc ReviewedService, mounts *mountIndex) (BrokerRelease, string) {
-	rels, err := BuiltinBrokerReleases()
-	if err != nil {
-		return BrokerRelease{}, "the broker release list could not be read"
-	}
+// when it does not, the first condition it fails — phrased as what is wrong. rels is the
+// release list the whole run uses, so this and the baseline cannot disagree about a
+// digest.
+func controllerEligible(body *yaml.Node, svc ReviewedService, mounts *mountIndex, rels BrokerReleases) (BrokerRelease, string) {
 	if !svc.Pinned() {
 		return BrokerRelease{}, "its image is not pinned by digest"
 	}
@@ -121,30 +139,34 @@ func controllerEligible(body *yaml.Node, svc ReviewedService, mounts *mountIndex
 			svc.Image, shortDigest(svc.Digest), listedVersions(rels))
 	}
 
-	if mapValue(body, "entrypoint") != nil {
-		return BrokerRelease{}, "the compose overrides the image's entrypoint, so what runs is not known to be the controller"
+	for i := 0; i+1 < len(body.Content); i += 2 {
+		if k := body.Content[i].Value; !controllerKeys[k] {
+			return BrokerRelease{}, fmt.Sprintf("it sets %s, which is not among the keys the exception covers "+
+				"(%s); each further key is something #759 does not describe", k, strings.Join(sortedTrue(controllerKeys), ", "))
+		}
 	}
 	if cmd, ok := commandOf(mapValue(body, "command")); !ok || cmd != controllerCommand {
 		return BrokerRelease{}, fmt.Sprintf("its command is not %s, so the process holding the socket is not "+
 			"the controller", controllerCommand)
 	}
-	if v, ok := nodeBool(mapValue(body, "privileged")); !ok || v {
-		return BrokerRelease{}, "it runs privileged"
-	}
-	if caps, ok := nodeStrings(mapValue(body, "cap_add")); !ok || len(caps) > 0 {
-		return BrokerRelease{}, "it adds capabilities"
-	}
-	if mapValue(body, "env_file") != nil {
-		return BrokerRelease{}, fmt.Sprintf("it reads environment from env_file, which is not in the manifest and "+
-			"could set %s", controllerEnginesEnv)
-	}
-	if why := enginesEnabled(mapValue(body, "environment")); why != "" {
+	if why := enginesSet(mapValue(body, "environment")); why != "" {
 		return BrokerRelease{}, why
 	}
 	if why := onlySocketHostMounts(mapValue(body, "volumes"), mounts); why != "" {
 		return BrokerRelease{}, why
 	}
 	return rel, ""
+}
+
+func sortedTrue(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k, v := range m {
+		if v {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // commandOf reads a command written as one word, as a scalar or a one-element list.
@@ -161,21 +183,20 @@ func commandOf(n *yaml.Node) (string, bool) {
 	return "", false
 }
 
-// enginesEnabled reports why the controller's engine flag may be on, or "" when the
-// manifest leaves it off. Off is the default (#759 refuses unless it is set), so absent
-// is off — but a value the HOST supplies is not, because then the host decides.
-func enginesEnabled(env *yaml.Node) string {
-	host := fmt.Sprintf("%s is taken from the host's environment, so the host decides whether the controller "+
-		"may create containers", controllerEnginesEnv)
-	on := fmt.Sprintf("%s is enabled, which lets the controller create new containers", controllerEnginesEnv)
-	verdict := func(v string) string {
-		switch {
-		case strings.Contains(v, "$"):
-			return host
-		case isOff(v):
-			return ""
-		}
-		return on
+// enginesSet reports why the controller's engine flag disqualifies the service, or ""
+// when the environment does not mention it.
+//
+// ABSENT, and only absent. The broker enables engine creation on exactly "on"
+// (ctrl.go: os.Getenv(EnginesEnvVar) == "on"), so `=false` is off in v0.5.4's code — but
+// the exception rests on reading the manifest, not on how one build parses a string, and
+// the broker's own guidance to verifiers is phrased the same way: "a verifier that
+// requires that variable to be absent" (doc/rtmr3-records.md §4.4). No deployment on the
+// fleet sets it, so the strict reading costs nothing. A value the HOST supplies
+// (`- NAME`, `NAME:`, `${…}`) is presence too.
+func enginesSet(env *yaml.Node) string {
+	set := func(how string) string {
+		return fmt.Sprintf("its environment sets %s (%s); the exception requires the variable to be absent, "+
+			"which is the one state in which the controller can create no container", controllerEnginesEnv, how)
 	}
 	switch {
 	case env == nil:
@@ -190,11 +211,9 @@ func enginesEnabled(env *yaml.Node) string {
 				continue
 			}
 			if !hasValue {
-				return host // `- NAME` passes the host's value through
+				return set("passed through from the host")
 			}
-			if why := verdict(v); why != "" {
-				return why
-			}
+			return set(fmt.Sprintf("to %q", v))
 		}
 		return ""
 	case env.Kind == yaml.MappingNode:
@@ -202,28 +221,14 @@ func enginesEnabled(env *yaml.Node) string {
 			if strings.TrimSpace(env.Content[i].Value) != controllerEnginesEnv {
 				continue
 			}
-			v := env.Content[i+1]
-			if v.Kind != yaml.ScalarNode {
-				return "the environment value for " + controllerEnginesEnv + " could not be read"
+			if v := env.Content[i+1]; v.Kind == yaml.ScalarNode && v.Tag != "!!null" {
+				return set(fmt.Sprintf("to %q", v.Value))
 			}
-			if v.Tag == "!!null" {
-				return host // `NAME:` with no value passes the host's value through
-			}
-			if why := verdict(v.Value); why != "" {
-				return why
-			}
+			return set("passed through from the host")
 		}
 		return ""
 	}
 	return "the environment could not be read"
-}
-
-func isOff(v string) bool {
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "", "off", "false", "0", "no":
-		return true
-	}
-	return false
 }
 
 // onlySocketHostMounts reports the first host path the service mounts beyond the docker

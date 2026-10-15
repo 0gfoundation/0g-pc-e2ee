@@ -33,6 +33,11 @@ package evidence
 // and an alias bomb are all refused by the decoder itself, with its own limits, before
 // resolveAnchors expands a single alias. Only then is the tree resolved into the form the
 // review walks.
+//
+// BOTH SIDES OF A BASELINE COMPARISON read through here (readAsCompose): the observed
+// manifest, and every block a baseline records. A reader on one side only would let the
+// same text reduce two ways — a recorded `privileged: !reset false` keeping the key the
+// manifest drops — and the comparison would then measure the readers, not the deployment.
 
 import (
 	"bytes"
@@ -56,45 +61,44 @@ const (
 // differently from this package — in which case nothing below the top level can be
 // described honestly, and the caller reports that instead.
 func readComposeDocument(doc []byte) (*yaml.Node, error) {
+	return readAsCompose(doc, "the compose text")
+}
+
+// readAsCompose is readComposeDocument for any YAML this package compares with what
+// docker compose runs — the observed compose text, and a recorded baseline block. ONE
+// reader for both sides is what lets a baseline be compared with a manifest at all: a
+// block written `privileged: !reset false` has to reduce the same way in the file that
+// records it as in the manifest it is checked against, and a stray `---` in a recorded
+// block must not quietly drop what follows it. what names the input in errors.
+func readAsCompose(doc []byte, what string) (*yaml.Node, error) {
 	dec := yaml.NewDecoder(bytes.NewReader(doc))
 	var root yaml.Node
 	if err := dec.Decode(&root); err != nil {
 		if errors.Is(err, io.EOF) {
-			return nil, errors.New("the compose text is an empty document")
+			return nil, fmt.Errorf("%s is an empty document", what)
 		}
-		return nil, fmt.Errorf("the compose text does not parse as YAML: %w", err)
+		return nil, fmt.Errorf("%s does not parse as YAML: %w", what, err)
 	}
-	var next yaml.Node
-	switch err := dec.Decode(&next); {
-	case errors.Is(err, io.EOF):
-	case err != nil:
-		return nil, fmt.Errorf("the compose text does not parse as YAML: %w", err)
-	default:
-		// Refused rather than merged. A manifest has no need for a second document, and
-		// reproducing compose's cross-document merge here would be a second
-		// reimplementation of its semantics to keep in step — the thing this file exists
-		// to avoid.
-		return nil, errors.New("the compose text holds more than one YAML document. docker compose merges " +
-			"every document in the file into the project it runs, so the first one alone does not describe " +
-			"what runs; this review reads only single-document compose files")
+	if err := refuseFurtherDocuments(dec, what); err != nil {
+		return nil, err
 	}
 	if root.Kind != yaml.DocumentNode || len(root.Content) == 0 {
-		return nil, errors.New("the compose text is an empty document")
+		return nil, fmt.Errorf("%s is an empty document", what)
 	}
 
 	top := applyComposeTags(root.Content[0])
 	if top == nil {
-		return nil, fmt.Errorf("the compose text's top level is tagged %s, which leaves docker compose "+
-			"nothing to load", composeResetTag)
+		return nil, fmt.Errorf("%s is tagged %s at its top level, which leaves docker compose nothing to load",
+			what, composeResetTag)
 	}
 
 	// The decode docker compose runs. Its result is not used — only its refusal is.
 	var decoded any
 	if err := top.Decode(&decoded); err != nil {
-		return nil, fmt.Errorf("docker compose's YAML reader refuses the compose text (%v), so what each "+
-			"service contains cannot be read", err)
+		return nil, fmt.Errorf("docker compose's YAML reader refuses %s (%v), so what it contains cannot be read",
+			what, err)
 	}
-	if err := requireStringKeys(decoded, ""); err != nil {
+	if err := requireStringKeys(decoded, what, ""); err != nil {
 		return nil, err
 	}
 
@@ -103,10 +107,57 @@ func readComposeDocument(doc []byte) (*yaml.Node, error) {
 		// Unreachable for anything the decode accepted, which refuses every input
 		// resolveAnchors does. Kept because the review's view must never be built from a
 		// half-resolved tree.
-		return nil, fmt.Errorf("the compose text's YAML anchors do not resolve, so what each service "+
-			"actually contains cannot be read: %w", err)
+		return nil, fmt.Errorf("the YAML anchors in %s do not resolve, so what it actually contains cannot "+
+			"be read: %w", what, err)
 	}
 	return resolved, nil
+}
+
+// refuseFurtherDocuments reads past the first document and refuses any that would make
+// docker compose's reading differ from the first document's.
+//
+// docker compose's loader decodes every document in the file and merges each into the
+// project. So a document after the first either changes what runs or stops the file
+// loading, and which one decides the wording, because the two are different claims:
+//
+//   - An empty mapping (`--- {}`) merges nothing; the file loads as its first document
+//     says. Accepted.
+//   - An empty or null document — a trailing `---`, `--- null`, a `---` followed only by
+//     a comment — or any other non-mapping: the loader stops with "Top-level object must
+//     be a mapping", so the file runs nothing at all.
+//   - Anything else is merged into what runs. Refused rather than merged here: a manifest
+//     has no need for a second document, and reproducing compose's cross-document merge
+//     would be a second reimplementation of its semantics to keep in step — the thing
+//     this file exists to avoid.
+//
+// Each of those is the loader's behaviour, recorded in testdata/composego, not a guess.
+func refuseFurtherDocuments(dec *yaml.Decoder, what string) error {
+	for {
+		var next yaml.Node
+		err := dec.Decode(&next)
+		switch {
+		case errors.Is(err, io.EOF):
+			return nil
+		case err != nil:
+			return fmt.Errorf("%s does not parse as YAML: %w", what, err)
+		}
+		var body *yaml.Node
+		if len(next.Content) > 0 {
+			body = next.Content[0]
+		}
+		switch {
+		case body != nil && body.Kind == yaml.MappingNode && len(body.Content) == 0 && body.ShortTag() == "!!map":
+			continue
+		case body == nil || body.Kind != yaml.MappingNode:
+			return fmt.Errorf("%s has a YAML document after the first that is empty or not a mapping (a "+
+				"trailing `---` is one). docker compose refuses such a file (\"Top-level object must be a "+
+				"mapping\"), so it is not what runs", what)
+		default:
+			return fmt.Errorf("%s holds more than one YAML document. docker compose merges every document "+
+				"in the file into the project it runs, so the first one alone does not describe what runs; "+
+				"only single-document compose files are read", what)
+		}
+	}
 }
 
 // applyComposeTags applies !reset and !override as compose-go v2.0.2's ResetProcessor
@@ -157,7 +208,7 @@ func applyComposeTags(n *yaml.Node) *yaml.Node {
 // requireStringKeys refuses a decoded document with a mapping key that is not a string,
 // as compose-go does right after decoding (convertToStringKeysRecursive). `1: x` decodes
 // to an int key, and docker compose will not load the file.
-func requireStringKeys(v any, path string) error {
+func requireStringKeys(v any, what, path string) error {
 	at := func(k string) string {
 		if path == "" {
 			return k
@@ -167,7 +218,7 @@ func requireStringKeys(v any, path string) error {
 	switch m := v.(type) {
 	case map[string]any:
 		for _, k := range sortedAnyKeys(m) {
-			if err := requireStringKeys(m[k], at(k)); err != nil {
+			if err := requireStringKeys(m[k], what, at(k)); err != nil {
 				return err
 			}
 		}
@@ -184,16 +235,16 @@ func requireStringKeys(v any, path string) error {
 				if path != "" {
 					where = "in " + path
 				}
-				return fmt.Errorf("the compose text has a mapping key that is not a string (%#v %s), which "+
-					"docker compose refuses to load", k, where)
+				return fmt.Errorf("%s has a mapping key that is not a string (%#v %s), which docker compose "+
+					"refuses to load", what, k, where)
 			}
-			if err := requireStringKeys(m[k], at(s)); err != nil {
+			if err := requireStringKeys(m[k], what, at(s)); err != nil {
 				return err
 			}
 		}
 	case []any:
 		for i, e := range m {
-			if err := requireStringKeys(e, fmt.Sprintf("%s[%d]", path, i)); err != nil {
+			if err := requireStringKeys(e, what, fmt.Sprintf("%s[%d]", path, i)); err != nil {
 				return err
 			}
 		}

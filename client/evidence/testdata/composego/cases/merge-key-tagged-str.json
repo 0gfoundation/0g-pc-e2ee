@@ -12,5 +12,6 @@
     "x-base": {
       "privileged": true
     }
-  }
+  },
+  "load_error": "validating docker-compose.yaml: services.app Additional property \u003c\u003c is not allowed"
 }

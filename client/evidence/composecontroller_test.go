@@ -82,26 +82,42 @@ func TestControllerException_EachConditionIsLoadBearing(t *testing.T) {
 		{"privileged",
 			sub("    command: 0g-controller\n", "    command: 0g-controller\n    privileged: true\n"), ""},
 		{"an added capability",
-			sub("    command: 0g-controller\n", "    command: 0g-controller\n    cap_add: [NET_ADMIN]\n"), "capabilities"},
+			sub("    command: 0g-controller\n", "    command: 0g-controller\n    cap_add: [NET_ADMIN]\n"), "cap_add"},
+		// None of these is blocking on its own — GPU services need devices — so "no other
+		// blocking finding" did not catch them. The allowlist does.
+		{"a host device",
+			sub("    command: 0g-controller\n", "    command: 0g-controller\n    devices: [/dev/sda:/dev/sda]\n"), "devices"},
+		{"the host's IPC namespace",
+			sub("    command: 0g-controller\n", "    command: 0g-controller\n    ipc: host\n"), "ipc"},
+		{"the host's UTS namespace",
+			sub("    command: 0g-controller\n", "    command: 0g-controller\n    uts: host\n"), "uts"},
+		{"no user-namespace remapping",
+			sub("    command: 0g-controller\n", "    command: 0g-controller\n    userns_mode: host\n"), "userns_mode"},
+		{"the host's network",
+			sub("    command: 0g-controller\n", "    command: 0g-controller\n    network_mode: host\n"), "network_mode"},
+		{"a security option",
+			sub("    command: 0g-controller\n", "    command: 0g-controller\n    security_opt: [seccomp:unconfined]\n"), "security_opt"},
+		{"another container's volumes",
+			sub("    command: 0g-controller\n", "    command: 0g-controller\n    volumes_from: [other]\n"), "volumes_from"},
 		{"engines on",
-			sub(envLine, envLine+"      - ZG_CONTROLLER_ENGINES=on\n"), "is enabled"},
+			sub(envLine, envLine+"      - ZG_CONTROLLER_ENGINES=on\n"), "sets ZG_CONTROLLER_ENGINES"},
 		{"engines on, map form",
-			sub("    environment:\n"+envLine, "    environment:\n      ZG_CONTROLLER_ENGINES: \"on\"\n"), "is enabled"},
+			sub("    environment:\n"+envLine, "    environment:\n      ZG_CONTROLLER_ENGINES: \"on\"\n"), "sets ZG_CONTROLLER_ENGINES"},
 		// The host decides, which is the same as on for this purpose.
 		{"engines passed through from the host",
 			sub(envLine, envLine+"      - ZG_CONTROLLER_ENGINES\n"), "host"},
 		{"engines interpolated from the host",
-			sub(envLine, envLine+"      - ZG_CONTROLLER_ENGINES=${ENGINES}\n"), "host"},
+			sub(envLine, envLine+"      - ZG_CONTROLLER_ENGINES=${ENGINES}\n"), "sets ZG_CONTROLLER_ENGINES"},
 		{"environment from a file the manifest does not contain",
 			sub("    command: 0g-controller\n", "    command: 0g-controller\n    env_file: ./controller.env\n"), "env_file"},
 		{"another absolute host path",
 			sub("      - zg-tee:/var/run/zg-tee\n", "      - zg-tee:/var/run/zg-tee\n      - /opt/data:/data\n"), "/opt/data"},
 		{"a relative host path",
 			sub("      - zg-tee:/var/run/zg-tee\n", "      - zg-tee:/var/run/zg-tee\n      - ./logs/controller:/var/log\n"), "relative"},
-		// Any other blocking finding on the service: an exception granted to a service
-		// the review already refuses would read as approval of it.
-		{"another blocking finding",
-			sub("    command: 0g-controller\n", "    command: 0g-controller\n    pid: host\n"), "another blocking finding"},
+		// A blocking key outside the allowlist is refused by the allowlist first; the
+		// other-blocking rule stays behind it for any blocking finding an allowed key grows.
+		{"a blocking key",
+			sub("    command: 0g-controller\n", "    command: 0g-controller\n    pid: host\n"), "pid"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := dockerSockFinding(t, reviewOf(t, manifest(tc.doc)), "0g-controller")
@@ -115,14 +131,44 @@ func TestControllerException_EachConditionIsLoadBearing(t *testing.T) {
 	}
 }
 
-// Engines explicitly off is the default made explicit, and must not cost the exception.
-func TestControllerException_EnginesOffIsFine(t *testing.T) {
+// Any value at all costs the exception, including the ones v0.5.4 reads as off: the
+// exception rests on the manifest leaving the variable ABSENT, which is how the broker
+// states it to verifiers, not on how one build parses a string.
+func TestControllerException_AnyEnginesValueCostsIt(t *testing.T) {
 	for _, v := range []string{"off", "false", "0", "OFF", ""} {
 		doc := strings.Replace(eligibleController, "      - CONFIG_FILE=/etc/config/config.yaml\n",
 			"      - CONFIG_FILE=/etc/config/config.yaml\n      - ZG_CONTROLLER_ENGINES="+v+"\n", 1)
-		if f := dockerSockFinding(t, reviewOf(t, manifest(doc)), "0g-controller"); f.Severity != SeverityJustify {
-			t.Errorf("ZG_CONTROLLER_ENGINES=%q: severity %s", v, f.Severity)
+		f := dockerSockFinding(t, reviewOf(t, manifest(doc)), "0g-controller")
+		if f.Severity != SeverityBlocking || !strings.Contains(f.Detail, "absent") {
+			t.Errorf("ZG_CONTROLLER_ENGINES=%q: severity %s:\n%s", v, f.Severity, f.Detail)
 		}
+	}
+}
+
+// The release list is the one the caller passes — the same one CheckCompose gets — not
+// one the review reads for itself. Otherwise a run given a different list would judge
+// the same digest two ways in one report.
+func TestControllerException_UsesTheReleaseListItIsGiven(t *testing.T) {
+	raw, hash := appComposeFor(t, manifest(eligibleController))
+	for _, tc := range []struct {
+		name string
+		rels BrokerReleases
+		want Severity
+	}{
+		{"the embedded list", builtinReleases(t), SeverityJustify},
+		{"an empty list", BrokerReleases{Repository: brokerRepoName}, SeverityBlocking},
+		{"a list without this digest", BrokerReleases{Repository: brokerRepoName,
+			Releases: []BrokerRelease{{"v9", "sha256:" + strings.Repeat("b", 64)}}}, SeverityBlocking},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := ReviewCompose(raw, hash, tc.rels)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if f := dockerSockFinding(t, r, "0g-controller"); f.Severity != tc.want {
+				t.Fatalf("severity %s, want %s:\n%s", f.Severity, tc.want, f.Detail)
+			}
+		})
 	}
 }
 
