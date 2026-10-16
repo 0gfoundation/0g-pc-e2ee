@@ -251,6 +251,92 @@ func TestLoad_ATemplatedShortEntryKeepsItsText(t *testing.T) {
 	}
 }
 
+// A provider can write an `x-` key into a long-syntax mount, port or ulimit — compose's
+// schema allows it and docker compose ignores it. Writing the key templates are held under
+// must not make the loader swap a real entry for a string the provider chose: that hid a
+// bind of the host's root behind `./data:/data`, from the review and from the baseline.
+func TestLoad_AManifestCannotForgeAHeldTemplate(t *testing.T) {
+	for _, key := range []string{"x-pcverify-held-template", holdKeyPrefix + strings.Repeat("0", 32), holdKeyPrefix} {
+		t.Run(key, func(t *testing.T) {
+			doc := "services:\n  app:\n    image: app\n    volumes:\n      - type: bind\n        source: /\n" +
+				"        target: /host\n        " + key + ": ./data:/data\n"
+			r := reviewOf(t, manifest(doc))
+			if r.LoadErr != nil {
+				t.Fatalf("refused: %v", r.LoadErr)
+			}
+			f := requireFinding(t, r, SeverityBlocking, "app", "volumes")
+			if !strings.Contains(f.Detail, "/ -> /host (rw)") {
+				t.Fatalf("the root bind is not what the review reports: %s\n%s", f.Detail, dumpFindings(r))
+			}
+			if strings.Contains(dumpFindings(r), "./data -> /data") {
+				t.Fatalf("the forged string was read as a mount:\n%s", dumpFindings(r))
+			}
+			if !strings.Contains(r.Blocks[0].Canonical, "source: /\n") {
+				t.Fatalf("the canonical form lost the real mount:\n%s", r.Blocks[0].Canonical)
+			}
+
+			// And the baseline does not take it for the mount it impersonates.
+			b, err := ParseComposeBaseline([]byte(`{"deployments": [{"name": "d", "contract": "` + testContract + `",
+				"providers": ["` + testProvider + `"], "services": [{"name": "app", "block": ["image: app", "volumes:",
+				"  - ./data:/data"]}]}]}`))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := CheckReview(b, testReleases, testContract, testProvider, r); got.OK() {
+				t.Fatal("a manifest binding the host root matched a baseline recording ./data:/data")
+			}
+		})
+	}
+
+	// The exploitable form against a baseline: a record holding a templated mount, and a
+	// manifest whose root bind forges that template. Before the key was drawn per load,
+	// the two rendered identically and the baseline matched 1 of 1.
+	b, err := ParseComposeBaseline([]byte(`{"deployments": [{"name": "d", "contract": "` + testContract + `",
+		"providers": ["` + testProvider + `"], "services": [{"name": "app", "block": ["image: app", "volumes:",
+		"  - ${DATA}:/data"]}]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	forged := reviewOf(t, manifest("services:\n  app:\n    image: app\n    volumes:\n      - type: bind\n"+
+		"        source: /\n        target: /host\n        x-pcverify-held-template: ${DATA}:/data\n"))
+	if got := CheckReview(b, testReleases, testContract, testProvider, forged); got.OK() {
+		t.Fatal("a root bind forging a held template matched the templated mount it impersonates")
+	}
+	// The genuine templated mount still matches its record.
+	genuine := reviewOf(t, manifest("services:\n  app:\n    image: app\n    volumes:\n      - \"${DATA}:/data\"\n"))
+	if got := CheckReview(b, testReleases, testContract, testProvider, genuine); !got.OK() || got.Matched != 1 {
+		t.Fatalf("the genuine templated mount no longer matches its record:\n%s", dumpMismatches(got))
+	}
+
+	// The same for a port and a ulimit: the provider's mapping stays the mapping it is.
+	r := reviewOf(t, manifest("services:\n  app:\n    image: app\n    ports:\n      - target: 80\n        published: \"80\"\n"+
+		"        x-pcverify-held-template: \"127.0.0.1:8080:80\"\n    ulimits:\n      nofile:\n        soft: 1\n        hard: 2\n"+
+		"        x-pcverify-held-template: \"1024\"\n"))
+	if r.LoadErr != nil {
+		t.Fatalf("refused: %v", r.LoadErr)
+	}
+	canonical := r.Blocks[0].Canonical
+	if strings.Contains(canonical, "- 127.0.0.1:8080:80") || !strings.Contains(canonical, "published: \"80\"") ||
+		!strings.Contains(canonical, "hard: 2") {
+		t.Fatalf("a forged port or ulimit was swapped:\n%s", canonical)
+	}
+}
+
+// Every load holds its templates under a key of its own.
+func TestLoad_HoldKeysAreDrawnPerLoad(t *testing.T) {
+	a, err := newHoldKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := newHoldKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a == b || !strings.HasPrefix(a, holdKeyPrefix) || len(a) != len(holdKeyPrefix)+32 {
+		t.Fatalf("keys %q and %q", a, b)
+	}
+}
+
 // A port holding a template is the environment's to read too.
 func TestLoad_ATemplatedPortIsReported(t *testing.T) {
 	r := reviewOf(t, manifest("services:\n  app:\n    image: app\n    ports: [\"${P:-8080}:80\", \"9090:90\"]\n"))

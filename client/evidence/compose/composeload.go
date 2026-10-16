@@ -59,6 +59,8 @@ package compose
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -114,13 +116,17 @@ const composeFilename = "docker-compose.yaml"
 // loadFiles is the loader with this file's options and schema validation off, its
 // templated short-syntax entries restored to the text they were written as.
 func loadFiles(files []types.ConfigFile) (map[string]any, error) {
+	key, err := newHoldKey()
+	if err != nil {
+		return nil, err
+	}
 	model, err := loader.LoadModelWithContext(context.Background(), types.ConfigDetails{
 		WorkingDir:  loadWorkingDir,
 		ConfigFiles: files,
 		Environment: map[string]string{},
 	}, func(o *loader.Options) {
 		o.SetProjectName("app", true)
-		o.Interpolate = castOnly(o.Interpolate)
+		o.Interpolate = castOnly(o.Interpolate, key)
 		o.SkipInclude = true
 		o.SkipExtends = true
 		o.SkipNormalization = true
@@ -133,7 +139,7 @@ func loadFiles(files []types.ConfigFile) (map[string]any, error) {
 	if err != nil {
 		return nil, err
 	}
-	restoreTemplates(model)
+	restoreTemplates(model, key)
 	return model, nil
 }
 
@@ -150,7 +156,7 @@ func loadFiles(files []types.ConfigFile) (map[string]any, error) {
 //
 // And the strings docker compose PARSES after substituting are held back from parsing
 // here (heldTemplate).
-func castOnly(opts *interp.Options) *interp.Options {
+func castOnly(opts *interp.Options, key string) *interp.Options {
 	casts := make(map[tree.Path]interp.Cast, len(opts.TypeCastMapping)+len(templatedShortSyntax))
 	for p, cast := range opts.TypeCastMapping {
 		casts[p] = func(v string) (any, error) {
@@ -164,7 +170,7 @@ func castOnly(opts *interp.Options) *interp.Options {
 		cast, typed := casts[p]
 		casts[p] = func(v string) (any, error) {
 			if strings.Contains(v, "$") {
-				return heldTemplate(v), nil
+				return heldTemplate(key, v), nil
 			}
 			if typed {
 				return cast(v)
@@ -207,24 +213,41 @@ var templatedShortSyntax = []tree.Path{
 	tree.NewPath("services", tree.PathMatchAll, "ulimits", tree.PathMatchAll),
 }
 
-// templateKey marks a held template. An `x-` key, so it is a legal extension field
-// wherever the schema allows them, and `target` is set alongside it because the loader's
-// uniqueness pass indexes mounts and ports by target.
-const templateKey = "x-pcverify-held-template"
+// A held template is a mapping under a key no manifest can write: `x-pcverify-held-`
+// and 128 random bits, drawn afresh for every load. It has to be unguessable, not merely
+// unusual. compose's schema allows `x-` keys inside a long-syntax mount, port or ulimit,
+// and docker compose ignores them, so a provider who knew the key could write a real
+// mount — `{type: bind, source: /, target: /host}` — carrying it, and have restoreTemplates
+// swap that mount for whatever string it named: the review would read the string and the
+// canonical form would record it, while docker compose mounted the host's root. A key
+// drawn at load time cannot appear in a manifest written before it, and a mapping is
+// restored only if it is exactly what heldTemplate built — that key, and a `target`
+// equal to the held text — so a provider's own `x-` key never qualifies. `target` is set
+// because the loader's uniqueness pass indexes mounts and ports by it.
+const holdKeyPrefix = "x-pcverify-held-"
 
-func heldTemplate(v string) map[string]any {
-	return map[string]any{templateKey: v, "target": v}
+func newHoldKey() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("cannot draw a key to hold templates under: %v", err)
+	}
+	return holdKeyPrefix + hex.EncodeToString(b[:]), nil
 }
 
-// restoreTemplates puts every held template back as the string it was written as.
-func restoreTemplates(model map[string]any) {
+func heldTemplate(key, v string) map[string]any {
+	return map[string]any{key: v, "target": v}
+}
+
+// restoreTemplates puts every template castOnly held under key back as the string it was
+// written as.
+func restoreTemplates(model map[string]any, key string) {
 	services, _ := model["services"].(map[string]any)
 	for _, svc := range services {
 		body, _ := svc.(map[string]any)
-		for _, key := range []string{"volumes", "ports"} {
-			if list, ok := body[key].([]any); ok {
+		for _, field := range []string{"volumes", "ports"} {
+			if list, ok := body[field].([]any); ok {
 				for i, e := range list {
-					if held, ok := heldText(e); ok {
+					if held, ok := heldText(e, key); ok {
 						list[i] = held
 					}
 				}
@@ -232,7 +255,7 @@ func restoreTemplates(model map[string]any) {
 		}
 		if limits, ok := body["ulimits"].(map[string]any); ok {
 			for k, e := range limits {
-				if held, ok := heldText(e); ok {
+				if held, ok := heldText(e, key); ok {
 					limits[k] = held
 				}
 			}
@@ -240,13 +263,18 @@ func restoreTemplates(model map[string]any) {
 	}
 }
 
-func heldText(v any) (string, bool) {
+// heldText returns the text of a mapping heldTemplate built under key, and nothing for
+// any other mapping.
+func heldText(v any, key string) (string, bool) {
 	m, ok := v.(map[string]any)
-	if !ok {
+	if !ok || len(m) != 2 {
 		return "", false
 	}
-	s, ok := m[templateKey].(string)
-	return s, ok
+	s, ok := m[key].(string)
+	if !ok || m["target"] != s {
+		return "", false
+	}
+	return s, true
 }
 
 // validateAsLoaded applies compose's schema where docker compose applies it — after each
