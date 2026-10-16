@@ -92,6 +92,61 @@ func TestLoad_RefusesWhatDockerComposeRefuses(t *testing.T) {
 	}
 }
 
+// docker compose substitutes before it validates, so a schema violation at a value that
+// holds a template is the environment's to settle, and docker compose loads the file
+// whenever it does. These used to be refused as a whole file because the check deleted
+// every templated value and re-validated: deleting a required field, or one branch of a
+// oneOf, failed where substituting would not.
+func TestLoad_ViolationsAtTemplatedValuesAreTheEnvironments(t *testing.T) {
+	pinned := "ghcr.io/0gfoundation/broker@sha256:" + strings.Repeat("a", 64)
+	for _, tc := range []struct{ name, body string }{
+		{"a templated ulimit beside a literal one", "    ulimits:\n      nofile:\n        soft: ${NOFILE}\n        hard: 2\n"},
+		{"a templated depends_on condition", "    depends_on:\n      db:\n        condition: ${C}\n"},
+		{"a templated typed field", "    privileged: ${PRIV}\n"},
+		{"a templated port target", "    ports:\n      - target: ${PORT}\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := "services:\n  app:\n    image: " + pinned + "\n" + tc.body + "  db:\n    image: " + pinned + "\n"
+			if r := reviewOf(t, manifest(doc)); r.LoadErr != nil {
+				t.Fatalf("refused a manifest docker compose loads once the environment fills it in: %v", r.LoadErr)
+			}
+		})
+	}
+}
+
+// The other direction: what no value of any variable changes is still refused.
+func TestLoad_ViolationsNoEnvironmentRepairsAreRefused(t *testing.T) {
+	pinned := "ghcr.io/0gfoundation/broker@sha256:" + strings.Repeat("a", 64)
+	for _, tc := range []struct{ name, doc, says string }{
+		// An unknown key is about the key, not its value.
+		{"an unknown key whose value is templated",
+			"services:\n  app:\n    image: " + pinned + "\n    bogus: \"${X}\"\n", "bogus"},
+		// A templated value does not cover a literal violation beside it.
+		{"a literal violation beside a templated value",
+			"services:\n  app:\n    image: " + pinned + "\n    ulimits:\n      nofile:\n        soft: ${NOFILE}\n        hard: abc\n",
+			"hard"},
+		// docker compose validates after each document is merged in, so a later document
+		// cannot repair an earlier one.
+		{"a violation a later document removes",
+			"services:\n  app:\n    image: " + pinned + "\n    bogus: x\n---\nservices:\n  app:\n    bogus: !reset null\n",
+			"after document 1 of 2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := reviewOf(t, manifest(tc.doc))
+			if r.LoadErr == nil || !strings.Contains(r.LoadErr.Error(), tc.says) {
+				t.Fatalf("LoadErr = %v, want a refusal mentioning %q", r.LoadErr, tc.says)
+			}
+		})
+	}
+
+	// And a multi-document file whose every prefix is valid still loads, merged.
+	r := reviewOf(t, manifest("services:\n  app:\n    image: "+pinned+"\n---\nservices:\n  app:\n    privileged: true\n"))
+	if r.LoadErr != nil {
+		t.Fatalf("a valid multi-document file: %v", r.LoadErr)
+	}
+	requireFinding(t, r, SeverityBlocking, "app", "privileged")
+}
+
 // include and extends are resolved by reading files from the loader's working directory —
 // on a verifier, its own machine. Neither is loaded, and both are reported as blocking.
 func TestLoad_IncludeAndExtendsAreNotLoaded(t *testing.T) {

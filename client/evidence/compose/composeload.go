@@ -42,9 +42,10 @@ package compose
 //   - The project consistency check: it cross-references names (depends_on targets and
 //     the like). A manifest failing it runs nothing at all; no rule here depends on it.
 //
-// Schema validation runs separately (validateLoaded), because without the environment it
-// refuses some manifests docker compose accepts: `privileged: ${P}` is not a boolean
-// until the environment fills it in.
+// Schema validation runs separately (validateAsLoaded): per document, as docker compose
+// runs it, and judging each violation on its own, because without the environment the
+// schema refuses some manifests docker compose accepts — `privileged: ${P}` is not a
+// boolean until the environment fills it in.
 //
 // WHAT THE REVIEW THEN WALKS. The loaded model re-encoded as a yaml.Node tree: the rules
 // were written against nodes, and a node tree keeps what a Go map would lose for them —
@@ -71,6 +72,7 @@ import (
 	"github.com/compose-spec/compose-go/v2/tree"
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/compose-spec/compose-go/v2/validation"
+	"github.com/xeipuuv/gojsonschema"
 	"gopkg.in/yaml.v3"
 )
 
@@ -81,12 +83,27 @@ import (
 const loadWorkingDir = "/nonexistent/pcverify-compose"
 
 // loadModel runs docker compose's loader over text, with the stages composeload.go's
-// header switches off. An error is the loader's refusal: docker compose cannot load the
-// text, whatever the environment holds.
+// header switches off, then validates it the way docker compose does (validateAsLoaded).
+// An error is a refusal docker compose would make whatever the environment holds.
 func loadModel(text []byte, what string) (map[string]any, error) {
-	model, err := loader.LoadModelWithContext(context.Background(), types.ConfigDetails{
+	model, err := loadFiles([]types.ConfigFile{{Filename: composeFilename, Content: text}})
+	if err != nil {
+		return nil, fmt.Errorf("docker compose cannot load %s: %v", what, err)
+	}
+	if err := validateAsLoaded(text, model); err != nil {
+		return nil, fmt.Errorf("docker compose refuses %s: %v", what, err)
+	}
+	return model, nil
+}
+
+// composeFilename is the name the loader is given for the text; it appears in its errors.
+const composeFilename = "docker-compose.yaml"
+
+// loadFiles is the loader with this file's options and schema validation off.
+func loadFiles(files []types.ConfigFile) (map[string]any, error) {
+	return loader.LoadModelWithContext(context.Background(), types.ConfigDetails{
 		WorkingDir:  loadWorkingDir,
-		ConfigFiles: []types.ConfigFile{{Filename: "docker-compose.yaml", Content: text}},
+		ConfigFiles: files,
 		Environment: map[string]string{},
 	}, func(o *loader.Options) {
 		o.SetProjectName("app", true)
@@ -100,13 +117,6 @@ func loadModel(text []byte, what string) (map[string]any, error) {
 		o.SkipConsistencyCheck = true
 		o.SkipValidation = true
 	})
-	if err != nil {
-		return nil, fmt.Errorf("docker compose cannot load %s: %v", what, err)
-	}
-	if err := validateLoaded(model); err != nil {
-		return nil, fmt.Errorf("docker compose refuses %s: %v", what, err)
-	}
-	return model, nil
 }
 
 // castOnly turns the loader's interpolation stage into its type casts alone.
@@ -135,70 +145,134 @@ func castOnly(opts *interp.Options) *interp.Options {
 	}
 }
 
-// validateLoaded applies compose's schema and its post-load validation, and returns a
-// refusal only when it does not depend on interpolation.
+// validateAsLoaded applies compose's schema where docker compose applies it — after each
+// YAML document is merged in, not only once at the end — and then its post-load checks.
 //
-// Without the environment, a typed field holding `${VAR}` fails the schema — yet docker
-// compose, which interpolates first, accepts it whenever the environment supplies a value
-// of the right type. So a refusal is re-checked with every interpolated scalar removed:
-// if the rest validates, the refusal was about values the environment decides, which is
-// not a statement that docker compose refuses the manifest (the review reports those
-// values itself, as provider-controlled). If it still fails, it fails for any
-// environment.
-func validateLoaded(model map[string]any) error {
-	err := validate(model)
-	if err == nil {
-		return nil
+// Per document, because a later document can repair an earlier one: `bogus: x` in the
+// first and `bogus: !reset null` in the second loads as valid as a whole, but docker
+// compose validated the merge after the first document and refused it there. So each
+// prefix of the documents is loaded and validated in turn. (The prefix models are
+// compose's canonical form rather than the raw merge it validates; the canonical
+// transforms only rewrite shapes the schema accepts either way.)
+func validateAsLoaded(text []byte, model map[string]any) error {
+	docs, err := splitDocuments(text)
+	if err != nil {
+		return err // unreachable: the loader just decoded the same text
 	}
-	if stripped, changed := withoutInterpolated(model); changed && validate(stripped.(map[string]any)) == nil {
-		return nil
+	for k := 1; k < len(docs); k++ {
+		files := make([]types.ConfigFile, k)
+		for i := range files {
+			files[i] = types.ConfigFile{Filename: composeFilename, Content: docs[i]}
+		}
+		prefix, err := loadFiles(files)
+		if err != nil {
+			return fmt.Errorf("after document %d of %d: %v", k, len(docs), err)
+		}
+		if err := validateSchema(prefix); err != nil {
+			return fmt.Errorf("after document %d of %d: %v", k, len(docs), err)
+		}
 	}
-	return err
-}
-
-func validate(model map[string]any) error {
-	if err := schema.Validate(model); err != nil {
+	if err := validateSchema(model); err != nil {
 		return err
 	}
 	return validation.Validate(model)
 }
 
-// withoutInterpolated copies v with every string containing `$` removed — map entries
-// and list elements alike — and reports whether anything was. `$` rather than a parse of
-// compose's template syntax, matching the review's rule that any `$` is
-// provider-controlled: an escaped `$$` removed here only makes the re-check more lenient
-// about a value the review flags anyway.
-func withoutInterpolated(v any) (any, bool) {
+// splitDocuments returns each YAML document of text on its own, re-encoded from its node
+// tree — compose's tags, anchors and aliases included, since they are all on the nodes.
+func splitDocuments(text []byte) ([][]byte, error) {
+	dec := yaml.NewDecoder(bytes.NewReader(text))
+	var docs [][]byte
+	for {
+		var doc yaml.Node
+		err := dec.Decode(&doc)
+		if errors.Is(err, io.EOF) {
+			return docs, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		out, err := yaml.Marshal(&doc)
+		if err != nil {
+			return nil, err
+		}
+		docs = append(docs, out)
+	}
+}
+
+// validateSchema checks model against compose's schema, and reports a violation only when
+// it does not rest on a value the environment decides.
+//
+// docker compose substitutes `${VAR}` before it validates, so a violation AT a value
+// holding a template — `ulimits.nofile.soft: ${NOFILE}` is not an integer yet,
+// `depends_on.db.condition: ${C}` is in no enum yet — is the environment's to settle, and
+// docker compose loads the file whenever it does. Every violation the schema reports is
+// judged on its own (compose-go's Validate keeps only one), and one is set aside when the
+// value it is about contains `$`. Two kinds never are: an unknown key and a missing
+// required one, which are about which KEYS exist, and no value of any variable changes
+// that — `bogus: "${X}"` is refused, as docker compose refuses it.
+//
+// What this does not establish is the converse. A violation set aside may be one no value
+// could repair (`cap_add: "${X}"` is a string whatever X holds), so a manifest this accepts
+// can still be one docker compose refuses for every environment. That direction describes
+// a deployment that runs nothing, so the review reads it rather than refusing it; the
+// direction that matters — refusing a manifest docker compose loads — does not occur.
+func validateSchema(model map[string]any) error {
+	result, err := gojsonschema.Validate(gojsonschema.NewStringLoader(schema.Schema), gojsonschema.NewGoLoader(model))
+	if err != nil {
+		return err
+	}
+	var kept []gojsonschema.ResultError
+	for _, e := range result.Errors() {
+		if !settledByEnvironment(e) {
+			kept = append(kept, e)
+		}
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	// The most specific violation reads best: a oneOf failure is reported alongside the
+	// errors of its closest branch, and those name the field.
+	pick := kept[0]
+	for _, e := range kept {
+		if t := e.Type(); t != "number_one_of" && t != "number_any_of" {
+			pick = e
+			break
+		}
+	}
+	return fmt.Errorf("%s: %s", pick.Field(), pick.Description())
+}
+
+// settledByEnvironment reports whether a schema violation is about a value whose final
+// form the environment decides.
+func settledByEnvironment(e gojsonschema.ResultError) bool {
+	switch e.Type() {
+	case "additional_property_not_allowed", "required", "invalid_property_name":
+		return false
+	}
+	return holdsTemplate(e.Value())
+}
+
+// holdsTemplate reports whether v, or anything under it, is a string containing `$`.
+// Keys are not looked at: compose substitutes values only.
+func holdsTemplate(v any) bool {
 	switch t := v.(type) {
 	case string:
-		return t, false
+		return strings.Contains(t, "$")
 	case map[string]any:
-		out := make(map[string]any, len(t))
-		changed := false
-		for k, e := range t {
-			if s, ok := e.(string); ok && strings.Contains(s, "$") || strings.Contains(k, "$") {
-				changed = true
-				continue
-			}
-			c, ch := withoutInterpolated(e)
-			out[k], changed = c, changed || ch
-		}
-		return out, changed
-	case []any:
-		out := make([]any, 0, len(t))
-		changed := false
 		for _, e := range t {
-			if s, ok := e.(string); ok && strings.Contains(s, "$") {
-				changed = true
-				continue
+			if holdsTemplate(e) {
+				return true
 			}
-			c, ch := withoutInterpolated(e)
-			out, changed = append(out, c), changed || ch
 		}
-		return out, changed
-	default:
-		return v, false
+	case []any:
+		for _, e := range t {
+			if holdsTemplate(e) {
+				return true
+			}
+		}
 	}
+	return false
 }
 
 // toNode re-encodes a loaded model as the node tree the review and the renderer walk.
