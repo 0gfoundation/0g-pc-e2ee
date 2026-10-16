@@ -968,7 +968,34 @@ func (r *ComposeReview) reviewService(name string, body *yaml.Node, mounts *moun
 // reports that rather than defaulting to "off". `privileged: yes-ish-typo` must not
 // read as absent — a rule that silently treats what it cannot parse as safe is worse
 // than no rule, because it produces a clean line.
+// templatedSeverity is, for each key reviewServiceKey has a rule for, the most severe
+// finding that rule can make — what a value the environment supplies may turn out to be.
+var templatedSeverity = map[string]Severity{
+	"privileged": SeverityBlocking, "cap_add": SeverityBlocking, "security_opt": SeverityBlocking,
+	"device_cgroup_rules": SeverityBlocking, "volumes_from": SeverityBlocking, "cgroup": SeverityBlocking,
+	"pid": SeverityBlocking, "network_mode": SeverityBlocking, "ipc": SeverityJustify, "uts": SeverityJustify,
+	"userns_mode": SeverityJustify, "cgroup_parent": SeverityJustify, "devices": SeverityJustify,
+	"sysctls": SeverityJustify, "group_add": SeverityJustify, "secrets": SeverityJustify, "configs": SeverityJustify,
+	"extra_hosts": SeverityNote, "dns": SeverityNote, "dns_search": SeverityNote, "dns_opt": SeverityNote,
+	"links": SeverityNote, "external_links": SeverityNote, "oom_kill_disable": SeverityNote,
+}
+
 func (r *ComposeReview) reviewServiceKey(name, key string, val *yaml.Node) bool {
+	// A rule reads literal text — `host`, `unconfined`, `SYS_ADMIN` — and a template is
+	// none of those until docker compose substitutes the environment: `security_opt:
+	// ["${S}"]` with S=seccomp:unconfined drops the container's confinement while every
+	// literal rule stays silent. So a templated value is reported at the worst the rule
+	// could find, and a templated scalar is that finding entirely.
+	if sev, ruled := templatedSeverity[key]; ruled {
+		if at, found := firstInterpolated(val, key); found {
+			r.add(sev, name, key, fmt.Sprintf("the value holds a template (at %s): docker compose substitutes the "+
+				"deployment's environment into it, so what it sets is the environment's choice, and the manifest "+
+				"does not say", at))
+			if val.Kind == yaml.ScalarNode {
+				return true
+			}
+		}
+	}
 	switch key {
 	case "privileged":
 		if b, ok := nodeBool(val); !ok {

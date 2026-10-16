@@ -26,6 +26,7 @@ import (
 	"bytes"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -514,6 +515,12 @@ func CheckReview(b ComposeBaseline, rels evidence.ReleaseVerifier, contract, pro
 	}
 	out.Recorded, out.Deployment, out.Expected = true, dep.Name, len(dep.Services)
 	out.TopExpected = len(dep.TopLevel)
+	if errors.Is(r.LoadErr, errNotRead) {
+		// Not docker compose's refusal: pcverify did not read the manifest, so the
+		// comparison did not run — incomplete, not a mismatch.
+		out.Unverified = append(out.Unverified, ComposeMismatch{Reason: "not compared: " + r.LoadErr.Error()})
+		return out
+	}
 	out.add("", "cannot be compared: "+r.LoadErr.Error(), "")
 	return out
 }
