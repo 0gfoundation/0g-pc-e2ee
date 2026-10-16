@@ -64,6 +64,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
 
 	interp "github.com/compose-spec/compose-go/v2/interpolation"
 	"github.com/compose-spec/compose-go/v2/loader"
@@ -86,22 +87,34 @@ const loadWorkingDir = "/nonexistent/pcverify-compose"
 // header switches off, then validates it the way docker compose does (validateAsLoaded).
 // An error is a refusal docker compose would make whatever the environment holds.
 func loadModel(text []byte, what string) (map[string]any, error) {
+	// The document count is bounded before anything is loaded: validation loads every
+	// prefix of the documents (validateAsLoaded), and the text is the provider's to write.
+	// A text that does not split is left for the loader, whose error is docker compose's.
+	docs, splitErr := splitDocuments(text)
+	if splitErr == nil && len(docs) > maxDocuments {
+		return nil, fmt.Errorf("%s holds %d YAML documents; pcverify reads at most %d", what, len(docs), maxDocuments)
+	}
 	model, err := loadFiles([]types.ConfigFile{{Filename: composeFilename, Content: text}})
 	if err != nil {
 		return nil, fmt.Errorf("docker compose cannot load %s: %v", what, err)
 	}
-	if err := validateAsLoaded(text, model); err != nil {
+	if err := validateAsLoaded(docs, model); err != nil {
 		return nil, fmt.Errorf("docker compose refuses %s: %v", what, err)
 	}
 	return model, nil
 }
 
+// maxDocuments bounds the YAML documents in one compose text. A manifest has no need for
+// more than one; the bound is what keeps per-document validation from being a lever.
+const maxDocuments = 16
+
 // composeFilename is the name the loader is given for the text; it appears in its errors.
 const composeFilename = "docker-compose.yaml"
 
-// loadFiles is the loader with this file's options and schema validation off.
+// loadFiles is the loader with this file's options and schema validation off, its
+// templated short-syntax entries restored to the text they were written as.
 func loadFiles(files []types.ConfigFile) (map[string]any, error) {
-	return loader.LoadModelWithContext(context.Background(), types.ConfigDetails{
+	model, err := loader.LoadModelWithContext(context.Background(), types.ConfigDetails{
 		WorkingDir:  loadWorkingDir,
 		ConfigFiles: files,
 		Environment: map[string]string{},
@@ -117,6 +130,11 @@ func loadFiles(files []types.ConfigFile) (map[string]any, error) {
 		o.SkipConsistencyCheck = true
 		o.SkipValidation = true
 	})
+	if err != nil {
+		return nil, err
+	}
+	restoreTemplates(model)
+	return model, nil
 }
 
 // castOnly turns the loader's interpolation stage into its type casts alone.
@@ -124,12 +142,16 @@ func loadFiles(files []types.ConfigFile) (map[string]any, error) {
 // docker compose's interpolation does two things: it substitutes `${VAR}` from the
 // environment, and it casts the strings at typed paths — `privileged: "true"` becomes the
 // boolean true, `ports[].target: "80"` the integer 80. The first needs an environment the
-// verifier does not have, so every template is left exactly as written. The second
+// verifier does not have, so every template is left exactly as written — after the same
+// syntax check docker compose makes, so a malformed template is still refused. The second
 // decides what runs, so it is kept: skipping it would read `privileged: "true"` as a
 // string, which docker compose does not, and refuse a manifest docker compose loads. A
 // value still holding `$` is left uncast, since its type is the environment's to decide.
+//
+// And the strings docker compose PARSES after substituting are held back from parsing
+// here (heldTemplate).
 func castOnly(opts *interp.Options) *interp.Options {
-	casts := make(map[tree.Path]interp.Cast, len(opts.TypeCastMapping))
+	casts := make(map[tree.Path]interp.Cast, len(opts.TypeCastMapping)+len(templatedShortSyntax))
 	for p, cast := range opts.TypeCastMapping {
 		casts[p] = func(v string) (any, error) {
 			if strings.Contains(v, "$") {
@@ -138,11 +160,93 @@ func castOnly(opts *interp.Options) *interp.Options {
 			return cast(v)
 		}
 	}
+	for _, p := range templatedShortSyntax {
+		cast, typed := casts[p]
+		casts[p] = func(v string) (any, error) {
+			if strings.Contains(v, "$") {
+				return heldTemplate(v), nil
+			}
+			if typed {
+				return cast(v)
+			}
+			return v, nil
+		}
+	}
 	return &interp.Options{
 		LookupValue:     func(string) (string, bool) { return "", false },
 		TypeCastMapping: casts,
-		Substitute:      func(s string, _ template.Mapping) (string, error) { return s, nil },
+		Substitute: func(s string, _ template.Mapping) (string, error) {
+			// docker compose refuses a template it cannot parse; a variable that is missing
+			// or empty is the environment's business, not a refusal. Every variable is
+			// reported present (and empty) so the parse runs without compose-go's
+			// "variable is not set" warning for each one.
+			_, err := template.Substitute(s, func(string) (string, bool) { return "", true })
+			var invalid *template.InvalidTemplateError
+			if errors.As(err, &invalid) {
+				return s, err
+			}
+			return s, nil
+		},
 	}
+}
+
+// templatedShortSyntax are the paths whose strings compose's canonical transforms PARSE:
+// a short-syntax mount (`source:target:options`), a short-syntax port
+// (`ip:published:target/proto`), and a ulimit given as one number. docker compose parses
+// them after substituting the environment. Parsed here, before substitution, a template
+// is read as text it is not — `/data:/d:${MODE}` loses its options entirely (the volume
+// parser ignores what it does not recognise), `${DATA:-./data}:/data` splits at the
+// default's colon, a templated ulimit is refused outright — and the canonical form then
+// equals that of a text docker compose would run differently. So such a string is not
+// parsed at all: it is held in a mapping the transforms pass through unchanged, and put
+// back as written once the loader is done (restoreTemplates). The canonical form keeps
+// the text, and the review reports it as the environment's.
+var templatedShortSyntax = []tree.Path{
+	tree.NewPath("services", tree.PathMatchAll, "volumes", tree.PathMatchList),
+	tree.NewPath("services", tree.PathMatchAll, "ports", tree.PathMatchList),
+	tree.NewPath("services", tree.PathMatchAll, "ulimits", tree.PathMatchAll),
+}
+
+// templateKey marks a held template. An `x-` key, so it is a legal extension field
+// wherever the schema allows them, and `target` is set alongside it because the loader's
+// uniqueness pass indexes mounts and ports by target.
+const templateKey = "x-pcverify-held-template"
+
+func heldTemplate(v string) map[string]any {
+	return map[string]any{templateKey: v, "target": v}
+}
+
+// restoreTemplates puts every held template back as the string it was written as.
+func restoreTemplates(model map[string]any) {
+	services, _ := model["services"].(map[string]any)
+	for _, svc := range services {
+		body, _ := svc.(map[string]any)
+		for _, key := range []string{"volumes", "ports"} {
+			if list, ok := body[key].([]any); ok {
+				for i, e := range list {
+					if held, ok := heldText(e); ok {
+						list[i] = held
+					}
+				}
+			}
+		}
+		if limits, ok := body["ulimits"].(map[string]any); ok {
+			for k, e := range limits {
+				if held, ok := heldText(e); ok {
+					limits[k] = held
+				}
+			}
+		}
+	}
+}
+
+func heldText(v any) (string, bool) {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return "", false
+	}
+	s, ok := m[templateKey].(string)
+	return s, ok
 }
 
 // validateAsLoaded applies compose's schema where docker compose applies it — after each
@@ -151,14 +255,11 @@ func castOnly(opts *interp.Options) *interp.Options {
 // Per document, because a later document can repair an earlier one: `bogus: x` in the
 // first and `bogus: !reset null` in the second loads as valid as a whole, but docker
 // compose validated the merge after the first document and refused it there. So each
-// prefix of the documents is loaded and validated in turn. (The prefix models are
-// compose's canonical form rather than the raw merge it validates; the canonical
-// transforms only rewrite shapes the schema accepts either way.)
-func validateAsLoaded(text []byte, model map[string]any) error {
-	docs, err := splitDocuments(text)
-	if err != nil {
-		return err // unreachable: the loader just decoded the same text
-	}
+// prefix of the documents is loaded and validated in turn — at most maxDocuments-1 extra
+// loads, and none for the usual single document. (The prefix models are compose's
+// canonical form rather than the raw merge it validates; the canonical transforms only
+// rewrite shapes the schema accepts either way.)
+func validateAsLoaded(docs [][]byte, model map[string]any) error {
 	for k := 1; k < len(docs); k++ {
 		files := make([]types.ConfigFile, k)
 		for i := range files {
@@ -218,7 +319,11 @@ func splitDocuments(text []byte) ([][]byte, error) {
 // a deployment that runs nothing, so the review reads it rather than refusing it; the
 // direction that matters — refusing a manifest docker compose loads — does not occur.
 func validateSchema(model map[string]any) error {
-	result, err := gojsonschema.Validate(gojsonschema.NewStringLoader(schema.Schema), gojsonschema.NewGoLoader(model))
+	compiled, err := composeSchema()
+	if err != nil {
+		return err
+	}
+	result, err := compiled.Validate(gojsonschema.NewGoLoader(model))
 	if err != nil {
 		return err
 	}
@@ -242,6 +347,12 @@ func validateSchema(model map[string]any) error {
 	}
 	return fmt.Errorf("%s: %s", pick.Field(), pick.Description())
 }
+
+// composeSchema is compose's schema, compiled once: compiling it is most of what one
+// validation costs, and a run validates every recorded block as well as the manifest.
+var composeSchema = sync.OnceValues(func() (*gojsonschema.Schema, error) {
+	return gojsonschema.NewSchema(gojsonschema.NewStringLoader(schema.Schema))
+})
 
 // settledByEnvironment reports whether a schema violation is about a value whose final
 // form the environment decides.

@@ -2,11 +2,13 @@ package compose
 
 import (
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The cases this package's own YAML reader was once held to against compose-go, kept as
@@ -179,19 +181,113 @@ func TestLoad_IncludeAndExtendsAreNotLoaded(t *testing.T) {
 	requireFinding(t, r, SeverityBlocking, "app", "extends")
 }
 
-// compose-go reads `${HOSTROOT}:/host` as a volume named "${HOSTROOT}" — it parses before
-// interpolation. What it mounts is the environment's choice, so it is not a volume name.
-func TestLoad_AnInterpolatedMountSourceIsTheEnvironmentsChoice(t *testing.T) {
+// A short-syntax mount holding a template is not parsed (composeload.go,
+// templatedShortSyntax): docker compose parses it after substitution, so the review
+// reports the text as written rather than a split of it.
+func TestLoad_ATemplatedShortMountIsReportedAsWritten(t *testing.T) {
 	pinned := "ghcr.io/0gfoundation/broker@sha256:" + strings.Repeat("a", 64)
-	for _, src := range []string{"${HOSTROOT}", "/${ROOT}/etc", "$DATA"} {
-		r := reviewOf(t, manifest("services:\n  app:\n    image: "+pinned+"\n    volumes:\n      - "+src+":/host\n"))
+	for _, entry := range []string{"${HOSTROOT}:/host", "/${ROOT}/etc:/host", "$DATA:/host", "/data:/d:${MODE}",
+		"${DATA:-./data}:/data"} {
+		r := reviewOf(t, manifest("services:\n  app:\n    image: "+pinned+"\n    volumes:\n      - \""+entry+"\"\n"))
 		if r.LoadErr != nil {
-			t.Fatalf("%s: %v", src, r.LoadErr)
+			t.Fatalf("%s: %v", entry, r.LoadErr)
 		}
 		f := requireFinding(t, r, SeverityBlocking, "app", "volumes")
-		if !strings.Contains(f.Detail, "decided by the deployment's environment") {
-			t.Fatalf("%s: detail = %s", src, f.Detail)
+		if !strings.Contains(f.Detail, fmt.Sprintf("%q is a short-syntax mount holding a template", entry)) {
+			t.Fatalf("%s: detail = %s", entry, f.Detail)
 		}
+	}
+	// A long-syntax source holding a template is not parsed by anyone, and keeps its rule.
+	r := reviewOf(t, manifest("services:\n  app:\n    image: "+pinned+"\n    volumes:\n      - type: bind\n"+
+		"        source: ${HOSTROOT}\n        target: /host\n"))
+	f := requireFinding(t, r, SeverityBlocking, "app", "volumes")
+	if !strings.Contains(f.Detail, "decided by the deployment's environment") {
+		t.Fatalf("long syntax: detail = %s", f.Detail)
+	}
+}
+
+// The canonical form keeps a templated short-syntax entry as written, so it cannot equal
+// the form of a text docker compose would run differently. Parsed before substitution,
+// `/data:/d:${MODE}` lost its options and reduced to exactly `/data:/d`.
+func TestLoad_ATemplatedShortEntryKeepsItsText(t *testing.T) {
+	for _, tc := range []struct{ name, plain, templated, keeps string }{
+		{"mount options", "image: x\nvolumes: [\"/data:/d\"]\n", "image: x\nvolumes: [\"/data:/d:${MODE}\"]\n",
+			"/data:/d:${MODE}"},
+		{"a default with a colon", "image: x\nvolumes: [\"./data:/data\"]\n",
+			"image: x\nvolumes: [\"${DATA:-./data}:/data\"]\n", "${DATA:-./data}:/data"},
+		{"a port", "image: x\nports: [\"8080:80\"]\n", "image: x\nports: [\"${P:-8080}:80\"]\n", "${P:-8080}:80"},
+		{"a ulimit", "image: x\nulimits: {nofile: 1024}\n", "image: x\nulimits: {nofile: \"${U}\"}\n", "${U}"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plain, err := CanonicalizeServiceBlock("a", []byte(tc.plain))
+			if err != nil {
+				t.Fatal(err)
+			}
+			templated, err := CanonicalizeServiceBlock("a", []byte(tc.templated))
+			if err != nil {
+				t.Fatalf("refused: %v", err)
+			}
+			if plain == templated || !strings.Contains(templated, tc.keeps) {
+				t.Fatalf("the template did not survive:\n%s\nvs\n%s", plain, templated)
+			}
+			// And the text is stable: reducing it again changes nothing.
+			again, err := CanonicalizeServiceBlock("a", []byte(templated))
+			if err != nil || again != templated {
+				t.Fatalf("not idempotent (%v):\n%s\nvs\n%s", err, templated, again)
+			}
+		})
+	}
+
+	// So a baseline recorded with the plain mount does not match the templated manifest.
+	b, err := ParseComposeBaseline([]byte(`{"deployments": [{"name": "d", "contract": "` + testContract + `",
+		"providers": ["` + testProvider + `"], "services": [{"name": "a", "block": ["image: x", "volumes:",
+		"  - /data:/d"]}]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := reviewOf(t, manifest("services:\n  a:\n    image: x\n    volumes: [\"/data:/d:${MODE}\"]\n"))
+	if got := CheckReview(b, testReleases, testContract, testProvider, r); got.OK() {
+		t.Fatalf("a templated mount matched the plain one it is not:\n%s", dumpMismatches(got))
+	}
+}
+
+// A port holding a template is the environment's to read too.
+func TestLoad_ATemplatedPortIsReported(t *testing.T) {
+	r := reviewOf(t, manifest("services:\n  app:\n    image: app\n    ports: [\"${P:-8080}:80\", \"9090:90\"]\n"))
+	f := requireFinding(t, r, SeverityJustify, "app", "ports")
+	if !strings.Contains(f.Detail, `"${P:-8080}:80" is a short-syntax port holding a template`) {
+		t.Fatalf("detail = %s", f.Detail)
+	}
+}
+
+// Template syntax is checked as docker compose checks it: a malformed template is a
+// refusal, a missing or required variable is the environment's.
+func TestLoad_TemplateSyntax(t *testing.T) {
+	if r := reviewOf(t, manifest("services:\n  app:\n    image: app\n    environment: [\"A=${\"]\n")); r.LoadErr == nil ||
+		!strings.Contains(r.LoadErr.Error(), "invalid interpolation format") {
+		t.Fatalf("a malformed template: %v", r.LoadErr)
+	}
+	for _, v := range []string{"${X:?set X}", "${X?}", "${X:-d}", "$X", "$${X}"} {
+		if r := reviewOf(t, manifest("services:\n  app:\n    image: app\n    environment: [\"A="+v+"\"]\n")); r.LoadErr != nil {
+			t.Fatalf("%s: %v", v, r.LoadErr)
+		}
+	}
+}
+
+// Validation loads every prefix of the documents, and the text is the provider's, so the
+// document count is bounded and a long run of documents is refused before any is loaded.
+func TestLoad_DocumentCountIsBounded(t *testing.T) {
+	ok := strings.Repeat("services: {}\n---\n", maxDocuments-1) + "services:\n  app:\n    image: app\n"
+	if r := reviewOf(t, manifest(ok)); r.LoadErr != nil {
+		t.Fatalf("%d documents: %v", maxDocuments, r.LoadErr)
+	}
+	start := time.Now()
+	r := reviewOf(t, manifest(strings.Repeat("---\nservices: {}\n", 5000)))
+	if r.LoadErr == nil || !strings.Contains(r.LoadErr.Error(), "pcverify reads at most") {
+		t.Fatalf("5000 documents: %v", r.LoadErr)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("refusing 5000 documents took %v", d)
 	}
 }
 
