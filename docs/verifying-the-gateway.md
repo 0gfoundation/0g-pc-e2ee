@@ -35,13 +35,15 @@ about to rely on:
 
 ```sh
 git clone https://github.com/0gfoundation/0g-pc-e2ee
-cd 0g-pc-e2ee/client
-go build -o pcverify ./cmd/pcverify     # or: go run ./cmd/pcverify -gateway <domain>
+cd 0g-pc-e2ee/client/cmd/pcverify
+go build -o pcverify .     # or: go run . -gateway <domain>
 ```
 
-(`go install …/cmd/pcverify@latest` does **not** work: `client/go.mod` carries a
-`replace` for the in-repo `protocol` module, which `go install` refuses. Clone and
-build.)
+pcverify is its own Go module, so it is built from its own directory. That keeps the
+dependencies only a verifier needs — Sigstore's, for checking broker release provenance —
+out of the gateway's build. (`go install …/cmd/pcverify@latest` does **not** work: its
+`go.mod` carries `replace` directives for the in-repo `client` and `protocol` modules,
+which `go install` refuses. Clone and build.)
 
 **Read the exit code, and read which one.** Two lookups are *advisory by default*,
 because they reach things that say nothing about the deployment: the release lookup

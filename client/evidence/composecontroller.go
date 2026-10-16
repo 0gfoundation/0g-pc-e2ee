@@ -2,7 +2,7 @@ package evidence
 
 // composecontroller.go holds the one exception the review makes to its rule that a
 // container holding the container runtime's socket is BLOCKING: 0G's own controller, at a
-// listed release, under the conditions the broker enforces in the controller's code.
+// verified release, under the conditions the broker enforces in the controller's code.
 //
 // WHY AN EXCEPTION AT ALL. Every provider on the 2026-10-10 sweep mounted
 // /var/run/docker.sock into 0g-controller — it is how the broker deployment works, not
@@ -26,12 +26,12 @@ package evidence
 // WHY JUSTIFY AND NOT SILENCE. Those limits are the controller's CODE at a particular
 // digest. This review reads a manifest; it cannot see code, and it does not adjudicate.
 // So the finding stays, at Justify, saying what it rests on — and on any build the
-// release list does not name, the limits are not known to hold and it stays Blocking.
+// release verifier does not accept, the limits are not known to hold and it stays Blocking.
 //
 // WHY THESE CONDITIONS. Each closes a way to put the socket in the hands of something
 // #759 does not govern. The broker image ships three programs, so the service has to RUN
-// the controller, not merely be named after it. The image has to be a listed release,
-// since an unlisted build is unknown code. Any service key beyond the few a controller
+// the controller, not merely be named after it. The image has to be a verified release,
+// since an unverified build is unknown code. Any service key beyond the few a controller
 // needs (controllerKeys), extra host paths, and any mention of the engine flag each widen
 // what the holder can reach beyond what #759 describes. And any OTHER blocking finding
 // on the service keeps this one blocking too: an exception granted to a service the
@@ -90,6 +90,9 @@ func (r *ComposeReview) justifyControllerRuntimeSocket(name string, body *yaml.N
 	}
 
 	rel, why := controllerEligible(body, svc, mounts, r.releases)
+	if why == "" && rel.Commit != "" {
+		rel.Version += " (commit " + rel.Commit + ")"
+	}
 	if why == "" && otherBlocking != "" {
 		why = fmt.Sprintf("the service has another blocking finding (%s)", otherBlocking)
 	}
@@ -101,7 +104,7 @@ func (r *ComposeReview) justifyControllerRuntimeSocket(name string, body *yaml.N
 			continue
 		}
 		r.Findings[i].Severity = SeverityJustify
-		r.Findings[i].Detail += fmt.Sprintf(". JUSTIFIED rather than blocking: this is 0G's controller at listed "+
+		r.Findings[i].Detail += fmt.Sprintf(". JUSTIFIED rather than blocking: this is 0G's controller at verified "+
 			"release %s, running as %s, with no service keys, environment variables or healthcheck beyond the "+
 			"ones the exception covers (so no entrypoint override, privileges, capabilities, devices, host "+
 			"namespaces, env_file or second program), nothing interpolated in its own service, no host path "+
@@ -111,7 +114,7 @@ func (r *ComposeReview) justifyControllerRuntimeSocket(name string, body *yaml.N
 			"repository's doc/controller-design.md §3.4). The repository in that swap is controller.imageRepo "+
 			"from the controller's config file, which the provider supplies (written by broker-config-init) and "+
 			"can rewrite at runtime, so which images broker and event run after boot is bounded only by replaying "+
-			"RTMR3 against the release list — not by this review. Those limits are the controller's code at this "+
+			"RTMR3 against the release policy — not by this review. Those limits are the controller's code at this "+
 			"digest: this review cannot see them, and they do not hold on any other build",
 			rel.Version, controllerCommand, controllerEnginesEnv)
 	}
@@ -161,21 +164,27 @@ var (
 
 // controllerEligible reports whether a service meets the exception's conditions, and
 // when it does not, the first condition it fails — phrased as what is wrong. rels is the
-// release list the whole run uses, so this and the baseline cannot disagree about a
+// release verifier the whole run uses, so this and the baseline cannot disagree about a
 // digest.
-func controllerEligible(body *yaml.Node, svc ReviewedService, mounts *mountIndex, rels BrokerReleases) (BrokerRelease, string) {
+func controllerEligible(body *yaml.Node, svc ReviewedService, mounts *mountIndex, rels ReleaseVerifier) (BrokerRelease, string) {
 	if !svc.Pinned() {
 		return BrokerRelease{}, "its image is not pinned by digest"
 	}
-	if svc.Image != rels.Repository {
+	if rels != nil && svc.Image != rels.Repository() {
 		return BrokerRelease{}, fmt.Sprintf("its image is %s, not 0G's broker image", svc.Image)
 	}
-	rel, ok := rels.Lookup(svc.Image, svc.Digest)
-	if !ok {
-		return BrokerRelease{}, fmt.Sprintf("%s@%s is not a listed release (brokerreleases.json lists %s), so "+
-			"the controller code that would limit the socket is not known to be there",
-			svc.Image, shortDigest(svc.Digest), listedVersions(rels))
+	v := verifyRelease(rels, svc.Image, svc.Digest)
+	switch v.Status {
+	case ReleaseAccepted:
+	case ReleaseUnavailable:
+		return BrokerRelease{}, fmt.Sprintf("whether %s@%s is a release could not be checked (%s), so the "+
+			"controller code that would limit the socket is not known to be there",
+			svc.Image, shortDigest(svc.Digest), v.Reason)
+	default:
+		return BrokerRelease{}, fmt.Sprintf("%s@%s is not an accepted release (%s), so the controller code "+
+			"that would limit the socket is not known to be there", svc.Image, shortDigest(svc.Digest), v.Reason)
 	}
+	rel := v.Release
 
 	// Before anything reads a value: a `$` anywhere means docker compose fills that value
 	// in from the deployment's environment (the .env dstack writes from the encrypted

@@ -109,7 +109,7 @@ One command, run from anywhere, against a domain you name:
 
 ```sh
 git clone https://github.com/0gfoundation/0g-pc-e2ee
-cd 0g-pc-e2ee/client && go build -o pcverify ./cmd/pcverify
+cd 0g-pc-e2ee/client/cmd/pcverify && go build -o pcverify .
 
 ./pcverify -gateway <gateway-domain>
 ```

@@ -46,16 +46,6 @@ func manifest(composeText string, extra ...map[string]any) map[string]any {
 	return m
 }
 
-// builtinReleases is the embedded broker release list — what pcverify passes.
-func builtinReleases(t *testing.T) BrokerReleases {
-	t.Helper()
-	rels, err := BuiltinBrokerReleases()
-	if err != nil {
-		t.Fatalf("embedded release list: %v", err)
-	}
-	return rels
-}
-
 // The compose_hash each recorded deployment's verified quote binds (2026-10-15).
 const (
 	// testnet: provider 0x1cB95Eb6… on contract 0xa79F4c83….
@@ -92,7 +82,7 @@ func reviewRecorded(t *testing.T, file, composeHash string) ComposeReview {
 	if _, err := hex.Decode(hash[:], []byte(composeHash)); err != nil {
 		t.Fatal(err)
 	}
-	r, err := ReviewCompose(raw, hash, builtinReleases(t))
+	r, err := ReviewCompose(raw, hash, fleetReleases)
 	if err != nil {
 		t.Fatalf("%s is not the manifest its quote binds: %v", file, err)
 	}
@@ -103,7 +93,7 @@ func reviewRecorded(t *testing.T, file, composeHash string) ComposeReview {
 func reviewOf(t *testing.T, fields map[string]any) ComposeReview {
 	t.Helper()
 	raw, hash := appComposeFor(t, fields)
-	r, err := ReviewCompose(raw, hash, builtinReleases(t))
+	r, err := ReviewCompose(raw, hash, fleetReleases)
 	if err != nil {
 		t.Fatalf("ReviewCompose: %v", err)
 	}
@@ -181,7 +171,7 @@ func TestReviewCompose_RefusesBytesTheQuoteDoesNotBind(t *testing.T) {
 	raw, hash := appComposeFor(t, hardenedManifest())
 	hash[0] ^= 0xff
 
-	if _, err := ReviewCompose(raw, hash, builtinReleases(t)); err == nil {
+	if _, err := ReviewCompose(raw, hash, fleetReleases); err == nil {
 		t.Fatal("reviewed an app-compose whose digest does not match the compose_hash")
 	}
 
@@ -189,7 +179,7 @@ func TestReviewCompose_RefusesBytesTheQuoteDoesNotBind(t *testing.T) {
 	// gate must be over the bytes, not over anything recoverable from them.
 	raw2, hash2 := appComposeFor(t, hardenedManifest())
 	raw2[len(raw2)-2] = ' '
-	if _, err := ReviewCompose(raw2, hash2, builtinReleases(t)); err == nil {
+	if _, err := ReviewCompose(raw2, hash2, fleetReleases); err == nil {
 		t.Fatal("reviewed an app-compose that was modified after its hash was taken")
 	}
 }
@@ -207,20 +197,20 @@ func TestReviewCompose_RefusesReformattedEqualJSON(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if _, err := ReviewCompose(pretty, hash, builtinReleases(t)); err == nil {
+	if _, err := ReviewCompose(pretty, hash, fleetReleases); err == nil {
 		t.Fatal("accepted a reformatted app-compose against the original hash")
 	}
 }
 
 func TestReviewCompose_RefusesNonJSON(t *testing.T) {
 	raw := []byte("not json at all")
-	if _, err := ReviewCompose(raw, sha256.Sum256(raw), builtinReleases(t)); err == nil {
+	if _, err := ReviewCompose(raw, sha256.Sum256(raw), fleetReleases); err == nil {
 		t.Fatal("reviewed bytes that are not JSON")
 	}
 	// A JSON array passes the "is JSON" bar but is not an app-compose; it must not
 	// reach the field walk as an empty object, which would review as clean.
 	arr := []byte(`["services"]`)
-	if _, err := ReviewCompose(arr, sha256.Sum256(arr), builtinReleases(t)); err == nil {
+	if _, err := ReviewCompose(arr, sha256.Sum256(arr), fleetReleases); err == nil {
 		t.Fatal("reviewed a JSON array as an app-compose")
 	}
 }
@@ -1066,7 +1056,7 @@ func TestReviewCompose_StrictStructDecodeIsNotAGateFailure(t *testing.T) {
 		t.Fatal("VerifyAppCompose accepted an allowed_envs object")
 	}
 	// ...but the gate passes, so the review must run and report it as a finding.
-	r, err := ReviewCompose(raw, hash, builtinReleases(t))
+	r, err := ReviewCompose(raw, hash, fleetReleases)
 	if err != nil {
 		t.Fatalf("ReviewCompose refused authenticated bytes: %v", err)
 	}

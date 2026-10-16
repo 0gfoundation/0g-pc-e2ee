@@ -66,11 +66,11 @@ func TestControllerException_EachConditionIsLoadBearing(t *testing.T) {
 	}
 	envLine := "      - CONFIG_FILE=/etc/config/config.yaml\n"
 	for _, tc := range []struct{ name, doc, says string }{
-		{"an unlisted release",
+		{"a release the verifier does not accept",
 			sub("sha256:951f4c79", "sha256:ec5df834"), ""},
 		{"v0.5.1, the build cn-20 runs",
 			strings.Replace(eligibleController, "@sha256:951f4c7971f87377ab077639a5a84d2aed8945460494da076ff8466ea1ee90b5",
-				"@sha256:ec5df8347f91c3b28a6638db4e24dba343799c0a3a7e2cdd44845a3a27f2e734", 1), "not a listed release"},
+				"@sha256:ec5df8347f91c3b28a6638db4e24dba343799c0a3a7e2cdd44845a3a27f2e734", 1), "not an accepted release"},
 		{"a tag instead of a digest",
 			sub(v054, "ghcr.io/0gfoundation/0g-serving-broker:v0.5.4"), "not pinned"},
 		{"another repository",
@@ -178,28 +178,32 @@ func TestControllerException_AnyEnginesValueCostsIt(t *testing.T) {
 	}
 }
 
-// The release list is the one the caller passes — the same one CheckCompose gets — not
-// one the review reads for itself. Otherwise a run given a different list would judge
-// the same digest two ways in one report.
-func TestControllerException_UsesTheReleaseListItIsGiven(t *testing.T) {
+// The verdict is the caller's verifier's — the same one CheckCompose gets — not one the
+// review reaches for itself. Otherwise one report could judge a digest two ways. Only an
+// ACCEPTED verdict grants the exception: a rejected build, a build nobody could check
+// (registry down), and a run with no verifier at all each keep the finding blocking.
+func TestControllerException_UsesTheVerifierItIsGiven(t *testing.T) {
 	raw, hash := appComposeFor(t, manifest(eligibleController))
 	for _, tc := range []struct {
 		name string
-		rels BrokerReleases
+		rels ReleaseVerifier
 		want Severity
+		says string
 	}{
-		{"the embedded list", builtinReleases(t), SeverityJustify},
-		{"an empty list", BrokerReleases{Repository: brokerRepoName}, SeverityBlocking},
-		{"a list without this digest", BrokerReleases{Repository: brokerRepoName,
-			Releases: []BrokerRelease{{"v9", "sha256:" + strings.Repeat("b", 64)}}}, SeverityBlocking},
+		{"an accepting verifier", fleetReleases, SeverityJustify, "v0.5.4 (commit c0ffee)"},
+		{"a verifier that accepts nothing", fakeReleases{repo: brokerRepoName}, SeverityBlocking, "not an accepted release"},
+		{"a verifier that could not check", fakeReleases{repo: brokerRepoName, unavailable: true}, SeverityBlocking,
+			"could not be checked"},
+		{"no verifier", nil, SeverityBlocking, "no release verifier"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r, err := ReviewCompose(raw, hash, tc.rels)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if f := dockerSockFinding(t, r, "0g-controller"); f.Severity != tc.want {
-				t.Fatalf("severity %s, want %s:\n%s", f.Severity, tc.want, f.Detail)
+			f := dockerSockFinding(t, r, "0g-controller")
+			if f.Severity != tc.want || !strings.Contains(f.Detail, tc.says) {
+				t.Fatalf("severity %s, want %s mentioning %q:\n%s", f.Severity, tc.want, tc.says, f.Detail)
 			}
 		})
 	}
@@ -249,7 +253,7 @@ func TestControllerException_OnTheRecordedDeployments(t *testing.T) {
 		t.Errorf("testnet: severity %s:\n%s", f.Severity, f.Detail)
 	}
 	f := dockerSockFinding(t, reviewCN20(t), "0g-controller")
-	if f.Severity != SeverityBlocking || !strings.Contains(f.Detail, "not a listed release") {
+	if f.Severity != SeverityBlocking || !strings.Contains(f.Detail, "not an accepted release") {
 		t.Errorf("cn-20: severity %s:\n%s", f.Severity, f.Detail)
 	}
 }

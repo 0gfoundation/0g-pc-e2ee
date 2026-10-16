@@ -50,8 +50,9 @@
 // Every direction is checked: a recorded service missing from the manifest, a manifest
 // service the deployment does not record (an unlisted container runs in the same guest as
 // the reviewed ones), a service declared twice, a block that differs, and an image
-// outside its rule. 0G's broker image is the one allowed to move, and only between the
-// releases client/evidence/brokerreleases.json lists. A provider with NO recorded
+// outside its rule. 0G's broker image is the one allowed to move, and only between
+// released builds, judged by their signed provenance (provenance/policy.json); a build
+// whose provenance cannot be fetched leaves the run incomplete. A provider with NO recorded
 // deployment is not compared, and the run says so and exits 3: nobody reviewed it, which
 // is not the same claim as "it differs from what we reviewed". Recording is not approval:
 // the review keeps reporting what it finds on every run. -app-baseline reads a candidate
@@ -202,8 +203,10 @@ import (
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
+	"github.com/0gfoundation/0g-pc-e2ee/client/cmd/pcverify/provenance"
 	"github.com/0gfoundation/0g-pc-e2ee/client/dcap"
 	"github.com/0gfoundation/0g-pc-e2ee/client/evidence"
+	"github.com/0gfoundation/0g-pc-e2ee/client/release"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
 )
 
@@ -379,11 +382,12 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 		fmt.Fprintf(out, "pcverify: %v\n", err)
 		return 2
 	}
-	// The release list bounds the baseline's `repository` rule. Embedded only — no flag
-	// substitutes it — because it is the list of broker builds the gateway is willing to
-	// accept, and a diagnostic that could be pointed at a friendlier one would answer a
-	// different question from the one the gateway asks.
-	brokerReleases, err := evidence.BuiltinBrokerReleases()
+	// Broker builds are judged by their signed release provenance, fetched from the image
+	// registry and checked against an embedded policy and Sigstore trust root
+	// (provenance/policy.json). Embedded only — no flag substitutes them — for the reason
+	// no flag substitutes the OS-image allowlist: a diagnostic that could be pointed at a
+	// friendlier policy would answer a different question from the one it is asked.
+	brokerReleases, err := provenance.New(release.NewHTTPClient(*timeout), *timeout)
 	if err != nil {
 		fmt.Fprintf(out, "pcverify: %v\n", err)
 		return 2
@@ -422,8 +426,9 @@ type providerOpts struct {
 	// rather than loaded inside report so a test can drive the comparison, and so
 	// -app-baseline can substitute a candidate file for the embedded one.
 	baseline evidence.ComposeBaseline
-	// releases bounds the baseline's `repository` rule (brokerreleases.json).
-	releases evidence.BrokerReleases
+	// releases judges broker builds, for the baseline's `repository` rule and the
+	// controller exception. Nil judges nothing: those services are reported as unchecked.
+	releases evidence.ReleaseVerifier
 }
 
 // report runs the checks and prints a per-hop result, returning the process exit code
@@ -707,6 +712,9 @@ func baselineSkip(check evidence.ComposeCheck) string {
 		return "the manifest was not compared against a per-service baseline (none is recorded)"
 	case !check.Recorded:
 		return "the manifest was not compared against a per-service baseline (no deployment is recorded for this provider)"
+	case !check.Complete():
+		return fmt.Sprintf("the per-service baseline comparison is incomplete (%d broker build(s) could not be "+
+			"checked against the release provenance policy)", len(check.Unverified))
 	}
 	return ""
 }
@@ -727,9 +735,17 @@ func reportBaseline(out io.Writer, check evidence.ComposeCheck, contract string)
 		fmt.Fprintf(out, "- baseline         not compared (no deployment is recorded for this provider on "+
 			"contract %s; see client/evidence/brokercompose.json)\n", contract)
 		return false
-	case check.OK():
+	case check.OK() && check.Complete():
 		fmt.Fprintf(out, "%s baseline         all %d service(s) and %d top-level section(s) match the recorded "+
 			"deployment %q\n", mark(true), check.Matched, check.TopMatched, check.Deployment)
+		return false
+	case check.OK():
+		// Nothing differs, but not everything could be judged: the "-" of a check that did
+		// not run, never the ✓ of one that passed.
+		fmt.Fprintf(out, "- baseline         incomplete: %d of %d service(s) and %d of %d top-level section(s) "+
+			"match the recorded deployment %q; %d could not be checked\n", check.Matched, check.Expected,
+			check.TopMatched, check.TopExpected, check.Deployment, len(check.Unverified))
+		printUnverified(out, check)
 		return false
 	}
 	fmt.Fprintf(out, "%s baseline         %d of %d service(s) and %d of %d top-level section(s) match the "+
@@ -745,7 +761,15 @@ func reportBaseline(out io.Writer, check evidence.ComposeCheck, contract string)
 			fmt.Fprintf(out, "      %s\n", m.Diff)
 		}
 	}
+	printUnverified(out, check)
 	return true
+}
+
+// printUnverified lists the broker builds whose release status could not be checked.
+func printUnverified(out io.Writer, check evidence.ComposeCheck) {
+	for _, u := range check.Unverified {
+		fmt.Fprintf(out, "    %s: not checked — %s\n", u.Service, u.Reason)
+	}
 }
 
 // dumpBlock prints one canonical block, line-prefixed so it cannot be mistaken for the

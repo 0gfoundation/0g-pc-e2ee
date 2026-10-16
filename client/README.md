@@ -220,21 +220,31 @@ that nobody had recorded them. Not recorded is unverified, not refuted.
 Two deployments are recorded: mainnet **compute-network-20** and testnet
 **compute-network-20-dev**, each taken from that provider's own `-blocks` output and
 checked back against the live provider. The other mainnet providers are deliberately not
-recorded yet — their broker builds are not ones the release list accepts, and the v0.5.4
+recorded yet — their broker builds are not ones the release policy accepts, and the v0.5.4
 rollout will change their manifests anyway.
 
 0G's broker image is the one image allowed to move without a new record, and only between
-the builds **`evidence/brokerreleases.json`** lists — today v0.5.4, resolved against the
-registry rather than copied off a provider. v0.5.1 and v0.5.2 are real releases left out
-on purpose: v0.5.4 is the first the broker team reports as carrying the controller's
-container-creation limits (#759) and the change that lets broker-ingress drop
-`dstack.sock` (#763). So cn-20, on v0.5.1, matches nine of its twelve recorded services
-and fails on the three that run the broker image.
+**released builds, judged by their signed provenance at run time**
+(`cmd/pcverify/provenance`). pcverify fetches the Sigstore bundle attached to the digest
+in the registry and accepts the build only when its SLSA provenance verifies against
+Sigstore's trust root and was signed by the broker repository's release workflow
+(`build.yml`) on a release tag, on a GitHub-hosted runner, at or above v0.5.4 — the first
+release carrying the controller's container-creation limits (#759) and the change that
+lets broker-ingress drop `dstack.sock` (#763). No list is edited when the broker ships.
+v0.5.1 and v0.5.2 are signed by the same workflow and refused by the version floor;
+manual branch builds (`docker-publish.yml`) are refused by the workflow check. So cn-20,
+on v0.5.1, matches nine of its twelve recorded services and fails on the three that run
+the broker image. When the registry cannot be read, those services are reported as not
+checked and the run exits 3, never 0.
+
+pcverify is its own Go module (`cmd/pcverify/go.mod`), so that Sigstore's verifier and
+the dependency versions it requires never enter the gateway's build. Build it from that
+directory: `cd client/cmd/pcverify && go build .`
 
 **Recording is not approval.** The review reports on every run whatever it finds; a
 record only means the services cannot change unseen. The one finding the review relaxes
 is `0g-controller`'s `docker.sock`, reported as *justify* rather than *blocking* when the
-controller runs a listed release as the `0g-controller` program, using only the service
+controller runs a verified release as the `0g-controller` program, using only the service
 keys, environment variables and healthcheck every controller on the fleet uses, with
 nothing interpolated in its own service, no host path beyond the two sockets, only
 declared local volumes, and `ZG_CONTROLLER_ENGINES` absent — the conditions under which
@@ -242,7 +252,7 @@ declared local volumes, and `ZG_CONTROLLER_ENGINES` absent — the conditions un
 which condition failed (`evidence/composecontroller.go`). What it does NOT bound: the
 repository image swaps pull from is `controller.imageRepo` in the controller's config
 file, which the provider supplies and can rewrite at runtime, so what broker and event
-run after boot is bounded only by an RTMR3 replay against the release list.
+run after boot is bounded only by an RTMR3 replay against the release policy.
 
 The baseline also records each deployment's **top-level sections** — `volumes`,
 `networks`, and anything else besides `services` and `x-` extensions — and compares them

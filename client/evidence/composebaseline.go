@@ -135,16 +135,16 @@ func (b ComposeBaseline) For(contract, provider string) (Deployment, bool) {
 // tag, or no image at all, whichever the recorded text says. Repository is the one case
 // the text cannot express.
 type ImageRule struct {
-	// Repository accepts any RELEASED build of this repository — a digest listed in
-	// brokerreleases.json — and switches the block comparison to the image-held-out form
-	// so the reference is not pinned twice.
+	// Repository accepts any RELEASED build of this repository — a digest the caller's
+	// ReleaseVerifier accepts (brokerrelease.go) — and switches the block comparison to
+	// the image-held-out form so the reference is not pinned twice.
 	//
 	// It exists for one case: an image whose release cadence would otherwise force a
 	// gateway release per broker release. Every deployment runs 0G's own broker image in
 	// three services, and it moves on every broker ship. It first accepted any
 	// digest-pinned image in the repository, which turned out to be no bound at all: of the
 	// four broker digests the 2026-10-10 sweep found, two were pointed at by no release tag
-	// when the registry was checked on 2026-10-15. The release list is the bound.
+	// when the registry was checked on 2026-10-15. The release verifier is the bound.
 	Repository string
 }
 
@@ -452,10 +452,19 @@ type ComposeCheck struct {
 	Matched int
 	// TopExpected and TopMatched are the same two counts for the top-level sections.
 	TopExpected, TopMatched int
+	// Unverified lists the services whose block matched but whose broker build could not
+	// be checked against the release verifier (ReleaseUnavailable). Neither a match nor a
+	// mismatch: the comparison is incomplete, which a report must say and a gate must not
+	// read as a pass.
+	Unverified []ComposeMismatch
 }
 
 // Compared reports whether a comparison actually ran.
 func (c ComposeCheck) Compared() bool { return c.Configured && c.Recorded }
+
+// Complete reports whether every recorded service could be judged — false when a broker
+// build's release status could not be checked.
+func (c ComposeCheck) Complete() bool { return len(c.Unverified) == 0 }
 
 // OK reports whether the manifest is acceptable. A comparison that did not run is OK:
 // the check is unavailable, and the caller's summary is where that is disclosed.
@@ -480,13 +489,14 @@ func (c ComposeCheck) OK() bool { return !c.Compared() || len(c.Mismatches) == 0
 // deployment: comparing cn-1 against cn-20's record would list twelve differences that
 // say nothing except that nobody recorded cn-1.
 //
-// rels bounds the `repository` rule: a service under it matches only when its digest is
-// a listed release (brokerreleases.json).
+// rels bounds the `repository` rule: a service under it matches only when rels accepts
+// its digest as a release. A build rels could not check lands in Unverified, not in
+// Mismatches; a nil rels is a verifier that can check nothing.
 //
 // top is ComposeReview.TopLevel, compared the same way in every direction: a recorded
 // section must be present and identical, and a section the deployment does not record is
 // a mismatch — it is where a service's volumes and networks get their meaning.
-func CheckCompose(b ComposeBaseline, rels BrokerReleases, contract, provider string, blocks []ServiceBlock,
+func CheckCompose(b ComposeBaseline, rels ReleaseVerifier, contract, provider string, blocks []ServiceBlock,
 	top []TopLevelBlock) ComposeCheck {
 	out := ComposeCheck{Configured: len(b.Deployments) > 0}
 	if !out.Configured {
@@ -526,9 +536,9 @@ func CheckCompose(b ComposeBaseline, rels BrokerReleases, contract, provider str
 			out.add(want.Name, "the baseline records this service but the manifest does not declare it", "")
 			continue
 		}
-		before := len(out.Mismatches)
+		before, unverified := len(out.Mismatches), len(out.Unverified)
 		out.checkService(want, got, rels)
-		if len(out.Mismatches) == before {
+		if len(out.Mismatches) == before && len(out.Unverified) == unverified {
 			out.Matched++
 		}
 	}
@@ -576,7 +586,7 @@ func (c *ComposeCheck) checkTopLevel(want []BaselineTopLevel, got []TopLevelBloc
 }
 
 // checkService compares one observed block against its baseline entry.
-func (c *ComposeCheck) checkService(want BaselineService, got ServiceBlock, rels BrokerReleases) {
+func (c *ComposeCheck) checkService(want BaselineService, got ServiceBlock, rels ReleaseVerifier) {
 	if !got.Pinnable() {
 		c.add(want.Name, fmt.Sprintf("the service has no canonical form, so it cannot be compared: %v", got.Err), "")
 		return
@@ -599,7 +609,7 @@ func (c *ComposeCheck) checkService(want BaselineService, got ServiceBlock, rels
 
 // checkImage applies the image rule, which only a repository rule has: every other case
 // is already settled by the block comparison, which included the image line.
-func (c *ComposeCheck) checkImage(want BaselineService, got ServiceBlock, rels BrokerReleases) {
+func (c *ComposeCheck) checkImage(want BaselineService, got ServiceBlock, rels ReleaseVerifier) {
 	if want.Image.pinsImageInBlock() {
 		return
 	}
@@ -614,13 +624,18 @@ func (c *ComposeCheck) checkImage(want BaselineService, got ServiceBlock, rels B
 	case repo != want.Image.Repository:
 		c.add(want.Name, fmt.Sprintf("the image is in %s; the baseline accepts only %s",
 			repo, want.Image.Repository), "")
-	case rels.Repository != want.Image.Repository:
-		c.add(want.Name, fmt.Sprintf("the baseline accepts released builds of %s, but the release list "+
-			"covers %s, so no build of it can be accepted", want.Image.Repository, describeRepo(rels.Repository)), "")
+	case rels != nil && rels.Repository() != want.Image.Repository:
+		c.add(want.Name, fmt.Sprintf("the baseline accepts released builds of %s, but the release verifier "+
+			"judges %s, so no build of it can be accepted", want.Image.Repository, describeRepo(rels.Repository())), "")
 	default:
-		if _, ok := rels.Lookup(repo, digest); !ok {
-			c.add(want.Name, fmt.Sprintf("the image is %s@%s, which is not a listed release of %s "+
-				"(brokerreleases.json lists %s)", repo, shortDigest(digest), repo, listedVersions(rels)), "")
+		switch v := verifyRelease(rels, repo, digest); v.Status {
+		case ReleaseAccepted:
+		case ReleaseUnavailable:
+			c.Unverified = append(c.Unverified, ComposeMismatch{Service: want.Name, Reason: fmt.Sprintf(
+				"whether %s@%s is a release could not be checked: %s", repo, shortDigest(digest), v.Reason)})
+		default:
+			c.add(want.Name, fmt.Sprintf("the image is %s@%s, which is not an accepted release of %s: %s",
+				repo, shortDigest(digest), repo, v.Reason), "")
 		}
 	}
 }
@@ -640,18 +655,6 @@ func shortDigest(d string) string {
 		return d[:len("sha256:")+12] + "…"
 	}
 	return d
-}
-
-// listedVersions renders the release list's versions for a mismatch line.
-func listedVersions(r BrokerReleases) string {
-	if len(r.Releases) == 0 {
-		return "none"
-	}
-	vs := make([]string, len(r.Releases))
-	for i, rel := range r.Releases {
-		vs[i] = rel.Version
-	}
-	return strings.Join(vs, ", ")
 }
 
 func (c *ComposeCheck) add(service, reason, diff string) {

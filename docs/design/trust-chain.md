@@ -341,12 +341,13 @@ precondition for flipping a switch.
 > Two deployments are recorded: mainnet compute-network-20 and testnet
 > compute-network-20-dev, each taken from that provider's own `-blocks` output and
 > checked back against it live. Their broker-image services may move without a new
-> record, but only between the builds `brokerreleases.json` lists — v0.5.4 today,
-> resolved against the registry. The first version of that rule accepted any
-> digest-pinned image in the repository, and of the four broker digests the 2026-10-10
-> sweep found, two were pointed at by no release tag at all when the registry was checked
-> on 2026-10-15. v0.5.1 and v0.5.2 are left out
-> on purpose, as predating the controller and ingress fixes v0.5.4 carries, so cn-20 —
+> record, but only between released builds, judged at run time by their signed
+> provenance: the Sigstore bundle attached in the registry must carry SLSA provenance
+> signed by the broker repository's release workflow on a release tag at or above v0.5.4.
+> The first version of that rule accepted any digest-pinned image in the repository, and
+> two broker builds running on mainnet are manual branch builds from `docker-publish.yml`,
+> validly signed but not releases. v0.5.1 and v0.5.2 are signed releases refused by the
+> version floor, as predating the controller and ingress fixes v0.5.4 carries, so cn-20 —
 > on v0.5.1 — matches nine of its twelve recorded services and fails on the other three.
 >
 > Recording is not approval, and the distinction is the whole reason the review and the
@@ -355,14 +356,14 @@ precondition for flipping a switch.
 > 0g-controller's `docker.sock`, every provider's, which the broker team accounts for as
 > #759 — the controller may create no container unless `ZG_CONTROLLER_ENGINES=on`, and
 > swaps an image only as repo@digest after recording the swap in RTMR3. The review
-> reports it as justify rather than blocking only on a listed release, run as the
+> reports it as justify rather than blocking only on a verified release, run as the
 > controller program, with nothing beyond the keys, variables and healthcheck the fleet's
 > controllers use, nothing interpolated in its service, no extra host paths and the
 > engine flag absent; anywhere else it stays blocking and names the condition that
 > failed. Those limits are the controller's code, which a manifest review cannot see, so
 > the finding stays — relaxed, not removed. And "repo@digest" is a repository the
 > provider names: `controller.imageRepo` comes from the controller's config file, which
-> the provider supplies and can rewrite, so only an RTMR3 replay against the release list
+> the provider supplies and can rewrite, so only an RTMR3 replay against the release policy
 > bounds what broker and event run after boot.
 >
 > A recorded deployment is its services AND its top-level sections (volumes, networks,
