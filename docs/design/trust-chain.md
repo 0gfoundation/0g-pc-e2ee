@@ -388,9 +388,10 @@ precondition for flipping a switch.
 >
 > The comparison form the baseline uses:
 > `client/evidence/compose/composeblock.go` reduces each service to a **canonical block**, keeping
-> every difference that changes what runs (values, keys, key order, scalar types) and
-> dropping every one that does not (comments, indentation, quoting, flow-versus-block
-> style). It emits two forms per service — the whole block, and the block with the image
+> every difference that changes what runs (values, keys, scalar types) and dropping every
+> one that does not (comments, indentation, quoting, flow-versus-block style, and — since
+> the manifest is loaded with docker compose's own loader, compose-go v2.0.2 — key order
+> and short-versus-long syntax, which docker compose discards too). It emits two forms per service — the whole block, and the block with the image
 > **identity** held out — because the baseline pins them separately: everything a
 > deployment decided should not move without review, while the image moves on every broker
 > release, and pinning it exactly would mean a gateway release per broker release.

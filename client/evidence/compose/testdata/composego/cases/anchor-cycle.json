@@ -1,5 +1,0 @@
-{
-  "documents": 1,
-  "error": "yaml: anchor 'x' value contains itself",
-  "load_error": "yaml: anchor 'x' value contains itself"
-}

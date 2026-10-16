@@ -1,5 +1,0 @@
-x-base: &base {privileged: true}
-services:
-  app:
-    image: app
-    !!str <<: *base

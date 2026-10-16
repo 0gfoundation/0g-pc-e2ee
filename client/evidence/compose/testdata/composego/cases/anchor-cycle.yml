@@ -1,4 +1,0 @@
-services:
-  app: &x
-    image: app
-    depends_on: [*x]

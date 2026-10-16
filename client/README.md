@@ -186,14 +186,21 @@ comments, indentation and quoting are dropped, everything that changes what runs
 and the image **identity** is held out separately so a broker release does not force a
 gateway release.
 
-Both the review and the blocks read the compose text **as docker compose reads it**:
-YAML anchors and merge keys resolved, compose's `!reset` / `!override` tags applied, and
-whatever docker compose's YAML reader refuses (duplicate keys, a bad merge, an alias bomb)
-refused. A file with more than one YAML document is refused too, because docker compose
-merges them all and a reader of the first would describe a deployment that does not run.
-This is held to the real loader rather than to a reading of it: the docker compose
-dstack ships (v2.26.0, compose-go v2.0.2) recorded its reading of every case in
-`evidence/compose/testdata/composego`, and the tests compare against that.
+Both the review and the blocks read the compose text **with docker compose's own
+loader**: compose-go v2.0.2, the version dstack's docker compose v2.26.0 links, held at
+that build's versions of the dependencies that parse port specs and image references
+(`evidence/compose/composeload.go`; a test fails if either module drifts). Every YAML
+document is merged as docker compose merges them, compose's `!reset` / `!override` tags
+and anchors are applied, interpolation's type casts run (`privileged: "true"` is the
+boolean docker compose sees), and its short syntax is rewritten long. Whatever docker
+compose refuses — a duplicate key, a wrong shape, a key its schema does not know — is
+refused as a whole file, and a recorded deployment cannot be compared against it (exit 1).
+Three stages are deliberately not run: `${VAR}` substitution, since the values are in the
+CVM's encrypted environment (every `$` is reported as provider-controlled instead), and
+`include` and `extends`, which compose-go resolves by reading files on whatever machine
+runs it; both are reported as blocking. The canonical form is therefore key-sorted and in
+long syntax, and services are listed by name. The loader lives in its own package, which
+only pcverify imports: the gateway's and sidecar's linked dependencies do not change.
 
 Identity rather than the `image` key, because a real manifest defeats the simpler
 version: cn-20's broker services copy the digest into an environment variable

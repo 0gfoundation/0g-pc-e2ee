@@ -1,5 +1,0 @@
-{
-  "documents": 1,
-  "error": "yaml: unmarshal errors:\n  line 7: mapping key \"\u003c\u003c\" already defined at line 6",
-  "load_error": "yaml: unmarshal errors:\n  line 7: mapping key \"\u003c\u003c\" already defined at line 6"
-}

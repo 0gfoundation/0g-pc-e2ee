@@ -1,5 +1,0 @@
-# A trailing null document.
-services:
-  app:
-    image: app
---- null

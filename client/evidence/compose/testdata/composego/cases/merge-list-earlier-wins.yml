@@ -1,6 +1,0 @@
-x-a: &a {user: a, restart: always}
-x-b: &b {user: b, network_mode: host}
-services:
-  app:
-    image: app
-    <<: [*a, *b]

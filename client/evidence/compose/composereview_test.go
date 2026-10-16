@@ -640,15 +640,6 @@ func TestReviewCompose_ReportsFieldsAndKeysItHasNoRuleFor(t *testing.T) {
 			t.Fatalf("detail %q does not say the field was not understood", f.Detail)
 		}
 	})
-	t.Run("service key", func(t *testing.T) {
-		doc := "services:\n  broker:\n    image: ghcr.io/0gfoundation/broker@sha256:" +
-			strings.Repeat("a", 64) + "\n    some_future_key: yes\n"
-		r := reviewOf(t, manifest(doc))
-		f := requireFinding(t, r, SeverityJustify, "broker", "some_future_key")
-		if !strings.Contains(f.Detail, "no rule") {
-			t.Fatalf("detail %q does not say the key was not understood", f.Detail)
-		}
-	})
 	// An empty docker_config is not a private registry, and must not be reported as one.
 	t.Run("empty docker_config stays quiet", func(t *testing.T) {
 		for _, v := range []any{nil, map[string]any{}} {
@@ -688,80 +679,68 @@ func TestReviewCompose_ListsEveryTopLevelField(t *testing.T) {
 	}
 }
 
-// A value in a shape the rule cannot read must NOT come back as "not set". A rule
-// that defaults to safe on an unparseable value produces a clean line, which is worse
-// than having no rule at all.
-func TestReviewCompose_UnreadableValueIsNotReadAsAbsent(t *testing.T) {
+// A value in a shape docker compose does not accept is refused with the whole file, by
+// docker compose's own schema: the review describes nothing in it, and a recorded
+// deployment cannot be compared against it (CheckReview). This used to be the review's
+// own job, key by key — each rule had to tell "present but unreadable" from "absent" —
+// and every case below was once a rule that read a wrong shape as "not set".
+func TestReviewCompose_DockerComposeRefusesWrongShapes(t *testing.T) {
 	pinned := "ghcr.io/0gfoundation/broker@sha256:" + strings.Repeat("a", 64)
-	for _, tc := range []struct {
-		name string
-		body string
-		sev  Severity
-		key  string
-	}{
-		{"privileged is not a bool", "privileged: sort-of", SeverityBlocking, "privileged"},
-		{"cap_add is a scalar", "cap_add: SYS_ADMIN", SeverityBlocking, "cap_add"},
-		{"cap_add is a mapping", "cap_add:\n      a: b", SeverityBlocking, "cap_add"},
-		{"cap_add holds a mapping", "cap_add:\n      - a: b", SeverityBlocking, "cap_add"},
-		{"security_opt is a scalar", "security_opt: seccomp:unconfined", SeverityBlocking, "security_opt"},
-		{"volumes_from is a scalar", "volumes_from: other", SeverityBlocking, "volumes_from"},
-		{"device_cgroup_rules is a scalar", "device_cgroup_rules: 'c 1:1 rmw'", SeverityBlocking, "device_cgroup_rules"},
-		{"devices is a scalar", "devices: /dev/nvidia0", SeverityJustify, "devices"},
-		{"volumes is a scalar", "volumes: /data", SeverityJustify, "volumes"},
-		{"volumes entry is nested", "volumes:\n      - - /a\n        - /b", SeverityJustify, "volumes"},
-		{"group_add is a scalar", "group_add: '44'", SeverityJustify, "group_add"},
+	svc := fmt.Sprintf("services:\n  broker:\n    image: %s\n", pinned)
+	for _, tc := range []struct{ name, doc, says string }{
+		{"privileged is not a bool", svc + "    privileged: sort-of\n", "privileged"},
+		{"cap_add is a scalar", svc + "    cap_add: SYS_ADMIN\n", "cap_add"},
+		{"cap_add is a mapping", svc + "    cap_add:\n      a: b\n", "cap_add"},
+		{"cap_add holds a mapping", svc + "    cap_add:\n      - a: b\n", "cap_add"},
+		{"security_opt is a scalar", svc + "    security_opt: seccomp:unconfined\n", "security_opt"},
+		{"volumes_from is a scalar", svc + "    volumes_from: other\n", "volumes_from"},
+		{"device_cgroup_rules is a scalar", svc + "    device_cgroup_rules: 'c 1:1 rmw'\n", "device_cgroup_rules"},
+		{"devices is a scalar", svc + "    devices: /dev/nvidia0\n", "devices"},
+		{"volumes is a scalar", svc + "    volumes: /data\n", "volumes"},
+		{"volumes entry is nested", svc + "    volumes:\n      - - /a\n        - /b\n", "volumes"},
+		{"a mount source that is not a string",
+			svc + "    volumes:\n      - type: bind\n        source: [/etc]\n        target: /x\n", "source"},
+		{"group_add is a scalar", svc + "    group_add: '44'\n", "group_add"},
+		{"pid is a list", svc + "    pid: [host]\n", "pid"},
+		{"network_mode is a mapping", svc + "    network_mode: {mode: host}\n", "network_mode"},
+		{"cgroup is a list", svc + "    cgroup: [host]\n", "cgroup"},
+		{"ipc is a mapping", svc + "    ipc: {mode: host}\n", "ipc"},
+		{"uts is a list", svc + "    uts: [host]\n", "uts"},
+		{"userns_mode is a list", svc + "    userns_mode: [host]\n", "userns_mode"},
+		{"cgroup_parent is a mapping", svc + "    cgroup_parent: {a: b}\n", "cgroup_parent"},
+		{"a service body that is not a mapping", "services:\n  broker: notamapping\n", "broker"},
+		{"an unknown service key", svc + "    some_future_key: yes\n", "some_future_key"},
+		{"an unknown top-level key", svc + "some_future_section:\n  a: b\n", "some_future_section"},
+		{"an unknown volume key", svc + "volumes:\n  state:\n    some_future_key: 1\n", "some_future_key"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			doc := fmt.Sprintf("services:\n  broker:\n    image: %s\n    %s\n", pinned, tc.body)
-			r := reviewOf(t, manifest(doc))
-			requireFinding(t, r, tc.sev, "broker", tc.key)
+			r := reviewOf(t, manifest(tc.doc))
+			if r.LoadErr == nil {
+				t.Fatalf("docker compose accepted it:\n%s", dumpFindings(r))
+			}
+			f := requireFinding(t, r, SeverityBlocking, "", "docker_compose_file")
+			if !strings.Contains(f.Detail, "docker compose") || !strings.Contains(f.Detail, tc.says) {
+				t.Fatalf("detail does not name docker compose and %q: %s", tc.says, f.Detail)
+			}
+			if len(r.Services) != 0 || len(r.Blocks) != 0 {
+				t.Fatalf("a refused file was described: %+v", r.Services)
+			}
 		})
 	}
 
 	// A `privileged: false` really is absent, and must stay quiet — otherwise the rule
-	// above is just "the key is present", and an operator clears it by deleting a line
-	// that says the safe thing.
-	doc := fmt.Sprintf("services:\n  broker:\n    image: %s\n    privileged: false\n", pinned)
-	if got := find(reviewOf(t, manifest(doc)), "broker", "privileged"); len(got) != 0 {
+	// is just "the key is present", and an operator clears it by deleting a line that
+	// says the safe thing.
+	if got := find(reviewOf(t, manifest(svc+"    privileged: false\n")), "broker", "privileged"); len(got) != 0 {
 		t.Fatalf("privileged: false was reported: %+v", got)
 	}
-}
 
-// An unreadable value must produce a finding that says SO — never the rule's own
-// sentence, which asserts the construct is there. `volumes_from:` reported "the service
-// takes another container's mounts wholesale" about a key with nothing after it, which
-// is a fabricated fact rather than a conservative one; and a reviewer who checks it and
-// finds nothing learns to distrust the whole blocking list.
-//
-// Written as one sweep over every list-shaped rule rather than per case, because the
-// bug was a copy-paste pattern (`!ok || len(x) > 0`) that three rules shared while the
-// rule twenty lines above them did it correctly.
-func TestReviewCompose_UnreadableValueNeverAssertsTheConstructExists(t *testing.T) {
-	pinned := "ghcr.io/0gfoundation/broker@sha256:" + strings.Repeat("a", 64)
-	// For each key: a value of the wrong shape, and a phrase from the rule's real
-	// sentence that must NOT appear when nothing could be read.
-	for _, tc := range []struct{ key, badValue, mustNotSay string }{
-		{"cap_add", "SYS_ADMIN", "beyond the default set"},
-		{"device_cgroup_rules", "'c 195:* rmw'", "grants itself device access"},
-		{"volumes_from", "other", "mounts wholesale"},
-		{"group_add", "'44'", "joins extra groups"},
-		{"devices", "/dev/nvidia0", "GPU work needs this"},
-		{"security_opt", "seccomp:unconfined", "switches off a confinement"},
-	} {
-		t.Run(tc.key, func(t *testing.T) {
-			doc := fmt.Sprintf("services:\n  broker:\n    image: %s\n    %s: %s\n", pinned, tc.key, tc.badValue)
-			got := find(reviewOf(t, manifest(doc)), "broker", tc.key)
-			if len(got) != 1 {
-				t.Fatalf("want 1 finding for an unreadable %s, got %d", tc.key, len(got))
-			}
-			if !strings.Contains(got[0].Detail, "could not be read") {
-				t.Errorf("%s: detail does not say the value was unreadable: %q", tc.key, got[0].Detail)
-			}
-			if strings.Contains(got[0].Detail, tc.mustNotSay) {
-				t.Errorf("%s: an unreadable value asserts the construct exists (%q): %q",
-					tc.key, tc.mustNotSay, got[0].Detail)
-			}
-		})
+	// A typed field set from the environment is not docker compose's refusal: it accepts
+	// the file whenever the environment supplies a value of the right type. The review
+	// loads it, and its own rule reports the value as provider-controlled.
+	r := reviewOf(t, manifest(svc+"    privileged: ${PRIV}\n"))
+	if r.LoadErr != nil || len(r.Services) != 1 {
+		t.Fatalf("an interpolated typed field was refused: %v", r.LoadErr)
 	}
 }
 
@@ -804,14 +783,6 @@ func TestReviewCompose_UnreadableComposeTextIsAFinding(t *testing.T) {
 			r := reviewOf(t, manifest(tc.text))
 			requireFinding(t, r, SeverityBlocking, "", "docker_compose_file")
 		})
-	}
-}
-
-func TestReviewCompose_ServiceBodyThatIsNotAMapping(t *testing.T) {
-	r := reviewOf(t, manifest("services:\n  broker: notamapping\n"))
-	requireFinding(t, r, SeverityBlocking, "broker", "")
-	if len(r.Services) != 1 || r.Services[0].Name != "broker" {
-		t.Fatalf("the service was dropped rather than reported: %+v", r.Services)
 	}
 }
 
@@ -863,10 +834,6 @@ func TestReviewCompose_TopLevelSections(t *testing.T) {
 		mustSay string
 	}{
 		{
-			"unknown top-level key", svc + "some_future_section:\n  a: b\n",
-			SeverityJustify, "compose.some_future_section", "no rule for the top-level compose key",
-		},
-		{
 			"include pulls in an unmeasured file", svc + "include:\n  - ../other/compose.yml\n",
 			SeverityBlocking, "compose.include", "does not commit to it",
 		},
@@ -878,10 +845,6 @@ func TestReviewCompose_TopLevelSections(t *testing.T) {
 			"network filesystem volume",
 			svc + "volumes:\n  models:\n    driver: local\n    driver_opts:\n      type: nfs\n      o: addr=10.0.0.1\n      device: \":/export/models\"\n",
 			SeverityBlocking, "compose.volumes.models", "off the network",
-		},
-		{
-			"unknown volume key", svc + "volumes:\n  state:\n    some_future_key: 1\n",
-			SeverityJustify, "compose.volumes.state.some_future_key", "no rule for the volume key",
 		},
 		{
 			"secret read from a host tree", svc + "secrets:\n  shadow:\n    file: /etc/shadow\n",
@@ -934,44 +897,7 @@ func TestReviewCompose_UndeclaredNamedVolume(t *testing.T) {
 	}
 }
 
-// --- scalar and JSON values in the wrong shape ---------------------------------
-
-// The companion to TestReviewCompose_UnreadableValueIsNotReadAsAbsent, whose table
-// only covered LIST-shaped keys — so the scalar readers kept returning "" for a
-// present-but-wrong-shape value and every rule above them stayed quiet.
-func TestReviewCompose_UnreadableScalarIsNotReadAsAbsent(t *testing.T) {
-	pinned := "ghcr.io/0gfoundation/broker@sha256:" + strings.Repeat("a", 64)
-	for _, tc := range []struct {
-		name string
-		body string
-		sev  Severity
-		key  string
-	}{
-		{"pid is a list", "pid: [host]", SeverityBlocking, "pid"},
-		{"network_mode is a mapping", "network_mode: {mode: host}", SeverityBlocking, "network_mode"},
-		{"cgroup is a list", "cgroup: [host]", SeverityBlocking, "cgroup"},
-		{"ipc is a mapping", "ipc: {mode: host}", SeverityJustify, "ipc"},
-		{"uts is a list", "uts: [host]", SeverityJustify, "uts"},
-		{"userns_mode is a list", "userns_mode: [host]", SeverityJustify, "userns_mode"},
-		{"cgroup_parent is a mapping", "cgroup_parent: {a: b}", SeverityJustify, "cgroup_parent"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			doc := fmt.Sprintf("services:\n  broker:\n    image: %s\n    %s\n", pinned, tc.body)
-			f := requireFinding(t, reviewOf(t, manifest(doc)), tc.sev, "broker", tc.key)
-			if !strings.Contains(f.Detail, "could not be read") {
-				t.Fatalf("detail %q does not say the value was unreadable", f.Detail)
-			}
-		})
-	}
-
-	// A long-syntax mount whose source is not a scalar is an unreadable ENTRY, not an
-	// anonymous volume — reading it as anonymous drops it silently.
-	doc := fmt.Sprintf("services:\n  broker:\n    image: %s\n    volumes:\n      - type: bind\n        source: [/etc]\n        target: /x\n", pinned)
-	f := requireFinding(t, reviewOf(t, manifest(doc)), SeverityJustify, "broker", "volumes")
-	if !strings.Contains(f.Detail, "could not be read") {
-		t.Fatalf("detail %q does not report the unreadable mount", f.Detail)
-	}
-}
+// --- app-compose values in the wrong shape ------------------------------------
 
 // The app-compose side of the same gap. pre_launch_script is the expensive one: it is
 // root TCB covered by no image digest, so reading a wrong-shaped value as absent hides
@@ -1303,6 +1229,8 @@ func TestIsNamedVolume(t *testing.T) {
 		{"~/keys", false},
 		{"sub/../../etc", false},
 		{"", false},
+		{"${HOSTROOT}", false},
+		{"$DATA", false},
 	} {
 		if got := isNamedVolume(tc.src); got != tc.want {
 			t.Errorf("isNamedVolume(%q) = %v, want %v", tc.src, got, tc.want)
@@ -1462,14 +1390,14 @@ volumes:
 			t.Errorf("%s origin = %v, want %v", name, origins[name], want)
 		}
 	}
-	// File order, not sorted or map order: the operator chose it, and a list that
-	// reshuffles between fetches reads as the deployment changing.
+	// Sorted by name: docker compose loads services into a map, so a sorted list is the
+	// one that cannot reshuffle between two reads of one deployment.
 	var names []string
 	for _, s := range r.Services {
 		names = append(names, s.Name)
 	}
-	if want := "broker-ingress,0g-controller,0gm-sglang,dcgm-exporter"; strings.Join(names, ",") != want {
-		t.Fatalf("services = %s, want %s (file order)", strings.Join(names, ","), want)
+	if want := "0g-controller,0gm-sglang,broker-ingress,dcgm-exporter"; strings.Join(names, ",") != want {
+		t.Fatalf("services = %s, want %s (sorted)", strings.Join(names, ","), want)
 	}
 }
 

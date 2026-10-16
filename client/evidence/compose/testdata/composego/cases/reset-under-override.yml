@@ -1,8 +1,0 @@
-# compose-go does not look inside an !override node, so a !reset under one is not
-# applied.
-services:
-  app:
-    image: app
-    environment: !override
-      A: "1"
-      B: !reset "2"

@@ -1,8 +1,0 @@
-x-base: &base
-  image: ghcr.io/example/app:1
-  restart: always
-  read_only: true
-services:
-  app:
-    <<: *base
-    command: serve
