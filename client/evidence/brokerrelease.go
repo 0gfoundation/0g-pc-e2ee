@@ -63,9 +63,9 @@ type ReleaseVerifier interface {
 	Verify(repository, digest string) ReleaseVerdict
 }
 
-// verifyRelease asks rels about repository@digest, treating a missing verifier as a check
+// VerifyRelease asks rels about repository@digest, treating a missing verifier as a check
 // that could not run rather than as a pass.
-func verifyRelease(rels ReleaseVerifier, repository, digest string) ReleaseVerdict {
+func VerifyRelease(rels ReleaseVerifier, repository, digest string) ReleaseVerdict {
 	if rels == nil {
 		return ReleaseVerdict{Status: ReleaseUnavailable, Reason: "no release verifier was configured"}
 	}

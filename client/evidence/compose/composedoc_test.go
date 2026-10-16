@@ -1,4 +1,4 @@
-package evidence
+package compose
 
 import (
 	"encoding/json"
@@ -226,7 +226,7 @@ func TestComposeDocument_LinksDockerComposesYAMLDecoder(t *testing.T) {
 		}
 		return string(m[1])
 	}
-	ours, theirs := version(filepath.Join("..", "go.mod")), version(filepath.Join("testdata", "composego", "go.mod"))
+	ours, theirs := version(filepath.Join("..", "..", "go.mod")), version(filepath.Join("testdata", "composego", "go.mod"))
 	if ours != theirs {
 		t.Fatalf("the client links yaml.v3 %s, the docker compose the cases were recorded from links %s; "+
 			"check what dstack ships and regenerate before moving either", ours, theirs)

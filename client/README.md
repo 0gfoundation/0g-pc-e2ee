@@ -193,7 +193,7 @@ refused. A file with more than one YAML document is refused too, because docker 
 merges them all and a reader of the first would describe a deployment that does not run.
 This is held to the real loader rather than to a reading of it: the docker compose
 dstack ships (v2.26.0, compose-go v2.0.2) recorded its reading of every case in
-`evidence/testdata/composego`, and the tests compare against that.
+`evidence/compose/testdata/composego`, and the tests compare against that.
 
 Identity rather than the `image` key, because a real manifest defeats the simpler
 version: cn-20's broker services copy the digest into an environment variable
@@ -201,10 +201,10 @@ version: cn-20's broker services copy the digest into an environment variable
 fingerprint moved on every release anyway. The reference and its digest are erased
 wherever they appear in the block — and no further: a value that merely looks like a
 digest is left alone, because erasing too much hides a real change while erasing too
-little only churns. See `evidence/composeblock.go`.
+little only churns. See `evidence/compose/composeblock.go`.
 
 Those blocks are then compared against the **deployment the per-service baseline records
-for this provider** (`evidence/brokercompose.json`, keyed by contract and provider
+for this provider** (`evidence/compose/brokercompose.json`, keyed by contract and provider
 address) — the check that adjudicates, and the only part of the manifest section that can
 fail a run. Every direction: a recorded service the manifest does not declare, a declared
 service the deployment does not record (an unlisted container runs in the same guest as
@@ -258,7 +258,7 @@ keys, environment variables and healthcheck every controller on the fleet uses, 
 nothing interpolated in its own service, no host path beyond the two sockets, only
 declared local volumes, and `ZG_CONTROLLER_ENGINES` absent — the conditions under which
 #759 limits what it does with the socket. On any other build it stays blocking and says
-which condition failed (`evidence/composecontroller.go`). What it does NOT bound: the
+which condition failed (`evidence/compose/composecontroller.go`). What it does NOT bound: the
 repository image swaps pull from is `controller.imageRepo` in the controller's config
 file, which the provider supplies and can rewrite at runtime, so what broker and event
 run after boot is bounded by the RTMR3 replay below, not by the review.

@@ -70,7 +70,7 @@ var ErrNoDockerCompose = errors.New("app-compose has no docker_compose_file")
 // verbatim, so callers must not reformat, re-indent, or re-marshal raw — that
 // would change the digest while leaving the JSON "equal".
 func VerifyAppCompose(raw []byte, composeHash [attest.ComposeHashLen]byte) (AppCompose, error) {
-	if err := gateAppCompose(raw, composeHash); err != nil {
+	if err := GateAppCompose(raw, composeHash); err != nil {
 		return AppCompose{}, err
 	}
 	var ac AppCompose
@@ -87,7 +87,7 @@ func VerifyAppCompose(raw []byte, composeHash [attest.ComposeHashLen]byte) (AppC
 	return ac, nil
 }
 
-// gateAppCompose is the security-relevant half of VerifyAppCompose on its own: the
+// GateAppCompose is the security-relevant half of VerifyAppCompose on its own: the
 // digest check, and nothing else.
 //
 // It is factored out for a caller that reads the manifest's fields ITSELF and must not
@@ -97,7 +97,7 @@ func VerifyAppCompose(raw []byte, composeHash [attest.ComposeHashLen]byte) (AppC
 // returned an error" would report that as a digest mismatch, i.e. accuse the provider
 // of serving a manifest its own quote does not bind. The gate is one function with one
 // implementation; what a caller decodes past it is that caller's business.
-func gateAppCompose(raw []byte, composeHash [attest.ComposeHashLen]byte) error {
+func GateAppCompose(raw []byte, composeHash [attest.ComposeHashLen]byte) error {
 	got := sha256.Sum256(raw)
 	if got != composeHash {
 		return fmt.Errorf(

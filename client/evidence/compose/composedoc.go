@@ -1,4 +1,4 @@
-package evidence
+package compose
 
 // composedoc.go reads the compose text the way docker compose reads it, before anything
 // in this package looks at a service.

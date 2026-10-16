@@ -1,4 +1,4 @@
-package evidence
+package compose
 
 // composecontroller.go holds the one exception the review makes to its rule that a
 // container holding the container runtime's socket is BLOCKING: 0G's own controller, at a
@@ -45,6 +45,8 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/0gfoundation/0g-pc-e2ee/client/evidence"
 )
 
 const (
@@ -168,22 +170,22 @@ var (
 // when it does not, the first condition it fails — phrased as what is wrong. rels is the
 // release verifier the whole run uses, so this and the baseline cannot disagree about a
 // digest.
-func controllerEligible(body *yaml.Node, svc ReviewedService, mounts *mountIndex, rels ReleaseVerifier) (BrokerRelease, string) {
+func controllerEligible(body *yaml.Node, svc ReviewedService, mounts *mountIndex, rels evidence.ReleaseVerifier) (evidence.BrokerRelease, string) {
 	if !svc.Pinned() {
-		return BrokerRelease{}, "its image is not pinned by digest"
+		return evidence.BrokerRelease{}, "its image is not pinned by digest"
 	}
 	if rels != nil && svc.Image != rels.Repository() {
-		return BrokerRelease{}, fmt.Sprintf("its image is %s, not 0G's broker image", svc.Image)
+		return evidence.BrokerRelease{}, fmt.Sprintf("its image is %s, not 0G's broker image", svc.Image)
 	}
-	v := verifyRelease(rels, svc.Image, svc.Digest)
+	v := evidence.VerifyRelease(rels, svc.Image, svc.Digest)
 	switch v.Status {
-	case ReleaseAccepted:
-	case ReleaseUnavailable:
-		return BrokerRelease{}, fmt.Sprintf("whether %s@%s is a release could not be checked (%s), so the "+
+	case evidence.ReleaseAccepted:
+	case evidence.ReleaseUnavailable:
+		return evidence.BrokerRelease{}, fmt.Sprintf("whether %s@%s is a release could not be checked (%s), so the "+
 			"controller code that would limit the socket is not known to be there",
 			svc.Image, shortDigest(svc.Digest), v.Reason)
 	default:
-		return BrokerRelease{}, fmt.Sprintf("%s@%s is not an accepted release (%s), so the controller code "+
+		return evidence.BrokerRelease{}, fmt.Sprintf("%s@%s is not an accepted release (%s), so the controller code "+
 			"that would limit the socket is not known to be there", svc.Image, shortDigest(svc.Digest), v.Reason)
 	}
 	rel := v.Release
@@ -196,30 +198,30 @@ func controllerEligible(body *yaml.Node, svc ReviewedService, mounts *mountIndex
 	// `$$` is compose's escape for a literal `$` and is refused too; a controller has no
 	// need of either.
 	if at, found := firstInterpolated(body, ""); found {
-		return BrokerRelease{}, fmt.Sprintf("its %s contains `$`, which docker compose fills in from the "+
+		return evidence.BrokerRelease{}, fmt.Sprintf("its %s contains `$`, which docker compose fills in from the "+
 			"deployment's environment when it loads the file, so the text this review read is not what runs", at)
 	}
 	for i := 0; i+1 < len(body.Content); i += 2 {
 		if k := body.Content[i].Value; !controllerKeys[k] {
-			return BrokerRelease{}, fmt.Sprintf("it sets %s, which is not among the keys the exception covers "+
+			return evidence.BrokerRelease{}, fmt.Sprintf("it sets %s, which is not among the keys the exception covers "+
 				"(%s); each further key is something #759 does not describe", k, strings.Join(sortedTrue(controllerKeys), ", "))
 		}
 	}
 	if cmd, ok := commandOf(mapValue(body, "command")); !ok || cmd != controllerCommand {
-		return BrokerRelease{}, fmt.Sprintf("its command is not %s, so the process holding the socket is not "+
+		return evidence.BrokerRelease{}, fmt.Sprintf("its command is not %s, so the process holding the socket is not "+
 			"the controller", controllerCommand)
 	}
 	if why := enginesSet(mapValue(body, "environment")); why != "" {
-		return BrokerRelease{}, why
+		return evidence.BrokerRelease{}, why
 	}
 	if why := onlyControllerEnv(mapValue(body, "environment")); why != "" {
-		return BrokerRelease{}, why
+		return evidence.BrokerRelease{}, why
 	}
 	if why := onlyControllerHealthcheck(mapValue(body, "healthcheck")); why != "" {
-		return BrokerRelease{}, why
+		return evidence.BrokerRelease{}, why
 	}
 	if why := onlySocketHostMounts(mapValue(body, "volumes"), mounts); why != "" {
-		return BrokerRelease{}, why
+		return evidence.BrokerRelease{}, why
 	}
 	return rel, ""
 }

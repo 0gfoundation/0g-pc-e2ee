@@ -1,4 +1,4 @@
-package evidence
+package compose
 
 import (
 	"crypto/sha256"
@@ -10,6 +10,8 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/compose"
+
+	"github.com/0gfoundation/0g-pc-e2ee/client/evidence"
 )
 
 // blocksOf runs the REAL path — ReviewCompose, hash gate included — over a compose text
@@ -936,7 +938,7 @@ func TestServiceBlocks_DoNotDisturbTheReview(t *testing.T) {
 	if len(r.Services) != 1 {
 		t.Fatalf("services = %+v", r.Services)
 	}
-	if got := r.Services[0]; got.Ref != pinned || !got.Pinned() || got.Origin != OriginFirstParty {
+	if got := r.Services[0]; got.Ref != pinned || !got.Pinned() || got.Origin != evidence.OriginFirstParty {
 		t.Fatalf("the review lost the image after blocks were built: %+v", got)
 	}
 	// And the rules that walk the same nodes still fire.
@@ -971,7 +973,7 @@ func TestServiceBlocks_DoNotDisturbTheReview(t *testing.T) {
 	if !strings.Contains(svc.Ref, cn20Digest) || svc.Digest != "sha256:"+cn20Digest {
 		t.Fatalf("the review lost the real digest to the hold-out: ref=%q digest=%q", svc.Ref, svc.Digest)
 	}
-	if !svc.Pinned() || svc.Origin != OriginFirstParty {
+	if !svc.Pinned() || svc.Origin != evidence.OriginFirstParty {
 		t.Fatalf("the review's image judgement changed: %+v", svc)
 	}
 	if strings.Contains(svc.Ref, imageHeldOut) {

@@ -1,4 +1,4 @@
-package evidence
+package compose
 
 import (
 	"crypto/sha256"
@@ -12,6 +12,8 @@ import (
 	"testing"
 
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
+
+	"github.com/0gfoundation/0g-pc-e2ee/client/evidence"
 )
 
 // appComposeFor marshals fields into an app-compose document and returns it with the
@@ -19,7 +21,7 @@ import (
 //
 // It marshals once and hashes what it marshalled, rather than hashing a re-encoding:
 // the digest is over the file as written, so a test that re-marshalled would be
-// testing a preimage no verifier ever sees (the caveat VerifyAppCompose states).
+// testing a preimage no verifier ever sees (the caveat evidence.VerifyAppCompose states).
 func appComposeFor(t *testing.T, fields map[string]any) ([]byte, [attest.ComposeHashLen]byte) {
 	t.Helper()
 	raw, err := json.Marshal(fields)
@@ -231,7 +233,7 @@ func TestReviewCompose_HardenedManifestHasNothingBlocking(t *testing.T) {
 	if !r.Services[0].Pinned() {
 		t.Fatalf("broker reads as unpinned: %+v", r.Services[0])
 	}
-	if r.Services[0].Origin != OriginFirstParty {
+	if r.Services[0].Origin != evidence.OriginFirstParty {
 		t.Fatalf("origin = %v, want first-party", r.Services[0].Origin)
 	}
 	if r.Runner != "docker-compose" {
@@ -1051,9 +1053,9 @@ func TestReviewCompose_StrictStructDecodeIsNotAGateFailure(t *testing.T) {
 	fields := manifest(hardenedCompose, map[string]any{"allowed_envs": map[string]any{"A": 1}})
 	raw, hash := appComposeFor(t, fields)
 
-	// VerifyAppCompose, the narrow decoder, genuinely cannot read it...
-	if _, err := VerifyAppCompose(raw, hash); err == nil {
-		t.Fatal("VerifyAppCompose accepted an allowed_envs object")
+	// evidence.VerifyAppCompose, the narrow decoder, genuinely cannot read it...
+	if _, err := evidence.VerifyAppCompose(raw, hash); err == nil {
+		t.Fatal("evidence.VerifyAppCompose accepted an allowed_envs object")
 	}
 	// ...but the gate passes, so the review must run and report it as a finding.
 	r, err := ReviewCompose(raw, hash, fleetReleases)
@@ -1115,20 +1117,20 @@ func TestReviewCompose_FindingsAreStablyOrderedMostSevereFirst(t *testing.T) {
 func TestClassifyOrigin(t *testing.T) {
 	for _, tc := range []struct {
 		image string
-		want  ImageOrigin
+		want  evidence.ImageOrigin
 	}{
-		{"ghcr.io/0gfoundation/broker", OriginFirstParty},
-		{"ghcr.io/0gFoundation/broker", OriginFirstParty},
-		{"ghcr.io/0gfoundation/nested/broker", OriginFirstParty},
-		{"mysql", OriginThirdParty},
-		{"library/mysql", OriginThirdParty},
-		{"nvcr.io/nvidia/dcgm-exporter", OriginThirdParty},
-		{"localhost:5000/other/broker", OriginThirdParty},
+		{"ghcr.io/0gfoundation/broker", evidence.OriginFirstParty},
+		{"ghcr.io/0gFoundation/broker", evidence.OriginFirstParty},
+		{"ghcr.io/0gfoundation/nested/broker", evidence.OriginFirstParty},
+		{"mysql", evidence.OriginThirdParty},
+		{"library/mysql", evidence.OriginThirdParty},
+		{"nvcr.io/nvidia/dcgm-exporter", evidence.OriginThirdParty},
+		{"localhost:5000/other/broker", evidence.OriginThirdParty},
 		// The trap: a namespace that merely CONTAINS ours, on a registry an attacker
 		// controls. A prefix match on the whole reference would call this first-party.
-		{"evil.example.com/0gfoundation-fake/broker", OriginThirdParty},
-		{"ghcr.io/not0gfoundation/broker", OriginThirdParty},
-		{"", OriginNone},
+		{"evil.example.com/0gfoundation-fake/broker", evidence.OriginThirdParty},
+		{"ghcr.io/not0gfoundation/broker", evidence.OriginThirdParty},
+		{"", evidence.OriginNone},
 
 		// The simpler trap, which the one above distracted from: OUR namespace, spelled
 		// exactly right, on a registry that is not ours. Anyone can push that path to a
@@ -1136,23 +1138,23 @@ func TestClassifyOrigin(t *testing.T) {
 		// and we can resolve this" about an image we never published — and the
 		// digest-pinning argument for what a namespace binds only holds on a registry we
 		// control in the first place.
-		{"evil.example.com/0gfoundation/broker", OriginForeignRegistry},
-		{"quay.io/0gfoundation/broker", OriginForeignRegistry},
-		{"localhost:5000/0gfoundation/broker", OriginForeignRegistry},
-		{"registry.internal:5000/0gfoundation/broker", OriginForeignRegistry},
+		{"evil.example.com/0gfoundation/broker", evidence.OriginForeignRegistry},
+		{"quay.io/0gfoundation/broker", evidence.OriginForeignRegistry},
+		{"localhost:5000/0gfoundation/broker", evidence.OriginForeignRegistry},
+		{"registry.internal:5000/0gfoundation/broker", evidence.OriginForeignRegistry},
 
 		// Docker Hub is the same trap wearing a uniqueness argument. A Hub namespace does
 		// name one account — but not necessarily OURS, since nothing here ever pushes
 		// there, so an unregistered or squatted "0gfoundation" would otherwise have read
 		// as first-party. Both the explicit spellings and the implicit host of an
 		// unqualified reference must land in the foreign-registry state.
-		{"0gfoundation/broker", OriginForeignRegistry},
-		{"docker.io/0gfoundation/broker", OriginForeignRegistry},
-		{"index.docker.io/0gfoundation/broker", OriginForeignRegistry},
-		{"registry-1.docker.io/0gfoundation/broker", OriginForeignRegistry},
+		{"0gfoundation/broker", evidence.OriginForeignRegistry},
+		{"docker.io/0gfoundation/broker", evidence.OriginForeignRegistry},
+		{"index.docker.io/0gfoundation/broker", evidence.OriginForeignRegistry},
+		{"registry-1.docker.io/0gfoundation/broker", evidence.OriginForeignRegistry},
 	} {
-		if got := ClassifyImageOrigin(tc.image); got != tc.want {
-			t.Errorf("ClassifyImageOrigin(%q) = %v, want %v", tc.image, got, tc.want)
+		if got := evidence.ClassifyImageOrigin(tc.image); got != tc.want {
+			t.Errorf("evidence.ClassifyImageOrigin(%q) = %v, want %v", tc.image, got, tc.want)
 		}
 	}
 }
@@ -1169,7 +1171,7 @@ func TestReviewCompose_OurNamespaceOnAForeignRegistry(t *testing.T) {
 			t.Errorf("detail does not mention %q: %q", want, f.Detail)
 		}
 	}
-	if r.Services[0].Origin != OriginForeignRegistry {
+	if r.Services[0].Origin != evidence.OriginForeignRegistry {
 		t.Fatalf("origin = %v, want our-name/not-ours", r.Services[0].Origin)
 	}
 	// The control: the same image on ghcr.io is first-party and says nothing.
@@ -1182,14 +1184,14 @@ func TestReviewCompose_OurNamespaceOnAForeignRegistry(t *testing.T) {
 // The same finding for an UNQUALIFIED reference, which is the shape Docker Hub leaving
 // firstPartyRegistries made reachable. Two things have to hold: our namespace on Hub is
 // not ours (we publish nowhere but ghcr.io, so the name is one we may not even hold),
-// and the finding has to name the registry a reader should go look at — splitRegistry
+// and the finding has to name the registry a reader should go look at — evidence.SplitRegistry
 // reports the implicit host as "", which would otherwise render as "on , which is not a
 // registry we publish through".
 func TestReviewCompose_OurNamespaceOnImplicitDockerHub(t *testing.T) {
 	ref := "0gfoundation/broker@sha256:" + strings.Repeat("a", 64)
 	doc := fmt.Sprintf("services:\n  broker:\n    image: %s\n", ref)
 	r := reviewOf(t, manifest(doc))
-	if r.Services[0].Origin != OriginForeignRegistry {
+	if r.Services[0].Origin != evidence.OriginForeignRegistry {
 		t.Fatalf("origin = %v, want our-name/not-ours — we do not publish to Docker Hub", r.Services[0].Origin)
 	}
 	f := requireFinding(t, r, SeverityJustify, "broker", "image")
@@ -1318,9 +1320,9 @@ func TestSplitRegistry(t *testing.T) {
 		{"library/mysql", "", "library/mysql"},
 		{"", "", ""},
 	} {
-		reg, repo := splitRegistry(tc.ref)
+		reg, repo := evidence.SplitRegistry(tc.ref)
 		if reg != tc.registry || repo != tc.repo {
-			t.Errorf("splitRegistry(%q) = (%q, %q), want (%q, %q)", tc.ref, reg, repo, tc.registry, tc.repo)
+			t.Errorf("evidence.SplitRegistry(%q) = (%q, %q), want (%q, %q)", tc.ref, reg, repo, tc.registry, tc.repo)
 		}
 	}
 }
@@ -1446,15 +1448,15 @@ volumes:
 	}
 
 	// The origin column: which lines we can answer for, and which need upstream.
-	origins := map[string]ImageOrigin{}
+	origins := map[string]evidence.ImageOrigin{}
 	for _, s := range r.Services {
 		origins[s.Name] = s.Origin
 	}
-	for name, want := range map[string]ImageOrigin{
-		"broker-ingress": OriginFirstParty,
-		"0g-controller":  OriginFirstParty,
-		"0gm-sglang":     OriginThirdParty,
-		"dcgm-exporter":  OriginThirdParty,
+	for name, want := range map[string]evidence.ImageOrigin{
+		"broker-ingress": evidence.OriginFirstParty,
+		"0g-controller":  evidence.OriginFirstParty,
+		"0gm-sglang":     evidence.OriginThirdParty,
+		"dcgm-exporter":  evidence.OriginThirdParty,
 	} {
 		if origins[name] != want {
 			t.Errorf("%s origin = %v, want %v", name, origins[name], want)
@@ -1471,22 +1473,22 @@ volumes:
 	}
 }
 
-// ErrNoDockerCompose has to stay distinguishable from a gate failure: one says the
+// evidence.ErrNoDockerCompose has to stay distinguishable from a gate failure: one says the
 // bytes are not the manifest the quote binds, the other says they are and carry no
 // compose file. Reporting the second as the first would announce a substitution that
 // did not happen.
 func TestErrNoDockerCompose_IsNotAGateFailure(t *testing.T) {
 	raw, hash := appComposeFor(t, map[string]any{"runner": "docker-compose"})
-	_, err := VerifyAppCompose(raw, hash)
+	_, err := evidence.VerifyAppCompose(raw, hash)
 	if err == nil {
-		t.Fatal("VerifyAppCompose accepted an app-compose with no docker_compose_file")
+		t.Fatal("evidence.VerifyAppCompose accepted an app-compose with no docker_compose_file")
 	}
-	if !errors.Is(err, ErrNoDockerCompose) {
-		t.Fatalf("err = %v, want ErrNoDockerCompose", err)
+	if !errors.Is(err, evidence.ErrNoDockerCompose) {
+		t.Fatalf("err = %v, want evidence.ErrNoDockerCompose", err)
 	}
 	// The gate failure must NOT match the sentinel.
 	hash[0] ^= 0xff
-	if _, err := VerifyAppCompose(raw, hash); err == nil || errors.Is(err, ErrNoDockerCompose) {
-		t.Fatalf("a digest mismatch reported as ErrNoDockerCompose: %v", err)
+	if _, err := evidence.VerifyAppCompose(raw, hash); err == nil || errors.Is(err, evidence.ErrNoDockerCompose) {
+		t.Fatalf("a digest mismatch reported as evidence.ErrNoDockerCompose: %v", err)
 	}
 }
