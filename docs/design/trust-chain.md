@@ -275,10 +275,11 @@ The code root's OTHER half — hop 3 pins the guest OS and says nothing about th
 containers inside it — is now **read and adjudicated** in `pcverify -provider`: the
 per-service baseline records reviewed deployments by contract and provider, a recorded
 provider whose manifest has moved is a mismatch, and a provider nobody recorded is
-reported as not compared (see below). What is not done is wiring that comparison into
-the SEALING path, which unlike hop 5's switch waits on two things: reading RTMR3, since
-the manifest describes what booted and the controller can change what runs afterwards,
-and the fleet moving to a broker release the gateway accepts.
+reported as not compared (see below). What runs AFTER boot is read too: the RTMR3 event
+log is replayed into the verified quote, and the build the controller last swapped to
+must be an accepted release whose keys are the quote's (`evidence/rtmr3.go`). What is not
+done is wiring either into the SEALING path, which waits on the fleet moving to a broker
+release the gateway accepts, and on rules for the upstream set the records now carry.
 
 Hop 3 is no longer blocked on either of the two things that used to hold it — the shape
 of an allowlist entry, and having no published source for its values. Its allowlist takes one entry per OS image
@@ -368,7 +369,9 @@ precondition for flipping a switch.
 > the finding stays — relaxed, not removed. And "repo@digest" is a repository the
 > provider names: `controller.imageRepo` comes from the controller's config file, which
 > the provider supplies and can rewrite, so only an RTMR3 replay against the release policy
-> bounds what broker and event run after boot.
+> bounds what broker and event run after boot. pcverify runs that replay: the event log
+> must replay to the verified quote's RTMR3, the last `zg-image-update` must name an
+> accepted release, and its signer and enc_pub must be report_data's.
 >
 > A recorded deployment is its services AND its top-level sections (volumes, networks,
 > …): a declaration changed to an `nfs` driver moves the data behind a volume name while
@@ -376,10 +379,11 @@ precondition for flipping a switch.
 >
 > Wiring the comparison into the SEALING path, behind its own enforce switch, waits on
 > two things. The manifest describes what BOOTED, and on v0.5.4 the controller may swap
-> images and change the upstream set at runtime, recorded only in RTMR3 — so a verifier
-> that reads the manifest alone would accept a deployment that booted as recorded and no
-> longer runs that way. And enforcing today would refuse every mainnet provider, none of
-> which runs a listed broker release yet. `-app-baseline` reads a candidate for checking a
+> images and change the upstream set at runtime, recorded only in RTMR3. pcverify now
+> reads those records, but the sealing path does not yet, and the upstream set has no
+> rules to judge it by. And enforcing today would refuse every mainnet provider, none of
+> which runs a listed broker release yet: on 2026-10-16 the RTMR3 records showed cn-19,
+> cn-20 and cn-41 running manual branch builds swapped in after boot. `-app-baseline` reads a candidate for checking a
 > deployment against a live provider first.
 >
 > The comparison form the baseline uses:
