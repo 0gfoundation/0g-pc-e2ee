@@ -1,0 +1,23 @@
+# Dependabot covers pcverify's own module only.
+#
+# That module carries Sigstore's verifier (sigstore-go, go-tuf, in-toto). Falling behind
+# there is how a Sigstore format change becomes a verification failure on providers, so
+# its updates arrive as PRs and are checked by ci.yml, security.yml and
+# broker-release.yml like any other change. The gateway's modules (protocol, client) are
+# not listed: what the sealed binaries are built from moves only by deliberate change.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /client/cmd/pcverify
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      sigstore:
+        patterns:
+          - "github.com/sigstore/*"
+          - "github.com/theupdateframework/*"
+          - "github.com/in-toto/*"
+    commit-message:
+      prefix: "pcverify"

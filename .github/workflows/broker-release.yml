@@ -1,0 +1,140 @@
+name: Broker release
+
+# Daily: check the broker's newest release the way `pcverify -provider` will check it on a
+# provider — its SLSA provenance, fetched from ghcr.io, verified against Sigstore's
+# current trust root and client/cmd/pcverify/provenance/policy.json.
+#
+# WHY A TIMER. pcverify accepts a new broker release with no change here, but only while
+# the broker keeps building releases the way the policy expects (the release contract in
+# 0gfoundation/0g-serving-broker#765) and while Sigstore's trust root stays reachable
+# over TUF. Either can drift without a commit in this repository. Without this job, the
+# first sign would be a provider check reporting a correct deployment as failed.
+#
+# The newest RELEASE, not the newest tag: build.yml creates the GitHub release as its
+# last step, after the image is pushed, signed and attested, so a release exists only for
+# a build that is complete.
+
+on:
+  schedule:
+    # Off the hour, and away from security.yml's 03:17.
+    - cron: "43 4 * * *"
+  pull_request:
+    paths:
+      - "client/cmd/pcverify/provenance/**"
+      - "client/cmd/pcverify/go.mod"
+      - "client/cmd/pcverify/go.sum"
+      - ".github/workflows/broker-release.yml"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to check (default: the newest release)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: broker-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write # file the nightly report; unused on the other paths
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: client/cmd/pcverify/go.mod
+          cache-dependency-path: client/cmd/pcverify/go.sum
+
+      - name: Resolve the release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag="$INPUT_TAG"
+          if [ -z "$tag" ]; then
+            # Only tags the policy can accept (vMAJOR.MINOR.PATCH); sort -V orders them.
+            tag=$(gh api 'repos/0gfoundation/0g-serving-broker/releases?per_page=50' \
+                    --jq '.[] | select(.draft | not) | select(.prerelease | not) | .tag_name' |
+                  grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' | sort -V | tail -n 1)
+          fi
+          if [ -z "$tag" ]; then
+            echo "::error::no broker release found"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Checking 0g-serving-broker $tag"
+
+      - name: Verify it
+        id: verify
+        working-directory: client/cmd/pcverify
+        env:
+          PCVERIFY_LIVE_BROKER_TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -o pipefail
+          go test -count=1 -run '^TestLive_BrokerRelease$' -v ./provenance 2>&1 | tee "${RUNNER_TEMP}/verify.txt"
+
+      - name: File an issue on a nightly failure
+        # Same reasoning as security.yml: a scheduled run has no PR to turn red, so a
+        # failure has to become an issue to be seen. One standing issue, commented on.
+        if: failure() && github.event_name == 'schedule'
+        uses: actions/github-script@v7
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+          LOG: ${{ runner.temp }}/verify.txt
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = 'Broker release does not verify';
+            const open = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100,
+            });
+            const existing = open.find(i => !i.pull_request && i.title.startsWith(marker));
+
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}` +
+                        `/actions/runs/${context.runId}`;
+            let out = fs.existsSync(process.env.LOG) ? fs.readFileSync(process.env.LOG, 'utf8') : '(no output)';
+            const cap = 60000;
+            if (out.length > cap) out = out.slice(-cap);
+
+            const body = [
+              `0g-serving-broker \`${process.env.TAG || '(unresolved)'}\` did not verify against the provenance`,
+              `policy. Until this is fixed, \`pcverify -provider\` reports every provider running`,
+              `this release as failed (rejected) or not checked (unavailable).`,
+              ``,
+              `Either the broker's release no longer meets the release contract`,
+              `(0gfoundation/0g-serving-broker#765), or Sigstore's trust root moved in a way this`,
+              `verifier does not follow, or ghcr.io / TUF did not answer. The log says which.`,
+              ``,
+              `Run: ${run}`,
+              ``,
+              '```',
+              out.trimEnd(),
+              '```',
+            ].join('\n');
+
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: `${marker}: ${process.env.TAG || 'unresolved'} (${new Date().toISOString().slice(0, 10)})`,
+                body,
+              });
+            }

@@ -237,6 +237,15 @@ on v0.5.1, matches nine of its twelve recorded services and fails on the three t
 the broker image. When the registry cannot be read, those services are reported as not
 checked and the run exits 3, never 0.
 
+Sigstore's trust root is fetched each run over TUF (`tuf-repo-cdn.sigstore.dev`, as
+cosign does), so a Sigstore key rotation needs no pcverify release either. If TUF cannot
+be reached, pcverify falls back to a snapshot embedded in the binary; a bundle that does
+not verify against that snapshot is reported as not checked (exit 3) rather than refused,
+since it may be signed under a newer key. What the broker repository must keep doing for
+its releases to verify is written down in 0gfoundation/0g-serving-broker#765, and
+`.github/workflows/broker-release.yml` checks the broker's newest release this way every
+day and files an issue when it stops verifying.
+
 pcverify is its own Go module (`cmd/pcverify/go.mod`), so that Sigstore's verifier and
 the dependency versions it requires never enter the gateway's build. Build it from that
 directory: `cd client/cmd/pcverify && go build .`

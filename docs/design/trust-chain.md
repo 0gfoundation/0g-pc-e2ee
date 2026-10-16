@@ -349,6 +349,10 @@ precondition for flipping a switch.
 > validly signed but not releases. v0.5.1 and v0.5.2 are signed releases refused by the
 > version floor, as predating the controller and ingress fixes v0.5.4 carries, so cn-20 —
 > on v0.5.1 — matches nine of its twelve recorded services and fails on the other three.
+> Sigstore's own trust root is fetched each run over TUF, with an embedded snapshot as
+> the fallback; against the snapshot, a bundle that does not verify is reported as not
+> checked rather than refused. A daily workflow verifies the broker's newest release the
+> same way, so drift on either side is seen before a provider check reports it.
 >
 > Recording is not approval, and the distinction is the whole reason the review and the
 > baseline are separate mechanisms. The review reports what it finds on every run; a

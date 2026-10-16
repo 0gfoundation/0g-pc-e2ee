@@ -383,8 +383,9 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 		return 2
 	}
 	// Broker builds are judged by their signed release provenance, fetched from the image
-	// registry and checked against an embedded policy and Sigstore trust root
-	// (provenance/policy.json). Embedded only — no flag substitutes them — for the reason
+	// registry and checked against an embedded policy (provenance/policy.json) and
+	// Sigstore's trust root, fetched over TUF with an embedded snapshot as the fallback.
+	// The policy is embedded only — no flag substitutes it — for the reason
 	// no flag substitutes the OS-image allowlist: a diagnostic that could be pointed at a
 	// friendlier policy would answer a different question from the one it is asked.
 	brokerReleases, err := provenance.New(release.NewHTTPClient(*timeout), *timeout)
