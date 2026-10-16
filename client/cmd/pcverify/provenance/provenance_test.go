@@ -132,9 +132,10 @@ func TestJudge_RealBundles(t *testing.T) {
 	}
 }
 
-// Altering the signed statement — here, claiming a branch ref — must break verification,
-// not change what the policy reads.
-func TestJudge_TamperedProvenance(t *testing.T) {
+// tamperedV054 is v0.5.4's provenance with its signed statement altered to claim a
+// branch ref.
+func tamperedV054(t *testing.T) []byte {
+	t.Helper()
 	var b map[string]any
 	if err := json.Unmarshal(fixture(t, "v0.5.4.slsa.json"), &b); err != nil {
 		t.Fatal(err)
@@ -153,7 +154,13 @@ func TestJudge_TamperedProvenance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := embedded(t).judge(digestV054, [][]byte{raw})
+	return raw
+}
+
+// Altering the signed statement must break verification, not change what the policy
+// reads.
+func TestJudge_TamperedProvenance(t *testing.T) {
+	got := embedded(t).judge(digestV054, [][]byte{tamperedV054(t)})
 	if got.Status != evidence.ReleaseRejected || !strings.Contains(got.Reason, "does not verify") {
 		t.Fatalf("a tampered statement: %+v", got)
 	}

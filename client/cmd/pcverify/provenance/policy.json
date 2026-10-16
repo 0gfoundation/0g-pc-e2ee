@@ -2,9 +2,10 @@
   "_comment": [
     "Which builds of 0G's broker image a provider may run. A build is accepted when its",
     "SLSA provenance, attached to the image in the registry as a Sigstore bundle, verifies",
-    "against Sigstore's public-good trust root (trusted_root.json) AND its signing",
-    "certificate says it came from the release workflow below, run on a release tag at or",
-    "above minimum_version, on a GitHub-hosted runner, triggered by the tag push. Nothing here",
+    "against Sigstore's public-good trust root (fetched over TUF; trusted_root.json is the",
+    "fallback snapshot) AND its signing certificate says it came from the release workflow",
+    "below, run on a release tag at or above minimum_version, on a GitHub-hosted runner,",
+    "triggered by the tag push. Nothing here",
     "changes when the broker ships: a new release is accepted because the release workflow",
     "signed it, not because someone added it to a list.",
     "",

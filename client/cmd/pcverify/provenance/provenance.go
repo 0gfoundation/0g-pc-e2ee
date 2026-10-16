@@ -57,14 +57,19 @@ var policyJSON []byte
 
 // trusted_root.json is Sigstore's public-good trust root — the Fulcio CAs, Rekor and CT
 // log keys and the timestamp authority — as sigstore-go's TUF client fetched and verified
-// it from tuf-repo-cdn.sigstore.dev on 2026-10-16. A SNAPSHOT, embedded rather than
-// fetched at run time, so that verification needs no TUF client and no network beyond the
-// registry. The cost: when Sigstore rotates a key or opens a new log shard, bundles signed
-// after that stop verifying until the snapshot is refreshed — a failure that rejects
-// releases, never one that accepts a build. TestEmbeddedTrustRoot pins which keys it holds.
+// it from tuf-repo-cdn.sigstore.dev on snapshotDate. It is the FALLBACK, not the root a
+// run normally uses: each run first fetches the current trust root over TUF (trust.go),
+// so a Sigstore key rotation or a new log shard needs no release here. The snapshot is
+// used only when TUF cannot be reached, and then a bundle that does not verify against
+// it is reported as a check that did not run rather than as a refusal — it may have been
+// signed under a key the snapshot predates. TestEmbeddedPolicyAndTrustRoot pins which
+// keys it holds.
 //
 //go:embed trusted_root.json
 var trustedRootJSON []byte
+
+// snapshotDate is when trusted_root.json was fetched, for reports.
+const snapshotDate = "2026-10-16"
 
 // slsaProvenanceV1 is the only predicate accepted. The broker's release workflow also
 // signs the image with `cosign sign` (predicate https://sigstore.dev/cosign/sign/v1), and
@@ -140,22 +145,30 @@ func (p Policy) signerPrefix() string {
 // is judged once per Verifier; a run builds one.
 type Verifier struct {
 	policy   Policy
-	sigstore *verify.Verifier
 	registry *registry
+
+	// snapshot verifies against the embedded trust root. fetchRoot, when set, supplies the
+	// current one; it is called at most once, on the first digest that needs it.
+	snapshot  *verify.Verifier
+	fetchRoot func() (root.TrustedMaterial, error)
+	trustOnce sync.Once
+	trusted   trust
 
 	mu    sync.Mutex
 	cache map[string]evidence.ReleaseVerdict
 }
 
-// New builds a Verifier from the embedded policy and trust root. timeout bounds the
-// registry fetches for one digest. An error means an embedded file is malformed — a
-// defect in this build, not a statement about any provider.
+// New builds a Verifier from the embedded policy, the current Sigstore trust root (fetched
+// over TUF with client, on first use) and the embedded snapshot as its fallback. timeout
+// bounds the registry fetches for one digest. An error means an embedded file is
+// malformed — a defect in this build, not a statement about any provider.
 func New(client *http.Client, timeout time.Duration) (*Verifier, error) {
 	v, err := newVerifier(policyJSON, trustedRootJSON)
 	if err != nil {
 		return nil, err
 	}
 	v.registry = newRegistry(client, timeout)
+	v.fetchRoot = func() (root.TrustedMaterial, error) { return fetchTrustedRoot(client) }
 	return v, nil
 }
 
@@ -168,14 +181,19 @@ func newVerifier(policy, trustedRoot []byte) (*Verifier, error) {
 	if err != nil {
 		return nil, fmt.Errorf("embedded Sigstore trust root: %w", err)
 	}
-	// One signed certificate timestamp, one transparency log entry, one observed
-	// timestamp: what every bundle Sigstore's public-good instance issues carries.
-	sv, err := verify.NewVerifier(tr, verify.WithSignedCertificateTimestamps(1),
-		verify.WithTransparencyLog(1), verify.WithObserverTimestamps(1))
+	sv, err := sigstoreVerifier(tr)
 	if err != nil {
-		return nil, fmt.Errorf("sigstore verifier: %w", err)
+		return nil, fmt.Errorf("embedded Sigstore trust root: %w", err)
 	}
-	return &Verifier{policy: p, sigstore: sv, cache: map[string]evidence.ReleaseVerdict{}}, nil
+	return &Verifier{policy: p, snapshot: sv, cache: map[string]evidence.ReleaseVerdict{}}, nil
+}
+
+// sigstoreVerifier verifies bundles against tm. One signed certificate timestamp, one
+// transparency log entry, one observed timestamp: what every bundle Sigstore's
+// public-good instance issues carries.
+func sigstoreVerifier(tm root.TrustedMaterial) (*verify.Verifier, error) {
+	return verify.NewVerifier(tm, verify.WithSignedCertificateTimestamps(1),
+		verify.WithTransparencyLog(1), verify.WithObserverTimestamps(1))
 }
 
 // Repository implements evidence.ReleaseVerifier.
@@ -241,15 +259,18 @@ func (v *Verifier) judge(digest string, bundles [][]byte) evidence.ReleaseVerdic
 	}
 	policy := verify.NewPolicy(verify.WithArtifactDigest("sha256", want), verify.WithCertificateIdentity(identity))
 
+	trust := v.trust()
 	var reasons []string
+	unverified := false
 	for _, raw := range bundles {
 		var b bundle.Bundle
 		if err := b.UnmarshalJSON(raw); err != nil {
 			reasons = append(reasons, fmt.Sprintf("an attached bundle does not parse: %v", err))
 			continue
 		}
-		res, err := v.sigstore.Verify(&b, policy)
+		res, err := trust.sigstore.Verify(&b, policy)
 		if err != nil {
+			unverified = true
 			reasons = append(reasons, fmt.Sprintf("an attached bundle does not verify: %v", err))
 			continue
 		}
@@ -258,6 +279,11 @@ func (v *Verifier) judge(digest string, bundles [][]byte) evidence.ReleaseVerdic
 			return evidence.ReleaseVerdict{Status: evidence.ReleaseAccepted, Release: rel}
 		}
 		reasons = append(reasons, why)
+	}
+	if unverified && trust.stale != "" {
+		// Against the snapshot, a bundle that does not verify may only be newer than it.
+		return evidence.ReleaseVerdict{Status: evidence.ReleaseUnavailable,
+			Reason: strings.Join(dedupe(reasons), "; ") + "; " + trust.stale}
 	}
 	return rejected("%s", strings.Join(dedupe(reasons), "; "))
 }
