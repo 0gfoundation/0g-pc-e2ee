@@ -713,6 +713,31 @@ func (r *ComposeReview) reviewTopLevelVolumes(n *yaml.Node) map[string]namedVolu
 			continue
 		}
 
+		// A template anywhere in what the volume IS — its driver, or any of driver_opts —
+		// makes it whatever the deployment's environment says: `device: ${D}` is a host bind
+		// of `/` as easily as of a scratch directory, `type: ${T}` is NFS as easily as
+		// tmpfs. The literal rules below read text that is not there yet, so the worst is
+		// reported, and the volume is unreadable to every service that mounts it.
+		if at, found := firstInterpolated(mapValue(decl, "driver"), key+".driver"); found {
+			out[name] = namedVolume{Opaque: "its driver is decided by the deployment's environment"}
+			r.add(SeverityBlocking, "", key, fmt.Sprintf("the volume's driver holds a template (at %s), so what "+
+				"mounting it exposes is the deployment's environment's choice, and the manifest does not say", at))
+			continue
+		}
+		if at, found := firstInterpolated(mapValue(decl, "driver_opts"), key+".driver_opts"); found {
+			out[name] = namedVolume{Opaque: "its driver_opts are decided by the deployment's environment"}
+			r.add(SeverityBlocking, "", key, fmt.Sprintf("driver_opts holds a template (at %s): whether the volume "+
+				"is a host bind, and of which path, or a network filesystem, is the deployment's environment's "+
+				"choice, and the manifest does not say", at))
+			continue
+		}
+		for _, field := range []string{"name", "external"} {
+			if at, found := firstInterpolated(mapValue(decl, field), key+"."+field); found {
+				r.add(SeverityJustify, "", key, fmt.Sprintf("the volume's %s holds a template (at %s): which volume "+
+					"it is — possibly one another deployment created — is the deployment's environment's choice", field, at))
+			}
+		}
+
 		var v namedVolume
 		for j := 0; j+1 < len(decl.Content); j += 2 {
 			k := decl.Content[j].Value
@@ -798,12 +823,29 @@ func (r *ComposeReview) reviewFileSources(n *yaml.Node, section string) {
 				"the content comes from environment variable %s at deploy time, so it is chosen outside the "+
 					"measured manifest", env))
 		}
+		for _, field := range []string{"name", "external"} {
+			if at, found := firstInterpolated(mapValue(decl, field), key+"."+field); found {
+				r.add(SeverityJustify, "", key, fmt.Sprintf("the %s holds a template (at %s), so which one it is "+
+					"is the deployment's environment's choice", field, at))
+			}
+		}
 		file, ok := nodeScalar(mapValue(decl, "file"))
 		if !ok {
 			r.add(SeverityJustify, "", key, "the file: path is not a scalar, so what it reads could not be determined")
 			continue
 		}
 		if file == "" {
+			continue
+		}
+		// docker compose injects a file secret or config by bind-mounting it, so the file
+		// is a host path into containers; templated, it is whichever path the deployment's
+		// environment names — /var/run/docker.sock as easily as a certificate. Not a
+		// relative path, which is what the branch below would have called it.
+		if strings.Contains(file, "$") {
+			r.add(SeverityBlocking, "", key, fmt.Sprintf(
+				"reads %q from the host and injects it into containers: the path holds a template, so which host "+
+					"file — a runtime socket included — is the deployment's environment's choice, and the manifest "+
+					"does not say", file))
 			continue
 		}
 		// Same three cases as a mount source, and the relative one has to be reported for

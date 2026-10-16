@@ -678,3 +678,49 @@ func TestLoad_TemplatedReviewedKeys(t *testing.T) {
 		})
 	}
 }
+
+// A template in a top-level declaration is what the environment makes of it, and a
+// literal rule cannot read that: reported at the worst the literal case reaches.
+func TestLoad_TemplatedTopLevelDeclarations(t *testing.T) {
+	svc := "services:\n  a:\n    image: x\n"
+	for _, tc := range []struct {
+		name, doc, key, says string
+		sev                  Severity
+		notSay               string
+	}{
+		// docker compose bind-mounts a file secret, so F=/var/run/docker.sock is an escape.
+		{"a templated secret file", svc + "secrets:\n  s:\n    file: ${F}\n", "compose.secrets.s",
+			"the path holds a template", SeverityBlocking, "RELATIVE"},
+		{"a templated config file", svc + "configs:\n  c:\n    file: ${F}/x\n", "compose.configs.c",
+			"the path holds a template", SeverityBlocking, "RELATIVE"},
+		// `device: /` resolves to a host bind of the root; `${D}` can be exactly that.
+		{"a templated volume device", svc + "volumes:\n  v:\n    driver_opts: {type: none, o: bind, device: '${D}'}\n",
+			"compose.volumes.v", "driver_opts holds a template", SeverityBlocking, "cannot resolve"},
+		{"a templated volume type", svc + "volumes:\n  v:\n    driver_opts: {type: '${T}', device: ':/x'}\n",
+			"compose.volumes.v", "driver_opts holds a template", SeverityBlocking, ""},
+		{"a templated volume driver", svc + "volumes:\n  v:\n    driver: ${DRV}\n", "compose.volumes.v",
+			"driver holds a template", SeverityBlocking, ""},
+		{"a templated volume name", svc + "volumes:\n  v:\n    name: ${N}\n", "compose.volumes.v",
+			"name holds a template", SeverityJustify, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := reviewOf(t, manifest(tc.doc))
+			if r.LoadErr != nil {
+				t.Fatal(r.LoadErr)
+			}
+			f := requireFinding(t, r, tc.sev, "", tc.key)
+			if !strings.Contains(f.Detail, tc.says) || (tc.notSay != "" && strings.Contains(f.Detail, tc.notSay)) {
+				t.Fatalf("detail = %s", f.Detail)
+			}
+		})
+	}
+
+	// And a service mounting such a volume is told it cannot be read.
+	// (Not a one-letter name: compose reads `v:/data` as a Windows drive path.)
+	r := reviewOf(t, manifest("services:\n  a:\n    image: x\n    volumes: [vol:/data]\nvolumes:\n  vol:\n"+
+		"    driver_opts: {type: none, o: bind, device: '${D}'}\n"))
+	f := requireFinding(t, r, SeverityJustify, "a", "volumes")
+	if !strings.Contains(f.Detail, "decided by the deployment's environment") {
+		t.Fatalf("detail = %s", f.Detail)
+	}
+}
