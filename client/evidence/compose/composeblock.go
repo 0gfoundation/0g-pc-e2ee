@@ -66,8 +66,10 @@ package compose
 
 import (
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -136,6 +138,10 @@ func blockOf(name string, body *yaml.Node) ServiceBlock {
 	b := ServiceBlock{Name: name}
 	// A copy, because rendering normalizes in place and the review walks this same tree.
 	body = cloneNode(body)
+	if why := templatedIdentity(body); why != "" {
+		b.Err = errors.New(why)
+		return b
+	}
 	if body == nil || body.Kind != yaml.MappingNode {
 		b.Err = fmt.Errorf("the service body is not a mapping, so it has no canonical form")
 		return b
@@ -424,4 +430,110 @@ func topLevelBlocks(top *yaml.Node) []TopLevelBlock {
 		out = append(out, b)
 	}
 	return out
+}
+
+// identityOf names how docker compose identifies an entry of a list it de-duplicates —
+// override.EnforceUnicity's indexers in compose-go v2.0.2 (override/uncity.go), for the
+// service lists they cover — given the entry as this package holds it after loading.
+type identityOf func(entry *yaml.Node) string
+
+// beforeEquals is keyValueIndexer: the text before the first "=".
+func beforeEquals(e *yaml.Node) string {
+	if e.Kind != yaml.ScalarNode {
+		return ""
+	}
+	k, _, _ := strings.Cut(e.Value, "=")
+	return k
+}
+
+func scalarOr(field ...string) identityOf {
+	return func(e *yaml.Node) string {
+		if e.Kind == yaml.ScalarNode {
+			return e.Value
+		}
+		var parts []string
+		for _, f := range field {
+			if v := mapValue(e, f); v != nil && v.Kind == yaml.ScalarNode {
+				parts = append(parts, v.Value)
+			}
+		}
+		return strings.Join(parts, " ")
+	}
+}
+
+// dedupedLists are the service lists compose de-duplicates, and how it identifies their
+// entries. Nested lists are written with "." (networks.*.aliases reads every network).
+var dedupedLists = map[string]identityOf{
+	"annotations": beforeEquals, "cap_add": beforeEquals, "cap_drop": beforeEquals, "dns": beforeEquals,
+	"dns_opt": beforeEquals, "dns_search": beforeEquals, "environment": beforeEquals, "extra_hosts": beforeEquals,
+	"labels": beforeEquals, "links": beforeEquals, "profiles": beforeEquals, "sysctls": beforeEquals,
+	"tmpfs": beforeEquals, "deploy.labels": beforeEquals, "build.args": beforeEquals,
+	"build.additional_contexts": beforeEquals, "build.extra_hosts": beforeEquals, "build.platform": beforeEquals,
+	"build.tags": beforeEquals, "build.labels": beforeEquals, "networks.*.aliases": beforeEquals,
+	"networks.*.link_local_ips": beforeEquals,
+	"configs":                   scalarOr("target", "source"),
+	"secrets":                   scalarOr("target", "source"),
+	"env_file":                  scalarOr("path"),
+	"expose":                    scalarOr(),
+	"ports":                     scalarOr("host_ip", "published", "target", "protocol"),
+	"volumes":                   scalarOr("target"),
+}
+
+// templatedIdentity explains why a service body has no canonical form when one of its
+// de-duplicated lists holds, beside other entries, an entry whose identity is a template.
+//
+// docker compose merges list entries that share an identity — two mounts on one target,
+// two values for one environment variable — and it computes the identity after
+// substitution. `/safe:/data` beside `${X}:/data` is one mount to docker compose (the
+// later), two here; `{source: /, target: "${X}:/data"}` beside `"${X}:/data"` is two to
+// docker compose and, before the held template's target was made unforgeable, one here.
+// Which entries run is the environment's choice, so no text this package renders can be
+// the one that runs, and pinning one would let a baseline vouch for it. A templated entry
+// on its own is no such case: nothing can merge with it.
+func templatedIdentity(body *yaml.Node) string {
+	for _, path := range sortedIdentityPaths() {
+		for _, list := range listsAt(body, strings.Split(path, ".")) {
+			if list.Kind != yaml.SequenceNode || len(list.Content) < 2 {
+				continue
+			}
+			for _, e := range list.Content {
+				if id := dedupedLists[path](e); strings.Contains(id, "$") {
+					return fmt.Sprintf("%s holds an entry identified by a template (%q) beside %d other(s); docker "+
+						"compose merges entries with one identity after substituting the environment, so which of "+
+						"them run is the environment's choice, and the block has no canonical form",
+						path, id, len(list.Content)-1)
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// listsAt returns the nodes at path under n, "*" matching every key of a mapping.
+func listsAt(n *yaml.Node, path []string) []*yaml.Node {
+	if n == nil {
+		return nil
+	}
+	if len(path) == 0 {
+		return []*yaml.Node{n}
+	}
+	if n.Kind != yaml.MappingNode {
+		return nil
+	}
+	var out []*yaml.Node
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		if path[0] == "*" || n.Content[i].Value == path[0] {
+			out = append(out, listsAt(n.Content[i+1], path[1:])...)
+		}
+	}
+	return out
+}
+
+func sortedIdentityPaths() []string {
+	paths := make([]string, 0, len(dedupedLists))
+	for p := range dedupedLists {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	return paths
 }

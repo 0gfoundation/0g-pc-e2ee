@@ -849,8 +849,8 @@ func baselineSkip(check compose.ComposeCheck) string {
 	case !check.Recorded:
 		return "the manifest was not compared against a per-service baseline (no deployment is recorded for this provider)"
 	case !check.Complete():
-		return fmt.Sprintf("the per-service baseline comparison is incomplete (%d broker build(s) could not be "+
-			"checked against the release provenance policy)", len(check.Unverified))
+		return fmt.Sprintf("the per-service baseline comparison is incomplete (%d item(s) could not be checked)",
+			len(check.Unverified))
 	}
 	return ""
 }
@@ -904,7 +904,11 @@ func reportBaseline(out io.Writer, check compose.ComposeCheck, contract string) 
 // printUnverified lists the broker builds whose release status could not be checked.
 func printUnverified(out io.Writer, check compose.ComposeCheck) {
 	for _, u := range check.Unverified {
-		fmt.Fprintf(out, "    %s: not checked — %s\n", u.Service, u.Reason)
+		where := u.Service
+		if where == "" {
+			where = "manifest"
+		}
+		fmt.Fprintf(out, "    %s: not checked — %s\n", where, u.Reason)
 	}
 }
 

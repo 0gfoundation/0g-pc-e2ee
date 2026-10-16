@@ -202,8 +202,16 @@ runs it; both are reported as blocking. A short-syntax mount, port or ulimit tha
 template is not parsed either, since docker compose parses it only after substitution: it
 is kept as written (so `/data:/d:${MODE}` cannot reduce to `/data:/d`), and a templated
 mount is blocking. The canonical form is therefore key-sorted and in long syntax except
-for those entries, and services are listed by name. A manifest may hold at most 16 YAML
-documents; docker compose validates after each one, and so does the review. The loader lives in its own package, which
+for those entries, and services are listed by name. Where docker compose de-duplicates a
+list by an identity a template decides (a mount's target, an environment variable's key)
+and the list holds other entries, which of them run is the environment's choice, and the
+block has no canonical form. The loading runs docker compose's own per-document loop with
+compose-go's functions — validation before the transforms, as docker compose does, so a
+malformed manifest is refused rather than crashing the verifier — and is held to
+compose-go's loader by a differential test. A manifest past 16 YAML documents (docker
+compose re-validates after each one) is not read, and a recorded deployment then reports
+the comparison as not run (exit 3). Every reviewed key whose value holds a template is
+reported at the worst its rule can find. The loader lives in its own package, which
 only pcverify imports: the gateway's and sidecar's linked dependencies do not change.
 
 Identity rather than the `image` key, because a real manifest defeats the simpler

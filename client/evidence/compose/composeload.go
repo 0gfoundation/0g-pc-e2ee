@@ -20,20 +20,24 @@ package compose
 // that recipe and moving the pin with it — and re-checking that the gateway's linked
 // dependencies still do not move (TestComposeGoStaysOutOfTheGateway).
 //
-// WHAT IS LOADED, AND WHAT IS NOT. The loader's own pipeline — every YAML document,
-// merged, with !reset / !override applied, anchors and merge keys resolved by yaml.v3,
-// key uniqueness enforced, and compose's canonical transforms (short syntax to long) —
-// with these stages switched off, each for a stated reason:
+// WHAT IS LOADED, AND WHAT IS NOT. docker compose's per-document loop, run step for
+// step with compose-go's own functions (loadModel lists them): every YAML document decoded
+// with !reset / !override applied and anchors and merge keys resolved by yaml.v3, merged,
+// de-duplicated and validated against compose's schema, and then compose's canonical
+// transforms (short syntax to long). Not loader.LoadModelWithContext itself, because it
+// can only validate with substitution or not at all, and this needs validation without
+// substitution — run in docker compose's place, before the transforms, which panic on
+// input the schema has not passed. TestLoad_IsComposeGosLoader holds the result to that
+// function's on every input both accept. What is not done, each for a stated reason:
 //
 //   - Substitution. `${VAR}` values come from the CVM's encrypted environment, which the
 //     verifier does not have; every template is left as written, and the review treats
-//     every `$` as provider-controlled. The type casts interpolation also performs are
-//     kept (castOnly).
-//   - include, and extends: compose-go resolves both by reading FILES, from the working
-//     directory of whoever runs the loader. On a verifier that is the verifier's own
-//     machine — a manifest saying `include: /etc/…` would have pcverify read its host's
-//     files. Neither is loaded; the review reports both as blocking, since what they pull
-//     in is not in the measured manifest.
+//     every `$` as provider-controlled. The type casts interpolation also performs, and
+//     its template syntax check, are kept (castOnly); strings docker compose parses after
+//     substituting are held back from parsing (templatedShortSyntax).
+//   - include, and extends: compose-go resolves both by reading FILES, from the machine
+//     running the loader — on a verifier, the verifier's own. Neither is loaded; the
+//     review reports both as blocking, since what they pull in is not in the manifest.
 //   - Normalization, default values, environment resolution and path resolution: each
 //     rewrites the model toward what a particular host would run (project names, the
 //     default network, env_file contents, absolute paths under the working directory).
@@ -42,10 +46,9 @@ package compose
 //   - The project consistency check: it cross-references names (depends_on targets and
 //     the like). A manifest failing it runs nothing at all; no rule here depends on it.
 //
-// Schema validation runs separately (validateAsLoaded): per document, as docker compose
-// runs it, and judging each violation on its own, because without the environment the
-// schema refuses some manifests docker compose accepts — `privileged: ${P}` is not a
-// boolean until the environment fills it in.
+// Schema violations are judged one by one (validateSchema), because without the
+// environment the schema refuses some manifests docker compose accepts — `privileged: ${P}`
+// is not a boolean until the environment fills it in.
 //
 // WHAT THE REVIEW THEN WALKS. The loaded model re-encoded as a yaml.Node tree: the rules
 // were written against nodes, and a node tree keeps what a Go map would lose for them —
@@ -65,13 +68,16 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
 	interp "github.com/compose-spec/compose-go/v2/interpolation"
 	"github.com/compose-spec/compose-go/v2/loader"
+	"github.com/compose-spec/compose-go/v2/override"
 	"github.com/compose-spec/compose-go/v2/schema"
 	"github.com/compose-spec/compose-go/v2/template"
+	"github.com/compose-spec/compose-go/v2/transform"
 	"github.com/compose-spec/compose-go/v2/tree"
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/compose-spec/compose-go/v2/validation"
@@ -79,69 +85,239 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// loadWorkingDir is the working directory the loader is given. Nothing is read from it —
-// include and extends are off, and so is path resolution — and it names a path that
-// does not exist, so that a future option that started reading files would fail rather
-// than read the verifier's own.
-const loadWorkingDir = "/nonexistent/pcverify-compose"
+// errNotRead marks a manifest pcverify did not read — too many documents, or a failure of
+// its own loader. That is not docker compose refusing the manifest, and not a finding about
+// it: a recorded deployment it hits is reported as not compared (exit 3), never as a
+// mismatch.
+var errNotRead = errors.New("not read by pcverify")
 
-// loadModel runs docker compose's loader over text, with the stages composeload.go's
-// header switches off, then validates it the way docker compose does (validateAsLoaded).
-// An error is a refusal docker compose would make whatever the environment holds.
-func loadModel(text []byte, what string) (map[string]any, error) {
-	// The document count is bounded before anything is loaded: validation loads every
-	// prefix of the documents (validateAsLoaded), and the text is the provider's to write.
-	// A text that does not split is left for the loader, whose error is docker compose's.
-	docs, splitErr := splitDocuments(text)
-	if splitErr == nil && len(docs) > maxDocuments {
-		return nil, fmt.Errorf("%s holds %d YAML documents; pcverify reads at most %d", what, len(docs), maxDocuments)
-	}
-	model, err := loadFiles([]types.ConfigFile{{Filename: composeFilename, Content: text}})
+// loadModel loads compose text as docker compose v2.26.0's loader does, in its order and
+// with compose-go's own steps (loadYamlModel in compose-go v2.0.2's loader/loader.go), for
+// each YAML document in turn:
+//
+//	decode, applying !reset / !override within the document (loader.ParseYAML)
+//	interpolate — here, type casts and template syntax only (castOnly)
+//	null lists to empty ones (fixEmptyNotNull)
+//	apply the document's !reset / !override to what earlier documents built (applyResets)
+//	merge it in (override.Merge), de-duplicate (override.EnforceUnicity)
+//	validate the result against compose's schema (validateSchema)
+//
+// and then, once, the canonical transforms, a second de-duplication and compose's
+// post-load validation. The order is the point. compose-go's transforms assume
+// schema-valid input and type-assert accordingly; run on input the schema has not passed,
+// `volumes: {v: hello}` or `networks: [1]` panics them, and a verifier a provider can
+// crash with one line is a verifier any provider can take offline. docker compose never
+// gets there, because it validates every document first; neither does this.
+//
+// extends and include are not steps here at all: compose-go resolves both by reading
+// files, on whatever machine runs the loader (the review reports both as blocking).
+// Normalization, default values and environment and path resolution are not either:
+// each rewrites the model toward what one particular host would run.
+func loadModel(text []byte, what string) (model map[string]any, err error) {
+	// compose-go's code runs on input a provider chose, and some of it panics on input it
+	// has not validated yet — `env_file: [{required: true}]` crashes docker compose's own
+	// loader. Whatever it does, the run reports; it does not crash.
+	defer func() {
+		if p := recover(); p != nil {
+			model, err = nil, fmt.Errorf("compose-go, the loader docker compose runs, failed while loading %s (%v). "+
+				"docker compose's own loader fails the same way on such input — it de-duplicates lists before it "+
+				"validates them — but where templates are involved pcverify cannot rule out its own part, so the "+
+				"manifest was not compared (%w)", what, p, errNotRead)
+		}
+	}()
+	docs, err := documents(text)
 	if err != nil {
 		return nil, fmt.Errorf("docker compose cannot load %s: %v", what, err)
 	}
-	if err := validateAsLoaded(docs, model); err != nil {
+	if len(docs) > maxDocuments {
+		return nil, fmt.Errorf("%s holds more than %d YAML documents, the most pcverify reads (%w)",
+			what, maxDocuments, errNotRead)
+	}
+	key, err := newHoldKey()
+	if err != nil {
+		return nil, fmt.Errorf("%v (%w)", err, errNotRead)
+	}
+	opts := castOnly(key)
+	model = map[string]any{}
+	for i, doc := range docs {
+		where := ""
+		if len(docs) > 1 {
+			where = fmt.Sprintf(" (document %d of %d)", i+1, len(docs))
+		}
+		if doc.empty {
+			// What docker compose's decode loop makes of a document with nothing in it.
+			return nil, fmt.Errorf("docker compose cannot load %s%s: Top-level object must be a mapping", what, where)
+		}
+		raw, err := loader.ParseYAML(doc.text)
+		if err != nil {
+			return nil, fmt.Errorf("docker compose cannot load %s%s: %v", what, where, err)
+		}
+		cfg, err := interp.Interpolate(raw, *opts)
+		if err != nil {
+			return nil, fmt.Errorf("docker compose cannot load %s%s: %v", what, where, err)
+		}
+		fixEmptyNotNull(cfg)
+		applyResets(model, doc.resets, tree.NewPath())
+		if model, err = override.Merge(model, cfg); err != nil {
+			return nil, fmt.Errorf("docker compose cannot load %s%s: %v", what, where, err)
+		}
+		if model, err = override.EnforceUnicity(model); err != nil {
+			return nil, fmt.Errorf("docker compose cannot load %s%s: %v", what, where, err)
+		}
+		// Validated as the strings the held templates will be restored to, which is what
+		// the schema sees in docker compose (as substituted text).
+		if err := validateSchema(withTemplatesRestored(model, key)); err != nil {
+			return nil, fmt.Errorf("docker compose refuses %s%s: %v", what, where, err)
+		}
+		delete(model, "version") // docker compose drops it, with a warning, once validated
+	}
+	if len(model) == 0 {
+		return nil, fmt.Errorf("docker compose cannot load %s: empty compose file", what)
+	}
+	if model, err = transform.Canonical(model); err != nil {
+		return nil, fmt.Errorf("docker compose cannot load %s: %v", what, err)
+	}
+	if model, err = override.EnforceUnicity(model); err != nil {
+		return nil, fmt.Errorf("docker compose cannot load %s: %v", what, err)
+	}
+	restoreTemplates(model, key)
+	if err := validation.Validate(model); err != nil {
 		return nil, fmt.Errorf("docker compose refuses %s: %v", what, err)
 	}
 	return model, nil
 }
 
-// maxDocuments bounds the YAML documents in one compose text. A manifest has no need for
-// more than one; the bound is what keeps per-document validation from being a lever.
+// maxDocuments bounds the YAML documents in one compose text. docker compose has no such
+// bound, but it re-validates everything merged so far after each document, so the cost of
+// a text grows with the square of its document count — and the text is the provider's to
+// write. A manifest has no need for more than one; one past the bound is not read (exit 3).
 const maxDocuments = 16
 
-// composeFilename is the name the loader is given for the text; it appears in its errors.
-const composeFilename = "docker-compose.yaml"
-
-// loadFiles is the loader with this file's options and schema validation off, its
-// templated short-syntax entries restored to the text they were written as.
-func loadFiles(files []types.ConfigFile) (map[string]any, error) {
-	key, err := newHoldKey()
-	if err != nil {
-		return nil, err
-	}
-	model, err := loader.LoadModelWithContext(context.Background(), types.ConfigDetails{
-		WorkingDir:  loadWorkingDir,
-		ConfigFiles: files,
-		Environment: map[string]string{},
-	}, func(o *loader.Options) {
-		o.SetProjectName("app", true)
-		o.Interpolate = castOnly(o.Interpolate, key)
-		o.SkipInclude = true
-		o.SkipExtends = true
-		o.SkipNormalization = true
-		o.SkipDefaultValues = true
-		o.SkipResolveEnvironment = true
-		o.ResolvePaths = false
-		o.SkipConsistencyCheck = true
-		o.SkipValidation = true
-	})
-	if err != nil {
-		return nil, err
-	}
-	restoreTemplates(model, key)
-	return model, nil
+// document is one YAML document of a compose text: its own text, and where it tags
+// !reset or !override.
+type document struct {
+	text   []byte
+	resets []tree.Path
+	empty  bool
 }
+
+// documents splits text into its YAML documents. Each is re-encoded from its node tree —
+// compose's tags, anchors and aliases are all on the nodes — so loader.ParseYAML can read
+// it on its own.
+func documents(text []byte) ([]document, error) {
+	dec := yaml.NewDecoder(bytes.NewReader(text))
+	var docs []document
+	for {
+		var node yaml.Node
+		err := dec.Decode(&node)
+		if errors.Is(err, io.EOF) {
+			return docs, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		out, err := yaml.Marshal(&node)
+		if err != nil {
+			return nil, err
+		}
+		// A document with nothing in it (a trailing `---`) is a null: its re-encoding is
+		// empty text, which ParseYAML would report as end-of-file rather than as what
+		// docker compose reports.
+		empty := len(node.Content) == 0 ||
+			(len(node.Content) == 1 && node.Content[0].Kind == yaml.ScalarNode && node.Content[0].Tag == "!!null")
+		doc := document{text: out, empty: empty}
+		if node.Kind == yaml.DocumentNode && len(node.Content) == 1 {
+			recordResets(node.Content[0], tree.NewPath(), &doc.resets)
+		}
+		if len(docs) == maxDocuments {
+			return append(docs, doc), nil // one past the bound is enough to say so; not read further
+		}
+		docs = append(docs, doc)
+	}
+}
+
+// recordResets and applyResets are compose-go v2.0.2's ResetProcessor (loader/reset.go)
+// — resolveReset's path recording and applyNullOverrides — which compose-go does not let a
+// caller construct. They are reproduced exactly, the inconsistency included: a path inside
+// a sequence is recorded as its index ("0") and matched as "[0]", so across documents a
+// !reset inside a list never applies, in docker compose as here.
+func recordResets(n *yaml.Node, p tree.Path, out *[]tree.Path) {
+	if n.Tag == "!reset" || n.Tag == "!override" {
+		*out = append(*out, p)
+		return
+	}
+	switch n.Kind {
+	case yaml.SequenceNode:
+		for i, c := range n.Content {
+			recordResets(c, p.Next(strconv.Itoa(i)), out)
+		}
+	case yaml.MappingNode:
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			recordResets(n.Content[i+1], p.Next(n.Content[i].Value), out)
+		}
+	}
+}
+
+func applyResets(target any, paths []tree.Path, p tree.Path) {
+	if len(paths) == 0 {
+		return
+	}
+	switch v := target.(type) {
+	case map[string]any:
+	keys:
+		for k, e := range v {
+			next := p.Next(k)
+			for _, pattern := range paths {
+				if next.Matches(pattern) {
+					delete(v, k)
+					continue keys
+				}
+			}
+			applyResets(e, paths, next)
+		}
+	case []any:
+	items:
+		for i, e := range v {
+			next := p.Next(fmt.Sprintf("[%d]", i))
+			for _, pattern := range paths {
+				if next.Matches(pattern) {
+					continue items
+				}
+			}
+			applyResets(e, paths, next)
+		}
+	}
+}
+
+// fixEmptyNotNull is compose-go v2.0.2's (loader/fix.go): a list decoded empty is an
+// empty list, not a null one.
+func fixEmptyNotNull(value any) any {
+	switch v := value.(type) {
+	case []any:
+		if v == nil {
+			return []any{}
+		}
+		for i, e := range v {
+			v[i] = fixEmptyNotNull(e)
+		}
+	case map[string]any:
+		for k, e := range v {
+			v[k] = fixEmptyNotNull(e)
+		}
+	}
+	return value
+}
+
+// typeCasts is the loader's own table of typed paths, as its interpolation receives it.
+// compose-go keeps the table unexported; a loader call with no files hands it to an option
+// function and returns before reading anything.
+var typeCasts = sync.OnceValue(func() map[tree.Path]interp.Cast {
+	var casts map[tree.Path]interp.Cast
+	_, _ = loader.LoadModelWithContext(context.Background(), types.ConfigDetails{}, func(o *loader.Options) {
+		casts = o.Interpolate.TypeCastMapping
+	})
+	return casts
+})
 
 // castOnly turns the loader's interpolation stage into its type casts alone.
 //
@@ -156,9 +332,10 @@ func loadFiles(files []types.ConfigFile) (map[string]any, error) {
 //
 // And the strings docker compose PARSES after substituting are held back from parsing
 // here (heldTemplate).
-func castOnly(opts *interp.Options, key string) *interp.Options {
-	casts := make(map[tree.Path]interp.Cast, len(opts.TypeCastMapping)+len(templatedShortSyntax))
-	for p, cast := range opts.TypeCastMapping {
+func castOnly(key string) *interp.Options {
+	table := typeCasts()
+	casts := make(map[tree.Path]interp.Cast, len(table)+len(templatedShortSyntax))
+	for p, cast := range table {
 		casts[p] = func(v string) (any, error) {
 			if strings.Contains(v, "$") {
 				return v, nil
@@ -221,9 +398,13 @@ var templatedShortSyntax = []tree.Path{
 // swap that mount for whatever string it named: the review would read the string and the
 // canonical form would record it, while docker compose mounted the host's root. A key
 // drawn at load time cannot appear in a manifest written before it, and a mapping is
-// restored only if it is exactly what heldTemplate built — that key, and a `target`
-// equal to the held text — so a provider's own `x-` key never qualifies. `target` is set
-// because the loader's uniqueness pass indexes mounts and ports by it.
+// restored only if it is exactly what heldTemplate built — that key, and a `target` of
+// the key and the held text — so a provider's own `x-` key never qualifies. `target` is
+// set because the loader's uniqueness pass indexes mounts and ports by it, and it carries
+// the key so that it can equal no real entry's target: set to the text alone, a real
+// mount whose target was that text was merged into the held entry and vanished, a bind of
+// the host's root included. Which entries docker compose merges is decided after
+// substitution; blockOf says so when it matters (templatedIdentity).
 const holdKeyPrefix = "x-pcverify-held-"
 
 func newHoldKey() (string, error) {
@@ -235,7 +416,7 @@ func newHoldKey() (string, error) {
 }
 
 func heldTemplate(key, v string) map[string]any {
-	return map[string]any{key: v, "target": v}
+	return map[string]any{key: v, "target": key + ":" + v}
 }
 
 // restoreTemplates puts every template castOnly held under key back as the string it was
@@ -263,6 +444,58 @@ func restoreTemplates(model map[string]any, key string) {
 	}
 }
 
+// withTemplatesRestored is model with its held templates as strings, copying only what it
+// changes: the services, the lists and maps that hold a template, nothing else.
+func withTemplatesRestored(model map[string]any, key string) map[string]any {
+	services, ok := model["services"].(map[string]any)
+	if !ok {
+		return model
+	}
+	view := make(map[string]any, len(model))
+	for k, v := range model {
+		view[k] = v
+	}
+	svcs := make(map[string]any, len(services))
+	for name, svc := range services {
+		body, ok := svc.(map[string]any)
+		if !ok {
+			svcs[name] = svc
+			continue
+		}
+		b := make(map[string]any, len(body))
+		for k, v := range body {
+			b[k] = v
+		}
+		for _, field := range []string{"volumes", "ports"} {
+			if list, ok := body[field].([]any); ok {
+				cp := make([]any, len(list))
+				for i, e := range list {
+					if held, ok := heldText(e, key); ok {
+						cp[i] = held
+					} else {
+						cp[i] = e
+					}
+				}
+				b[field] = cp
+			}
+		}
+		if limits, ok := body["ulimits"].(map[string]any); ok {
+			cp := make(map[string]any, len(limits))
+			for k, e := range limits {
+				if held, ok := heldText(e, key); ok {
+					cp[k] = held
+				} else {
+					cp[k] = e
+				}
+			}
+			b["ulimits"] = cp
+		}
+		svcs[name] = b
+	}
+	view["services"] = svcs
+	return view
+}
+
 // heldText returns the text of a mapping heldTemplate built under key, and nothing for
 // any other mapping.
 func heldText(v any, key string) (string, bool) {
@@ -271,62 +504,10 @@ func heldText(v any, key string) (string, bool) {
 		return "", false
 	}
 	s, ok := m[key].(string)
-	if !ok || m["target"] != s {
+	if !ok || m["target"] != key+":"+s {
 		return "", false
 	}
 	return s, true
-}
-
-// validateAsLoaded applies compose's schema where docker compose applies it — after each
-// YAML document is merged in, not only once at the end — and then its post-load checks.
-//
-// Per document, because a later document can repair an earlier one: `bogus: x` in the
-// first and `bogus: !reset null` in the second loads as valid as a whole, but docker
-// compose validated the merge after the first document and refused it there. So each
-// prefix of the documents is loaded and validated in turn — at most maxDocuments-1 extra
-// loads, and none for the usual single document. (The prefix models are compose's
-// canonical form rather than the raw merge it validates; the canonical transforms only
-// rewrite shapes the schema accepts either way.)
-func validateAsLoaded(docs [][]byte, model map[string]any) error {
-	for k := 1; k < len(docs); k++ {
-		files := make([]types.ConfigFile, k)
-		for i := range files {
-			files[i] = types.ConfigFile{Filename: composeFilename, Content: docs[i]}
-		}
-		prefix, err := loadFiles(files)
-		if err != nil {
-			return fmt.Errorf("after document %d of %d: %v", k, len(docs), err)
-		}
-		if err := validateSchema(prefix); err != nil {
-			return fmt.Errorf("after document %d of %d: %v", k, len(docs), err)
-		}
-	}
-	if err := validateSchema(model); err != nil {
-		return err
-	}
-	return validation.Validate(model)
-}
-
-// splitDocuments returns each YAML document of text on its own, re-encoded from its node
-// tree — compose's tags, anchors and aliases included, since they are all on the nodes.
-func splitDocuments(text []byte) ([][]byte, error) {
-	dec := yaml.NewDecoder(bytes.NewReader(text))
-	var docs [][]byte
-	for {
-		var doc yaml.Node
-		err := dec.Decode(&doc)
-		if errors.Is(err, io.EOF) {
-			return docs, nil
-		}
-		if err != nil {
-			return nil, err
-		}
-		out, err := yaml.Marshal(&doc)
-		if err != nil {
-			return nil, err
-		}
-		docs = append(docs, out)
-	}
 }
 
 // validateSchema checks model against compose's schema, and reports a violation only when

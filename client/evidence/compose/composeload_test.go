@@ -1,14 +1,20 @@
 package compose
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/compose-spec/compose-go/v2/loader"
+	"github.com/compose-spec/compose-go/v2/types"
 )
 
 // The cases this package's own YAML reader was once held to against compose-go, kept as
@@ -131,7 +137,7 @@ func TestLoad_ViolationsNoEnvironmentRepairsAreRefused(t *testing.T) {
 		// cannot repair an earlier one.
 		{"a violation a later document removes",
 			"services:\n  app:\n    image: " + pinned + "\n    bogus: x\n---\nservices:\n  app:\n    bogus: !reset null\n",
-			"after document 1 of 2"},
+			"(document 1 of 2)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			r := reviewOf(t, manifest(tc.doc))
@@ -369,7 +375,7 @@ func TestLoad_DocumentCountIsBounded(t *testing.T) {
 	}
 	start := time.Now()
 	r := reviewOf(t, manifest(strings.Repeat("---\nservices: {}\n", 5000)))
-	if r.LoadErr == nil || !strings.Contains(r.LoadErr.Error(), "pcverify reads at most") {
+	if r.LoadErr == nil || !strings.Contains(r.LoadErr.Error(), "the most pcverify reads") {
 		t.Fatalf("5000 documents: %v", r.LoadErr)
 	}
 	if d := time.Since(start); d > 5*time.Second {
@@ -377,10 +383,31 @@ func TestLoad_DocumentCountIsBounded(t *testing.T) {
 	}
 }
 
-// The loader reads no file: a working directory that existed would be the verifier's.
-func TestLoad_WorkingDirDoesNotExist(t *testing.T) {
-	if _, err := os.Stat(loadWorkingDir); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("loadWorkingDir %q exists (or cannot be checked): %v", loadWorkingDir, err)
+// The loader reads no file. include and extends are the steps that would — compose-go
+// resolves both from the machine running it — and neither is run: a manifest naming a
+// real file on the verifier gets none of its content.
+func TestLoad_ReadsNoFileOnTheVerifier(t *testing.T) {
+	dir := t.TempDir()
+	other := filepath.Join(dir, "other.yml")
+	if err := os.WriteFile(other, []byte("services:\n  x:\n    image: x\n    privileged: true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, doc := range []string{
+		"include:\n  - " + other + "\nservices:\n  app:\n    image: app\n",
+		"services:\n  app:\n    image: app\n    extends:\n      file: " + other + "\n      service: x\n",
+	} {
+		r := reviewOf(t, manifest(doc))
+		if r.LoadErr != nil {
+			t.Fatalf("%v", r.LoadErr)
+		}
+		if got := find(r, "x", "privileged"); len(got) != 0 || len(find(r, "app", "privileged")) != 0 {
+			t.Fatalf("a file on the verifier was read into the manifest:\n%s", dumpFindings(r))
+		}
+		for _, s := range r.Services {
+			if s.Name == "x" {
+				t.Fatalf("the included service appeared: %+v", r.Services)
+			}
+		}
 	}
 }
 
@@ -453,5 +480,201 @@ func TestComposeGoStaysOutOfTheGateway(t *testing.T) {
 		if strings.HasPrefix(pkg, "github.com/compose-spec/") || strings.HasSuffix(pkg, "/client/evidence/compose") {
 			t.Errorf("the gateway or sidecar now depends on %s", pkg)
 		}
+	}
+}
+
+// loadModel reproduces compose-go's own per-document loop, so that schema validation can
+// come before the transforms (and filter what the environment settles). Its result must be
+// compose-go's: for every input both accept, the model is the one compose-go's loader
+// builds with the same options — the live manifests, and the cross-document cases where
+// the reproduced !reset handling decides the outcome.
+func TestLoad_IsComposeGosLoader(t *testing.T) {
+	var cases []string
+	for _, f := range []string{"testnet-app-compose.json", "cn20-app-compose.json"} {
+		raw, err := os.ReadFile(filepath.Join("testdata", f))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var ac struct {
+			DockerComposeFile string `json:"docker_compose_file"`
+		}
+		if err := json.Unmarshal(raw, &ac); err != nil {
+			t.Fatal(err)
+		}
+		cases = append(cases, ac.DockerComposeFile)
+	}
+	cases = append(cases,
+		"x-base: &base\n  privileged: true\n  cap_add: [SYS_ADMIN]\nservices:\n  app:\n    image: app\n    <<: *base\n    privileged: !reset false\n",
+		"services:\n  app:\n    image: app\n    privileged: true\n    user: root\n---\nservices:\n  app:\n    privileged: !reset null\n",
+		"services:\n  app:\n    image: app\n    environment: [A=1]\n---\nservices:\n  app:\n    environment: !override [B=2]\n",
+		"services:\n  app:\n    image: app\n    volumes: [/a:/a, /b:/b]\n---\nservices:\n  app:\n    volumes: [/c:/a]\n",
+		"{}\n---\nservices: {a: {image: x}}\n",
+		"version: '3.8'\nservices:\n  app:\n    image: app\n    ports: ['8080:80']\n    privileged: \"true\"\n",
+	)
+	for i, text := range cases {
+		ours, err := loadModel([]byte(text), "case")
+		if err != nil {
+			t.Fatalf("case %d: %v", i, err)
+		}
+		key, _ := newHoldKey()
+		theirs, err := loader.LoadModelWithContext(context.Background(), types.ConfigDetails{
+			WorkingDir:  "/nonexistent",
+			ConfigFiles: []types.ConfigFile{{Filename: "docker-compose.yaml", Content: []byte(text)}},
+			Environment: map[string]string{},
+		}, func(o *loader.Options) {
+			o.SetProjectName("app", true)
+			o.Interpolate = castOnly(key)
+			o.SkipInclude, o.SkipExtends, o.SkipNormalization, o.SkipDefaultValues = true, true, true, true
+			o.SkipResolveEnvironment, o.ResolvePaths, o.SkipConsistencyCheck = true, false, true
+		})
+		if err != nil {
+			t.Fatalf("case %d: compose-go refused what loadModel accepted: %v", i, err)
+		}
+		restoreTemplates(theirs, key)
+		if !reflect.DeepEqual(ours, theirs) {
+			a, _ := json.MarshalIndent(ours, "", " ")
+			b, _ := json.MarshalIndent(theirs, "", " ")
+			t.Fatalf("case %d: loadModel and compose-go's loader differ:\n%s\nvs\n%s", i, a, b)
+		}
+	}
+}
+
+// Input the schema refuses must be refused, never handed to compose-go's transforms: they
+// type-assert on schema-valid shapes and panic on anything else, and one panic took the
+// whole verifier down with it. The last two make docker compose's own loader panic too (it
+// de-duplicates before validating): reported as not read, never a crash.
+func TestLoad_SchemaInvalidInputIsRefusedNotAPanic(t *testing.T) {
+	for _, tc := range []struct {
+		doc     string
+		notRead bool
+	}{
+		{"services:\n  a:\n    image: x\nvolumes: {v: hello}\n", false},
+		{"services:\n  a:\n    image: x\n    networks: [1]\n", false},
+		{"services:\n  a:\n    image: x\n    env_file: [{required: true}]\n", true},
+		{"services:\n  a:\n    image: x\n    secrets: [{target: 1}]\n", true},
+	} {
+		func() {
+			defer func() {
+				if p := recover(); p != nil {
+					t.Fatalf("%q panicked: %v", tc.doc, p)
+				}
+			}()
+			r := reviewOf(t, manifest(tc.doc))
+			switch {
+			case tc.notRead && !errors.Is(r.LoadErr, errNotRead):
+				t.Fatalf("%q: LoadErr = %v, want not read", tc.doc, r.LoadErr)
+			case !tc.notRead && (r.LoadErr == nil || !strings.Contains(r.LoadErr.Error(), "docker compose refuses")):
+				t.Fatalf("%q: LoadErr = %v, want docker compose's refusal", tc.doc, r.LoadErr)
+			}
+		}()
+	}
+}
+
+// docker compose checks for an empty file once every document is merged, so an empty
+// first document is not a refusal.
+func TestLoad_AnEmptyFirstDocument(t *testing.T) {
+	r := reviewOf(t, manifest("{}\n---\nservices: {a: {image: x}}\n"))
+	if r.LoadErr != nil || len(r.Services) != 1 {
+		t.Fatalf("LoadErr = %v, services %+v", r.LoadErr, r.Services)
+	}
+}
+
+// Past the document bound the manifest is not read, and a recorded deployment reports the
+// comparison as not run (exit 3), not as a mismatch docker compose would not make.
+func TestLoad_PastTheDocumentBoundIsNotCompared(t *testing.T) {
+	doc := strings.Repeat("services: {}\n---\n", maxDocuments) + "services:\n  mysql:\n    image: mysql:8.0\n"
+	r := reviewOf(t, manifest(doc))
+	if !errors.Is(r.LoadErr, errNotRead) {
+		t.Fatalf("LoadErr = %v, want not read", r.LoadErr)
+	}
+	b, err := ParseComposeBaseline([]byte(`{"deployments": [{"name": "d", "contract": "` + testContract + `",
+		"providers": ["` + testProvider + `"], "services": [{"name": "mysql", "block": ["image: mysql:8.0"]}]}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := CheckReview(b, testReleases, testContract, testProvider, r)
+	if !got.OK() || got.Complete() || len(got.Unverified) != 1 {
+		t.Fatalf("want an incomplete comparison, not a mismatch: %+v", got)
+	}
+}
+
+// A real mount cannot be merged into a held template: their targets never coincide.
+func TestLoad_ARealMountIsNotMergedIntoAHeldTemplate(t *testing.T) {
+	r := reviewOf(t, manifest("services:\n  a:\n    image: x\n    volumes: [{type: bind, source: /, target: '${X}:/data'}, '${X}:/data']\n"))
+	if r.LoadErr != nil {
+		t.Fatal(r.LoadErr)
+	}
+	var root bool
+	for _, f := range find(r, "a", "volumes") {
+		if strings.Contains(f.Detail, "/ -> ${X}:/data") {
+			root = true
+		}
+	}
+	if !root {
+		t.Fatalf("the root bind is not reported:\n%s", dumpFindings(r))
+	}
+	// And which of the two docker compose keeps is the environment's: no canonical form.
+	if b := r.Blocks[0]; b.Pinnable() || !strings.Contains(b.Err.Error(), "identified by a template") {
+		t.Fatalf("block = %+v", b)
+	}
+}
+
+// Wherever docker compose de-duplicates by an identity the environment decides, the block
+// cannot be pinned; alone, a templated entry can.
+func TestLoad_TemplatedIdentitiesLeaveNoCanonicalForm(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		pinnable   bool
+	}{
+		{"a templated mount after a literal one on its target, across documents", "", false},
+		{"a templated mount beside a literal one", "    volumes: [/safe:/data, '${X}:/data']\n", false},
+		{"a templated environment key beside another", "    environment: ['A=1', '${K}=2']\n", false},
+		{"a templated environment value", "    environment: ['A=${V}', 'B=2']\n", true},
+		{"a templated mount alone", "    volumes: ['${X}:/data']\n", true},
+		{"a templated secret target beside another", "    secrets: [{source: s, target: '${T}'}, {source: t, target: u}]\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := "services:\n  a:\n    image: x\n" + tc.body + "secrets: {s: {file: ./s}, t: {file: ./t}}\n"
+			if tc.body == "" {
+				doc = "services:\n  a:\n    image: x\n    volumes: [/safe:/data]\n---\nservices:\n  a:\n    volumes: ['${X}:/data']\n"
+			}
+			r := reviewOf(t, manifest(doc))
+			if r.LoadErr != nil {
+				t.Fatal(r.LoadErr)
+			}
+			if got := r.Blocks[0].Pinnable(); got != tc.pinnable {
+				t.Fatalf("pinnable = %v, want %v (%v)", got, tc.pinnable, r.Blocks[0].Err)
+			}
+		})
+	}
+}
+
+// Every reviewed key holding a template is reported at the worst its rule could find.
+func TestLoad_TemplatedReviewedKeys(t *testing.T) {
+	for _, tc := range []struct {
+		body, key string
+		sev       Severity
+	}{
+		{"    security_opt: ['${S}']\n", "security_opt", SeverityBlocking},
+		{"    network_mode: ${NM}\n", "network_mode", SeverityBlocking},
+		{"    pid: ${P}\n", "pid", SeverityBlocking},
+		{"    cgroup: ${C}\n", "cgroup", SeverityBlocking},
+		{"    ipc: ${I}\n", "ipc", SeverityJustify},
+		{"    userns_mode: ${U}\n", "userns_mode", SeverityJustify},
+		{"    devices: ['${D}']\n", "devices", SeverityJustify},
+	} {
+		t.Run(tc.key, func(t *testing.T) {
+			r := reviewOf(t, manifest("services:\n  a:\n    image: x\n"+tc.body))
+			if r.LoadErr != nil {
+				t.Fatal(r.LoadErr)
+			}
+			var found bool
+			for _, f := range find(r, "a", tc.key) {
+				found = found || (f.Severity == tc.sev && strings.Contains(f.Detail, "holds a template"))
+			}
+			if !found {
+				t.Fatalf("no %s finding that the value holds a template:\n%s", tc.sev, dumpFindings(r))
+			}
+		})
 	}
 }
