@@ -937,6 +937,9 @@ func (r *ComposeReview) reviewService(name string, body *yaml.Node, mounts *moun
 
 	for i := 0; i+1 < len(body.Content); i += 2 {
 		key, val := body.Content[i].Value, body.Content[i+1]
+		if key == "ports" {
+			r.reviewTemplatedPorts(name, val)
+		}
 		if key == "" || key == "image" || key == "build" || benignServiceKeys[key] {
 			continue
 		}
@@ -1228,6 +1231,18 @@ func (r *ComposeReview) reviewVolumes(name string, val *yaml.Node, mounts *mount
 		return
 	}
 	for _, entry := range val.Content {
+		// A short-syntax entry is still a string only when it holds a template: the loader
+		// parses every other one into long syntax, and holds these back because docker
+		// compose parses them after substitution (composeload.go, templatedShortSyntax).
+		// Split here, it would be split the way the loader would have misread it.
+		if entry.Kind == yaml.ScalarNode && strings.Contains(entry.Value, "$") {
+			r.add(SeverityBlocking, name, "volumes", fmt.Sprintf(
+				"%q is a short-syntax mount holding a template. docker compose splits it into source, target and "+
+					"options only after substituting the deployment's environment, so which path is mounted, where, "+
+					"and how (read-only, propagation) is the environment's choice, and the manifest does not say",
+				entry.Value))
+			continue
+		}
 		src, target, ro, ok := parseMount(entry)
 		if !ok {
 			r.add(SeverityJustify, name, "volumes",
@@ -1309,6 +1324,22 @@ func (r *ComposeReview) reviewVolumes(name string, val *yaml.Node, mounts *mount
 				r.add(sev, name, "volumes", fmt.Sprintf("%s%s -> %s (%s): %s",
 					src, normalizedAs(src, clean), target, mode(ro), why))
 			}
+		}
+	}
+}
+
+// reviewTemplatedPorts reports the short-syntax ports that hold a template — the only
+// ones the loader leaves as strings, for the reason reviewVolumes gives for mounts.
+func (r *ComposeReview) reviewTemplatedPorts(name string, val *yaml.Node) {
+	if val == nil || val.Kind != yaml.SequenceNode {
+		return
+	}
+	for _, entry := range val.Content {
+		if entry.Kind == yaml.ScalarNode && strings.Contains(entry.Value, "$") {
+			r.add(SeverityJustify, name, "ports", fmt.Sprintf(
+				"%q is a short-syntax port holding a template: docker compose parses it only after substituting the "+
+					"deployment's environment, so which host interface and port it publishes is the environment's choice",
+				entry.Value))
 		}
 	}
 }

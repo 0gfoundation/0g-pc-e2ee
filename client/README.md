@@ -198,8 +198,12 @@ refused as a whole file, and a recorded deployment cannot be compared against it
 Three stages are deliberately not run: `${VAR}` substitution, since the values are in the
 CVM's encrypted environment (every `$` is reported as provider-controlled instead), and
 `include` and `extends`, which compose-go resolves by reading files on whatever machine
-runs it; both are reported as blocking. The canonical form is therefore key-sorted and in
-long syntax, and services are listed by name. The loader lives in its own package, which
+runs it; both are reported as blocking. A short-syntax mount, port or ulimit that holds a
+template is not parsed either, since docker compose parses it only after substitution: it
+is kept as written (so `/data:/d:${MODE}` cannot reduce to `/data:/d`), and a templated
+mount is blocking. The canonical form is therefore key-sorted and in long syntax except
+for those entries, and services are listed by name. A manifest may hold at most 16 YAML
+documents; docker compose validates after each one, and so does the review. The loader lives in its own package, which
 only pcverify imports: the gateway's and sidecar's linked dependencies do not change.
 
 Identity rather than the `image` key, because a real manifest defeats the simpler
