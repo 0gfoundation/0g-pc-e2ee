@@ -17,12 +17,6 @@ const (
 	testProvider = "0x4870CbC4D07d6Ac2EE5aA865588e5985FE77a4E9"
 )
 
-// testReleases lists digestA and digestB as releases of the broker repository, so the
-// repository-rule tests below are about the rule rather than about the list.
-var testReleases = BrokerReleases{Repository: brokerRepo, Releases: []BrokerRelease{
-	{Version: "vA", Digest: digestA}, {Version: "vB", Digest: digestB},
-}}
-
 // deployment is one recorded deployment for the baseline JSON.
 func deployment(name, contract string, providers []string, services ...map[string]any) map[string]any {
 	return map[string]any{"name": name, "contract": contract, "providers": providers, "services": services}
@@ -263,7 +257,7 @@ func TestBuiltinComposeBaseline_EachEntryRecordsTheFormItsRuleCompares(t *testin
 }
 
 // The shipped baseline against the manifests it was recorded from, with the SHIPPED
-// release list — the only tests here that exercise the files rather than the mechanism.
+// release verdicts — the only tests here that exercise the files rather than the mechanism.
 // Everything else builds a tiny manifest and a baseline to match it, so all of it would
 // still pass if a block in brokercompose.json were mistyped or a release were missing.
 //
@@ -277,12 +271,9 @@ func TestBuiltinComposeBaseline_AgainstTheManifestsItWasRecordedFrom(t *testing.
 	if err != nil {
 		t.Fatal(err)
 	}
-	rels, err := BuiltinBrokerReleases()
-	if err != nil {
-		t.Fatal(err)
-	}
+	rels := fleetReleases
 
-	// testnet runs v0.5.4, a listed release: every service matches.
+	// testnet runs v0.5.4, an accepted release: every service matches.
 	t.Run("testnet matches in full", func(t *testing.T) {
 		got := CheckCompose(b, rels, testnetContract, testnetProvider, reviewTestnet(t).Blocks, reviewTestnet(t).TopLevel)
 		if !got.Compared() || !got.OK() {
@@ -299,7 +290,7 @@ func TestBuiltinComposeBaseline_AgainstTheManifestsItWasRecordedFrom(t *testing.
 	// cn-20 runs v0.5.1: a real release, deliberately not a listed one. Its nine other
 	// services match; exactly the three broker-image services fail, and on their IMAGE —
 	// their blocks still match. That is the release rule doing its job, and pinning it here
-	// means a release list that started accepting v0.5.1 again would fail this test.
+	// means a verifier that started accepting v0.5.1 again would fail this test.
 	t.Run("cn-20 fails only on its unlisted broker release", func(t *testing.T) {
 		got := CheckCompose(b, rels, mainnetContract, cn20Provider, reviewCN20(t).Blocks, reviewCN20(t).TopLevel)
 		if !got.Compared() {
@@ -309,7 +300,7 @@ func TestBuiltinComposeBaseline_AgainstTheManifestsItWasRecordedFrom(t *testing.
 			t.Fatalf("matched %d, %d mismatches; want 9 and 3:\n%s", got.Matched, len(got.Mismatches), dumpMismatches(got))
 		}
 		for _, svc := range []string{"0g-serving-provider-broker", "0g-serving-provider-event", "0g-controller"} {
-			m := requireMismatch(t, got, svc, "not a listed release")
+			m := requireMismatch(t, got, svc, "not an accepted release")
 			if !strings.Contains(m.Reason, "sha256:ec5df8347f91") {
 				t.Errorf("%s: the reason does not name the running digest: %s", svc, m.Reason)
 			}
@@ -565,39 +556,78 @@ func TestCheckCompose_RepositoryRule(t *testing.T) {
 		requireMismatch(t, got, "0g-controller", "pinned by digest")
 	})
 
-	// The bound the release list adds, and the reason it exists: on 2026-10-15 two of the
-	// four broker digests on the fleet were pointed at by no release tag, and the rule as
-	// first written ("any digest-pinned image in the repository") accepted them.
-	t.Run("a digest-pinned image that is not a listed release does not match", func(t *testing.T) {
+	// The bound the release verifier adds, and the reason it exists: two of the broker
+	// digests on the fleet are manual branch builds, and the rule as first written ("any
+	// digest-pinned image in the repository") accepted them.
+	t.Run("a digest-pinned image that is not an accepted release does not match", func(t *testing.T) {
 		unreleased := "sha256:" + strings.Repeat("d", 64)
 		got := check(baseline, reviewOf(t, manifest(svc(unreleased))).Blocks)
 		if got.OK() {
 			t.Fatal("an unreleased build matched")
 		}
-		m := requireMismatch(t, got, "0g-controller", "not a listed release")
-		if !strings.Contains(m.Reason, "vA, vB") {
-			t.Fatalf("the reason does not say what IS listed: %s", m.Reason)
+		m := requireMismatch(t, got, "0g-controller", "not an accepted release")
+		if !strings.Contains(m.Reason, "no provenance from the release workflow") {
+			t.Fatalf("the verifier's reason did not reach the report: %s", m.Reason)
 		}
 	})
 
-	// An empty release list accepts nothing. It must never read as "any digest".
-	t.Run("an empty release list accepts nothing", func(t *testing.T) {
-		got := CheckCompose(baseline, BrokerReleases{Repository: brokerRepo}, testContract, testProvider,
+	// A verifier that accepts nothing accepts nothing. It must never read as "any digest".
+	t.Run("a verifier that accepts nothing", func(t *testing.T) {
+		got := CheckCompose(baseline, fakeReleases{repo: brokerRepo}, testContract, testProvider,
 			reviewOf(t, manifest(svc(digestA))).Blocks, nil)
 		if got.OK() {
-			t.Fatal("a release list with no entries accepted a build")
+			t.Fatal("a verifier that accepts nothing accepted a build")
 		}
-		requireMismatch(t, got, "0g-controller", "lists none")
+		requireMismatch(t, got, "0g-controller", "not an accepted release")
 	})
 
-	// A release list for some other repository cannot vouch for this one.
-	t.Run("a release list for another repository accepts nothing", func(t *testing.T) {
-		got := CheckCompose(baseline, BrokerReleases{Repository: "ghcr.io/x/y", Releases: testReleases.Releases},
+	// A verifier for some other repository cannot vouch for this one.
+	t.Run("a verifier for another repository accepts nothing", func(t *testing.T) {
+		got := CheckCompose(baseline, fakeReleases{repo: "ghcr.io/x/y", accepted: testReleases.accepted},
 			testContract, testProvider, reviewOf(t, manifest(svc(digestA))).Blocks, nil)
 		if got.OK() {
-			t.Fatal("a release list for another repository accepted a build")
+			t.Fatal("a verifier for another repository accepted a build")
 		}
-		requireMismatch(t, got, "0g-controller", "release list covers ghcr.io/x/y")
+		requireMismatch(t, got, "0g-controller", "release verifier judges ghcr.io/x/y")
+	})
+
+	// A build nobody could check — the registry did not answer — is neither a match nor a
+	// mismatch: the comparison is incomplete, which pcverify reports as exit 3. The block
+	// itself still has to match; only the release question is left open.
+	t.Run("a build that could not be checked leaves the comparison incomplete", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			rels ReleaseVerifier
+		}{
+			{"the verifier could not reach the registry", fakeReleases{repo: brokerRepo, unavailable: true}},
+			{"no verifier", nil},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				got := CheckCompose(baseline, tc.rels, testContract, testProvider,
+					reviewOf(t, manifest(svc(digestA))).Blocks, nil)
+				if !got.OK() || len(got.Mismatches) != 0 {
+					t.Fatalf("an unchecked build was reported as a mismatch: %+v", got.Mismatches)
+				}
+				if got.Complete() || len(got.Unverified) != 1 || got.Unverified[0].Service != "0g-controller" {
+					t.Fatalf("an unchecked build was not reported as unverified: %+v", got)
+				}
+				if got.Matched != 0 {
+					t.Fatalf("an unchecked build counted as matched (%d)", got.Matched)
+				}
+			})
+		}
+		// The block is still compared first: a differing block is a mismatch however the
+		// release question would have come out.
+		other := strings.Replace(svc(digestA), "/var/run/dstack.sock:/var/run/dstack.sock",
+			"/var/run/dstack.sock:/var/run/dstack.sock\n      - /etc:/host-etc", 1)
+		if other == svc(digestA) {
+			t.Fatal("the edit did not apply")
+		}
+		got := CheckCompose(baseline, fakeReleases{repo: brokerRepo, unavailable: true}, testContract, testProvider,
+			reviewOf(t, manifest(other)).Blocks, nil)
+		if got.OK() {
+			t.Fatal("a differing block passed because its release could not be checked")
+		}
 	})
 
 	// A change OUTSIDE the image must still fail — the hold-out lets the image move, not
@@ -849,7 +879,7 @@ func TestCheckCompose_TopLevelSections(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rels := builtinReleases(t)
+	rels := fleetReleases
 	var ac map[string]any
 	raw, err := os.ReadFile(filepath.Join("testdata", "testnet-app-compose.json"))
 	if err != nil {

@@ -26,12 +26,12 @@
     "  the live provider with `pcverify -strict -app-baseline`: 11 of 11, exit 0, and a",
     "  one-character edit to the recorded model revision made that run fail on that line.",
     "  The other mainnet providers are NOT recorded. They run broker builds that",
-    "  brokerreleases.json does not accept (v0.5.2, and two digests no release tag points",
-    "  at), and the broker team's v0.5.4 rollout will change their manifests anyway.",
+    "  the release provenance policy does not accept (v0.5.2, and two manual branch builds",
+    "  from docker-publish.yml), and the broker team's v0.5.4 rollout will change their manifests anyway.",
     "  Recording them now would freeze controllers that predate the fixes v0.5.4 carries.",
     "",
     "RECORDING IS NOT APPROVAL, and the mainnet entry is the case in point. Its three",
-    "broker-image services run v0.5.1, which is a real release but not a listed one, so",
+    "broker-image services run v0.5.1, a real release below the policy's v0.5.4 floor, so",
     "they MISMATCH under the release rule until that provider moves to v0.5.4 — and the",
     "review still reports ten blocking findings on it. It stays recorded because the",
     "other nine services are worth holding still: from here a change to any of them is a",
@@ -60,7 +60,7 @@
     "THERE IS ONE IMAGE RULE. `image` omitted (the default) means the recorded block",
     "contains the image line and pins the reference exactly as written. `\"image\":",
     "{\"repository\": \"ghcr.io/...\"}` means any RELEASED build of that repository — a",
-    "digest listed in brokerreleases.json — and records the `no-image:` block instead. It",
+    "digest whose signed release provenance pcverify verifies at run time (client/cmd/pcverify/provenance) — and records the `no-image:` block instead. It",
     "exists for 0G's own broker image, which moves on every broker release; it is used",
     "nowhere else. There is deliberately no `digest` or `reference` rule: the block already",
     "says the reference, and a second statement of it could only disagree.",
@@ -291,8 +291,8 @@
           "name": "0g-serving-provider-broker",
           "note": [
             "0G's own broker image, under the release rule. cn-20 runs v0.5.1, which",
-            "brokerreleases.json does not list, so this service mismatches on its image until the",
-            "provider moves to a listed release; the block itself matches. The digest also appears",
+            "the release provenance policy refuses (below its v0.5.4 floor), so this service mismatches on its image until the",
+            "provider moves to an accepted release; the block itself matches. The digest also appears",
             "in IMAGE_DIGEST, which is why the hold-out erases the image IDENTITY wherever it",
             "appears rather than just deleting the `image` key.",
             "Two relative bind mounts (./logs/broker, ./logs/event) are review justifies: what a",
@@ -403,7 +403,7 @@
             "broker/event images, may create no new container without ZG_CONTROLLER_ENGINES=on,",
             "and records each swap in RTMR3 first — but that is controller CODE from v0.5.4 on.",
             "On v0.5.1 those constraints do not hold, which is why the review keeps this finding",
-            "blocking here rather than relaxing it as it does for a listed release.",
+            "blocking here rather than relaxing it as it does for a verified release.",
             "Also mounts ./logs/controller, a relative bind the review justifies."
           ],
           "image": {
@@ -967,12 +967,12 @@
             "Same image and repository rule. Holds BOTH host sockets: /var/run/dstack.sock (the",
             "only service that does, after #763 — it serves the zg-tee and read-only zg-tee-ro",
             "proxies) and /var/run/docker.sock. The review reports the second at JUSTIFY, not",
-            "blocking: this is a listed release, run as the 0g-controller program, with only the",
+            "blocking: this is a verified release, run as the 0g-controller program, with only the",
             "keys, environment variables and healthcheck the exception covers, nothing interpolated in its service,",
             "no host path beyond the two sockets (its logs are on a declared named volume), and",
             "ZG_CONTROLLER_ENGINES absent — the conditions under which broker",
             "#759 limits what it does with the socket (evidence/composecontroller.go). Those limits",
-            "are the controller's code at this digest, which is why the digest has to be listed."
+            "are the controller's code at this digest, which is why the release has to be verified."
           ],
           "image": {
             "repository": "ghcr.io/0gfoundation/0g-serving-broker"

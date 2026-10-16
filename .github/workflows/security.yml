@@ -1,6 +1,6 @@
 name: Security
 
-# govulncheck over both modules. Unlike a version-range scanner, it does call-graph
+# govulncheck over every module. Unlike a version-range scanner, it does call-graph
 # analysis and reports a vulnerability only when this code can actually REACH the
 # affected symbol — which is what makes it safe to run as a gate rather than as a
 # feed. That matters here: the dependency tree is mostly cryptography and attestation
@@ -59,15 +59,16 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          # Both modules pin the same Go; read it from protocol/go.mod. This version
+          # Every module builds with the toolchain protocol/go.mod pins. This version
           # is also what the standard-library half of the scan is judged against.
           go-version-file: protocol/go.mod
-          # BOTH sums, unlike ci.yml: this job resolves the full dependency graph of
+          # EVERY sum, unlike ci.yml: this job resolves the full dependency graph of
           # each module in turn, so caching only one leaves the other's downloads
           # uncached on every run.
           cache-dependency-path: |
             protocol/go.sum
             client/go.sum
+            client/cmd/pcverify/go.sum
 
       - name: Install govulncheck
         # Pinned, not @latest: a gate whose own implementation changes underneath it
@@ -85,7 +86,7 @@ jobs:
           rc=0
           report="${RUNNER_TEMP}/govulncheck.txt"
           : > "$report"
-          for m in protocol client; do
+          for m in protocol client client/cmd/pcverify; do
             echo "::group::$m"
             ( cd "$m" && govulncheck ./... ) 2>&1 | tee -a "$report"
             # PIPESTATUS, not $?: the pipeline's status is tee's, and tee succeeds

@@ -209,9 +209,9 @@ func (s ReviewedService) Pinned() bool { return isDigestShaped(s.Digest) }
 
 // ComposeReview is everything one authenticated app-compose was found to contain.
 type ComposeReview struct {
-	// releases is the broker release list the controller exception reads (see
-	// ReviewCompose). Not reported.
-	releases BrokerReleases
+	// releases judges broker builds for the controller exception (see ReviewCompose).
+	// Not reported.
+	releases ReleaseVerifier
 
 	// Name and Runner are the app-compose's own labels. Runner decides whether the
 	// compose-text half of this review ran at all.
@@ -286,10 +286,11 @@ func (r ComposeReview) Summary() string {
 // the quote binds, or they are not JSON. Everything else, including a manifest with
 // no compose text at all, comes back as a review with findings.
 //
-// releases is the broker release list the run uses, passed in rather than read here so
-// that the controller exception and CheckCompose — two halves of one report — judge a
-// digest against the same list.
-func ReviewCompose(raw []byte, composeHash [attest.ComposeHashLen]byte, releases BrokerReleases) (ComposeReview, error) {
+// releases judges broker builds, passed in rather than built here so that the controller
+// exception and CheckCompose — two halves of one report — reach the same verdict about a
+// digest, and so that this package carries no signature-verification dependency
+// (brokerrelease.go). A nil releases judges nothing: the exception then never applies.
+func ReviewCompose(raw []byte, composeHash [attest.ComposeHashLen]byte, releases ReleaseVerifier) (ComposeReview, error) {
 	// The gate, and ONLY the gate. Deliberately not VerifyAppCompose: its AppCompose
 	// decode is stricter than this review's field reads, so an authenticated manifest
 	// with, say, an `allowed_envs` object would come back as an error — and a caller

@@ -111,7 +111,7 @@ func baselineFor(t *testing.T, composeText string) evidence.ComposeBaseline {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	review, err := evidence.ReviewCompose(raw, sha256.Sum256(raw), evidence.BrokerReleases{})
+	review, err := evidence.ReviewCompose(raw, sha256.Sum256(raw), nil)
 	if err != nil {
 		t.Fatalf("ReviewCompose: %v", err)
 	}
@@ -369,6 +369,57 @@ func TestReport_ProviderVerdicts(t *testing.T) {
 			prov, contract, "", "", providerOpts{baseline: baselineFor(t, cleanCompose)})
 		if !strings.Contains(out.String(), `match the recorded deployment "test"`) {
 			t.Errorf("the verdict does not name the deployment:\n%s", out.String())
+		}
+	})
+
+	// A broker service under the repository rule is judged by the release verifier, and the
+	// three verdicts map onto the three exit codes: accepted passes, rejected fails, and a
+	// build nobody could check (the registry did not answer) leaves the run incomplete —
+	// exit 3, never a pass, and 1 under -strict.
+	t.Run("the release verdict decides a broker service", func(t *testing.T) {
+		const repo = "ghcr.io/0gfoundation/0g-serving-broker"
+		digest := "sha256:" + strings.Repeat("e", 64)
+		compose := "services:\n  0g-serving-provider-broker:\n    image: " + repo + "@" + digest + "\n    restart: always\n"
+		trusted := stubQuote{v: attest.Verified{SignerAddr: signer, MeasurementTrusted: true}}.withManifest(t, compose, nil)
+		doc, _ := json.Marshal(map[string]any{"deployments": []any{map[string]any{
+			"name": "test", "contract": contract, "providers": []string{prov},
+			"services": []any{map[string]any{"name": "0g-serving-provider-broker", "image": map[string]any{"repository": repo},
+				"block": []string{"restart: always"}}},
+		}}})
+		baseline, err := evidence.ParseComposeBaseline(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, tc := range []struct {
+			name   string
+			status evidence.ReleaseStatus
+			code   int
+			strict int
+			says   string
+		}{
+			{"accepted", evidence.ReleaseAccepted, 0, 0, "✓ baseline"},
+			{"rejected", evidence.ReleaseRejected, 1, 1, "not an accepted release of " + repo + ": stub reason"},
+			{"could not be checked", evidence.ReleaseUnavailable, 3, 1, "not checked — whether " + repo},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				rels := stubVerifier{repo: repo, verdict: evidence.ReleaseVerdict{Status: tc.status, Reason: "stub reason",
+					Release: evidence.BrokerRelease{Version: "v9.9.9", Digest: digest}}}
+				for _, strict := range []bool{false, true} {
+					var out bytes.Buffer
+					code := report(context.Background(), &out, stubService{info: acked}, trusted, prov, contract, "", "",
+						providerOpts{strict: strict, baseline: baseline, releases: rels})
+					want := tc.code
+					if strict {
+						want = tc.strict
+					}
+					if code != want {
+						t.Fatalf("strict=%v: code = %d, want %d\n%s", strict, code, want, out.String())
+					}
+					if !strings.Contains(out.String(), tc.says) {
+						t.Fatalf("output missing %q:\n%s", tc.says, out.String())
+					}
+				}
+			})
 		}
 	})
 
@@ -714,3 +765,13 @@ func TestQuoteURLFromEndpoint(t *testing.T) {
 		}
 	}
 }
+
+// stubVerifier is an evidence.ReleaseVerifier with one answer for every build.
+type stubVerifier struct {
+	repo    string
+	verdict evidence.ReleaseVerdict
+}
+
+func (s stubVerifier) Repository() string { return s.repo }
+
+func (s stubVerifier) Verify(_, _ string) evidence.ReleaseVerdict { return s.verdict }

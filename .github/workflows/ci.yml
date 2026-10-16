@@ -16,7 +16,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          # Both modules pin the same Go; read it from protocol/go.mod.
+          # Every module builds with the toolchain protocol/go.mod pins; read it from there.
           go-version-file: protocol/go.mod
           cache-dependency-path: protocol/go.sum
 
@@ -29,10 +29,12 @@ jobs:
             exit 1
           fi
 
+      # client/cmd/pcverify is its own module (see its go.mod): what only the verifier
+      # needs stays out of the gateway's dependency versions.
       - name: vet, build, test (per module)
         run: |
           set -e
-          for m in protocol client; do
+          for m in protocol client client/cmd/pcverify; do
             echo "::group::$m"
             ( cd "$m" && go vet ./... && go build ./... && go test -race ./... )
             echo "::endgroup::"
