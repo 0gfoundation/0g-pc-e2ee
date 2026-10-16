@@ -703,7 +703,7 @@ func reportManifest(out io.Writer, pq providerQuote, opts providerOpts, contract
 		}
 	}
 
-	check := compose.CheckCompose(opts.baseline, opts.releases, contract, provider, review.Blocks, review.TopLevel)
+	check := compose.CheckReview(opts.baseline, opts.releases, contract, provider, review)
 	res := manifestResult{failed: reportBaseline(out, check, contract), skipped: baselineSkip(check),
 		confined: check.Compared() && len(check.Mismatches) == 0}
 	for _, s := range review.Services {

@@ -345,7 +345,7 @@ func parseServices(deployment string, entries []baselineServiceFile) ([]Baseline
 			return nil, fmt.Errorf("compose baseline %s: block is required; an entry with no "+
 				"recorded text would accept any body for this service", label)
 		}
-		block, err := CanonicalizeServiceBlock([]byte(strings.Join(e.Block, "\n") + "\n"))
+		block, err := CanonicalizeServiceBlock(e.Name, []byte(strings.Join(e.Block, "\n")+"\n"))
 		if err != nil {
 			return nil, fmt.Errorf("compose baseline %s: block does not reduce: %w", label, err)
 		}
@@ -391,7 +391,7 @@ func parseTopLevel(deployment string, entries []topLevelFile) ([]BaselineTopLeve
 				"would accept any declaration", label)
 		}
 		seen[key] = true
-		block, err := canonicalizeText([]byte(strings.Join(e.Block, "\n")+"\n"), "the top-level "+key+" section")
+		block, err := canonicalizeTopLevel(key, []byte(strings.Join(e.Block, "\n")+"\n"))
 		if err != nil {
 			return nil, fmt.Errorf("compose baseline %s: block does not reduce: %w", label, err)
 		}
@@ -498,6 +498,26 @@ func (c ComposeCheck) OK() bool { return !c.Compared() || len(c.Mismatches) == 0
 // top is ComposeReview.TopLevel, compared the same way in every direction: a recorded
 // section must be present and identical, and a section the deployment does not record is
 // a mismatch — it is where a service's volumes and networks get their meaning.
+// CheckReview compares a review's manifest against the deployment the baseline records
+// for (contract, provider). A manifest docker compose refuses cannot be compared at all,
+// and for a recorded deployment that is a mismatch in itself: the manifest passed the
+// compose-hash gate, so it is what this CVM booted, and docker compose loads nothing from
+// it — it is not the deployment that was recorded.
+func CheckReview(b ComposeBaseline, rels evidence.ReleaseVerifier, contract, provider string, r ComposeReview) ComposeCheck {
+	if r.LoadErr == nil {
+		return CheckCompose(b, rels, contract, provider, r.Blocks, r.TopLevel)
+	}
+	out := ComposeCheck{Configured: len(b.Deployments) > 0}
+	dep, ok := b.For(contract, provider)
+	if !out.Configured || !ok {
+		return out
+	}
+	out.Recorded, out.Deployment, out.Expected = true, dep.Name, len(dep.Services)
+	out.TopExpected = len(dep.TopLevel)
+	out.add("", "cannot be compared: "+r.LoadErr.Error(), "")
+	return out
+}
+
 func CheckCompose(b ComposeBaseline, rels evidence.ReleaseVerifier, contract, provider string, blocks []ServiceBlock,
 	top []TopLevelBlock) ComposeCheck {
 	out := ComposeCheck{Configured: len(b.Deployments) > 0}

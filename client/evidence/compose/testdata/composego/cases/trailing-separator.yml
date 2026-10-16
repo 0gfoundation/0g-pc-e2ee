@@ -1,5 +1,0 @@
-# A trailing document separator: an empty document after the first.
-services:
-  app:
-    image: app
----

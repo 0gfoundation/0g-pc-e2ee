@@ -1,7 +1,0 @@
-# A merge key may list aliases to mappings, but may not name an alias to a list, even a
-# list of mappings.
-x-list: &list [{user: a}, {pid: host}]
-services:
-  app:
-    image: app
-    <<: *list

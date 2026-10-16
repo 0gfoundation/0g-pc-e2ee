@@ -123,6 +123,24 @@ func TestServiceBlock_DropsPresentationOnly(t *testing.T) {
 				"    restart: always\n",
 		},
 		{
+			// docker compose loads the file into a map, so key order means nothing to what
+			// runs, and the canonical form is key-sorted (composeload.go).
+			"keys reordered",
+			"    restart: always\n" +
+				"    environment:\n      GF_SECURITY_ADMIN_PASSWORD: 'secret'\n" +
+				"    ports:\n      - \"3000:3000\"\n" +
+				"    image: grafana/grafana-oss:11.4.0\n",
+		},
+		{
+			// The loader rewrites short syntax to long, so the two spellings of one port
+			// are one block.
+			"long syntax instead of short",
+			"    image: grafana/grafana-oss:11.4.0\n" +
+				"    ports:\n      - target: 3000\n        published: \"3000\"\n        protocol: tcp\n        mode: ingress\n" +
+				"    environment:\n      GF_SECURITY_ADMIN_PASSWORD: 'secret'\n" +
+				"    restart: always\n",
+		},
+		{
 			"trailing whitespace",
 			"    image: grafana/grafana-oss:11.4.0   \n" +
 				"    ports:\n      - \"3000:3000\"  \n" +
@@ -177,16 +195,6 @@ func TestServiceBlock_KeepsEverythingThatRuns(t *testing.T) {
 			"a key removed",
 			strings.Replace(base, "    restart: always\n", "", 1),
 		},
-		{
-			// Reordering is a real edit to the file. A baseline that accepted any order
-			// would accept a diff nobody reviewed — see the file header, which also notes
-			// this is the one knob that could reasonably go the other way.
-			"keys reordered",
-			"    restart: always\n" +
-				"    environment:\n      GF_SECURITY_ADMIN_PASSWORD: 'secret'\n" +
-				"    ports:\n      - \"3000:3000\"\n" +
-				"    image: grafana/grafana-oss:11.4.0\n",
-		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := oneBlock(t, tc.body); got.Canonical == want.Canonical {
@@ -197,17 +205,16 @@ func TestServiceBlock_KeepsEverythingThatRuns(t *testing.T) {
 }
 
 // The one collapse that would matter. Dropping quote style is what makes `'x'` and `"x"`
-// equal, and the obvious worry is that it also makes `true` and `"true"` equal — which
-// would let a string sneak into a boolean field, exactly where composereview.go's
-// wrong-shape rules live. yaml.v3 re-quotes a !!str that would otherwise read as a bool,
-// so it does not; asserted here because the whole quote-normalization decision rests on
-// it and it is a property of the library, not of our code.
+// equal, and the obvious worry is that it also makes `true` and `"true"` equal. yaml.v3
+// re-quotes a !!str that would otherwise read as a bool, so it does not; asserted here
+// because the whole quote-normalization decision rests on it and it is a property of the
+// library, not of our code. Each pair is at a path compose does not type; at a typed
+// path docker compose itself casts the string (the next test).
 func TestServiceBlock_DoesNotCollapseScalarTags(t *testing.T) {
 	for _, tc := range []struct{ name, a, b string }{
-		{"bool vs string", "    privileged: true\n", "    privileged: \"true\"\n"},
+		{"bool vs string", "    environment:\n      DEBUG: true\n", "    environment:\n      DEBUG: \"true\"\n"},
 		{"int vs string", "    shm_size: 64\n", "    shm_size: \"64\"\n"},
 		{"null vs string", "    command: ~\n", "    command: \"~\"\n"},
-		{"float vs string", "    cpus: 1.5\n", "    cpus: \"1.5\"\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a, b := oneBlock(t, tc.a), oneBlock(t, tc.b)
@@ -215,6 +222,29 @@ func TestServiceBlock_DoesNotCollapseScalarTags(t *testing.T) {
 				t.Fatalf("%s collapsed to the same canonical form:\n%s", tc.name, a.Canonical)
 			}
 		})
+	}
+}
+
+// At a TYPED path the two spellings are one value, because docker compose's interpolation
+// casts the string before anything reads it (composeload.go castOnly). Keeping them apart
+// would record a difference docker compose does not run.
+func TestServiceBlock_TypedFieldsAreCastAsDockerComposeCasts(t *testing.T) {
+	for _, tc := range []struct{ name, a, b, want string }{
+		{"privileged", "    privileged: true\n", "    privileged: \"true\"\n", "privileged: true"},
+		{"cpus", "    cpus: 1.5\n", "    cpus: \"1.5\"\n", "cpus: 1.5"},
+		{"a port target", "    ports:\n      - target: 80\n", "    ports:\n      - target: \"80\"\n", "target: 80"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a, b := oneBlock(t, tc.a), oneBlock(t, tc.b)
+			if a.Canonical != b.Canonical || !strings.Contains(a.Canonical, tc.want) {
+				t.Fatalf("not cast as docker compose casts:\n%s\nvs\n%s", a.Canonical, b.Canonical)
+			}
+		})
+	}
+	// A typed value still holding a template is the environment's to type: left as the
+	// string it is, not refused.
+	if b := oneBlock(t, "    privileged: ${PRIV}\n"); !strings.Contains(b.Canonical, "privileged: ${PRIV}") {
+		t.Fatalf("an interpolated typed value:\n%s", b.Canonical)
 	}
 }
 
@@ -246,7 +276,7 @@ func TestServiceBlock_ImageHoldOut(t *testing.T) {
 		t.Fatalf("CanonicalNoImage still carries the image key:\n%s", a.CanonicalNoImage)
 	}
 	// Everything else has to survive the hold-out, or the reduced form pins nothing.
-	for _, want := range []string{"volumes", "zg-tee:/var/lib/zg-tee", "restart", "always"} {
+	for _, want := range []string{"volumes", "source: zg-tee", "target: /var/lib/zg-tee", "restart", "always"} {
 		if !strings.Contains(a.CanonicalNoImage, want) {
 			t.Errorf("CanonicalNoImage lost %q:\n%s", want, a.CanonicalNoImage)
 		}
@@ -505,7 +535,7 @@ func TestServiceBlock_ReducedFormIsIdempotent(t *testing.T) {
 	} {
 		b := oneBlock(t, body)
 		for _, form := range []string{b.Canonical, b.CanonicalNoImage} {
-			again, err := CanonicalizeServiceBlock([]byte(form))
+			again, err := CanonicalizeServiceBlock("svc", []byte(form))
 			if err != nil {
 				t.Fatalf("CanonicalizeServiceBlock: %v", err)
 			}
@@ -609,17 +639,16 @@ func TestServiceBlock_RefusesAManifestCarryingThePlaceholder(t *testing.T) {
 	}
 }
 
-// The corrected form of a claim this file's header used to make. `"3000:3000"` does come
-// out unquoted, but a colon is a mapping indicator only when followed by whitespace, so it
-// reads back as the same scalar — and the emitter keeps quotes exactly where they are
-// load-bearing. That second half is the property replaceScalars depends on: it substitutes
+// The emitter keeps quotes exactly where they are load-bearing, and drops them
+// everywhere else. That second half is the property replaceScalars depends on: it substitutes
 // into a VALUE and lets the emitter re-decide how to write it.
 func TestServiceBlock_QuotingIsDroppedButMeaningIsNot(t *testing.T) {
 	b := oneBlock(t, "    image: mysql:8\n    ports: [\"3000:3000\", \"127.0.0.1:8080:80\"]\n"+
 		"    environment: [\"KEY=a: b\", \"OTHER=x#y\"]\n")
-	// A value that needs no quotes loses them...
-	if !strings.Contains(b.Canonical, "- 3000:3000") {
-		t.Fatalf("expected an unquoted port:\n%s", b.Canonical)
+	// The loader turns the ports into long syntax; a published port is a string there,
+	// and stays one.
+	if !strings.Contains(b.Canonical, `published: "3000"`) {
+		t.Fatalf("expected a quoted published port:\n%s", b.Canonical)
 	}
 	// ...and one that does keeps them.
 	if !strings.Contains(b.Canonical, `'KEY=a: b'`) {
@@ -627,7 +656,7 @@ func TestServiceBlock_QuotingIsDroppedButMeaningIsNot(t *testing.T) {
 	}
 	// Neither reading changed: reducing the canonical text again is a no-op, so the
 	// unquoted form parsed back to the same scalar rather than to a mapping.
-	again, err := CanonicalizeServiceBlock([]byte(b.Canonical))
+	again, err := CanonicalizeServiceBlock("svc", []byte(b.Canonical))
 	if err != nil {
 		t.Fatalf("CanonicalizeServiceBlock: %v", err)
 	}
@@ -657,7 +686,7 @@ func TestServiceBlock_ResolvesIndirection(t *testing.T) {
 			// report the opposite of what runs.
 			"merge key, explicit key wins",
 			"x-base: &base\n  privileged: true\n  restart: always\nservices:\n  svc:\n    <<: *base\n    privileged: false\n    image: mysql:8\n",
-			"privileged: false\nimage: mysql:8\nrestart: always\n",
+			"image: mysql:8\nprivileged: false\nrestart: always\n",
 		},
 		{
 			// The case the review used to get WRONG rather than merely refuse: cn-39's
@@ -676,7 +705,7 @@ func TestServiceBlock_ResolvesIndirection(t *testing.T) {
 			// docker compose itself resolves.
 			"merge sequence, earlier source wins",
 			"x-a: &a\n  restart: always\nx-b: &b\n  restart: never\n  init: true\nservices:\n  svc:\n    <<: [*a, *b]\n    image: mysql:8\n",
-			"image: mysql:8\nrestart: always\ninit: true\n",
+			"image: mysql:8\ninit: true\nrestart: always\n",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -780,50 +809,17 @@ func TestServiceBlock_OneServiceAliasingAnotherIsTheSameService(t *testing.T) {
 	}
 }
 
-// A self-referencing anchor is the one input that still cannot be resolved, and the
-// reason it gets a direct test rather than only a fixture is that its old failure was not
-// an error — it was an unrecoverable stack overflow, on a manifest a provider writes
-// freely. Asserted at the resolver so the guarantee does not depend on a caller running
-// something else first.
-func TestResolveAnchors_RefusesACycleInsteadOfLooping(t *testing.T) {
-	var root yaml.Node
-	if err := yaml.Unmarshal([]byte("a: &x\n  self: *x\n"), &root); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-	body := root.Content[0].Content[1]
-	alias := body.Content[1]
-	// The premise: yaml.v3 really does close the loop, and the alias points at the
-	// ANCHORED node rather than at itself — which is why detection has to track the
-	// expansion path. If this stops holding, the guard below tests nothing and should be
-	// revisited rather than deleted.
-	if alias.Kind != yaml.AliasNode || alias.Alias != body {
-		t.Fatalf("yaml.v3 did not build a cycle: alias kind=%d Alias=%p body=%p", alias.Kind, alias.Alias, body)
-	}
-
-	got, err := resolveAnchors(body) // must terminate
-	if err == nil {
-		t.Fatalf("a self-referencing anchor resolved to %+v", got)
-	}
-	if !strings.Contains(err.Error(), "itself") {
-		t.Fatalf("err = %v, want it to say the anchor contains a reference to itself", err)
-	}
-}
-
-// Resolution is also the deep copy blockOf relies on, including when there is nothing to
-// resolve — the case that would otherwise be the one that corrupts the review's view of
-// the same nodes, since every no-anchor manifest takes it.
-func TestResolveAnchors_AlwaysCopies(t *testing.T) {
+// blockOf renders a copy, never the review's own tree: rendering normalizes in place, and
+// the review walks the same nodes for its rules.
+func TestCloneNode_IsDeep(t *testing.T) {
 	var root yaml.Node
 	if err := yaml.Unmarshal([]byte("a:\n  image: mysql:8.0\n"), &root); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	body := root.Content[0].Content[1]
-	got, err := resolveAnchors(body)
-	if err != nil {
-		t.Fatal(err)
-	}
+	got := cloneNode(body)
 	if got == body {
-		t.Fatal("resolveAnchors returned the original node")
+		t.Fatal("cloneNode returned the original node")
 	}
 	got.Content[1].Value = "mutated"
 	if body.Content[1].Value == "mutated" {
@@ -832,12 +828,15 @@ func TestResolveAnchors_AlwaysCopies(t *testing.T) {
 }
 
 func TestServiceBlock_BodyThatIsNotAMapping(t *testing.T) {
-	b := requireBlock(t, "services:\n  svc: notamapping\n", "svc")
-	if b.Err == nil {
-		t.Fatalf("a scalar body was reduced: %q", b.Canonical)
+	// docker compose's schema refuses it, so the review describes no block at all.
+	f := requireFinding(t, reviewOf(t, manifest("services:\n  svc: notamapping\n")), SeverityBlocking, "",
+		"docker_compose_file")
+	if !strings.Contains(f.Detail, "docker compose refuses") {
+		t.Fatalf("detail = %s", f.Detail)
 	}
-	if !strings.Contains(b.Err.Error(), "not a mapping") {
-		t.Fatalf("err = %v", b.Err)
+	if _, err := CanonicalizeServiceBlock("svc", []byte("notamapping\n")); err == nil ||
+		!strings.Contains(err.Error(), "not a mapping") {
+		t.Fatalf("a recorded scalar body: %v", err)
 	}
 }
 
@@ -860,9 +859,9 @@ func TestServiceBlocks_FileOrderAndDigests(t *testing.T) {
 	for _, b := range got {
 		names = append(names, b.Name)
 	}
-	// File order, not sorted and not map order — the operator chose it, and a list that
-	// reshuffles between two reads of one unchanged deployment reads as a change.
-	if want := "broker-ingress,0gm-sglang,mysql"; strings.Join(names, ",") != want {
+	// Sorted by name: docker compose loads services into a map, so the file's order is not
+	// part of what runs, and a sorted list is stable between two reads of one deployment.
+	if want := "0gm-sglang,broker-ingress,mysql"; strings.Join(names, ",") != want {
 		t.Fatalf("names = %s, want %s", strings.Join(names, ","), want)
 	}
 	for _, b := range got {
@@ -984,20 +983,13 @@ func TestServiceBlocks_DoNotDisturbTheReview(t *testing.T) {
 		t.Fatalf("the block kept the digest:\n%s", rc.Blocks[0].CanonicalNoImage)
 	}
 
-	// The alignment claim is by construction, so it has to hold for the shapes that
-	// bypass the normal path too: a body that is not a mapping still appends to both.
+	// A body that is not a mapping is no longer one service the review cannot read: docker
+	// compose refuses the file, so nothing in it is described.
 	r2 := reviewOf(t, manifest("services:\n  a:\n    image: mysql:8.0\n  b: notamapping\n"))
-	if len(r2.Blocks) != len(r2.Services) || len(r2.Services) != 2 {
-		t.Fatalf("alignment broken on an unreadable body: %d blocks, %d services", len(r2.Blocks), len(r2.Services))
+	if len(r2.Blocks) != 0 || len(r2.Services) != 0 {
+		t.Fatalf("a refused file was described: %d blocks, %d services", len(r2.Blocks), len(r2.Services))
 	}
-	for i, s := range r2.Services {
-		if r2.Blocks[i].Name != s.Name {
-			t.Fatalf("index %d: block %q vs service %q", i, r2.Blocks[i].Name, s.Name)
-		}
-	}
-	if r2.Blocks[1].Pinnable() {
-		t.Fatal("an unreadable body produced a pinnable block")
-	}
+	requireFinding(t, r2, SeverityBlocking, "", "docker_compose_file")
 }
 
 // A compose file with the same service name twice used to be described service by
@@ -1030,7 +1022,7 @@ func TestCanonicalizeServiceBlock_AgreesWithTheObservedSide(t *testing.T) {
 
 	// A baseline author would store the canonical text. Reducing it again must be a
 	// no-op, or the comparison is not stable under its own output.
-	again, err := CanonicalizeServiceBlock([]byte(observed.Canonical))
+	again, err := CanonicalizeServiceBlock("svc", []byte(observed.Canonical))
 	if err != nil {
 		t.Fatalf("CanonicalizeServiceBlock: %v", err)
 	}
@@ -1041,7 +1033,7 @@ func TestCanonicalizeServiceBlock_AgreesWithTheObservedSide(t *testing.T) {
 	// And a baseline stored in some OTHER formatting — hand-edited, re-indented, with a
 	// note added — must still reduce to the same thing.
 	stored := "# reviewed 2026-08: db volume only\nimage: \"mysql:8.0\"\nvolumes: [db:/var/lib/mysql]\nrestart: always\n"
-	got, err := CanonicalizeServiceBlock([]byte(stored))
+	got, err := CanonicalizeServiceBlock("svc", []byte(stored))
 	if err != nil {
 		t.Fatalf("CanonicalizeServiceBlock: %v", err)
 	}
@@ -1058,7 +1050,7 @@ func TestCanonicalizeServiceBlock_RefusesUnusable(t *testing.T) {
 		{"alias", "volumes: *vols\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, err := CanonicalizeServiceBlock([]byte(tc.text)); err == nil {
+			if _, err := CanonicalizeServiceBlock("svc", []byte(tc.text)); err == nil {
 				t.Fatal("unusable baseline text was accepted")
 			}
 		})

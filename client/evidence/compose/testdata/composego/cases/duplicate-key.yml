@@ -1,5 +1,0 @@
-services:
-  app:
-    image: app
-    privileged: false
-    privileged: true

@@ -422,7 +422,7 @@ func TestCheckCompose_ChecksEveryDirection(t *testing.T) {
 	})
 
 	// docker compose refuses a file that declares a service twice, and so does the review
-	// (composedoc.go), so no manifest produces this list any more. CheckCompose refuses
+	// (composeload.go), so no manifest produces this list any more. CheckCompose refuses
 	// it on its own all the same, so the guarantee does not rest on its caller.
 	t.Run("the same service declared twice", func(t *testing.T) {
 		blocks := append(reviewOf(t, manifest("services:\n  mysql:\n    "+pinned+"\n")).Blocks,
@@ -450,14 +450,29 @@ func TestCheckCompose_ChecksEveryDirection(t *testing.T) {
 	})
 
 	t.Run("a block with no canonical form cannot be compared", func(t *testing.T) {
-		// A scalar body. Anchors no longer reach this state — they resolve — so the
-		// remaining way to have no canonical form is a body that is not a mapping at all.
-		doc := "services:\n  mysql: notamapping\n"
+		// The one block docker compose loads that has no canonical form: it carries the
+		// hold-out placeholder (blockOf).
+		doc := "services:\n  mysql:\n    image: mysql:8.0\n    environment:\n      - X=" + imageHeldOut + "\n"
 		got := check(oneEntry(), reviewOf(t, manifest(doc)).Blocks)
 		if got.OK() {
 			t.Fatal("an unreducible block matched")
 		}
 		requireMismatch(t, got, "mysql", "no canonical form")
+	})
+
+	t.Run("a manifest docker compose refuses cannot be compared", func(t *testing.T) {
+		r := reviewOf(t, manifest("services:\n  mysql: notamapping\n"))
+		got := CheckReview(oneEntry(), testReleases, testContract, testProvider, r)
+		if got.OK() || len(got.Mismatches) != 1 {
+			t.Fatalf("want exactly one mismatch, got %+v", got.Mismatches)
+		}
+		requireMismatch(t, got, "", "cannot be compared: docker compose refuses the compose text")
+		// And it is still only a deployment that is recorded which fails: an unrecorded
+		// provider's manifest is not compared, refused or not.
+		if got := CheckReview(oneEntry(), testReleases, testContract, "0x"+strings.Repeat("9", 40), r); got.Recorded ||
+			!got.OK() {
+			t.Fatalf("an unrecorded provider: %+v", got)
+		}
 	})
 }
 
@@ -936,8 +951,13 @@ func TestCheckCompose_TopLevelSections(t *testing.T) {
 	}
 
 	t.Run("a recorded section removed", func(t *testing.T) {
-		got := CheckCompose(b, rels, testnetContract, testnetProvider, reviewTestnet(t).Blocks,
-			reviewTestnet(t).TopLevel[:1])
+		var top []TopLevelBlock
+		for _, tl := range reviewTestnet(t).TopLevel {
+			if tl.Key != "networks" {
+				top = append(top, tl)
+			}
+		}
+		got := CheckCompose(b, rels, testnetContract, testnetProvider, reviewTestnet(t).Blocks, top)
 		requireMismatch(t, got, "top-level networks", "does not have it")
 	})
 

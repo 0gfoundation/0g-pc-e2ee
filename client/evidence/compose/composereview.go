@@ -170,8 +170,9 @@ type ComposeReview struct {
 	// same one.
 	PreLaunchBytes  int
 	PreLaunchSHA256 string
-	// Services is the compose file's services, in file order (the author's order — see
-	// compose.ParseServices on why that is the answer and not an accident).
+	// Services is the compose file's services, sorted by name: docker compose loads them
+	// into a map, so the file's order is not part of what runs, and a sorted list cannot
+	// reshuffle between two reads of one deployment.
 	Services []ReviewedService
 	// Blocks is each service's canonical form — the material a per-service baseline is
 	// written from (see composeblock.go). Index-aligned with Services BY CONSTRUCTION:
@@ -183,8 +184,12 @@ type ComposeReview struct {
 	// blocks separately would either re-run the gate or skip it, and only one of those
 	// is merely wasteful.
 	Blocks []ServiceBlock
+	// LoadErr is docker compose's refusal of the compose text, when it refuses it. Nothing
+	// is then described — no service, no block — and a recorded deployment cannot be
+	// compared against it (CheckReview).
+	LoadErr error
 	// TopLevel is every top-level section other than services and `x-` extensions, in
-	// canonical form, in file order — what the services' volumes and networks resolve to.
+	// canonical form, sorted by key — what the services' volumes and networks resolve to.
 	// The baseline compares it alongside Blocks (see TopLevelBlock).
 	TopLevel []TopLevelBlock
 	// Findings is sorted most-severe first, then by service and key, so two runs over
@@ -266,7 +271,7 @@ func (r *ComposeReview) add(s Severity, service, key, detail string) {
 
 // sortFindings orders most-severe first, then by service and key, so the output is
 // stable across runs. Findings arrive in walk order, which is stable for the compose
-// text (file order) but not for the app-compose map, and a report that reshuffles
+// text (sorted, as loaded) but not for the app-compose map, and a report that reshuffles
 // itself between two runs of one unchanged manifest reads as the manifest changing.
 func (r *ComposeReview) sortFindings() {
 	sort.SliceStable(r.Findings, func(i, j int) bool {
@@ -585,23 +590,17 @@ var knownComposeTopKeys = map[string]bool{
 // bind}` makes `- etcbind:/host-etc` mean exactly what `- /etc:/host-etc` means. Reading
 // services alone left every host-path rule one indirection away from being bypassed.
 func (r *ComposeReview) reviewComposeText(doc []byte) {
-	// The text is read ONCE, here, for the whole document — compose's tags applied and
-	// anchors resolved before the top-level walk and before any service is read
-	// (composedoc.go).
+	// The text is loaded ONCE, here, for the whole document, by docker compose's own
+	// loader (composeload.go): every document merged, compose's tags applied and anchors
+	// resolved before the top-level walk and before any service is read. Loading here also
+	// means the review and the canonical block cannot disagree about what a service
+	// contains — both walk the one tree.
 	//
-	// It belongs at the parse site because an alias is a property of the DOCUMENT, not of
-	// whoever reads it: the anchor a service merges is usually defined outside `services:`
-	// entirely (`x-logging: &default-logging`), so neither this walk nor blockOf could
-	// resolve one on its own without reaching back into the file. Reading here also means
-	// the review and the canonical block cannot disagree about what a service contains,
-	// which they did while one refused merged services and the other described them as
-	// having no image.
-	//
-	// A failure is the whole compose text, not one service, and that is the cost of doing
-	// it once. Everything refused is a text docker compose would read differently or not
-	// at all, so the honest report is that nothing below this level could be read.
+	// A refusal is the whole compose text, not one service: docker compose loads nothing
+	// from it, so the honest report is that nothing below this level runs.
 	top, err := readComposeDocument(doc)
 	if err != nil {
+		r.LoadErr = err
 		r.add(SeverityBlocking, "", "docker_compose_file", err.Error())
 		return
 	}
@@ -1108,20 +1107,6 @@ func (r *ComposeReview) reviewServiceKey(name, key string, val *yaml.Node) bool 
 		}
 		return true
 
-	case mergeKey:
-		// A real merge key cannot reach this walk: the document is resolved before dispatch
-		// (readComposeDocument), so what an anchor contributes arrives as the service's own
-		// keys. What CAN arrive is a key spelled "<<" that is not a merge — quoted, or tagged
-		// !!str — which YAML reads as an ordinary key named "<<" (isMergeKey). That is the
-		// manifest's doing, and docker compose's schema refuses it, so the finding says so
-		// rather than falling through to "no rule for the key", which would read as merely
-		// unusual.
-		r.add(SeverityBlocking, name, key,
-			"the service has a key named \"<<\" that is not a YAML merge key (it is quoted or tagged as a "+
-				"string), so it merges nothing; docker compose refuses the file (\"Additional property << is "+
-				"not allowed\"), so this is not what runs")
-		return true
-
 	case "sysctls":
 		if nodeHasContent(val) {
 			r.add(SeverityJustify, name, key, "the container sets kernel parameters, which apply to a namespace it shares")
@@ -1171,6 +1156,16 @@ func (r *ComposeReview) reviewServiceKey(name, key string, val *yaml.Node) bool 
 		if b, ok := nodeBool(val); ok && b {
 			r.add(SeverityNote, name, key, "the container is exempt from the OOM killer, so it can starve its neighbours")
 		}
+		return true
+
+	case "extends":
+		// docker compose merges the extended service in — from this file or from another
+		// one, by path. Neither is loaded here (composeload.go: resolving it would read files
+		// on the verifier's machine), so the review describes less than what runs.
+		r.add(SeverityBlocking, name, key,
+			"the service extends another service, which docker compose merges in; this review does not load "+
+				"extends, so what runs is more than what is described here — and an extended file is not part "+
+				"of the measured manifest at all")
 		return true
 	}
 	return false
@@ -1251,6 +1246,13 @@ func (r *ComposeReview) reviewVolumes(name string, val *yaml.Node, mounts *mount
 		// path does not depend on the deployment directory). Cleaning decides it now, in
 		// hostPathVerdict.
 		switch {
+		case strings.Contains(src, "$"):
+			mounts.named[src] = true
+			r.add(SeverityBlocking, name, "volumes", fmt.Sprintf(
+				"%s -> %s (%s): the source is interpolated, so what the container mounts — a host path or a "+
+					"volume — is decided by the deployment's environment, which the manifest does not contain",
+				src, target, mode(ro)))
+
 		case isNamedVolume(src):
 			// Resolve through the top-level section before deciding it is harmless.
 			// `- etcbind:/host-etc` over a volume whose driver_opts.device is /etc IS
@@ -1456,8 +1458,8 @@ func displayRegistry(registry string) string {
 // no single-value form of these to call by accident.
 
 // mapValue returns the value of key, or nil. The first pair is the only pair: a
-// duplicate key never reaches a reader here, because docker compose's decoder refuses the
-// document and so does readComposeDocument.
+// duplicate key never reaches a reader here, because docker compose's loader refuses the
+// document (readComposeDocument) and a re-encoded model has none.
 func mapValue(n *yaml.Node, key string) *yaml.Node {
 	if n == nil || n.Kind != yaml.MappingNode {
 		return nil
@@ -1514,9 +1516,14 @@ func nodeHasContent(n *yaml.Node) bool {
 // Testing for the name, rather than testing for "looks relative", is what keeps the
 // three cases exhaustive: every source is a name, an absolute path, or a relative path,
 // and each branch of the switch in reviewVolumes handles exactly one.
+//
+// A source containing `$` is none of them, and is not a name: docker compose's loader
+// files `${HOSTROOT}:/host` as a volume named "${HOSTROOT}" because it reads the text
+// before interpolation, but what it mounts is whatever the environment says — a host
+// path as easily as a volume. reviewVolumes reports it on its own branch.
 func isNamedVolume(src string) bool {
 	return src != "" && !strings.HasPrefix(src, "/") && !strings.HasPrefix(src, ".") &&
-		!strings.ContainsAny(src, "/~")
+		!strings.ContainsAny(src, "/~$")
 }
 
 // nodeScalar reads a scalar node. ok is false when the node is PRESENT but is not a

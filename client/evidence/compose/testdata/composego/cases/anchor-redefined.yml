@@ -1,9 +1,0 @@
-# An anchor name may be defined again; each alias names the definition before it.
-x-one: &v {user: first}
-services:
-  a:
-    image: app
-    <<: *v
-x-two: &v {user: second}
-more:
-  b: *v

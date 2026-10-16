@@ -1,6 +1,0 @@
-# Explicit start and end markers around one document.
----
-services:
-  app:
-    image: app
-...

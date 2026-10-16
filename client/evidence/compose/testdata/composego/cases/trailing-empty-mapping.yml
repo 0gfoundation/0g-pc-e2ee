@@ -1,5 +1,0 @@
-# A trailing empty mapping merges nothing.
-services:
-  app:
-    image: app
---- {}
