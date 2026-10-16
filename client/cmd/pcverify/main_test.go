@@ -39,6 +39,10 @@ type stubQuote struct {
 	haveComposeHash bool
 	composeHashErr  error
 	appComposeErr   error
+	// The runtime half. Nil means "the reply carries no event log" — the skip path, by
+	// default, for the same reason as the manifest's. withRuntime builds the read shape.
+	runtime    *evidence.RuntimeState
+	runtimeErr error
 }
 
 func (s stubQuote) FetchAndVerify(context.Context, string) (providerQuote, error) {
@@ -53,14 +57,28 @@ func (s stubQuote) FetchAndVerify(context.Context, string) (providerQuote, error
 	if len(s.appCompose) == 0 && acErr == nil {
 		acErr = attest.ErrNoAppCompose
 	}
-	return providerQuote{
+	pq := providerQuote{
 		Verified:        s.v,
 		ComposeHash:     s.composeHash,
 		HaveComposeHash: s.haveComposeHash,
 		ComposeHashErr:  hashErr,
 		AppCompose:      s.appCompose,
 		AppComposeErr:   acErr,
-	}, nil
+		RuntimeErr:      s.runtimeErr,
+	}
+	switch {
+	case s.runtime != nil:
+		pq.Runtime = *s.runtime
+	case s.runtimeErr == nil:
+		pq.RuntimeErr = evidence.ErrNoEventLog
+	}
+	return pq, nil
+}
+
+// withRuntime gives the stub a runtime state read from a log that replayed.
+func (s stubQuote) withRuntime(st evidence.RuntimeState) stubQuote {
+	s.runtime = &st
+	return s
 }
 
 func (s stubQuote) BaselineConfigured() bool { return !s.noBaseline }
@@ -290,7 +308,7 @@ func TestReport_ProviderVerdicts(t *testing.T) {
 		// app-compose was read, gated, and compared against a recorded baseline. A stub
 		// missing either belongs in the skip cases below.
 		trusted := stubQuote{v: attest.Verified{SignerAddr: signer, MeasurementTrusted: true}}.
-			withManifest(t, cleanCompose, nil)
+			withManifest(t, cleanCompose, nil).withRuntime(evidence.RuntimeState{})
 		if code := report(context.Background(), &out, stubService{info: acked}, trusted,
 			prov, contract, "", "", providerOpts{baseline: baselineFor(t, cleanCompose)}); code != 0 {
 			t.Errorf("code = %d, want 0 — every hop ran and passed\n%s", code, out.String())
@@ -380,7 +398,8 @@ func TestReport_ProviderVerdicts(t *testing.T) {
 		const repo = "ghcr.io/0gfoundation/0g-serving-broker"
 		digest := "sha256:" + strings.Repeat("e", 64)
 		compose := "services:\n  0g-serving-provider-broker:\n    image: " + repo + "@" + digest + "\n    restart: always\n"
-		trusted := stubQuote{v: attest.Verified{SignerAddr: signer, MeasurementTrusted: true}}.withManifest(t, compose, nil)
+		trusted := stubQuote{v: attest.Verified{SignerAddr: signer, MeasurementTrusted: true}}.
+			withManifest(t, compose, nil).withRuntime(evidence.RuntimeState{})
 		doc, _ := json.Marshal(map[string]any{"deployments": []any{map[string]any{
 			"name": "test", "contract": contract, "providers": []string{prov},
 			"services": []any{map[string]any{"name": "0g-serving-provider-broker", "image": map[string]any{"repository": repo},
@@ -511,7 +530,7 @@ func TestReport_Manifest(t *testing.T) {
 	}
 
 	t.Run("authenticated manifest is read and reviewed", func(t *testing.T) {
-		code, got := runReport(t, base.withManifest(t, cleanCompose, nil), false, baselineFor(t, cleanCompose))
+		code, got := runReport(t, base.withManifest(t, cleanCompose, nil).withRuntime(evidence.RuntimeState{}), false, baselineFor(t, cleanCompose))
 		if code != 0 {
 			t.Fatalf("code = %d, want 0\n%s", code, got)
 		}
@@ -606,7 +625,7 @@ func TestReport_Manifest(t *testing.T) {
 	t.Run("-blocks prints the canonical text", func(t *testing.T) {
 		var out bytes.Buffer
 		code := report(context.Background(), &out, stubService{info: acked},
-			base.withManifest(t, cleanCompose, nil), prov, contract, "", "",
+			base.withManifest(t, cleanCompose, nil).withRuntime(evidence.RuntimeState{}), prov, contract, "", "",
 			providerOpts{blocks: true, baseline: baselineFor(t, cleanCompose)})
 		if code != 0 {
 			t.Fatalf("code = %d, want 0\n%s", code, out.String())
@@ -681,7 +700,7 @@ func TestReport_Manifest(t *testing.T) {
 		dirty := "services:\n  broker:\n    image: mysql:8.0\n    privileged: true\n"
 		code, got := runReport(t, base.withManifest(t, dirty, map[string]any{
 			"allowed_envs": []string{"DSTACK_AUTHORIZED_KEYS"},
-		}), false, baselineFor(t, dirty))
+		}).withRuntime(evidence.RuntimeState{}), false, baselineFor(t, dirty))
 		if code != 0 {
 			t.Fatalf("code = %d, want 0 — the review must not gate\n%s", code, got)
 		}
@@ -775,3 +794,101 @@ type stubVerifier struct {
 func (s stubVerifier) Repository() string { return s.repo }
 
 func (s stubVerifier) Verify(_, _ string) evidence.ReleaseVerdict { return s.verdict }
+
+// What the runtime section does with each state the RTMR3 reader can return. The reader
+// itself is tested against real logs in client/evidence; this is the verdict wiring.
+func TestReport_Runtime(t *testing.T) {
+	acked := chain.ServiceInfo{URL: "https://prov.example/v1", Signer: signer, Acknowledged: true}
+	const repo = "ghcr.io/0gfoundation/0g-serving-broker"
+	running := "sha256:" + strings.Repeat("d", 64)
+	encPub := make([]byte, 32)
+	encPub[0] = 7
+	var key [32]byte
+	copy(key[:], encPub)
+	image := func(signer string) evidence.RuntimeState {
+		return evidence.RuntimeState{Runtime: 2, ImageUpdates: 1,
+			Image: &evidence.ImageRecord{Repository: repo, Digest: running, Signer: signer, EncPub: key, Index: 2}}
+	}
+	accepts := stubVerifier{repo: repo, verdict: evidence.ReleaseVerdict{Status: evidence.ReleaseAccepted,
+		Release: evidence.BrokerRelease{Version: "v9.9.9", Digest: running, Commit: "c0ffee"}}}
+	rejects := stubVerifier{repo: repo, verdict: evidence.ReleaseVerdict{Reason: "it is signed by docker-publish.yml"}}
+	unavailable := stubVerifier{repo: repo, verdict: evidence.ReleaseVerdict{Status: evidence.ReleaseUnavailable,
+		Reason: "the registry did not answer"}}
+
+	for _, tc := range []struct {
+		name         string
+		st           *evidence.RuntimeState
+		err          error
+		rels         evidence.ReleaseVerifier
+		code, strict int
+		says         []string
+	}{
+		{name: "no event log", code: 3, strict: 1, says: []string{"- event log        not served",
+			"the RTMR3 event log was not read"}},
+		{name: "a log that does not replay", err: errors.New("the event log does not replay to the quote's RTMR3"),
+			code: 1, strict: 1, says: []string{"✗ event log        the event log does not replay"}},
+		{name: "no record: the manifest's image runs", st: &evidence.RuntimeState{Runtime: 1}, code: 0, strict: 0,
+			says: []string{"✓ event log        replays to the quote's RTMR3 (1 runtime entry after system-ready)",
+				"the image the manifest pins"}},
+		{name: "a swap to a release", st: ptr(image(signer)), rels: accepts, code: 0, strict: 0,
+			says: []string{repo + "@" + running + " (zg-image-update, runtime entry 2; 1 image record since boot)",
+				"✓ running release  verified release v9.9.9 (commit c0ffee)", "✓ running keys"}},
+		{name: "a swap to a branch build", st: ptr(image(signer)), rels: rejects, code: 1, strict: 1,
+			says: []string{"✗ runtime          the running broker build " + repo + "@" + running,
+				"is not an accepted release: it is signed by docker-publish.yml"}},
+		{name: "a swap nobody could check", st: ptr(image(signer)), rels: unavailable, code: 3, strict: 1,
+			says: []string{"- runtime          not checked: the running broker build"}},
+		{name: "keys that are not report_data's", st: ptr(image("0x" + strings.Repeat("1", 40))), rels: accepts,
+			code: 1, strict: 1, says: []string{"is not the signer " + signer + " in report_data"}},
+		{name: "a record this reader does not know", st: &evidence.RuntimeState{Runtime: 1, Unknown: []string{"zg-new"}},
+			code: 3, strict: 1, says: []string{"not checked: the event log has record(s) this pcverify does not know (zg-new)"}},
+		{name: "upstreams are reported, not judged", code: 0, strict: 0, st: &evidence.RuntimeState{Runtime: 1,
+			Upstreams: &evidence.UpstreamSet{Members: []evidence.Upstream{{Name: "local", URL: "http://broker:8000/v1"},
+				{Name: "api", URL: "https://api.example.com/v1", Identity: "openai"}}}},
+			says: []string{"upstreams        2 (reported, not judged)", "inside the CVM (service broker)",
+				"https://api.example.com/v1 identity=openai — outside the CVM"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			qc := stubQuote{v: attest.Verified{SignerAddr: signer, EncPub: encPub, MeasurementTrusted: true},
+				runtime: tc.st, runtimeErr: tc.err}.withManifest(t, cleanCompose, nil)
+			for _, strict := range []bool{false, true} {
+				var out bytes.Buffer
+				code := report(context.Background(), &out, stubService{info: acked}, qc, prov, contract, "", "",
+					providerOpts{strict: strict, baseline: baselineFor(t, cleanCompose), releases: tc.rels})
+				want := tc.code
+				if strict {
+					want = tc.strict
+				}
+				if code != want {
+					t.Fatalf("strict=%v: code = %d, want %d\n%s", strict, code, want, out.String())
+				}
+				for _, s := range tc.says {
+					if !strings.Contains(out.String(), s) {
+						t.Fatalf("output missing %q:\n%s", s, out.String())
+					}
+				}
+				// The baseline matched here, so no confinement caveat.
+				if strings.Contains(out.String(), "caveat") {
+					t.Fatalf("a caveat on a confined deployment:\n%s", out.String())
+				}
+			}
+		})
+	}
+
+	// Without a matching recorded deployment, an image record is reported with the
+	// caveat that only the baseline establishes who can write records.
+	t.Run("an unrecorded deployment carries the caveat", func(t *testing.T) {
+		qc := stubQuote{v: attest.Verified{SignerAddr: signer, EncPub: encPub, MeasurementTrusted: true}}.
+			withManifest(t, cleanCompose, nil).withRuntime(image(signer))
+		var out bytes.Buffer
+		if code := report(context.Background(), &out, stubService{info: acked}, qc, prov, contract, "", "",
+			providerOpts{releases: rejects}); code != 1 {
+			t.Fatalf("code = %d, want 1: the running build is judged recorded or not\n%s", code, out.String())
+		}
+		if !strings.Contains(out.String(), "caveat           the records are as trustworthy as the confinement of dstack.sock") {
+			t.Fatalf("no caveat:\n%s", out.String())
+		}
+	})
+}
+
+func ptr[T any](v T) *T { return &v }

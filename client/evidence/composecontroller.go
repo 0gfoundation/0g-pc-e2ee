@@ -21,7 +21,8 @@ package evidence
 // environment (ctrl.go: os.Getenv(EnginesEnvVar) == "on"), which this exception pins. It
 // DOES name controller.imageRepo, the repository image swaps pull from, so "repo@digest"
 // is a repository of the provider's choosing; only an RTMR3 replay against the release
-// list bounds what broker and event run after boot. The justification says so.
+// policy bounds what broker and event run after boot. That replay is rtmr3.go, run by
+// pcverify beside this review, and the justification points there.
 //
 // WHY JUSTIFY AND NOT SILENCE. Those limits are the controller's CODE at a particular
 // digest. This review reads a manifest; it cannot see code, and it does not adjudicate.
@@ -113,8 +114,9 @@ func (r *ComposeReview) justifyControllerRuntimeSocket(name string, body *yaml.N
 			"swap only as repo@digest for broker and event, recorded in RTMR3 first (the full list is the broker "+
 			"repository's doc/controller-design.md §3.4). The repository in that swap is controller.imageRepo "+
 			"from the controller's config file, which the provider supplies (written by broker-config-init) and "+
-			"can rewrite at runtime, so which images broker and event run after boot is bounded only by replaying "+
-			"RTMR3 against the release policy — not by this review. Those limits are the controller's code at this "+
+			"can rewrite at runtime, so which images broker and event run after boot is bounded by replaying "+
+			"RTMR3 against the release policy (the running-broker check), not by this review. Those limits are the "+
+			"controller's code at this "+
 			"digest: this review cannot see them, and they do not hold on any other build",
 			rel.Version, controllerCommand, controllerEnginesEnv)
 	}

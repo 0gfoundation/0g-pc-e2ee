@@ -261,7 +261,26 @@ declared local volumes, and `ZG_CONTROLLER_ENGINES` absent — the conditions un
 which condition failed (`evidence/composecontroller.go`). What it does NOT bound: the
 repository image swaps pull from is `controller.imageRepo` in the controller's config
 file, which the provider supplies and can rewrite at runtime, so what broker and event
-run after boot is bounded only by an RTMR3 replay against the release policy.
+run after boot is bounded by the RTMR3 replay below, not by the review.
+
+**What runs now, not only what booted.** The controller records every image swap and
+config change in RTMR3 before making it. `pcverify -provider` replays the event log from
+the provider's `/v1/quote` reply into the verified quote's RTMR3. A log that does not
+replay fails the run. It then reads the controller's records as the broker repository
+specifies them (`doc/rtmr3-records.md`). This is an independent implementation in
+`evidence/rtmr3.go`, tested against the broker's own vector and two live replies, not an
+import of the broker's code. The last `zg-image-update` names the build broker and event
+run now. That build must be an accepted release by the same provenance policy, for every
+provider whether a deployment is recorded or not, and its signer and enc_pub must equal
+the quote's report_data. A `zg-engine-set` record fails the run. Several things leave the
+run incomplete (exit 3): a reply without an event log, a record name this reader does not
+know, an upstream set the controller marked `invalidated`, an aborted instance change,
+and a release check that could not run. The upstream set (where plaintext may go, inside
+or outside the CVM) and the config hash are printed, not judged. The records are only as
+trustworthy as the confinement of `dstack.sock`, which only a matching recorded deployment
+establishes, and the report says so when there is none. On 2026-10-16 this check found
+cn-19, cn-20 and cn-41 running manual branch builds swapped in after boot, behind
+manifests pinning v0.5.2, v0.5.1 and a branch build.
 
 The baseline also records each deployment's **top-level sections** — `volumes`,
 `networks`, and anything else besides `services` and `x-` extensions — and compares them

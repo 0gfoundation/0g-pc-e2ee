@@ -59,6 +59,15 @@
 // file instead, which is how a deployment gets checked against a live provider before it
 // is committed.
 //
+// The manifest is what the CVM BOOTED, and the controller can swap the broker's image and
+// change its config afterwards, recording each change in RTMR3 first. So the run then
+// replays the reply's event log into the verified quote's RTMR3 — a log that does not
+// replay fails — and reads the controller's records (client/evidence's rtmr3.go): the
+// build the last zg-image-update names must be an accepted release, for every provider,
+// recorded or not, and its signer and enc_pub must be report_data's. A record this
+// reader does not know, or a reply with no event log, leaves the run incomplete. The
+// upstream set and config hash the records carry are printed, not judged.
+//
 //	pcverify -provider 0x... [-chain-rpc-url ...] [-serving-contract 0x...]
 //	         [-endpoint https://...] [-expect-signer 0x...] [-no-quote]
 //	         [-pccs-url https://...] [-blocks] [-app-baseline brokercompose.json]
@@ -255,6 +264,12 @@ type providerQuote struct {
 	AppCompose []byte
 	// AppComposeErr says why the reply carried none.
 	AppComposeErr error
+	// Runtime is what the controller's RTMR3 records say the CVM runs now, read from the
+	// reply's event log only after it replayed to the VERIFIED quote's RTMR3. RuntimeErr
+	// is set instead when it did not: evidence.ErrNoEventLog for a reply without a log
+	// (a check that did not run), anything else a finding about the provider.
+	Runtime    evidence.RuntimeState
+	RuntimeErr error
 }
 
 // quoteChecker fetches a provider's TDX quote from its endpoint and DCAP-verifies
@@ -545,13 +560,21 @@ func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecke
 		// allowlisted image can still run entirely different containers, because
 		// mr_config_id commits to the manifest the OPERATOR chose. This is the only place
 		// in the tool that reads it.
-		failed, skip := reportManifest(out, pq, opts, contract, provider)
+		man := reportManifest(out, pq, opts, contract, provider)
+		if man.failed {
+			ok = false
+		}
+		if man.skipped != "" {
+			skipped = append(skipped, man.skipped)
+		}
+
+		// What runs NOW. The manifest is what the CVM booted; the controller can swap
+		// the broker's image and config afterwards, recording each change in RTMR3.
+		failed, skip := reportRuntime(out, pq, opts, man)
 		if failed {
 			ok = false
 		}
-		if skip != "" {
-			skipped = append(skipped, skip)
-		}
+		skipped = append(skipped, skip...)
 	}
 
 	return verdict(out, !ok, strings.Join(skipped, "; "), opts.strict)
@@ -574,18 +597,18 @@ func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecke
 //     not write, and a heuristic wired to an exit code refuses a provider for being
 //     unusual. It is printed so a human can turn it into a baseline; the baseline is
 //     what will adjudicate. See evidence/composereview.go's header.
-func reportManifest(out io.Writer, pq providerQuote, opts providerOpts, contract, provider string) (failed bool, skipped string) {
+func reportManifest(out io.Writer, pq providerQuote, opts providerOpts, contract, provider string) manifestResult {
 	dumpBlocks := opts.blocks
 	switch {
 	case !pq.HaveComposeHash:
 		fmt.Fprintf(out, "- app-compose      not read (%s)\n", reason(pq.ComposeHashErr,
 			"the quote's mr_config_id exposes no compose_hash"))
-		return false, "the provider's manifest was not read (the quote exposes no compose_hash to gate it against)"
+		return manifestResult{skipped: "the provider's manifest was not read (the quote exposes no compose_hash to gate it against)"}
 	case len(pq.AppCompose) == 0:
 		fmt.Fprintf(out, "  compose_hash     %x\n", pq.ComposeHash)
 		fmt.Fprintf(out, "- app-compose      not served (%s)\n", reason(pq.AppComposeErr,
 			"the /v1/quote reply carries no app_compose"))
-		return false, "the provider's manifest was not read (its /v1/quote reply carries no app_compose)"
+		return manifestResult{skipped: "the provider's manifest was not read (its /v1/quote reply carries no app_compose)"}
 	}
 
 	review, err := evidence.ReviewCompose(pq.AppCompose, pq.ComposeHash, opts.releases)
@@ -593,7 +616,7 @@ func reportManifest(out io.Writer, pq providerQuote, opts providerOpts, contract
 		// The gate, or bytes that are not JSON. Either way nothing below it may be
 		// believed, so nothing below it is printed.
 		fmt.Fprintf(out, "%s app-compose      %v\n", mark(false), err)
-		return true, ""
+		return manifestResult{failed: true}
 	}
 	fmt.Fprintf(out, "%s app-compose      authenticated: sha256 equals the compose_hash the quote binds\n", mark(true))
 	fmt.Fprintf(out, "  compose_hash     %x\n", pq.ComposeHash)
@@ -680,7 +703,11 @@ func reportManifest(out io.Writer, pq providerQuote, opts providerOpts, contract
 	}
 
 	check := evidence.CheckCompose(opts.baseline, opts.releases, contract, provider, review.Blocks, review.TopLevel)
-	failed = reportBaseline(out, check, contract)
+	res := manifestResult{failed: reportBaseline(out, check, contract), skipped: baselineSkip(check),
+		confined: check.Compared() && len(check.Mismatches) == 0}
+	for _, s := range review.Services {
+		res.services = append(res.services, s.Name)
+	}
 
 	// Never a mark on the review line: a ✓ or ✗ would read as a verdict, and the review
 	// deliberately has none. The contrast with the baseline line above is the whole point.
@@ -695,7 +722,114 @@ func reportManifest(out io.Writer, pq providerQuote, opts providerOpts, contract
 		}
 		fmt.Fprintf(out, "    [%s] %s: %s\n", f.Severity, where, f.Detail)
 	}
-	return failed, baselineSkip(check)
+	return res
+}
+
+// manifestResult is what reportManifest established, for the verdict and for the runtime
+// section after it.
+type manifestResult struct {
+	// failed and skipped are the section's verdict: a check that failed, and what went
+	// unchecked.
+	failed  bool
+	skipped string
+	// services are the manifest's service names, once it is authenticated: an upstream
+	// whose host is one of them is inside the CVM.
+	services []string
+	// confined is whether the manifest matched a recorded deployment — the one check that
+	// establishes only the controller holds dstack.sock, which is what makes its RTMR3
+	// records worth reading.
+	confined bool
+}
+
+// reportRuntime prints what the controller's RTMR3 records say the CVM runs now, and
+// returns whether a check FAILED and what went unchecked (evidence/rtmr3.go).
+//
+// The running broker build is judged for every provider, recorded or not: the record is
+// a statement the quote vouches for, and "not a release" needs no reviewed baseline to be
+// true. The upstream set and the config are printed, not judged.
+func reportRuntime(out io.Writer, pq providerQuote, opts providerOpts, man manifestResult) (failed bool, skipped []string) {
+	switch {
+	case errors.Is(pq.RuntimeErr, evidence.ErrNoEventLog):
+		fmt.Fprintf(out, "- event log        not served, so what the CVM runs since boot was not checked\n")
+		return false, []string{"the RTMR3 event log was not read (the /v1/quote reply carries none)"}
+	case pq.RuntimeErr != nil:
+		fmt.Fprintf(out, "%s event log        %v\n", mark(false), pq.RuntimeErr)
+		return true, nil
+	}
+	st := pq.Runtime
+	fmt.Fprintf(out, "%s event log        replays to the quote's RTMR3 (%d runtime entr%s after system-ready)\n",
+		mark(true), st.Runtime, plural(st.Runtime, "y", "ies"))
+	if len(st.Ignored) > 0 {
+		fmt.Fprintf(out, "  ignored          %s before system-ready (not written by a container, not read)\n",
+			strings.Join(st.Ignored, ", "))
+	}
+
+	c := evidence.CheckRuntime(st, opts.releases, pq.Verified.SignerAddr, pq.Verified.EncPub)
+	switch im := st.Image; {
+	case im == nil:
+		fmt.Fprintf(out, "  running broker   the image the manifest pins (no zg-image-update; judged by the baseline)\n")
+	default:
+		fmt.Fprintf(out, "  running broker   %s@%s (zg-image-update, runtime entry %d; %d image record%s since boot)\n",
+			im.Repository, im.Digest, im.Index, st.ImageUpdates, plural(st.ImageUpdates, "", "s"))
+		if v := c.Release; v != nil && v.Status == evidence.ReleaseAccepted {
+			fmt.Fprintf(out, "%s running release  verified release %s (commit %s)\n", mark(true), v.Release.Version,
+				v.Release.Commit)
+		}
+		if c.KeysBound {
+			fmt.Fprintf(out, "%s running keys     zg-image-update signer and enc_pub == report_data\n", mark(true))
+		}
+	}
+	for _, f := range c.Failures {
+		fmt.Fprintf(out, "%s runtime          %s\n", mark(false), f)
+	}
+	for _, u := range c.Unverified {
+		fmt.Fprintf(out, "- runtime          not checked: %s\n", u)
+	}
+
+	if st.ConfigUpdates > 0 {
+		fmt.Fprintf(out, "  config           %d update%s, last sha256 %s (reported; no config is reviewed)\n",
+			st.ConfigUpdates, plural(st.ConfigUpdates, "", "s"), st.LastConfig)
+	}
+	switch u := st.Upstreams; {
+	case u == nil:
+		fmt.Fprintf(out, "  upstreams        not recorded by this controller\n")
+	case u.Invalidated:
+		// Reported under "runtime" above as a check that did not run.
+	default:
+		inside := map[string]bool{}
+		for _, s := range man.services {
+			inside[s] = true
+		}
+		fmt.Fprintf(out, "  upstreams        %d (reported, not judged)\n", len(u.Members))
+		for _, m := range u.Members {
+			where := "outside the CVM"
+			if h := m.Host(); !strings.Contains(h, ".") && inside[h] {
+				where = "inside the CVM (service " + h + ")"
+			}
+			id := ""
+			if m.Identity != "" {
+				id = " identity=" + m.Identity
+			}
+			fmt.Fprintf(out, "    %-24s %s%s — %s\n", m.Name, m.URL, id, where)
+		}
+	}
+	if len(st.Instances) > 0 {
+		fmt.Fprintf(out, "  instances        %d broker instance(s) changed by the controller\n", len(st.Instances))
+	}
+	if !man.confined && st.Image != nil {
+		// Anything holding dstack.sock can append a record. Only a matching recorded
+		// deployment establishes that just the controller does.
+		fmt.Fprintf(out, "  caveat           the records are as trustworthy as the confinement of dstack.sock, "+
+			"which only a matching recorded deployment establishes\n")
+	}
+	return len(c.Failures) > 0, c.Unverified
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 // baselineSkip names the gap when the comparison did not run. That is not a pass: the
@@ -939,6 +1073,9 @@ func (c *dcapChecker) FetchAndVerify(ctx context.Context, endpoint string) (prov
 	} else {
 		pq.AppCompose = ac
 	}
+	// The same reply, so the log cannot belong to another quote; and the RTMR3 it must
+	// replay to is the verified one, never a value read out of the reply.
+	pq.Runtime, pq.RuntimeErr = evidence.ReadRuntimeState(reply, verified.Measurement.RTMR3)
 	return pq, nil
 }
 
