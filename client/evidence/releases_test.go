@@ -38,10 +38,6 @@ func (f fakeReleases) Verify(repository, digest string) ReleaseVerdict {
 	return ReleaseVerdict{Reason: "it carries no provenance from the release workflow"}
 }
 
-// testReleases accepts digestA and digestB, so the repository-rule tests are about the
-// rule rather than about any real build.
-var testReleases = fakeReleases{repo: brokerRepo, accepted: map[string]string{digestA: "vA", digestB: "vB"}}
-
 // fleetReleases accepts what the real verifier accepts among the builds the recorded
 // deployments run: v0.5.4, and not v0.5.1 (cn-20).
 var fleetReleases = fakeReleases{repo: brokerRepoName, accepted: map[string]string{v054Digest: "v0.5.4"}}

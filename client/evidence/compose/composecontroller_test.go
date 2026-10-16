@@ -1,8 +1,10 @@
-package evidence
+package compose
 
 import (
 	"strings"
 	"testing"
+
+	"github.com/0gfoundation/0g-pc-e2ee/client/evidence"
 )
 
 // v054 is the broker release the embedded list carries.
@@ -186,7 +188,7 @@ func TestControllerException_UsesTheVerifierItIsGiven(t *testing.T) {
 	raw, hash := appComposeFor(t, manifest(eligibleController))
 	for _, tc := range []struct {
 		name string
-		rels ReleaseVerifier
+		rels evidence.ReleaseVerifier
 		want Severity
 		says string
 	}{

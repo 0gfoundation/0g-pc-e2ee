@@ -325,11 +325,11 @@ precondition for flipping a switch.
 > `app-compose` is checked against the hash the quote binds, and what it authenticates
 > is reported: the container list on the identity endpoint, and in `pcverify -provider`
 > a structural review of the manifest as well. The review deliberately gates nothing (see
-> `client/evidence/composereview.go`) — its rules are heuristics about a manifest we do
+> `client/evidence/compose/composereview.go`) — its rules are heuristics about a manifest we do
 > not write, and the adjudicating comparison has to be byte-exact against a baseline,
 > which is what the review exists to help write.
 >
-> That comparison now exists: `client/evidence/composebaseline.go` checks an
+> That comparison now exists: `client/evidence/compose/composebaseline.go` checks an
 > authenticated manifest against the DEPLOYMENT `brokercompose.json` records for that
 > provider on that contract, in every direction — a recorded service the manifest does
 > not declare, a declared service the deployment does not record, a service declared
@@ -387,7 +387,7 @@ precondition for flipping a switch.
 > deployment against a live provider first.
 >
 > The comparison form the baseline uses:
-> `client/evidence/composeblock.go` reduces each service to a **canonical block**, keeping
+> `client/evidence/compose/composeblock.go` reduces each service to a **canonical block**, keeping
 > every difference that changes what runs (values, keys, key order, scalar types) and
 > dropping every one that does not (comments, indentation, quoting, flow-versus-block
 > style). It emits two forms per service — the whole block, and the block with the image

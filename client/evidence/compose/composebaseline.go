@@ -1,4 +1,4 @@
-package evidence
+package compose
 
 // composebaseline.go compares an authenticated manifest against the recorded
 // per-service baseline. This is the check that ADJUDICATES — the one composereview.go
@@ -31,6 +31,8 @@ import (
 	"strings"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/compose"
+
+	"github.com/0gfoundation/0g-pc-e2ee/client/evidence"
 )
 
 // brokercompose.json holds the per-service baseline. EMBEDDED rather than read from a
@@ -136,7 +138,7 @@ func (b ComposeBaseline) For(contract, provider string) (Deployment, bool) {
 // the text cannot express.
 type ImageRule struct {
 	// Repository accepts any RELEASED build of this repository — a digest the caller's
-	// ReleaseVerifier accepts (brokerrelease.go) — and switches the block comparison to
+	// evidence.ReleaseVerifier accepts (brokerrelease.go) — and switches the block comparison to
 	// the image-held-out form so the reference is not pinned twice.
 	//
 	// It exists for one case: an image whose release cadence would otherwise force a
@@ -453,7 +455,7 @@ type ComposeCheck struct {
 	// TopExpected and TopMatched are the same two counts for the top-level sections.
 	TopExpected, TopMatched int
 	// Unverified lists the services whose block matched but whose broker build could not
-	// be checked against the release verifier (ReleaseUnavailable). Neither a match nor a
+	// be checked against the release verifier (evidence.ReleaseUnavailable). Neither a match nor a
 	// mismatch: the comparison is incomplete, which a report must say and a gate must not
 	// read as a pass.
 	Unverified []ComposeMismatch
@@ -496,7 +498,7 @@ func (c ComposeCheck) OK() bool { return !c.Compared() || len(c.Mismatches) == 0
 // top is ComposeReview.TopLevel, compared the same way in every direction: a recorded
 // section must be present and identical, and a section the deployment does not record is
 // a mismatch — it is where a service's volumes and networks get their meaning.
-func CheckCompose(b ComposeBaseline, rels ReleaseVerifier, contract, provider string, blocks []ServiceBlock,
+func CheckCompose(b ComposeBaseline, rels evidence.ReleaseVerifier, contract, provider string, blocks []ServiceBlock,
 	top []TopLevelBlock) ComposeCheck {
 	out := ComposeCheck{Configured: len(b.Deployments) > 0}
 	if !out.Configured {
@@ -586,7 +588,7 @@ func (c *ComposeCheck) checkTopLevel(want []BaselineTopLevel, got []TopLevelBloc
 }
 
 // checkService compares one observed block against its baseline entry.
-func (c *ComposeCheck) checkService(want BaselineService, got ServiceBlock, rels ReleaseVerifier) {
+func (c *ComposeCheck) checkService(want BaselineService, got ServiceBlock, rels evidence.ReleaseVerifier) {
 	if !got.Pinnable() {
 		c.add(want.Name, fmt.Sprintf("the service has no canonical form, so it cannot be compared: %v", got.Err), "")
 		return
@@ -609,7 +611,7 @@ func (c *ComposeCheck) checkService(want BaselineService, got ServiceBlock, rels
 
 // checkImage applies the image rule, which only a repository rule has: every other case
 // is already settled by the block comparison, which included the image line.
-func (c *ComposeCheck) checkImage(want BaselineService, got ServiceBlock, rels ReleaseVerifier) {
+func (c *ComposeCheck) checkImage(want BaselineService, got ServiceBlock, rels evidence.ReleaseVerifier) {
 	if want.Image.pinsImageInBlock() {
 		return
 	}
@@ -628,9 +630,9 @@ func (c *ComposeCheck) checkImage(want BaselineService, got ServiceBlock, rels R
 		c.add(want.Name, fmt.Sprintf("the baseline accepts released builds of %s, but the release verifier "+
 			"judges %s, so no build of it can be accepted", want.Image.Repository, describeRepo(rels.Repository())), "")
 	default:
-		switch v := verifyRelease(rels, repo, digest); v.Status {
-		case ReleaseAccepted:
-		case ReleaseUnavailable:
+		switch v := evidence.VerifyRelease(rels, repo, digest); v.Status {
+		case evidence.ReleaseAccepted:
+		case evidence.ReleaseUnavailable:
 			c.Unverified = append(c.Unverified, ComposeMismatch{Service: want.Name, Reason: fmt.Sprintf(
 				"whether %s@%s is a release could not be checked: %s", repo, shortDigest(digest), v.Reason)})
 		default:
@@ -697,4 +699,12 @@ func sortedBoolKeys(m map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func truncate(s string) string {
+	const max = 100
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
 }

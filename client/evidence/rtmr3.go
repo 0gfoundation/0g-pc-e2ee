@@ -491,7 +491,7 @@ type RuntimeCheck struct {
 func CheckRuntime(st RuntimeState, rels ReleaseVerifier, signer string, encPub []byte) RuntimeCheck {
 	c := RuntimeCheck{State: st}
 	if im := st.Image; im != nil {
-		v := verifyRelease(rels, im.Repository, im.Digest)
+		v := VerifyRelease(rels, im.Repository, im.Digest)
 		c.Release = &v
 		switch v.Status {
 		case ReleaseAccepted:
@@ -540,4 +540,16 @@ func CheckRuntime(st RuntimeState, rels ReleaseVerifier, signer string, encPub [
 		}
 	}
 	return c
+}
+
+func dedupe(in []string) []string {
+	seen := make(map[string]bool, len(in))
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
 }

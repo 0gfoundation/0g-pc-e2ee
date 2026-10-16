@@ -311,7 +311,7 @@ What it is **not** is a check. Nothing compared those images against an expected
 a panel may render the list but must not read its existence as approval. Hop 3 is not
 that set: its allowlist is populated, but it pins the guest **OS image** and would say
 nothing about container images even fully enforced. The missing piece is a per-service
-baseline — see `client/evidence/composereview.go`, which reads the same authenticated
+baseline — see `client/evidence/compose/composereview.go`, which reads the same authenticated
 manifest and reports how far it is from being one, and deliberately adjudicates nothing. The one finding it carries unaided is an **empty digest**:
 an image pinned by tag leaves `compose_hash` committing to a *name* whose contents can
 be republished under it, so the absence is rendered rather than hidden.

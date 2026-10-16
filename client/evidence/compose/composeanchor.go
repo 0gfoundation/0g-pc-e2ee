@@ -1,4 +1,4 @@
-package evidence
+package compose
 
 // composeanchor.go resolves YAML anchors — aliases (`*name`) and merge keys (`<<`) —
 // into the content they name, so that everything downstream reads a service as it will

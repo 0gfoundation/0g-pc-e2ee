@@ -1,4 +1,4 @@
-package evidence
+package compose
 
 // composeblock.go reduces each compose service to a CANONICAL FORM — the shape a
 // per-service baseline can be written against, and compared with.

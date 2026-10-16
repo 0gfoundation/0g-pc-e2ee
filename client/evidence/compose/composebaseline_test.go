@@ -1,4 +1,4 @@
-package evidence
+package compose
 
 import (
 	"encoding/json"
@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/0gfoundation/0g-pc-e2ee/client/evidence"
 )
 
 // The deployment every single-deployment test records, and the provider it is checked
@@ -597,7 +599,7 @@ func TestCheckCompose_RepositoryRule(t *testing.T) {
 	t.Run("a build that could not be checked leaves the comparison incomplete", func(t *testing.T) {
 		for _, tc := range []struct {
 			name string
-			rels ReleaseVerifier
+			rels evidence.ReleaseVerifier
 		}{
 			{"the verifier could not reach the registry", fakeReleases{repo: brokerRepo, unavailable: true}},
 			{"no verifier", nil},

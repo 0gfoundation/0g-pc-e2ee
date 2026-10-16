@@ -971,7 +971,7 @@
             "keys, environment variables and healthcheck the exception covers, nothing interpolated in its service,",
             "no host path beyond the two sockets (its logs are on a declared named volume), and",
             "ZG_CONTROLLER_ENGINES absent — the conditions under which broker",
-            "#759 limits what it does with the socket (evidence/composecontroller.go). Those limits",
+            "#759 limits what it does with the socket (evidence/compose/composecontroller.go). Those limits",
             "are the controller's code at this digest, which is why the release has to be verified."
           ],
           "image": {

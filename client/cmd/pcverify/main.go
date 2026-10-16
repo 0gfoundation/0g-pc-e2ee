@@ -38,14 +38,14 @@
 // Beside each service the run prints its CANONICAL BLOCK fingerprint — two of them,
 // because the baseline pins them separately: `block` covers everything the deployment
 // decided, and `block-no-image` is the half that must not move when the broker ships a
-// new image digest (see client/evidence/composeblock.go). The fingerprints make a sweep
+// new image digest (see client/evidence/compose/composeblock.go). The fingerprints make a sweep
 // across providers able to say which services are already identical fleet-wide, which is
 // the fact a baseline revision has to be written against. -blocks prints the canonical
 // text itself, which is what a baseline entry holds; it is a comparison form, not
 // deployable YAML.
 //
 // Those blocks are then COMPARED against the deployment the per-service baseline
-// (client/evidence/brokercompose.json) records for this provider on this contract — the
+// (client/evidence/compose/brokercompose.json) records for this provider on this contract — the
 // check that adjudicates, and the only part of the manifest section that can fail a run.
 // Every direction is checked: a recorded service missing from the manifest, a manifest
 // service the deployment does not record (an unlisted container runs in the same guest as
@@ -215,6 +215,7 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/client/cmd/pcverify/provenance"
 	"github.com/0gfoundation/0g-pc-e2ee/client/dcap"
 	"github.com/0gfoundation/0g-pc-e2ee/client/evidence"
+	"github.com/0gfoundation/0g-pc-e2ee/client/evidence/compose"
 	"github.com/0gfoundation/0g-pc-e2ee/client/release"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
 )
@@ -258,7 +259,7 @@ type providerQuote struct {
 	// disagreed with the verified measurement" are very different findings.
 	ComposeHashErr error
 	// AppCompose is the reply's app-compose text, UNAUTHENTICATED. It exists to be fed
-	// to evidence.ReviewCompose together with ComposeHash, which is the only sanctioned
+	// to compose.ReviewCompose together with ComposeHash, which is the only sanctioned
 	// use: that call performs the gate, so there is no path here that reads this text
 	// without one.
 	AppCompose []byte
@@ -294,8 +295,8 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 	endpoint := fs.String("endpoint", "", "provider serving endpoint for the quote fetch (default: read from chain, Service.url)")
 	expectSigner := fs.String("expect-signer", "", "if set, require the on-chain teeSignerAddress to equal this")
 	noQuote := fs.Bool("no-quote", false, "skip the TDX quote hops; check only the on-chain signer (no provider contact)")
-	appBaseline := fs.String("app-baseline", "", "provider mode: read the per-service compose baseline from this file instead of the one built into the binary (see client/evidence/brokercompose.json). It must name the provider and its contract in a deployment, as the built-in file does. For checking a candidate deployment against a live provider before committing it")
-	blocks := fs.Bool("blocks", false, "provider mode: print each service's canonical block text, not just its fingerprint. This is the text a per-service baseline is written from (client/evidence/composeblock.go); it is a COMPARISON form, not deployable YAML")
+	appBaseline := fs.String("app-baseline", "", "provider mode: read the per-service compose baseline from this file instead of the one built into the binary (see client/evidence/compose/brokercompose.json). It must name the provider and its contract in a deployment, as the built-in file does. For checking a candidate deployment against a live provider before committing it")
+	blocks := fs.Bool("blocks", false, "provider mode: print each service's canonical block text, not just its fingerprint. This is the text a per-service baseline is written from (client/evidence/compose/composeblock.go); it is a COMPARISON form, not deployable YAML")
 	gateway := fs.String("gateway", "", "cloud-TEE gateway domain (e.g. pc-gateway.example.com); selects gateway mode — verify its /evidences bundle and compare the served certificate")
 	pccsURL := fs.String("pccs-url", "", "fetch DCAP collateral (TCB Info, QE Identity, PCK CRL) from this PCCS mirror instead of api.trustedservices.intel.com (e.g. https://pccs.phala.network); the root-CA CRL still comes from Intel. Applies to whichever mode verifies a quote")
 	allowUntrustedCert := fs.Bool("allow-untrusted-cert", false, "gateway mode: proceed when the served certificate does not chain to a public root (ACME staging). Relaxes no attestation check, but drops the link between the connection and the domain asked for, so an interceptor running its own attested CVM would still pass — smoke-test your own deployment only")
@@ -308,7 +309,7 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 	noDNSDiscovery := fs.Bool("no-dns-discovery", false, "gateway mode: do not derive the platform base domain from DNS; check only what was passed in")
 	expectComposeFile := fs.String("expect-compose-file", "", "gateway mode: path to the docker-compose manifest this deployment should be running (a digest-pinned docker-compose.release.yml), compared against the authenticated app-compose's docker_compose_file. Overrides the default -releases lookup")
 	releases := fs.Int("releases", defaultReleases, "gateway mode: accept the deployment if its compose text matches any of the newest N published releases, and report which one. 0 disables the lookup")
-	strict := fs.Bool("strict", false, "require every check to RUN, not merely to not fail: anything that would report an advisory \"-\" (exit 3) fails the run instead (exit 1). Gateway mode — a releases or app-compose lookup that cannot be completed; it demands the checks without demanding their inputs, so discovery still supplies them. Provider mode — hop 3, which cannot pass when the audited allowlist has no entry to compare against; the app-compose read, which cannot happen when the provider publishes none; the per-service baseline comparison, which cannot run when client/evidence/brokercompose.json records no deployment for the provider (true of most of the fleet as shipped, so -strict fails every provider nobody has recorded); and -no-quote, which skips hops 2-4 by request and so cannot be combined with this flag")
+	strict := fs.Bool("strict", false, "require every check to RUN, not merely to not fail: anything that would report an advisory \"-\" (exit 3) fails the run instead (exit 1). Gateway mode — a releases or app-compose lookup that cannot be completed; it demands the checks without demanding their inputs, so discovery still supplies them. Provider mode — hop 3, which cannot pass when the audited allowlist has no entry to compare against; the app-compose read, which cannot happen when the provider publishes none; the per-service baseline comparison, which cannot run when client/evidence/compose/brokercompose.json records no deployment for the provider (true of most of the fleet as shipped, so -strict fails every provider nobody has recorded); and -no-quote, which skips hops 2-4 by request and so cannot be combined with this flag")
 	releaseRepo := fs.String("repo", defaultReleaseRepo, "gateway mode: owner/name to read releases from, with -releases")
 	releaseAsset := fs.String("release-asset", defaultReleaseAsset, "gateway mode: release asset holding the deployment manifest, with -releases")
 	timeout := fs.Duration("timeout", 30*time.Second, "overall timeout")
@@ -441,7 +442,7 @@ type providerOpts struct {
 	// baseline is the per-service baseline to compare the manifest against. Passed in
 	// rather than loaded inside report so a test can drive the comparison, and so
 	// -app-baseline can substitute a candidate file for the embedded one.
-	baseline evidence.ComposeBaseline
+	baseline compose.ComposeBaseline
 	// releases judges broker builds, for the baseline's `repository` rule and the
 	// controller exception. Nil judges nothing: those services are reported as unchecked.
 	releases evidence.ReleaseVerifier
@@ -596,7 +597,7 @@ func report(ctx context.Context, out io.Writer, sr serviceReader, qc quoteChecke
 //   - The review itself gates NOTHING. Its rules are heuristics about a manifest we did
 //     not write, and a heuristic wired to an exit code refuses a provider for being
 //     unusual. It is printed so a human can turn it into a baseline; the baseline is
-//     what will adjudicate. See evidence/composereview.go's header.
+//     what will adjudicate. See evidence/compose/composereview.go's header.
 func reportManifest(out io.Writer, pq providerQuote, opts providerOpts, contract, provider string) manifestResult {
 	dumpBlocks := opts.blocks
 	switch {
@@ -611,7 +612,7 @@ func reportManifest(out io.Writer, pq providerQuote, opts providerOpts, contract
 		return manifestResult{skipped: "the provider's manifest was not read (its /v1/quote reply carries no app_compose)"}
 	}
 
-	review, err := evidence.ReviewCompose(pq.AppCompose, pq.ComposeHash, opts.releases)
+	review, err := compose.ReviewCompose(pq.AppCompose, pq.ComposeHash, opts.releases)
 	if err != nil {
 		// The gate, or bytes that are not JSON. Either way nothing below it may be
 		// believed, so nothing below it is printed.
@@ -702,7 +703,7 @@ func reportManifest(out io.Writer, pq providerQuote, opts providerOpts, contract
 		}
 	}
 
-	check := evidence.CheckCompose(opts.baseline, opts.releases, contract, provider, review.Blocks, review.TopLevel)
+	check := compose.CheckCompose(opts.baseline, opts.releases, contract, provider, review.Blocks, review.TopLevel)
 	res := manifestResult{failed: reportBaseline(out, check, contract), skipped: baselineSkip(check),
 		confined: check.Compared() && len(check.Mismatches) == 0}
 	for _, s := range review.Services {
@@ -841,7 +842,7 @@ func plural(n int, one, many string) string {
 // deployment is recorded for was not reviewed; reporting it as a mismatch against some
 // other deployment made six healthy providers out of seven exit 1 on the 2026-10-10 sweep
 // for the sole reason that nobody had recorded them.
-func baselineSkip(check evidence.ComposeCheck) string {
+func baselineSkip(check compose.ComposeCheck) string {
 	switch {
 	case !check.Configured:
 		return "the manifest was not compared against a per-service baseline (none is recorded)"
@@ -860,15 +861,15 @@ func baselineSkip(check evidence.ComposeCheck) string {
 // can fail a run. Its vocabulary is deliberately not the review's: a mismatch carries no
 // severity, because there is nothing to rank — either the deployment is the one that was
 // reviewed and recorded, or it is not.
-func reportBaseline(out io.Writer, check evidence.ComposeCheck, contract string) bool {
+func reportBaseline(out io.Writer, check compose.ComposeCheck, contract string) bool {
 	switch {
 	case !check.Configured:
 		fmt.Fprintf(out, "- baseline         not compared (no per-service baseline recorded; see "+
-			"client/evidence/brokercompose.json)\n")
+			"client/evidence/compose/brokercompose.json)\n")
 		return false
 	case !check.Recorded:
 		fmt.Fprintf(out, "- baseline         not compared (no deployment is recorded for this provider on "+
-			"contract %s; see client/evidence/brokercompose.json)\n", contract)
+			"contract %s; see client/evidence/compose/brokercompose.json)\n", contract)
 		return false
 	case check.OK() && check.Complete():
 		fmt.Fprintf(out, "%s baseline         all %d service(s) and %d top-level section(s) match the recorded "+
@@ -901,7 +902,7 @@ func reportBaseline(out io.Writer, check evidence.ComposeCheck, contract string)
 }
 
 // printUnverified lists the broker builds whose release status could not be checked.
-func printUnverified(out io.Writer, check evidence.ComposeCheck) {
+func printUnverified(out io.Writer, check compose.ComposeCheck) {
 	for _, u := range check.Unverified {
 		fmt.Fprintf(out, "    %s: not checked — %s\n", u.Service, u.Reason)
 	}
@@ -973,17 +974,17 @@ func providerBootChains() (attest.BootChainPolicy, error) {
 // reject an empty one. What it does reject is an unreadable or malformed one, in either
 // source: a baseline that failed to load and a baseline with no entries reach the report
 // as the same "not configured" state, and only one of them should be silent.
-func loadComposeBaseline(path string) (evidence.ComposeBaseline, error) {
+func loadComposeBaseline(path string) (compose.ComposeBaseline, error) {
 	if strings.TrimSpace(path) == "" {
-		return evidence.BuiltinComposeBaseline()
+		return compose.BuiltinComposeBaseline()
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return evidence.ComposeBaseline{}, fmt.Errorf("read -app-baseline: %w", err)
+		return compose.ComposeBaseline{}, fmt.Errorf("read -app-baseline: %w", err)
 	}
-	b, err := evidence.ParseComposeBaseline(raw)
+	b, err := compose.ParseComposeBaseline(raw)
 	if err != nil {
-		return evidence.ComposeBaseline{}, fmt.Errorf("%s: %w", path, err)
+		return compose.ComposeBaseline{}, fmt.Errorf("%s: %w", path, err)
 	}
 	return b, nil
 }

@@ -11,6 +11,7 @@ import (
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
 	"github.com/0gfoundation/0g-pc-e2ee/client/evidence"
+	"github.com/0gfoundation/0g-pc-e2ee/client/evidence/compose"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
 )
 
@@ -121,7 +122,7 @@ const cleanCompose = "services:\n  broker:\n    image: ghcr.io/0gfoundation/brok
 // emitted one is settled in composebaseline_test.go against baselines a human wrote. A
 // derived baseline here would be tautological only if it were the sole test of matching,
 // which it is not.
-func baselineFor(t *testing.T, composeText string) evidence.ComposeBaseline {
+func baselineFor(t *testing.T, composeText string) compose.ComposeBaseline {
 	t.Helper()
 	raw, err := json.Marshal(map[string]any{
 		"manifest_version": 2, "runner": "docker-compose", "docker_compose_file": composeText,
@@ -129,7 +130,7 @@ func baselineFor(t *testing.T, composeText string) evidence.ComposeBaseline {
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	review, err := evidence.ReviewCompose(raw, sha256.Sum256(raw), nil)
+	review, err := compose.ReviewCompose(raw, sha256.Sum256(raw), nil)
 	if err != nil {
 		t.Fatalf("ReviewCompose: %v", err)
 	}
@@ -154,7 +155,7 @@ func baselineFor(t *testing.T, composeText string) evidence.ComposeBaseline {
 	if err != nil {
 		t.Fatalf("marshal baseline: %v", err)
 	}
-	out, err := evidence.ParseComposeBaseline(doc)
+	out, err := compose.ParseComposeBaseline(doc)
 	if err != nil {
 		t.Fatalf("ParseComposeBaseline: %v", err)
 	}
@@ -397,15 +398,15 @@ func TestReport_ProviderVerdicts(t *testing.T) {
 	t.Run("the release verdict decides a broker service", func(t *testing.T) {
 		const repo = "ghcr.io/0gfoundation/0g-serving-broker"
 		digest := "sha256:" + strings.Repeat("e", 64)
-		compose := "services:\n  0g-serving-provider-broker:\n    image: " + repo + "@" + digest + "\n    restart: always\n"
+		manifest := "services:\n  0g-serving-provider-broker:\n    image: " + repo + "@" + digest + "\n    restart: always\n"
 		trusted := stubQuote{v: attest.Verified{SignerAddr: signer, MeasurementTrusted: true}}.
-			withManifest(t, compose, nil).withRuntime(evidence.RuntimeState{})
+			withManifest(t, manifest, nil).withRuntime(evidence.RuntimeState{})
 		doc, _ := json.Marshal(map[string]any{"deployments": []any{map[string]any{
 			"name": "test", "contract": contract, "providers": []string{prov},
 			"services": []any{map[string]any{"name": "0g-serving-provider-broker", "image": map[string]any{"repository": repo},
 				"block": []string{"restart: always"}}},
 		}}})
-		baseline, err := evidence.ParseComposeBaseline(doc)
+		baseline, err := compose.ParseComposeBaseline(doc)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -521,7 +522,7 @@ func TestReport_Manifest(t *testing.T) {
 	base := stubQuote{v: attest.Verified{SignerAddr: signer, MeasurementTrusted: true}}
 	// baseline nil means "none recorded", which is now a skip — so a subtest asserting
 	// exit 0 has to supply one, and one asserting the skip must not.
-	runReport := func(t *testing.T, qc stubQuote, strict bool, baseline evidence.ComposeBaseline) (int, string) {
+	runReport := func(t *testing.T, qc stubQuote, strict bool, baseline compose.ComposeBaseline) (int, string) {
 		t.Helper()
 		var out bytes.Buffer
 		code := report(context.Background(), &out, stubService{info: acked}, qc,
@@ -556,7 +557,7 @@ func TestReport_Manifest(t *testing.T) {
 	t.Run("a manifest the quote does not bind fails the run", func(t *testing.T) {
 		qc := base.withManifest(t, cleanCompose, nil)
 		qc.composeHash[0] ^= 0xff
-		code, got := runReport(t, qc, false, evidence.ComposeBaseline{})
+		code, got := runReport(t, qc, false, compose.ComposeBaseline{})
 		if code != 1 {
 			t.Fatalf("code = %d, want 1\n%s", code, got)
 		}
@@ -588,7 +589,7 @@ func TestReport_Manifest(t *testing.T) {
 			},
 		} {
 			t.Run(tc.name, func(t *testing.T) {
-				code, got := runReport(t, tc.qc, false, evidence.ComposeBaseline{})
+				code, got := runReport(t, tc.qc, false, compose.ComposeBaseline{})
 				if code != 3 {
 					t.Fatalf("code = %d, want 3\n%s", code, got)
 				}
@@ -598,7 +599,7 @@ func TestReport_Manifest(t *testing.T) {
 				if !strings.Contains(got, tc.says) {
 					t.Errorf("output does not say why it was skipped (%q):\n%s", tc.says, got)
 				}
-				if code, got := runReport(t, tc.qc, true, evidence.ComposeBaseline{}); code != 1 {
+				if code, got := runReport(t, tc.qc, true, compose.ComposeBaseline{}); code != 1 {
 					t.Errorf("-strict: code = %d, want 1\n%s", code, got)
 				}
 			})
@@ -609,7 +610,7 @@ func TestReport_Manifest(t *testing.T) {
 	// the report has to carry them — and has to carry BOTH, because a baseline pins the
 	// block and the image separately (a broker release moves the image and nothing else).
 	t.Run("block fingerprints", func(t *testing.T) {
-		_, got := runReport(t, base.withManifest(t, cleanCompose, nil), false, evidence.ComposeBaseline{})
+		_, got := runReport(t, base.withManifest(t, cleanCompose, nil), false, compose.ComposeBaseline{})
 		if !strings.Contains(got, "block          ") {
 			t.Errorf("no block fingerprint in the report:\n%s", got)
 		}
@@ -679,10 +680,10 @@ func TestReport_Manifest(t *testing.T) {
 	// blank — a missing line reads as "nothing to report".
 	t.Run("a block that cannot be pinned says so", func(t *testing.T) {
 		// A scalar body. This used to be a merge key, which is now RESOLVED rather than
-		// refused (client/evidence/composeanchor.go) — a body that is not a mapping is
+		// refused (client/evidence/compose/composeanchor.go) — a body that is not a mapping is
 		// what is left that has no canonical form.
 		doc := "services:\n  broker: notamapping\n"
-		_, got := runReport(t, base.withManifest(t, doc, nil), false, evidence.ComposeBaseline{})
+		_, got := runReport(t, base.withManifest(t, doc, nil), false, compose.ComposeBaseline{})
 		if !strings.Contains(got, "cannot be pinned") {
 			t.Errorf("an unpinnable block printed no reason:\n%s", got)
 		}
