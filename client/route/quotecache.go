@@ -70,6 +70,11 @@ type quoteFacts struct {
 	// the derivation needs the quote reply, which only the miss path holds, so a
 	// cache hit that recomputed it would have to fetch again.
 	containers []compose.Service
+	// runtime is what the reply's event log says the CVM runs now (runtimerelease.go),
+	// read under the same verification for the same reason: only the miss path holds the
+	// reply. Its verdict is NOT cached here — it is judged when a record is read, since the
+	// release check behind it completes in the background.
+	runtime runtimeFacts
 }
 
 func newQuoteCache(ttl time.Duration) *quoteCache {

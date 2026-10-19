@@ -297,6 +297,13 @@ var (
 		Namespace: namespace, Subsystem: subsystem, Name: "quote_measurement_untrusted_total",
 		Help: "Genuine quotes whose measurement was not in the allowlist (attest warn mode).",
 	})
+	// The broker build a provider's CVM runs now, judged from its RTMR3 runtime records
+	// (route/runtimerelease.go). Observed, never enforced. The verdict label is the
+	// provider-identity vocabulary: pass, no_match, unavailable, not_checked.
+	runtimeRelease = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "runtime_release_checks_total",
+		Help: "Quote verifications by the verdict on the broker build the provider runs now (observed, not enforced).",
+	}, []string{"verdict"})
 
 	// On-chain signer grounding (route.groundSignerOnChain, trust-chain hop 5).
 	// The outcome label separates the two classes an operator must not conflate:
@@ -370,7 +377,7 @@ func init() {
 		previewAttempts, previewCalls, previewDuration, previewRetrySuppressed,
 		upstreamAttempts, upstreamDuration, streamTTFF, candidateFallbacks, walkBudgetExhausted,
 		signatureFetchCalls, signatureFetchDuration,
-		quoteVerify, quoteVerifyDuration, quoteCache, measurementUntrusted,
+		quoteVerify, quoteVerifyDuration, quoteCache, measurementUntrusted, runtimeRelease,
 		onchainGrounding, onchainRevalidations,
 		warmerSweeps, warmerProviderRefresh, warmerSignerRefresh,
 		warmerReadyProviders, warmerLastSuccess,
@@ -548,6 +555,10 @@ func QuoteCacheLookup(hit bool) { quoteCache.WithLabelValues(hitMiss(hit)).Inc()
 // MeasurementUntrusted counts a genuine quote whose measurement was not in the
 // allowlist (only reachable in attest warn mode; enforce fails the verify).
 func MeasurementUntrusted() { measurementUntrusted.Inc() }
+
+// RuntimeRelease counts one quote verification by the verdict on the broker build the
+// provider runs now: pass, no_match, unavailable or not_checked.
+func RuntimeRelease(verdict string) { runtimeRelease.WithLabelValues(verdict).Inc() }
 
 // OnChainGrounding records the outcome of one on-chain signer-grounding attempt.
 // outcome is a fixed low-cardinality label: ok, ok_stale, mismatch,

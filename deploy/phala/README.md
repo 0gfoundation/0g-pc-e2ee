@@ -715,7 +715,7 @@ it sealed a request to
 is the one the response carried in `X-Provider`.
 
 No new setting is required — the route is on by default and reads results the request
-path already produced. Four settings govern whether it can answer anything, and what
+path already produced. These settings govern whether it can answer anything, and what
 it can say:
 
 | Setting | Effect |
@@ -724,6 +724,7 @@ it can say:
 | `ZG_GATEWAY_ATTEST_ENFORCE` | on (as deployed), an out-of-allowlist boot chain fails the verification, so that provider gets no record and its address 404s — `verdicts.measurement` is `pass` in every record that exists. Off, the same provider is sealed to and reported as `no_match`. |
 | `ZG_GATEWAY_ONCHAIN` | when off, `verdicts.onchain_signer` is `not_checked` rather than a comparison result. When on but the chain could not be read, it is `unavailable` — a chain-RPC problem is never reported as a finding against the provider. |
 | `ZG_GATEWAY_ONCHAIN_ENFORCE` | on (as deployed), a provider the registry does not vouch for is skipped — but **unlike the boot-chain check above it still gets a record**, carrying the `no_match` that rejected it, because a stale earlier `pass` standing for the rest of its TTL while the gateway refuses that provider is the worse failure. So `verdicts.onchain_signer: "no_match"` stays readable under enforce, and a survey of hop 5 does not have to be taken from a warn-mode gateway the way a measurement survey does. |
+| `ZG_GATEWAY_RUNTIME_RELEASES` | on by default with `ZG_GATEWAY_ATTEST`: `verdicts.runtime_release` judges the broker build the provider's CVM runs now (below). Needs egress to `ghcr.io` and `tuf-repo-cdn.sigstore.dev`; set `false` for a CVM without it, which then reports `not_checked`. Never enforced, so it changes nothing about which provider is sealed to. A commented-out line in the compose. |
 | `ZG_GATEWAY_PROVIDER_IDENTITY_ENDPOINT` | on by default; set `false` to remove the route entirely. Appears in the compose only as a commented-out line, per this file's convention. |
 
 **This endpoint does report verdicts, unlike the self-description above — and that is
@@ -768,7 +769,29 @@ an enforcing gateway cannot answer that question, because every provider it can 
 has already passed. The third value, `no_baseline`, means this build's
 `client/evidence/brokerimages.json` carried no entry to compare against, so it says
 nothing about the provider and a panel must render it as "observed only" rather than as
-a failure; a release should never show it. Smoke-test after deploying:
+a failure; a release should never show it.
+
+**`verdicts.runtime_release` is about what runs NOW, and it is observed, not enforced.**
+The boot chain and `compose_hash` say what the CVM booted; on broker v0.5.4 the
+controller can swap the broker image afterwards and records each swap in RTMR3. The
+gateway replays the quote reply's event log to the verified quote's RTMR3, reads the last
+runtime image record (`running_broker`, repository@digest), and checks that build's
+signed release provenance against `client/provenance/policy.json` — the same judgement
+`pcverify -provider` makes. `pass` names the release in `running_release`; `no_match`
+is a build that is not a release (on 2026-10-16, cn-19, cn-20 and cn-41 ran main-branch
+builds swapped in after boot), keys that are not report_data's, or an event log that does
+not replay; `unavailable` is a check that did not run — no event log, records this build
+does not know, or provenance not fetched yet (it is fetched in the background, so a
+provider's first record usually reads `unavailable` for a few seconds); `not_checked`
+means no runtime image record, so the broker is the image `containers` lists, which this
+check does not judge. **A `no_match` here did not stop the gateway from sealing to that
+provider** — enforcing it waits on the per-service compose baseline reaching the gateway
+too, since a provider that never swapped is the case this check says nothing about. Each
+verification is counted in `zg_gateway_runtime_release_checks_total{verdict}`, and a
+`no_match` is logged at warn with the build and the reason. The same check runs in the
+sidecar (`ZG_SIDECAR_RUNTIME_RELEASES`), where it is only logged.
+
+Smoke-test after deploying:
 
 ```sh
 # the address the sealed request was pinned to

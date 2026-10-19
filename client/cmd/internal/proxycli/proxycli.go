@@ -37,6 +37,8 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/client/evidence"
 	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
+	"github.com/0gfoundation/0g-pc-e2ee/client/provenance"
+	"github.com/0gfoundation/0g-pc-e2ee/client/release"
 	"github.com/0gfoundation/0g-pc-e2ee/client/route"
 	"github.com/0gfoundation/0g-pc-e2ee/client/sig"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
@@ -185,6 +187,7 @@ type Flags struct {
 	warmInterval    *time.Duration
 	pccsURL         *string
 	collateralTTL   *time.Duration
+	runtimeReleases *bool
 }
 
 // defaultWarmInterval is the refresh-ahead period the background quote-cache
@@ -209,7 +212,7 @@ const defaultCollateralTTL = time.Hour
 // default: <envPrefix>_LISTEN, _ROUTER_URL, _PROVIDER_URL,
 // _ATTEST, _ATTEST_ENFORCE, _ONCHAIN, _ONCHAIN_ENFORCE,
 // _CHAIN_RPC_URL, _SERVING_CONTRACT, _WARM, _WARM_INTERVAL, _PCCS_URL,
-// _COLLATERAL_TTL.
+// _COLLATERAL_TTL, _RUNTIME_RELEASES.
 // defaultListen is the built-in listen address used when neither the flag nor
 // <envPrefix>_LISTEN is set.
 //
@@ -248,6 +251,8 @@ func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen, defaultRouterURL 
 			fmt.Sprintf("with -attest, fetch Intel PCS collateral (TCB Info, QE Identity, PCK CRL) from this PCCS base (e.g. https://pccs.phala.network) instead of api.trustedservices.intel.com; the root-CA CRL still comes from Intel (env %s)", env("PCCS_URL"))),
 		collateralTTL: fs.Duration("collateral-ttl", envDuration(env("COLLATERAL_TTL"), defaultCollateralTTL),
 			fmt.Sprintf("with -attest, how long to memoize DCAP collateral by URL so it is not re-fetched per provider/sweep; bounds revocation lag, 0 disables (env %s)", env("COLLATERAL_TTL"))),
+		runtimeReleases: fs.Bool("runtime-releases", envBool(env("RUNTIME_RELEASES"), true),
+			fmt.Sprintf("with -attest, judge the broker build each provider's CVM runs now (its RTMR3 runtime records) against the broker's signed release provenance (client/provenance/policy.json), fetching it from ghcr.io and Sigstore's trust root from tuf-repo-cdn.sigstore.dev in the background; observed and logged, never enforced. false for a host with no egress to those (env %s)", env("RUNTIME_RELEASES"))),
 	}
 }
 
@@ -472,6 +477,9 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 	if *f.attestOn {
 		routeOpts = append(routeOpts, route.WithQuoteVerification(
 			newVerifier(label, *f.attestEnforce, *f.pccsURL, *f.collateralTTL, logger), logger))
+		if *f.runtimeReleases {
+			routeOpts = append(routeOpts, route.WithReleaseVerifier(newReleaseVerifier(label, logger), logger))
+		}
 	}
 	// resolver is the CONCRETE on-chain registry the warmer uses to resolve each
 	// provider's endpoint via ServiceInfo. The route's grounding uses the caching
@@ -823,4 +831,26 @@ func envDuration(key string, def time.Duration) time.Duration {
 		log.Fatalf("invalid %s=%q: must be a Go duration (e.g. 4m, 90s)", key, v)
 	}
 	return d
+}
+
+// releaseCheckTimeout bounds one build's provenance fetch from the registry. The check
+// runs in the background (route.WithReleaseVerifier), so this caps a slot's hold, not a
+// request's latency.
+const releaseCheckTimeout = 30 * time.Second
+
+// newReleaseVerifier is the broker release policy the runtime check judges against: the
+// same embedded policy and Sigstore verifier pcverify uses (client/provenance), so a
+// build pcverify calls a release is the build this process calls one.
+//
+// It exits on an error, which means an embedded file is malformed — a defect in this
+// build, the same class as an unparseable boot-chain allowlist.
+func newReleaseVerifier(label string, logger *slog.Logger) *provenance.Verifier {
+	v, err := provenance.New(release.NewHTTPClient(releaseCheckTimeout), releaseCheckTimeout)
+	if err != nil {
+		logger.Error("broker release policy", "err", err)
+		os.Exit(1)
+	}
+	logger.Info("runtime release check enabled (observed, not enforced)", "label", label,
+		"repository", v.Repository())
+	return v
 }

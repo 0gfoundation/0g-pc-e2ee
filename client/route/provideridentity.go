@@ -263,6 +263,26 @@ type ProviderIdentity struct {
 	// pinned only by tag, which leaves ComposeHash committing to a name whose
 	// contents can be republished underneath it.
 	Containers []compose.Service
+	// RuntimeRelease is the verdict on the broker build the provider's CVM runs NOW, read
+	// from the RTMR3 runtime records the quote reply's event log carries, after the log
+	// replayed to the verified quote's RTMR3 (runtimerelease.go, judgeRuntime, has what
+	// each value means here). OBSERVED, never enforced: a no_match here did not stop this
+	// gateway from sealing to the provider, which is why it is reported at all.
+	//
+	// It is judged when the record is READ, not when the quote was verified: the release
+	// check fetches the build's provenance in the background, so a verdict that lands
+	// after the verification is reported without waiting for the next one.
+	RuntimeRelease Verdict
+	// RunningBroker is the build the last runtime image record (zg-image-update) names,
+	// repository@digest — what the quote vouches the CVM runs now — or "" when there is
+	// no such record and the image the manifest pins runs.
+	RunningBroker string
+	// RunningRelease is RunningBroker's release version, e.g. "v0.5.4", when
+	// RuntimeRelease is VerdictPass; "" otherwise.
+	RunningRelease string
+
+	// runtime is what RuntimeRelease and the two fields above are judged from.
+	runtime runtimeFacts
 }
 
 // ProviderIdentitySource is the read side of the record store — the seam the
@@ -492,8 +512,17 @@ func (s *identityStore) get(address string) (ProviderIdentity, bool) {
 // ProviderIdentity implements ProviderIdentitySource against this Router's records.
 // It only ever reads: an address this Router has not verified returns false, and
 // nothing here starts a verification to change that.
+//
+// The runtime release verdict is judged here, on the read, from what the verification
+// recorded and the verdicts the release check holds now; a read never starts a check.
 func (r *Router) ProviderIdentity(address string) (ProviderIdentity, bool) {
-	return r.identities.get(address)
+	id, ok := r.identities.get(address)
+	if !ok {
+		return ProviderIdentity{}, false
+	}
+	v := r.judgeRuntime(id.runtime, false)
+	id.RuntimeRelease, id.RunningBroker, id.RunningRelease = v.verdict, v.running, v.release
+	return id, true
 }
 
 // providerIdentityOf assembles the record from a verified provider: its on-chain
@@ -519,6 +548,7 @@ func providerIdentityOf(address, endpoint string, res quoteResult, onchain Verdi
 		OSImage:       res.facts.osImage,
 		ComposeHash:   res.facts.composeHash,
 		Containers:    res.facts.containers,
+		runtime:       res.facts.runtime,
 	}
 	// A verdict must never reach the wire empty. Every path that builds a quoteResult
 	// records what the boot-chain check concluded, so an unset value would mean a

@@ -115,6 +115,15 @@ type providerIdentityDoc struct {
 	// nothing compared these images against an expected set, so a panel may render
 	// them but must not present the list's existence, or the label, as approval.
 	Containers []providerContainerRef `json:"containers"`
+	// RunningBroker is the broker build the provider's CVM runs NOW, repository@digest,
+	// as its last RTMR3 runtime image record (zg-image-update) names it — a record the
+	// quote vouches for, since the event log had to replay to the quote's RTMR3. Null when
+	// there is no such record: then the broker is the image Containers lists, which the
+	// controller has not swapped. verdicts.runtime_release says whether it is a release.
+	RunningBroker *string `json:"running_broker"`
+	// RunningRelease is RunningBroker's release version, e.g. "v0.5.4" — non-null only
+	// alongside runtime_release "pass", as os_image is beside measurement "pass".
+	RunningRelease *string `json:"running_release"`
 	// Verify is providerVerifyNote. See the file comment.
 	Verify string `json:"verify"`
 }
@@ -194,6 +203,17 @@ type providerVerdicts struct {
 	// "no_match" is unreachable, because that provider is refused rather than recorded
 	// and the address 404s (route.ProviderIdentity.Measurement).
 	Measurement route.Verdict `json:"measurement"`
+	// RuntimeRelease: the broker build the CVM runs now (running_broker) against the
+	// broker's signed release provenance. OBSERVED, never enforced — a "no_match" here
+	// did not stop this gateway from sealing to the provider, and a panel must say so.
+	// "pass" an accepted release whose keys are report_data's; "no_match" a build that is
+	// not a release, keys that differ, an event log that does not replay to the quote, or
+	// containers created after launch; "unavailable" a check that did not run (no event
+	// log, records this gateway does not know, provenance not fetched yet or not
+	// reachable); "not_checked" no runtime image record — the image the compose pins runs,
+	// which this check does not judge — or a deployment with the check off
+	// (route.ProviderIdentity.RuntimeRelease).
+	RuntimeRelease route.Verdict `json:"runtime_release"`
 }
 
 // providerIdentityHandler serves one provider's record from src.
@@ -216,14 +236,17 @@ func providerIdentityHandler(src route.ProviderIdentitySource) http.Handler {
 			Address:  id.Address,
 			Endpoint: id.Endpoint,
 			Verdicts: providerVerdicts{
-				QuoteDCAP:     id.QuoteDCAP,
-				OnChainSigner: id.OnChainSigner,
-				Measurement:   id.Measurement,
+				QuoteDCAP:      id.QuoteDCAP,
+				OnChainSigner:  id.OnChainSigner,
+				Measurement:    id.Measurement,
+				RuntimeRelease: id.RuntimeRelease,
 			},
-			OSImage:     optional(id.OSImage),
-			ComposeHash: optional(id.ComposeHash),
-			Containers:  providerContainersOf(id.Containers),
-			Verify:      providerVerifyNote(id.QuoteURL),
+			OSImage:        optional(id.OSImage),
+			ComposeHash:    optional(id.ComposeHash),
+			Containers:     providerContainersOf(id.Containers),
+			RunningBroker:  optional(id.RunningBroker),
+			RunningRelease: optional(id.RunningRelease),
+			Verify:         providerVerifyNote(id.QuoteURL),
 		}, "", "  ")
 		if err != nil {
 			// Nothing in the document can fail to marshal; a 500 here would be a bug in

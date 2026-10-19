@@ -260,6 +260,9 @@ type Router struct {
 	// quote-verification path (verifier != nil).
 	quoteCache *quoteCache
 	quoteSF    singleflight.Group
+	// releases, when non-nil, judges the broker build each verified provider's CVM runs
+	// now (runtimerelease.go). Observed only: nothing on the request path reads it.
+	releases *releaseJudge
 	// identities keeps, per provider address, the outcome of the checks this process
 	// ran before sealing to that provider — read by the gateway's provider-identity
 	// endpoint (see provideridentity.go). Written only from the path that materializes
@@ -1127,7 +1130,7 @@ func (r *Router) verifyQuoteAt(ctx context.Context, quoteURL string) (res quoteR
 	start := time.Now()
 	defer func() { metrics.QuoteVerification(err == nil, time.Since(start)) }()
 
-	raw, appCompose, err := r.fetchQuote(ctx, quoteURL)
+	raw, appCompose, reply, err := r.fetchQuote(ctx, quoteURL)
 	if err != nil {
 		return quoteResult{}, err
 	}
@@ -1163,6 +1166,11 @@ func (r *Router) verifyQuoteAt(ctx context.Context, quoteURL string) (res quoteR
 		facts.composeHash = hex.EncodeToString(composeHash[:])
 		facts.containers = r.containersOf(appCompose, composeHash, quoteURL)
 	}
+	// The same reply, so the log cannot belong to another quote; and the RTMR3 it must
+	// replay to is the verified one, never a value read out of the reply.
+	facts.runtime = runtimeFacts{signer: verified.SignerAddr, encPub: verified.EncPub}
+	facts.runtime.state, facts.runtime.err = evidence.ReadRuntimeState(reply, verified.Measurement.RTMR3)
+	r.observeRuntime(quoteURL, facts.runtime)
 	return quoteResult{
 		encPub: verified.EncPub,
 		signer: verified.SignerAddr,
@@ -1469,7 +1477,9 @@ func (r *Router) onchainLookupFailed(providerAddr string, cause error) (groundin
 
 // fetchQuote GETs and decodes a provider's /v1/quote reply.
 //
-// It returns two things with very different standing. `raw` is the TDX quote the
+// It returns the reply itself too, for the event log it carries (read only against the
+// verified quote's RTMR3, by evidence.ReadRuntimeState), and two decoded things with very
+// different standing. `raw` is the TDX quote the
 // caller is about to verify. `appCompose` is the app-compose text the same reply
 // carries in its unsigned `tcb_info` — worth nothing until it is hashed against
 // the verified quote's compose_hash (attest.AppComposeFromQuoteResponse says why),
@@ -1477,26 +1487,26 @@ func (r *Router) onchainLookupFailed(providerAddr string, cause error) (groundin
 //
 // A reply carrying no app-compose is not an error: `appCompose` comes back nil and
 // the container list is simply absent. Only the quote is load-bearing here.
-func (r *Router) fetchQuote(ctx context.Context, quoteURL string) (raw, appCompose []byte, err error) {
+func (r *Router) fetchQuote(ctx context.Context, quoteURL string) (raw, appCompose, reply []byte, err error) {
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, quoteURL, nil)
 	if err != nil {
-		return nil, nil, upstream(0, err)
+		return nil, nil, nil, upstream(0, err)
 	}
 	resp, err := r.http.Do(httpReq)
 	if err != nil {
-		return nil, nil, upstream(0, fmt.Errorf("fetch provider quote: %w", err))
+		return nil, nil, nil, upstream(0, fmt.Errorf("fetch provider quote: %w", err))
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxControlBodyBytes))
 	if err != nil {
-		return nil, nil, upstream(0, fmt.Errorf("read provider quote: %w", err))
+		return nil, nil, nil, upstream(0, fmt.Errorf("read provider quote: %w", err))
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, nil, upstreamBody(resp.StatusCode, body, fmt.Errorf("provider quote returned %d", resp.StatusCode))
+		return nil, nil, nil, upstreamBody(resp.StatusCode, body, fmt.Errorf("provider quote returned %d", resp.StatusCode))
 	}
 	raw, err = attest.DecodeQuoteResponse(body)
 	if err != nil {
-		return nil, nil, upstream(0, err)
+		return nil, nil, nil, upstream(0, err)
 	}
 	appCompose, acErr := attest.AppComposeFromQuoteResponse(body)
 	if acErr != nil {
@@ -1519,7 +1529,7 @@ func (r *Router) fetchQuote(ctx context.Context, quoteURL string) (raw, appCompo
 		}
 		appCompose = nil
 	}
-	return raw, appCompose, nil
+	return raw, appCompose, body, nil
 }
 
 // attemptTimeout and retryBudget read the pacing pair with the constants as
