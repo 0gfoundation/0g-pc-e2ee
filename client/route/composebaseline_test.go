@@ -6,10 +6,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -44,6 +48,14 @@ func blManifest(t *testing.T, name string) []byte {
 func blRouter(t *testing.T, address, contract string, committed, served []byte, rels evidence.ReleaseVerifier,
 	opts ...Option) (*Router, string) {
 	t.Helper()
+	return blRouterHeld(t, address, contract, committed, served, rels, nil, nil, opts...)
+}
+
+// blRouterHeld is blRouter whose quote endpoint, when hold is set, answers only once hold
+// is closed, counting fetches in quotes.
+func blRouterHeld(t *testing.T, address, contract string, committed, served []byte, rels evidence.ReleaseVerifier,
+	hold <-chan struct{}, quotes *atomic.Int32, opts ...Option) (*Router, string) {
+	t.Helper()
 	sum := sha256.Sum256(committed)
 	raw := pidQuote(t, qvMeasurement(0xaa), pidMRConfigID(t, 1, hex.EncodeToString(sum[:])))
 	var srv *httptest.Server
@@ -58,6 +70,12 @@ func blRouter(t *testing.T, address, contract string, committed, served []byte, 
 		_, _ = fmt.Fprintf(w, `{"object":"list","data":[{"address":%q}]}`, address)
 	})
 	mux.HandleFunc("GET /v1/quote", func(w http.ResponseWriter, r *http.Request) {
+		if quotes != nil {
+			quotes.Add(1)
+		}
+		if hold != nil {
+			<-hold
+		}
 		tcb, _ := json.Marshal(map[string]string{"app_compose": string(served)})
 		_ = json.NewEncoder(w).Encode(map[string]string{"quote": hex.EncodeToString(raw), "tcb_info": string(tcb)})
 	})
@@ -183,6 +201,92 @@ func TestComposeBaseline_ObservedPerVerification(t *testing.T) {
 	// above started nothing.
 	if n := rels.calls.Load(); n != 1 {
 		t.Fatalf("the broker build was judged %d times, want once", n)
+	}
+}
+
+// logCounter is a slog.Handler counting records, at every level, by message.
+type logCounter struct {
+	mu sync.Mutex
+	n  map[string]int
+}
+
+func (c *logCounter) Enabled(context.Context, slog.Level) bool { return true }
+func (c *logCounter) Handle(_ context.Context, rec slog.Record) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.n[rec.Message]++
+	return nil
+}
+func (c *logCounter) WithAttrs([]slog.Attr) slog.Handler { return c }
+func (c *logCounter) WithGroup(string) slog.Handler      { return c }
+
+func (c *logCounter) count(prefix string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for m, k := range c.n {
+		if strings.HasPrefix(m, prefix) {
+			n += k
+		}
+	}
+	return n
+}
+
+// Requests that reach an expired provider together join ONE verification through the
+// singleflight, and every one of them sees a cache miss — so "this request verified" is
+// not something a request can know. The verification is observed once — one log line
+// about cn-20's manifest (the comparison is incomplete at that moment, its broker build
+// still being judged), not one per request.
+func TestComposeBaseline_ConcurrentRequestsObserveOnce(t *testing.T) {
+	cn20 := blManifest(t, "cn20-app-compose.json")
+	hold := make(chan struct{})
+	var quotes atomic.Int32
+	logs := &logCounter{n: map[string]int{}}
+	r, _ := blRouterHeld(t, blCN20Provider, blMainnetContract, cn20, cn20, fleetStub(), hold, &quotes,
+		func(r *Router) { r.logger = slog.New(logs) })
+
+	const n = 8
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() { errs <- rtServe(r) }()
+	}
+	// Let the requests pile up on the one verification in flight, then answer it.
+	time.Sleep(100 * time.Millisecond)
+	close(hold)
+	for i := 0; i < n; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+	}
+	if q := quotes.Load(); q != 1 {
+		t.Fatalf("%d quote fetches; the requests were meant to share one verification", q)
+	}
+	if got := logs.count("provider's manifest"); got != 1 {
+		t.Fatalf("one verification shared by %d requests was observed %d times, want once", n, got)
+	}
+	// And the record still reaches its verdict.
+	if id := blSettled(t, r, blCN20Provider); id.ComposeBaseline != VerdictNoMatch {
+		t.Fatalf("got %q", id.ComposeBaseline)
+	}
+}
+
+// The token is per verification AND per provider: one endpoint can serve several
+// registrations, each compared against its own record, and each is observed once.
+func TestComposeBaseline_ObservedOncePerProvider(t *testing.T) {
+	r := New("", WithComposeBaseline(compose.ComposeBaseline{}, blMainnetContract))
+	r.logger = discardLogger()
+	f := manifestFacts{observed: newObservation(), err: "no manifest"}
+	if !r.observeBaseline(blCN20Provider, f) {
+		t.Fatal("the first use was not observed")
+	}
+	if r.observeBaseline(blCN20Provider, f) || r.observeBaseline(strings.ToLower(blCN20Provider), f) {
+		t.Fatal("the same verification was observed twice for one provider")
+	}
+	if !r.observeBaseline(blTestnetProvider, f) {
+		t.Fatal("a second provider sharing the verification was not observed")
+	}
+	if !r.observeBaseline(blCN20Provider, manifestFacts{observed: newObservation(), err: "no manifest"}) {
+		t.Fatal("a new verification was not observed")
 	}
 }
 

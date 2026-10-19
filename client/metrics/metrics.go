@@ -305,11 +305,11 @@ var (
 		Help: "Quote verifications by the verdict on the broker build the provider runs now (observed, not enforced).",
 	}, []string{"verdict"})
 	// The manifest a provider's CVM booted against the deployment recorded for it
-	// (route/composebaseline.go). Observed, never enforced. Counted per verification of
-	// a provider — a fresh one on the request path, and every warmer sweep.
+	// (route/composebaseline.go). Observed, never enforced. Counted once per quote
+	// verification and provider, however many requests share that verification.
 	composeBaseline = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "compose_baseline_checks_total",
-		Help: "Provider verifications by the verdict on its manifest against its recorded deployment (observed, not enforced).",
+		Help: "Provider quote verifications (once per verification and provider) by the verdict on the manifest against the provider's recorded deployment (observed, not enforced).",
 	}, []string{"verdict"})
 
 	// On-chain signer grounding (route.groundSignerOnChain, trust-chain hop 5).

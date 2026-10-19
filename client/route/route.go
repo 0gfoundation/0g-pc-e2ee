@@ -854,16 +854,11 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 		// identity below.
 		verified    quoteResult
 		quoteCached bool
-		// fresh is whether verified came from a verification made for this request,
-		// rather than the quote cache — when what it establishes is observed (counted
-		// and logged) rather than only recorded.
-		fresh bool
-		err   error
+		err         error
 	)
 	if c.router.verifier != nil {
 		verified, quoteCached, err = c.router.verifiedProviderCached(ctx, prov.Endpoint)
 		encPub, signer = verified.encPub, verified.signer
-		fresh = !quoteCached
 	} else {
 		var pubkeyURL string
 		pubkeyURL, err = derivePubkeyURL(prov.Endpoint)
@@ -913,7 +908,7 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 		// mode would go on sealing to an enclave that has rotated and the request would
 		// fail at the provider.
 		if g.outcome == groundingMismatch && quoteCached {
-			rotated, rerr := c.router.reverifiedProvider(ctx, prov.Endpoint)
+			fresh, rerr := c.router.reverifiedProvider(ctx, prov.Endpoint)
 			// All three arms say something, because a mismatch that survives to the
 			// metric is `onchain_grounding_total{outcome="mismatch"}` — the counter the
 			// runbook pages on as an accusation against a provider. Unlogged, "the
@@ -925,14 +920,14 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 				// nothing. The mismatch below is the CACHED quote's, never re-checked.
 				c.router.logger.Warn("could not re-verify the quote after an on-chain signer mismatch; the mismatch stands on the cached quote",
 					"provider", prov.Address, "cached_signer", signer, "err", rerr)
-			case rotated.signer != signer:
+			case fresh.signer != signer:
 				c.router.logger.Info("re-verified quote after an on-chain signer mismatch; the cached quote had rotated",
-					"provider", prov.Address, "cached_signer", signer, "fresh_signer", rotated.signer)
+					"provider", prov.Address, "cached_signer", signer, "fresh_signer", fresh.signer)
 				// Take the fresh result WHOLE, facts included: they describe the enclave we
 				// are now sealing to, and a record built from the rotated-away quote would
 				// report the wrong compose hash for the request that actually happened.
-				verified, fresh = rotated, true
-				encPub, signer = rotated.encPub, rotated.signer
+				verified = fresh
+				encPub, signer = fresh.encPub, fresh.signer
 				g, err = c.router.groundSignerOnChain(ctx, prov.Address, signer)
 				g.revalidated = true
 			default:
@@ -964,9 +959,10 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 	// word for it would be worse than reporting nothing.
 	if c.router.verifier != nil {
 		c.router.recordProviderIdentity(providerIdentityOf(prov.Address, prov.Endpoint, verified, onchain))
-		if fresh {
-			c.router.observeBaseline(prov.Address, verified.facts.manifest)
-		}
+		// A no-op unless this is the first use of this verification for this provider,
+		// which the verification itself tracks: a request cannot tell, since every caller
+		// that joined it through the singleflight saw a cache miss.
+		c.router.observeBaseline(prov.Address, verified.facts.manifest)
 	}
 	if grounded != nil {
 		return core.Provider{}, grounded
