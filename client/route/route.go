@@ -1173,11 +1173,11 @@ func (r *Router) verifyQuoteAt(ctx context.Context, quoteURL string) (res quoteR
 		facts.composeHash = hex.EncodeToString(composeHash[:])
 		facts.containers = r.containersOf(appCompose, composeHash, quoteURL)
 	}
-	facts.manifest = r.readManifest(appCompose, composeHash, haveHash)
+	facts.manifest = r.readManifest(appCompose, composeHash, haveHash, quoteURL)
 	// The same reply, so the log cannot belong to another quote; and the RTMR3 it must
 	// replay to is the verified one, never a value read out of the reply.
 	facts.runtime = runtimeFacts{signer: verified.SignerAddr, encPub: verified.EncPub}
-	facts.runtime.state, facts.runtime.err = evidence.ReadRuntimeState(reply, verified.Measurement.RTMR3)
+	facts.runtime.state, facts.runtime.err = r.readRuntime(reply, verified.Measurement.RTMR3, quoteURL)
 	r.observeRuntime(quoteURL, facts.runtime)
 	return quoteResult{
 		encPub: verified.EncPub,

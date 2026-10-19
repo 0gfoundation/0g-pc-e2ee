@@ -243,8 +243,34 @@ func ReviewCompose(raw []byte, composeHash [attest.ComposeHashLen]byte, releases
 	if err := json.Unmarshal(raw, &fields); err != nil {
 		return ComposeReview{}, fmt.Errorf("app-compose is not a JSON object: %w", err)
 	}
+	return reviewFields(fields, releases), nil
+}
 
-	r := ComposeReview{Fields: sortedKeys(fields), releases: releases}
+// reviewText is the compose-text half of a review. A variable only so a test can make it
+// fail the way no input is known to.
+var reviewText = (*ComposeReview).reviewComposeText
+
+// reviewFields is ReviewCompose past the gate: everything that reads what the provider
+// wrote.
+//
+// NOTHING HERE MAY CRASH THE CALLER. The input is the provider's, and the callers are a
+// CLI run and — since the sealing path compares manifests too (route/composebaseline.go)
+// — the gateway and the sidecar, long-running processes that serve every other provider
+// as well. loadModel already turns a panic in compose-go into a manifest it did not read;
+// this does the same for everything around it (the document read, the top-level and
+// service canonicalization, the rules), so a manifest that trips any of it is reported
+// as not read — a check that did not run, errNotRead — never as a crash, and never as a
+// mismatch the code could not stand behind. The review is returned empty but for that
+// one finding: a half-built one would describe part of a manifest as if it were all.
+func reviewFields(fields map[string]json.RawMessage, releases evidence.ReleaseVerifier) (r ComposeReview) {
+	defer func() {
+		if p := recover(); p != nil {
+			err := fmt.Errorf("reading the manifest failed (%v), so it was not compared (%w)", p, errNotRead)
+			r = ComposeReview{Fields: sortedKeys(fields), releases: releases, LoadErr: err}
+			r.add(SeverityBlocking, "", "docker_compose_file", err.Error())
+		}
+	}()
+	r = ComposeReview{Fields: sortedKeys(fields), releases: releases}
 	r.Name, _ = jsonString(fields["name"]) // a label; an unreadable one is not a finding
 	r.reviewAppComposeFields(fields)
 
@@ -258,10 +284,10 @@ func ReviewCompose(raw []byte, composeHash [attest.ComposeHashLen]byte, releases
 		r.add(SeverityBlocking, "", "docker_compose_file",
 			"the manifest embeds no compose text, so there is nothing to pin per service")
 	default:
-		r.reviewComposeText([]byte(text))
+		reviewText(&r, []byte(text))
 	}
 	r.sortFindings()
-	return r, nil
+	return r
 }
 
 // add appends a finding.
