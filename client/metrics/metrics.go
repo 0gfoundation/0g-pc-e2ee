@@ -298,18 +298,24 @@ var (
 		Help: "Genuine quotes whose measurement was not in the allowlist (attest warn mode).",
 	})
 	// The broker build a provider's CVM runs now, judged from its RTMR3 runtime records
-	// (route/runtimerelease.go). Observed, never enforced. The verdict label is the
+	// (route/runtimerelease.go), whether or not provider enforce acts on it. The verdict label is the
 	// provider-identity vocabulary: pass, no_match, unavailable, not_checked.
 	runtimeRelease = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "runtime_release_checks_total",
-		Help: "Quote verifications by the verdict on the broker build the provider runs now (observed, not enforced).",
+		Help: "Quote verifications by the verdict on the broker build the provider runs now.",
 	}, []string{"verdict"})
+	// Candidates refused under provider enforce (route/enforce.go), by which check did not
+	// pass: runtime_release or compose_baseline. A candidate failing both counts in both.
+	providerEnforceRefusals = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "provider_enforce_refusals_total",
+		Help: "Candidates refused under provider enforce, by the check that did not pass (runtime_release, compose_baseline).",
+	}, []string{"check"})
 	// The manifest a provider's CVM booted against the deployment recorded for it
-	// (route/composebaseline.go). Observed, never enforced. Counted once per quote
+	// (route/composebaseline.go), whether or not provider enforce acts on it. Counted once per quote
 	// verification and provider, however many requests share that verification.
 	composeBaseline = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "compose_baseline_checks_total",
-		Help: "Provider quote verifications (once per verification and provider) by the verdict on the manifest against the provider's recorded deployment (observed, not enforced).",
+		Help: "Provider quote verifications (once per verification and provider) by the verdict on the manifest against the provider's recorded deployment.",
 	}, []string{"verdict"})
 
 	// On-chain signer grounding (route.groundSignerOnChain, trust-chain hop 5).
@@ -384,7 +390,7 @@ func init() {
 		previewAttempts, previewCalls, previewDuration, previewRetrySuppressed,
 		upstreamAttempts, upstreamDuration, streamTTFF, candidateFallbacks, walkBudgetExhausted,
 		signatureFetchCalls, signatureFetchDuration,
-		quoteVerify, quoteVerifyDuration, quoteCache, measurementUntrusted, runtimeRelease, composeBaseline,
+		quoteVerify, quoteVerifyDuration, quoteCache, measurementUntrusted, runtimeRelease, composeBaseline, providerEnforceRefusals,
 		onchainGrounding, onchainRevalidations,
 		warmerSweeps, warmerProviderRefresh, warmerSignerRefresh,
 		warmerReadyProviders, warmerLastSuccess,
@@ -566,6 +572,10 @@ func MeasurementUntrusted() { measurementUntrusted.Inc() }
 // RuntimeRelease counts one quote verification by the verdict on the broker build the
 // provider runs now: pass, no_match, unavailable or not_checked.
 func RuntimeRelease(verdict string) { runtimeRelease.WithLabelValues(verdict).Inc() }
+
+// ProviderEnforceRefusal counts one candidate refused under provider enforce because
+// check (runtime_release or compose_baseline) did not pass.
+func ProviderEnforceRefusal(check string) { providerEnforceRefusals.WithLabelValues(check).Inc() }
 
 // ComposeBaseline counts one provider verification by the verdict on its manifest
 // against its recorded deployment: pass, no_match, no_baseline, unavailable or

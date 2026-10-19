@@ -9,6 +9,8 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -356,6 +358,50 @@ func TestBuildClientsFollowWhatTheBinaryServes(t *testing.T) {
 				if built.Clients[ep.Path] == nil {
 					t.Errorf("no client for served surface %s", ep.Path)
 				}
+			}
+		})
+	}
+}
+
+// -provider-enforce gates on a record keyed by the router-supplied provider address, so
+// every combination in which that address is not bound to the enclave — or in which no
+// provider could pass — must refuse to start rather than run a gate that means nothing.
+// Build exits the process on a bad combination, so each runs in a child.
+func TestBuildProviderEnforceRefusesUnsafeCombinations(t *testing.T) {
+	if args := os.Getenv("PROXYCLI_BUILD_ARGS"); args != "" {
+		fs := flag.NewFlagSet("t", flag.ContinueOnError)
+		f := RegisterFlags(fs, "ZG_TEST", ":0", route.DefaultRouterURL)
+		if err := fs.Parse(strings.Fields(args)); err != nil {
+			os.Exit(2)
+		}
+		f.Build("test", slog.New(slog.NewTextHandler(os.Stderr, nil)))
+		os.Exit(0)
+	}
+	for _, tc := range []struct {
+		args, says string
+	}{
+		{"-provider-enforce", "requires -attest"},
+		{"-attest -provider-enforce", "requires -onchain-enforce"},
+		{"-attest -onchain -provider-enforce", "requires -onchain-enforce"},
+		{"-attest -onchain -onchain-enforce -runtime-releases=false -provider-enforce", "requires -runtime-releases"},
+		{"-provider-url https://broker.example/v1 -attest -provider-enforce", "direct-broker mode"},
+		{"-attest -onchain -onchain-enforce -provider-enforce", ""}, // starts
+	} {
+		t.Run(tc.args, func(t *testing.T) {
+			cmd := exec.Command(os.Args[0], "-test.run=^TestBuildProviderEnforceRefusesUnsafeCombinations$")
+			cmd.Env = append(os.Environ(), "PROXYCLI_BUILD_ARGS="+tc.args)
+			out, err := cmd.CombinedOutput()
+			code := 0
+			if ee, ok := err.(*exec.ExitError); ok {
+				code = ee.ExitCode()
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			switch {
+			case tc.says == "" && code != 0:
+				t.Fatalf("a safe combination did not start (exit %d):\n%s", code, out)
+			case tc.says != "" && (code != 1 || !strings.Contains(string(out), tc.says)):
+				t.Fatalf("exit %d, want 1 saying %q:\n%s", code, tc.says, out)
 			}
 		})
 	}

@@ -261,11 +261,18 @@ type Router struct {
 	quoteCache *quoteCache
 	quoteSF    singleflight.Group
 	// releases, when non-nil, judges the broker build each verified provider's CVM runs
-	// now (runtimerelease.go). Observed only: nothing on the request path reads it.
+	// now (runtimerelease.go). Observed, unless providerEnforce makes it a gate.
 	releases *releaseJudge
 	// baseline, when non-nil, holds each verified provider's manifest against the
-	// deployment recorded for it (composebaseline.go). Observed only, like releases.
+	// deployment recorded for it (composebaseline.go). Observed, unless providerEnforce
+	// makes it a gate.
 	baseline *composeBaseline
+	// providerEnforce makes the two checks above a gate (enforce.go): a candidate whose
+	// provider does not pass both is refused, as onchainEnforce refuses one the registry
+	// does not vouch for. providerEnforceWaitTO, when set, is a test's shorter bound on
+	// waiting for a release verdict (see enforceWait).
+	providerEnforce       bool
+	providerEnforceWaitTO time.Duration
 	// identities keeps, per provider address, the outcome of the checks this process
 	// ran before sealing to that provider — read by the gateway's provider-identity
 	// endpoint (see provideridentity.go). Written only from the path that materializes
@@ -966,6 +973,14 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 	}
 	if grounded != nil {
 		return core.Provider{}, grounded
+	}
+	// Checked after the record, like grounding, so a refused provider is still reported
+	// with the verdicts that refused it; and after grounding, which is what binds the
+	// router-supplied address the baseline is keyed by to this enclave.
+	if c.router.verifier != nil && c.router.providerEnforce {
+		if err := c.router.refuseProvider(ctx, prov.Address, verified.facts); err != nil {
+			return core.Provider{}, err
+		}
 	}
 	// Two distinct pins, which may differ (so they are NOT cross-checked):
 	//   - SignerAddr (broker's signer_address) → sealed into _e2ee.signer_addr,

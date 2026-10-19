@@ -724,7 +724,8 @@ it can say:
 | `ZG_GATEWAY_ATTEST_ENFORCE` | on (as deployed), an out-of-allowlist boot chain fails the verification, so that provider gets no record and its address 404s — `verdicts.measurement` is `pass` in every record that exists. Off, the same provider is sealed to and reported as `no_match`. |
 | `ZG_GATEWAY_ONCHAIN` | when off, `verdicts.onchain_signer` is `not_checked` rather than a comparison result. When on but the chain could not be read, it is `unavailable` — a chain-RPC problem is never reported as a finding against the provider. |
 | `ZG_GATEWAY_ONCHAIN_ENFORCE` | on (as deployed), a provider the registry does not vouch for is skipped — but **unlike the boot-chain check above it still gets a record**, carrying the `no_match` that rejected it, because a stale earlier `pass` standing for the rest of its TTL while the gateway refuses that provider is the worse failure. So `verdicts.onchain_signer: "no_match"` stays readable under enforce, and a survey of hop 5 does not have to be taken from a warn-mode gateway the way a measurement survey does. |
-| `ZG_GATEWAY_RUNTIME_RELEASES` | on by default with `ZG_GATEWAY_ATTEST`: `verdicts.runtime_release` judges the broker build the provider's CVM runs now (below). Needs egress to `ghcr.io` and `tuf-repo-cdn.sigstore.dev`; set `false` for a CVM without it, which then reports `not_checked`. Never enforced, so it changes nothing about which provider is sealed to. A commented-out line in the compose. |
+| `ZG_GATEWAY_RUNTIME_RELEASES` | on by default with `ZG_GATEWAY_ATTEST`: `verdicts.runtime_release` judges the broker build the provider's CVM runs now (below). Needs egress to `ghcr.io` and `tuf-repo-cdn.sigstore.dev`; set `false` for a CVM without it, which then reports `not_checked`. On its own it changes nothing about which provider is sealed to. A commented-out line in the compose. |
+| `ZG_GATEWAY_PROVIDER_ENFORCE` | **off** (as deployed). On, `runtime_release` and `compose_baseline` become a gate together (below): a candidate is sealed to only when both pass, and is skipped otherwise — including `no_baseline` and `unavailable`, fail-closed like `ZG_GATEWAY_ONCHAIN_ENFORCE`. Requires `ZG_GATEWAY_ATTEST`, `ZG_GATEWAY_ONCHAIN_ENFORCE` (the record is keyed by the router-supplied address, which only on-chain enforce binds to the enclave) and `ZG_GATEWAY_RUNTIME_RELEASES`; the gateway refuses to start otherwise. A refused provider still has a record, with the verdicts that refused it. |
 | `ZG_GATEWAY_PROVIDER_IDENTITY_ENDPOINT` | on by default; set `false` to remove the route entirely. Appears in the compose only as a commented-out line, per this file's convention. |
 
 **This endpoint does report verdicts, unlike the self-description above — and that is
@@ -771,7 +772,7 @@ has already passed. The third value, `no_baseline`, means this build's
 nothing about the provider and a panel must render it as "observed only" rather than as
 a failure; a release should never show it.
 
-**`verdicts.runtime_release` is about what runs NOW, and it is observed, not enforced.**
+**`verdicts.runtime_release` is about what runs NOW, and it is a gate only under provider enforce.**
 The boot chain and `compose_hash` say what the CVM booted; on broker v0.5.4 the
 controller can swap the broker image afterwards and records each swap in RTMR3. The
 gateway replays the quote reply's event log to the verified quote's RTMR3, reads the last
@@ -791,7 +792,7 @@ the build and the reason. The same check runs in the sidecar
 (`ZG_SIDECAR_RUNTIME_RELEASES`), where it is only logged.
 
 **`verdicts.compose_baseline` holds the manifest against the deployment recorded for this
-provider, and it is observed, not enforced too.** The manifest is the app-compose that
+provider, and it too is a gate only under provider enforce.** The manifest is the app-compose that
 `compose_hash` commits to, loaded as dstack's docker compose loads it, and compared
 service by service and section by section against the deployment
 `client/evidence/compose/brokercompose.json` records for this provider on this contract
@@ -807,9 +808,22 @@ them. No setting: the baseline is embedded and needs no network, so it is on whe
 `ZG_GATEWAY_ATTEST` is. Counted in `zg_gateway_compose_baseline_checks_total{verdict}`,
 with a `no_match` logged at warn.
 
-The two are only enforceable together, and neither is enforced yet: the runtime check
-says nothing about a provider that never swapped, and only the baseline judges what it
-booted.
+**`ZG_GATEWAY_PROVIDER_ENFORCE` makes the two a gate, together and only together**: the
+runtime check says nothing about a provider that never swapped (`not_checked`), and only
+the baseline judges what it booted, so a `not_checked` there passes only beside a baseline
+`pass`. Everything else refuses the candidate — `no_match`, and equally `no_baseline` and
+`unavailable`. A build seen for the first time is waited for (up to 15s per request,
+while its provenance is fetched) rather than refused for being new; accepted releases
+are judged once for the life of the process, so the wait is paid once per build, and the
+warmer pays it before any request does. Refusals are counted in
+`zg_gateway_provider_enforce_refusals_total{check}` and logged at warn; under enforce a
+provider that would be refused is not counted ready by the warmer either, so it holds
+back a blue/green cutover as an on-chain refusal does. **It stays off on this
+deployment**: on 2026-10-19 no mainnet provider passes — cn-19, cn-20 and cn-41 run
+builds the policy refuses, and only cn-20 is recorded — so enforcing would refuse the
+whole fleet. Turn it on once `zg_gateway_runtime_release_checks_total` and
+`zg_gateway_compose_baseline_checks_total` show `pass` for every provider being routed
+to, read off a gateway with it off, the way on-chain enforce was decided.
 
 Smoke-test after deploying:
 

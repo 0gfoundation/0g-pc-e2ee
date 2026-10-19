@@ -81,6 +81,14 @@ func rtVector(t *testing.T, name string, edit func(map[string]any)) []byte {
 // RTMR3 that real quote carries, and the image record has to name its keys.
 func rtRouter(t *testing.T, reply []byte, rels evidence.ReleaseVerifier, extra ...Option) (*Router, *httptest.Server) {
 	t.Helper()
+	return rtRouterAt(t, testProviderAddr, reply, rels, extra...)
+}
+
+// rtRouterAt is rtRouter with the candidate — and the one provider the catalog lists —
+// at address.
+func rtRouterAt(t *testing.T, address string, reply []byte, rels evidence.ReleaseVerifier,
+	extra ...Option) (*Router, *httptest.Server) {
+	t.Helper()
 	raw, err := attest.DecodeQuoteResponse(reply)
 	if err != nil {
 		t.Fatal(err)
@@ -94,8 +102,11 @@ func rtRouter(t *testing.T, reply []byte, rels evidence.ReleaseVerifier, extra .
 	mux.HandleFunc("POST /v1/routing/preview", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(previewResponse{
 			Object: "routing.preview", ServiceType: "chatbot",
-			Providers: []previewProvider{{Address: testProviderAddr, CanonicalID: "canon-1", Endpoint: srv.URL, ModelID: "m"}},
+			Providers: []previewProvider{{Address: address, CanonicalID: "canon-1", Endpoint: srv.URL, ModelID: "m"}},
 		})
+	})
+	mux.HandleFunc("GET /v1/providers", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"object": "list", "data": []map[string]string{{"address": address}}})
 	})
 	mux.HandleFunc("GET /v1/quote", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write(reply) })
 	srv = httptest.NewServer(mux)

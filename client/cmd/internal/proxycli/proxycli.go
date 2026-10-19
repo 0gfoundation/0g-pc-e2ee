@@ -189,6 +189,7 @@ type Flags struct {
 	pccsURL         *string
 	collateralTTL   *time.Duration
 	runtimeReleases *bool
+	providerEnforce *bool
 }
 
 // defaultWarmInterval is the refresh-ahead period the background quote-cache
@@ -213,7 +214,7 @@ const defaultCollateralTTL = time.Hour
 // default: <envPrefix>_LISTEN, _ROUTER_URL, _PROVIDER_URL,
 // _ATTEST, _ATTEST_ENFORCE, _ONCHAIN, _ONCHAIN_ENFORCE,
 // _CHAIN_RPC_URL, _SERVING_CONTRACT, _WARM, _WARM_INTERVAL, _PCCS_URL,
-// _COLLATERAL_TTL, _RUNTIME_RELEASES.
+// _COLLATERAL_TTL, _RUNTIME_RELEASES, _PROVIDER_ENFORCE.
 // defaultListen is the built-in listen address used when neither the flag nor
 // <envPrefix>_LISTEN is set.
 //
@@ -253,7 +254,9 @@ func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen, defaultRouterURL 
 		collateralTTL: fs.Duration("collateral-ttl", envDuration(env("COLLATERAL_TTL"), defaultCollateralTTL),
 			fmt.Sprintf("with -attest, how long to memoize DCAP collateral by URL so it is not re-fetched per provider/sweep; bounds revocation lag, 0 disables (env %s)", env("COLLATERAL_TTL"))),
 		runtimeReleases: fs.Bool("runtime-releases", envBool(env("RUNTIME_RELEASES"), true),
-			fmt.Sprintf("with -attest, judge the broker build each provider's CVM runs now (its RTMR3 runtime records) against the broker's signed release provenance (client/provenance/policy.json), fetching it from ghcr.io and Sigstore's trust root from tuf-repo-cdn.sigstore.dev in the background; observed and logged, never enforced. false for a host with no egress to those (env %s)", env("RUNTIME_RELEASES"))),
+			fmt.Sprintf("with -attest, judge the broker build each provider's CVM runs now (its RTMR3 runtime records) against the broker's signed release provenance (client/provenance/policy.json), fetching it from ghcr.io and Sigstore's trust root from tuf-repo-cdn.sigstore.dev in the background; observed and logged, and a gate only under -provider-enforce. false for a host with no egress to those (env %s)", env("RUNTIME_RELEASES"))),
+		providerEnforce: fs.Bool("provider-enforce", envBool(env("PROVIDER_ENFORCE"), false),
+			fmt.Sprintf("seal only to a provider whose manifest is the deployment recorded for it (client/evidence/compose/brokercompose.json) and whose broker build running now is an accepted release; skip any other, including one nobody recorded and one whose checks could not run. Requires -attest, -onchain-enforce (which binds the router-supplied address the record is keyed by) and -runtime-releases; not in direct-broker mode. Turn it on only once every provider being routed to is recorded and on a release (env %s)", env("PROVIDER_ENFORCE"))),
 	}
 }
 
@@ -457,6 +460,27 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 		logger.Error("-warm requires -attest and -onchain")
 		os.Exit(1)
 	}
+	// Provider enforce gates on a record keyed by the provider's address, which the
+	// router supplies and only on-chain enforce binds to the enclave; on the release
+	// verdicts -runtime-releases fetches; and on a quote to read both from. Direct-broker
+	// mode has no address at all. Without any of these every candidate would be refused,
+	// or worse, judged against a record the router chose, so the combination fails loud.
+	if *f.providerEnforce {
+		switch {
+		case directMode:
+			logger.Error("-provider-enforce is not supported in direct-broker mode (-provider-url): there is no provider address to look a recorded deployment up by")
+			os.Exit(1)
+		case !*f.attestOn:
+			logger.Error("-provider-enforce requires -attest (the checks read the verified quote)")
+			os.Exit(1)
+		case !*f.onchainEnforce:
+			logger.Error("-provider-enforce requires -onchain-enforce (the router supplies the provider address the recorded deployment is keyed by; only on-chain enforce binds it to the enclave)")
+			os.Exit(1)
+		case !*f.runtimeReleases:
+			logger.Error("-provider-enforce requires -runtime-releases (without release verdicts no provider can pass)")
+			os.Exit(1)
+		}
+	}
 	if *f.warmOn && *f.warmInterval <= 0 {
 		logger.Error("-warm requires a positive -warm-interval")
 		os.Exit(1)
@@ -479,9 +503,16 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 		routeOpts = append(routeOpts, route.WithQuoteVerification(
 			newVerifier(label, *f.attestEnforce, *f.pccsURL, *f.collateralTTL, logger), logger))
 		if *f.runtimeReleases {
-			routeOpts = append(routeOpts, route.WithReleaseVerifier(newReleaseVerifier(label, logger), logger))
+			routeOpts = append(routeOpts, route.WithReleaseVerifier(newReleaseVerifier(label, *f.providerEnforce, logger),
+				logger))
 		}
-		routeOpts = append(routeOpts, route.WithComposeBaseline(builtinBaseline(label, logger), *f.servingContract))
+		routeOpts = append(routeOpts, route.WithComposeBaseline(builtinBaseline(label, *f.providerEnforce, logger),
+			*f.servingContract))
+		if *f.providerEnforce {
+			routeOpts = append(routeOpts, route.WithProviderEnforce(true))
+			logger.Info("provider enforce enabled: a provider is sealed to only when its manifest is its recorded "+
+				"deployment and its running broker build is an accepted release", "label", label)
+		}
 	}
 	// resolver is the CONCRETE on-chain registry the warmer uses to resolve each
 	// provider's endpoint via ServiceInfo. The route's grounding uses the caching
@@ -843,7 +874,7 @@ func envDuration(key string, def time.Duration) time.Duration {
 //
 // It exits on an error, which means the embedded file is malformed — a defect in this
 // build.
-func builtinBaseline(label string, logger *slog.Logger) compose.ComposeBaseline {
+func builtinBaseline(label string, enforce bool, logger *slog.Logger) compose.ComposeBaseline {
 	b, err := compose.BuiltinComposeBaseline()
 	if err != nil {
 		logger.Error("compose baseline", "err", err)
@@ -853,7 +884,7 @@ func builtinBaseline(label string, logger *slog.Logger) compose.ComposeBaseline 
 	for _, d := range b.Deployments {
 		names = append(names, d.Name)
 	}
-	logger.Info("compose baseline comparison enabled (observed, not enforced)", "label", label,
+	logger.Info("compose baseline comparison enabled", "label", label, "enforce", enforce,
 		"deployments", strings.Join(names, ","))
 	return b
 }
@@ -869,13 +900,13 @@ const releaseCheckTimeout = 30 * time.Second
 //
 // It exits on an error, which means an embedded file is malformed — a defect in this
 // build, the same class as an unparseable boot-chain allowlist.
-func newReleaseVerifier(label string, logger *slog.Logger) *provenance.Verifier {
+func newReleaseVerifier(label string, enforce bool, logger *slog.Logger) *provenance.Verifier {
 	v, err := provenance.New(release.NewHTTPClient(releaseCheckTimeout), releaseCheckTimeout)
 	if err != nil {
 		logger.Error("broker release policy", "err", err)
 		os.Exit(1)
 	}
-	logger.Info("runtime release check enabled (observed, not enforced)", "label", label,
+	logger.Info("runtime release check enabled", "label", label, "enforce", enforce,
 		"repository", v.Repository())
 	return v
 }

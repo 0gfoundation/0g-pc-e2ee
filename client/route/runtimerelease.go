@@ -11,11 +11,12 @@ package route
 // the reply's event log to the verified quote's RTMR3 makes those records as good as the
 // quote, and the last one names the build serving now.
 //
-// OBSERVE ONLY. Nothing here changes which provider is used or whether a request is
-// sealed: the verdict is recorded (ProviderIdentity.RuntimeRelease), counted, and logged.
-// An enforce switch waits on the compose baseline reaching this path too: a provider
-// that never swapped has no runtime record, and only the baseline judges what it booted,
-// so enforcing this check alone would pass exactly the providers it says nothing about.
+// OBSERVED, AND ENFORCED ONLY WITH THE BASELINE. This file records the verdict
+// (ProviderIdentity.RuntimeRelease), counts and logs it, and changes nothing about which
+// provider is used. Provider enforce (enforce.go) is what turns it into a gate, and only
+// together with the compose baseline: a provider that never swapped has no runtime
+// record, and only the baseline judges what it booted, so enforcing this check alone
+// would pass exactly the providers it says nothing about.
 //
 // OFF THE REQUEST PATH. Reading the runtime state is local and cheap (verifyQuoteAt does
 // it with the quote). Judging a build is not — it fetches the build's provenance from
@@ -25,6 +26,7 @@ package route
 // after the quote was verified is reported without waiting for the next verification.
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"strings"
@@ -80,8 +82,7 @@ type runtimeVerdict struct {
 	why []string
 }
 
-// judgeRuntime judges f. start says whether a build with no verdict yet may be sent for
-// one: true on a verification, false on a read, which never starts work.
+// judgeRuntime judges f, asking the release judge for verdicts as l says (see lookup).
 //
 //   - no_match: a contradiction — the log does not replay to the quote's RTMR3, the build
 //     is not an accepted release, its keys are not report_data's, or the controller
@@ -94,7 +95,7 @@ type runtimeVerdict struct {
 //     process was not given a release verifier.
 //   - pass: the last runtime image record names an accepted release whose keys are
 //     report_data's, and nothing above applies.
-func (r *Router) judgeRuntime(f runtimeFacts, start bool) runtimeVerdict {
+func (r *Router) judgeRuntime(f runtimeFacts, l lookup) runtimeVerdict {
 	switch {
 	case r.releases == nil:
 		v := runtimeVerdict{verdict: VerdictNotChecked}
@@ -109,7 +110,7 @@ func (r *Router) judgeRuntime(f runtimeFacts, start bool) runtimeVerdict {
 	case f.err != nil:
 		return runtimeVerdict{verdict: VerdictNoMatch, why: []string{f.err.Error()}}
 	}
-	c := evidence.CheckRuntime(f.state, judgedReleases{j: r.releases, start: start}, f.signer, f.encPub)
+	c := evidence.CheckRuntime(f.state, r.judged(l), f.signer, f.encPub)
 	v := runtimeVerdict{}
 	if im := f.state.Image; im != nil {
 		v.running = im.Repository + "@" + im.Digest
@@ -132,12 +133,12 @@ func (r *Router) judgeRuntime(f runtimeFacts, start bool) runtimeVerdict {
 // for one, and counts and logs the outcome. It returns nothing: the record is judged
 // again when it is read.
 func (r *Router) observeRuntime(quoteURL string, f runtimeFacts) {
-	v := r.judgeRuntime(f, true)
+	v := r.judgeRuntime(f, lookup{start: true})
 	metrics.RuntimeRelease(string(v.verdict))
 	switch v.verdict {
 	case VerdictNoMatch:
 		r.logger.Warn("provider's CVM runs a broker build that is not an accepted release, or its runtime records "+
-			"contradict its quote (observed, not enforced)",
+			"contradict its quote",
 			"quote_url", quoteURL, "running", v.running, "signer_addr", f.signer, "why", strings.Join(v.why, "; "))
 	case VerdictUnavailable:
 		r.logger.Debug("provider's runtime release could not be checked",
@@ -145,11 +146,27 @@ func (r *Router) observeRuntime(quoteURL string, f runtimeFacts) {
 	}
 }
 
+// lookup is how a judgement asks the release judge for verdicts: whether a build with
+// none may be sent for one (start — a verification may, a read of a record never does),
+// and where to collect the builds it had none for (missing — set by enforcement, which
+// awaits them).
+type lookup struct {
+	start   bool
+	missing *[][2]string
+}
+
+// judged is the release verifier a judgement under l asks.
+func (r *Router) judged(l lookup) judgedReleases {
+	return judgedReleases{j: r.releases, start: l.start, missing: l.missing}
+}
+
 // judgedReleases is the evidence.ReleaseVerifier CheckRuntime is handed: it answers from
-// the judge's verdicts and never waits for one.
+// the judge's verdicts and never waits for one. missing, when set, collects the builds it
+// had no verdict for, so a caller that must have one (enforce.go) knows what to await.
 type judgedReleases struct {
-	j     *releaseJudge
-	start bool
+	j       *releaseJudge
+	start   bool
+	missing *[][2]string
 }
 
 func (a judgedReleases) Repository() string { return a.j.rels.Repository() }
@@ -166,6 +183,9 @@ func (a judgedReleases) verifier() evidence.ReleaseVerifier {
 func (a judgedReleases) Verify(repository, digest string) evidence.ReleaseVerdict {
 	if v, ok := a.j.verdict(repository, digest, a.start); ok {
 		return v
+	}
+	if a.missing != nil {
+		*a.missing = append(*a.missing, [2]string{repository, digest})
 	}
 	return evidence.ReleaseVerdict{Status: evidence.ReleaseUnavailable,
 		Reason: "its release provenance has not been checked yet (it is checked in the background)"}
@@ -202,9 +222,10 @@ type releaseJudge struct {
 
 type judgedRelease struct {
 	verdict evidence.ReleaseVerdict
-	have    bool      // verdict holds an answer
-	at      time.Time // when it was answered
-	running bool      // a check is in flight
+	have    bool          // verdict holds an answer
+	at      time.Time     // when it was answered
+	running bool          // a check is in flight
+	done    chan struct{} // closed when the check in flight completes
 }
 
 func newReleaseJudge(rels evidence.ReleaseVerifier, logger *slog.Logger) *releaseJudge {
@@ -232,7 +253,7 @@ func (j *releaseJudge) verdict(repository, digest string, start bool) (evidence.
 		}
 		select {
 		case j.slots <- struct{}{}:
-			e.running = true
+			e.running, e.done = true, make(chan struct{})
 			go j.check(key, e, repository, digest)
 		default:
 		}
@@ -249,10 +270,53 @@ func (j *releaseJudge) check(key string, e *judgedRelease, repository, digest st
 	v := j.rels.Verify(repository, digest)
 	j.mu.Lock()
 	e.verdict, e.have, e.at, e.running = v, true, j.now(), false
+	close(e.done)
 	j.mu.Unlock()
 	j.logger.Debug("broker build judged against the release policy", "build", key,
 		"accepted", v.Status == evidence.ReleaseAccepted, "version", v.Release.Version, "reason", v.Reason)
 }
+
+// await returns once a verdict is held for repository@digest — starting a check if none
+// is in flight, waiting for a slot if all are taken — or when ctx ends. It is what
+// enforcement waits on (enforce.go): observing never waits, but refusing a provider for
+// a check that merely has not finished yet would refuse every build the first time it
+// is seen.
+func (j *releaseJudge) await(ctx context.Context, repository, digest string) {
+	key := repository + "@" + digest
+	for {
+		j.verdict(repository, digest, true)
+		j.mu.Lock()
+		e := j.m[key]
+		var done chan struct{}
+		switch {
+		case e != nil && e.have:
+			j.mu.Unlock()
+			return
+		case e != nil && e.running:
+			done = e.done
+		}
+		j.mu.Unlock()
+		if done == nil {
+			// No slot, or no room: ask again shortly.
+			t := time.NewTimer(releaseAwaitRetry)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return
+			case <-t.C:
+			}
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-done:
+		}
+	}
+}
+
+// releaseAwaitRetry is how often await asks again for a check it could not start.
+const releaseAwaitRetry = 50 * time.Millisecond
 
 // makeRoomLocked frees a slot for a new build at the bound, dropping verdicts other than
 // acceptances that are not being checked. It reports whether there is room.
