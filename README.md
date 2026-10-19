@@ -79,7 +79,7 @@ And four directories that are not modules:
 | [`docs/`](docs/) | [`why-this-is-private.md`](docs/why-this-is-private.md) is the product-facing answer and [`verifying-the-gateway.md`](docs/verifying-the-gateway.md) the procedure behind it; [`design/`](docs/design/) for the trust model, the router path, and the request envelope |
 | [`deploy/`](deploy/) | [`phala/`](deploy/phala/) is the CVM deployment — the source of the measured manifest, with the release/`:latest` distinction noted above; [`grafana/`](deploy/grafana/) is the operational dashboard |
 | [`loadtest/`](loadtest/) | capacity measurement for the gateway. Internal |
-| [`scripts/`](scripts/) | functional smoke tests against a deployed gateway — [`smoke-toolcall.sh`](scripts/smoke-toolcall.sh) exercises the tool-call path, the half of the sealed field set a prompt-only test never reaches. Internal |
+| [`scripts/`](scripts/) | functional smoke tests against a deployed gateway — [`smoke-gateway.sh`](scripts/smoke-gateway.sh) is the post-deploy pass (health, auth, sealed and streamed chat, passthrough, session stickiness, the provider-identity verdicts, and optionally `pcverify -gateway`); [`smoke-toolcall.sh`](scripts/smoke-toolcall.sh) exercises the tool-call path, the half of the sealed field set a prompt-only test never reaches. Internal |
 
 ## Status
 
