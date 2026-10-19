@@ -23,9 +23,11 @@
 // Every field the policy is applied to comes from the verified certificate, never from
 // the unverified bundle or from the registry's own annotations.
 //
-// WHY ITS OWN MODULE (client/cmd/pcverify). Sigstore's verifier and the dependency
-// versions it requires would otherwise move the versions the gateway is built with; see
-// the go.mod there.
+// WHO USES IT. pcverify, and the gateway and the sidecar through route's runtime check
+// (route.WithReleaseVerifier): one policy, so a build the verifier calls a release is the
+// build the sealing path calls one. A long-running process holds one Verifier for its
+// lifetime, which is why a verdict that could not be reached is retried and the trust
+// root is refreshed (see Verifier).
 package provenance
 
 import (

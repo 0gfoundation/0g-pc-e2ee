@@ -64,7 +64,7 @@
     "THERE IS ONE IMAGE RULE. `image` omitted (the default) means the recorded block",
     "contains the image line and pins the reference exactly as written. `\"image\":",
     "{\"repository\": \"ghcr.io/...\"}` means any RELEASED build of that repository — a",
-    "digest whose signed release provenance pcverify verifies at run time (client/cmd/pcverify/provenance) — and records the `no-image:` block instead. It",
+    "digest whose signed release provenance pcverify and the sealing path verify at run time (client/provenance) — and records the `no-image:` block instead. It",
     "exists for 0G's own broker image, which moves on every broker release; it is used",
     "nowhere else. There is deliberately no `digest` or `reference` rule: the block already",
     "says the reference, and a second statement of it could only disagree.",

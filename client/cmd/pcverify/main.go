@@ -51,7 +51,7 @@
 // service the deployment does not record (an unlisted container runs in the same guest as
 // the reviewed ones), a service declared twice, a block that differs, and an image
 // outside its rule. 0G's broker image is the one allowed to move, and only between
-// released builds, judged by their signed provenance (provenance/policy.json); a build
+// released builds, judged by their signed provenance (client/provenance/policy.json); a build
 // whose provenance cannot be fetched leaves the run incomplete. A provider with NO recorded
 // deployment is not compared, and the run says so and exits 3: nobody reviewed it, which
 // is not the same claim as "it differs from what we reviewed". Recording is not approval:
@@ -212,10 +212,10 @@ import (
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
-	"github.com/0gfoundation/0g-pc-e2ee/client/cmd/pcverify/provenance"
 	"github.com/0gfoundation/0g-pc-e2ee/client/dcap"
 	"github.com/0gfoundation/0g-pc-e2ee/client/evidence"
 	"github.com/0gfoundation/0g-pc-e2ee/client/evidence/compose"
+	"github.com/0gfoundation/0g-pc-e2ee/client/provenance"
 	"github.com/0gfoundation/0g-pc-e2ee/client/release"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
 )
@@ -399,7 +399,7 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 		return 2
 	}
 	// Broker builds are judged by their signed release provenance, fetched from the image
-	// registry and checked against an embedded policy (provenance/policy.json) and
+	// registry and checked against an embedded policy (client/provenance/policy.json) and
 	// Sigstore's trust root, fetched over TUF with an embedded snapshot as the fallback.
 	// The policy is embedded only — no flag substitutes it — for the reason
 	// no flag substitutes the OS-image allowlist: a diagnostic that could be pointed at a

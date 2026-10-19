@@ -1,18 +1,27 @@
-# Dependabot covers pcverify's own module only.
+# Dependabot covers Sigstore's verifier only (sigstore-go, go-tuf, in-toto).
 #
-# That module carries Sigstore's verifier (sigstore-go, go-tuf, in-toto). Falling behind
-# there is how a Sigstore format change becomes a verification failure on providers, so
-# its updates arrive as PRs and are checked by ci.yml, security.yml and
-# broker-release.yml like any other change. The gateway's modules (protocol, client) are
-# not listed: what the sealed binaries are built from moves only by deliberate change.
+# Falling behind there is how a Sigstore format change becomes a verification failure on
+# providers — in pcverify, and in the gateway's and the sidecar's runtime_release — so its
+# updates arrive as PRs and are checked by ci.yml, security.yml and broker-release.yml like
+# any other change. Everything else in these modules is what the sealed binaries are built
+# from and moves only by deliberate change, hence the allow list.
+#
+# Both modules that require it, in one update: pcverify resolves its own versions, so a
+# bump to the client module alone would leave pcverify's go.sum behind.
 version: 2
 updates:
   - package-ecosystem: gomod
-    directory: /client/cmd/pcverify
+    directories:
+      - /client
+      - /client/cmd/pcverify
     schedule:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+    allow:
+      - dependency-name: "github.com/sigstore/*"
+      - dependency-name: "github.com/theupdateframework/*"
+      - dependency-name: "github.com/in-toto/*"
     groups:
       sigstore:
         patterns:
@@ -20,4 +29,4 @@ updates:
           - "github.com/theupdateframework/*"
           - "github.com/in-toto/*"
     commit-message:
-      prefix: "pcverify"
+      prefix: "provenance"

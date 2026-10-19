@@ -29,8 +29,8 @@ jobs:
             exit 1
           fi
 
-      # client/cmd/pcverify is its own module (see its go.mod): what only the verifier
-      # needs stays out of the gateway's dependency versions.
+      # client/cmd/pcverify is its own module (see its go.mod for why, and why that reason
+      # has lapsed).
       - name: vet, build, test (per module)
         run: |
           set -e

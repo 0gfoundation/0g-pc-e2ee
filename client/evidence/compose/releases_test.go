@@ -9,7 +9,7 @@ const (
 )
 
 // fakeReleases is a ReleaseVerifier with a fixed answer per digest. The real one checks
-// signatures (client/cmd/pcverify/provenance) and is tested there against real bundles;
+// signatures (client/provenance) and is tested there against real bundles;
 // what this package tests is what the compose checks DO with each verdict.
 type fakeReleases struct {
 	repo     string

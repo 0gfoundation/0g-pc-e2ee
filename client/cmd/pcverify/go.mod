@@ -1,10 +1,8 @@
-// pcverify is its own module so that what only a verifier needs never enters the
-// gateway's build. Go selects dependency versions per module: anything required here —
-// Sigstore's verifier for broker release provenance, and the newer x/net, x/crypto and
-// protobuf it pulls in — would, in the client module, also change the versions the gateway
-// and sidecar are built with, even though neither imports it. As a separate module it
-// cannot. Whether the gateway should ever verify provenance itself is a decision for when
-// it enforces these checks, taken on its own.
+// pcverify is its own module for a reason that no longer holds: it kept Sigstore's
+// verifier, and the dependency versions it requires, out of the gateway's build. The
+// gateway and the sidecar now check broker release provenance themselves
+// (client/provenance), so the client module carries the same dependencies. Folding this
+// module back into it is a separate change.
 //
 // Build from this directory: `go build .` (or `go run . -provider …`). `go install
 // …@latest` does not work, for the reason it does not for the client module: the
@@ -18,9 +16,6 @@ toolchain go1.26.9
 require (
 	github.com/0gfoundation/0g-pc-e2ee/client v0.0.0
 	github.com/0gfoundation/0g-pc-e2ee/protocol v0.0.0
-	github.com/in-toto/attestation v1.2.0
-	github.com/sigstore/sigstore-go v1.3.0
-	github.com/theupdateframework/go-tuf/v2 v2.4.2
 )
 
 require (
@@ -70,6 +65,7 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gowebpki/jcs v1.0.1 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 // indirect
+	github.com/in-toto/attestation v1.2.0 // indirect
 	github.com/in-toto/in-toto-golang v0.11.0 // indirect
 	github.com/mattn/go-shellwords v1.0.12 // indirect
 	github.com/mitchellh/copystructure v1.2.0 // indirect
@@ -89,8 +85,10 @@ require (
 	github.com/sigstore/rekor v1.5.3 // indirect
 	github.com/sigstore/rekor-tiles/v2 v2.3.0 // indirect
 	github.com/sigstore/sigstore v1.10.8 // indirect
+	github.com/sigstore/sigstore-go v1.3.0 // indirect
 	github.com/sigstore/timestamp-authority/v2 v2.1.3 // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
+	github.com/theupdateframework/go-tuf/v2 v2.4.2 // indirect
 	github.com/transparency-dev/formats v0.1.1 // indirect
 	github.com/transparency-dev/merkle v0.0.2 // indirect
 	github.com/xeipuuv/gojsonpointer v0.0.0-20180127040702-4e3ac2762d5f // indirect
