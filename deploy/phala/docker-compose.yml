@@ -526,6 +526,14 @@ services:
       # ZG_GATEWAY_ATTEST (on above), or the route is not mounted. On by default;
       # uncomment to remove it. See client/cmd/gateway/provideridentity.go.
       # - "ZG_GATEWAY_PROVIDER_IDENTITY_ENDPOINT=false"
+      #
+      # Its runtime_release verdict: the broker build each provider's CVM runs NOW (its
+      # RTMR3 runtime records) against the broker's signed release provenance, fetched
+      # from ghcr.io with Sigstore's trust root from tuf-repo-cdn.sigstore.dev, in the
+      # background. Observed and logged, never enforced. On by default with
+      # ZG_GATEWAY_ATTEST; uncomment for a CVM with no egress to those, which then
+      # reports runtime_release: not_checked.
+      # - "ZG_GATEWAY_RUNTIME_RELEASES=false"
     volumes:
       # Identity in, read-only, as a plain JSON file — deliberately not the
       # guest-agent socket, which also derives keys and issues quotes.

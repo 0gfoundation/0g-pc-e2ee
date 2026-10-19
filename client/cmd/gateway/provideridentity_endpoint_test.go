@@ -49,6 +49,8 @@ func pidFullRecord() route.ProviderIdentity {
 		// The no-entry case: nothing was compared, so no image was named.
 		Measurement: route.VerdictNoBaseline,
 		ComposeHash: "8779f38c1b2d4e5a6071829304a5b6c7d8e9f00112233445566778899aabbccd",
+		// No runtime image record: the broker the compose pins runs.
+		RuntimeRelease: route.VerdictNotChecked,
 	}
 }
 
@@ -171,6 +173,41 @@ func TestProviderIdentityRoute_NamesTheMatchedOSImage(t *testing.T) {
 	// a shape of its own would invite a panel to render it as a check of its own.
 	if !strings.Contains(body, `"os_image": "dstack-nvidia-0.5.9"`) {
 		t.Errorf("os_image is not rendered as a plain string:\n%s", body)
+	}
+}
+
+// The broker build the CVM runs now reaches the wire beside its verdict: the build as a
+// plain repository@digest, its version only with a pass — and both null when there is no
+// runtime image record, where the verdict says the check had nothing to judge.
+func TestProviderIdentityRoute_ReportsTheRunningBroker(t *testing.T) {
+	const running = "ghcr.io/0gfoundation/0g-serving-broker@sha256:951f4c7971f87377ab077639a5a84d2aed8945460494da076ff8466ea1ee90b5"
+	swapped := pidFullRecord()
+	swapped.RuntimeRelease, swapped.RunningBroker, swapped.RunningRelease = route.VerdictPass, running, "v0.5.4"
+	for _, tc := range []struct {
+		name             string
+		record           route.ProviderIdentity
+		verdict          route.Verdict
+		running, release string
+	}{
+		{"a release swapped in at runtime", swapped, route.VerdictPass,
+			`"running_broker": "` + running + `"`, `"running_release": "v0.5.4"`},
+		{"no runtime image record", pidFullRecord(), route.VerdictNotChecked,
+			`"running_broker": null`, `"running_release": null`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gw, _ := pidGateway(t, &stubIdentities{record: tc.record, have: true})
+			_, body := pidGet(t, gw.URL+pidPath)
+			var doc providerIdentityDoc
+			if err := json.Unmarshal([]byte(body), &doc); err != nil {
+				t.Fatalf("decode: %v\n%s", err, body)
+			}
+			if doc.Verdicts.RuntimeRelease != tc.verdict {
+				t.Errorf("runtime_release = %q, want %q", doc.Verdicts.RuntimeRelease, tc.verdict)
+			}
+			if !strings.Contains(body, tc.running) || !strings.Contains(body, tc.release) {
+				t.Errorf("want %s and %s in:\n%s", tc.running, tc.release, body)
+			}
+		})
 	}
 }
 
