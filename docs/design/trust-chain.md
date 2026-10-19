@@ -15,9 +15,9 @@ see there are no gaps — and where the gaps still are.
 >   (`client/evidence/brokerimages.json`, one entry per audited OS image) and enforce is
 >   **on**: an unlisted image is refused, not warned about. Its OS half is closed. The
 >   container half below it is read and adjudicated *in the verifier* — the per-service
->   baseline records reviewed deployments — but that comparison is not yet in the
->   gateway's sealing path. The build a provider runs NOW (its RTMR3 runtime records) is
->   judged in that path, but observed only (`runtime_release`).
+>   baseline records reviewed deployments — and judged in the gateway's sealing path
+>   too, together with the build a provider runs NOW (its RTMR3 runtime records), but
+>   OBSERVED only (`compose_baseline`, `runtime_release`): neither refuses a provider yet.
 > - **hop 5** — wired, observed, and enforce is **on**: a provider the registry does not
 >   vouch for is skipped, not warned about.
 > - **hop 11** — enforced, but only because `-verify-responses` is on; it is off by default.
@@ -280,10 +280,11 @@ reported as not compared (see below). What runs AFTER boot is read too: the RTMR
 log is replayed into the verified quote, and the build the controller last swapped to
 must be an accepted release whose keys are the quote's (`evidence/rtmr3.go`). The gateway
 and the sidecar make that runtime judgement too, on every quote they verify, and report it
-as `runtime_release` — OBSERVED, not enforced (`route/runtimerelease.go`). What is not done
-is enforcing either in the SEALING path: the baseline is not in it yet, the runtime check
-alone says nothing about a provider that never swapped, the fleet is not on a release the
-policy accepts, and the upstream set the records carry has no rules to judge it by.
+as `runtime_release`, and hold the manifest against its recorded deployment and report it
+as `compose_baseline` — both OBSERVED, not enforced (`route/runtimerelease.go`,
+`route/composebaseline.go`). What is not done is enforcing them in the SEALING path: the
+fleet is neither on a release the policy accepts nor recorded, and the upstream set the
+records carry has no rules to judge it by.
 
 Hop 3 is no longer blocked on either of the two things that used to hold it — the shape
 of an allowlist entry, and having no published source for its values. Its allowlist takes one entry per OS image
@@ -381,18 +382,18 @@ precondition for flipping a switch.
 > …): a declaration changed to an `nfs` driver moves the data behind a volume name while
 > every service block still matches, so the sections are recorded and compared too.
 >
-> Wiring the comparison into the SEALING path, behind its own enforce switch, waits on
-> two things. The manifest describes what BOOTED, and on v0.5.4 the controller may swap
-> images and change the upstream set at runtime, recorded only in RTMR3. The sealing path
-> now reads those records — the gateway and the sidecar judge the running build on every
-> verified quote and report it as `runtime_release`, observed only — but the baseline
-> itself is not in that path yet, and without it the runtime check passes exactly the
-> providers it says nothing about: one that never swapped has no runtime record, and only
-> the baseline judges what it booted. The upstream set still has no rules to judge it by.
-> And enforcing today would refuse every mainnet provider, none of which runs a listed
-> broker release yet: on 2026-10-16 the RTMR3 records showed cn-19, cn-20 and cn-41
-> running manual branch builds swapped in after boot. `-app-baseline` reads a candidate
-> for checking a deployment against a live provider first.
+> The comparison is in the SEALING path now, with the runtime check beside it: the
+> gateway and the sidecar hold every verified provider's manifest against its recorded
+> deployment (`compose_baseline`) and judge the build the controller swapped in since
+> (`runtime_release`) — the manifest describes what BOOTED, and on v0.5.4 the controller
+> may swap images and change the upstream set at runtime, recorded only in RTMR3. Both
+> are observed only. The two are only enforceable together — the runtime check says
+> nothing about a provider that never swapped, which only the baseline judges — and
+> enforcing them today would refuse every mainnet provider: none runs a listed broker
+> release yet (on 2026-10-16 the RTMR3 records showed cn-19, cn-20 and cn-41 running
+> manual branch builds swapped in after boot), and only cn-20 is recorded. The upstream
+> set still has no rules to judge it by. `-app-baseline` reads a candidate for checking
+> a deployment against a live provider first.
 >
 > The comparison form the baseline uses:
 > `client/evidence/compose/composeblock.go` reduces each service to a **canonical block**, keeping
@@ -472,8 +473,8 @@ an image that is not listed FAILS — a new OS image version needs an entry befo
 deployed. Hop 3's broker allowlist is a separate file on the same mechanism
 (`client/evidence/brokerimages.json`) and is populated too; it is enforced in the
 deployed gateway as well, so what waits on the fleet is the layer below it — the
-per-service baseline, which adjudicates in the verifier but is not yet in the sealing
-path.
+per-service baseline, which adjudicates in the verifier and is observed, not yet
+enforced, in the sealing path.
 
 Two further limits are worth stating: the compose hash is only as strong as the image
 pinning inside the compose text — a floating tag keeps it stable while the code changes

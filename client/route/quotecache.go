@@ -75,6 +75,10 @@ type quoteFacts struct {
 	// reply. Its verdict is NOT cached here — it is judged when a record is read, since the
 	// release check behind it completes in the background.
 	runtime runtimeFacts
+	// manifest is the authenticated manifest, loaded for the baseline comparison
+	// (composebaseline.go). The comparison itself needs the provider's address, which this
+	// cache, keyed by endpoint, does not have; it runs where the record is written and read.
+	manifest manifestFacts
 }
 
 func newQuoteCache(ttl time.Duration) *quoteCache {

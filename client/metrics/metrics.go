@@ -304,6 +304,13 @@ var (
 		Namespace: namespace, Subsystem: subsystem, Name: "runtime_release_checks_total",
 		Help: "Quote verifications by the verdict on the broker build the provider runs now (observed, not enforced).",
 	}, []string{"verdict"})
+	// The manifest a provider's CVM booted against the deployment recorded for it
+	// (route/composebaseline.go). Observed, never enforced. Counted per verification of
+	// a provider — a fresh one on the request path, and every warmer sweep.
+	composeBaseline = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "compose_baseline_checks_total",
+		Help: "Provider verifications by the verdict on its manifest against its recorded deployment (observed, not enforced).",
+	}, []string{"verdict"})
 
 	// On-chain signer grounding (route.groundSignerOnChain, trust-chain hop 5).
 	// The outcome label separates the two classes an operator must not conflate:
@@ -377,7 +384,7 @@ func init() {
 		previewAttempts, previewCalls, previewDuration, previewRetrySuppressed,
 		upstreamAttempts, upstreamDuration, streamTTFF, candidateFallbacks, walkBudgetExhausted,
 		signatureFetchCalls, signatureFetchDuration,
-		quoteVerify, quoteVerifyDuration, quoteCache, measurementUntrusted, runtimeRelease,
+		quoteVerify, quoteVerifyDuration, quoteCache, measurementUntrusted, runtimeRelease, composeBaseline,
 		onchainGrounding, onchainRevalidations,
 		warmerSweeps, warmerProviderRefresh, warmerSignerRefresh,
 		warmerReadyProviders, warmerLastSuccess,
@@ -559,6 +566,11 @@ func MeasurementUntrusted() { measurementUntrusted.Inc() }
 // RuntimeRelease counts one quote verification by the verdict on the broker build the
 // provider runs now: pass, no_match, unavailable or not_checked.
 func RuntimeRelease(verdict string) { runtimeRelease.WithLabelValues(verdict).Inc() }
+
+// ComposeBaseline counts one provider verification by the verdict on its manifest
+// against its recorded deployment: pass, no_match, no_baseline, unavailable or
+// not_checked.
+func ComposeBaseline(verdict string) { composeBaseline.WithLabelValues(verdict).Inc() }
 
 // OnChainGrounding records the outcome of one on-chain signer-grounding attempt.
 // outcome is a fixed low-cardinality label: ok, ok_stale, mismatch,

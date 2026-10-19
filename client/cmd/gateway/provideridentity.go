@@ -124,6 +124,10 @@ type providerIdentityDoc struct {
 	// RunningRelease is RunningBroker's release version, e.g. "v0.5.4" — non-null only
 	// alongside runtime_release "pass", as os_image is beside measurement "pass".
 	RunningRelease *string `json:"running_release"`
+	// BaselineDeployment names the recorded deployment the provider's manifest was
+	// compared against (verdicts.compose_baseline), e.g. "mainnet compute-network-20", or
+	// null when none is recorded for it. A label on the verdict, as os_image is.
+	BaselineDeployment *string `json:"baseline_deployment"`
 	// Verify is providerVerifyNote. See the file comment.
 	Verify string `json:"verify"`
 }
@@ -214,6 +218,16 @@ type providerVerdicts struct {
 	// which this check does not judge — or a deployment with the check off
 	// (route.ProviderIdentity.RuntimeRelease).
 	RuntimeRelease route.Verdict `json:"runtime_release"`
+	// ComposeBaseline: the manifest the provider's CVM booted (what compose_hash commits
+	// to) against the deployment recorded for this provider (baseline_deployment) — the
+	// comparison pcverify -provider makes. OBSERVED, never enforced. "pass" it is that
+	// deployment; "no_match" it is not (a service or section differs, is missing or extra,
+	// or a broker build the record lets move is not a release); "no_baseline" nothing is
+	// recorded for this provider, which says nothing against it; "unavailable" the
+	// comparison could not run or finish; "not_checked" the deployment does not make it.
+	// The compose REVIEW's findings are deliberately not here: they are advice, never a
+	// verdict (route.ProviderIdentity.ComposeBaseline).
+	ComposeBaseline route.Verdict `json:"compose_baseline"`
 }
 
 // providerIdentityHandler serves one provider's record from src.
@@ -236,17 +250,19 @@ func providerIdentityHandler(src route.ProviderIdentitySource) http.Handler {
 			Address:  id.Address,
 			Endpoint: id.Endpoint,
 			Verdicts: providerVerdicts{
-				QuoteDCAP:      id.QuoteDCAP,
-				OnChainSigner:  id.OnChainSigner,
-				Measurement:    id.Measurement,
-				RuntimeRelease: id.RuntimeRelease,
+				QuoteDCAP:       id.QuoteDCAP,
+				OnChainSigner:   id.OnChainSigner,
+				Measurement:     id.Measurement,
+				RuntimeRelease:  id.RuntimeRelease,
+				ComposeBaseline: id.ComposeBaseline,
 			},
-			OSImage:        optional(id.OSImage),
-			ComposeHash:    optional(id.ComposeHash),
-			Containers:     providerContainersOf(id.Containers),
-			RunningBroker:  optional(id.RunningBroker),
-			RunningRelease: optional(id.RunningRelease),
-			Verify:         providerVerifyNote(id.QuoteURL),
+			OSImage:            optional(id.OSImage),
+			ComposeHash:        optional(id.ComposeHash),
+			Containers:         providerContainersOf(id.Containers),
+			RunningBroker:      optional(id.RunningBroker),
+			RunningRelease:     optional(id.RunningRelease),
+			BaselineDeployment: optional(id.BaselineDeployment),
+			Verify:             providerVerifyNote(id.QuoteURL),
 		}, "", "  ")
 		if err != nil {
 			// Nothing in the document can fail to marshal; a 500 here would be a bug in

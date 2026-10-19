@@ -51,6 +51,8 @@ func pidFullRecord() route.ProviderIdentity {
 		ComposeHash: "8779f38c1b2d4e5a6071829304a5b6c7d8e9f00112233445566778899aabbccd",
 		// No runtime image record: the broker the compose pins runs.
 		RuntimeRelease: route.VerdictNotChecked,
+		// Nobody recorded this provider's deployment.
+		ComposeBaseline: route.VerdictNoBaseline,
 	}
 }
 
@@ -206,6 +208,41 @@ func TestProviderIdentityRoute_ReportsTheRunningBroker(t *testing.T) {
 			}
 			if !strings.Contains(body, tc.running) || !strings.Contains(body, tc.release) {
 				t.Errorf("want %s and %s in:\n%s", tc.running, tc.release, body)
+			}
+		})
+	}
+}
+
+// The baseline verdict reaches the wire with the recorded deployment it was compared
+// against as a label, null when none is recorded — and the compose review's findings do
+// not reach it at all: they are advice, and a verdicts block is read as verdicts.
+func TestProviderIdentityRoute_ReportsTheBaseline(t *testing.T) {
+	recorded := pidFullRecord()
+	recorded.ComposeBaseline, recorded.BaselineDeployment = route.VerdictNoMatch, "mainnet compute-network-20"
+	for _, tc := range []struct {
+		name       string
+		record     route.ProviderIdentity
+		verdict    route.Verdict
+		deployment string
+	}{
+		{"a recorded deployment", recorded, route.VerdictNoMatch, `"baseline_deployment": "mainnet compute-network-20"`},
+		{"none recorded", pidFullRecord(), route.VerdictNoBaseline, `"baseline_deployment": null`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gw, _ := pidGateway(t, &stubIdentities{record: tc.record, have: true})
+			_, body := pidGet(t, gw.URL+pidPath)
+			var doc providerIdentityDoc
+			if err := json.Unmarshal([]byte(body), &doc); err != nil {
+				t.Fatalf("decode: %v\n%s", err, body)
+			}
+			if doc.Verdicts.ComposeBaseline != tc.verdict || !strings.Contains(body, tc.deployment) {
+				t.Errorf("compose_baseline = %q, want %q with %s in:\n%s", doc.Verdicts.ComposeBaseline, tc.verdict,
+					tc.deployment, body)
+			}
+			for _, absent := range []string{"finding", "blocking", "justify", "severity"} {
+				if strings.Contains(strings.ToLower(body), absent) {
+					t.Errorf("the response carries the compose review (%q):\n%s", absent, body)
+				}
 			}
 		})
 	}

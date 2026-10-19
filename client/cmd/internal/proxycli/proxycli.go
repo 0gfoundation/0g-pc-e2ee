@@ -36,6 +36,7 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/client/dcap"
 	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/client/evidence"
+	"github.com/0gfoundation/0g-pc-e2ee/client/evidence/compose"
 	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/0gfoundation/0g-pc-e2ee/client/provenance"
 	"github.com/0gfoundation/0g-pc-e2ee/client/release"
@@ -480,6 +481,7 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 		if *f.runtimeReleases {
 			routeOpts = append(routeOpts, route.WithReleaseVerifier(newReleaseVerifier(label, logger), logger))
 		}
+		routeOpts = append(routeOpts, route.WithComposeBaseline(builtinBaseline(label, logger), *f.servingContract))
 	}
 	// resolver is the CONCRETE on-chain registry the warmer uses to resolve each
 	// provider's endpoint via ServiceInfo. The route's grounding uses the caching
@@ -831,6 +833,29 @@ func envDuration(key string, def time.Duration) time.Duration {
 		log.Fatalf("invalid %s=%q: must be a Go duration (e.g. 4m, 90s)", key, v)
 	}
 	return d
+}
+
+// builtinBaseline is the per-service compose baseline embedded in this binary
+// (client/evidence/compose/brokercompose.json), the same one pcverify -provider compares
+// against. Embedded only, for the reason the boot-chain allowlist is: no flag can point
+// the comparison at a friendlier record. It needs no network, so it is on whenever quote
+// verification is.
+//
+// It exits on an error, which means the embedded file is malformed — a defect in this
+// build.
+func builtinBaseline(label string, logger *slog.Logger) compose.ComposeBaseline {
+	b, err := compose.BuiltinComposeBaseline()
+	if err != nil {
+		logger.Error("compose baseline", "err", err)
+		os.Exit(1)
+	}
+	names := make([]string, 0, len(b.Deployments))
+	for _, d := range b.Deployments {
+		names = append(names, d.Name)
+	}
+	logger.Info("compose baseline comparison enabled (observed, not enforced)", "label", label,
+		"deployments", strings.Join(names, ","))
+	return b
 }
 
 // releaseCheckTimeout bounds one build's provenance fetch from the registry. The check

@@ -462,27 +462,6 @@ func TestLoaderLinksDockerComposesVersions(t *testing.T) {
 	}
 }
 
-// The gateway and the sidecar import client/evidence, never this package, so compose-go
-// is not linked into either — and moving the version of anything they link would have to
-// be a decision taken about them, not a side effect of the verifier's loader.
-func TestComposeGoStaysOutOfTheGateway(t *testing.T) {
-	gobin, err := exec.LookPath("go")
-	if err != nil {
-		t.Skip("no go command to list dependencies with")
-	}
-	out, err := exec.Command(gobin, "list", "-deps",
-		"github.com/0gfoundation/0g-pc-e2ee/client/cmd/gateway",
-		"github.com/0gfoundation/0g-pc-e2ee/client/cmd/sidecar").CombinedOutput()
-	if err != nil {
-		t.Skipf("go list: %v\n%s", err, out)
-	}
-	for _, pkg := range strings.Fields(string(out)) {
-		if strings.HasPrefix(pkg, "github.com/compose-spec/") || strings.HasSuffix(pkg, "/client/evidence/compose") {
-			t.Errorf("the gateway or sidecar now depends on %s", pkg)
-		}
-	}
-}
-
 // loadModel reproduces compose-go's own per-document loop, so that schema validation can
 // come before the transforms (and filter what the environment settles). Its result must be
 // compose-go's: for every input both accept, the model is the one compose-go's loader
