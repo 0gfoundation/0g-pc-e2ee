@@ -12,12 +12,16 @@
 #   1. health     /healthz 200 and /readyz 200 (503 = no provider ready).
 #   2. auth       a chat request with no API key is refused 401 by the gateway.
 #   3. sealed     a chat completion for --sealed-model: 200, X-0G-E2EE: sealed, an
-#                 X-Provider, and a non-empty answer.
-#   4. stream     the same, streamed: X-0G-E2EE: sealed, content deltas, [DONE].
-#                 Every frame is sealed and opened separately (SPEC §7), so this is a
-#                 different code path from 3.
-#   5. passthru   a chat completion for --plain-model, a model the gateway does NOT
-#                 seal: 200 and X-0G-E2EE: none. Skipped without --plain-model.
+#                 X-Provider, and a non-empty answer. A reasoning model's thinking
+#                 (reasoning_content) counts as an answer: it came back through the
+#                 sealed channel and opened, which is what is being tested — and a
+#                 reasoning model can spend the whole token budget thinking.
+#   4. stream     the same, streamed: X-0G-E2EE: sealed, text deltas (content or
+#                 reasoning_content), [DONE]. Every frame is sealed and opened
+#                 separately (SPEC §7), so this is a different code path from 3.
+#   5. passthru   a request for --plain-model, a model the gateway does NOT seal:
+#                 200, X-0G-E2EE: none, and an answer. Anthropic format by default
+#                 (POST /v1/messages), OpenAI chat with --plain-format openai.
 #   6. session    --turns sealed requests sharing one X-Session-Id (and
 #                 X-Claude-Code-Session-Id): every one should land on the same
 #                 X-Provider. Proves the stickiness only when the model has two or
@@ -40,13 +44,17 @@
 # USAGE ----------------------------------------------------------------------
 #   ZG_API_KEY=sk-... ./scripts/smoke-gateway.sh --gateway router-api-staging.0g.ai
 #   ZG_API_KEY=sk-... ./scripts/smoke-gateway.sh --gateway router-api-staging.0g.ai \
-#       --plain-model glm-5.2 --pcverify ./pcverify
+#       --plain-model glm-5.2 --plain-format openai --pcverify ./pcverify
 #
 #   --gateway HOST       gateway host or URL (env GATEWAY; required)
 #   --sealed-model M     a model in the gateway's ZG_GATEWAY_SEAL_MODELS
 #                        (env SEALED_MODEL; default 0GM-1.0-35B-A3B)
-#   --plain-model M      a model it does not seal (env PLAIN_MODEL; check 5 skipped
-#                        without one)
+#   --plain-model M      a model it does not seal (env PLAIN_MODEL; default
+#                        claude-sonnet-5; "" skips check 5)
+#   --plain-format F     anthropic or openai, the API check 5 speaks (env
+#                        PLAIN_FORMAT; default anthropic)
+#   --max-tokens N       per-request token budget (env MAX_TOKENS; default 512 —
+#                        generous, since a reasoning model thinks before it answers)
 #   --turns N            session turns for check 6 (env TURNS; default 3)
 #   --pcverify PATH      pcverify binary for check 8 (env PCVERIFY; skipped without)
 #
@@ -59,7 +67,9 @@ set -euo pipefail
 
 GATEWAY=${GATEWAY:-}
 SEALED_MODEL=${SEALED_MODEL:-0GM-1.0-35B-A3B}
-PLAIN_MODEL=${PLAIN_MODEL:-}
+PLAIN_MODEL=${PLAIN_MODEL-claude-sonnet-5}
+PLAIN_FORMAT=${PLAIN_FORMAT:-anthropic}
+MAX_TOKENS=${MAX_TOKENS:-512}
 TURNS=${TURNS:-3}
 PCVERIFY=${PCVERIFY:-}
 
@@ -74,6 +84,8 @@ while [ $# -gt 0 ]; do
 	--gateway) GATEWAY=$2; shift 2 ;;
 	--sealed-model) SEALED_MODEL=$2; shift 2 ;;
 	--plain-model) PLAIN_MODEL=$2; shift 2 ;;
+	--plain-format) PLAIN_FORMAT=$2; shift 2 ;;
+	--max-tokens) MAX_TOKENS=$2; shift 2 ;;
 	--turns) TURNS=$2; shift 2 ;;
 	--pcverify) PCVERIFY=$2; shift 2 ;;
 	-h | --help) usage 0 ;;
@@ -87,6 +99,8 @@ done
 [ -n "$GATEWAY" ] || { echo "--gateway is required" >&2; usage 2; }
 [ -n "${ZG_API_KEY:-}" ] || { echo "ZG_API_KEY is required" >&2; exit 2; }
 case "$TURNS" in '' | *[!0-9]*) echo "--turns must be a number" >&2; exit 2 ;; esac
+case "$MAX_TOKENS" in '' | *[!0-9]*) echo "--max-tokens must be a number" >&2; exit 2 ;; esac
+case "$PLAIN_FORMAT" in anthropic | openai) ;; *) echo "--plain-format is anthropic or openai" >&2; exit 2 ;; esac
 
 BASE=$GATEWAY
 case "$BASE" in https://* | http://*) ;; *) BASE="https://$BASE" ;; esac
@@ -134,11 +148,28 @@ chat() {
 	shift 4
 	local body
 	body=$(jq -nc --arg m "$model" --argjson s "$([ "$stream" = 1 ] && echo true || echo false)" \
-		'{model: $m, stream: $s, max_tokens: 32,
+		--argjson n "$MAX_TOKENS" '{model: $m, stream: $s, max_tokens: $n,
 		  messages: [{role: "user", content: "Reply with the single word: pong"}]}')
 	curl -sS -o "$out" -D "$hdr" -w '%{http_code}' --max-time 120 \
 		-H 'Content-Type: application/json' -H "Authorization: Bearer $ZG_API_KEY" \
 		"$@" --data-binary "$body" "$BASE/v1/chat/completions" 2>/dev/null || printf '000'
+}
+
+# messages <out> <hdr> <model> — POST an Anthropic Messages request (x-api-key, as an
+# Anthropic client sends it) and echo the status.
+messages() {
+	local body
+	body=$(jq -nc --arg m "$3" --argjson n "$MAX_TOKENS" \
+		'{model: $m, max_tokens: $n, messages: [{role: "user", content: "Reply with the single word: pong"}]}')
+	curl -sS -o "$1" -D "$2" -w '%{http_code}' --max-time 120 \
+		-H 'Content-Type: application/json' -H "x-api-key: $ZG_API_KEY" -H 'anthropic-version: 2023-06-01' \
+		--data-binary "$body" "$BASE/v1/messages" 2>/dev/null || printf '000'
+}
+
+# answer_of <file> — the text an OpenAI chat completion came back with: the answer,
+# or, from a reasoning model that spent its budget thinking, the thinking.
+answer_of() {
+	jqr '.choices[0].message | if (.content // "") != "" then .content else (.reasoning_content // "") end' "$1"
 }
 
 printf 'gateway  %s\n\n' "$BASE"
@@ -176,12 +207,14 @@ PROVIDER=
 st=$(chat "$WORK/s.json" "$WORK/s.h" "$SEALED_MODEL" 0)
 e2ee=$(header "$WORK/s.h" X-0G-E2EE)
 PROVIDER=$(header "$WORK/s.h" X-Provider)
-answer=$(jqr '.choices[0].message.content // empty' "$WORK/s.json")
+answer=$(answer_of "$WORK/s.json")
+kind=answer
+[ -z "$(jqr '.choices[0].message.content // empty' "$WORK/s.json")" ] && [ -n "$answer" ] && kind=reasoning
 if [ "$st" = 200 ] && [ "$e2ee" = sealed ] && [ -n "$PROVIDER" ] && [ -n "$answer" ]; then
 	ok "sealed: $SEALED_MODEL -> 200, X-0G-E2EE: sealed"
-	note "provider $PROVIDER; answer: $(printf '%s' "$answer" | head -c 80 | tr '\n' ' ')"
+	note "provider $PROVIDER; $kind: $(printf '%s' "$answer" | head -c 80 | tr '\n' ' ')"
 else
-	bad "sealed: $SEALED_MODEL -> status $st, X-0G-E2EE '${e2ee:-<none>}', X-Provider '${PROVIDER:-<none>}', answer ${answer:+present}${answer:-empty}"
+	bad "sealed: $SEALED_MODEL -> status $st, X-0G-E2EE '${e2ee:-<none>}', X-Provider '${PROVIDER:-<none>}', answer $([ -n "$answer" ] && echo present || echo empty)"
 	note "$(excerpt "$WORK/s.json")"
 fi
 
@@ -191,25 +224,35 @@ e2ee=$(header "$WORK/st.h" X-0G-E2EE)
 # Each stage tolerates "nothing to read": under pipefail a grep with no match would
 # otherwise abort the run here, on exactly the failure this check exists to report.
 deltas=$({ grep '^data: {' "$WORK/st.out" 2>/dev/null || true; } | sed 's/^data: //' |
-	jqr -s '[.[] | .choices[0].delta.content // empty | select(. != "")] | length')
+	jqr -s '[.[] | .choices[0].delta | ((.content // "") + (.reasoning_content // ""))
+		| select(. != "")] | length')
 done_=$(grep -c '^data: \[DONE\]' "$WORK/st.out" 2>/dev/null || true)
 if [ "$st" = 200 ] && [ "$e2ee" = sealed ] && [ "${deltas:-0}" -gt 0 ] && [ "${done_:-0}" -ge 1 ]; then
-	ok "stream: $SEALED_MODEL -> 200, X-0G-E2EE: sealed, $deltas content deltas, [DONE]"
+	ok "stream: $SEALED_MODEL -> 200, X-0G-E2EE: sealed, $deltas text deltas, [DONE]"
 else
-	bad "stream: status $st, X-0G-E2EE '${e2ee:-<none>}', ${deltas:-0} content deltas, [DONE] x${done_:-0}"
+	bad "stream: status $st, X-0G-E2EE '${e2ee:-<none>}', ${deltas:-0} text deltas, [DONE] x${done_:-0}"
 	note "$(excerpt "$WORK/st.out")"
 fi
 
 # 5. passthrough ---------------------------------------------------------------
 if [ -z "$PLAIN_MODEL" ]; then
-	skp "passthru: no --plain-model given"
+	skp "passthru: --plain-model is empty"
 else
-	st=$(chat "$WORK/p.json" "$WORK/p.h" "$PLAIN_MODEL" 0)
-	e2ee=$(header "$WORK/p.h" X-0G-E2EE)
-	if [ "$st" = 200 ] && [ "$e2ee" = none ]; then
-		ok "passthru: $PLAIN_MODEL -> 200, X-0G-E2EE: none"
+	if [ "$PLAIN_FORMAT" = anthropic ]; then
+		st=$(messages "$WORK/p.json" "$WORK/p.h" "$PLAIN_MODEL")
+		answer=$(jqr '[.content[]? | select(.type == "text") | .text] | join("")' "$WORK/p.json")
+		what="POST /v1/messages"
 	else
-		bad "passthru: $PLAIN_MODEL -> status $st, X-0G-E2EE '${e2ee:-<none>}' (want none)"
+		st=$(chat "$WORK/p.json" "$WORK/p.h" "$PLAIN_MODEL" 0)
+		answer=$(answer_of "$WORK/p.json")
+		what="POST /v1/chat/completions"
+	fi
+	e2ee=$(header "$WORK/p.h" X-0G-E2EE)
+	if [ "$st" = 200 ] && [ "$e2ee" = none ] && [ -n "$answer" ]; then
+		ok "passthru: $PLAIN_MODEL ($what) -> 200, X-0G-E2EE: none"
+		note "answer: $(printf '%s' "$answer" | head -c 80 | tr '\n' ' ')"
+	else
+		bad "passthru: $PLAIN_MODEL ($what) -> status $st, X-0G-E2EE '${e2ee:-<none>}' (want none), answer $([ -n "$answer" ] && echo present || echo empty)"
 		note "$(excerpt "$WORK/p.json")"
 		[ "$e2ee" = sealed ] && note "it was SEALED: is $PLAIN_MODEL in ZG_GATEWAY_SEAL_MODELS?"
 	fi
