@@ -15,11 +15,20 @@ package provenance
 // not may simply be newer than the snapshot. judge reports that case as a check that did
 // not run (exit 3, a failure under -strict), never as a refusal and never as a pass.
 //
-// No cache is written: pcverify keeps no state between runs.
+// A LONG-RUNNING PROCESS. pcverify resolves the root once per run; the gateway and the
+// sidecar hold one Verifier for days, so the root is fetched again every trustRefresh.
+// A refresh that fails keeps the last root TUF did deliver — it is never older than the
+// snapshot, and it is what the process was verifying against a moment ago — and is
+// retried every trustRetry. Only a process that has never reached TUF verifies against the
+// snapshot, and only that case carries the staleness caveat.
+//
+// Nothing is written to disk: TUF's local cache is disabled, so every fetch walks from the
+// root sigstore-go embeds.
 
 import (
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/sigstore/sigstore-go/pkg/root"
 	"github.com/sigstore/sigstore-go/pkg/tuf"
@@ -34,24 +43,37 @@ type trust struct {
 	stale string
 }
 
-// trust resolves, once per Verifier, which trust root to verify against.
+// How often the current root is fetched again, and how soon a failed fetch is retried.
+const (
+	trustRefresh = 24 * time.Hour
+	trustRetry   = 10 * time.Minute
+)
+
+// trust resolves which trust root to verify against, fetching the current one when it is
+// due. Calls wait for a fetch in progress rather than starting a second.
 func (v *Verifier) trust() trust {
-	v.trustOnce.Do(func() {
+	v.trustMu.Lock()
+	defer v.trustMu.Unlock()
+	now := v.now()
+	if v.trusted.sigstore == nil {
 		v.trusted = trust{sigstore: v.snapshot}
-		if v.fetchRoot == nil {
-			return
+	}
+	if v.fetchRoot == nil || !v.trustNext.IsZero() && now.Before(v.trustNext) {
+		return v.trusted
+	}
+	tm, err := v.fetchRoot()
+	if err == nil {
+		var sv *verify.Verifier
+		if sv, err = sigstoreVerifier(tm); err == nil {
+			v.trusted, v.current, v.trustNext = trust{sigstore: sv}, true, now.Add(trustRefresh)
+			return v.trusted
 		}
-		tm, err := v.fetchRoot()
-		if err == nil {
-			var sv *verify.Verifier
-			if sv, err = sigstoreVerifier(tm); err == nil {
-				v.trusted.sigstore = sv
-				return
-			}
-		}
+	}
+	v.trustNext = now.Add(trustRetry)
+	if !v.current {
 		v.trusted.stale = fmt.Sprintf("the current Sigstore trust root could not be fetched (%v), so it was checked "+
 			"against the snapshot embedded on %s, which may predate the key that signed it", err, snapshotDate)
-	})
+	}
 	return v.trusted
 }
 
@@ -59,7 +81,7 @@ func (v *Verifier) trust() trust {
 func fetchTrustedRoot(client *http.Client) (root.TrustedMaterial, error) {
 	f := fetcher.NewDefaultFetcher()
 	f.SetHTTPClient(client)
-	f.SetHTTPUserAgent("pcverify")
+	f.SetHTTPUserAgent("0g-pc-e2ee-provenance")
 	opts := tuf.DefaultOptions().WithDisableLocalCache().WithFetcher(f)
 	return root.FetchTrustedRootWithOptions(opts)
 }

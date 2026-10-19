@@ -191,3 +191,73 @@ func TestParseChallenge(t *testing.T) {
 		t.Fatalf("got %v", got)
 	}
 }
+
+// A process holds one Verifier for days, so a verdict is reused only as long as what it
+// says can hold: an acceptance for good, a rejection for an hour (the attestation may not
+// be uploaded yet), an outage for minutes.
+func TestVerify_CacheLifetimes(t *testing.T) {
+	clock := &fakeClock{t: time.Date(2026, 10, 19, 0, 0, 0, 0, time.UTC)}
+
+	t.Run("an outage is asked again after unavailableTTL", func(t *testing.T) {
+		f := newFakeRegistry(digestV054)
+		f.attach(t, fixture(t, "v0.5.4.slsa.json"), digestV054)
+		f.status["referrers/"+digestV054] = http.StatusServiceUnavailable
+		v := serve(t, f)
+		v.now = clock.now
+		if got := v.Verify(v.Repository(), digestV054); got.Status != evidence.ReleaseUnavailable {
+			t.Fatalf("503: got %+v", got)
+		}
+		delete(f.status, "referrers/"+digestV054)
+		clock.advance(unavailableTTL - time.Second)
+		if got := v.Verify(v.Repository(), digestV054); got.Status != evidence.ReleaseUnavailable {
+			t.Fatalf("within unavailableTTL: got %+v", got)
+		}
+		clock.advance(time.Second)
+		if got := v.Verify(v.Repository(), digestV054); got.Status != evidence.ReleaseAccepted {
+			t.Fatalf("after unavailableTTL: got %+v", got)
+		}
+		n := f.requests.Load()
+		clock.advance(365 * 24 * time.Hour)
+		if got := v.Verify(v.Repository(), digestV054); got.Status != evidence.ReleaseAccepted || f.requests.Load() != n {
+			t.Fatalf("an acceptance went back to the registry a year on (%d -> %d requests): %+v", n, f.requests.Load(), got)
+		}
+	})
+
+	t.Run("a digest seen before its attestation is asked again after rejectedTTL", func(t *testing.T) {
+		f := newFakeRegistry(digestV054)
+		v := serve(t, f)
+		v.now = clock.now
+		if got := v.Verify(v.Repository(), digestV054); got.Status != evidence.ReleaseRejected {
+			t.Fatalf("no bundle yet: got %+v", got)
+		}
+		f.attach(t, fixture(t, "v0.5.4.slsa.json"), digestV054)
+		clock.advance(rejectedTTL - time.Second)
+		if got := v.Verify(v.Repository(), digestV054); got.Status != evidence.ReleaseRejected {
+			t.Fatalf("within rejectedTTL: got %+v", got)
+		}
+		clock.advance(time.Second)
+		if got := v.Verify(v.Repository(), digestV054); got.Status != evidence.ReleaseAccepted {
+			t.Fatalf("after rejectedTTL: got %+v", got)
+		}
+	})
+}
+
+// The cache is bounded, since a provider picks the digest its runtime record names: at the
+// bound, expired verdicts go first, then everything but acceptances; an acceptance is
+// never pushed out by a stream of rejections.
+func TestVerify_CacheIsBounded(t *testing.T) {
+	clock := &fakeClock{t: time.Date(2026, 10, 19, 0, 0, 0, 0, time.UTC)}
+	v := embedded(t)
+	v.now = clock.now
+	digest := func(i int) string { return fmt.Sprintf("sha256:%064x", i) }
+	v.remember(digestV054, evidence.ReleaseVerdict{Status: evidence.ReleaseAccepted})
+	for i := 0; i < 3*maxCachedVerdicts; i++ {
+		v.remember(digest(i), evidence.ReleaseVerdict{Reason: "a branch build"})
+	}
+	if len(v.cache) > maxCachedVerdicts {
+		t.Fatalf("the cache holds %d verdicts, over %d", len(v.cache), maxCachedVerdicts)
+	}
+	if got, ok := v.cache[digestV054]; !ok || got.verdict.Status != evidence.ReleaseAccepted {
+		t.Fatal("rejections pushed an acceptance out of the cache")
+	}
+}
