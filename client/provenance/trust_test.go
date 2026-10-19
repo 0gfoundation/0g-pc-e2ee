@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sigstore/sigstore-go/pkg/root"
 
@@ -102,5 +103,63 @@ func TestTrust_TheCurrentRootDecides(t *testing.T) {
 	if got := v.judge(digestV054, [][]byte{fixture(t, "v0.5.4.slsa.json")}); got.Status != evidence.ReleaseRejected ||
 		!strings.Contains(got.Reason, "does not verify") {
 		t.Fatalf("v0.5.4 against a root without its log: %+v", got)
+	}
+}
+
+// fakeClock is a settable clock for the cache and the trust root.
+type fakeClock struct{ t time.Time }
+
+func (c *fakeClock) now() time.Time          { return c.t }
+func (c *fakeClock) advance(d time.Duration) { c.t = c.t.Add(d) }
+
+// A process holds one Verifier for days: the root is fetched again every trustRefresh, a
+// failed refresh keeps the last root TUF delivered (with no staleness caveat, since it is
+// not the snapshot) and is retried every trustRetry, and a process that never reached TUF
+// says so.
+func TestTrust_RefreshedInALongRunningProcess(t *testing.T) {
+	live, err := root.NewTrustedRootFromJSON(trustedRootJSON)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := &fakeClock{t: time.Date(2026, 10, 19, 0, 0, 0, 0, time.UTC)}
+	v := embedded(t)
+	v.now = clock.now
+	calls := 0
+	var fail error
+	v.fetchRoot = func() (root.TrustedMaterial, error) {
+		calls++
+		if fail != nil {
+			return nil, fail
+		}
+		return live, nil
+	}
+
+	if tr := v.trust(); tr.stale != "" || calls != 1 {
+		t.Fatalf("first use: stale %q after %d fetches", tr.stale, calls)
+	}
+	clock.advance(trustRefresh - time.Minute)
+	if v.trust(); calls != 1 {
+		t.Fatalf("fetched again before trustRefresh (%d fetches)", calls)
+	}
+	clock.advance(time.Minute)
+	fail = errors.New("tuf-repo-cdn.sigstore.dev: 503")
+	if tr := v.trust(); calls != 2 || tr.stale != "" || tr.sigstore == v.snapshot {
+		t.Fatalf("a failed refresh: %d fetches, stale %q, snapshot in use %v", calls, tr.stale, tr.sigstore == v.snapshot)
+	}
+	clock.advance(trustRetry - time.Second)
+	if v.trust(); calls != 2 {
+		t.Fatalf("retried before trustRetry (%d fetches)", calls)
+	}
+	clock.advance(time.Second)
+	fail = nil
+	if tr := v.trust(); calls != 3 || tr.stale != "" {
+		t.Fatalf("the retry: %d fetches, stale %q", calls, tr.stale)
+	}
+
+	never := embedded(t)
+	never.now = clock.now
+	never.fetchRoot = func() (root.TrustedMaterial, error) { return nil, errors.New("no route to host") }
+	if tr := never.trust(); tr.sigstore != never.snapshot || !strings.Contains(tr.stale, "no route to host") {
+		t.Fatalf("never reached TUF: %+v", tr)
 	}
 }

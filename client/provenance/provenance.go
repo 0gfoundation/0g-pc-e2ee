@@ -143,22 +143,54 @@ func (p Policy) signerPrefix() string {
 	return p.SourceRepository + "/" + p.Workflow + "@"
 }
 
-// Verifier is an evidence.ReleaseVerifier backed by provenance verification. Each digest
-// is judged once per Verifier; a run builds one.
+// Verifier is an evidence.ReleaseVerifier backed by provenance verification. pcverify
+// builds one per run; the gateway and the sidecar hold one for the life of the process,
+// which is what the cache lifetimes and the trust-root refresh below are for.
 type Verifier struct {
 	policy   Policy
 	registry *registry
+	// now is the clock the cache and the trust root are aged by.
+	now func() time.Time
 
 	// snapshot verifies against the embedded trust root. fetchRoot, when set, supplies the
-	// current one; it is called at most once, on the first digest that needs it.
+	// current one: on the first digest that needs it, then again every trustRefresh (every
+	// trustRetry while it fails). See trust.go.
 	snapshot  *verify.Verifier
 	fetchRoot func() (root.TrustedMaterial, error)
-	trustOnce sync.Once
+	trustMu   sync.Mutex
 	trusted   trust
+	current   bool      // trusted holds a root fetched over TUF, not the snapshot
+	trustNext time.Time // when to fetch it again; zero before the first fetch
 
 	mu    sync.Mutex
-	cache map[string]evidence.ReleaseVerdict
+	cache map[string]cachedVerdict
 }
+
+// cachedVerdict is a verdict and when it stops being reused.
+type cachedVerdict struct {
+	verdict evidence.ReleaseVerdict
+	// until is when the digest is judged again; zero means never.
+	until time.Time
+}
+
+// How long a verdict is reused, by what it says.
+//
+//   - ACCEPTED is kept: the policy is embedded, so nothing short of a new build of this
+//     verifier can turn a release into a non-release.
+//   - REJECTED is kept for an hour, not forever. Most rejections are as final as an
+//     acceptance (a branch build stays a branch build), but one is not: a digest seen
+//     between the broker's image push and its attestation upload has no bundle yet.
+//   - UNAVAILABLE is kept for minutes. It says nothing about the build, only that the
+//     registry or TUF did not answer, and the next answer may be the real one.
+const (
+	rejectedTTL    = time.Hour
+	unavailableTTL = 5 * time.Minute
+)
+
+// maxCachedVerdicts bounds the cache. A provider decides which digest its runtime record
+// names, so a process that judged every one forever would hold whatever a provider chose
+// to make it hold. Far above the number of broker builds anyone runs.
+const maxCachedVerdicts = 1024
 
 // New builds a Verifier from the embedded policy, the current Sigstore trust root (fetched
 // over TUF with client, on first use) and the embedded snapshot as its fallback. timeout
@@ -187,7 +219,7 @@ func newVerifier(policy, trustedRoot []byte) (*Verifier, error) {
 	if err != nil {
 		return nil, fmt.Errorf("embedded Sigstore trust root: %w", err)
 	}
-	return &Verifier{policy: p, snapshot: sv, cache: map[string]evidence.ReleaseVerdict{}}, nil
+	return &Verifier{policy: p, snapshot: sv, now: time.Now, cache: map[string]cachedVerdict{}}, nil
 }
 
 // sigstoreVerifier verifies bundles against tm. One signed certificate timestamp, one
@@ -212,15 +244,48 @@ func (v *Verifier) Verify(repository, digest string) evidence.ReleaseVerdict {
 	v.mu.Lock()
 	cached, ok := v.cache[digest]
 	v.mu.Unlock()
-	if ok {
-		return cached
+	if ok && (cached.until.IsZero() || v.now().Before(cached.until)) {
+		return cached.verdict
 	}
 
 	verdict := v.check(digest)
-	v.mu.Lock()
-	v.cache[digest] = verdict
-	v.mu.Unlock()
+	v.remember(digest, verdict)
 	return verdict
+}
+
+// remember caches verdict for as long as its status allows (see rejectedTTL). At the
+// bound it first drops what has expired, then what was not an acceptance; a verdict that
+// still finds no room is not cached, and the digest is simply judged again next time.
+func (v *Verifier) remember(digest string, verdict evidence.ReleaseVerdict) {
+	now := v.now()
+	c := cachedVerdict{verdict: verdict}
+	switch verdict.Status {
+	case evidence.ReleaseAccepted:
+	case evidence.ReleaseUnavailable:
+		c.until = now.Add(unavailableTTL)
+	default:
+		c.until = now.Add(rejectedTTL)
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if _, ok := v.cache[digest]; !ok && len(v.cache) >= maxCachedVerdicts {
+		for d, e := range v.cache {
+			if !e.until.IsZero() && !now.Before(e.until) {
+				delete(v.cache, d)
+			}
+		}
+		if len(v.cache) >= maxCachedVerdicts {
+			for d, e := range v.cache {
+				if e.verdict.Status != evidence.ReleaseAccepted {
+					delete(v.cache, d)
+				}
+			}
+		}
+		if len(v.cache) >= maxCachedVerdicts {
+			return
+		}
+	}
+	v.cache[digest] = c
 }
 
 func (v *Verifier) check(digest string) evidence.ReleaseVerdict {
