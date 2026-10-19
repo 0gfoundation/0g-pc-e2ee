@@ -23,14 +23,17 @@ package route
 // WHERE IT RUNS. The manifest is loaded once per quote verification, with the quote
 // (verifyQuoteAt) — the expensive step, compose-go's loader, and the one that does not
 // depend on who the provider is. The comparison needs the provider's address, which the
-// quote cache (keyed by endpoint) does not have, so it runs where the address is known:
-// observed on a fresh verification in the request path and in every warmer sweep, and
-// judged again whenever a record is read, since the broker builds it names are judged in
-// the background (releaseJudge) and their verdicts can land later.
+// quote cache (keyed by endpoint) does not have, so it runs where the address is known —
+// the request path and every warmer sweep — and is judged again whenever a record is
+// read, since the broker builds it names are judged in the background (releaseJudge) and
+// their verdicts can land later. It is OBSERVED (counted and logged) once per
+// verification and provider, not once per request: see observation.
 
 import (
 	"strings"
+	"sync"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
 	"github.com/0gfoundation/0g-pc-e2ee/client/evidence/compose"
 	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
@@ -64,27 +67,70 @@ type manifestFacts struct {
 	// there was none to load (err says why).
 	review *compose.ComposeReview
 	err    string
+	// observed is shared by every holder of this verification's facts — each request
+	// that joined it through the singleflight, every later cache hit, and a warmer sweep
+	// that joined it — and says which providers it has been observed for.
+	observed *observation
+}
+
+// observation records which providers one verification has been observed for, so that
+// observeBaseline counts and logs it once per verification and provider however many
+// requests share it.
+//
+// Per provider, not just per verification: one endpoint can serve several registrations
+// (cn-39 and cn-40 are one CVM), each with its own recorded deployment, and a token per
+// verification alone would observe whichever address happened to come first.
+//
+// Per verification, not per request: a request is not evidence. "Is this the request
+// that verified?" cannot be answered from the request's side — every caller that joins
+// a verification through the singleflight sees a cache miss — so the answer lives with
+// the verification.
+type observation struct {
+	mu   sync.Mutex
+	seen map[string]bool
+}
+
+func newObservation() *observation { return &observation{seen: map[string]bool{}} }
+
+// first reports whether address has not been observed for this verification yet, and
+// marks it. A nil observation (facts no verification produced) always reports true.
+func (o *observation) first(address string) bool {
+	if o == nil {
+		return true
+	}
+	key := chain.ProviderKey(address)
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.seen[key] {
+		return false
+	}
+	o.seen[key] = true
+	return true
 }
 
 // readManifest loads the reply's app-compose for the baseline, after the hash gate. It
 // returns nothing to compare when the Router has no baseline, so a deployment without one
 // pays nothing for compose-go.
 func (r *Router) readManifest(appCompose []byte, composeHash [attest.ComposeHashLen]byte, haveHash bool) manifestFacts {
+	f := manifestFacts{observed: newObservation()}
 	switch {
 	case r.baseline == nil:
-		return manifestFacts{}
 	case !haveHash:
-		return manifestFacts{err: "the quote's mr_config_id does not expose a compose hash, so no manifest is authenticated"}
+		f.err = "the quote's mr_config_id does not expose a compose hash, so no manifest is authenticated"
 	case len(appCompose) == 0:
-		return manifestFacts{err: "the quote reply carries no app-compose"}
+		f.err = "the quote reply carries no app-compose"
+	default:
+		// No release verifier for the review itself: its findings are not recorded here,
+		// and the one thing it would judge builds for (the controller exception) is a
+		// finding.
+		review, err := compose.ReviewCompose(appCompose, composeHash, nil)
+		if err != nil {
+			f.err = err.Error()
+		} else {
+			f.review = &review
+		}
 	}
-	// No release verifier for the review itself: its findings are not recorded here, and
-	// the one thing it would judge builds for (the controller exception) is a finding.
-	review, err := compose.ReviewCompose(appCompose, composeHash, nil)
-	if err != nil {
-		return manifestFacts{err: err.Error()}
-	}
-	return manifestFacts{review: &review}
+	return f
 }
 
 // baselineVerdict is the judgement of one manifest against one provider's record.
@@ -137,9 +183,15 @@ func (r *Router) judgeBaseline(address string, f manifestFacts, start bool) base
 	return v
 }
 
-// observeBaseline judges a provider's manifest where a verification happened, sending
-// broker builds with no verdict for one, and counts and logs the outcome.
-func (r *Router) observeBaseline(address string, f manifestFacts) {
+// observeBaseline judges a provider's manifest the first time a verification is used for
+// that provider, sending broker builds with no verdict for one, and counts and logs the
+// outcome. Every later use of the same verification for the same provider — a request
+// that joined it, a cache hit — is a no-op, and observeBaseline reports whether it
+// observed.
+func (r *Router) observeBaseline(address string, f manifestFacts) bool {
+	if !f.observed.first(address) {
+		return false
+	}
 	v := r.judgeBaseline(address, f, true)
 	metrics.ComposeBaseline(string(v.verdict))
 	switch v.verdict {
@@ -150,6 +202,7 @@ func (r *Router) observeBaseline(address string, f manifestFacts) {
 		r.logger.Debug("provider's manifest could not be compared against its recorded deployment",
 			"provider", address, "deployment", v.deployment, "why", strings.Join(v.why, "; "))
 	}
+	return true
 }
 
 func mismatchReasons(ms []compose.ComposeMismatch) []string {
