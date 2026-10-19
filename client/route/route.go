@@ -1175,7 +1175,7 @@ func (r *Router) verifyQuoteAt(ctx context.Context, quoteURL string) (res quoteR
 			"rtmr2", fmt.Sprintf("%x", bc.RTMR2[:]),
 			"signer_addr", verified.SignerAddr)
 	}
-	composeHash, haveHash := composeHashOf(raw, verified, r.logger)
+	composeHash, haveHash := composeHashOf(raw, reply, verified, r.logger)
 	facts := quoteFacts{
 		measurement: r.measurementVerdict(verified),
 		// The verifier reports which audited image matched, so the record can name it
@@ -1273,8 +1273,9 @@ func (r *Router) measurementVerdict(verified attest.Verified) Verdict {
 }
 
 // composeHashOf reads the dstack compose hash — which application configuration the
-// provider enclave booted — out of the quote's mr_config_id, or returns "" when the
-// register's layout does not expose one (V2/V3 commit to it inside a digest).
+// provider enclave booted — out of the quote's mr_config_id, or returns "" when none
+// can be established from it (evidence.ComposeHashOf: V1 in the clear, V3 against the
+// reply's event log replayed to the verified RTMR3).
 //
 // The register comes from a STRUCTURAL re-parse of the same bytes the verifier just
 // authenticated, which is what makes the value trustworthy: mr_config_id sits inside
@@ -1300,7 +1301,8 @@ func (r *Router) measurementVerdict(verified attest.Verified) Verdict {
 // lookup compares raw bytes against sha256 of the app-compose. Hexing and re-parsing
 // between the two would be a lossy round trip in the one place that must not have
 // one.
-func composeHashOf(raw []byte, verified attest.Verified, logger *slog.Logger) (hash [attest.ComposeHashLen]byte, ok bool) {
+func composeHashOf(raw, reply []byte, verified attest.Verified, logger *slog.Logger) (hash [attest.ComposeHashLen]byte,
+	ok bool) {
 	body, err := attest.ParseTDXQuoteBody(raw)
 	if err != nil {
 		logger.Debug("provider quote: cannot structurally re-parse a verified quote, reporting no compose_hash", "err", err)
@@ -1310,11 +1312,13 @@ func composeHashOf(raw []byte, verified attest.Verified, logger *slog.Logger) (h
 		logger.Warn("provider quote: structural re-parse disagrees with the verified measurement, reporting no compose_hash")
 		return hash, false
 	}
-	hash, err = attest.ComposeHashFromMRConfigID(body.MRConfigID)
+	// V3 (dstack 0.6) is read against the reply's event log, replayed to the verified
+	// RTMR3 (evidence.ComposeHashOf); V1 from the register alone.
+	hash, err = evidence.ComposeHashOf(body.MRConfigID, reply, verified.Measurement.RTMR3)
 	if err != nil {
-		// A V2/V3 (or absent) mr_config_id does not carry the hash in the clear. Nothing
-		// is wrong with the quote; there is simply nothing to read.
-		logger.Debug("provider quote: mr_config_id does not expose compose_hash", "err", err)
+		// No hash this reader can establish (a V2 mr_config_id, or a V3 one whose document
+		// it cannot rebuild). Nothing is wrong with the quote; there is nothing to read.
+		logger.Debug("provider quote: no compose_hash established from mr_config_id", "err", err)
 		return hash, false
 	}
 	return hash, true

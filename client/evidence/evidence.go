@@ -408,6 +408,9 @@ type Report struct {
 	// the verified quote bytes.
 	MRConfigID    [48]byte
 	MRConfigIDErr error
+	// quoteReply is quote.json as fetched: a V3 mr_config_id is read against its event
+	// log (ComposeHashOf).
+	quoteReply []byte
 	// BindingErr is set when report_data does not bind this manifest (step 3).
 	BindingErr error
 
@@ -718,6 +721,7 @@ func (c *Checker) Check(ctx context.Context, domain string) (rep Report, err err
 	if err != nil {
 		rep.QuoteErr = err
 	} else {
+		rep.quoteReply = quoteBody
 		raw, derr := attest.DecodeQuoteResponse(quoteBody)
 		if derr != nil {
 			rep.QuoteErr = derr
@@ -788,12 +792,14 @@ func (c *Checker) checkCodeIdentity(ctx context.Context, rep *Report) {
 		code.HashErr = rep.MRConfigIDErr
 		return
 	}
-	composeHash, err := attest.ComposeHashFromMRConfigID(rep.MRConfigID)
+	composeHash, err := ComposeHashOf(rep.MRConfigID, rep.quoteReply, rep.Measurement.RTMR3)
 	if err != nil {
 		code.HashErr = err
 		return
 	}
 	code.ComposeHash = composeHash
+	// Read once, used by both paths below; "" when the log does not replay or names none.
+	logged, _ := LoggedAppID(rep.quoteReply, rep.Measurement.RTMR3)
 
 	// Obtain the app-compose. A caller-supplied copy wins over fetching: it is what
 	// an operator uses to assert "this is the release I deployed", and it works when
@@ -804,14 +810,14 @@ func (c *Checker) checkCodeIdentity(ctx context.Context, rep *Report) {
 		raw, code.Source = c.cfg.AppCompose, "supplied"
 		// Still settle an app_id, for the report only — the bytes are already in hand,
 		// so no lookup depends on it and none is worth a DNS round trip here.
-		code.AppID, code.AppIDSource = c.appIDWithoutDNS(composeHash)
+		code.AppID, code.AppIDSource = c.appIDWithoutDNS(composeHash, logged)
 	default:
 		// Nothing supplied, so every input of the lookup is discovered: a failure to
 		// reach either platform path says nothing about the deployment, and nobody
 		// asked for it (see OK). Requested — the caller naming an app_id, a base
 		// domain, or the bytes — is what turns that into a demand.
 		code.Discovered = !code.Requested
-		code.AppID, code.AppIDSource, code.AppIDErr = c.resolveAppID(ctx, rep.Domain, composeHash)
+		code.AppID, code.AppIDSource, code.AppIDErr = c.resolveAppID(ctx, rep.Domain, composeHash, logged)
 
 		// Two paths to the same document, cloud first. It is the one that does not
 		// depend on the platform routing port 8090 into this particular CVM, and a
@@ -924,18 +930,21 @@ func cloudLookupCtx(ctx context.Context, fallbackPossible bool) (context.Context
 	return context.WithTimeout(ctx, remaining/2)
 }
 
-// The three values CodeIdentity.AppIDSource can hold. They are strings rather than
+// The four values CodeIdentity.AppIDSource can hold. They are strings rather than
 // an enum because their only consumer is a report line, and a reader of that line
 // needs the words, not a constant.
 const (
 	appIDFromConfig      = "supplied"
+	appIDFromEventLog    = "the quote's RTMR3 event log"
 	appIDFromDNS         = appAddressPrefix + " TXT"
 	appIDFromComposeHash = "compose_hash prefix"
 )
 
 // resolveAppID settles which app_id the lookups address, preferring the most
-// specific source available: what the caller pinned, then the record the platform
-// itself routes this domain by, then compose_hash's leading bytes.
+// specific source available: what the caller pinned, then the app-id the guest wrote
+// into RTMR3 (logged, from LoggedAppID — the one the quote itself vouches for, read only
+// once the log replayed), then the record the platform itself routes this domain by,
+// then compose_hash's leading bytes.
 //
 // The last is a fallback rather than the rule, and the returned error says so when
 // it is used. It is what dstack derives an app_id from when an app is CREATED, so it
@@ -945,9 +954,13 @@ func (c *Checker) resolveAppID(
 	ctx context.Context,
 	domain string,
 	composeHash [attest.ComposeHashLen]byte,
+	logged string,
 ) (id, source string, err error) {
 	if pinned := normalizeAppID(c.cfg.AppID); pinned != "" {
 		return pinned, appIDFromConfig, nil
+	}
+	if logged != "" {
+		return logged, appIDFromEventLog, nil
 	}
 	if c.cfg.NoDNSDiscovery {
 		err = errors.New("DNS discovery is off")
@@ -965,9 +978,12 @@ func (c *Checker) resolveAppID(
 // bytes: the app_id is then reported and nothing more, so it is not worth a DNS
 // round trip — and a lookup performed only to print a value would fail runs that
 // have nothing left to look up.
-func (c *Checker) appIDWithoutDNS(composeHash [attest.ComposeHashLen]byte) (id, source string) {
+func (c *Checker) appIDWithoutDNS(composeHash [attest.ComposeHashLen]byte, logged string) (id, source string) {
 	if pinned := normalizeAppID(c.cfg.AppID); pinned != "" {
 		return pinned, appIDFromConfig
+	}
+	if logged != "" {
+		return logged, appIDFromEventLog
 	}
 	return attest.AppIDFromComposeHash(composeHash), appIDFromComposeHash
 }

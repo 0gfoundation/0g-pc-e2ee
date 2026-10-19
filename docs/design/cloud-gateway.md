@@ -525,10 +525,13 @@ does not.
    `compose_hash` directly — `0x01 ‖ SHA-256(app-compose.json) ‖ padding`
    (`dstack-types/src/mr_config.rs`, `MrConfig::V1`) — and that register is inside
    the signed TD report, so **no event-log replay is needed**: whatever verified
-   the quote already authenticated it. `attest.ComposeHashFromMRConfigID` reads it
-   (failing closed on the V2/V3 layouts, which commit to the hash inside a digest
-   rather than carrying it). The `compose-hash` runtime event in RTMR3 carries the
-   same value and is kept only as a cross-check in the KAT.
+   the quote already authenticated it. `attest.ComposeHashFromMRConfigID` reads it.
+   dstack 0.6 launches with **V3** instead, which carries only
+   SHA-256 of a launch document the host writes; `evidence.ComposeHashOf` rebuilds
+   that document from the event log — replayed to the verified RTMR3 first, so it
+   does need the replay — and accepts the `compose-hash` it names only when the
+   rebuilt document reproduces `mr_config_id` exactly (`client/evidence/mrconfig.go`).
+   V2 is still not read.
 
    **`app_id` is not in that register, and is not derivable from it.** dstack assigns
    an app its id at creation and keeps it across compose upgrades
