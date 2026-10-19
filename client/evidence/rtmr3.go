@@ -172,34 +172,9 @@ func EventDigest(eventType uint32, event string, payload []byte) [RTMRLen]byte {
 // the state its records describe. An error other than ErrNoEventLog is a finding: the
 // log is not the CVM's, or a record in it is not one the controller writes.
 func ReadRuntimeState(reply []byte, rtmr3 [RTMRLen]byte) (RuntimeState, error) {
-	entries, err := eventLogOf(reply)
+	log, err := replayRTMR3(reply, rtmr3)
 	if err != nil {
 		return RuntimeState{}, err
-	}
-	type rtmr3Entry struct {
-		eventEntry
-		payload []byte
-	}
-	var mr [RTMRLen]byte
-	var log []rtmr3Entry
-	for i, e := range entries {
-		if e.IMR != 3 {
-			continue // the firmware's registers; compared as the boot chain, not replayed here
-		}
-		payload, err := hex.DecodeString(e.Payload)
-		if err != nil {
-			return RuntimeState{}, fmt.Errorf("event log entry %d (%q): the payload is not hex: %v", i, e.Event, err)
-		}
-		d := EventDigest(e.EventType, e.Event, payload)
-		h := sha512.New384()
-		h.Write(mr[:])
-		h.Write(d[:])
-		copy(mr[:], h.Sum(nil))
-		log = append(log, rtmr3Entry{e, payload})
-	}
-	if mr != rtmr3 {
-		return RuntimeState{}, fmt.Errorf("the event log does not replay to the quote's RTMR3 (replayed %x, quote %x): "+
-			"it is not the log this CVM wrote", mr, rtmr3)
 	}
 
 	st := RuntimeState{Entries: len(log)}
@@ -231,6 +206,45 @@ func ReadRuntimeState(reply []byte, rtmr3 [RTMRLen]byte) (RuntimeState, error) {
 		}
 	}
 	return st, nil
+}
+
+// rtmr3Entry is one RTMR3 entry of an event log that replayed, with its payload decoded.
+type rtmr3Entry struct {
+	eventEntry
+	payload []byte
+}
+
+// replayRTMR3 reads the event log out of a /v1/quote reply and requires its RTMR3 entries
+// to replay to rtmr3 — the RTMR3 of the VERIFIED quote, never one read from the reply. It
+// returns those entries in log order, each now as good as the quote: the replay is what
+// makes any of them worth reading. ErrNoEventLog when the reply carries none.
+func replayRTMR3(reply []byte, rtmr3 [RTMRLen]byte) ([]rtmr3Entry, error) {
+	entries, err := eventLogOf(reply)
+	if err != nil {
+		return nil, err
+	}
+	var mr [RTMRLen]byte
+	var log []rtmr3Entry
+	for i, e := range entries {
+		if e.IMR != 3 {
+			continue // the firmware's registers; compared as the boot chain, not replayed here
+		}
+		payload, err := hex.DecodeString(e.Payload)
+		if err != nil {
+			return nil, fmt.Errorf("event log entry %d (%q): the payload is not hex: %v", i, e.Event, err)
+		}
+		d := EventDigest(e.EventType, e.Event, payload)
+		h := sha512.New384()
+		h.Write(mr[:])
+		h.Write(d[:])
+		copy(mr[:], h.Sum(nil))
+		log = append(log, rtmr3Entry{e, payload})
+	}
+	if mr != rtmr3 {
+		return nil, fmt.Errorf("the event log does not replay to the quote's RTMR3 (replayed %x, quote %x): "+
+			"it is not the log this CVM wrote", mr, rtmr3)
+	}
+	return log, nil
 }
 
 // apply reads one record into the state; the last record of each kind wins (§2 step 5).

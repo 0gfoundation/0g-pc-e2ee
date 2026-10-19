@@ -203,9 +203,11 @@
         "     the two MRTDs dstack-mr computed. That file carries the RTMR1/RTMR2 inputs",
         "     (kernel authenticode, initrd sha384, cmdline), not the registers, so those",
         "     two rest on step 2 until step 5.",
-        "  4. STEP 5 IS STILL OPEN: no live quote of this image has been compared yet.",
-        "     Confirm all three registers with `pcverify -gateway <domain>` on the first",
-        "     CVM to boot it, and record which of the two entries it matched."
+        "  4. RTMR1 and RTMR2 are CONFIRMED by a live quote — router-api-staging.0g.ai",
+        "     on 2026-10-19, which matched the two-pass entry below. This entry's MRTD",
+        "     is the one value no quote has confirmed yet; it equals the single_pass",
+        "     MRTD in the release's own measurement.tdx.cbor, computed independently",
+        "     of dstack-mr."
       ],
       "mrtd": "83baf004a06c83f6371d4d9e19c8bb1ead734ba7696e56d6b52271011394a6f24efecc27af3b5c1da41594dbfa706e97",
       "rtmr1": "89ef86c5125b986c325f0a94acfa87718a4ef3a4d4f237dbb72dda3cf777fd2c054555fb4407eb53338d7d67329a7333",
@@ -240,9 +242,13 @@
         "     the two MRTDs dstack-mr computed. That file carries the RTMR1/RTMR2 inputs",
         "     (kernel authenticode, initrd sha384, cmdline), not the registers, so those",
         "     two rest on step 2 until step 5.",
-        "  4. STEP 5 IS STILL OPEN: no live quote of this image has been compared yet.",
-        "     Confirm all three registers with `pcverify -gateway <domain>` on the first",
-        "     CVM to boot it, and record which of the two entries it matched."
+        "  4. CONFIRMED against a live quote (step 5): router-api-staging.0g.ai",
+        "     (pc-gateway-staging-b, 2026-10-19) reports all three of these values,",
+        "     and its event log, replayed to the quote's RTMR3, names os-image-hash",
+        "     ec43cb8c…, tying that quote to this artifact. The host's vm_config carries",
+        "     qemu_single_pass_add_pages=true (QEMU 8.2.2), which dstack-mr feeds",
+        "     straight into two_pass_add_pages — independently explaining why it",
+        "     measures the two-pass MRTD."
       ],
       "mrtd": "2a674327c50218dba880066b349b8d559d749ed68dce33fd651c184a877d084b07a9e583767a7ad5da13ed91deec2b70",
       "rtmr1": "89ef86c5125b986c325f0a94acfa87718a4ef3a4d4f237dbb72dda3cf777fd2c054555fb4407eb53338d7d67329a7333",

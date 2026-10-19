@@ -250,8 +250,9 @@ type serviceReader interface {
 type providerQuote struct {
 	Verified attest.Verified
 	// ComposeHash is the compose_hash the verified quote commits to, and HaveComposeHash
-	// says whether there is one to read — a V2/V3 mr_config_id folds it into a digest
-	// instead of carrying it in the clear, which is not a fault in the quote.
+	// says whether one was established — evidence.ComposeHashOf reads V1 in the clear
+	// and V3 against the reply's replayed event log; a V2 mr_config_id, or a V3 document
+	// it cannot rebuild, leaves none, which is not a fault in the quote.
 	ComposeHash     [attest.ComposeHashLen]byte
 	HaveComposeHash bool
 	// ComposeHashErr says why there is no hash, for the report. Distinct from
@@ -1065,7 +1066,7 @@ func (c *dcapChecker) FetchAndVerify(ctx context.Context, endpoint string) (prov
 		// bytes I read describe the TD you verified" stops being self-evident.
 		pq.ComposeHashErr = errors.New("the structural re-parse disagrees with the verified measurement")
 	default:
-		hash, err := attest.ComposeHashFromMRConfigID(qb.MRConfigID)
+		hash, err := evidence.ComposeHashOf(qb.MRConfigID, reply, verified.Measurement.RTMR3)
 		if err != nil {
 			pq.ComposeHashErr = err
 		} else {

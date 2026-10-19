@@ -171,7 +171,9 @@ const ComposeHashLen = sha256.Size
 // Only MRConfigV1 exposes the hash. V2 and V3 commit to it inside a digest, so
 // they return ErrUnsupportedMRConfig rather than a guess: a caller holding all of
 // V2's inputs can recompute and compare, but that is a different operation from
-// extraction and must not be conflated with it.
+// extraction and must not be conflated with it. (The client module does that for V3,
+// which dstack 0.6 launches with: evidence.ComposeHashOf rebuilds the launch document
+// from the replayed event log and compares.)
 //
 // An all-zero mr_config_id (a TD built without one) also fails — there is nothing
 // to read, and returning a zero hash would look like a real commitment.

@@ -244,8 +244,9 @@ type ProviderIdentity struct {
 	// ComposeHash is the dstack compose hash from the verified quote's mr_config_id,
 	// hex-encoded: SHA-256 over the provider CVM's app-compose.json, i.e. WHICH
 	// application configuration that enclave booted. Empty when the quote's
-	// mr_config_id uses a layout that does not expose it (V2/V3 commit to it inside a
-	// digest) — see attest.ComposeHashFromMRConfigID.
+	// mr_config_id does not establish one — V1 carries it in the clear, V3 (dstack 0.6)
+	// is established against the reply's replayed event log, V2 is not read; see
+	// evidence.ComposeHashOf.
 	//
 	// It is authenticated: mr_config_id sits inside the signed TD report, so the same
 	// signature check behind QuoteDCAP covers it.

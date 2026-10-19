@@ -211,7 +211,7 @@ func buildIdentity(ctx context.Context, cfg identityConfig, logger *slog.Logger)
 	var composeHash [attest.ComposeHashLen]byte
 	haveHash := false
 	if cfg.QuotePath != "" {
-		switch body, err := readQuoteBody(cfg.QuotePath); {
+		switch body, reply, err := readQuoteBody(cfg.QuotePath); {
 		case err != nil:
 			// The bundle is written by dstack-ingress after its first ACME run, so an
 			// absent quote is the normal state for the first minute of a fresh CVM's life,
@@ -219,10 +219,13 @@ func buildIdentity(ctx context.Context, cfg identityConfig, logger *slog.Logger)
 			res.pending = append(res.pending, "quote: "+err.Error())
 			logger.Debug("identity: quote unavailable", "path", cfg.QuotePath, "err", err)
 		default:
-			hash, err := attest.ComposeHashFromMRConfigID(body.MRConfigID)
+			// V3 (dstack 0.6) is read against the same file's event log, replayed to this
+			// quote's RTMR3 — structurally read, like everything here: self-reported, as
+			// the step-1 note says; pcverify is what verifies it.
+			hash, err := evidence.ComposeHashOf(body.MRConfigID, reply, body.Measurement.RTMR3)
 			if err != nil {
-				// A V2/V3 mr_config_id does not carry the hash in the clear. Re-reading the
-				// same file will not change that, so this is settled, not pending.
+				// No hash this reader can establish from this quote. Re-reading the same file
+				// will not change that, so this is settled, not pending.
 				logger.Warn("identity: cannot read compose_hash from this quote", "err", err)
 			} else {
 				composeHash, haveHash = hash, true
@@ -387,16 +390,17 @@ func deref(s *string) string {
 
 // readQuoteBody reads and structurally parses the bundle's quote.json. See
 // buildIdentity on why this does not DCAP-verify.
-func readQuoteBody(path string) (attest.QuoteBody, error) {
-	body, err := os.ReadFile(path)
+func readQuoteBody(path string) (attest.QuoteBody, []byte, error) {
+	reply, err := os.ReadFile(path)
 	if err != nil {
-		return attest.QuoteBody{}, err
+		return attest.QuoteBody{}, nil, err
 	}
-	raw, err := attest.DecodeQuoteResponse(body)
+	raw, err := attest.DecodeQuoteResponse(reply)
 	if err != nil {
-		return attest.QuoteBody{}, err
+		return attest.QuoteBody{}, nil, err
 	}
-	return attest.ParseTDXQuoteBody(raw)
+	body, err := attest.ParseTDXQuoteBody(raw)
+	return body, reply, err
 }
 
 // loadAppCompose returns the raw app-compose bytes and where they came from.

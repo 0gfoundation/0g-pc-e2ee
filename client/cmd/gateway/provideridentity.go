@@ -100,8 +100,9 @@ type providerIdentityDoc struct {
 	// against, or (in principle) matched an entry that carried no name.
 	OSImage *string `json:"os_image"`
 	// ComposeHash is the dstack compose hash out of the verified quote's mr_config_id
-	// — WHICH application configuration that enclave booted. Null when the register's
-	// layout does not carry it in the clear (mr_config_id V2/V3).
+	// — WHICH application configuration that enclave booted. Null when it cannot be
+	// established from that register (evidence.ComposeHashOf: V1 in the clear, V3
+	// against the replayed event log; a V2 layout is not read).
 	ComposeHash *string `json:"compose_hash"`
 	// Containers is what ComposeHash commits to, unpacked: the services the provider
 	// CVM runs, in the order its compose file lists them. Null — never [] — when
