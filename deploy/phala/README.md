@@ -825,7 +825,9 @@ whole fleet. Turn it on once `zg_gateway_runtime_release_checks_total` and
 `zg_gateway_compose_baseline_checks_total` show `pass` for every provider being routed
 to, read off a gateway with it off, the way on-chain enforce was decided.
 
-Smoke-test after deploying:
+Smoke-test after deploying — `scripts/smoke-gateway.sh` runs this check, along with
+health, auth, sealed and streamed chat, passthrough and session stickiness, in one go
+(`ZG_API_KEY=… scripts/smoke-gateway.sh --gateway <DOMAIN>`); by hand:
 
 ```sh
 # the address the sealed request was pinned to
