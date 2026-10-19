@@ -41,7 +41,7 @@ Grafana `dashboards` provider watches). The `uid` is `0g-pc-gateway`.
 
 ## Layout
 
-One dashboard, eight collapsible rows — one service, so cross-metric correlation
+One dashboard, nine collapsible rows — one service, so cross-metric correlation
 (latency vs quote-cache misses, open failures vs a bad provider) stays on one
 screen:
 
@@ -218,9 +218,21 @@ screen:
    and note "Ready providers" uses `min` across the selected replicas, not a sum: one
    replica that can ground nothing is the number that matters, since it is the one
    failing every request.
-7. **Warmer & DCAP collateral**: warmer last-success age (with alert-colored
+7. **Provider checks — observed, not enforced**: the two judgements of what a
+   provider runs, per quote verification — `runtime_release` (the broker build the
+   CVM's RTMR3 records say it runs now, against the broker's signed release policy)
+   and `compose_baseline` (the manifest it booted, against the deployment recorded for
+   it) — as `no_match` rates and by verdict. Both are counted once per verification and
+   provider, not per request, and neither refuses a provider: this row is the survey an
+   enforce switch would be decided on, in the role row 6 played for on-chain
+   enforce. Read `no_match` as the only finding; `no_baseline` (nobody recorded the
+   provider), `not_checked` (no runtime image record, or the check is off) and
+   `unavailable` (a check that did not run — on a new build, for the seconds its
+   provenance is fetched in the background) say nothing against a provider, and on
+   today's fleet `no_baseline` is most of what the baseline panel shows.
+8. **Warmer & DCAP collateral**: warmer last-success age (with alert-colored
    thresholds), sweep/provider outcomes, collateral cache + fetch latency.
-8. **Process runtime**: goroutines, resident memory, CPU. These are the panels
+9. **Process runtime**: goroutines, resident memory, CPU. These are the panels
    that are not summed, so they draw one line per replica; the legend is
    `{{instance_id}}` rather than Prometheus' own `instance`, which is the scrape
    address (`gateway:9464`) and therefore the same string in every replica.
@@ -294,6 +306,13 @@ highest-signal ones:
   one. Under enforce that provider is unusable, and enough of them turn `/readyz`
   red and hold back a blue/green cutover; it is the same condition as a grounding
   `mismatch`, seen from the sweep rather than from a request.
+- `sum(rate(zg_gateway_runtime_release_checks_total{verdict="no_match"}[15m])) > 0` and
+  the same on `zg_gateway_compose_baseline_checks_total` — a provider runs a broker build
+  that is not a release, or a manifest that is not the deployment recorded for it.
+  Notify, do not page: both are observed, so the gateway is still sealing to that
+  provider, and on today's fleet they fire (cn-19, cn-20, cn-41 run builds the policy
+  refuses). The provider and the reason are in the warn log line of the same name; the
+  provider-identity record has the verdicts.
 - `rate(zg_gateway_onchain_revalidations_total{result="ok"}[5m]) > 0` — informational
   rather than a page: a stale or cached reading disagreed but a live re-read agreed,
   which is the signature of a benign broker-signer rotation. Worth noticing during a
