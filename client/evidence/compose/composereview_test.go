@@ -1420,3 +1420,33 @@ func TestErrNoDockerCompose_IsNotAGateFailure(t *testing.T) {
 		t.Fatalf("a digest mismatch reported as evidence.ErrNoDockerCompose: %v", err)
 	}
 }
+
+// A manifest that makes the reader fail — no input is known to, so the failure is
+// injected — is a manifest not read: no crash, and not a mismatch either. The gateway and
+// the sidecar run this on every provider's manifest, so a panic here used to take the
+// process down with every other provider it served.
+func TestReviewCompose_AReaderFailureIsNotRead(t *testing.T) {
+	saved := reviewText
+	t.Cleanup(func() { reviewText = saved })
+	reviewText = func(*ComposeReview, []byte) { panic("index out of range [3] with length 3") }
+
+	r := reviewRecorded(t, "testnet-app-compose.json", testnetComposeHash)
+	if !errors.Is(r.LoadErr, errNotRead) || len(r.Blocks) != 0 || len(r.TopLevel) != 0 || len(r.Services) != 0 {
+		t.Fatalf("LoadErr %v, %d blocks, %d sections, %d services", r.LoadErr, len(r.Blocks), len(r.TopLevel),
+			len(r.Services))
+	}
+	if len(r.Findings) != 1 || r.Findings[0].Severity != SeverityBlocking ||
+		!strings.Contains(r.Findings[0].Detail, "index out of range") {
+		t.Fatalf("findings %+v", r.Findings)
+	}
+	// Against the deployment recorded for it: a comparison that did not run, not a
+	// mismatch.
+	b, err := BuiltinComposeBaseline()
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := CheckReview(b, fleetReleases, testnetContract, testnetProvider, r)
+	if !c.Compared() || len(c.Mismatches) != 0 || len(c.Unverified) != 1 {
+		t.Fatalf("got %+v", c)
+	}
+}

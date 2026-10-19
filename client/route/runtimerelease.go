@@ -86,8 +86,8 @@ type runtimeVerdict struct {
 //   - no_match: a contradiction — the log does not replay to the quote's RTMR3, the build
 //     is not an accepted release, its keys are not report_data's, or the controller
 //     created containers after launch.
-//   - unavailable: a check that did not run — no event log in the reply, records this
-//     reader does not know, an upstream set or instance state the controller could not
+//   - unavailable: a check that did not run — no event log in the reply, a log this
+//     process failed to read (untrusted.go), records this reader does not know, an upstream set or instance state the controller could not
 //     state, or a build whose provenance has not been (or could not be) fetched.
 //   - not_checked: nothing to judge here — no runtime image record, so the image the
 //     manifest pins is what runs and the compose baseline is what judges it; or this
@@ -104,6 +104,8 @@ func (r *Router) judgeRuntime(f runtimeFacts, start bool) runtimeVerdict {
 		return v
 	case errors.Is(f.err, evidence.ErrNoEventLog):
 		return runtimeVerdict{verdict: VerdictUnavailable, why: []string{"the quote reply carries no event log"}}
+	case errors.Is(f.err, errReaderFailed):
+		return runtimeVerdict{verdict: VerdictUnavailable, why: []string{f.err.Error()}}
 	case f.err != nil:
 		return runtimeVerdict{verdict: VerdictNoMatch, why: []string{f.err.Error()}}
 	}

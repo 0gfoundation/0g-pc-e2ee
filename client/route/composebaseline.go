@@ -111,7 +111,8 @@ func (o *observation) first(address string) bool {
 // readManifest loads the reply's app-compose for the baseline, after the hash gate. It
 // returns nothing to compare when the Router has no baseline, so a deployment without one
 // pays nothing for compose-go.
-func (r *Router) readManifest(appCompose []byte, composeHash [attest.ComposeHashLen]byte, haveHash bool) manifestFacts {
+func (r *Router) readManifest(appCompose []byte, composeHash [attest.ComposeHashLen]byte, haveHash bool,
+	quoteURL string) manifestFacts {
 	f := manifestFacts{observed: newObservation()}
 	switch {
 	case r.baseline == nil:
@@ -123,7 +124,7 @@ func (r *Router) readManifest(appCompose []byte, composeHash [attest.ComposeHash
 		// No release verifier for the review itself: its findings are not recorded here,
 		// and the one thing it would judge builds for (the controller exception) is a
 		// finding.
-		review, err := compose.ReviewCompose(appCompose, composeHash, nil)
+		review, err := r.reviewManifest(appCompose, composeHash, quoteURL)
 		if err != nil {
 			f.err = err.Error()
 		} else {
