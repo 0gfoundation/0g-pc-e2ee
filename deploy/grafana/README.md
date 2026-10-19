@@ -218,14 +218,15 @@ screen:
    and note "Ready providers" uses `min` across the selected replicas, not a sum: one
    replica that can ground nothing is the number that matters, since it is the one
    failing every request.
-7. **Provider checks — observed, not enforced**: the two judgements of what a
-   provider runs, per quote verification — `runtime_release` (the broker build the
-   CVM's RTMR3 records say it runs now, against the broker's signed release policy)
-   and `compose_baseline` (the manifest it booted, against the deployment recorded for
-   it) — as `no_match` rates and by verdict. Both are counted once per verification and
-   provider, not per request, and neither refuses a provider: this row is the survey an
-   enforce switch would be decided on, in the role row 6 played for on-chain
-   enforce. Read `no_match` as the only finding; `no_baseline` (nobody recorded the
+7. **Provider checks**: the two judgements of what a provider runs, per quote
+   verification — `runtime_release` (the broker build the CVM's RTMR3 records say it
+   runs now, against the broker's signed release policy) and `compose_baseline` (the
+   manifest it booted, against the deployment recorded for it) — as `no_match` rates and
+   by verdict, and the candidates `ZG_GATEWAY_PROVIDER_ENFORCE` refused, by check. Both
+   verdicts are counted once per verification and provider, not per request. With
+   enforce off (as deployed) the refusals panel stays empty and this row is the survey
+   enforce is decided on, in the role row 6 played for on-chain enforce: turn it on when
+   every provider being routed to reads `pass` in both by-verdict panels. Read `no_match` as the only finding; `no_baseline` (nobody recorded the
    provider), `not_checked` (no runtime image record, or the check is off) and
    `unavailable` (a check that did not run — on a new build, for the seconds its
    provenance is fetched in the background) say nothing against a provider, and on
@@ -313,6 +314,12 @@ highest-signal ones:
   provider, and on today's fleet they fire (cn-19, cn-20, cn-41 run builds the policy
   refuses). The provider and the reason are in the warn log line of the same name; the
   provider-identity record has the verdicts.
+- `sum(rate(zg_gateway_provider_enforce_refusals_total[5m])) > 0` — with
+  `ZG_GATEWAY_PROVIDER_ENFORCE` on, candidates are being refused because what a provider
+  runs does not pass. Page-worthy then, as an on-chain `mismatch` is: either a provider
+  moved off its recorded deployment or off a release, or the release check cannot reach
+  ghcr.io / Sigstore (`check="runtime_release"` and the log line say which). With
+  enforce off it never fires.
 - `rate(zg_gateway_onchain_revalidations_total{result="ok"}[5m]) > 0` — informational
   rather than a page: a stale or cached reading disagreed but a live re-read agreed,
   which is the signature of a benign broker-signer rotation. Worth noticing during a

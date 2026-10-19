@@ -266,8 +266,10 @@ type ProviderIdentity struct {
 	// RuntimeRelease is the verdict on the broker build the provider's CVM runs NOW, read
 	// from the RTMR3 runtime records the quote reply's event log carries, after the log
 	// replayed to the verified quote's RTMR3 (runtimerelease.go, judgeRuntime, has what
-	// each value means here). OBSERVED, never enforced: a no_match here did not stop this
-	// gateway from sealing to the provider, which is why it is reported at all.
+	// each value means here). Observed, unless provider enforce is on (enforce.go): then a
+	// candidate this and ComposeBaseline do not both pass is refused, and its record —
+	// written before the refusal, as on-chain enforce's is — carries the verdict that
+	// refused it. Without enforce, a no_match here did not stop the gateway from sealing.
 	//
 	// It is judged when the record is READ, not when the quote was verified: the release
 	// check fetches the build's provenance in the background, so a verdict that lands
@@ -284,8 +286,8 @@ type ProviderIdentity struct {
 	// ComposeBaseline is the verdict on the manifest the CVM booted (the app-compose
 	// ComposeHash commits to) against the deployment recorded for this provider in
 	// client/evidence/compose/brokercompose.json (composebaseline.go, judgeBaseline, has
-	// what each value means here). OBSERVED, never enforced. Judged when the record is
-	// read, for the reason RuntimeRelease is.
+	// what each value means here). Observed or enforced as RuntimeRelease is. Judged when
+	// the record is read, for the reason RuntimeRelease is.
 	ComposeBaseline Verdict
 	// BaselineDeployment names the recorded deployment the manifest was compared against,
 	// e.g. "mainnet compute-network-20", or "" when none is recorded for the provider. A
@@ -533,9 +535,9 @@ func (r *Router) ProviderIdentity(address string) (ProviderIdentity, bool) {
 	if !ok {
 		return ProviderIdentity{}, false
 	}
-	v := r.judgeRuntime(id.runtime, false)
+	v := r.judgeRuntime(id.runtime, lookup{})
 	id.RuntimeRelease, id.RunningBroker, id.RunningRelease = v.verdict, v.running, v.release
-	b := r.judgeBaseline(id.Address, id.manifest, false)
+	b := r.judgeBaseline(id.Address, id.manifest, lookup{})
 	id.ComposeBaseline, id.BaselineDeployment = b.verdict, b.deployment
 	return id, true
 }

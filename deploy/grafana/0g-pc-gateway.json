@@ -2965,7 +2965,7 @@
     {
       "id": 110,
       "type": "row",
-      "title": "Provider checks \u2014 observed, not enforced",
+      "title": "Provider checks \u2014 runtime release & compose baseline",
       "collapsed": false,
       "gridPos": {
         "x": 0,
@@ -3112,7 +3112,7 @@
       "gridPos": {
         "x": 8,
         "y": 85,
-        "w": 8,
+        "w": 6,
         "h": 6
       },
       "targets": [
@@ -3187,9 +3187,9 @@
         "uid": "${datasource}"
       },
       "gridPos": {
-        "x": 16,
+        "x": 14,
         "y": 85,
-        "w": 8,
+        "w": 6,
         "h": 6
       },
       "targets": [
@@ -3252,6 +3252,70 @@
         "tooltip": {
           "mode": "multi",
           "sort": "desc"
+        }
+      }
+    },
+    {
+      "id": 115,
+      "type": "stat",
+      "title": "Refused under provider enforce (rate)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 20,
+        "y": 85,
+        "w": 4,
+        "h": 6
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (check) (rate(zg_gateway_provider_enforce_refusals_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval]))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{check}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "color": {
+            "mode": "thresholds"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 0.001
+              }
+            ]
+          },
+          "decimals": 3
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "textMode": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
         }
       }
     },
@@ -3951,6 +4015,6 @@
   "timezone": "browser",
   "title": "0G-PC Gateway",
   "uid": "0g-pc-gateway",
-  "version": 11,
+  "version": 12,
   "weekStart": ""
 }

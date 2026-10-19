@@ -399,11 +399,11 @@ The compose review's findings are not in the record: they are advice, and only p
 prints them. Beside it is the runtime half: `verdicts.runtime_release`
 judges the broker build the provider's CVM runs now — the last `zg-image-update` in its
 RTMR3 event log, replayed to the verified quote — against the broker's signed release
-provenance, and `running_broker` / `running_release` name it. It is observed, not
-enforced: a `no_match` there did not stop the gateway from sealing to that provider, and
-`not_checked` (no runtime record) means the broker is the image `containers` lists, which
-only the baseline judges. Neither verdict is enforced yet: a `no_match` in either did not
-stop the gateway from sealing to that provider. Alongside them, `pcverify` reports what would still have to change in a manifest
+provenance, and `running_broker` / `running_release` name it. `not_checked` there (no
+runtime record) means the broker is the image `containers` lists, which only the baseline
+judges. A gateway run with `-provider-enforce` seals only to providers both verdicts pass
+(a runtime `not_checked` counts only beside a baseline `pass`); the deployed one does
+not, so a `no_match` in either did not stop it from sealing to that provider. Alongside them, `pcverify` reports what would still have to change in a manifest
 (unpinned images, `privileged`, host mounts) precisely because recording a deployment is
 not approving it.
 

@@ -16,8 +16,10 @@ see there are no gaps — and where the gaps still are.
 >   **on**: an unlisted image is refused, not warned about. Its OS half is closed. The
 >   container half below it is read and adjudicated *in the verifier* — the per-service
 >   baseline records reviewed deployments — and judged in the gateway's sealing path
->   too, together with the build a provider runs NOW (its RTMR3 runtime records), but
->   OBSERVED only (`compose_baseline`, `runtime_release`): neither refuses a provider yet.
+>   too, together with the build a provider runs NOW (its RTMR3 runtime records)
+>   (`compose_baseline`, `runtime_release`). The two are a gate under
+>   `-provider-enforce`, which is **off** in the deployed gateway: no mainnet provider
+>   passes yet.
 > - **hop 5** — wired, observed, and enforce is **on**: a provider the registry does not
 >   vouch for is skipped, not warned about.
 > - **hop 11** — enforced, but only because `-verify-responses` is on; it is off by default.
@@ -281,10 +283,10 @@ log is replayed into the verified quote, and the build the controller last swapp
 must be an accepted release whose keys are the quote's (`evidence/rtmr3.go`). The gateway
 and the sidecar make that runtime judgement too, on every quote they verify, and report it
 as `runtime_release`, and hold the manifest against its recorded deployment and report it
-as `compose_baseline` — both OBSERVED, not enforced (`route/runtimerelease.go`,
-`route/composebaseline.go`). What is not done is enforcing them in the SEALING path: the
-fleet is neither on a release the policy accepts nor recorded, and the upstream set the
-records carry has no rules to judge it by.
+as `compose_baseline` (`route/runtimerelease.go`, `route/composebaseline.go`), and
+`-provider-enforce` makes the two a gate together (`route/enforce.go`). What is not done
+is turning that gate on: the fleet is neither on a release the policy accepts nor
+recorded, and the upstream set the records carry has no rules to judge it by.
 
 Hop 3 is no longer blocked on either of the two things that used to hold it — the shape
 of an allowlist entry, and having no published source for its values. Its allowlist takes one entry per OS image
@@ -386,10 +388,12 @@ precondition for flipping a switch.
 > gateway and the sidecar hold every verified provider's manifest against its recorded
 > deployment (`compose_baseline`) and judge the build the controller swapped in since
 > (`runtime_release`) — the manifest describes what BOOTED, and on v0.5.4 the controller
-> may swap images and change the upstream set at runtime, recorded only in RTMR3. Both
-> are observed only. The two are only enforceable together — the runtime check says
-> nothing about a provider that never swapped, which only the baseline judges — and
-> enforcing them today would refuse every mainnet provider: none runs a listed broker
+> may swap images and change the upstream set at runtime, recorded only in RTMR3. The
+> two are only enforceable together — the runtime check says nothing about a provider
+> that never swapped, which only the baseline judges — so `-provider-enforce` is one
+> switch for both, fail-closed like `-onchain-enforce` and requiring it (it binds the
+> router-supplied address the record is keyed by). It is off, because enforcing today
+> would refuse every mainnet provider: none runs a listed broker
 > release yet (on 2026-10-16 the RTMR3 records showed cn-19, cn-20 and cn-41 running
 > manual branch builds swapped in after boot), and only cn-20 is recorded. The upstream
 > set still has no rules to judge it by. `-app-baseline` reads a candidate for checking

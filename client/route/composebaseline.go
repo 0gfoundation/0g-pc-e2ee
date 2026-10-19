@@ -16,9 +16,9 @@ package route
 // pcverify and never a gate (composebaseline.go in evidence/compose says why). A verdict
 // field is read as a verdict, so only the comparison that adjudicates gets one.
 //
-// OBSERVE ONLY, like the runtime check: the verdict is recorded
-// (ProviderIdentity.ComposeBaseline), counted and logged, and nothing on the request path
-// acts on it.
+// OBSERVED here, like the runtime check: the verdict is recorded
+// (ProviderIdentity.ComposeBaseline), counted and logged. Provider enforce (enforce.go)
+// makes the two a gate together.
 //
 // WHERE IT RUNS. The manifest is loaded once per quote verification, with the quote
 // (verifyQuoteAt) — the expensive step, compose-go's loader, and the one that does not
@@ -144,9 +144,8 @@ type baselineVerdict struct {
 	why []string
 }
 
-// judgeBaseline compares f against the deployment recorded for address. start says
-// whether a broker build with no release verdict yet may be sent for one (see
-// judgeRuntime).
+// judgeBaseline compares f against the deployment recorded for address, asking the
+// release judge for verdicts as l says (see lookup).
 //
 //   - pass: the manifest is the recorded deployment — every service and top-level
 //     section, with any broker build the record lets move an accepted release.
@@ -158,7 +157,7 @@ type baselineVerdict struct {
 //     one this build does not read, or a broker build whose provenance has not been (or
 //     could not be) checked.
 //   - not_checked: this process was not given a baseline.
-func (r *Router) judgeBaseline(address string, f manifestFacts, start bool) baselineVerdict {
+func (r *Router) judgeBaseline(address string, f manifestFacts, l lookup) baselineVerdict {
 	switch {
 	case r.baseline == nil:
 		return baselineVerdict{verdict: VerdictNotChecked}
@@ -167,7 +166,7 @@ func (r *Router) judgeBaseline(address string, f manifestFacts, start bool) base
 	}
 	var rels judgedReleases
 	if r.releases != nil {
-		rels = judgedReleases{j: r.releases, start: start}
+		rels = r.judged(l)
 	}
 	c := compose.CheckReview(r.baseline.b, rels.verifier(), r.baseline.contract, address, *f.review)
 	v := baselineVerdict{deployment: c.Deployment}
@@ -193,11 +192,11 @@ func (r *Router) observeBaseline(address string, f manifestFacts) bool {
 	if !f.observed.first(address) {
 		return false
 	}
-	v := r.judgeBaseline(address, f, true)
+	v := r.judgeBaseline(address, f, lookup{start: true})
 	metrics.ComposeBaseline(string(v.verdict))
 	switch v.verdict {
 	case VerdictNoMatch:
-		r.logger.Warn("provider's manifest is not the deployment recorded for it (observed, not enforced)",
+		r.logger.Warn("provider's manifest is not the deployment recorded for it",
 			"provider", address, "deployment", v.deployment, "why", strings.Join(v.why, "; "))
 	case VerdictUnavailable:
 		r.logger.Debug("provider's manifest could not be compared against its recorded deployment",

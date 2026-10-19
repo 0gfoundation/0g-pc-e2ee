@@ -447,6 +447,18 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 			if quoteVerified {
 				r.recordWarmedProviderIdentity(providerIdentityOf(addr, info.URL, verified, onchain))
 				r.observeBaseline(addr, verified.facts.manifest)
+				// Under provider enforce, a provider whose checks do not pass is one a
+				// request would refuse, so it is not ready — the same reading the on-chain
+				// arms above give their enforce. Judging it here also fetches the release
+				// verdicts it needs, so the first request after a sweep does not wait for
+				// them.
+				if r.providerEnforce && prepared {
+					if failed, _, _ := r.providerPasses(ctx, addr, verified.facts); len(failed) > 0 {
+						prepared = false
+						r.logger.Debug("warmer: provider does not pass the provider checks (provider enforce)",
+							"provider", addr, "checks", len(failed))
+					}
+				}
 			} else {
 				r.forgetWarmedProviderIdentity(addr, quoteURL)
 			}

@@ -534,6 +534,14 @@ services:
       # ZG_GATEWAY_ATTEST; uncomment for a CVM with no egress to those, which then
       # reports runtime_release: not_checked.
       # - "ZG_GATEWAY_RUNTIME_RELEASES=false"
+      #
+      # Seal only to a provider whose manifest is the deployment recorded for it and
+      # whose running broker build is an accepted release — runtime_release and
+      # compose_baseline as a gate, fail-closed. OFF: no mainnet provider passes yet (none
+      # is on a release, one is recorded), so it would refuse the whole fleet. Needs
+      # ZG_GATEWAY_ONCHAIN_ENFORCE (above), which binds the address the record is keyed
+      # by. README "Provider identity" says when to turn it on.
+      # - "ZG_GATEWAY_PROVIDER_ENFORCE=true"
     volumes:
       # Identity in, read-only, as a plain JSON file — deliberately not the
       # guest-agent socket, which also derives keys and issues quotes.

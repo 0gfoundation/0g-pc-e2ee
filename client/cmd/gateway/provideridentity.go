@@ -208,8 +208,11 @@ type providerVerdicts struct {
 	// and the address 404s (route.ProviderIdentity.Measurement).
 	Measurement route.Verdict `json:"measurement"`
 	// RuntimeRelease: the broker build the CVM runs now (running_broker) against the
-	// broker's signed release provenance. OBSERVED, never enforced — a "no_match" here
-	// did not stop this gateway from sealing to the provider, and a panel must say so.
+	// broker's signed release provenance. Observed unless the gateway runs provider enforce,
+	// in which case this and compose_baseline must both pass for it to seal to the
+	// provider — a record still exists for a provider it refused, carrying the verdict
+	// that refused it. Without enforce a "no_match" here did not stop the gateway from
+	// sealing, and a panel must say so.
 	// "pass" an accepted release whose keys are report_data's; "no_match" a build that is
 	// not a release, keys that differ, an event log that does not replay to the quote, or
 	// containers created after launch; "unavailable" a check that did not run (no event
@@ -220,7 +223,7 @@ type providerVerdicts struct {
 	RuntimeRelease route.Verdict `json:"runtime_release"`
 	// ComposeBaseline: the manifest the provider's CVM booted (what compose_hash commits
 	// to) against the deployment recorded for this provider (baseline_deployment) — the
-	// comparison pcverify -provider makes. OBSERVED, never enforced. "pass" it is that
+	// comparison pcverify -provider makes. Observed or enforced as runtime_release is. "pass" it is that
 	// deployment; "no_match" it is not (a service or section differs, is missing or extra,
 	// or a broker build the record lets move is not a release); "no_baseline" nothing is
 	// recorded for this provider, which says nothing against it; "unavailable" the
