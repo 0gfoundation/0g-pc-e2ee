@@ -281,8 +281,21 @@ type ProviderIdentity struct {
 	// RuntimeRelease is VerdictPass; "" otherwise.
 	RunningRelease string
 
-	// runtime is what RuntimeRelease and the two fields above are judged from.
-	runtime runtimeFacts
+	// ComposeBaseline is the verdict on the manifest the CVM booted (the app-compose
+	// ComposeHash commits to) against the deployment recorded for this provider in
+	// client/evidence/compose/brokercompose.json (composebaseline.go, judgeBaseline, has
+	// what each value means here). OBSERVED, never enforced. Judged when the record is
+	// read, for the reason RuntimeRelease is.
+	ComposeBaseline Verdict
+	// BaselineDeployment names the recorded deployment the manifest was compared against,
+	// e.g. "mainnet compute-network-20", or "" when none is recorded for the provider. A
+	// label, like OSImage: what this repository called the record, not evidence.
+	BaselineDeployment string
+
+	// runtime is what RuntimeRelease and the two fields after it are judged from, and
+	// manifest what ComposeBaseline is.
+	runtime  runtimeFacts
+	manifest manifestFacts
 }
 
 // ProviderIdentitySource is the read side of the record store — the seam the
@@ -513,7 +526,7 @@ func (s *identityStore) get(address string) (ProviderIdentity, bool) {
 // It only ever reads: an address this Router has not verified returns false, and
 // nothing here starts a verification to change that.
 //
-// The runtime release verdict is judged here, on the read, from what the verification
+// The runtime release and baseline verdicts are judged here, on the read, from what the verification
 // recorded and the verdicts the release check holds now; a read never starts a check.
 func (r *Router) ProviderIdentity(address string) (ProviderIdentity, bool) {
 	id, ok := r.identities.get(address)
@@ -522,6 +535,8 @@ func (r *Router) ProviderIdentity(address string) (ProviderIdentity, bool) {
 	}
 	v := r.judgeRuntime(id.runtime, false)
 	id.RuntimeRelease, id.RunningBroker, id.RunningRelease = v.verdict, v.running, v.release
+	b := r.judgeBaseline(id.Address, id.manifest, false)
+	id.ComposeBaseline, id.BaselineDeployment = b.verdict, b.deployment
 	return id, true
 }
 
@@ -549,6 +564,7 @@ func providerIdentityOf(address, endpoint string, res quoteResult, onchain Verdi
 		ComposeHash:   res.facts.composeHash,
 		Containers:    res.facts.containers,
 		runtime:       res.facts.runtime,
+		manifest:      res.facts.manifest,
 	}
 	// A verdict must never reach the wire empty. Every path that builds a quoteResult
 	// records what the boot-chain check concluded, so an unset value would mean a

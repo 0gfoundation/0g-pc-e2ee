@@ -152,6 +152,15 @@ type judgedReleases struct {
 
 func (a judgedReleases) Repository() string { return a.j.rels.Repository() }
 
+// verifier is a as an evidence.ReleaseVerifier, or nil when there is no judge — never an
+// interface holding a nil judge, which evidence.VerifyRelease could not tell from one.
+func (a judgedReleases) verifier() evidence.ReleaseVerifier {
+	if a.j == nil {
+		return nil
+	}
+	return a
+}
+
 func (a judgedReleases) Verify(repository, digest string) evidence.ReleaseVerdict {
 	if v, ok := a.j.verdict(repository, digest, a.start); ok {
 		return v

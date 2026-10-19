@@ -391,15 +391,19 @@ served you* compared these images against an expected set, and hop 3 is not that
 its allowlist is populated, but it pins the provider's guest **OS image**, and would say
 nothing about container images even fully enforced. The per-service baseline that does
 compare them exists — `pcverify -provider` holds a provider's manifest against the
-deployment recorded for it, and says plainly when none is — but it is not yet wired into
-the gateway's sealing path, so it is a check you can run and not one this record
-reflects. What the record DOES reflect is the runtime half: `verdicts.runtime_release`
+deployment recorded for it, and says plainly when none is — and the record carries the
+gateway's own run of it: `verdicts.compose_baseline` is `pass` when the manifest is the
+deployment recorded for this provider (named in `baseline_deployment`), `no_match` when it
+is not, and `no_baseline` when none is recorded, which says nothing against the provider.
+The compose review's findings are not in the record: they are advice, and only pcverify
+prints them. Beside it is the runtime half: `verdicts.runtime_release`
 judges the broker build the provider's CVM runs now — the last `zg-image-update` in its
 RTMR3 event log, replayed to the verified quote — against the broker's signed release
 provenance, and `running_broker` / `running_release` name it. It is observed, not
 enforced: a `no_match` there did not stop the gateway from sealing to that provider, and
 `not_checked` (no runtime record) means the broker is the image `containers` lists, which
-only the baseline judges. Alongside it, `pcverify` reports what would still have to change in a manifest
+only the baseline judges. Neither verdict is enforced yet: a `no_match` in either did not
+stop the gateway from sealing to that provider. Alongside them, `pcverify` reports what would still have to change in a manifest
 (unpinned images, `privileged`, host mounts) precisely because recording a deployment is
 not approving it.
 

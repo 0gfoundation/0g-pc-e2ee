@@ -17,8 +17,9 @@ package compose
 // (see client/evidence/osimages.json), whose vendored modules pin
 // github.com/compose-spec/compose-go/v2 v2.0.2 over gopkg.in/yaml.v3 v3.0.1. client/go.mod
 // pins exactly those. Moving to a dstack with a newer docker compose means re-checking
-// that recipe and moving the pin with it — and re-checking that the gateway's linked
-// dependencies still do not move (TestComposeGoStaysOutOfTheGateway).
+// that recipe and moving the pin with it (TestLoaderLinksDockerComposesVersions). The
+// gateway and the sidecar link this loader too (route/composebaseline.go), so the pin is
+// what they read manifests with as well.
 //
 // WHAT IS LOADED, AND WHAT IS NOT. docker compose's per-document loop, run step for
 // step with compose-go's own functions (loadModel lists them): every YAML document decoded

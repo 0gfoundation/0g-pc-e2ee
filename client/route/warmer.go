@@ -446,6 +446,7 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 		if ctx.Err() == nil {
 			if quoteVerified {
 				r.recordWarmedProviderIdentity(providerIdentityOf(addr, info.URL, verified, onchain))
+				r.observeBaseline(addr, verified.facts.manifest)
 			} else {
 				r.forgetWarmedProviderIdentity(addr, quoteURL)
 			}

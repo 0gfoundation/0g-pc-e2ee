@@ -263,6 +263,9 @@ type Router struct {
 	// releases, when non-nil, judges the broker build each verified provider's CVM runs
 	// now (runtimerelease.go). Observed only: nothing on the request path reads it.
 	releases *releaseJudge
+	// baseline, when non-nil, holds each verified provider's manifest against the
+	// deployment recorded for it (composebaseline.go). Observed only, like releases.
+	baseline *composeBaseline
 	// identities keeps, per provider address, the outcome of the checks this process
 	// ran before sealing to that provider — read by the gateway's provider-identity
 	// endpoint (see provideridentity.go). Written only from the path that materializes
@@ -851,11 +854,16 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 		// identity below.
 		verified    quoteResult
 		quoteCached bool
-		err         error
+		// fresh is whether verified came from a verification made for this request,
+		// rather than the quote cache — when what it establishes is observed (counted
+		// and logged) rather than only recorded.
+		fresh bool
+		err   error
 	)
 	if c.router.verifier != nil {
 		verified, quoteCached, err = c.router.verifiedProviderCached(ctx, prov.Endpoint)
 		encPub, signer = verified.encPub, verified.signer
+		fresh = !quoteCached
 	} else {
 		var pubkeyURL string
 		pubkeyURL, err = derivePubkeyURL(prov.Endpoint)
@@ -905,7 +913,7 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 		// mode would go on sealing to an enclave that has rotated and the request would
 		// fail at the provider.
 		if g.outcome == groundingMismatch && quoteCached {
-			fresh, rerr := c.router.reverifiedProvider(ctx, prov.Endpoint)
+			rotated, rerr := c.router.reverifiedProvider(ctx, prov.Endpoint)
 			// All three arms say something, because a mismatch that survives to the
 			// metric is `onchain_grounding_total{outcome="mismatch"}` — the counter the
 			// runbook pages on as an accusation against a provider. Unlogged, "the
@@ -917,14 +925,14 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 				// nothing. The mismatch below is the CACHED quote's, never re-checked.
 				c.router.logger.Warn("could not re-verify the quote after an on-chain signer mismatch; the mismatch stands on the cached quote",
 					"provider", prov.Address, "cached_signer", signer, "err", rerr)
-			case fresh.signer != signer:
+			case rotated.signer != signer:
 				c.router.logger.Info("re-verified quote after an on-chain signer mismatch; the cached quote had rotated",
-					"provider", prov.Address, "cached_signer", signer, "fresh_signer", fresh.signer)
+					"provider", prov.Address, "cached_signer", signer, "fresh_signer", rotated.signer)
 				// Take the fresh result WHOLE, facts included: they describe the enclave we
 				// are now sealing to, and a record built from the rotated-away quote would
 				// report the wrong compose hash for the request that actually happened.
-				verified = fresh
-				encPub, signer = fresh.encPub, fresh.signer
+				verified, fresh = rotated, true
+				encPub, signer = rotated.encPub, rotated.signer
 				g, err = c.router.groundSignerOnChain(ctx, prov.Address, signer)
 				g.revalidated = true
 			default:
@@ -956,6 +964,9 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 	// word for it would be worse than reporting nothing.
 	if c.router.verifier != nil {
 		c.router.recordProviderIdentity(providerIdentityOf(prov.Address, prov.Endpoint, verified, onchain))
+		if fresh {
+			c.router.observeBaseline(prov.Address, verified.facts.manifest)
+		}
 	}
 	if grounded != nil {
 		return core.Provider{}, grounded
@@ -1166,6 +1177,7 @@ func (r *Router) verifyQuoteAt(ctx context.Context, quoteURL string) (res quoteR
 		facts.composeHash = hex.EncodeToString(composeHash[:])
 		facts.containers = r.containersOf(appCompose, composeHash, quoteURL)
 	}
+	facts.manifest = r.readManifest(appCompose, composeHash, haveHash)
 	// The same reply, so the log cannot belong to another quote; and the RTMR3 it must
 	// replay to is the verified one, never a value read out of the reply.
 	facts.runtime = runtimeFacts{signer: verified.SignerAddr, encPub: verified.EncPub}

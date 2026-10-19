@@ -784,12 +784,32 @@ not replay; `unavailable` is a check that did not run — no event log, records 
 does not know, or provenance not fetched yet (it is fetched in the background, so a
 provider's first record usually reads `unavailable` for a few seconds); `not_checked`
 means no runtime image record, so the broker is the image `containers` lists, which this
-check does not judge. **A `no_match` here did not stop the gateway from sealing to that
-provider** — enforcing it waits on the per-service compose baseline reaching the gateway
-too, since a provider that never swapped is the case this check says nothing about. Each
-verification is counted in `zg_gateway_runtime_release_checks_total{verdict}`, and a
-`no_match` is logged at warn with the build and the reason. The same check runs in the
-sidecar (`ZG_SIDECAR_RUNTIME_RELEASES`), where it is only logged.
+check does not judge — `compose_baseline` below does. **A `no_match` here did not stop the
+gateway from sealing to that provider.** Each verification is counted in
+`zg_gateway_runtime_release_checks_total{verdict}`, and a `no_match` is logged at warn with
+the build and the reason. The same check runs in the sidecar
+(`ZG_SIDECAR_RUNTIME_RELEASES`), where it is only logged.
+
+**`verdicts.compose_baseline` holds the manifest against the deployment recorded for this
+provider, and it is observed, not enforced too.** The manifest is the app-compose that
+`compose_hash` commits to, loaded as dstack's docker compose loads it, and compared
+service by service and section by section against the deployment
+`client/evidence/compose/brokercompose.json` records for this provider on this contract
+(named in `baseline_deployment`) — the comparison `pcverify -provider` makes, with the 0G
+broker image allowed to move only between accepted releases. `pass` it is that
+deployment; `no_match` it is not (on 2026-10-19 cn-20, the one recorded mainnet provider,
+ran broker v0.5.1, which the release policy refuses); `no_baseline` nobody recorded this
+provider, which says nothing against it; `unavailable` the comparison could not run or
+finish (no authenticated manifest, or a broker build whose provenance is still being
+fetched). The compose REVIEW's findings — Blocking, Justify — are deliberately not in the
+record: they are advice about a manifest, never a verdict, and `pcverify -provider` prints
+them. No setting: the baseline is embedded and needs no network, so it is on whenever
+`ZG_GATEWAY_ATTEST` is. Counted in `zg_gateway_compose_baseline_checks_total{verdict}`,
+with a `no_match` logged at warn.
+
+The two are only enforceable together, and neither is enforced yet: the runtime check
+says nothing about a provider that never swapped, and only the baseline judges what it
+booted.
 
 Smoke-test after deploying:
 
