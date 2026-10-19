@@ -1,12 +1,5 @@
 package evidence
 
-import (
-	"os"
-	"path/filepath"
-	"strings"
-	"testing"
-)
-
 const (
 	brokerRepoName = "ghcr.io/0gfoundation/0g-serving-broker"
 	// v054Digest is broker v0.5.4, the build testnet runs.
@@ -14,7 +7,7 @@ const (
 )
 
 // fakeReleases is a ReleaseVerifier with a fixed answer per digest. The real one checks
-// signatures (client/cmd/pcverify/provenance) and is tested there against real bundles;
+// signatures (client/provenance) and is tested there against real bundles;
 // what this package tests is what the compose checks DO with each verdict.
 type fakeReleases struct {
 	repo     string
@@ -41,18 +34,3 @@ func (f fakeReleases) Verify(repository, digest string) ReleaseVerdict {
 // fleetReleases accepts what the real verifier accepts among the builds the recorded
 // deployments run: v0.5.4, and not v0.5.1 (cn-20).
 var fleetReleases = fakeReleases{repo: brokerRepoName, accepted: map[string]string{v054Digest: "v0.5.4"}}
-
-// The release verifier's dependencies live in pcverify's own module so that they never
-// move the versions the gateway is built with (brokerrelease.go, and the go.mod of
-// client/cmd/pcverify). If Sigstore appears in this module's requirements, that boundary
-// has been crossed — deliberately or not, it is a change to the gateway's build and has to
-// be made as one.
-func TestClientModuleCarriesNoSigstore(t *testing.T) {
-	raw, err := os.ReadFile(filepath.Join("..", "go.mod"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(raw), "sigstore") {
-		t.Fatal("client/go.mod requires Sigstore; the release verifier belongs to client/cmd/pcverify's module")
-	}
-}

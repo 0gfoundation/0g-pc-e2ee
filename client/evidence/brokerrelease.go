@@ -14,11 +14,14 @@ package evidence
 //
 // WHY AN INTERFACE. The answer is now a signature check — the build's SLSA provenance,
 // signed by the broker repository's release workflow on a release tag, at or above a
-// minimum version (client/cmd/pcverify/provenance). That needs Sigstore's verifier and
-// its dependency tree, and this package is imported by the gateway. Taking the answer
-// through an interface keeps every byte of that out of the gateway binary until a
-// decision to put it there is taken on purpose. It also replaced brokerreleases.json, a
-// list someone had to edit on every broker release.
+// minimum version (client/provenance). That needs Sigstore's verifier and its dependency
+// tree, network access to the registry, and a trust root kept current; none of that
+// belongs in a package whose checks are pure functions of their inputs. Taking the answer
+// through an interface keeps this package testable with a fixed answer per digest, and
+// leaves where the answer comes from — and how long it may take — to the caller: pcverify
+// asks synchronously, route asks off the request path (route.WithReleaseVerifier).
+// It also replaced brokerreleases.json, a list someone had to edit on every broker
+// release.
 
 // BrokerRelease is one accepted build of the broker image.
 type BrokerRelease struct {

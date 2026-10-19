@@ -1,8 +1,8 @@
 name: Broker release
 
-# Daily: check the broker's newest release the way `pcverify -provider` will check it on a
-# provider — its SLSA provenance, fetched from ghcr.io, verified against Sigstore's
-# current trust root and client/cmd/pcverify/provenance/policy.json.
+# Daily: check the broker's newest release the way `pcverify -provider`, the gateway and
+# the sidecar will check it on a provider — its SLSA provenance, fetched from ghcr.io,
+# verified against Sigstore's current trust root and client/provenance/policy.json.
 #
 # WHY A TIMER. pcverify accepts a new broker release with no change here, but only while
 # the broker keeps building releases the way the policy expects (the release contract in
@@ -20,9 +20,9 @@ on:
     - cron: "43 4 * * *"
   pull_request:
     paths:
-      - "client/cmd/pcverify/provenance/**"
-      - "client/cmd/pcverify/go.mod"
-      - "client/cmd/pcverify/go.sum"
+      - "client/provenance/**"
+      - "client/go.mod"
+      - "client/go.sum"
       - ".github/workflows/broker-release.yml"
   workflow_dispatch:
     inputs:
@@ -49,8 +49,8 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version-file: client/cmd/pcverify/go.mod
-          cache-dependency-path: client/cmd/pcverify/go.sum
+          go-version-file: client/go.mod
+          cache-dependency-path: client/go.sum
 
       - name: Resolve the release
         id: release
@@ -74,7 +74,7 @@ jobs:
 
       - name: Verify it
         id: verify
-        working-directory: client/cmd/pcverify
+        working-directory: client
         env:
           PCVERIFY_LIVE_BROKER_TAG: ${{ steps.release.outputs.tag }}
         run: |
@@ -110,7 +110,8 @@ jobs:
             const body = [
               `0g-serving-broker \`${process.env.TAG || '(unresolved)'}\` did not verify against the provenance`,
               `policy. Until this is fixed, \`pcverify -provider\` reports every provider running`,
-              `this release as failed (rejected) or not checked (unavailable).`,
+              `this release as failed (rejected) or not checked (unavailable), and the gateway`,
+              `and the sidecar report its runtime_release as no_match or unavailable.`,
               ``,
               `Either the broker's release no longer meets the release contract`,
               `(0gfoundation/0g-serving-broker#765), or Sigstore's trust root moved in a way this`,

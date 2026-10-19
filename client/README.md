@@ -244,7 +244,8 @@ rollout will change their manifests anyway.
 
 0G's broker image is the one image allowed to move without a new record, and only between
 **released builds, judged by their signed provenance at run time**
-(`cmd/pcverify/provenance`). pcverify fetches the Sigstore bundle attached to the digest
+(`provenance`). pcverify — and the gateway and the sidecar, for the build a provider runs
+now — fetches the Sigstore bundle attached to the digest
 in the registry and accepts the build only when its SLSA provenance verifies against
 Sigstore's trust root and was signed by the broker repository's release workflow
 (`build.yml`) on a release tag, on a GitHub-hosted runner, at or above v0.5.4 — the first
