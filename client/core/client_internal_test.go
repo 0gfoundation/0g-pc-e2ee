@@ -385,7 +385,7 @@ func TestCandidateWalkBudgetIsSharedAcrossCandidates(t *testing.T) {
 // A FAILED attempt is charged to the walk. This test used to assert the opposite —
 // that attempts are never charged — which was the reasoning that left the walk
 // unbounded: with materialization cached and free, exhausted() never tripped and the
-// loop ran to the router's candidate count, N x providerTimeout of the caller's time.
+// loop ran to the router's candidate count, N x bufferedTimeout of the caller's time.
 // See resolveBudget for why "a long inference must not starve a later fallback" was
 // the wrong way round.
 func TestCandidateWalkChargesFailedAttempts(t *testing.T) {
@@ -862,7 +862,7 @@ func TestCallerDisconnectIsNotAFallback(t *testing.T) {
 // A slow retryable failure on the LAST candidate is not a ceiling cut: a running
 // attempt is never interrupted by the budget, so there it only decides whether to
 // move on, and there was nothing to move on to. Counting it booked every request
-// whose upstream is slower than resolveBudget (90s, against a 630s providerTimeout)
+// whose upstream is slower than resolveBudget (90s, against a 630s bufferedTimeout)
 // as OUR ceiling firing — in the one series the runbook says means exactly that and
 // tells operators to correlate with the latency p99.
 func TestSlowFailureOnTheLastCandidateIsNotABudgetCut(t *testing.T) {

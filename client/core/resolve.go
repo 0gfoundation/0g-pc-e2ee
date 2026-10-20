@@ -72,7 +72,7 @@ type Candidates interface {
 // at all — the thing this budget is named for. If the head's long inference
 // SUCCEEDS there is no fallback to starve, because Complete returns; if it FAILS,
 // those minutes were the caller's, spent on nothing, and are exactly what wants
-// counting. Uncharged, a chain whose candidates each burn the full providerTimeout
+// counting. Uncharged, a chain whose candidates each burn the full bufferedTimeout
 // cost N × 10m30s, with N chosen by the untrusted router.
 //
 // The budget gates ENTRY to the next candidate and is never imposed on an attempt
@@ -80,7 +80,7 @@ type Candidates interface {
 // its caller. So the ceiling, stated the same way preview's is, is this budget plus
 // one attempt: bounded, and one attempt's overrun rather than N. maxPreviewCandidates
 // bounds N independently, so neither factor is left to the router. One consequence
-// of gating entry rather than attempts: an attempt that runs to providerTimeout
+// of gating entry rather than attempts: an attempt that runs to bufferedTimeout
 // blows the budget by itself and the walk stops after it, which is intended — a
 // caller already held ten minutes by one provider is not served by ten more.
 //

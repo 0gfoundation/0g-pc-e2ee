@@ -294,7 +294,9 @@ a gateway fault. The 65536 default is far above anything a single gateway carrie
   collector.
 - **Per-account fairness is still absent** (issue #20). A global ceiling stops a
   pile-up; it does not stop one account from being the cause of it.
-- **Long-lived streams.** `core.providerTimeout` is 10m30s, and each in-flight
+- **Long-lived streams.** A stream has no total bound in core (only
+  `core.streamIdleTimeout`, 10m30s, between frames); the router ends it at its
+  whole-stream cap, ~59 min. Each in-flight
   stream holds a goroutine, a connection to the router, and buffers. Memory, not
   CPU, may be the real ceiling for high-`MOCK_CHUNKS` shapes — watch the heap
   profile and `go_goroutines`.

@@ -66,12 +66,14 @@ var verifyBuckets = []float64{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 
 var previewBuckets = []float64{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120}
 
 // upstreamBuckets sizes the data-plane attempt histogram, which needs a far wider
-// range than verifyBuckets: a completion can legitimately run for minutes and a
-// stream is bounded only by the provider timeout (10m30s), so the top bucket sits
-// past it — without one, every long-but-healthy stream would pile into +Inf and
-// the p99 would be unreadable exactly when it matters. The stream first-frame
-// histogram shares it for the same reason: that wait is bounded by the same idle
-// watchdog, not by anything smaller.
+// range than verifyBuckets: a buffered completion can legitimately run up to
+// core's bufferedTimeout (10m30s), so the top bucket sits past it — without one,
+// every long-but-healthy attempt would pile into +Inf and the p99 would be
+// unreadable exactly when it matters. A stream can stay open far longer (up to
+// the router's whole-stream cap, ~59 min), so stream attempts past 900s land in
+// +Inf; read those from the count, not the quantile. The stream first-frame
+// histogram shares these buckets: that wait is bounded by the response-header
+// wait and the stream idle watchdog (both 10m30s), not by anything smaller.
 var upstreamBuckets = []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600, 900}
 
 var (
@@ -233,7 +235,7 @@ var (
 			"which the attempt duration cannot show (a stream that runs for minutes may have " +
 			"produced its first token instantly).",
 		// upstreamBuckets, not verifyBuckets: the wait for a first frame is bounded
-		// only by the stream idle watchdog (providerTimeout, 10m30s), so a 60s top
+		// only by the header wait and the stream idle watchdog (both 10m30s), so a 60s top
 		// bucket would put every degraded stream in +Inf — unreadable exactly when
 		// this panel matters.
 		Buckets: upstreamBuckets,
