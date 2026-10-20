@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
 	"github.com/0gfoundation/0g-pc-e2ee/client/evidence"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/attest"
@@ -706,6 +707,32 @@ func TestIdentityDoc_AbsentFieldsAreNull(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("body is missing %s:\n%s", want, body)
 		}
+	}
+}
+
+// The chain root is reported whether or not the quote is there — it is this process's
+// configuration, not evidence — and a root set by endpoint and contract rather than
+// by name says so with a null network instead of claiming mainnet.
+func TestBuildIdentity_ReportsTheChainRoot(t *testing.T) {
+	testnet, err := chain.LookupNetwork(chain.NetworkTestnet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newIdentityFixture(t, deployedComposeText)
+	cfg := f.config()
+	cfg.QuotePath = filepath.Join(f.dir, "absent-quote.json")
+	cfg.Chain = testnet
+	body := marshal(t, buildFixture(t, cfg).doc)
+	for _, want := range []string{`"network": "testnet"`, `"rpc_url": "https://evmrpc-testnet.0g.ai"`,
+		`"serving_contract": "` + testnet.ServingContract + `"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body is missing %s:\n%s", want, body)
+		}
+	}
+
+	cfg.Chain = chain.Network{RPCURL: "http://node:8545", ServingContract: testnet.ServingContract}
+	if body := marshal(t, buildFixture(t, cfg).doc); !strings.Contains(body, `"network": null`) {
+		t.Errorf("a root nobody named reports a network:\n%s", body)
 	}
 }
 

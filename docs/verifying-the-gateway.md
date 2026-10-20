@@ -100,6 +100,9 @@ gateway            pc-gateway.0g.ai
   allowed_envs     ZG_GATEWAY_ROUTER_URL DNS_SETUP_MODE DOMAIN …
 ✓ compose file       matches release-2026.08.07.1 byte-for-byte
 ✓ os image           dstack-nvidia-0.5.4.1
+✓ chain              mainnet, as the gateway reports it (want mainnet)
+  rpc              https://evmrpc.0g.ai
+  contract         0x47340d900bdFec2BD393c626E12ea0656F938d84
 
 note: code identity is only as strong as the image pinning inside the compose text —
 a floating tag keeps compose_hash stable while the code changes
@@ -121,6 +124,19 @@ A matched `os image` prints only the name. An image **not** in the allowlist is 
 The names in parentheses are what the allowlist **contains** — every entry, not what was
 observed; the four lines under them are the observation. `rtmr0` is listed apart because nothing compares
 it (see step 7).
+
+The last line, `chain`, is the one value the evidence bundle cannot show: which 0G
+network the gateway grounds providers against (trust-chain hop 5). A deployment
+chooses it by name, `ZG_GATEWAY_NETWORK=mainnet|testnet`, from its encrypted
+environment — which dstack keeps confidential but does not authenticate, so the host
+could replace it. The measured compose admits only a network *name*, each one an RPC
+endpoint and contract compiled into the gateway, so the most a host can do is pick the
+other real network. `pcverify` asks the gateway which one it is on, over a connection
+pinned to the certificate the quote binds — so what answers is the attested code, as
+far as the compose check says which code that is — and fails the run when it is not
+`-expect-network` (default `mainnet`; pass `testnet` for a testnet gateway, or an empty
+value to skip the step). A build from before this report could not be pointed off
+mainnet at all, and is reported as mainnet.
 
 ---
 
@@ -287,6 +303,8 @@ curl -s https://<gateway-domain>/v1/gateway/identity
   "compose_hash": "55d872aa…",
   "os_image": "dstack-nvidia-0.5.4.1",   // null if it matched no allowlisted image
   "matched_release": { "tag": "release-2026.08.07.1", "url": "https://github.com/…" },
+  "chain": { "network": "mainnet", "rpc_url": "https://evmrpc.0g.ai",
+             "serving_contract": "0x47340d90…" },   // hop 5's root; see the `chain` step above
   "containers": [
     { "name": "gateway", "image": "ghcr.io/0gfoundation/0g-pc-e2ee-gateway",
       "digest": "sha256:9c41ab7e…", "source": "0g-release" },
@@ -781,6 +799,7 @@ Release manifests are the `docker-compose.release.yml` asset on
 | `app-compose` digest does not match `compose_hash` | the manifest is for a different deployment or instance — under blue/green, most often the standby side rather than the live one |
 | a `compose_hash` seen elsewhere does not match this one | check *whose* enclave it names before treating it as a discrepancy — see [three enclaves, three compose hashes](#three-enclaves-three-compose-hashes) |
 | compose text matches no published release | **the finding that matters.** The deployment is running something that was not published. Report it. |
+| `chain` is not the network expected | the deployment was started with `ZG_GATEWAY_NETWORK` set to the other network — by its operator (a testnet gateway: re-run with `-expect-network testnet`) or by whoever can replace its encrypted environment. Either way its providers are grounded against that network's registry. |
 | `os image` matches no allowlisted image | either the deployment was upgraded to an OS this tool does not know yet, or it is not running the OS it should be. The observed registers are printed so the two can be told apart against the reproducible build. |
 
 ### Three enclaves, three compose hashes

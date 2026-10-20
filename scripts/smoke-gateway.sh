@@ -8,7 +8,8 @@
 #   0. preflight  GET /v1/gateway/identity answers — only a gateway serves it; a bare
 #                 router serves the same OpenAI surface and seals NOTHING, so a run
 #                 aimed at one would otherwise look green. Prints compose_hash,
-#                 os_image and matched_release.
+#                 os_image, matched_release and the chain (0G network) it grounds
+#                 providers against.
 #   1. health     /healthz 200 and /readyz 200 (503 = no provider ready).
 #   2. auth       a chat request with no API key is refused 401 by the gateway.
 #   3. sealed     a chat completion for --sealed-model: 200, X-0G-E2EE: sealed, an
@@ -186,7 +187,8 @@ fi
 ok "preflight: /v1/gateway/identity answers"
 note "compose_hash    $(jqr '.compose_hash // "null"' "$WORK/id.json")"
 note "os_image        $(jqr '.os_image // "null"' "$WORK/id.json")"
-note "matched_release $(jqr '.matched_release // "null"' "$WORK/id.json")"
+note "matched_release $(jqr '.matched_release.tag // "null"' "$WORK/id.json")"
+note "chain           $(jqr 'if .chain then (.chain.network // "custom") else "not reported" end' "$WORK/id.json")"
 
 # 1. health --------------------------------------------------------------------
 for path in /healthz /readyz; do

@@ -114,7 +114,7 @@ func TestReportGateway(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var out bytes.Buffer
-			code := reportGateway(context.Background(), &out, stubEvidence{rep: tc.rep}, "pc-gateway.test", tc.allowUntrusted, false, expectSource{})
+			code := reportGateway(context.Background(), &out, stubEvidence{rep: tc.rep}, "pc-gateway.test", tc.allowUntrusted, false, expectSource{}, chainCheck{})
 			if code != tc.wantCode {
 				t.Errorf("code = %d, want %d\n%s", code, tc.wantCode, out.String())
 			}
@@ -135,7 +135,7 @@ func TestReportGateway_WaivedTrustWarns(t *testing.T) {
 	// 3, not 0: nothing failed, but the domain binding went unestablished, so the
 	// verdict has to agree with the warning rather than read as a full pass.
 	var out bytes.Buffer
-	if code := reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", true, false, expectSource{}); code != 3 {
+	if code := reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", true, false, expectSource{}, chainCheck{}); code != 3 {
 		t.Fatalf("code = %d, want 3\n%s", code, out.String())
 	}
 	for _, want := range []string{"warning", "waived", "does NOT establish"} {
@@ -148,7 +148,7 @@ func TestReportGateway_WaivedTrustWarns(t *testing.T) {
 // …and a run whose trust actually validates must NOT print that warning.
 func TestReportGateway_TrustedRunHasNoWarning(t *testing.T) {
 	var out bytes.Buffer
-	if code := reportGateway(context.Background(), &out, stubEvidence{rep: passing()}, "pc-gateway.test", true, false, expectSource{}); code != 0 {
+	if code := reportGateway(context.Background(), &out, stubEvidence{rep: passing()}, "pc-gateway.test", true, false, expectSource{}, chainCheck{}); code != 0 {
 		t.Fatalf("code = %d, want 0\n%s", code, out.String())
 	}
 	if strings.Contains(out.String(), "warning") {
@@ -164,7 +164,7 @@ func TestReportGateway_PassStatesItsCaveats(t *testing.T) {
 		"the compose-hash binding — treat code identity as strong evidence, not proof"
 
 	var out bytes.Buffer
-	if code := reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", false, false, expectSource{}); code != 0 {
+	if code := reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", false, false, expectSource{}, chainCheck{}); code != 0 {
 		t.Fatalf("code = %d, want 0\n%s", code, out.String())
 	}
 	if !strings.Contains(out.String(), "not proof") {
@@ -199,7 +199,7 @@ func TestReportGateway_OSImage(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var out bytes.Buffer
 			code := reportGateway(context.Background(), &out, stubEvidence{rep: tc.rep},
-				"pc-gateway.test", false, false, expectSource{})
+				"pc-gateway.test", false, false, expectSource{}, chainCheck{})
 			if code != tc.wantCode {
 				t.Errorf("code = %d, want %d\n%s", code, tc.wantCode, out.String())
 			}
@@ -210,7 +210,7 @@ func TestReportGateway_OSImage(t *testing.T) {
 	}
 	// The observed registers appear where they are actionable, and not otherwise.
 	var out bytes.Buffer
-	reportGateway(context.Background(), &out, stubEvidence{rep: matched}, "pc-gateway.test", false, false, expectSource{})
+	reportGateway(context.Background(), &out, stubEvidence{rep: matched}, "pc-gateway.test", false, false, expectSource{}, chainCheck{})
 	if strings.Contains(out.String(), "observed mrtd") {
 		t.Errorf("a clean match should not dump registers:\n%s", out.String())
 	}
@@ -263,7 +263,7 @@ func TestReportGateway_StrictAndIncompleteVerdicts(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			var out bytes.Buffer
 			got := reportGateway(context.Background(), &out, stubEvidence{rep: tc.rep},
-				"pc-gateway.test", false, tc.strict, expectSource{})
+				"pc-gateway.test", false, tc.strict, expectSource{}, chainCheck{})
 			if got != tc.wantCode {
 				t.Errorf("exit = %d, want %d\n%s", got, tc.wantCode, out.String())
 			}
@@ -338,7 +338,7 @@ func TestIncompleteReason_NamesTheSpecificGap(t *testing.T) {
 // An unusable domain is a caller error (exit 2), not a failed check (exit 1).
 func TestReportGateway_CheckerError(t *testing.T) {
 	var out bytes.Buffer
-	code := reportGateway(context.Background(), &out, stubEvidence{err: errors.New("evidence: empty domain")}, "", false, false, expectSource{})
+	code := reportGateway(context.Background(), &out, stubEvidence{err: errors.New("evidence: empty domain")}, "", false, false, expectSource{}, chainCheck{})
 	if code != 2 {
 		t.Errorf("code = %d, want 2\n%s", code, out.String())
 	}
@@ -462,7 +462,7 @@ func TestReportGateway_DiscoveredLookupFailureIsAdvisory(t *testing.T) {
 			tc.mutate(&rep)
 			var out bytes.Buffer
 			got := reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", false, false,
-				expectSource{Label: "newest 5 release(s)"})
+				expectSource{Label: "newest 5 release(s)"}, chainCheck{})
 			if got != tc.wantCode {
 				t.Errorf("exit = %d, want %d\n%s", got, tc.wantCode, out.String())
 			}
@@ -522,7 +522,7 @@ func TestReportCodeIdentity_NeverMarksWorkThatDidNotHappen(t *testing.T) {
 			rep.Code = tc.code
 			var out bytes.Buffer
 			got := reportGateway(context.Background(), &out, stubEvidence{rep: rep},
-				"pc-gateway.test", false, false, expectSource{Label: "newest 5 release(s)"})
+				"pc-gateway.test", false, false, expectSource{Label: "newest 5 release(s)"}, chainCheck{})
 			if got != tc.wantCode {
 				t.Errorf("exit = %d, want %d\n%s", got, tc.wantCode, out.String())
 			}
@@ -577,7 +577,7 @@ func TestReportGateway_AppIDCarriesItsSource(t *testing.T) {
 			rep.Code = tc.code
 
 			var out strings.Builder
-			reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", false, false, expectSource{})
+			reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", false, false, expectSource{}, chainCheck{})
 			if want := "app_id           " + tc.want + "\n"; !strings.Contains(out.String(), want) {
 				t.Errorf("output does not contain %q:\n%s", want, out.String())
 			}
@@ -596,7 +596,7 @@ func TestReportGateway_AppIDFallbackExplainsItself(t *testing.T) {
 		"_dstack-app-address.gw.example.com: lookup: server misbehaving")
 
 	var out strings.Builder
-	reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", false, false, expectSource{})
+	reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", false, false, expectSource{}, chainCheck{})
 	got := out.String()
 	for _, want := range []string{"(compose_hash prefix)", "server misbehaving", "pass -app-id to pin it"} {
 		if !strings.Contains(got, want) {
@@ -613,7 +613,7 @@ func TestReportGateway_NoFallbackNoteWhenDiscovered(t *testing.T) {
 	rep.Code.AppIDSource = "_dstack-app-address TXT"
 
 	var out strings.Builder
-	reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", false, false, expectSource{})
+	reportGateway(context.Background(), &out, stubEvidence{rep: rep}, "pc-gateway.test", false, false, expectSource{}, chainCheck{})
 	if strings.Contains(out.String(), "pass -app-id") {
 		t.Errorf("a healthy run carries the fallback hint:\n%s", out.String())
 	}

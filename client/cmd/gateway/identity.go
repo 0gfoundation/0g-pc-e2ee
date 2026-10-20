@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
 	"github.com/0gfoundation/0g-pc-e2ee/client/compose"
 	"github.com/0gfoundation/0g-pc-e2ee/client/evidence"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
@@ -96,6 +97,13 @@ type identityDoc struct {
 	// when there is none to report. Null rather than [] on purpose: an empty array
 	// says "this deployment runs no containers", which is never true.
 	Containers []containerRef `json:"containers"`
+	// Chain is the on-chain root this gateway grounds providers against and keys
+	// their recorded deployments by. Unlike every field above it, it is not read from
+	// the evidence: it comes from the encrypted environment (ZG_GATEWAY_NETWORK),
+	// which the measured compose leaves to the deployer and which nothing
+	// authenticates. What the measurement does fix is that it can only name one of the
+	// networks built into this binary, and that this code reports the one it got.
+	Chain chainRef `json:"chain"`
 	// EvidenceURL is where the attestation bundle lives, RELATIVE to this gateway.
 	// Deliberately not an absolute URL: the only thing this process knows about its
 	// own public name is the Host header, which the caller controls, so building one
@@ -103,6 +111,23 @@ type identityDoc struct {
 	EvidenceURL string `json:"evidence_url"`
 	// Verify is verifyNote. See the file comment.
 	Verify string `json:"verify"`
+}
+
+// chainRef is the on-chain root: a named network, or (outside the deployed compose)
+// an endpoint and contract set one by one, when Network is null.
+type chainRef struct {
+	Network         *string `json:"network"`
+	RPCURL          string  `json:"rpc_url"`
+	ServingContract string  `json:"serving_contract"`
+}
+
+func chainRefOf(n chain.Network) chainRef {
+	ref := chainRef{RPCURL: n.RPCURL, ServingContract: n.ServingContract}
+	if n.Name != "" {
+		name := n.Name
+		ref.Network = &name
+	}
+	return ref
 }
 
 // releaseRef names a published release.
@@ -171,6 +196,8 @@ type identityConfig struct {
 	ReleaseRepo    string
 	ReleaseAsset   string
 	ReleaseAPIBase string
+	// Chain is the on-chain root the process resolved (proxycli.Built.ChainRoot).
+	Chain chain.Network
 	// OSImages is the allowlist the boot chain is compared against. Callers pass
 	// evidence.BuiltinOSImages(); tests pass their own.
 	OSImages []evidence.OSImage
@@ -196,6 +223,7 @@ type buildResult struct {
 func buildIdentity(ctx context.Context, cfg identityConfig, logger *slog.Logger) buildResult {
 	res := buildResult{doc: identityDoc{
 		InstanceID:  cfg.InstanceID,
+		Chain:       chainRefOf(cfg.Chain),
 		EvidenceURL: evidencePrefix,
 		Verify:      verifyNote,
 	}}
@@ -510,6 +538,7 @@ func startIdentity(cfg identityConfig, logger *slog.Logger) (*identityCache, fun
 	// instance id from the very first request rather than 503ing or serving "{}".
 	cache.store(buildResult{doc: identityDoc{
 		InstanceID:  cfg.InstanceID,
+		Chain:       chainRefOf(cfg.Chain),
 		EvidenceURL: evidencePrefix,
 		Verify:      verifyNote,
 	}, pending: []string{"not assembled yet"}})

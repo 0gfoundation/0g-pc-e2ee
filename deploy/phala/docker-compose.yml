@@ -113,10 +113,7 @@ services:
       - DNS_PROVIDER=cloudflare
       # `:?` on the OPERATOR-supplied vars on purpose: one a human forgot to set
       # must fail the deploy loudly rather than degrade. (GATEWAY_DOMAIN below is
-      # not one of those and is deliberately ungated — see its note.) An empty
-      # DELEGATION_ZONE in particular is not a no-op — it switches the container out
-      # of delegation mode, at which point it tries to write records into the SERVED
-      # domain's own zone with a token that has no access there.
+      # not one of those and is deliberately ungated — see its note.)
       - DOMAIN=${DOMAIN:?set DOMAIN, e.g. pc-gateway.example.com}
       # NOT an operator secret. DSTACK_GATEWAY_DOMAIN is exported by Phala Cloud's
       # pre-launch script — app-compose.json `pre_launch_script`, which dstack
@@ -151,8 +148,24 @@ services:
       # So the check is at deploy time, on the record that actually gets published —
       # README "Serving domain".
       - GATEWAY_DOMAIN=_.${DSTACK_GATEWAY_DOMAIN}
-      - DELEGATION_ZONE=${DELEGATION_ZONE:?set DELEGATION_ZONE, the zone this container may write}
-      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:?set CLOUDFLARE_API_TOKEN, scoped to DELEGATION_ZONE only}
+      # DELEGATION_ZONE picks the DNS mode, and an empty value is a mode, not a
+      # default: dstack-ingress switches on whether it is empty (dns01.sh,
+      # `[ -n "$DELEGATION_ZONE" ]`). A zone name delegates — the container writes
+      # only into that zone, behind three CNAMEs the operator created once (README
+      # "Serving domain"). EMPTY writes the served domain's own zone directly: the
+      # serving CNAME, the _dstack-app-address TXT, the ACME challenge and the CAA
+      # record, with a token that can edit that zone. Single instance only — blue /
+      # green (blue-green.md) and switch.sh are built on delegation.
+      #
+      # So `?`, not `:?`: an UNSET variable still fails the deploy, as forgetting it
+      # did before, and only an explicitly empty one selects the direct mode — a
+      # choice someone made, not a key someone forgot.
+      - DELEGATION_ZONE=${DELEGATION_ZONE?set DELEGATION_ZONE to the zone this container may write, or to empty to write the served domain's own zone}
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:?set CLOUDFLARE_API_TOKEN, scoped to DELEGATION_ZONE, or to the served domain's zone when DELEGATION_ZONE is empty}
+      # The CAA record pins issuance for the served name to this container's own ACME
+      # account (README "Serving domain"). Delegation publishes it unconditionally;
+      # the direct mode only when asked, so ask — the same record either way.
+      - SET_CAA=true
       - TARGET_ENDPOINT=gateway:8443 # forward decrypted traffic to the gateway
       # Default `wait` blocks on boot until the served CNAMEs resolve to
       # `<name>.<DOMAIN>.<DELEGATION_ZONE>` — a strict one-hop match, correct for a
@@ -425,11 +438,19 @@ services:
       # refusals now, not that counter.
       - "ZG_GATEWAY_ATTEST_ENFORCE=true"
       # Cross-check each provider's quote-bound TEE signer against its acknowledged
-      # on-chain teeSignerAddress. The RPC + contract default to 0G mainnet, so they
-      # stay implicit; override BOTH together for testnet or your own node.
+      # on-chain teeSignerAddress.
       - "ZG_GATEWAY_ONCHAIN=true"
-      # - "ZG_GATEWAY_CHAIN_RPC_URL=https://evmrpc.0g.ai"
-      # - "ZG_GATEWAY_SERVING_CONTRACT=0x47340d900bdFec2BD393c626E12ea0656F938d84"
+      # Which 0G network that registry is read on, BY NAME: mainnet or testnet, each
+      # a JSON-RPC endpoint and InferenceServing contract compiled into the gateway
+      # (client/chain/network.go). Overridable from the encrypted env, like the router
+      # URL — but the router is untrusted by construction and the chain is not: it is
+      # hop 5's root. The encrypted env is confidential, not authenticated (anyone
+      # with VMM access can replace it), so the measured text admits only a name,
+      # never an endpoint: the host can at most pick the other real network, and the
+      # gateway reports which one it is on (/v1/gateway/identity `chain`, which
+      # pcverify -gateway checks). ZG_GATEWAY_CHAIN_RPC_URL / _SERVING_CONTRACT exist
+      # for the sidecar and local runs and are deliberately not referenced here.
+      - "ZG_GATEWAY_NETWORK=${ZG_GATEWAY_NETWORK:-mainnet}"
       # Skip a provider whose on-chain signer is missing/unacknowledged/mismatched
       # instead of only warning. ON, so hop 5 is a gate: a provider the registry does not
       # vouch for is refused before anything is sealed to it, and the request falls back
@@ -599,7 +620,7 @@ configs:
           # two CVMs of one app_id run this exact config — which is what the
           # per-job file_sd target labels below are for.
           service: 0g-pc-gateway
-          env: "${ZG_PROM_ENV:?set staging or mainnet}"
+          env: "${ZG_PROM_ENV:?set staging, testnet or mainnet}"
       scrape_configs:
         # Both jobs take their per-replica identity as TARGET labels from the
         # documents cvm-identity wrote; nothing is labelled exporter-side.

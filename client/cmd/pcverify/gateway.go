@@ -247,7 +247,7 @@ func incompleteReason(rep evidence.Report, expect expectSource) string {
 // claim — an interceptor running its own attested CVM would satisfy everything
 // else — so a run that uses it prints that caveat rather than a bare PASS, and is
 // incomplete for the same reason: the domain binding went unestablished.
-func reportGateway(ctx context.Context, out io.Writer, ec evidenceChecker, domain string, allowUntrustedCert, strict bool, expect expectSource) int {
+func reportGateway(ctx context.Context, out io.Writer, ec evidenceChecker, domain string, allowUntrustedCert, strict bool, expect expectSource, cc chainCheck) int {
 	rep, err := ec.Check(ctx, domain)
 	if err != nil {
 		fmt.Fprintf(out, "pcverify: %v\n", err)
@@ -352,6 +352,10 @@ func reportGateway(ctx context.Context, out io.Writer, ec evidenceChecker, domai
 		fmt.Fprintf(out, "%s os image           %s\n", mark(true), rep.OSImage.Matched)
 	}
 
+	// Step 8 — the network the gateway grounds providers against (chainroot.go).
+	chainFailed, chainSkipped := reportChain(ctx, out, cc, endpointBound{
+		bound: rep.CertErr == nil && rep.CertMatch.OK(), leaf: rep.ServedCertSHA256}, rep.Domain)
+
 	fmt.Fprintf(out, "\nnote: %s\n", rep.Note)
 	// Waiving chain trust drops the link between this connection and the name that
 	// was asked for, so say what the pass no longer covers. Without this an operator
@@ -370,10 +374,13 @@ func reportGateway(ctx context.Context, out io.Writer, ec evidenceChecker, domai
 			"  production hostname, where this check should pass without the flag.\n", rep.Domain)
 	}
 
-	if !rep.Pass() || !(trustOK || allowUntrustedCert) {
+	if !rep.Pass() || !(trustOK || allowUntrustedCert) || chainFailed {
 		return fail(out)
 	}
 	reason := incompleteReason(rep, expect)
+	if reason == "" {
+		reason = chainSkipped
+	}
 	// Waiving chain trust leaves the connection untied to the name asked for, so that
 	// run did not cover everything either — the warning above says so at length, and
 	// the verdict should agree with it. Checked second: an actual skipped check is the

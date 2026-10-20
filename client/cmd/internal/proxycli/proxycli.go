@@ -182,6 +182,7 @@ type Flags struct {
 	onchainOn       *bool
 	onchainEnforce  *bool
 	verifyResponses *bool
+	network         *string
 	chainRPCURL     *string
 	servingContract *string
 	warmOn          *bool
@@ -212,7 +213,7 @@ const defaultCollateralTTL = time.Hour
 // whose pointers are filled by fs.Parse. envPrefix (e.g. "ZG_GATEWAY",
 // "ZG_SIDECAR") selects the environment variables consulted for each flag's
 // default: <envPrefix>_LISTEN, _ROUTER_URL, _PROVIDER_URL,
-// _ATTEST, _ATTEST_ENFORCE, _ONCHAIN, _ONCHAIN_ENFORCE,
+// _ATTEST, _ATTEST_ENFORCE, _ONCHAIN, _ONCHAIN_ENFORCE, _NETWORK,
 // _CHAIN_RPC_URL, _SERVING_CONTRACT, _WARM, _WARM_INTERVAL, _PCCS_URL,
 // _COLLATERAL_TTL, _RUNTIME_RELEASES, _PROVIDER_ENFORCE.
 // defaultListen is the built-in listen address used when neither the flag nor
@@ -241,10 +242,12 @@ func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen, defaultRouterURL 
 			fmt.Sprintf("with -onchain, skip a provider whose on-chain signer is missing/unacknowledged/mismatched instead of only warning (env %s)", env("ONCHAIN_ENFORCE"))),
 		verifyResponses: fs.Bool("verify-responses", envBool(env("VERIFY_RESPONSES"), false),
 			fmt.Sprintf("verify each response's §8 TEE signature (trust-chain hop 11), fetched directly from the provider's broker endpoint, fail-closed against the quote-bound signer; requires -attest, and -onchain additionally grounds that signer on-chain (env %s)", env("VERIFY_RESPONSES"))),
-		chainRPCURL: fs.String("chain-rpc-url", envOr(env("CHAIN_RPC_URL"), chain.DefaultChainRPCURL),
-			fmt.Sprintf("0G chain JSON-RPC endpoint for on-chain signer lookups; must be a source trusted independently of the router (defaults to 0G mainnet) (env %s)", env("CHAIN_RPC_URL"))),
-		servingContract: fs.String("serving-contract", envOr(env("SERVING_CONTRACT"), chain.DefaultInferenceServingAddress),
-			fmt.Sprintf("InferenceServing contract address for on-chain signer lookups (env %s)", env("SERVING_CONTRACT"))),
+		network: fs.String("network", envOr(env("NETWORK"), ""),
+			fmt.Sprintf("0G network whose InferenceServing registry grounds providers (%s), naming the JSON-RPC endpoint and the contract together as a fixed pair; excludes -chain-rpc-url and -serving-contract. Empty means mainnet unless those two say otherwise (env %s)", strings.Join(chain.NetworkNames(), ", "), env("NETWORK"))),
+		chainRPCURL: fs.String("chain-rpc-url", envOr(env("CHAIN_RPC_URL"), ""),
+			fmt.Sprintf("0G chain JSON-RPC endpoint for on-chain signer lookups; must be a source trusted independently of the router. Empty means 0G mainnet's (%s) (env %s)", chain.DefaultChainRPCURL, env("CHAIN_RPC_URL"))),
+		servingContract: fs.String("serving-contract", envOr(env("SERVING_CONTRACT"), ""),
+			fmt.Sprintf("InferenceServing contract address for on-chain signer lookups and the recorded deployments' key. Empty means 0G mainnet's (%s) (env %s)", chain.DefaultInferenceServingAddress, env("SERVING_CONTRACT"))),
 		warmOn: fs.Bool("warm", envBool(env("WARM"), false),
 			fmt.Sprintf("run a background warmer that pre-verifies every provider's quote and refreshes it ahead of expiry, so requests hit a warm cache instead of paying the DCAP verify inline; requires -attest and -onchain (env %s)", env("WARM"))),
 		warmInterval: fs.Duration("warm-interval", envDuration(env("WARM_INTERVAL"), defaultWarmInterval),
@@ -290,7 +293,15 @@ type Built struct {
 	// verifiesQuotes records whether provider quotes are DCAP-verified (-attest), so
 	// ProviderIdentities can say whether there will ever be a verdict to report.
 	verifiesQuotes bool
+	// chainRoot is the on-chain root the flags resolved to (see Flags.chainRoot).
+	chainRoot chain.Network
 }
+
+// ChainRoot returns the JSON-RPC endpoint and InferenceServing contract this process
+// grounds providers against (with -onchain) and keys recorded deployments by (with
+// -attest), and the network they were named as — "" when -chain-rpc-url or
+// -serving-contract set them instead.
+func (b *Built) ChainRoot() chain.Network { return b.chainRoot }
 
 // ProviderIdentities returns the read side of the per-provider verification records
 // the router accumulates — what this process verified about each provider it sealed
@@ -439,8 +450,9 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 		logger.Error("-onchain requires -attest (the signer must come from a verified quote)")
 		os.Exit(1)
 	}
-	if *f.onchainOn && strings.TrimSpace(*f.chainRPCURL) == "" {
-		logger.Error("-onchain requires -chain-rpc-url")
+	root, err := f.chainRoot()
+	if err != nil {
+		logger.Error(err.Error())
 		os.Exit(1)
 	}
 	// Response verification anchors on the provider's signer. In router mode that
@@ -507,7 +519,7 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 				logger))
 		}
 		routeOpts = append(routeOpts, route.WithComposeBaseline(builtinBaseline(label, *f.providerEnforce, logger),
-			*f.servingContract))
+			root.ServingContract))
 		if *f.providerEnforce {
 			routeOpts = append(routeOpts, route.WithProviderEnforce(true))
 			logger.Info("provider enforce enabled: a provider is sealed to only when its manifest is its recorded "+
@@ -520,7 +532,7 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 	// two are deliberately different values off the same underlying registry.
 	var resolver route.EndpointResolver
 	if *f.onchainOn {
-		reg, err := chain.NewOnChainRegistry(chain.Config{RPCURL: *f.chainRPCURL, ContractAddress: *f.servingContract})
+		reg, err := chain.NewOnChainRegistry(chain.Config{RPCURL: root.RPCURL, ContractAddress: root.ServingContract})
 		if err != nil {
 			logger.Error("on-chain registry", "err", err)
 			os.Exit(1)
@@ -529,8 +541,8 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 		routeOpts = append(routeOpts,
 			route.WithOnChainVerification(chain.Cached(reg, onchainCacheTTL, onchainCacheGrace), *f.onchainEnforce, logger))
 		logger.Info("on-chain signer grounding enabled", "label", label,
-			"enforce", *f.onchainEnforce,
-			"contract", *f.servingContract, "cache_ttl", onchainCacheTTL, "cache_grace", onchainCacheGrace)
+			"enforce", *f.onchainEnforce, "network", networkLabel(root),
+			"rpc", root.RPCURL, "contract", root.ServingContract, "cache_ttl", onchainCacheTTL, "cache_grace", onchainCacheGrace)
 	}
 	// Shared by every client. Nothing per-row goes here — the row itself travels
 	// via core.WithEndpoint, and each client derives its sealed set from that
@@ -571,7 +583,7 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 		// the broker's paths as chat and any other row would seal to a chat
 		// endpoint. The gateway refuses the rest explicitly rather than leaving them
 		// to its catch-all.
-		return &Built{Clients: sealingClients(directRes, served, coreOpts)}
+		return &Built{Clients: sealingClients(directRes, served, coreOpts), chainRoot: root}
 	}
 
 	// ONE router. It is one 0G Router, at one URL, serving every endpoint — so
@@ -592,7 +604,8 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 	router := route.New(*f.RouterURL, append(append([]route.Option{}, routeOpts...),
 		route.WithWarmServiceTypes(warmTypes...))...)
 
-	b := &Built{Clients: sealingClients(router, served, coreOpts), router: router, verifiesQuotes: *f.attestOn}
+	b := &Built{Clients: sealingClients(router, served, coreOpts), router: router, verifiesQuotes: *f.attestOn,
+		chainRoot: root}
 	if *f.warmOn {
 		b.resolver = resolver
 		b.warmInterval = *f.warmInterval
@@ -770,6 +783,50 @@ func newVerifier(label string, enforce bool, pccsURL string, collateralTTL time.
 		})),
 		attest.WithMeasurementMode(mode),
 	)
+}
+
+// chainRoot resolves the on-chain root from -network, -chain-rpc-url and
+// -serving-contract. A network names both values, so it cannot be combined with
+// either: one of them overriding half of a named pair is a root nobody named. Without
+// a network, each value defaults to mainnet's, and the root is named mainnet only
+// when neither was overridden.
+func (f *Flags) chainRoot() (chain.Network, error) {
+	name := strings.TrimSpace(*f.network)
+	rpc := strings.TrimSpace(*f.chainRPCURL)
+	contract := strings.TrimSpace(*f.servingContract)
+	if name != "" {
+		if rpc != "" || contract != "" {
+			return chain.Network{}, errors.New("-network names the JSON-RPC endpoint and the contract together; " +
+				"do not also set -chain-rpc-url or -serving-contract")
+		}
+		n, err := chain.LookupNetwork(name)
+		if err != nil {
+			return chain.Network{}, fmt.Errorf("-network: %w", err)
+		}
+		return n, nil
+	}
+	n, err := chain.LookupNetwork(chain.NetworkMainnet)
+	if err != nil {
+		return chain.Network{}, err
+	}
+	if rpc != "" || contract != "" {
+		n.Name = ""
+	}
+	if rpc != "" {
+		n.RPCURL = rpc
+	}
+	if contract != "" {
+		n.ServingContract = contract
+	}
+	return n, nil
+}
+
+// networkLabel is how a log line names a root: its network, or "custom".
+func networkLabel(n chain.Network) string {
+	if n.Name == "" {
+		return "custom"
+	}
+	return n.Name
 }
 
 // collateralSource names where DCAP collateral is fetched from, for the startup
