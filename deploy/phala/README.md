@@ -222,10 +222,26 @@ phala cvm create --compose deploy/phala/docker-compose.yml
 
 ### CVM shape — and the one setting that depends on it
 
-> **⚠️ Unverified.** The intended mainnet shape is **16 vCPU / 32 GiB**, but
-> nothing in this repository can confirm what a given CVM was actually created
-> with — the shape is chosen at `cvm create` time, not declared in the compose.
-> Confirm it against the deployment before trusting the arithmetic below.
+> The intended mainnet shape is **16 vCPU / 32 GiB**. The shape is chosen at
+> `cvm create` time, not declared in the compose, so read it off the deployment —
+> the evidence bundle carries the `vm_config` the CVM booted with:
+>
+> ```sh
+> curl -s https://<DOMAIN>/evidences/quote.json \
+>   | jq '.vm_config | fromjson | {cpu_count, GiB: (.memory_size/1073741824), image}'
+> ```
+>
+> On 2026-10-20 that read:
+>
+> | deployment | vCPU | memory | against `GOMEMLIMIT=24GiB` |
+> |---|---|---|---|
+> | mainnet (`router-api.0g.ai`) | 16 | 32 GiB | as intended |
+> | staging (`router-api-staging.0g.ai`) | 1 | 2 GiB | **limit above RAM** — see "On resize" below |
+> | testnet (`router-api-testnet-tee.integratenetwork.work`) | 1 | 2 GiB | **limit above RAM** |
+>
+> `vm_config` is what the host reports, from the boot that wrote the bundle (see
+> "The bundle is only as fresh as the certificate"); RTMR0 measures the same shape,
+> but nothing pins RTMR0, so treat this as a reading, not a proof.
 
 | Setting | Value | Depends on the shape? |
 |---|---|---|
@@ -685,6 +701,40 @@ radius — the gateway exiting takes the endpoint down entirely, not just this r
 which is the right trade for a path that sits in the measured compose next to the
 volume it names (a mismatch is a deploy error, caught on the first staging boot), but
 it is why the check stays that narrow.
+
+**The bundle is only as fresh as the certificate.** dstack-ingress writes it when a
+pass issues or renews a certificate, and at no other time (`dns01.sh`:
+`collect_evidence` runs only when a certificate changed). A CVM that boots with its
+`cert-data` and `evidences` volumes intact finds a valid certificate, issues nothing,
+and goes on publishing the **previous** bundle — whose quote describes the boot that
+wrote it, `compose_hash` included.
+
+That is harmless when nothing measured changed — a restart, a power cycle, a
+value-only env change: the old quote's `compose_hash` is still the running one. It is
+not harmless when the **compose changed and the volumes survived**. Then `pcverify
+-gateway` verifies the OLD compose while the NEW one runs, and endpoint binding still
+passes, because the TLS key lives on the same surviving volume. Every check is green
+and the claim is about a configuration that is no longer deployed.
+
+Whether a compose change keeps the volumes is the platform's choice, not ours. The
+staging-to-real note under [Deploy](#deploy) measured an upgrade that came up with an
+empty `cert-data`; the testnet gateway on `dstack-pha-in2` (2026-10-20) is the other
+case — after an in-place compose edit its bundle was byte-identical to the first
+boot's, with the first boot's certificate. So do not assume either: **after every
+compose change, confirm the bundle moved with it.**
+
+```sh
+curl -s https://<DOMAIN>/v1/gateway/identity | jq '{compose_hash, containers: (.containers|length)}'
+sha256sum app-compose.json   # the app-compose you just deployed
+```
+
+`compose_hash` must equal the new app-compose's sha256, and `containers` must be a
+list. The gateway checks the second for you: it reads the RUNNING app-compose and
+admits it only when it hashes to the bundle quote's `compose_hash`, so a stale bundle
+shows up as `containers: null` here (and `app-compose does not match the quote's
+compose_hash` in its log). A stale bundle is fixed by a fresh issuance — a CVM with
+an empty `cert-data`, i.e. recreated rather than updated in place — which spends one
+of the 5 duplicate certificates per hostname per week.
 
 **Still browser-unreachable:** endpoint binding. JS cannot read the peer certificate
 of its own TLS connection — no API exposes it — so a web page can establish *code*
