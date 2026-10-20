@@ -185,13 +185,13 @@ func deriveSignatureURL(endpoint, chatKey string) (string, error) {
 
 // endedBy names who ended a fetch whose context is done, which is NOT always the
 // caller: core hands this fetcher a context derived from the attempt, so the
-// buffered path's providerTimeout expiring mid-fetch arrives here indistinguishable
+// buffered path's bufferedTimeout expiring mid-fetch arrives here indistinguishable
 // from a disconnect unless the error kind is read. It was all counted "canceled",
 // which put our own deadline in the bucket every alert ignores.
 //
 // context.Canceled means somebody called cancel — in practice the caller going
 // away. context.DeadlineExceeded means a deadline on the CONTEXT fired, which on
-// this path means core's providerTimeout.
+// this path means core's bufferedTimeout.
 //
 // Note what this does NOT cover: the fetcher's own http.Client.Timeout never touches
 // the context — it surfaces as a transport error from Do, which fetchOnce marks

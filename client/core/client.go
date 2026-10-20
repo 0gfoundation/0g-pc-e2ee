@@ -19,17 +19,40 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
-// providerTimeout aligns the client's bounds with the 0G router's upstream
-// timeout: nginx proxy_read_timeout / proxy_send_timeout and the backend
-// write_timeout are all 600s, and the streaming path clears its total deadline
-// so it is bounded by that same 600s read gap. We size to it plus a small margin
-// so the router's own timeout (a clean 504) fires first — the client never cuts
-// a request the router would still allow. Used as:
-//   - the non-streaming context deadline (applied per call, NOT via
-//     http.Client.Timeout, which would also cut a long stream);
-//   - the response-header wait (ResponseHeaderTimeout, both paths); and
-//   - the streaming idle gap between frames.
-const providerTimeout = 10*time.Minute + 30*time.Second
+// The client's bounds on a provider round trip, one per thing the router bounds.
+// Each sits a margin above the router's own limit, so the router — which bills
+// what was delivered and answers with an error the caller can read — ends a
+// request first, and the client never cuts a request the router would still
+// allow. None of them is set as http.Client.Timeout, which would also cut a long
+// stream. A stream has no total bound here: the router ends it at its own
+// whole-stream cap (router.stream_max_duration_seconds, 3540s under Cloud Run's
+// 3600s request timeout on mainnet and staging).
+//
+// When the router's limits move, these move with them; check its
+// server.write_timeout and router.stream_idle_timeout_seconds.
+const (
+	// bufferedTimeout bounds one buffered (non-streaming) attempt end to end, as a
+	// per-attempt context deadline. The router writes a buffered response under
+	// its server.write_timeout (600s; its upstream header wait is 570s inside
+	// that), which still holds after its stream cap went to 3540s — that cap is
+	// for streams only. The async submit shares it: a submit is a buffered round
+	// trip.
+	bufferedTimeout = 10*time.Minute + 30*time.Second
+
+	// responseHeaderTimeout is the transport's wait for response headers. The
+	// transport is shared by both paths, so it is sized by the slower one: a
+	// buffered response sends its headers with the body, at the end of the whole
+	// generation. A stream's headers come far sooner (the router holds them at
+	// most through its 120s prelude failover), so this never bounds a stream that
+	// is working.
+	responseHeaderTimeout = bufferedTimeout
+
+	// streamIdleTimeout bounds the gap between two frames of a stream (core's idle
+	// watchdog, which times only the provider read). The router ends a stream
+	// whose upstream sends nothing for router.stream_idle_timeout_seconds (540s);
+	// past that it is the router, not the provider, that has gone quiet.
+	streamIdleTimeout = 10*time.Minute + 30*time.Second
+)
 
 // DefaultProviderURL is where a sealed request is POSTed when Provider.URL is
 // empty: the 0G router's OpenAI chat-completions endpoint. (Provider discovery —
@@ -619,9 +642,9 @@ func NewWithResolver(r Resolver, opts ...Option) *Client {
 	// a server-sized idle-connection pool (see NewPooledTransport — Go's default of
 	// 2 per host throttles a proxy that sends every request to the same router),
 	// and bound the wait for response headers via ResponseHeaderTimeout. No blunt
-	// http.Client.Timeout: it would also cut a long stream (see providerTimeout).
+	// http.Client.Timeout: it would also cut a long stream (see bufferedTimeout).
 	tr := NewPooledTransport()
-	tr.ResponseHeaderTimeout = providerTimeout
+	tr.ResponseHeaderTimeout = responseHeaderTimeout
 	c := &Client{
 		resolver:      r,
 		ep:            endpoint.Chat,
@@ -744,7 +767,7 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 }
 
 // completeOnce runs one non-streaming attempt against a single provider under
-// its own per-attempt deadline (providerTimeout), so each candidate gets a full
+// its own per-attempt deadline (bufferedTimeout), so each candidate gets a full
 // budget rather than sharing one across the whole fallback chain. retry reports
 // whether the caller may fall back to the next candidate:
 //   - false (terminal): a request-level seal failure, a 4xx (client fault), or a
@@ -754,7 +777,7 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 //     dropped mid-read, or a 2xx whose sealed body will not decode/open — all
 //     provider-side failures with nothing yet returned to the caller.
 func (c *Client) completeOnce(parent context.Context, provider Provider, req wire.Request, ephPub []byte, ephPriv crypto.PrivateKey) (wire.Response, bool, error) {
-	ctx, cancel := context.WithTimeout(parent, providerTimeout)
+	ctx, cancel := context.WithTimeout(parent, bufferedTimeout)
 	defer cancel()
 
 	sealed, err := c.seal(provider, req, ephPub)

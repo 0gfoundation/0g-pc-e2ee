@@ -89,7 +89,7 @@ func (c *Client) SubmitAsync(ctx context.Context, req wire.Request) (wire.Respon
 // attempt, not per request: the key is what the job id will carry, and each
 // attempt that reaches a router is a separate job.
 func (c *Client) submitOnce(parent context.Context, provider Provider, req wire.Request) (wire.Response, int, bool, error) {
-	ctx, cancel := context.WithTimeout(parent, providerTimeout)
+	ctx, cancel := context.WithTimeout(parent, bufferedTimeout)
 	defer cancel()
 
 	ephPriv, ephPub, err := crypto.GenerateRecipientKey()

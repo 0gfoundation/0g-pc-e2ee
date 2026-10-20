@@ -174,7 +174,7 @@ screen:
      turning the panel into a slow-failure counter.
    - **A failing chain is bounded, in both factors.** `core.resolveBudget` charges
      materialization AND failed attempts, so the walk stops instead of paying
-     `providerTimeout` once per candidate; `route.maxPreviewCandidates` bounds how
+     `bufferedTimeout` once per candidate; `route.maxPreviewCandidates` bounds how
      many candidates the router can put in front of us in the first place. The
      ceiling is the budget plus the one attempt already running when it ran out —
      a running attempt is never cut, because that would cut a completion mid-stream.

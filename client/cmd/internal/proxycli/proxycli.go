@@ -50,7 +50,7 @@ import (
 // typical orchestrator stop grace (Docker defaults to 10s, Kubernetes to 30s; the
 // dstack/Phala deployment sends SIGTERM on stop), so ordinary buffered
 // completions finish cleanly while a long-lived SSE stream — which can otherwise
-// run up to the core's providerTimeout (~10m) — is cut rather than stalling the
+// run up to the router's whole-stream cap (~59 min) — is cut rather than stalling the
 // redeploy. A cut stream is unavoidable on any bounded-grace shutdown; the
 // alternative (waiting out the stream) would make every deploy hang for minutes.
 const ShutdownTimeout = 30 * time.Second

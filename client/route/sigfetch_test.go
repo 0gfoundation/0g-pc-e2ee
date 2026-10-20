@@ -231,7 +231,7 @@ func TestSignatureFetchMetersPreflightFailures(t *testing.T) {
 
 // The context this fetcher receives is derived from the ATTEMPT, not from the
 // caller, so a done context is not evidence of a disconnect: our own
-// providerTimeout expiring mid-fetch arrives here looking the same. Counting both
+// bufferedTimeout expiring mid-fetch arrives here looking the same. Counting both
 // as "canceled" put our deadline in the bucket every alert ignores.
 func TestSignatureFetchSeparatesOurDeadlineFromTheCaller(t *testing.T) {
 	const (
@@ -257,7 +257,7 @@ func TestSignatureFetchSeparatesOurDeadlineFromTheCaller(t *testing.T) {
 	prov := core.Provider{Endpoint: srv.URL}
 	key := "11111111-1111-1111-1111-111111111111"
 
-	// A DEADLINE — what core's providerTimeout looks like from in here.
+	// A DEADLINE — what core's bufferedTimeout looks like from in here.
 	dl, cancelDL := context.WithTimeout(context.Background(), 80*time.Millisecond)
 	defer cancelDL()
 	if _, err := f.FetchSignature(dl, prov, key); err == nil {

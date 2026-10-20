@@ -40,7 +40,8 @@ func retryAfterSeconds() int {
 //     budget (loadtest/README.md). Past the knee, one caller's load is served out
 //     of every other caller's latency — and they are paying too.
 //   - Cost and occupancy are not the same shape. A stream is held open for its
-//     whole token schedule, bounded only by providerTimeout (10m30s). A thousand
+//     whole token schedule, bounded only by the router's whole-stream cap (~59
+//     min) and, between frames, core's streamIdleTimeout (10m30s). A thousand
 //     cheap, slow streams cost little and occupy everything.
 //   - Not everything on the path is charged. The route-preview round trip and
 //     the DCAP verify on a cold quote cache are gateway work that no token count

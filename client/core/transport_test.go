@@ -49,8 +49,8 @@ func TestNewWithResolverUsesAPooledTransport(t *testing.T) {
 	if tr.MaxIdleConnsPerHost != maxIdleConnsPerHost {
 		t.Errorf("MaxIdleConnsPerHost: got %d, want %d", tr.MaxIdleConnsPerHost, maxIdleConnsPerHost)
 	}
-	if tr.ResponseHeaderTimeout != providerTimeout {
-		t.Errorf("ResponseHeaderTimeout: got %v, want %v", tr.ResponseHeaderTimeout, providerTimeout)
+	if tr.ResponseHeaderTimeout != responseHeaderTimeout {
+		t.Errorf("ResponseHeaderTimeout: got %v, want %v", tr.ResponseHeaderTimeout, responseHeaderTimeout)
 	}
 	// A blunt client timeout would cut a long stream; the header wait above is the
 	// only bound on the data path (see NewWithResolver).
