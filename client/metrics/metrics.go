@@ -112,6 +112,18 @@ var (
 		Namespace: namespace, Subsystem: subsystem, Name: "requests_shed_total",
 		Help: "Sealed inference requests refused with 503 because the in-flight limit was reached. Also counted in http_requests_total{status=\"503\"} — subtract this to isolate genuine faults.",
 	})
+	// Request bodies that missed openaiproxy.BoundBodyRead's deadline — a client that
+	// sent its headers and then did not finish its body in time — each answered 408.
+	bodyReadTimeouts = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "body_read_timeouts_total",
+		Help: "Inference requests whose body did not arrive within the body-read deadline, answered 408.",
+	})
+	// Requests BoundBodyRead could not bound because the response writer chain does
+	// not reach the connection. Expected to stay 0; any count is a wiring bug.
+	bodyReadUnbounded = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "body_read_unbounded_total",
+		Help: "Inference requests served without a body-read deadline because the response writer could not carry one. Should stay 0.",
+	})
 
 	// Completion outcome (openaiproxy) — attributes each chat completion to where
 	// a failure originated (core.Error.Source/Stage), so a gateway-side fault is
@@ -387,7 +399,7 @@ func init() {
 	registry.MustRegister(
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
-		httpRequests, httpDuration, httpInFlight, inFlightLimit, requestsShed,
+		httpRequests, httpDuration, httpInFlight, inFlightLimit, requestsShed, bodyReadTimeouts, bodyReadUnbounded,
 		completions, openFailures, verificationFailures, sealDecisions,
 		previewAttempts, previewCalls, previewDuration, previewRetrySuppressed,
 		upstreamAttempts, upstreamDuration, streamTTFF, candidateFallbacks, walkBudgetExhausted,
@@ -468,6 +480,12 @@ func SetInFlightLimit(n int) { inFlightLimit.Set(float64(n)) }
 // Worth alerting on at any sustained non-zero rate: it means real requests are
 // being turned away, which is the intended behavior but never a steady state.
 func RequestShed() { requestsShed.Inc() }
+
+// BodyReadTimeout records one request whose body missed the body-read deadline.
+func BodyReadTimeout() { bodyReadTimeouts.Inc() }
+
+// BodyReadUnbounded records one request served without a body-read deadline.
+func BodyReadUnbounded() { bodyReadUnbounded.Inc() }
 
 // Completion records one chat-completion outcome. For a success, source and
 // stage are "none"; for a failure they carry core.Error.Source()/Stage.

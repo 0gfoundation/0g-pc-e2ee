@@ -56,6 +56,12 @@ screen:
    premise behind `route.retryGate` (row 3): that a router outage becomes
    gateway-wide shedding, because each retrying request holds its concurrency
    slot for the whole retry ceiling.
+   Under it, **refused at the door**: the 503 sheds and the 408 body-read timeouts
+   (an admitted request whose body did not arrive within `-body-read-timeout`) as a
+   count over the selected range, and again as rates on their own axis — on the
+   in-flight panel shed/s is drawn against hundreds of in-flight requests and does
+   not show. `body-read unbounded` there must stay 0: it counts requests the
+   deadline could not be set on.
 2. **Completions**: outcome by result, and errors broken down by
    `source`/`stage` (gateway fault vs router/provider).
 3. **Route preview — the uncached control plane**: retried-preview ratio, failure

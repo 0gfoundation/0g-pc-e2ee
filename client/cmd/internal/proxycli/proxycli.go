@@ -874,13 +874,18 @@ func EnvIntOr(key string, def int) int { return envInt(key, def) }
 // fail-loud treatment of a set-but-unparseable value.
 func EnvDurationOr(key string, def time.Duration) time.Duration { return envDuration(key, def) }
 
-// envInt parses an integer environment variable. An unset variable falls back to
-// def; a set-but-unparseable one is fatal rather than silently defaulting, so a
-// typo in a concurrency ceiling cannot quietly restore the built-in value while
-// the operator believes they changed it.
+// envInt parses an integer environment variable. An unset or empty variable falls
+// back to def; a set-but-unparseable one is fatal rather than silently defaulting,
+// so a typo in a concurrency ceiling cannot quietly restore the built-in value
+// while the operator believes they changed it.
 func envInt(key string, def int) int {
 	v, ok := os.LookupEnv(key)
-	if !ok {
+	// Empty reads as unset. For a string an empty value can be the setting itself
+	// (see envOr), but no integer is spelled "", and it is what a compose entry of
+	// the form KEY=${KEY:-} delivers when the deployment sets nothing — the only
+	// way to leave a variable overridable from the encrypted env while keeping the
+	// built-in default (ZG_GATEWAY_MAX_INFLIGHT).
+	if !ok || strings.TrimSpace(v) == "" {
 		return def
 	}
 	n, err := strconv.Atoi(v)

@@ -301,12 +301,7 @@ func Register(mux *http.ServeMux, ep endpoint.Endpoint, c *core.Client, opts ...
 	mux.HandleFunc("POST "+ep.Path, func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxRequestBytes))
 		if err != nil {
-			var tooLarge *http.MaxBytesError
-			if errors.As(err, &tooLarge) {
-				writeGatewayError(w, http.StatusRequestEntityTooLarge, "request body too large")
-				return
-			}
-			writeGatewayError(w, http.StatusBadRequest, "read request body")
+			readBodyError(w, err)
 			return
 		}
 		// A surface with a DecodeMultipart converts a multipart body into the
