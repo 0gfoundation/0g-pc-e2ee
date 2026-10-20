@@ -26,9 +26,10 @@ import (
 // reverse-proxies uploads to the router (POST /v1/files: up to 5 files of 50 MB by
 // the router's defaults) that nothing here caps, so the server-wide value has to
 // be loose enough for those — the gateway's is 90 s, above the router's own 60 s.
-// A sealed body is capped at MaxRequestBytes and can be held to far less; this
-// bounds only what it wraps, and starts the clock when a slot is held, which is
-// the resource it protects.
+// The inference routes cap their bodies (MaxRequestBytes sealed; the gateway's
+// cleartext branch at 20 MiB), so they can be held to far less; this bounds only
+// what it wraps, and starts the clock when a slot is held, which is the resource
+// it protects.
 //
 // The deadline is set on the connection through the response's controller.
 // net/http lifts it itself when the body hits EOF (startBackgroundRead clears the

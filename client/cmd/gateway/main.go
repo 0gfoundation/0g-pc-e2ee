@@ -861,10 +861,11 @@ type entryPolicy struct {
 // net/http lifts it at the body's EOF, so it does not reach a streamed response.
 const serverReadTimeout = 90 * time.Second
 
-// defaultBodyReadTimeout is long enough for MaxRequestBytes (10 MiB) on a slow
-// uplink — about 2.8 Mbit/s — and far shorter than the time a trickled body
-// could otherwise hold a slot, which was unbounded.
-const defaultBodyReadTimeout = 30 * time.Second
+// defaultBodyReadTimeout is long enough for the largest body these routes admit —
+// maxPassthroughBytes (20 MiB), a chat turn carrying a video — on a ~2.8 Mbit/s
+// uplink, and far shorter than the time a trickled body could otherwise hold a
+// slot, which was unbounded.
+const defaultBodyReadTimeout = 60 * time.Second
 
 // bodyRead resolves bodyReadTimeout's zero value to the default; a negative one
 // is returned as-is, which BoundBodyRead reads as disabled.

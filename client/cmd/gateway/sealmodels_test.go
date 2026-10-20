@@ -611,3 +611,52 @@ func TestComposeSealModelsSealsTheIntendedModel(t *testing.T) {
 			"Matching must stay exact — if that model is meant to be sealed, name it", m[1])
 	}
 }
+
+// bodyOfSize is a chat body for model padded to about n bytes.
+func bodyOfSize(model string, n int) string {
+	return fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":%q}]}`, model, strings.Repeat("v", n))
+}
+
+// The two branches have different caps (maxPassthroughBytes): a body between
+// them is forwarded, verbatim, for a model this deployment does not seal — a chat
+// turn carrying a video to a model with no E2EE — and refused for one it does,
+// which never reaches the router at all.
+func TestCleartextCapIsWiderThanTheSealedOne(t *testing.T) {
+	rr := &recordingRouter{}
+	router := rr.server(nil)
+	defer router.Close()
+	gw := catalogGateway(t, router, entryPolicy{sealModels: parseSealModels(sealedModel)})
+	between := openaiproxy.MaxRequestBytes + (maxPassthroughBytes-openaiproxy.MaxRequestBytes)/2
+	forwarded := func() []string {
+		var out []string
+		paths, _, bodies := rr.snapshot()
+		for i, p := range paths {
+			if p == "POST "+endpoint.Chat.Path {
+				out = append(out, bodies[i])
+			}
+		}
+		return out
+	}
+
+	body := bodyOfSize("video-model", between)
+	resp, got := postChat(t, gw.URL, body, "application/json")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("cleartext body of %d MiB: status %d, want the router's 200 (%.200s)", between>>20, resp.StatusCode, got)
+	}
+	if m := resp.Header.Get(openaiproxy.HeaderE2EE); m != openaiproxy.E2EEValueNone {
+		t.Errorf("%s = %q, want %q", openaiproxy.HeaderE2EE, m, openaiproxy.E2EEValueNone)
+	}
+	if f := forwarded(); len(f) != 1 || f[0] != body {
+		t.Fatalf("router got %d chat bodies, want exactly the caller's one (byte-for-byte)", len(f))
+	}
+
+	if resp, _ := postChat(t, gw.URL, bodyOfSize(sealedModel, between), "application/json"); resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Errorf("sealed model, %d MiB: status %d, want 413 at the sealed cap", between>>20, resp.StatusCode)
+	}
+	if resp, _ := postChat(t, gw.URL, bodyOfSize("video-model", maxPassthroughBytes+1024), "application/json"); resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Errorf("cleartext model past the cleartext cap: status %d, want 413", resp.StatusCode)
+	}
+	if f := forwarded(); len(f) != 1 {
+		t.Errorf("router got %d chat bodies, want still 1: neither oversize request may be forwarded", len(f))
+	}
+}

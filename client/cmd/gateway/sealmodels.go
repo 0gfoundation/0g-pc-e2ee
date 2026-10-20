@@ -12,7 +12,6 @@ import (
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
-	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 )
 
 // Per-model seal routing: seal the models this deployment can actually seal, and
@@ -171,6 +170,20 @@ func (s sealModels) label(model string) string {
 	return "other"
 }
 
+// maxPassthroughBytes caps a request body this gateway forwards to the router in
+// the clear — a model it does not seal. Twice the sealed cap (MaxRequestBytes), for
+// chat turns that carry a video to a model with no E2EE support; see dispatch for
+// why the two branches can afford different caps. The router applies its own
+// per-route cap after it (chatBodyCap), so raising this alone admits nothing the
+// router would refuse.
+//
+// Against the derived in-flight cap (inflight.go), which prices a request at
+// 3 x MaxRequestBytes = 30 MiB: a cleartext request at this cap holds the buffer
+// plus io.ReadAll's growth slack, up to about 40 MiB. That is over the per-request
+// price but well under what a sealed request at its own cap was measured at, so
+// the sealed path, not this one, still sets the worst case.
+const maxPassthroughBytes = 20 << 20 // 20 MiB
+
 // dispatch returns a handler that reads each request's model and sends it to
 // `sealed` or `cleartext` accordingly.
 //
@@ -196,19 +209,26 @@ func (s sealModels) label(model string) string {
 // # The body
 //
 // Deciding needs the model, the model is in the body, and both destinations need
-// the body afterwards — so it is buffered and rewound. The sealed path already
-// read it whole (openaiproxy.Register, capped at MaxRequestBytes), so nothing
-// changes there. What DOES change is the cleartext path on these surfaces: it
-// used to stream, and now it is buffered up to the same cap. That is a real
-// narrowing, accepted because the cap is the sealed path's own and these are
-// chat-shaped bodies — and because being inside the cap is what keeps that
-// memory inside the ceiling.
+// the body afterwards — so it is buffered and rewound, up to maxPassthroughBytes.
+// The sealed path already read it whole (openaiproxy.Register, capped at
+// MaxRequestBytes), so nothing changes there. What DOES change is the cleartext
+// path on these surfaces: it used to stream, and now it is buffered up to its own
+// cap — inside the in-flight cap, which is what keeps that memory inside the
+// ceiling.
 //
-// Reading one byte past the cap, rather than enforcing it here, keeps the
-// oversize answer where it already lives: we learn the body is too big, decide
-// "sealed", and let Register's MaxBytesReader produce the 413 it produces today.
-// Enforcing it here would mean a second place that writes that error, and two
-// places to keep saying the same thing.
+// Two caps, because the two branches cost different amounts. A sealed request is
+// parsed, sealed and base64'd, measured at roughly 7-13x its body
+// (inflight.go), and the router sees it about a third larger again; a cleartext
+// one is this one buffer, handed to the router as it is. So a body between the
+// two caps is fine for a model this deployment forwards (a chat turn carrying a
+// video, for a model with no E2EE support) and refused for one it seals.
+//
+// Reading one byte past the cleartext cap, rather than enforcing either cap here,
+// keeps the oversize answer where it already lives: a body past it reads as "body
+// too large", is decided "sealed", and Register's MaxBytesReader produces the 413
+// it produces today; a sealed model's body past MaxRequestBytes reaches the same
+// 413 by being sealed. Enforcing it here would mean a second place that writes
+// that error, and two places to keep saying the same thing.
 func (s sealModels) dispatch(sealed, cleartext http.Handler) http.Handler {
 	if s.all() {
 		return sealed
@@ -221,7 +241,7 @@ func (s sealModels) dispatch(sealed, cleartext http.Handler) http.Handler {
 			sealed.ServeHTTP(w, r)
 			return
 		}
-		buf, err := io.ReadAll(io.LimitReader(r.Body, openaiproxy.MaxRequestBytes+1))
+		buf, err := io.ReadAll(io.LimitReader(r.Body, maxPassthroughBytes+1))
 		// Rewind before any branch returns: whichever handler runs must see the
 		// body byte-for-byte as it arrived. MultiReader covers the oversize case,
 		// where r.Body still holds the remainder we did not read.
@@ -252,7 +272,7 @@ func modelOf(body []byte, contentType string, readErr error, n int) (model, reas
 	switch {
 	case readErr != nil:
 		return "", "unreadable_body"
-	case n > openaiproxy.MaxRequestBytes:
+	case n > maxPassthroughBytes:
 		return "", "body_too_large"
 	case isMultipartContentType(contentType):
 		return modelOfMultipart(body, contentType)

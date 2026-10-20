@@ -482,17 +482,23 @@ services:
       - "ZG_GATEWAY_WARM=true"
       # - "ZG_GATEWAY_WARM_INTERVAL=4m" # optional; 4m is already the default
       #
-      # Soft limit for the Go runtime, and the input the sealed path's in-flight cap
-      # is derived from — ZG_GATEWAY_MAX_INFLIGHT is deliberately unset, so the number
-      # has one source:
+      # Soft limit for the Go runtime, and the input the in-flight cap is derived
+      # from when ZG_GATEWAY_MAX_INFLIGHT is not set:
       #
-      #   24 GiB / 2 (bodies' share) / ~30 MiB (peak per request) = ~409 in flight
+      #   24 GiB / 2 (bodies' share) / ~30 MiB (peak per request) = ~409 in flight,
+      #   and never more than 512 however large the limit
       #
-      # ASSUMES a 32 GiB CVM, which nothing here can check, so it must be re-derived
-      # by hand on resize. Where 24 comes from, why this is not a substitute for the
-      # cap, and how a wrong value stays quiet: README "CVM shape — and the one
-      # setting that depends on it".
-      - "GOMEMLIMIT=24GiB"
+      # The default ASSUMES a 32 GiB CVM, which nothing here can check, so both are
+      # overridable from the encrypted env and must be re-derived by hand on resize
+      # (list them in allowed_envs to use that). Both decide availability only — the
+      # most a wrong or hostile value does is shed traffic or run the CVM out of
+      # memory, which a host can do anyway by not running it — so, unlike the chain
+      # (ZG_GATEWAY_NETWORK above), they may take a value rather than a name. An
+      # empty ZG_GATEWAY_MAX_INFLIGHT keeps the derived default. Where 24 comes
+      # from, what an explicit cap should be priced at, and how a wrong value stays
+      # quiet: README "CVM shape — and the one setting that depends on it".
+      - "GOMEMLIMIT=${GOMEMLIMIT:-24GiB}"
+      - "ZG_GATEWAY_MAX_INFLIGHT=${ZG_GATEWAY_MAX_INFLIGHT:-}"
       # Read this CVM's identity from the file cvm-identity wrote, NOT the
       # guest-agent socket. The empty ZG_GATEWAY_DSTACK_SOCKET is load-bearing: unset
       # it and the binary's default would reinstate the socket path as a fallback,
