@@ -244,8 +244,21 @@ source. Set it only to replace that arithmetic with a **measured** value — an 
 run is what produces one ([`../../loadtest/`](../../loadtest/)), and measurement
 should beat estimation. Until then the signal to watch is
 `zg_gateway_requests_shed_total`: any sustained non-zero rate means real traffic
-is being turned away. There are no dashboard panels for it yet, so read it off
-`/metrics`.
+is being turned away. The dashboard's Overview row has it on its own, beside
+`zg_gateway_body_read_timeouts_total` (below).
+
+A slot is held from admission until the response ends, and the request body is
+read inside it. So a body is given **`-body-read-timeout` (default 30 s)** to
+arrive once admitted; past it the request is answered 408 and the slot freed.
+Without that bound a client could send its headers and trickle the body,
+holding a slot indefinitely — the credential check in front only looks at a
+credential's shape, so it would cost no account, and dstack-ingress is a TCP proxy
+with a 24 h idle timeout. The bound covers the sealed inference routes only and
+lifts when the body has been read, so it never cuts a streamed response, and it
+does not touch the catch-all (router uploads such as `POST /v1/files` are larger
+than 10 MiB and keep no deadline here). 30 s covers a 10 MiB body at about
+2.8 Mbit/s; `ZG_GATEWAY_BODY_READ_TIMEOUT` is not referenced by the compose, so
+changing it is a compose edit.
 | `GOMAXPROCS` | unset | No. A CVM is a VM, so the guest sees its own vCPUs and Go reads them correctly. Only a *container CPU quota* would need it pinned. |
 
 **On resize, `GOMEMLIMIT` must be re-derived by hand.** It is the one number here

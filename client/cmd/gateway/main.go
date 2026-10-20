@@ -192,6 +192,14 @@ func main() {
 	// optimization in the global-entry topology: the router rate-limits these paths
 	// PER CLIENT IP, and this gateway forwards no client IP, so without the cache
 	// every user on earth shares one 120/min bucket.
+	// How long a sealed-path request's body may take to arrive once it holds an
+	// in-flight slot (openaiproxy.BoundBodyRead). Without it a client that sends
+	// headers and trickles the body holds a slot indefinitely.
+	bodyReadTimeout := flag.Duration("body-read-timeout", proxycli.EnvDurationOr("ZG_GATEWAY_BODY_READ_TIMEOUT", defaultBodyReadTimeout),
+		"how long an inference request's body may take to arrive once it is admitted under "+
+			"-max-inflight; past it the request is answered 408 and its slot freed. The bound "+
+			"lifts when the body has been read, so it never cuts a streamed response. 0 disables it "+
+			"(env ZG_GATEWAY_BODY_READ_TIMEOUT)")
 	catalogCacheTTL := flag.Duration("catalog-cache-ttl", proxycli.EnvDurationOr("ZG_GATEWAY_CATALOG_CACHE_TTL", defaultCatalogCacheTTL),
 		"how long to reuse the router's public catalog reads (/v1/models, /v1/providers, "+
 			"/v1/service-types, /status, the public stats groups) across callers, collapsing "+
@@ -560,6 +568,7 @@ func main() {
 				// is the ordinary deployment). Both are right for their own reader, and
 				// this is the one line that translates — see entryPolicy.catalogCacheTTL.
 				catalogCacheTTL: disabledIfZero(*catalogCacheTTL),
+				bodyReadTimeout: disabledIfZero(*bodyReadTimeout),
 			})),
 		ReadHeaderTimeout: 10 * time.Second,     // mitigate slow-header (Slowloris) clients
 		IdleTimeout:       proxycli.IdleTimeout, // bound idle keep-alives; unset means unbounded
@@ -833,6 +842,24 @@ type entryPolicy struct {
 	// conventional "0 disables" spelling for the operator, and the translation
 	// happens once, at the flag, rather than being a second meaning for zero here.
 	catalogCacheTTL time.Duration
+	// bodyReadTimeout bounds a sealed-path body read (openaiproxy.BoundBodyRead).
+	// Same convention as catalogCacheTTL: ZERO MEANS defaultBodyReadTimeout, and a
+	// negative value — what -body-read-timeout=0 maps to — turns it off.
+	bodyReadTimeout time.Duration
+}
+
+// defaultBodyReadTimeout is long enough for MaxRequestBytes (10 MiB) on a slow
+// uplink — about 2.8 Mbit/s — and far shorter than the time a trickled body
+// could otherwise hold a slot, which was unbounded.
+const defaultBodyReadTimeout = 30 * time.Second
+
+// bodyRead resolves bodyReadTimeout's zero value to the default; a negative one
+// is returned as-is, which BoundBodyRead reads as disabled.
+func (p entryPolicy) bodyRead() time.Duration {
+	if p.bodyReadTimeout == 0 {
+		return defaultBodyReadTimeout
+	}
+	return p.bodyReadTimeout
 }
 
 // disabledIfZero maps a flag's "0 disables" convention onto entryPolicy's
@@ -1106,8 +1133,11 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	gated.Handle("GET "+openaiproxy.AsyncJobsPrefix+"{id}",
 		openaiproxy.AsyncJobPoll(routerTarget, &http.Client{Transport: core.NewPooledTransport()}))
 	gated.Handle("/", policy.sealModels.dispatch(sealed, passthrough))
+	// The body-read bound sits INSIDE the cap, so its clock starts when a slot is
+	// held — the slot is what a trickled body would otherwise keep — and outside
+	// everything that reads the body, the model dispatcher included.
 	var sealedGate http.Handler = openaiproxy.RequireInferenceCredential(
-		openaiproxy.LimitInFlight(maxInFlight, gated))
+		openaiproxy.LimitInFlight(maxInFlight, openaiproxy.BoundBodyRead(policy.bodyRead(), gated)))
 	if policy.credentialsAllowed() {
 		sealedGate = openaiproxy.AcceptCookieCredential(allowedOrigins, sealedGate)
 	}

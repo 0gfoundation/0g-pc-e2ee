@@ -191,6 +191,11 @@ func (s *statusRecorder) Flush() {
 	}
 }
 
+// Unwrap exposes the wrapped writer to http.ResponseController, which is how
+// BoundBodyRead reaches the connection to set its read deadline. Without it the
+// controller stops here and the bound silently does not apply.
+func (s *statusRecorder) Unwrap() http.ResponseWriter { return s.ResponseWriter }
+
 // streamed reports whether the response was served as Server-Sent Events, so the
 // access log can distinguish streaming from buffered completions. It reads the
 // response Content-Type the handler set (serveStream sets text/event-stream).

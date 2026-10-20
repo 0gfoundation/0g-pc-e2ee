@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -51,12 +50,7 @@ func registerAsync(mux *http.ServeMux, ep endpoint.Endpoint, c *core.Client, o o
 	mux.HandleFunc("POST "+ep.Path, func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxRequestBytes))
 		if err != nil {
-			var tooLarge *http.MaxBytesError
-			if errors.As(err, &tooLarge) {
-				writeGatewayError(w, http.StatusRequestEntityTooLarge, "request body too large")
-				return
-			}
-			writeGatewayError(w, http.StatusBadRequest, "read request body")
+			readBodyError(w, err)
 			return
 		}
 		var req wire.Request
