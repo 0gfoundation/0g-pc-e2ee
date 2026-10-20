@@ -309,6 +309,7 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 	osImages := fs.String("os-image-allowlist", "", "gateway mode: read the expected OS-image boot-chain measurements from this file instead of the ones built into the binary (see client/evidence/osimages.json). For testing and for pinning an image before it is committed")
 	noDNSDiscovery := fs.Bool("no-dns-discovery", false, "gateway mode: do not derive the platform base domain from DNS; check only what was passed in")
 	expectComposeFile := fs.String("expect-compose-file", "", "gateway mode: path to the docker-compose manifest this deployment should be running (a digest-pinned docker-compose.release.yml), compared against the authenticated app-compose's docker_compose_file. Overrides the default -releases lookup")
+	expectNetwork := fs.String("expect-network", chain.NetworkMainnet, "gateway mode: the 0G network ("+strings.Join(chain.NetworkNames(), ", ")+") the gateway must report grounding providers against, read from its /v1/gateway/identity over the connection pinned to the quote-bound certificate. Empty skips the check")
 	releases := fs.Int("releases", defaultReleases, "gateway mode: accept the deployment if its compose text matches any of the newest N published releases, and report which one. 0 disables the lookup")
 	strict := fs.Bool("strict", false, "require every check to RUN, not merely to not fail: anything that would report an advisory \"-\" (exit 3) fails the run instead (exit 1). Gateway mode — a releases or app-compose lookup that cannot be completed; it demands the checks without demanding their inputs, so discovery still supplies them. Provider mode — hop 3, which cannot pass when the audited allowlist has no entry to compare against; the app-compose read, which cannot happen when the provider publishes none; the per-service baseline comparison, which cannot run when client/evidence/compose/brokercompose.json records no deployment for the provider (true of most of the fleet as shipped, so -strict fails every provider nobody has recorded); and -no-quote, which skips hops 2-4 by request and so cannot be combined with this flag")
 	releaseRepo := fs.String("repo", defaultReleaseRepo, "gateway mode: owner/name to read releases from, with -releases")
@@ -372,7 +373,8 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 			}
 			return 2
 		}
-		return reportGateway(ctx, out, ec, *gateway, *allowUntrustedCert, *strict, expect)
+		return reportGateway(ctx, out, ec, *gateway, *allowUntrustedCert, *strict, expect,
+			chainCheck{want: strings.TrimSpace(*expectNetwork), read: httpChainReader{timeout: *timeout, allowUntrustedCert: *allowUntrustedCert}})
 	}
 
 	reg, err := chain.NewOnChainRegistry(chain.Config{RPCURL: *chainRPCURL, ContractAddress: *servingContract})

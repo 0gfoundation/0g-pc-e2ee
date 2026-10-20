@@ -75,11 +75,13 @@ zone alone — it needs no access to the served domain's own zone.
 | Variable | Example | Notes |
 |---|---|---|
 | `DOMAIN` | `pc-gateway.example.com` | the hostname we serve |
-| `DELEGATION_ZONE` | `delegation.example.net` | zone the container writes into |
-| `CLOUDFLARE_API_TOKEN` | — | DNS edit permission, **`DELEGATION_ZONE` only** |
+| `DELEGATION_ZONE` | `delegation.example.net` | zone the container writes into; **empty** = [no delegation](#without-delegation-single-instance) |
+| `CLOUDFLARE_API_TOKEN` | — | DNS edit permission, **`DELEGATION_ZONE` only** (the served domain's zone without delegation) |
 
-All three are declared `${VAR:?…}` in the compose file, so a missing one fails the
-deploy immediately instead of silently degrading. They must also be listed in the
+All three are required by the compose file, so a missing one fails the deploy
+immediately instead of silently degrading. `DOMAIN` and `CLOUDFLARE_API_TOKEN` are
+`${VAR:?…}`, which also refuses an empty value; `DELEGATION_ZONE` is `${VAR?…}`, which
+refuses only an unset one, because empty is how the direct mode below is chosen. They must also be listed in the
 app's `allowed_envs` — dstack drops any encrypted variable that is not, and the
 only symptom is an interpolation error at boot.
 
@@ -175,6 +177,39 @@ certificate.
 > `switch <side>`. [blue-green.md](./blue-green.md)'s release fast path already
 > puts `acme` first for the same reason; this note is for the first deployment,
 > which does not go through that path.
+
+### Without delegation (single instance)
+
+Set `DELEGATION_ZONE` to the **empty string** — set, not omitted; an omitted one
+still fails the deploy — and dstack-ingress writes the served domain's own zone
+directly, as its upstream default does: the serving CNAME to `GATEWAY_DOMAIN`, the
+`_dstack-app-address` TXT, the `_acme-challenge` TXT (through certbot's Cloudflare
+plugin), and the CAA record (`SET_CAA=true` in the compose; delegation publishes it
+regardless). Nobody creates any record by hand, and the CNAMEs above are not needed.
+
+```
+DOMAIN=router-api-testnet-tee.integratenetwork.work
+DELEGATION_ZONE=
+CLOUDFLARE_API_TOKEN=<DNS edit on integratenetwork.work>
+```
+
+What it costs:
+
+- **The token can edit the served domain's whole zone**, from inside the CVM — every
+  record in it, not just this hostname's. That is the privilege delegation exists to
+  avoid, so use the direct mode where the zone holds nothing a less-guarded
+  deployment should reach. In particular, a zone that also carries another
+  deployment's switch layer (blue/green's `<DOMAIN>.<DZ>` records live in
+  `integratenetwork.work`) hands that deployment's traffic switch to this CVM's token.
+- **Single instance only.** Blue/green ([blue-green.md](./blue-green.md)) and
+  `switch.sh` are built on delegation: two sides writing the served name directly
+  would overwrite each other's records.
+- The [published-record check](#serving-domain) above applies to `<DOMAIN>` itself
+  rather than `<DOMAIN>.<DELEGATION_ZONE>`.
+
+Switching an existing deployment between the modes is a DNS migration, not a
+setting: delegation's three CNAMEs sit on exactly the names the direct mode writes,
+so remove them before booting a direct-mode CVM, and create them before going back.
 
 ## Deploy
 
@@ -1053,7 +1088,7 @@ You pass three values, not a hand-built config:
 | `ZG_PROM_REMOTE_WRITE_URL` | no | `https://prometheus.example.com/api/v1/write` |
 | `ZG_PROM_REMOTE_WRITE_USERNAME` | no | `0g-pc-gateway` |
 | `ZG_PROM_REMOTE_WRITE_PASSWORD` | **yes** | — |
-| `ZG_PROM_ENV` | no | `staging` / `mainnet` |
+| `ZG_PROM_ENV` | no | `staging` / `testnet` / `mainnet` |
 
 Set all four in the CVM's **encrypted environment** — the Phala env file, the
 same channel as `CLOUDFLARE_API_TOKEN` — and list them in the app's
@@ -1121,6 +1156,20 @@ and warmer liveness).
   the container. Since the *measured* text is the `${…}` form, staging and
   production share `app_id`; that is safe only because the router is untrusted by
   construction (see the provider-verification note below).
+- **The 0G network** providers are grounded against (hop 5) is
+  `${ZG_GATEWAY_NETWORK:-mainnet}`: unset for mainnet, `testnet` in the encrypted
+  environment for a testnet gateway (listed in `allowed_envs`, like every override
+  here). Pair it with a router on the same network (`ZG_GATEWAY_ROUTER_URL`). The
+  value is a NAME, and that is deliberate: each network is an RPC endpoint and an
+  InferenceServing contract compiled into the gateway (`client/chain/network.go`).
+  Unlike the router, the chain is trusted — it decides which signer each provider is
+  held to — and the encrypted environment is confidential but not authenticated, so
+  whoever can replace it can at most choose the other real network, never an endpoint
+  of their own. The gateway reports the one it is on (`chain` in
+  `/v1/gateway/identity`) and `pcverify -gateway` fails a run where it is not
+  `-expect-network` (default `mainnet`). `ZG_GATEWAY_CHAIN_RPC_URL` and
+  `ZG_GATEWAY_SERVING_CONTRACT` still exist as flags for local runs, and a test keeps
+  them out of this compose.
 
   > ⚠️ **Never point this at `router-api.0g.ai`.** That is the *public entry* —
   > after the global-entry cutover it resolves to this gateway, so the gateway

@@ -506,6 +506,7 @@ func main() {
 			AppComposePath: *appComposeFile,
 			BaseDomain:     *platformBaseDomain,
 			Releases:       *identityReleases,
+			Chain:          built.ChainRoot(),
 			OSImages:       osImages,
 			Timeout:        identityLookupTimeout,
 		}, logger)

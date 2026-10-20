@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
 	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/client/route"
 )
@@ -402,6 +403,64 @@ func TestBuildProviderEnforceRefusesUnsafeCombinations(t *testing.T) {
 				t.Fatalf("a safe combination did not start (exit %d):\n%s", code, out)
 			case tc.says != "" && (code != 1 || !strings.Contains(string(out), tc.says)):
 				t.Fatalf("exit %d, want 1 saying %q:\n%s", code, tc.says, out)
+			}
+		})
+	}
+}
+
+// The on-chain root is either a named network — both values from one pair — or the
+// mainnet defaults with either value overridden, never a mix of the two: a network
+// with one half replaced is a root nobody named.
+func TestChainRoot(t *testing.T) {
+	mainnet, _ := chain.LookupNetwork(chain.NetworkMainnet)
+	testnet, _ := chain.LookupNetwork(chain.NetworkTestnet)
+	for _, tc := range []struct {
+		name string
+		args []string
+		env  map[string]string
+		want chain.Network
+		err  string
+	}{
+		{name: "default is mainnet", want: mainnet},
+		{name: "named", args: []string{"-network", "testnet"}, want: testnet},
+		{name: "named by env", env: map[string]string{"ZG_TEST_NETWORK": "testnet"}, want: testnet},
+		{name: "flag wins over env", args: []string{"-network", "mainnet"},
+			env: map[string]string{"ZG_TEST_NETWORK": "testnet"}, want: mainnet},
+		{name: "unknown", args: []string{"-network", "galileo"}, err: `unknown network "galileo"`},
+		{name: "network and rpc", args: []string{"-network", "testnet", "-chain-rpc-url", "http://node:8545"},
+			err: "do not also set"},
+		{name: "network and contract by env", args: []string{"-network", "testnet"},
+			env: map[string]string{"ZG_TEST_SERVING_CONTRACT": testnet.ServingContract}, err: "do not also set"},
+		{name: "own node", args: []string{"-chain-rpc-url", "http://node:8545"},
+			want: chain.Network{RPCURL: "http://node:8545", ServingContract: mainnet.ServingContract}},
+		{name: "own contract", args: []string{"-serving-contract", testnet.ServingContract},
+			want: chain.Network{RPCURL: mainnet.RPCURL, ServingContract: testnet.ServingContract}},
+		{name: "empty env is unset", env: map[string]string{"ZG_TEST_CHAIN_RPC_URL": ""}, want: mainnet},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, k := range []string{"ZG_TEST_NETWORK", "ZG_TEST_CHAIN_RPC_URL", "ZG_TEST_SERVING_CONTRACT"} {
+				if v, ok := tc.env[k]; ok {
+					t.Setenv(k, v)
+				} else {
+					t.Setenv(k, "")
+					os.Unsetenv(k)
+				}
+			}
+			fs := flag.NewFlagSet("t", flag.ContinueOnError)
+			f := RegisterFlags(fs, "ZG_TEST", ":0", route.DefaultRouterURL)
+			if err := fs.Parse(tc.args); err != nil {
+				t.Fatal(err)
+			}
+			got, err := f.chainRoot()
+			switch {
+			case tc.err != "":
+				if err == nil || !strings.Contains(err.Error(), tc.err) {
+					t.Fatalf("err = %v, want one saying %q", err, tc.err)
+				}
+			case err != nil:
+				t.Fatal(err)
+			case got != tc.want:
+				t.Fatalf("root = %+v, want %+v", got, tc.want)
 			}
 		})
 	}
