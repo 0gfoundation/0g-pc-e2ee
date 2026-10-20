@@ -31,6 +31,7 @@ package metrics
 
 import (
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -75,6 +76,14 @@ var previewBuckets = []float64{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10,
 // stream idle watchdog (both 10m30s), so its top two buckets stay empty.
 var upstreamBuckets = []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600, 900, 1800, 3600}
 
+// httpBuckets sizes the per-route HTTP latency histogram: Prometheus's default
+// buckets, which resolve the fast routes (catalog, health, evidence) down to 5ms,
+// continued with upstreamBuckets' long tail. A streamed completion is handled
+// for as long as it streams — up to the router's 3540s whole-stream cap — and
+// with the default's 10s top bucket every one of them landed in +Inf, leaving
+// the inference routes' quantiles unreadable.
+var httpBuckets = append(slices.Clone(prometheus.DefBuckets), 30, 60, 120, 300, 600, 900, 1800, 3600)
+
 var (
 	// HTTP layer (openaiproxy.LogRequests) — the RED signals for every request.
 	httpRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -83,7 +92,7 @@ var (
 	}, []string{"route", "method", "status"})
 	httpDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "http_request_duration_seconds",
-		Help: "HTTP request handling latency, by route template.", Buckets: prometheus.DefBuckets,
+		Help: "HTTP request handling latency, by route template.", Buckets: httpBuckets,
 	}, []string{"route"})
 	httpInFlight = prometheus.NewGauge(prometheus.GaugeOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "http_requests_in_flight",
