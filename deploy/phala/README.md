@@ -245,8 +245,16 @@ phala cvm create --compose deploy/phala/docker-compose.yml
 
 | Setting | Value | Depends on the shape? |
 |---|---|---|
-| `GOMEMLIMIT` | `24GiB` | **Yes — hardcoded.** 32 GiB less ~2 for guest OS/kernel, ~1 for `dstack-ingress` + the metrics agent, ~5 of slack so the *host* never reaches an OOM kill (which takes the whole CVM, not just one container). |
-| in-flight cap | derived, **~409** | Indirectly: it is `GOMEMLIMIT / 2 / ~30 MiB`, so it follows the line above. Printed as `max_inflight` on the gateway's startup line and published as `zg_gateway_inflight_limit`. |
+| `GOMEMLIMIT` | `${GOMEMLIMIT:-24GiB}` | **Yes — set it per shape.** The default is for 32 GiB: less ~2 for guest OS/kernel, ~1 for `dstack-ingress` + the metrics agent, ~5 of slack so the *host* never reaches an OOM kill (which takes the whole CVM, not just one container). |
+| in-flight cap | `${ZG_GATEWAY_MAX_INFLIGHT:-}`; empty = derived, **~409** at the default | Indirectly: derived as `GOMEMLIMIT / 2 / ~30 MiB`, never above 512. Printed as `max_inflight` on the gateway's startup line and published as `zg_gateway_inflight_limit`. |
+| `GOMAXPROCS` | unset | No. A CVM is a VM, so the guest sees its own vCPUs and Go reads them correctly. Only a *container CPU quota* would need it pinned. |
+
+Both are read from the CVM's encrypted environment (list them in `allowed_envs` to
+set them), so once a release carrying this compose is deployed, a resize needs no
+compose edit and no further release. That is acceptable for
+these two and not for, say, the chain RPC: they decide only availability — the most
+a wrong or hostile value does is shed traffic or exhaust memory, which a host can
+do anyway by not running the CVM.
 
 The two bound different things and neither replaces the other. The in-flight cap
 refuses admission, so it bounds **live** memory: past the ceiling a request is
@@ -255,24 +263,47 @@ makes the collector work harder as the heap approaches the limit, but it cannot
 refuse an allocation, so on its own it answers a memory spike with CPU rather
 than with backpressure.
 
-`ZG_GATEWAY_MAX_INFLIGHT` is deliberately left unset so the cap has a single
-source. Set it only to replace that arithmetic with a **measured** value — an L3
-run is what produces one ([`../../loadtest/`](../../loadtest/)), and measurement
-should beat estimation. Until then the signal to watch is
+**The derived cap stops at 512**, however large `GOMEMLIMIT` is, and it prices a
+request at 3 × 10 MiB — about a quarter of what one was measured at
+(`client/cmd/gateway/inflight.go`: roughly 7-8x its body for a sealed chat request,
+10-13x for speech). On a larger CVM, set `ZG_GATEWAY_MAX_INFLIGHT` explicitly and
+price it at the measured cost. For a 64 vCPU / 128 GiB CVM, for example:
+
+```
+GOMEMLIMIT=110GiB              # 128 less OS, ingress, agent and slack
+ZG_GATEWAY_MAX_INFLIGHT=800    # 800 sealed chat requests at the 10 MiB cap ≈ 62 GiB at ~8x
+```
+
+That is the worst case — every request a full-size body. Ordinary chat bodies are
+kilobytes, and a cleartext request (a model the gateway does not seal, up to
+20 MiB) costs one or two copies of its body rather than ~8x. An L3 run
+([`../../loadtest/`](../../loadtest/)) is what replaces this arithmetic with a
+measurement. Either way the signal to watch is
 `zg_gateway_requests_shed_total`: any sustained non-zero rate means real traffic
 is being turned away. The dashboard's Overview row has it on its own, beside
 `zg_gateway_body_read_timeouts_total` (below).
 
+**Body sizes.** A sealed request's body is capped at **10 MiB**
+(`MaxRequestBytes`). A cleartext one — a model outside `ZG_GATEWAY_SEAL_MODELS`,
+e.g. a chat turn carrying a video to a model without E2EE — at **20 MiB**: the
+model dispatcher buffers it to read the model, so it is admitted under the cap,
+and it costs one or two copies of the body. The router applies its own per-route caps
+after that (`chatBodyCap` on `/v1/chat/completions` and `/v1/messages`), so a body
+the router refuses is refused with its 413 whatever the gateway admits.
+
 A slot is held from admission until the response ends, and the request body is
-read inside it. So a body is given **`-body-read-timeout` (default 30 s)** to
+read inside it. So a body is given **`-body-read-timeout` (default 60 s)** to
 arrive once admitted; past it the request is answered 408 and the slot freed.
 Without that bound a client could send its headers and trickle the body,
 holding a slot indefinitely — the credential check in front only looks at a
 credential's shape, so it would cost no account, and dstack-ingress is a TCP proxy
-with a 24 h idle timeout. The bound covers the sealed inference routes only and
-lifts when the body has been read, so it never cuts a streamed response. 30 s
-covers a 10 MiB body at about 2.8 Mbit/s; `ZG_GATEWAY_BODY_READ_TIMEOUT` is not
-referenced by the compose, so changing it is a compose edit.
+with a 24 h idle timeout. The bound covers the inference routes (sealed and
+cleartext alike) and lifts when the body has been read, so it never cuts a
+streamed response. 60 s covers a 20 MiB body at about 2.8 Mbit/s;
+`ZG_GATEWAY_BODY_READ_TIMEOUT` is not referenced by the compose, so changing it is
+a compose edit. (All of this assumes sealing is on, as deployed. With
+`ZG_GATEWAY_SEAL_POLICY=off` the inference routes are a plain passthrough: outside
+the in-flight cap, unbuffered, and bounded only by the backstop below.)
 
 Every other route — the catch-all to the router, which streams bodies through
 unbuffered and holds no slot — is bounded by the listener's **90 s `ReadTimeout`**
@@ -280,10 +311,10 @@ instead: loose enough for router uploads (`POST /v1/files`, up to 5 × 50 MB) an
 above the router's own 60 s, so it is a backstop that does not depend on the
 router's setting rather than a limit an upload meets first. A slow body there
 costs a connection (dstack-ingress allows 4096 in all), not a slot.
-| `GOMAXPROCS` | unset | No. A CVM is a VM, so the guest sees its own vCPUs and Go reads them correctly. Only a *container CPU quota* would need it pinned. |
 
-**On resize, `GOMEMLIMIT` must be re-derived by hand.** It is the one number here
-that does not scale itself, and getting it wrong is quiet in both directions:
+**On resize, `GOMEMLIMIT` must be re-derived by hand** — set it in the encrypted
+environment. It is the one number here that does not scale itself, and getting it
+wrong is quiet in both directions:
 
 - **Set above physical RAM** (e.g. `24GiB` left in place on a 16 GiB CVM) and it
   stops existing — the runtime never reaches a limit it cannot allocate up to, so

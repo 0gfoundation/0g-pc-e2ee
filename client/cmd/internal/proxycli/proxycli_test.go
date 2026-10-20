@@ -465,3 +465,21 @@ func TestChainRoot(t *testing.T) {
 		})
 	}
 }
+
+// envInt reads an empty value as unset, unlike envOr: no integer is spelled "",
+// and KEY=${KEY:-} in the compose delivers exactly that when the deployment sets
+// nothing (ZG_GATEWAY_MAX_INFLIGHT), which must keep the derived default rather
+// than kill the process. The set-but-unparseable case stays log.Fatal.
+func TestEnvIntEmptyIsUnset(t *testing.T) {
+	const key = "ZG_PROXYCLI_TEST_ENVINT"
+	for _, v := range []string{"", "  "} {
+		t.Setenv(key, v)
+		if got := envInt(key, 409); got != 409 {
+			t.Errorf("%q: got %d, want the default 409", v, got)
+		}
+	}
+	t.Setenv(key, "800")
+	if got := envInt(key, 409); got != 800 {
+		t.Errorf("set: got %d, want 800", got)
+	}
+}
