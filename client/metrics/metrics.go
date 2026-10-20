@@ -67,14 +67,13 @@ var previewBuckets = []float64{0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10,
 
 // upstreamBuckets sizes the data-plane attempt histogram, which needs a far wider
 // range than verifyBuckets: a buffered completion can legitimately run up to
-// core's bufferedTimeout (10m30s), so the top bucket sits past it — without one,
-// every long-but-healthy attempt would pile into +Inf and the p99 would be
-// unreadable exactly when it matters. A stream can stay open far longer (up to
-// the router's whole-stream cap, ~59 min), so stream attempts past 900s land in
-// +Inf; read those from the count, not the quantile. The stream first-frame
-// histogram shares these buckets: that wait is bounded by the response-header
-// wait and the stream idle watchdog (both 10m30s), not by anything smaller.
-var upstreamBuckets = []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600, 900}
+// core's bufferedTimeout (10m30s) and a stream can stay open up to the router's
+// whole-stream cap (3540s, under Cloud Run's 3600s), so the buckets run to 3600 —
+// without that, every long-but-healthy stream would pile into +Inf and the p99
+// would be unreadable exactly when it matters. The stream first-frame histogram
+// shares these buckets: that wait is bounded by the response-header wait and the
+// stream idle watchdog (both 10m30s), so its top two buckets stay empty.
+var upstreamBuckets = []float64{0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300, 600, 900, 1800, 3600}
 
 var (
 	// HTTP layer (openaiproxy.LogRequests) — the RED signals for every request.
