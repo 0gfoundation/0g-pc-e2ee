@@ -570,8 +570,11 @@ func main() {
 				catalogCacheTTL: disabledIfZero(*catalogCacheTTL),
 				bodyReadTimeout: disabledIfZero(*bodyReadTimeout),
 			})),
-		ReadHeaderTimeout: 10 * time.Second,     // mitigate slow-header (Slowloris) clients
-		IdleTimeout:       proxycli.IdleTimeout, // bound idle keep-alives; unset means unbounded
+		ReadHeaderTimeout: 10 * time.Second, // mitigate slow-header (Slowloris) clients
+		// Backstop for every route: see serverReadTimeout. The sealed inference
+		// routes are bounded tighter, from admission, by -body-read-timeout.
+		ReadTimeout: serverReadTimeout,
+		IdleTimeout: proxycli.IdleTimeout, // bound idle keep-alives; unset means unbounded
 	}
 	// TLS is terminated ahead of this listener, inside the same enclave
 	// (dstack-ingress, over the CVM-internal network — see deploy/phala/), so the
@@ -848,6 +851,16 @@ type entryPolicy struct {
 	bodyReadTimeout time.Duration
 }
 
+// serverReadTimeout bounds reading any request, headers and body, on the public
+// listener. It is the backstop for the routes -body-read-timeout does not cover —
+// the catch-all, which streams bodies to the router unbuffered and holds no
+// in-flight slot, so a slow body there costs a connection (dstack-ingress allows
+// 4096 in all) rather than a slot. The router already ends such a body at its own
+// ReadTimeout (60 s by default); this keeps the bound from depending on it, and
+// sits above it so an upload the router accepts is never cut here first.
+// net/http lifts it at the body's EOF, so it does not reach a streamed response.
+const serverReadTimeout = 90 * time.Second
+
 // defaultBodyReadTimeout is long enough for MaxRequestBytes (10 MiB) on a slow
 // uplink — about 2.8 Mbit/s — and far shorter than the time a trickled body
 // could otherwise hold a slot, which was unbounded.
@@ -1110,10 +1123,10 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	// this process buffer a 9 MiB body and only then receive its 401 — which
 	// contradicts LimitInFlight's own contract ("rejected on shape alone … must
 	// not consume a slot") and invalidates computeMaxInFlight, whose ceiling is
-	// derived from how many requests can be buffering at once. These servers set
-	// no ReadTimeout (only ReadHeaderTimeout) and no global MaxBytesHandler, so a
-	// body fed in slowly could hold that buffer indefinitely while holding no slot
-	// and carrying no credential.
+	// derived from how many requests can be buffering at once. There is no global
+	// MaxBytesHandler, and the only read bound outside the cap is the listener's
+	// 90 s serverReadTimeout backstop, so a body fed in slowly could hold that
+	// buffer for that long while holding no slot and carrying no credential.
 	//
 	// Both branches sit inside the cap, cleartext included: that branch buffers
 	// exactly as much as the sealed one, so leaving it outside would put the same

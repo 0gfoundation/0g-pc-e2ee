@@ -270,11 +270,16 @@ Without that bound a client could send its headers and trickle the body,
 holding a slot indefinitely — the credential check in front only looks at a
 credential's shape, so it would cost no account, and dstack-ingress is a TCP proxy
 with a 24 h idle timeout. The bound covers the sealed inference routes only and
-lifts when the body has been read, so it never cuts a streamed response, and it
-does not touch the catch-all (router uploads such as `POST /v1/files` are larger
-than 10 MiB and keep no deadline here). 30 s covers a 10 MiB body at about
-2.8 Mbit/s; `ZG_GATEWAY_BODY_READ_TIMEOUT` is not referenced by the compose, so
-changing it is a compose edit.
+lifts when the body has been read, so it never cuts a streamed response. 30 s
+covers a 10 MiB body at about 2.8 Mbit/s; `ZG_GATEWAY_BODY_READ_TIMEOUT` is not
+referenced by the compose, so changing it is a compose edit.
+
+Every other route — the catch-all to the router, which streams bodies through
+unbuffered and holds no slot — is bounded by the listener's **90 s `ReadTimeout`**
+instead: loose enough for router uploads (`POST /v1/files`, up to 5 × 50 MB) and
+above the router's own 60 s, so it is a backstop that does not depend on the
+router's setting rather than a limit an upload meets first. A slow body there
+costs a connection (dstack-ingress allows 4096 in all), not a slot.
 | `GOMAXPROCS` | unset | No. A CVM is a VM, so the guest sees its own vCPUs and Go reads them correctly. Only a *container CPU quota* would need it pinned. |
 
 **On resize, `GOMEMLIMIT` must be re-derived by hand.** It is the one number here

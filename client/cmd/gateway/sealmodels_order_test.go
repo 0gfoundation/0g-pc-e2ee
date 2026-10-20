@@ -45,10 +45,10 @@ func (c *countingBody) Close() error { return nil }
 // LimitInFlight's own contract says a request "rejected on shape alone" must not
 // consume a slot, and the same reasoning covers memory: computeMaxInFlight
 // derives the process ceiling from how many requests can be buffering at once,
-// which is only true while nothing buffers ahead of the gate. There is no
-// ReadTimeout on these servers (only ReadHeaderTimeout) and no global
-// MaxBytesHandler, so a slow body fed in a byte at a time could otherwise hold
-// buffer indefinitely while holding no slot and carrying no credential.
+// which is only true while nothing buffers ahead of the gate. There is no global
+// MaxBytesHandler, and outside the cap only the listener's 90 s ReadTimeout
+// backstop bounds a read, so a slow body fed in a byte at a time could otherwise
+// hold buffer that long while holding no slot and carrying no credential.
 //
 // This could only ever bite a deployment with a model list configured, since the
 // dispatcher is not mounted otherwise — which is exactly why it needs a test

@@ -185,8 +185,9 @@ func (s sealModels) label(model string) string {
 // those guards means an unauthenticated or shed request gets buffered first and
 // refused second. That breaks LimitInFlight's stated contract (a request
 // "rejected on shape alone … must not consume a slot") and the memory ceiling
-// computeMaxInFlight derives from it, and with no ReadTimeout on these servers
-// a slow body could hold that buffer indefinitely while holding no slot.
+// computeMaxInFlight derives from it, and with only the listener's 90 s
+// ReadTimeout backstop out there a slow body could hold that buffer that long
+// while holding no slot.
 //
 // The marker rides along correctly because MarkE2EE uses Set, not Add: the
 // outer layer stamps "sealed" for the whole chain and the cleartext branch,

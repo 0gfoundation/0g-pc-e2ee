@@ -104,6 +104,40 @@ func TestBoundBodyReadLiftsAtEOF(t *testing.T) {
 	}
 }
 
+// The same holds for the server-wide ReadTimeout the gateway's listener sets as a
+// backstop: net/http clears it at the body's EOF too, so it does not end a stream
+// that outlives it.
+func TestServerReadTimeoutLiftsAtEOF(t *testing.T) {
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, err := io.ReadAll(r.Body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		for i := 0; i < 6; i++ {
+			fmt.Fprintf(w, "data: %d\n\n", i)
+			w.(http.Flusher).Flush()
+			time.Sleep(100 * time.Millisecond)
+		}
+	}))
+	srv.Config.ReadTimeout = 150 * time.Millisecond
+	srv.Start()
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL, "application/json", strings.NewReader(`{"model":"m"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("stream cut by ReadTimeout after the body was read: %v", err)
+	}
+	if got := strings.Count(string(body), "data: "); got != 6 {
+		t.Errorf("got %d frames, want 6", got)
+	}
+}
+
 // A body that arrives within the deadline is served normally, and so is a request
 // with no body at all.
 func TestBoundBodyReadPassesPromptRequests(t *testing.T) {
