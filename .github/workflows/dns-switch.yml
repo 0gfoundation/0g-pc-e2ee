@@ -8,14 +8,10 @@ name: DNS switch
 # THE TOKEN IS THE DEPLOYMENT. It edits the delegation zone, which holds the traffic
 # switch, the issuance switch and the CAA record: whoever holds it can point the
 # served hostname at a CVM of their own and get it a valid certificate. So it lives
-# ONLY in Environment secrets, never repository secrets, and each environment admits
-# only the main branch:
-#
-#   dns-<target>-read    Zone DNS Read. `status`, and any command with dry_run.
-#                        No reviewers: reading needs no one's approval, and a read
-#                        token cannot change anything if it leaks.
-#   dns-<target>-write   Zone DNS Edit. Every command that changes a record.
-#                        Required reviewers.
+# ONLY in Environment secrets, never repository secrets — one environment per
+# deployment, dns-staging and dns-mainnet, each admitting only the main branch and
+# carrying the token as CF_API_TOKEN. With required reviewers on them, every run
+# waits for an approval before it is handed the token.
 #
 # And before any of that: only a repository ADMIN may run this at all. Anyone with
 # write access can dispatch a workflow, so the plan job asks the API for the
@@ -54,7 +50,7 @@ on:
         default: "-"
         options: ["-", a, b, c]
       dry_run:
-        description: "Show the changes without applying them (runs with the read-only token)"
+        description: "Show the changes without applying them"
         required: false
         type: boolean
         default: true
@@ -122,13 +118,7 @@ jobs:
             [[ "$PROBE_URL" =~ ^https://[A-Za-z0-9._-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]] \
               || fail "probe_url must be a plain https URL"
           fi
-          # status writes nothing, and neither does a dry run: both get the read token.
-          if [ "$COMMAND" = status ] || [ "$DRY_RUN" = true ]; then
-            access="read"
-          else
-            access="write"
-          fi
-          echo "environment=dns-${TARGET}-${access}" >> "$GITHUB_OUTPUT"
+          echo "environment=dns-${TARGET}" >> "$GITHUB_OUTPUT"
           {
             echo "### DNS switch: \`$COMMAND\` on $TARGET"
             echo
@@ -136,7 +126,7 @@ jobs:
             echo "|---|---|"
             echo "| side | \`$SIDE\` |"
             echo "| dry run | $DRY_RUN |"
-            echo "| environment | \`dns-${TARGET}-${access}\` |"
+            echo "| environment | \`dns-${TARGET}\` |"
             echo "| triggered by | @$ACTOR |"
           } >> "$GITHUB_STEP_SUMMARY"
 

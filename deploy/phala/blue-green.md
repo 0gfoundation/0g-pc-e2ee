@@ -487,28 +487,22 @@ point the served hostname at their own CVM and get it a certificate. It therefor
 lives only in **Environment** secrets, behind protection rules. One-time setup, by a
 repository admin:
 
-1. **Two Cloudflare tokens per deployment**, both scoped to the delegation zone
-   (`integratenetwork.work`) only: one with *Zone · DNS · Read*, one with
-   *Zone · DNS · Edit*. Note what scoping cannot do: Cloudflare scopes a token to a
-   zone, not to record names, and staging and mainnet share this zone — a staging
-   *edit* token can move mainnet's records too. Protect `dns-staging-write` as
-   carefully as `dns-mainnet-write`, or give staging a zone of its own.
-2. **Four environments** (Settings → Environments), each with *Deployment branches
-   and tags* set to `main` only:
-
-   | Environment | Secret `CF_API_TOKEN` | Protection |
-   |---|---|---|
-   | `dns-staging-read` | staging Read token | none beyond `main` |
-   | `dns-staging-write` | staging Edit token | Required reviewers |
-   | `dns-mainnet-read` | mainnet Read token | none beyond `main` |
-   | `dns-mainnet-write` | mainnet Edit token | Required reviewers |
-
-   `status` and every dry run use `-read`; anything that changes a record uses
-   `-write`, and waits for a reviewer before it gets the token. On a write
-   environment, also clear *Allow administrators to bypass*, and turn on *Prevent
-   self-review* if there is more than one operator. Required reviewers are available
-   on every plan for a public repository.
-3. **Environment variables** on each of the four: `DOMAIN` (required — the workflow
+1. **A Cloudflare token** with *Zone · DNS · Edit*, scoped to the delegation zone
+   (`integratenetwork.work`) only. Cloudflare scopes a token to a zone, not to
+   record names, and staging and mainnet share this zone — so one token serves
+   both, and a separate staging token would not have contained anything anyway: it
+   could move mainnet's records too. Protect `dns-staging` as carefully as
+   `dns-mainnet`, or give staging a zone of its own.
+2. **Two environments** (Settings → Environments), `dns-staging` and `dns-mainnet`,
+   each with:
+   - secret `CF_API_TOKEN` — the token above;
+   - *Deployment branches and tags*: `main` only;
+   - *Required reviewers*, and *Allow administrators to bypass* cleared. Every run —
+     `status` and dry runs included — then waits for an approval before it is
+     handed the token. With a single operator, leave *Prevent self-review* off, or
+     nobody can approve. Required reviewers are available on every plan for a public
+     repository.
+3. **Environment variables** on each: `DOMAIN` (required — the workflow
    refuses to fall back to switch.sh's mainnet default), `PLATFORM_BASE`, and if
    used `PLATFORM_BASE_COLD`, `CF_ZONE`, `DELEGATION_ZONE` — the same values as
    `switch.env`.
@@ -517,7 +511,7 @@ repository admin:
    (organization owners do), and refuses if it cannot look that up. Anyone with write
    access can dispatch a workflow, so this is checked in the workflow itself, which
    makes it binding only while `main` cannot be changed past review: keep branch
-   protection on `main`. The required reviewers on the write environments are the
+   protection on `main`. The environments' required reviewers are the
    gate that holds regardless.
 
 Logs are public in a public repository. The script prints record names, targets
