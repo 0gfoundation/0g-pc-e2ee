@@ -17,11 +17,13 @@ name: DNS switch
 #   dns-<target>-write   Zone DNS Edit. Every command that changes a record.
 #                        Required reviewers.
 #
-# And independently of any plan or environment setting: a run that would change a
-# record is refused unless the person who triggered it is listed in the repository
-# variable DNS_OPERATORS (comma-separated GitHub logins). Unset means nobody. With a
-# single operator, "Prevent self-review" cannot be on, and this is what still keeps
-# every other account with write access from moving traffic.
+# And before any of that: only a repository ADMIN may run this at all. Anyone with
+# write access can dispatch a workflow, so the plan job asks the API for the
+# triggering account's permission on this repository and refuses anything but
+# admin (organization owners are admins). That check lives in this file, so it
+# holds only while this file on main cannot be edited past review — branch
+# protection on main is what makes it binding, and the environments' required
+# reviewers remain the gate that does not depend on this file at all.
 #
 # A job is handed an environment's secrets only after its protection rules pass,
 # and only if it names that environment — so a branch with an edited copy of this
@@ -81,6 +83,8 @@ jobs:
   # no environment entered and no token handed out.
   plan:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read # and the implicit metadata read the permission lookup needs
     outputs:
       environment: ${{ steps.plan.outputs.environment }}
     steps:
@@ -93,10 +97,16 @@ jobs:
           PROBE_URL: ${{ inputs.probe_url }}
           NO_VERIFY: ${{ inputs.no_verify }}
           ACTOR: ${{ github.actor }}
-          DNS_OPERATORS: ${{ vars.DNS_OPERATORS }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           fail() { echo "::error::$*"; exit 1; }
+          # Admins only, for every command. A lookup that fails refuses too.
+          permission="$(gh api "repos/${REPO}/collaborators/${ACTOR}/permission" --jq .permission)" \
+            || fail "could not read ${ACTOR}'s permission on ${REPO}; refusing"
+          [ "$permission" = admin ] \
+            || fail "${ACTOR} has '${permission}' on ${REPO}; only an admin may run the DNS switch"
           case "$COMMAND" in
             acme|switch|failover) [ "$SIDE" != "-" ] || fail "$COMMAND needs a side" ;;
             status|rollback)      [ "$SIDE" = "-" ] || fail "$COMMAND takes no side" ;;
@@ -117,17 +127,6 @@ jobs:
             access="read"
           else
             access="write"
-          fi
-          if [ "$access" = write ]; then
-            operator=false
-            IFS=',' read -ra operators <<< "$DNS_OPERATORS"
-            for o in "${operators[@]}"; do
-              o="${o// /}"
-              # GitHub logins are case-insensitive.
-              [ -n "$o" ] && [ "${o,,}" = "${ACTOR,,}" ] && operator=true
-            done
-            [ "$operator" = true ] \
-              || fail "$ACTOR is not in DNS_OPERATORS; only a listed operator may change records (a dry run needs no listing)"
           fi
           echo "environment=dns-${TARGET}-${access}" >> "$GITHUB_OUTPUT"
           {
