@@ -114,10 +114,10 @@ time: a cold side must finish its first warmer sweep, which is why the probe win
 is minutes (see
 [Health-checking the standby](#health-checking-the-standby-side)).
 
-> **About the certificate (step 1).** Side b serves the same `router-api-tee.0g.ai`
+> **About the certificate (step 1).** Side b serves the same `router-api.0g.ai`
 > and needs its own cert for it. **Side b's own dstack-ingress issues that cert on
 > first boot** (the key is generated in-enclave); `acme b` does not issue anything
-> — it just points `_acme-challenge.router-api-tee.0g.ai` at b's sub-zone so b's
+> — it just points `_acme-challenge.router-api.0g.ai` at b's sub-zone so b's
 > ACME dns-01 challenge can validate. Aim it there **before** deploying b, so b
 > issues cleanly on first boot instead of failing in a retry loop against a
 > challenge record still pointed at a (which burns the 5-failed-validations-per-hour
@@ -156,32 +156,32 @@ collide with the other side's:
 
 ```
 ① served zone 0g.ai — static, set once, NEVER touched again:
-     router-api-tee.0g.ai                      CNAME → router-api-tee.0g.ai.integratenetwork.work
-     _dstack-app-address.router-api-tee.0g.ai  CNAME → _dstack-app-address.router-api-tee.0g.ai.integratenetwork.work
-     _acme-challenge.router-api-tee.0g.ai      CNAME → _acme-challenge.router-api-tee.0g.ai.integratenetwork.work
+     router-api.0g.ai                      CNAME → router-api.0g.ai.integratenetwork.work
+     _dstack-app-address.router-api.0g.ai  CNAME → _dstack-app-address.router-api.0g.ai.integratenetwork.work
+     _acme-challenge.router-api.0g.ai      CNAME → _acme-challenge.router-api.0g.ai.integratenetwork.work
 
 ② delegation zone integratenetwork.work — the SWITCH LAYER (switch.sh owns these):
-     router-api-tee.0g.ai.integratenetwork.work                     CNAME → _.<live side's cluster> ← serving alias
-     _dstack-app-address.router-api-tee.0g.ai.integratenetwork.work CNAME → …a… | …b… (| …c…)    ← ★ traffic switch
-     _acme-challenge.router-api-tee.0g.ai.integratenetwork.work     CNAME → …a… | …b… (| …c…)    ← issuance switch
+     router-api.0g.ai.integratenetwork.work                     CNAME → _.<live side's cluster> ← serving alias
+     _dstack-app-address.router-api.0g.ai.integratenetwork.work CNAME → …a… | …b… (| …c…)    ← ★ traffic switch
+     _acme-challenge.router-api.0g.ai.integratenetwork.work     CNAME → …a… | …b… (| …c…)    ← issuance switch
 
 ③ delegation zone — PER-SIDE, each CVM's dstack-ingress writes ITS OWN:
      side a (DELEGATION_ZONE=a.integratenetwork.work):
-       _dstack-app-address.router-api-tee.0g.ai.a.integratenetwork.work  TXT = <app_id_a>:443
-       _acme-challenge.router-api-tee.0g.ai.a.integratenetwork.work      TXT = <acme token, during issuance>
-       router-api-tee.0g.ai.a.integratenetwork.work                      CNAME → <that side's GATEWAY_DOMAIN>   ← written, never read
+       _dstack-app-address.router-api.0g.ai.a.integratenetwork.work  TXT = <app_id_a>:443
+       _acme-challenge.router-api.0g.ai.a.integratenetwork.work      TXT = <acme token, during issuance>
+       router-api.0g.ai.a.integratenetwork.work                      CNAME → <that side's GATEWAY_DOMAIN>   ← written, never read
      side b (DELEGATION_ZONE=b.integratenetwork.work):
-       _dstack-app-address.router-api-tee.0g.ai.b.integratenetwork.work  TXT = <app_id_b>:443
-       _acme-challenge.router-api-tee.0g.ai.b.integratenetwork.work      TXT = <acme token, during issuance>
-       router-api-tee.0g.ai.b.integratenetwork.work                      CNAME → <that side's GATEWAY_DOMAIN>   ← written, never read
+       _dstack-app-address.router-api.0g.ai.b.integratenetwork.work  TXT = <app_id_b>:443
+       _acme-challenge.router-api.0g.ai.b.integratenetwork.work      TXT = <acme token, during issuance>
+       router-api.0g.ai.b.integratenetwork.work                      CNAME → <that side's GATEWAY_DOMAIN>   ← written, never read
      side c, the optional cold standby (DELEGATION_ZONE=c.integratenetwork.work): the same three records
        — see Cross-cluster fallback
 ```
 
-A client connecting to `router-api-tee.0g.ai` resolves ① → ② → ③, so the dstack
+A client connecting to `router-api.0g.ai` resolves ① → ② → ③, so the dstack
 gateway reads whichever `app_id` the **traffic switch** (②) currently points at,
 and routes L4 to that CVM, where its dstack-ingress terminates TLS with its own
-Let's Encrypt cert for `router-api-tee.0g.ai`.
+Let's Encrypt cert for `router-api.0g.ai`.
 
 The whole cutover is that **one CNAME** in ② — `switch.sh switch a|b` repoints it
 at the chosen side's per-side record; everything else is fixed. Solid = the live
@@ -189,11 +189,11 @@ path, dashed = the alternate the flip selects:
 
 ```mermaid
 flowchart TD
-    C(["client<br/>https://router-api-tee.0g.ai"]) --> GW
+    C(["client<br/>https://router-api.0g.ai"]) --> GW
     GW{{"dstack gateway (L4 passthrough)<br/>routes by app_id read from _dstack-app-address"}}
 
     subgraph Z0 ["0g.ai served zone (set once, never touched)"]
-        R0["_dstack-app-address.router-api-tee.0g.ai<br/>CNAME to base (fixed)"]
+        R0["_dstack-app-address.router-api.0g.ai<br/>CNAME to base (fixed)"]
     end
 
     subgraph ZD ["integratenetwork.work delegation zone (your token, switch.sh)"]
@@ -286,7 +286,7 @@ hand-set and unaffected. The record to look at is the side's own, in ③ —
 #   kms_info.gateway_app_url = https://gateway.<cluster>.phala.network
 
 # what that side's ingress actually published:
-dig +short CNAME router-api-tee.0g.ai.a.integratenetwork.work
+dig +short CNAME router-api.0g.ai.a.integratenetwork.work
 ```
 
 — and it must read exactly `_.<cluster>.phala.network`. Two ways it can be wrong
@@ -331,7 +331,7 @@ apart. (A cold standby in another cluster adds `PLATFORM_BASE_COLD` — see
 from memory.
 
 1. **Serving alias (once).** The one record you create by hand in the delegation
-   zone: `router-api-tee.0g.ai.integratenetwork.work` CNAME → the cluster's dstack
+   zone: `router-api.0g.ai.integratenetwork.work` CNAME → the cluster's dstack
    gateway, `_.<cluster>.phala.network`. This is the hop that carries traffic (②
    above), and it is the operator's to set — the CVMs no longer take a cluster
    value from you at all. With both sides in one cluster it never changes, and one
@@ -361,7 +361,7 @@ from memory.
    | gateway image digest | current build | **new build** (in a release; identical is also valid) |
    | `DELEGATION_ZONE` | `a.integratenetwork.work` | `b.integratenetwork.work` |
    | `DNS_SETUP_MODE` | `print` | `print` |
-   | `DOMAIN` | `router-api-tee.0g.ai` | `router-api-tee.0g.ai` |
+   | `DOMAIN` | `router-api.0g.ai` | `router-api.0g.ai` |
 
    Enter the **same set of keys** on both sides, `DNS_SETUP_MODE` and
    `ACME_STAGING` always among them (`ACME_STAGING` even when it is `false`) —
@@ -373,7 +373,7 @@ from memory.
    a secret does nothing. Everything else (`CLOUDFLARE_API_TOKEN`, gateway env)
    stays as in the shared compose. Each side,
    on boot, publishes its own `_dstack-app-address.…a/b…` and tries to issue a cert
-   for `router-api-tee.0g.ai` — for which it needs the issuance switch (next section).
+   for `router-api.0g.ai` — for which it needs the issuance switch (next section).
 
 3. **Confirm the switch layer.** `./switch.sh status` prints where the traffic
    and issuance switches point and each side's published `app_id`.
@@ -381,8 +381,8 @@ from memory.
 ## Certificates: the issuance switch and rate limits
 
 For an **instant** flip, both sides must already hold a valid cert for
-`router-api-tee.0g.ai` at the moment you cut over. ACME dns-01 validates the
-single record `_acme-challenge.router-api-tee.0g.ai`, which can only resolve to
+`router-api.0g.ai` at the moment you cut over. ACME dns-01 validates the
+single record `_acme-challenge.router-api.0g.ai`, which can only resolve to
 one side at a time — that is the **issuance switch**.
 
 To let side b obtain its first cert (side a keeps serving throughout):
@@ -413,7 +413,7 @@ borrowed only for the minutes it takes the standby to issue.
 **Let's Encrypt limits (README repeats these).** The binding limit is **5
 duplicate certificates per exact hostname per rolling week**. Each fresh CVM
 issues once from an empty `cert-data` volume, so you can stand up ~5 fresh CVMs
-for `router-api-tee.0g.ai` per week. A real cutover costs ~1 issuance and is well
+for `router-api.0g.ai` per week. A real cutover costs ~1 issuance and is well
 within budget; what burns it is **re-building a side repeatedly against the
 production hostname while iterating**. When iterating, test on the staging CA
 (`ACME_STAGING=true` in that side's compose — untrusted certs, high limits) and
@@ -441,7 +441,7 @@ switch to the production compose only once it works.
    [Health-checking the standby](#health-checking-the-standby-side);
 4. repoints the traffic + issuance switches at b;
 5. **confirms the cutover actually took effect, cache-proof.** It polls
-   `https://router-api-tee.0g.ai/healthz` **and** the served TLS cert fingerprint:
+   `https://router-api.0g.ai/healthz` **and** the served TLS cert fingerprint:
    success needs `/healthz` OK **and** the cert to have changed to b's. Because the
    dstack gateway caches the `_dstack-app-address` lookup (observed ~30 s), a bare
    `/healthz` can return 200 from the *old* side for a while after the flip — the
@@ -744,7 +744,7 @@ expects TLS. The `s` (passthrough) is the working form.
 
 The instance running today uses `DELEGATION_ZONE=integratenetwork.work`, so it
 writes the **switch-layer names themselves** (the base-zone
-`_dstack-app-address.router-api-tee.0g.ai.integratenetwork.work` etc.) and
+`_dstack-app-address.router-api.0g.ai.integratenetwork.work` etc.) and
 **keeps reasserting** the routing one. Migrate by standing a managed side up
 beside it under a per-side sub-zone, then retiring the legacy CVM. (You can't
 move the legacy instance into a sub-zone "in place": `DELEGATION_ZONE` is an
@@ -760,7 +760,7 @@ you no second side to cut over to safely.)
 2. **Issue side a's cert:** `./switch.sh acme a`. The base-zone `_acme-challenge`
    name is only written transiently during the live instance's own renewals, so
    converting it to a CNAME → side a is safe between renewals; side a completes
-   ACME and now holds a valid `router-api-tee.0g.ai` cert.
+   ACME and now holds a valid `router-api.0g.ai` cert.
 3. **Verify side a** directly (a probe, per above). It is healthy but takes no
    traffic yet — routing still points at the live instance's TXT.
 4. **Cut over and retire the legacy instance promptly, in that order:**
@@ -770,7 +770,7 @@ you no second side to cut over to safely.)
    ```
    The legacy instance reasserts the base-zone routing record on its reconcile
    loop, so until it is gone routing can briefly flap between it and side a.
-   **This is not an outage:** both serve `router-api-tee.0g.ai` with valid certs,
+   **This is not an outage:** both serve `router-api.0g.ai` with valid certs,
    so every request succeeds either way — though because side a is a new build, a
    few requests may hit the old build until the legacy CVM is gone. Once it is
    destroyed, the CNAME → side a is stable.

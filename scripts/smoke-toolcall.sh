@@ -14,8 +14,8 @@
 #   1. THE TARGET MAY NOT BE A GATEWAY AT ALL. The router serves the same OpenAI
 #      surface, so aiming this at a bare router answers every call happily with
 #      NOTHING SEALED — the gateway is what seals, and the router is the party it
-#      seals past. The hostname does not tell you which you have: the staging
-#      gateway is called router-api-tee-staging.0g.ai and is a gateway. Preflight
+#      seals past. The hostname does not tell you which you have: the gateways
+#      serve router-api.0g.ai and router-api-staging.0g.ai. Preflight
 #      A probes /v1/gateway/identity, which only the gateway serves; that answer
 #      is the only reliable tell, and its absence is repeated in the summary.
 #
@@ -56,7 +56,7 @@
 
 set -euo pipefail
 
-GATEWAY=${GATEWAY:-pc-gateway.0g.ai}
+GATEWAY=${GATEWAY:-router-api.0g.ai}
 MODEL=${MODEL:-0GM-1.0-35B-A3B}
 PROVIDER=${PROVIDER:-}
 PIN=1
@@ -171,9 +171,9 @@ echo "model    $MODEL"
 # ANYWHERE, since sealing is the gateway's job and the router is the party it
 # seals *past*. Every check below would still pass.
 #
-# And you cannot tell them apart by name. router-api-tee-staging.0g.ai IS a
-# gateway; production's is pc-gateway.0g.ai and the router it forwards to is
-# router-api.0g.ai. Hence a probe rather than a hostname rule: only the gateway
+# And you cannot tell them apart by name: the gateways serve router-api.0g.ai and
+# router-api-staging.0g.ai, the names the router itself used to answer on. Hence a
+# probe rather than a hostname rule: only the gateway
 # serves /v1/gateway/identity (client/cmd/gateway/identity.go).
 #
 # Its absence counts as a FAILURE, so the run exits nonzero — but it does not
@@ -194,8 +194,8 @@ else
 	note "end-to-end encrypted: the gateway is what seals, and the router is the"
 	note "party it seals past. The tool checks still mean something about the MODEL;"
 	note "they mean nothing about E2EE. The hostname will not tell you which you"
-	note "have — router-api-tee-staging.0g.ai is a gateway — so confirm with the"
-	note "operator which domain fronts the gateway."
+	note "have — router-api.0g.ai is a gateway — so confirm with the operator"
+	note "which domain fronts the gateway."
 fi
 echo
 

@@ -82,7 +82,7 @@
 # Config (env or env file, with defaults for the current production deployment):
 #   CF_API_TOKEN     (required) Cloudflare token that can edit the delegation zone
 #   CF_ZONE          delegation zone name           (default: integratenetwork.work)
-#   DOMAIN           served hostname                (default: router-api-tee.0g.ai)
+#   DOMAIN           served hostname                (default: router-api.0g.ai)
 #   DELEGATION_ZONE  base delegation zone           (default: same as CF_ZONE)
 #   PLATFORM_BASE    dstack platform base domain    (e.g. in1.phala.network) — the main
 #                    cluster, where a and b run. Required by setup, switch, failover
@@ -979,7 +979,7 @@ fi
 # Config (env / env-file, with defaults for the current production deployment)
 # ---------------------------------------------------------------------------
 CF_ZONE="${CF_ZONE:-integratenetwork.work}"
-DOMAIN="${DOMAIN:-router-api-tee.0g.ai}"
+DOMAIN="${DOMAIN:-router-api.0g.ai}"
 DELEGATION_ZONE="${DELEGATION_ZONE:-$CF_ZONE}"
 PLATFORM_BASE="${PLATFORM_BASE:-}"     # dstack platform base domain (e.g. in1.phala.network) for per-side app-id probes
 # Normalise to the BARE base once, here, because platform_probe_url interpolates

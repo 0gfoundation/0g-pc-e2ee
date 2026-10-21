@@ -80,18 +80,18 @@ full. This is what a pass looks like on today's builds:
 
 ```
 expected compose   newest 5 release(s) of 0gfoundation/0g-pc-e2ee (docker-compose.release.yml)
-gateway            pc-gateway.0g.ai
+gateway            router-api.0g.ai
 ✓   acme-account.json              0443a4bf…
-✓   cert-pc-gateway.0g.ai.pem      36024092…
+✓   cert-router-api.0g.ai.pem      36024092…
 ✓ evidence bundle    2 file(s) match sha256sum.txt
 ✓ quote              genuine TDX (DCAP verified)
 ✓ bundle binding     report_data == SHA-256(sha256sum.txt)
 ✓ endpoint binding   served certificate is the one the quote binds
   served cert      46d34704…
-  subject          CN=pc-gateway.0g.ai
+  subject          CN=router-api.0g.ai
   issuer           CN=E5,O=Let's Encrypt,C=US
   not after        2026-11-05T14:35:22Z
-✓ chain trust        validates for pc-gateway.0g.ai
+✓ chain trust        validates for router-api.0g.ai
 ✓ compose_hash       55d872aa…
   app_id           08f84bbaee1e78db04d3623eb564ad486b41f7fe (_dstack-app-address TXT)
 ✓ app-compose        sha256 == compose_hash (authenticated)
@@ -669,7 +669,7 @@ exercise circular), and step 7 needs `dstack-mr` and the image. `DOMAIN`
 is the gateway; the checks are numbered as above.
 
 ```bash
-DOMAIN=pc-gateway.0g.ai
+DOMAIN=router-api.0g.ai
 
 # --- 1. bundle integrity ---
 # NOTE: one call, not four. Every replica has its own bundle, so files fetched over
