@@ -471,6 +471,56 @@ valid cert, rollback is effectively instant (bounded by `TTL` + the gateway rout
 cache). **Keep the old side running until you are confident in the new one** — a
 destroyed side is no longer a rollback target.
 
+## Running switch.sh from GitHub Actions
+
+[`.github/workflows/dns-switch.yml`](../../.github/workflows/dns-switch.yml) runs the
+same script from a GitHub runner: Actions → **DNS switch** → *Run workflow*, with the
+deployment, the command, the side, and `dry_run` (on by default — clear it to apply).
+What that buys over a laptop: a network that does not drop Cloudflare mid-switch (a
+failed read used to surface as a bogus "split state"), one run at a time per
+deployment, and a record of who moved what. The script itself is unchanged and still
+runs locally — keep that as the fallback for when GitHub is down.
+
+**The Cloudflare token is the deployment.** It edits the delegation zone, which holds
+the traffic switch, the issuance switch and the CAA record, so whoever holds it can
+point the served hostname at their own CVM and get it a certificate. It therefore
+lives only in **Environment** secrets, behind protection rules. One-time setup, by a
+repository admin:
+
+1. **Two Cloudflare tokens per deployment**, both scoped to the delegation zone
+   (`integratenetwork.work`) only: one with *Zone · DNS · Read*, one with
+   *Zone · DNS · Edit*. Note what scoping cannot do: Cloudflare scopes a token to a
+   zone, not to record names, and staging and mainnet share this zone — a staging
+   *edit* token can move mainnet's records too. Protect `dns-staging-write` as
+   carefully as `dns-mainnet-write`, or give staging a zone of its own.
+2. **Four environments** (Settings → Environments), each with *Deployment branches
+   and tags* set to `main` only:
+
+   | Environment | Secret `CF_API_TOKEN` | Protection |
+   |---|---|---|
+   | `dns-staging-read` | staging Read token | none beyond `main` |
+   | `dns-staging-write` | staging Edit token | Required reviewers |
+   | `dns-mainnet-read` | mainnet Read token | none beyond `main` |
+   | `dns-mainnet-write` | mainnet Edit token | Required reviewers |
+
+   `status` and every dry run use `-read`; anything that changes a record uses
+   `-write`, and waits for a reviewer before it gets the token. On a write
+   environment, also clear *Allow administrators to bypass*, and turn on *Prevent
+   self-review* if there is more than one operator. Required reviewers are available
+   on every plan for a public repository.
+3. **Environment variables** on each of the four: `DOMAIN` (required — the workflow
+   refuses to fall back to switch.sh's mainnet default), `PLATFORM_BASE`, and if
+   used `PLATFORM_BASE_COLD`, `CF_ZONE`, `DELEGATION_ZONE` — the same values as
+   `switch.env`.
+4. **Repository variable `DNS_OPERATORS`**: the GitHub logins allowed to change
+   records, comma-separated. Checked before any environment is entered and
+   independent of plan or reviewer settings; unset means nobody, so a write is
+   refused until it is set. Dry runs and `status` need no listing.
+
+Logs are public in a public repository. The script prints record names, targets
+and app ids — all already served by public DNS, and certificate issuance is in
+public CT logs anyway — and never the token, which Actions masks regardless.
+
 ## Cross-cluster fallback
 
 The main pair, a and b, runs in one dstack cluster, and releases flip between

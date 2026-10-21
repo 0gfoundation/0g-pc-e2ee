@@ -1,0 +1,189 @@
+name: DNS switch
+
+# Runs deploy/phala/switch.sh — the blue/green traffic and issuance switches — from
+# a stable runner instead of an operator's machine, with an audit trail of who
+# moved what, and with the Cloudflare token behind GitHub Environment protection.
+# blue-green.md, "Running switch.sh from GitHub Actions", has the setup.
+#
+# THE TOKEN IS THE DEPLOYMENT. It edits the delegation zone, which holds the traffic
+# switch, the issuance switch and the CAA record: whoever holds it can point the
+# served hostname at a CVM of their own and get it a valid certificate. So it lives
+# ONLY in Environment secrets, never repository secrets, and each environment admits
+# only the main branch:
+#
+#   dns-<target>-read    Zone DNS Read. `status`, and any command with dry_run.
+#                        No reviewers: reading needs no one's approval, and a read
+#                        token cannot change anything if it leaks.
+#   dns-<target>-write   Zone DNS Edit. Every command that changes a record.
+#                        Required reviewers.
+#
+# And independently of any plan or environment setting: a run that would change a
+# record is refused unless the person who triggered it is listed in the repository
+# variable DNS_OPERATORS (comma-separated GitHub logins). Unset means nobody. With a
+# single operator, "Prevent self-review" cannot be on, and this is what still keeps
+# every other account with write access from moving traffic.
+#
+# A job is handed an environment's secrets only after its protection rules pass,
+# and only if it names that environment — so a branch with an edited copy of this
+# file cannot reach them (deployment branches: main only), and a fork's pull request
+# never runs this workflow at all (it is dispatch-only).
+#
+# Logs are public in a public repository. switch.sh prints record names, targets and
+# app ids, all of which public DNS already serves; it never prints the token, and
+# Actions masks secrets regardless.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Deployment"
+        required: true
+        type: choice
+        options: [staging, mainnet]
+      command:
+        description: "switch.sh command"
+        required: true
+        type: choice
+        options: [status, acme, switch, failover, rollback, setup]
+      side:
+        description: "Side, for acme / switch / failover (required) and setup (optional)"
+        required: false
+        type: choice
+        default: "-"
+        options: ["-", a, b, c]
+      dry_run:
+        description: "Show the changes without applying them (runs with the read-only token)"
+        required: false
+        type: boolean
+        default: true
+      probe_url:
+        description: "switch / failover: health-check the target side at this URL first (--probe-url)"
+        required: false
+        type: string
+      no_verify:
+        description: "switch / failover: skip the post-switch check and its auto-rollback (--no-verify)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# One switch per deployment at a time: two runs interleaving their writes is exactly
+# the split state switch.sh exists to avoid. Never cancelled — a switch stopped
+# between its writes is that split state.
+concurrency:
+  group: dns-switch-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  # Before anyone is asked to approve anything: a malformed request fails here, with
+  # no environment entered and no token handed out.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.plan.outputs.environment }}
+    steps:
+      - id: plan
+        env:
+          TARGET: ${{ inputs.target }}
+          COMMAND: ${{ inputs.command }}
+          SIDE: ${{ inputs.side }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          PROBE_URL: ${{ inputs.probe_url }}
+          NO_VERIFY: ${{ inputs.no_verify }}
+          ACTOR: ${{ github.actor }}
+          DNS_OPERATORS: ${{ vars.DNS_OPERATORS }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          case "$COMMAND" in
+            acme|switch|failover) [ "$SIDE" != "-" ] || fail "$COMMAND needs a side" ;;
+            status|rollback)      [ "$SIDE" = "-" ] || fail "$COMMAND takes no side" ;;
+            setup) ;;
+            *) fail "unknown command: $COMMAND" ;;
+          esac
+          case "$COMMAND" in
+            switch|failover) ;;
+            *) [ -z "$PROBE_URL" ] && [ "$NO_VERIFY" = false ] \
+                 || fail "probe_url and no_verify apply to switch and failover only" ;;
+          esac
+          if [ -n "$PROBE_URL" ]; then
+            [[ "$PROBE_URL" =~ ^https://[A-Za-z0-9._-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$ ]] \
+              || fail "probe_url must be a plain https URL"
+          fi
+          # status writes nothing, and neither does a dry run: both get the read token.
+          if [ "$COMMAND" = status ] || [ "$DRY_RUN" = true ]; then
+            access="read"
+          else
+            access="write"
+          fi
+          if [ "$access" = write ]; then
+            operator=false
+            IFS=',' read -ra operators <<< "$DNS_OPERATORS"
+            for o in "${operators[@]}"; do
+              o="${o// /}"
+              # GitHub logins are case-insensitive.
+              [ -n "$o" ] && [ "${o,,}" = "${ACTOR,,}" ] && operator=true
+            done
+            [ "$operator" = true ] \
+              || fail "$ACTOR is not in DNS_OPERATORS; only a listed operator may change records (a dry run needs no listing)"
+          fi
+          echo "environment=dns-${TARGET}-${access}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### DNS switch: \`$COMMAND\` on $TARGET"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| side | \`$SIDE\` |"
+            echo "| dry run | $DRY_RUN |"
+            echo "| environment | \`dns-${TARGET}-${access}\` |"
+            echo "| triggered by | @$ACTOR |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  run:
+    needs: plan
+    runs-on: ubuntu-latest
+    environment: ${{ needs.plan.outputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: switch.sh
+        env:
+          # Secret: only this step sees it. Config: environment variables, so the
+          # two deployments differ in their environments and nowhere else.
+          CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+          DOMAIN: ${{ vars.DOMAIN }}
+          CF_ZONE: ${{ vars.CF_ZONE }}
+          DELEGATION_ZONE: ${{ vars.DELEGATION_ZONE }}
+          PLATFORM_BASE: ${{ vars.PLATFORM_BASE }}
+          PLATFORM_BASE_COLD: ${{ vars.PLATFORM_BASE_COLD }}
+          COMMAND: ${{ inputs.command }}
+          SIDE: ${{ inputs.side }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          PROBE_URL: ${{ inputs.probe_url }}
+          NO_VERIFY: ${{ inputs.no_verify }}
+        run: |
+          set -euo pipefail
+          [ -n "$CF_API_TOKEN" ] || { echo "::error::CF_API_TOKEN is not set in this environment"; exit 1; }
+          [ -n "$DOMAIN" ] || { echo "::error::the DOMAIN variable is not set in this environment"; exit 1; }
+          # DOMAIN is required here although switch.sh defaults it to mainnet's: a
+          # staging environment missing it must fail, not operate on mainnet. The
+          # rest may be empty — switch.sh defaults an empty value like an unset one.
+          args=("$COMMAND")
+          [ "$SIDE" = "-" ] || args+=("$SIDE")
+          if [ "$DRY_RUN" = true ]; then args+=(--dry-run); else args+=(--yes); fi
+          [ -z "$PROBE_URL" ] || args+=(--probe-url "$PROBE_URL")
+          [ "$NO_VERIFY" = false ] || args+=(--no-verify)
+          # No env file: the runner's environment is the whole configuration.
+          rc=0
+          ./deploy/phala/switch.sh "${args[@]}" > switch.log 2>&1 || rc=$?
+          cat switch.log
+          {
+            echo '```'
+            cat switch.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
