@@ -26,7 +26,10 @@
 #   6. session    --turns sealed requests sharing one X-Session-Id (and
 #                 X-Claude-Code-Session-Id): every one should land on the same
 #                 X-Provider. Proves the stickiness only when the model has two or
-#                 more providers; with one it passes trivially, and says so.
+#                 more providers; with one it passes trivially, and says so. A
+#                 failed turn is reported with its status, elapsed time, the side
+#                 that answered (_0g.source) and its request id — "no HTTP
+#                 response" is this machine's network or the client timeout.
 #   7. identity   GET /v1/providers/<X-Provider>/identity for the provider check 3
 #                 used: quote_dcap pass, and the other verdicts printed
 #                 (measurement, onchain_signer, runtime_release, compose_baseline).
@@ -137,9 +140,19 @@ header() {
 		END { print out }' "$1" 2>/dev/null || true
 }
 
+# status_of <curl args...> — run curl and echo the HTTP status, "000" when there was
+# no response (a transport failure or the --max-time timeout). curl already writes
+# "000" through -w on a failure, so a fallback appended after it would read
+# "000000"; this echoes curl's own value and supplies "000" only if it wrote none.
+status_of() {
+	local code
+	code=$(curl "$@" 2>/dev/null) || true
+	printf '%s' "${code:-000}"
+}
+
 # get <out> <hdr> <path> — GET and echo the status ("000" on a transport failure).
 get() {
-	curl -sS -o "$1" -D "$2" -w '%{http_code}' --max-time 30 "$BASE$3" 2>/dev/null || printf '000'
+	status_of -sS -o "$1" -D "$2" -w '%{http_code}' --max-time 30 "$BASE$3"
 }
 
 # chat <out> <hdr> <model> <stream 0|1> [extra curl args...] — POST a chat completion
@@ -151,9 +164,9 @@ chat() {
 	body=$(jq -nc --arg m "$model" --argjson s "$([ "$stream" = 1 ] && echo true || echo false)" \
 		--argjson n "$MAX_TOKENS" '{model: $m, stream: $s, max_tokens: $n,
 		  messages: [{role: "user", content: "Reply with the single word: pong"}]}')
-	curl -sS -o "$out" -D "$hdr" -w '%{http_code}' --max-time 120 \
+	status_of -sS -o "$out" -D "$hdr" -w '%{http_code}' --max-time 120 \
 		-H 'Content-Type: application/json' -H "Authorization: Bearer $ZG_API_KEY" \
-		"$@" --data-binary "$body" "$BASE/v1/chat/completions" 2>/dev/null || printf '000'
+		"$@" --data-binary "$body" "$BASE/v1/chat/completions"
 }
 
 # messages <out> <hdr> <model> — POST an Anthropic Messages request (x-api-key, as an
@@ -162,9 +175,26 @@ messages() {
 	local body
 	body=$(jq -nc --arg m "$3" --argjson n "$MAX_TOKENS" \
 		'{model: $m, max_tokens: $n, messages: [{role: "user", content: "Reply with the single word: pong"}]}')
-	curl -sS -o "$1" -D "$2" -w '%{http_code}' --max-time 120 \
+	status_of -sS -o "$1" -D "$2" -w '%{http_code}' --max-time 120 \
 		-H 'Content-Type: application/json' -H "x-api-key: $ZG_API_KEY" -H 'anthropic-version: 2023-06-01' \
-		--data-binary "$body" "$BASE/v1/messages" 2>/dev/null || printf '000'
+		--data-binary "$body" "$BASE/v1/messages"
+}
+
+# failure <status> <seconds> <body> <headers> — one line saying where a failed request
+# went wrong, so a reader can tell their own network from the service: no response at
+# all, or the side (_0g.source: gateway, upstream, provider) that answered with an
+# error, its message, and the request id to find it in the gateway's access log.
+failure() {
+	if [ "$1" = 000 ]; then
+		printf 'no HTTP response after %ss: a network error on this side, or the client timeout' "$2"
+		return
+	fi
+	local src msg rid
+	src=$(jqr '._0g.source // empty' "$3")
+	msg=$(jqr '.error.message // empty' "$3")
+	rid=$(header "$4" X-Request-Id)
+	printf 'HTTP %s after %ss from %s: %s%s' "$1" "$2" "${src:-an unmarked source}" \
+		"${msg:-$(excerpt "$3" 160)}" "${rid:+ (request id $rid)}"
 }
 
 # answer_of <file> — the text an OpenAI chat completion came back with: the answer,
@@ -199,8 +229,8 @@ done
 
 # 2. auth ----------------------------------------------------------------------
 body='{"model":"x","messages":[{"role":"user","content":"x"}]}'
-st=$(curl -sS -o "$WORK/a.out" -w '%{http_code}' --max-time 30 -H 'Content-Type: application/json' \
-	--data-binary "$body" "$BASE/v1/chat/completions" 2>/dev/null || printf '000')
+st=$(status_of -sS -o "$WORK/a.out" -w '%{http_code}' --max-time 30 -H 'Content-Type: application/json' \
+	--data-binary "$body" "$BASE/v1/chat/completions")
 if [ "$st" = 401 ]; then ok "auth: no API key -> 401"
 else bad "auth: no API key answered $st, want 401"; note "$(excerpt "$WORK/a.out")"; fi
 
@@ -263,15 +293,22 @@ fi
 # 6. session -------------------------------------------------------------------
 sid="smoke-$(date +%s)-$$"
 seen=()
-errs=0
-for _ in $(seq 1 "$TURNS"); do
+fails=()
+for i in $(seq 1 "$TURNS"); do
+	t0=$SECONDS
 	st=$(chat "$WORK/t.json" "$WORK/t.h" "$SEALED_MODEL" 0 \
 		-H "X-Session-Id: $sid" -H "X-Claude-Code-Session-Id: $sid")
-	if [ "$st" = 200 ]; then seen+=("$(header "$WORK/t.h" X-Provider)"); else errs=$((errs + 1)); fi
+	if [ "$st" = 200 ]; then
+		seen+=("$(header "$WORK/t.h" X-Provider)")
+	else
+		fails+=("turn $i: $(failure "$st" $((SECONDS - t0)) "$WORK/t.json" "$WORK/t.h")")
+	fi
 done
 distinct=$(printf '%s\n' "${seen[@]:-}" | sort -u | grep -c . || true)
-if [ "$errs" -gt 0 ]; then
-	bad "session: $errs of $TURNS turns failed"
+if [ "${#fails[@]}" -gt 0 ]; then
+	bad "session: ${#fails[@]} of $TURNS turns failed"
+	for f in "${fails[@]}"; do note "$f"; done
+	[ "${#seen[@]}" -gt 0 ] && note "the others landed on: $(printf '%s ' "${seen[@]}")"
 elif [ "$distinct" = 1 ]; then
 	ok "session: $TURNS turns with one session id -> one provider (${seen[0]})"
 	note "proves stickiness only if $SEALED_MODEL has 2+ providers; with one this passes trivially"
