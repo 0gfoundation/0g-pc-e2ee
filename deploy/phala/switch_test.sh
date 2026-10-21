@@ -34,7 +34,7 @@ SWITCH="${HERE}/switch.sh"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-DOMAIN=router-api-tee.0g.ai
+DOMAIN=router-api.0g.ai
 DZ=integratenetwork.work
 BASE=in1.phala.network
 ALIAS="${DOMAIN}.${DZ}"
