@@ -512,10 +512,13 @@ repository admin:
    refuses to fall back to switch.sh's mainnet default), `PLATFORM_BASE`, and if
    used `PLATFORM_BASE_COLD`, `CF_ZONE`, `DELEGATION_ZONE` — the same values as
    `switch.env`.
-4. **Repository variable `DNS_OPERATORS`**: the GitHub logins allowed to change
-   records, comma-separated. Checked before any environment is entered and
-   independent of plan or reviewer settings; unset means nobody, so a write is
-   refused until it is set. Dry runs and `status` need no listing.
+4. **Admins only.** The workflow refuses to run — any command, `status`
+   included — unless the account that triggered it has *admin* on this repository
+   (organization owners do), and refuses if it cannot look that up. Anyone with write
+   access can dispatch a workflow, so this is checked in the workflow itself, which
+   makes it binding only while `main` cannot be changed past review: keep branch
+   protection on `main`. The required reviewers on the write environments are the
+   gate that holds regardless.
 
 Logs are public in a public repository. The script prints record names, targets
 and app ids — all already served by public DNS, and certificate issuance is in
