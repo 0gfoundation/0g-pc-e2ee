@@ -61,6 +61,19 @@
 #                        generous, since a reasoning model thinks before it answers)
 #   --turns N            session turns for check 6 (env TURNS; default 3)
 #   --pcverify PATH      pcverify binary for check 8 (env PCVERIFY; skipped without)
+#   --insecure           skip TLS certificate verification (env INSECURE=1), to
+#                        reach one blue/green side directly before traffic is
+#                        switched to it: the side's platform hostname,
+#                        https://<app_id>-443s.<cluster>, serves the certificate of
+#                        the deployment's domain, which cannot validate for it.
+#                        The API key then goes over a connection nothing has
+#                        authenticated, so use it only for that, never on the
+#                        served domain. Check 8 is skipped: pcverify ties the
+#                        evidence to the served domain, so run it there after the
+#                        switch.
+#
+#   ZG_API_KEY=sk-... ./scripts/smoke-gateway.sh --insecure \
+#       --gateway https://<app_id>-443s.dstack-pha-prod5.phala.network
 #
 # The API key is read from ZG_API_KEY only, never a flag, so it stays out of shell
 # history and process listings.
@@ -76,6 +89,7 @@ PLAIN_FORMAT=${PLAIN_FORMAT:-anthropic}
 MAX_TOKENS=${MAX_TOKENS:-512}
 TURNS=${TURNS:-3}
 PCVERIFY=${PCVERIFY:-}
+INSECURE=${INSECURE:-}
 
 # The header comment above IS the help text.
 usage() {
@@ -92,6 +106,7 @@ while [ $# -gt 0 ]; do
 	--max-tokens) MAX_TOKENS=$2; shift 2 ;;
 	--turns) TURNS=$2; shift 2 ;;
 	--pcverify) PCVERIFY=$2; shift 2 ;;
+	--insecure) INSECURE=1; shift ;;
 	-h | --help) usage 0 ;;
 	*) printf 'unknown argument: %s\n\n' "$1" >&2; usage 2 ;;
 	esac
@@ -105,6 +120,7 @@ done
 case "$TURNS" in '' | *[!0-9]*) echo "--turns must be a number" >&2; exit 2 ;; esac
 case "$MAX_TOKENS" in '' | *[!0-9]*) echo "--max-tokens must be a number" >&2; exit 2 ;; esac
 case "$PLAIN_FORMAT" in anthropic | openai) ;; *) echo "--plain-format is anthropic or openai" >&2; exit 2 ;; esac
+case "$INSECURE" in '' | 0) INSECURE= ;; *) INSECURE=1 ;; esac
 
 BASE=$GATEWAY
 case "$BASE" in https://* | http://*) ;; *) BASE="https://$BASE" ;; esac
@@ -144,9 +160,10 @@ header() {
 # no response (a transport failure or the --max-time timeout). curl already writes
 # "000" through -w on a failure, so a fallback appended after it would read
 # "000000"; this echoes curl's own value and supplies "000" only if it wrote none.
+# Every request goes through here, so --insecure takes effect here and nowhere else.
 status_of() {
 	local code
-	code=$(curl "$@" 2>/dev/null) || true
+	code=$(curl ${INSECURE:+-k} "$@" 2>/dev/null) || true
 	printf '%s' "${code:-000}"
 }
 
@@ -203,7 +220,12 @@ answer_of() {
 	jqr '.choices[0].message | if (.content // "") != "" then .content else (.reasoning_content // "") end' "$1"
 }
 
-printf 'gateway  %s\n\n' "$BASE"
+printf 'gateway  %s\n' "$BASE"
+if [ -n "$INSECURE" ]; then
+	printf '%s  WARN%s  TLS verification is OFF (--insecure): the API key is going over a connection\n' "$RED" "$OFF"
+	printf '        nothing has authenticated. Only for a side'"'"'s platform hostname, never the served domain.\n'
+fi
+printf '\n'
 
 # 0. preflight -----------------------------------------------------------------
 st=$(get "$WORK/id.json" "$WORK/id.h" /v1/gateway/identity)
@@ -339,6 +361,8 @@ fi
 # 8. pcverify ------------------------------------------------------------------
 if [ -z "$PCVERIFY" ]; then
 	skp "pcverify: no --pcverify given"
+elif [ -n "$INSECURE" ]; then
+	skp "pcverify: --insecure — the evidence is bound to the served domain; run pcverify there after the switch"
 else
 	if "$PCVERIFY" -gateway "$HOST" >"$WORK/pv.out" 2>&1; then
 		ok "pcverify: -gateway $HOST exit 0"
