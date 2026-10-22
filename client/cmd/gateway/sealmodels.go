@@ -25,9 +25,9 @@ import (
 // E2EE support today, so sealing everything fails every request for the rest — a
 // model with no sealable provider gets an empty route-preview, which the client
 // treats as TERMINAL and does not retry — while sealing nothing gives up
-// encryption for the models that do support it. The granularity
-// that matches reality is the model, which is also the natural rollout dial:
-// enable one model, watch, enable the next.
+// encryption for the models that do support it. The granularity that matches
+// reality is the model, which is also the natural rollout dial: enable one model,
+// watch, enable the next.
 //
 // This is deliberately NOT a percentage. A per-request percentage would make the
 // same caller's same model sealed on one request and cleartext on the next,
@@ -40,12 +40,12 @@ import (
 // # The two ends: `*` and empty
 //
 // `*` (the built-in default) seals every model, so a gateway that says nothing
-// keeps sealing rather than silently stopping. An EMPTY value seals nothing: every sealed
-// surface — its path, its subtree and its POST — is proxied to the router in the
-// clear, marked X-0G-E2EE: none, and this gateway behaves as the plain router.
+// keeps sealing rather than silently stopping. An EMPTY value seals nothing: every
+// sealed surface — its path, its subtree and its POST — is proxied to the router in
+// the clear, marked X-0G-E2EE: none, and this gateway behaves as the plain router.
 //
-// Sealing nothing exists for the global-entry cutover. Pointing router-api.0g.ai at a gateway
-// that seals unconditionally would, in one DNS change, also turn on default
+// Sealing nothing exists for the global-entry cutover. Pointing router-api.0g.ai at
+// a gateway that seals unconditionally would, in one DNS change, also turn on default
 // encryption for everybody: the provider pool narrows to the sealable ones, web
 // search and file attachments break by construction
 // (SealedPromptInjectionConflict), and every request pays a route-preview plus an

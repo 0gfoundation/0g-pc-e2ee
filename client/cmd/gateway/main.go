@@ -844,8 +844,9 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 		opt(&policy)
 	}
 	// The cleartext passthrough to the router, built once: it is the catch-all, and
-	// it is also what a sealed surface's namespace resolves to. Marked as unencrypted at the one place every cleartext response
-	// leaves this process, so no route can forget to say so.
+	// it is also what a sealed surface's namespace resolves to. Marked as unencrypted
+	// at the one place every cleartext response leaves this process, so no route can
+	// forget to say so.
 	//
 	// Two wrappings of ONE proxy (one connection pool): the namespace handler gets
 	// the plain one, the catch-all gets the catalog cache. The marker is the OUTER
@@ -1021,8 +1022,8 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 			// To Go's ServeMux, `POST /v1/chat/completions/` matches the subtree pattern
 			// `/v1/chat/completions/` — `POST /v1/chat/completions` does not match a path
 			// with a trailing slash, so it would land on the namespace's reverse proxy
-			// and be answered 200 with the WHOLE PROMPT forwarded to
-			// the router in the clear: exactly the leak the subtree claim exists to
+			// and be answered 200 with the WHOLE PROMPT forwarded to the router in the
+			// clear: exactly the leak the subtree claim exists to
 			// prevent, reached by a single character, and invisible to the caller because
 			// the router's gin then 307s the retry onto the real path and it works.
 			//
@@ -1052,8 +1053,9 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 		mux.Handle("POST "+path, unserved)
 		mux.Handle("POST "+path+"/{$}", unserved)
 	}
-	// The async poll (SPEC §7.5.4), registered whatever -seal-models says: a poll carries no model to decide on, and a job sealed by an
-	// earlier configuration must stay readable. The job id decides. With a key
+	// The async poll (SPEC §7.5.4), registered whatever -seal-models says: a poll
+	// carries no model to decide on, and a job sealed by an earlier configuration
+	// must stay readable. The job id decides. With a key
 	// segment it is a job this gateway sealed — opened through the gate; without
 	// one, the cleartext passthrough, which refuses to relay a sealed frame.
 	keylessPoll := openaiproxy.MarkE2EE(openaiproxy.E2EEValueNone, newKeylessPollProxy(routerTarget, logger))
@@ -1156,9 +1158,9 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	// newRouterProxy).
 	//
 	// The cached wrapping is mounted HERE and nowhere else. The namespace handler
-	// carries prompts, so it gets the uncached
-	// `passthrough`: keeping them separate means that path's safety rests on the
-	// cache not being there at all, rather than on the allowlist being right.
+	// carries prompts, so it gets the uncached `passthrough`: keeping them separate
+	// means that path's safety rests on the cache not being there at all, rather than
+	// on the allowlist being right.
 	mux.Handle("/", cachedPassthrough)
 	// CORS wraps the whole mux, INSIDE the access log: a preflight must be answered
 	// here — before the mux would hand it to the credential gate (which 401s a
