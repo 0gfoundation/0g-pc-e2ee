@@ -811,96 +811,16 @@ func TestGatewayMountsAServedAnthropicSurface(t *testing.T) {
 	}
 }
 
-// A sealed surface claims its SUBTREE, not just its exact path.
+// The exact path on a method this gateway does not seal is proxied, marked, and
+// not bounced.
 //
-// Mounting the exact path alone left every sub-resource of a sealed surface
-// falling through to the catch-all, which is a cleartext reverse proxy to the
-// router. An Anthropic SDK's messages.count_tokens() POSTs the whole
-// conversation and system prompt to /v1/messages/count_tokens; Message Batches
-// POSTs the same payload to /v1/messages/batches. Neither matched a pattern, so
-// both went to the untrusted router in the clear — and came back 200, so nothing
-// about the exchange looked wrong.
-//
-// The assertion is on what the ROUTER RECEIVED, not on the status code: a 501
-// with the payload already forwarded would be the same failure wearing a better
-// answer.
-//
-// Driven off endpoint.All so a row added later is covered the day it lands, and
-// with a client for every row, since whether this build seals a surface has no
-// bearing on whether its sub-resources may leak.
-func TestGatewayRefusesSubResourcesOfASealedSurface(t *testing.T) {
-	var (
-		mu        sync.Mutex
-		routerSaw []string
-		bodies    []string
-	)
-	router := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body, _ := io.ReadAll(r.Body)
-		mu.Lock()
-		routerSaw = append(routerSaw, r.Method+" "+r.URL.Path)
-		bodies = append(bodies, string(body))
-		mu.Unlock()
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"data":[]}`))
-	}))
-	defer router.Close()
-
-	clients := map[string]*core.Client{}
-	for _, ep := range endpoint.All {
-		clients[ep.Path] = routeClient()
-	}
-	gw := httptest.NewServer(newHandler(clients, mustURL(t, router.URL), testOrigins(), "", "",
-		noInFlightCap, nil, nil, nil, discardLogger()))
-	defer gw.Close()
-
-	const secret = "my secret prompt"
-	for _, ep := range endpoint.All {
-		for _, suffix := range []string{"count_tokens", "batches", "some/deeper/path"} {
-			path := ep.Path + "/" + suffix
-			t.Run(path, func(t *testing.T) {
-				req, _ := http.NewRequest(http.MethodPost, gw.URL+path, strings.NewReader(
-					`{"model":"m","system":"`+secret+`","messages":[{"role":"user","content":"`+secret+`"}]}`))
-				req.Header.Set("Content-Type", "application/json")
-				req.Header.Set("Authorization", "Bearer sk-user-key")
-				resp, err := http.DefaultClient.Do(req)
-				if err != nil {
-					t.Fatalf("post %s: %v", path, err)
-				}
-				defer resp.Body.Close()
-				body, _ := io.ReadAll(resp.Body)
-				if resp.StatusCode != http.StatusNotImplemented {
-					t.Errorf("status = %d, want 501 (body %s)", resp.StatusCode, body)
-				}
-			})
-		}
-	}
-
-	mu.Lock()
-	defer mu.Unlock()
-	if len(routerSaw) != 0 {
-		t.Fatalf("a sub-resource of a sealed surface was forwarded to the router: %v", routerSaw)
-	}
-	for i, b := range bodies {
-		if strings.Contains(b, secret) {
-			t.Errorf("the prompt reached the router in the clear at %s: %s", routerSaw[i], b)
-		}
-	}
-}
-
-// The exact path on a method this gateway does not seal is refused too, rather
-// than proxied or bounced.
-//
-// Two things this pins. A GET on the surface's own path used to reach the
-// cleartext proxy — harmless in itself (no body, so no prompt) but the surface's
-// path is this gateway's to answer. And registering the subtree alone made Go's
-// ServeMux answer the slash-less form with an implicit 307 INTO the subtree,
-// since the only pattern for the exact path was method-specific; the method-less
-// exact registration removes that redirect while still losing to `POST <path>`
-// for the sealed method.
-func TestGatewayRefusesUnsealedMethodsOnASealedPath(t *testing.T) {
-	router := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("the router must not see %s %s", r.Method, r.URL.Path)
-	}))
+// Registering the subtree alone made Go's ServeMux answer the slash-less form with
+// an implicit 307 INTO the subtree, since the only pattern for the exact path was
+// method-specific; the method-less exact registration removes that redirect while
+// still losing to `POST <path>` for the sealed method.
+func TestGatewayProxiesUnsealedMethodsOnASealedPath(t *testing.T) {
+	rr := &recordingRouter{}
+	router := rr.server(nil)
 	defer router.Close()
 
 	clients := map[string]*core.Client{endpoint.Anthropic.Path: routeClient()}
@@ -917,16 +837,21 @@ func TestGatewayRefusesUnsealedMethodsOnASealedPath(t *testing.T) {
 		t.Fatalf("get %s: %v", endpoint.Anthropic.Path, err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusNotImplemented {
+	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		t.Errorf("status = %d (Location %q), want 501: %s", resp.StatusCode, resp.Header.Get("Location"), body)
+		t.Errorf("status = %d (Location %q), want the router's 200: %s", resp.StatusCode, resp.Header.Get("Location"), body)
+	}
+	if got := resp.Header.Get(openaiproxy.HeaderE2EE); got != openaiproxy.E2EEValueNone {
+		t.Errorf("%s = %q, want %q", openaiproxy.HeaderE2EE, got, openaiproxy.E2EEValueNone)
+	}
+	if paths, _, _ := rr.snapshot(); len(paths) != 1 || paths[0] != "GET "+endpoint.Anthropic.Path {
+		t.Errorf("the router saw %v, want exactly the GET", paths)
 	}
 }
 
 // The catch-all must still reverse-proxy everything that is NOT part of a sealed
-// surface — the router's cleartext metadata APIs a thin client needs. Asserted
-// alongside the refusals because they are one decision: a subtree claim that
-// swallowed the model catalog would pass both tests above.
+// surface — the router's cleartext metadata APIs a thin client needs, through the
+// catalog cache rather than the namespace passthrough.
 func TestGatewayStillProxiesNonSealedPaths(t *testing.T) {
 	var (
 		mu        sync.Mutex
@@ -969,11 +894,11 @@ func TestGatewayStillProxiesNonSealedPaths(t *testing.T) {
 	}
 }
 
-// A CORS preflight is answered by the middleware ABOVE the mux, so the refusals
-// must not intercept one: a browser sends no credentials on a preflight, and a
+// A CORS preflight is answered by the middleware ABOVE the mux, so neither the
+// credential gate nor the namespace handler may intercept one: a browser sends no credentials on a preflight, and a
 // 501 there would break every browser client of the sealed surface before it
 // ever sent the real request.
-func TestGatewayAnswersPreflightOnRefusedPaths(t *testing.T) {
+func TestGatewayAnswersPreflightOnSealedSurfaces(t *testing.T) {
 	router := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{}`))
 	}))
@@ -999,69 +924,5 @@ func TestGatewayAnswersPreflightOnRefusedPaths(t *testing.T) {
 		if got := resp.Header.Get("Access-Control-Allow-Origin"); got != origin {
 			t.Errorf("preflight %s allow-origin = %q, want %q", path, got, origin)
 		}
-	}
-}
-
-// The refusal must not claim the gateway seals a surface this build does not
-// serve.
-//
-// In direct-broker mode the build holds a chat client only, so the same path
-// answered two contradictory things: the subtree/method refusal said "this
-// gateway seals that surface only at POST /v1/messages" while the POST refusal
-// on the very same path said it is "not served by this gateway build". The first
-// is false there, and an operator debugging direct mode reads it as the surface
-// being available on some other method.
-//
-// One reason, two wordings, chosen where the answer is known — which is also why
-// this is a test rather than a comment: the closure captures `served` at mount
-// time, so a future refactor that moved the registration would silently take the
-// wrong branch.
-func TestGatewayRefusalDoesNotClaimAnUnservedSurfaceIsSealed(t *testing.T) {
-	router := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		t.Errorf("the router must not see %s %s", r.Method, r.URL.Path)
-	}))
-	defer router.Close()
-
-	// The direct-broker shape: chat served, every other row not.
-	clients := map[string]*core.Client{endpoint.Chat.Path: routeClient()}
-	gw := httptest.NewServer(newHandler(clients, mustURL(t, router.URL), testOrigins(), "", "",
-		noInFlightCap, nil, nil, nil, discardLogger()))
-	defer gw.Close()
-
-	body := func(t *testing.T, method, path string) string {
-		t.Helper()
-		req, _ := http.NewRequest(method, gw.URL+path, strings.NewReader(`{}`))
-		req.Header.Set("Authorization", "Bearer sk-user-key")
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatalf("%s %s: %v", method, path, err)
-		}
-		defer resp.Body.Close()
-		b, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode != http.StatusNotImplemented {
-			t.Fatalf("%s %s = %d, want 501: %s", method, path, resp.StatusCode, b)
-		}
-		return string(b)
-	}
-
-	// UNSERVED row: nothing may promise a sealed method on it.
-	for _, tc := range []struct{ method, path string }{
-		{http.MethodGet, endpoint.Anthropic.Path},
-		{http.MethodPost, endpoint.Anthropic.Path + "/count_tokens"},
-	} {
-		got := body(t, tc.method, tc.path)
-		if strings.Contains(got, "seals") {
-			t.Errorf("%s %s claims this build seals an unserved surface: %s", tc.method, tc.path, got)
-		}
-		if !strings.Contains(got, "does not serve the sealed") {
-			t.Errorf("%s %s must say the build does not serve the surface: %s", tc.method, tc.path, got)
-		}
-	}
-
-	// SERVED row: the "only at POST" wording is the accurate one, and must survive.
-	got := body(t, http.MethodGet, endpoint.Chat.Path)
-	if !strings.Contains(got, "seals only at POST "+endpoint.Chat.Path) {
-		t.Errorf("a served row's refusal must name the sealed method: %s", got)
 	}
 }

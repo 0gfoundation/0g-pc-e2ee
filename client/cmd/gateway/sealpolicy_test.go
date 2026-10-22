@@ -12,7 +12,7 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 )
 
-// With -seal-policy=off the gateway is the plain router: every sealed surface's
+// With -seal-models=off the gateway is the plain router: every sealed surface's
 // POST is FORWARDED, not sealed and not refused.
 //
 // This is what makes the DNS cutover a deploy rather than a release. Pointing
@@ -20,11 +20,11 @@ import (
 // change, narrow the provider pool to sealable endpoints, break web search and
 // file attachments by construction, and add a route-preview plus an HPKE seal to
 // every request.
-func TestSealPolicyOffForwardsThePromptInstead(t *testing.T) {
+func TestSealModelsOffForwardsThePromptInstead(t *testing.T) {
 	rr := &recordingRouter{}
 	router := rr.server(nil)
 	defer router.Close()
-	gw := catalogGateway(t, router, entryPolicy{sealPolicy: sealPolicyOff})
+	gw := catalogGateway(t, router, entryPolicy{sealModels: sealModels{off: true}})
 
 	const body = `{"model":"m","messages":[{"role":"user","content":"hello"}]}`
 	for _, ep := range endpoint.All {
@@ -63,30 +63,18 @@ func TestSealPolicyOffForwardsThePromptInstead(t *testing.T) {
 	}
 }
 
-// The default seals. A deployment that says nothing about seal policy — every
+// The default seals. A deployment that says nothing about sealing — every
 // gateway running today, and every test that is about something else — must keep
 // sealing rather than silently becoming a cleartext proxy.
-func TestSealPolicyDefaultsToSealing(t *testing.T) {
+func TestSealingIsTheDefault(t *testing.T) {
 	if !(entryPolicy{}).sealingOn() {
 		t.Error("the zero entryPolicy does not seal; the zero value must be the ordinary deployment")
-	}
-	if !(entryPolicy{sealPolicy: sealPolicyAlways}).sealingOn() {
-		t.Error(`sealPolicy "always" must seal`)
-	}
-	if (entryPolicy{sealPolicy: sealPolicyOff}).sealingOn() {
-		t.Error(`sealPolicy "off" must not seal`)
-	}
-	// Only the exact "off" turns it off. Anything else — a value startup
-	// validation somehow let through — lands on sealing, which is the direction
-	// that cannot put a prompt the caller expected encrypted onto the clear path.
-	if !(entryPolicy{sealPolicy: "OFF"}).sealingOn() {
-		t.Error("an unrecognised seal policy must fall back to SEALING, not to cleartext")
 	}
 
 	rr := &recordingRouter{}
 	router := rr.server(nil)
 	defer router.Close()
-	gw := catalogGateway(t, router, entryPolicy{}) // no seal policy stated
+	gw := catalogGateway(t, router, entryPolicy{}) // no -seal-models stated
 
 	req, _ := http.NewRequest(http.MethodPost, gw.URL+endpoint.Chat.Path,
 		strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"secret"}]}`))
@@ -107,37 +95,29 @@ func TestSealPolicyDefaultsToSealing(t *testing.T) {
 	}
 }
 
-// -unsealed-subtree is inert while sealing is off. It only ever decided what a
-// SEALED surface's namespace answers, and with nothing sealed every one of those
-// paths is proxied — so `refuse` must not still be refusing sub-resources.
-func TestSealPolicyOffMakesUnsealedSubtreeInert(t *testing.T) {
-	for _, subtree := range []string{unsealedSubtreeRefuse, unsealedSubtreePassthrough} {
-		t.Run(subtree, func(t *testing.T) {
-			rr := &recordingRouter{}
-			router := rr.server(nil)
-			defer router.Close()
-			gw := catalogGateway(t, router, entryPolicy{
-				sealPolicy:      sealPolicyOff,
-				unsealedSubtree: subtree,
-			})
+// With sealing off a sealed surface's whole namespace is proxied — sub-resources
+// and other methods on the surface itself included.
+func TestSealModelsOffProxiesTheNamespace(t *testing.T) {
+	rr := &recordingRouter{}
+	router := rr.server(nil)
+	defer router.Close()
+	gw := catalogGateway(t, router, entryPolicy{sealModels: sealModels{off: true}})
 
-			for _, path := range []string{
-				endpoint.Chat.Path + "/count_tokens",
-				endpoint.Chat.Path + "/batches",
-				endpoint.Chat.Path, // GET on the surface itself
-			} {
-				req, _ := http.NewRequest(http.MethodGet, gw.URL+path, nil)
-				resp, err := http.DefaultClient.Do(req)
-				if err != nil {
-					t.Fatalf("get %s: %v", path, err)
-				}
-				resp.Body.Close()
-				if resp.StatusCode != http.StatusOK {
-					t.Errorf("%s = %d, want 200: with sealing off there is no sealed namespace "+
-						"left to refuse", path, resp.StatusCode)
-				}
-			}
-		})
+	for _, path := range []string{
+		endpoint.Chat.Path + "/count_tokens",
+		endpoint.Chat.Path + "/batches",
+		endpoint.Chat.Path, // GET on the surface itself
+	} {
+		req, _ := http.NewRequest(http.MethodGet, gw.URL+path, nil)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("get %s: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("%s = %d, want 200: with sealing off there is no sealed namespace "+
+				"left to refuse", path, resp.StatusCode)
+		}
 	}
 }
 
@@ -146,11 +126,11 @@ func TestSealPolicyOffMakesUnsealedSubtreeInert(t *testing.T) {
 // never be replayed to another. Guarded twice over (the cache is GET-only and
 // allowlisted, and these mount the uncached passthrough), so this pins the
 // outcome rather than either mechanism.
-func TestSealPolicyOffStillNeverCachesAPrompt(t *testing.T) {
+func TestSealModelsOffStillNeverCachesAPrompt(t *testing.T) {
 	rr := &recordingRouter{}
 	router := rr.server(nil)
 	defer router.Close()
-	gw := catalogGateway(t, router, entryPolicy{sealPolicy: sealPolicyOff})
+	gw := catalogGateway(t, router, entryPolicy{sealModels: sealModels{off: true}})
 
 	var sent []string
 	for _, body := range []string{`{"prompt":"first"}`, `{"prompt":"second"}`, `{"prompt":"third"}`} {

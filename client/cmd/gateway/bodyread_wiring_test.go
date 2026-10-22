@@ -73,10 +73,10 @@ func TestEntryPolicyBodyRead(t *testing.T) {
 	if got := (entryPolicy{}).bodyRead(); got != defaultBodyReadTimeout {
 		t.Errorf("zero policy = %v, want the default %v", got, defaultBodyReadTimeout)
 	}
-	if got := (entryPolicy{bodyReadTimeout: disabledIfZero(0)}).bodyRead(); got > 0 {
-		t.Errorf("-body-read-timeout=0 resolves to %v, want disabled (<= 0)", got)
+	if got := (entryPolicy{bodyReadTimeout: -1}).bodyRead(); got > 0 {
+		t.Errorf("a negative bodyReadTimeout resolves to %v, want disabled (<= 0)", got)
 	}
-	if got := (entryPolicy{bodyReadTimeout: disabledIfZero(5 * time.Second)}).bodyRead(); got != 5*time.Second {
-		t.Errorf("-body-read-timeout=5s resolves to %v", got)
+	if got := (entryPolicy{bodyReadTimeout: 5 * time.Second}).bodyRead(); got != 5*time.Second {
+		t.Errorf("bodyReadTimeout=5s resolves to %v", got)
 	}
 }

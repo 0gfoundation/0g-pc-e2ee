@@ -292,22 +292,22 @@ func TestCatalogCacheTTLExpiryAndDisable(t *testing.T) {
 // entryPolicy's own contract. A duration field whose zero means "off" would
 // quietly hand every test, and any future call site, a gateway shape nothing
 // deploys.
-func TestZeroPolicyCachesAndFlagZeroDisables(t *testing.T) {
+func TestZeroPolicyCachesAndNegativeDisables(t *testing.T) {
 	if c := (entryPolicy{}).newCatalogCache(); c == nil {
 		t.Error("the zero entryPolicy has no catalog cache; its zero value must be the ordinary deployment")
 	} else if c.ttl != defaultCatalogCacheTTL {
 		t.Errorf("zero policy TTL = %v, want the default %v", c.ttl, defaultCatalogCacheTTL)
 	}
-	if c := (entryPolicy{catalogCacheTTL: disabledIfZero(0)}).newCatalogCache(); c != nil {
-		t.Error("-catalog-cache-ttl=0 must disable the cache; the flag's 0 and the policy's 0 mean different things")
+	if c := (entryPolicy{catalogCacheTTL: -1}).newCatalogCache(); c != nil {
+		t.Error("a negative catalogCacheTTL must disable the cache")
 	}
-	if c := (entryPolicy{catalogCacheTTL: disabledIfZero(30 * time.Second)}).newCatalogCache(); c == nil || c.ttl != 30*time.Second {
+	if c := (entryPolicy{catalogCacheTTL: 30 * time.Second}).newCatalogCache(); c == nil || c.ttl != 30*time.Second {
 		t.Errorf("an explicit TTL must pass through unchanged, got %+v", c)
 	}
 }
 
 // The cache must never sit in front of a sealed surface's namespace, which
-// carries prompts under -unsealed-subtree=passthrough. Two POSTs with different
+// carries prompts. Two POSTs with different
 // bodies must reach the router as two distinct requests — if either the mount
 // point or the allowlist ever let one of these be cached, the second caller
 // would receive the first caller's completion.
@@ -315,7 +315,7 @@ func TestSealedNamespacePassthroughIsNeverCached(t *testing.T) {
 	rr := &recordingRouter{}
 	router := rr.server(nil)
 	defer router.Close()
-	gw := catalogGateway(t, router, entryPolicy{unsealedSubtree: unsealedSubtreePassthrough})
+	gw := catalogGateway(t, router, entryPolicy{})
 
 	var sent []string
 	for _, ep := range endpoint.All {

@@ -352,9 +352,8 @@ to a published release asset — expected for a development deployment, since th
 checked-in `docker-compose.yml` carries `:latest` and only the release asset is
 digest-pinned. There is no approximate matching.
 
-The endpoint may be switched off (`ZG_GATEWAY_IDENTITY_ENDPOINT=false`), and nothing
-in this document depends on it: every value it reports is in the evidence bundle and
-the published releases already.
+Nothing in this document depends on the endpoint: every value it reports is in the
+evidence bundle and the published releases already.
 
 ---
 
@@ -488,8 +487,7 @@ a quote that failed DCAP outright, and (under `ZG_GATEWAY_ATTEST_ENFORCE`) one w
 chain is not allowlisted. Neither leaves a record, so the address simply `404`s.
 
 It needs `ZG_GATEWAY_ATTEST` (without quote verification there are no verdicts to
-report, and the route is not mounted at all) and can be switched off with
-`ZG_GATEWAY_PROVIDER_IDENTITY_ENDPOINT=false`.
+report, and the route is not mounted at all).
 
 ---
 

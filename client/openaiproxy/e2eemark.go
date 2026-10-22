@@ -42,7 +42,8 @@ const (
 	// E2EEValueNone: this response came through the cleartext passthrough to the
 	// router. Correct and expected for the metadata and discovery surface (the model
 	// catalog, provider lists), and the honest answer for a content-bearing surface
-	// the passthrough is configured to carry (see -unsealed-subtree): the router saw
+	// the passthrough carries (a sealed surface's sub-resources, or a model the
+	// gateway does not seal): the router saw
 	// whatever transited it.
 	E2EEValueNone = "none"
 )

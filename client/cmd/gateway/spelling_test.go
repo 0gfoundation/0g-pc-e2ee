@@ -84,100 +84,75 @@ func TestSealedSurfaceSpellingsNeverReachTheRouter(t *testing.T) {
 		},
 	}
 
-	for _, mode := range []string{unsealedSubtreeRefuse, unsealedSubtreePassthrough} {
-		t.Run(mode, func(t *testing.T) {
-			rr := &recordingRouter{}
-			router := rr.server(nil)
-			defer router.Close()
+	rr := &recordingRouter{}
+	router := rr.server(nil)
+	defer router.Close()
 
-			// The sealed client points at a DIFFERENT (dead) router, so anything the
-			// recording router sees arrived through the cleartext passthrough.
-			gw := httptest.NewServer(newHandler(allSealedClients(), mustURL(t, router.URL), testOrigins(), "", "",
-				noInFlightCap, nil, nil, nil, discardLogger(),
-				withEntryPolicy(entryPolicy{unsealedSubtree: mode})))
-			defer gw.Close()
-			addr := strings.TrimPrefix(gw.URL, "http://")
+	// The sealed client points at a DIFFERENT (dead) router, so anything the
+	// recording router sees arrived through the cleartext passthrough.
+	gw := httptest.NewServer(newHandler(allSealedClients(), mustURL(t, router.URL), testOrigins(), "", "",
+		noInFlightCap, nil, nil, nil, discardLogger()))
+	defer gw.Close()
+	addr := strings.TrimPrefix(gw.URL, "http://")
 
-			const secret = "my secret prompt"
-			body := `{"model":"m","prompt":"` + secret + `","messages":[{"role":"user","content":"` + secret + `"}]}`
-			for _, ep := range endpoint.All {
-				for name, spell := range spellings {
-					target := spell(ep.Path)
-					t.Run(ep.Path+" / "+name, func(t *testing.T) {
-						_, hdr := rawPOST(t, addr, target, body)
-						if got := hdr[strings.ToLower(openaiproxy.HeaderE2EE)]; got != openaiproxy.E2EEValueSealed {
-							t.Errorf("POST %s: %s = %q, want %q — every spelling of a sealed "+
-								"surface belongs to the sealed path", target,
-								openaiproxy.HeaderE2EE, got, openaiproxy.E2EEValueSealed)
-						}
-					})
+	const secret = "my secret prompt"
+	body := `{"model":"m","prompt":"` + secret + `","messages":[{"role":"user","content":"` + secret + `"}]}`
+	for _, ep := range endpoint.All {
+		for name, spell := range spellings {
+			target := spell(ep.Path)
+			t.Run(ep.Path+" / "+name, func(t *testing.T) {
+				_, hdr := rawPOST(t, addr, target, body)
+				if got := hdr[strings.ToLower(openaiproxy.HeaderE2EE)]; got != openaiproxy.E2EEValueSealed {
+					t.Errorf("POST %s: %s = %q, want %q — every spelling of a sealed "+
+						"surface belongs to the sealed path", target,
+						openaiproxy.HeaderE2EE, got, openaiproxy.E2EEValueSealed)
 				}
-			}
+			})
+		}
+	}
 
-			paths, _, bodies := rr.snapshot()
-			for i, b := range bodies {
-				if strings.Contains(b, secret) {
-					t.Fatalf("the prompt reached the router in the clear at %s: %s", paths[i], b)
-				}
-			}
-			if len(paths) != 0 {
-				t.Errorf("a sealed surface was forwarded to the router: %v", paths)
-			}
-		})
+	paths, _, bodies := rr.snapshot()
+	for i, b := range bodies {
+		if strings.Contains(b, secret) {
+			t.Fatalf("the prompt reached the router in the clear at %s: %s", paths[i], b)
+		}
+	}
+	if len(paths) != 0 {
+		t.Errorf("a sealed surface was forwarded to the router: %v", paths)
 	}
 }
 
-// A sub-resource spelled with %2F is answered exactly as the literal spelling is —
-// refused under `refuse`, forwarded and marked under `passthrough`.
+// A sub-resource spelled with %2F is answered exactly as the literal spelling is:
+// forwarded, marked, and under the canonical spelling.
 //
 // The point is that the guard FOLDS spellings rather than inventing a third
 // behaviour for them: `/v1/messages%2Fcount_tokens` and
 // `/v1/messages/count_tokens` are the same request, so whatever policy governs one
-// governs the other. Under `refuse` that means the 501 covers the encoded form too,
-// which is what stops it being a way around the refusal.
+// governs the other.
 func TestSubResourceSpellingFollowsThePolicy(t *testing.T) {
-	tests := []struct {
-		mode       string
-		wantMark   string
-		wantRouter int
-	}{
-		{unsealedSubtreeRefuse, "", 0},
-		{unsealedSubtreePassthrough, openaiproxy.E2EEValueNone, 1},
+	rr := &recordingRouter{}
+	router := rr.server(nil)
+	defer router.Close()
+
+	gw := httptest.NewServer(newHandler(allSealedClients(), mustURL(t, router.URL), testOrigins(), "", "",
+		noInFlightCap, nil, nil, nil, discardLogger()))
+	defer gw.Close()
+
+	_, hdr := rawPOST(t, strings.TrimPrefix(gw.URL, "http://"),
+		endpoint.Anthropic.Path+"%2Fcount_tokens", `{"model":"m"}`)
+
+	if got := hdr[strings.ToLower(openaiproxy.HeaderE2EE)]; got != openaiproxy.E2EEValueNone {
+		t.Errorf("%s = %q, want %q", openaiproxy.HeaderE2EE, got, openaiproxy.E2EEValueNone)
 	}
-	for _, tt := range tests {
-		t.Run(tt.mode, func(t *testing.T) {
-			rr := &recordingRouter{}
-			router := rr.server(nil)
-			defer router.Close()
-
-			gw := httptest.NewServer(newHandler(allSealedClients(), mustURL(t, router.URL), testOrigins(), "", "",
-				noInFlightCap, nil, nil, nil, discardLogger(),
-				withEntryPolicy(entryPolicy{unsealedSubtree: tt.mode})))
-			defer gw.Close()
-
-			status, hdr := rawPOST(t, strings.TrimPrefix(gw.URL, "http://"),
-				endpoint.Anthropic.Path+"%2Fcount_tokens", `{"model":"m"}`)
-
-			if tt.wantRouter == 0 && !strings.Contains(status, "501") {
-				t.Errorf("status = %q, want 501: the encoded spelling must be refused like the literal one", status)
-			}
-			if tt.wantMark != "" {
-				if got := hdr[strings.ToLower(openaiproxy.HeaderE2EE)]; got != tt.wantMark {
-					t.Errorf("%s = %q, want %q", openaiproxy.HeaderE2EE, got, tt.wantMark)
-				}
-			}
-			paths, _, _ := rr.snapshot()
-			if len(paths) != tt.wantRouter {
-				t.Errorf("the router saw %v, want %d request(s) — the encoded spelling must follow "+
-					"the same policy as the literal one", paths, tt.wantRouter)
-			}
-			// And when it IS forwarded, it goes with the canonical spelling: the guard
-			// folds the surface prefix, so the router is not handed a path whose
-			// escaping it would have to re-interpret.
-			if len(paths) == 1 && !strings.HasSuffix(paths[0], endpoint.Anthropic.Path+"/count_tokens") {
-				t.Errorf("forwarded as %q, want the canonical %q", paths[0],
-					endpoint.Anthropic.Path+"/count_tokens")
-			}
-		})
+	paths, _, _ := rr.snapshot()
+	if len(paths) != 1 {
+		t.Fatalf("the router saw %v, want 1 request — the encoded spelling must follow "+
+			"the same policy as the literal one", paths)
+	}
+	// It goes with the canonical spelling: the guard folds the surface prefix, so the
+	// router is not handed a path whose escaping it would have to re-interpret.
+	if !strings.HasSuffix(paths[0], endpoint.Anthropic.Path+"/count_tokens") {
+		t.Errorf("forwarded as %q, want the canonical %q", paths[0],
+			endpoint.Anthropic.Path+"/count_tokens")
 	}
 }

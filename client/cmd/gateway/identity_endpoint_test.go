@@ -390,13 +390,13 @@ func TestBuildIdentity_ReleasesZeroIsSettled(t *testing.T) {
 
 // A deployment that configures no manifest source has ANSWERED: containers is null
 // and the assembly is done. Recording it as pending would leave the background
-// builder retrying an unsatisfiable lookup for the life of the process — both paths
-// are fixed at startup — and would keep the document permanently incomplete, and so
+// builder retrying an unsatisfiable lookup for the life of the process — the path
+// is fixed at startup — and would keep the document permanently incomplete, and so
 // permanently uncacheable, over a deliberate configuration choice.
 func TestBuildIdentity_NoAppComposeSourceIsSettled(t *testing.T) {
 	f := newIdentityFixture(t, deployedComposeText)
 	cfg := f.config()
-	cfg.AppComposePath = "" // and BaseDomain was never set
+	cfg.AppComposePath = ""
 
 	res := buildFixture(t, cfg)
 	if res.doc.Containers != nil {
@@ -413,14 +413,13 @@ func TestBuildIdentity_NoAppComposeSourceIsSettled(t *testing.T) {
 	}
 }
 
-func TestLoadAppCompose_ReportsEverySourceItTried(t *testing.T) {
-	cfg := identityConfig{AppComposePath: filepath.Join(t.TempDir(), "absent.json")}
-	_, _, err := loadAppCompose(context.Background(), cfg, "")
+func TestLoadAppCompose_NamesThePathItTried(t *testing.T) {
+	_, _, err := loadAppCompose(filepath.Join(t.TempDir(), "absent.json"))
 	if err == nil || !strings.Contains(err.Error(), "absent.json") {
 		t.Errorf("err = %v, want the attempted path named", err)
 	}
 	// Nothing configured at all is still an error, not a silent empty manifest.
-	if _, _, err := loadAppCompose(context.Background(), identityConfig{}, ""); err == nil {
+	if _, _, err := loadAppCompose(""); err == nil {
 		t.Error("expected an error when no source is configured")
 	}
 }

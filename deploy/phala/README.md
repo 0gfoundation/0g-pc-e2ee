@@ -292,17 +292,17 @@ after that (`chatBodyCap` on `/v1/chat/completions` and `/v1/messages`), so a bo
 the router refuses is refused with its 413 whatever the gateway admits.
 
 A slot is held from admission until the response ends, and the request body is
-read inside it. So a body is given **`-body-read-timeout` (default 60 s)** to
+read inside it. So a body is given **60 s** to
 arrive once admitted; past it the request is answered 408 and the slot freed.
 Without that bound a client could send its headers and trickle the body,
 holding a slot indefinitely — the credential check in front only looks at a
 credential's shape, so it would cost no account, and dstack-ingress is a TCP proxy
 with a 24 h idle timeout. The bound covers the inference routes (sealed and
 cleartext alike) and lifts when the body has been read, so it never cuts a
-streamed response. 60 s covers a 20 MiB body at about 2.8 Mbit/s;
-`ZG_GATEWAY_BODY_READ_TIMEOUT` is not referenced by the compose, so changing it is
-a compose edit. (All of this assumes sealing is on, as deployed. With
-`ZG_GATEWAY_SEAL_POLICY=off` the inference routes are a plain passthrough: outside
+streamed response. 60 s covers a 20 MiB body at about 2.8 Mbit/s; it is a
+constant in the binary (`defaultBodyReadTimeout`), so changing it is a gateway
+release. (All of this assumes sealing is on, as deployed. With
+`ZG_GATEWAY_SEAL_MODELS=off` the inference routes are a plain passthrough: outside
 the in-flight cap, unbuffered, and bounded only by the backstop below.)
 
 Every other route — the catch-all to the router, which streams bodies through
@@ -796,14 +796,11 @@ could not do anyway, since JS cannot see its own connection's peer certificate
 |---|---|---|
 | `-out-app-compose /run/identity/app-compose.json` | cvm-identity | publishes this CVM's `app-compose.json` verbatim on the shared `identity` volume, from the same guest-agent call that yields the identity file. |
 | `ZG_GATEWAY_APP_COMPOSE_FILE=/run/identity/app-compose.json` | gateway | where the container list comes from. Spelled out here, not defaulted in the binary, because the path is a contract between containers: it appears three times in the compose, and splitting it between YAML and Go is how a renamed volume becomes a silently empty list. |
-| `ZG_GATEWAY_PLATFORM_BASE_DOMAIN=${DSTACK_GATEWAY_DOMAIN}` | gateway | fallback source for the same manifest, consulted only when the file is unreadable. The platform-injected base domain, same value the ingress builds its `GATEWAY_DOMAIN` from. Empty disables it. |
 
-Two more knobs are left at their built-in defaults and appear in the compose only as
-commented-out lines, per this file's convention of stating what *differs* from the
-default: `ZG_GATEWAY_IDENTITY_ENDPOINT` (on — set `false` to remove the route
-entirely) and `ZG_GATEWAY_IDENTITY_RELEASES` (`5`, matching pcverify's own default —
-set `0` for a CVM with no egress to GitHub, which then reports `matched_release:
-null`).
+The file is the only source; a missing or stale one costs the container list and
+nothing else. The route is always mounted, and `matched_release` compares against the
+last 5 published releases, matching pcverify's own default; a CVM with no egress to
+GitHub reports `matched_release: null`.
 
 **It is not evidence, and the code is written to keep it that way.** The gateway signs
 nothing here and does not DCAP-verify its own quote; the response carries no
@@ -860,7 +857,6 @@ it can say:
 | `ZG_GATEWAY_ONCHAIN_ENFORCE` | on (as deployed), a provider the registry does not vouch for is skipped — but **unlike the boot-chain check above it still gets a record**, carrying the `no_match` that rejected it, because a stale earlier `pass` standing for the rest of its TTL while the gateway refuses that provider is the worse failure. So `verdicts.onchain_signer: "no_match"` stays readable under enforce, and a survey of hop 5 does not have to be taken from a warn-mode gateway the way a measurement survey does. |
 | `ZG_GATEWAY_RUNTIME_RELEASES` | on by default with `ZG_GATEWAY_ATTEST`: `verdicts.runtime_release` judges the broker build the provider's CVM runs now (below). Needs egress to `ghcr.io` and `tuf-repo-cdn.sigstore.dev`; set `false` for a CVM without it, which then reports `not_checked`. On its own it changes nothing about which provider is sealed to. A commented-out line in the compose. |
 | `ZG_GATEWAY_PROVIDER_ENFORCE` | **off** (as deployed). On, `runtime_release` and `compose_baseline` become a gate together (below): a candidate is sealed to only when both pass, and is skipped otherwise — including `no_baseline` and `unavailable`, fail-closed like `ZG_GATEWAY_ONCHAIN_ENFORCE`. Requires `ZG_GATEWAY_ATTEST`, `ZG_GATEWAY_ONCHAIN_ENFORCE` (the record is keyed by the router-supplied address, which only on-chain enforce binds to the enclave) and `ZG_GATEWAY_RUNTIME_RELEASES`; the gateway refuses to start otherwise. A refused provider still has a record, with the verdicts that refused it. |
-| `ZG_GATEWAY_PROVIDER_IDENTITY_ENDPOINT` | on by default; set `false` to remove the route entirely. Appears in the compose only as a commented-out line, per this file's convention. |
 
 **This endpoint does report verdicts, unlike the self-description above — and that is
 the intended difference.** There the gateway describes *itself*, so a verdict would be

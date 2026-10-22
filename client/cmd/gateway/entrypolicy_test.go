@@ -4,8 +4,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -60,27 +58,21 @@ func allSealedClients() map[string]*core.Client {
 	return clients
 }
 
-// Under unsealedSubtreePassthrough a sealed surface's sub-resources are FORWARDED
-// to the router, marked as unencrypted.
-//
-// This is the deliberate inverse of TestGatewayRefusesSubResourcesOfASealedSurface,
-// which pins the default. Both behaviors are correct, for different topologies: the
-// 501 is right while a caller who wants the router's own handling can call the
-// router directly, and it is wrong once this gateway IS the router's hostname,
-// where refusing is not pointing at another door but closing the only one.
+// A sealed surface's sub-resources are FORWARDED to the router, marked as
+// unencrypted. This gateway IS the router's hostname, so refusing them would not
+// point a caller at another door but close the only one.
 //
 // The marker is asserted alongside the forwarding because it is what keeps the
 // forwarding honest. The payload really does reach the router in the clear here —
 // that has not changed — so the caller has to be able to SEE that, on the response
 // itself, rather than inferring it from a path.
-func TestUnsealedSubtreePassthroughForwardsAndMarks(t *testing.T) {
+func TestSealedSurfaceSubtreeForwardsAndMarks(t *testing.T) {
 	rr := &recordingRouter{}
 	router := rr.server(nil)
 	defer router.Close()
 
 	gw := httptest.NewServer(newHandler(allSealedClients(), mustURL(t, router.URL), testOrigins(), "", "",
-		noInFlightCap, nil, nil, nil, discardLogger(),
-		withEntryPolicy(entryPolicy{unsealedSubtree: unsealedSubtreePassthrough})))
+		noInFlightCap, nil, nil, nil, discardLogger()))
 	defer gw.Close()
 
 	for _, ep := range endpoint.All {
@@ -115,26 +107,23 @@ func TestUnsealedSubtreePassthroughForwardsAndMarks(t *testing.T) {
 	}
 }
 
-// ...and the sealed POST is NOT forwarded, under either value.
+// ...and the sealed POST is NOT forwarded.
 //
-// This is the invariant the whole flag has to preserve: passthrough widens what a
-// sealed surface's NAMESPACE answers, and must not touch the one method that
-// seals. If it did, turning the flag on for the global-entry topology would put
-// every prompt on the cleartext path — the exact leak the refusal was written to
-// prevent, reintroduced by the fix for it.
+// This is the invariant the namespace passthrough has to preserve: it widens what
+// a sealed surface's NAMESPACE answers, and must not touch the one method that
+// seals. If it did, every prompt would be on the cleartext path.
 //
 // The sealed client here points at a DIFFERENT (dead) router than the catch-all's
 // target, so anything the recording router sees arrived through the passthrough
 // and nothing else. Seeing no request for the surface's own path is therefore
 // proof the POST went to the seal path.
-func TestUnsealedSubtreePassthroughStillSealsThePost(t *testing.T) {
+func TestSealedSurfaceSubtreeStillSealsThePost(t *testing.T) {
 	rr := &recordingRouter{}
 	router := rr.server(nil)
 	defer router.Close()
 
 	gw := httptest.NewServer(newHandler(allSealedClients(), mustURL(t, router.URL), testOrigins(), "", "",
-		noInFlightCap, nil, nil, nil, discardLogger(),
-		withEntryPolicy(entryPolicy{unsealedSubtree: unsealedSubtreePassthrough})))
+		noInFlightCap, nil, nil, nil, discardLogger()))
 	defer gw.Close()
 
 	const secret = "my secret prompt"
@@ -392,109 +381,57 @@ func TestCookieCredentialWiring(t *testing.T) {
 	}
 }
 
-// The surface's own TRAILING-SLASH form is sealed, not proxied — under both values
-// of -unsealed-subtree.
+// The surface's own TRAILING-SLASH form is sealed, not proxied.
 //
-// This is the same invariant as TestUnsealedSubtreePassthroughStillSealsThePost,
+// This is the same invariant as TestSealedSurfaceSubtreeStillSealsThePost,
 // reached by the one spelling that slipped past it. To Go's ServeMux,
 // `POST /v1/chat/completions/` matches the SUBTREE pattern, not `POST
-// /v1/chat/completions` — so under `passthrough` the subtree handler was the
-// reverse proxy, and the whole prompt went to the router in the clear with a 200.
+// /v1/chat/completions` — so the subtree handler, the reverse proxy, took it, and the whole prompt went to the router in the clear with a 200.
 // One character, and the caller could not tell: the router's gin 307s the retry
 // onto the canonical path, so the request works and nothing looks wrong.
 //
 // The assertion is on what the ROUTER RECEIVED, for the reason the sibling test
 // gives: a status code cannot distinguish "sealed" from "already forwarded".
 func TestSealedSurfaceTrailingSlashIsNeverProxied(t *testing.T) {
-	for _, mode := range []string{unsealedSubtreeRefuse, unsealedSubtreePassthrough} {
-		t.Run(mode, func(t *testing.T) {
-			rr := &recordingRouter{}
-			router := rr.server(nil)
-			defer router.Close()
+	rr := &recordingRouter{}
+	router := rr.server(nil)
+	defer router.Close()
 
-			// The sealed client points at a DIFFERENT (dead) router, so anything the
-			// recording router sees arrived through the passthrough and nothing else.
-			gw := httptest.NewServer(newHandler(allSealedClients(), mustURL(t, router.URL), testOrigins(), "", "",
-				noInFlightCap, nil, nil, nil, discardLogger(),
-				withEntryPolicy(entryPolicy{unsealedSubtree: mode})))
-			defer gw.Close()
+	// The sealed client points at a DIFFERENT (dead) router, so anything the
+	// recording router sees arrived through the passthrough and nothing else.
+	gw := httptest.NewServer(newHandler(allSealedClients(), mustURL(t, router.URL), testOrigins(), "", "",
+		noInFlightCap, nil, nil, nil, discardLogger()))
+	defer gw.Close()
 
-			const secret = "my secret prompt"
-			for _, ep := range endpoint.All {
-				req, _ := http.NewRequest(http.MethodPost, gw.URL+ep.Path+"/", strings.NewReader(
-					`{"model":"m","prompt":"`+secret+`","messages":[{"role":"user","content":"`+secret+`"}]}`))
-				req.Header.Set("Content-Type", "application/json")
-				req.Header.Set("Authorization", "Bearer sk-user-key")
-				// Do not follow redirects: the point is what THIS gateway answered.
-				client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
-					return http.ErrUseLastResponse
-				}}
-				resp, err := client.Do(req)
-				if err != nil {
-					t.Fatalf("post %s/: %v", ep.Path, err)
-				}
-				_ = resp.Body.Close()
-				if got := resp.Header.Get(openaiproxy.HeaderE2EE); got != openaiproxy.E2EEValueSealed {
-					t.Errorf("POST %s/: %s = %q, want %q — the trailing-slash form belongs to the "+
-						"sealed surface, not to its subtree", ep.Path, openaiproxy.HeaderE2EE, got,
-						openaiproxy.E2EEValueSealed)
-				}
-			}
-
-			paths, _, bodies := rr.snapshot()
-			for i, b := range bodies {
-				if strings.Contains(b, secret) {
-					t.Fatalf("the prompt reached the router in the clear at %s: %s", paths[i], b)
-				}
-			}
-			if len(paths) != 0 {
-				t.Errorf("the trailing-slash form was forwarded to the router: %v", paths)
-			}
-		})
+	const secret = "my secret prompt"
+	for _, ep := range endpoint.All {
+		req, _ := http.NewRequest(http.MethodPost, gw.URL+ep.Path+"/", strings.NewReader(
+			`{"model":"m","prompt":"`+secret+`","messages":[{"role":"user","content":"`+secret+`"}]}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer sk-user-key")
+		// Do not follow redirects: the point is what THIS gateway answered.
+		client := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("post %s/: %v", ep.Path, err)
+		}
+		_ = resp.Body.Close()
+		if got := resp.Header.Get(openaiproxy.HeaderE2EE); got != openaiproxy.E2EEValueSealed {
+			t.Errorf("POST %s/: %s = %q, want %q — the trailing-slash form belongs to the "+
+				"sealed surface, not to its subtree", ep.Path, openaiproxy.HeaderE2EE, got,
+				openaiproxy.E2EEValueSealed)
+		}
 	}
-}
 
-// composeUnsealedSubtree reads the deployed default out of the compose manifest.
-var composeUnsealedSubtree = regexp.MustCompile(
-	`ZG_GATEWAY_UNSEALED_SUBTREE=\$\{ZG_GATEWAY_UNSEALED_SUBTREE:-([^}]*)\}`)
-
-// The deployed default is pinned because it decides whether a sealed surface's
-// sub-resources reach the untrusted router IN THE CLEAR, and because it
-// deliberately disagrees with the binary's own default.
-//
-// The flag defaults to "refuse", which is right for a gateway beside a router a
-// caller can still reach — a 501 there points at an open door. The deployment
-// whose endpoint becomes the network's only entry needs "passthrough", because
-// on the only entry a 501 deletes the feature instead of redirecting. Two
-// correct answers for two topologies, and the file has to pick one.
-//
-// Neither direction of a wrong value announces itself: "refuse" on the sole
-// entry looks like an endpoint that was never implemented, and "passthrough"
-// beside a router forwards content nobody decided to forward. So this asserts
-// the value rather than merely that it parses — changing it should mean editing
-// this test and saying which topology changed.
-func TestComposeUnsealedSubtreeIsPassthrough(t *testing.T) {
-	compose, err := os.ReadFile(composePath)
-	if err != nil {
-		t.Fatalf("read %s: %v", composePath, err)
+	paths, _, bodies := rr.snapshot()
+	for i, b := range bodies {
+		if strings.Contains(b, secret) {
+			t.Fatalf("the prompt reached the router in the clear at %s: %s", paths[i], b)
+		}
 	}
-	m := composeUnsealedSubtree.FindSubmatch(compose)
-	if m == nil {
-		t.Fatalf("no ZG_GATEWAY_UNSEALED_SUBTREE=${...:-<default>} entry in %s; if the entry was "+
-			"reshaped deliberately, update this test rather than dropping it", composePath)
-	}
-	switch got := string(m[1]); got {
-	case unsealedSubtreePassthrough:
-		// The global-entry deployment's answer.
-	case unsealedSubtreeRefuse:
-		t.Errorf("the compose default is %q, the binary's default and the one for a gateway "+
-			"running BESIDE a reachable router. On the sole entry it turns "+
-			"POST /v1/messages/count_tokens and GET /v1/chat/completions into 501s that "+
-			"look like endpoints nobody implemented. If this deployment is no longer the "+
-			"sole entry, say so here", got)
-	default:
-		t.Errorf("the compose default is %q, which is neither %q nor %q — the gateway refuses "+
-			"to start on it, so this would be a deploy that never comes up",
-			got, unsealedSubtreeRefuse, unsealedSubtreePassthrough)
+	if len(paths) != 0 {
+		t.Errorf("the trailing-slash form was forwarded to the router: %v", paths)
 	}
 }
