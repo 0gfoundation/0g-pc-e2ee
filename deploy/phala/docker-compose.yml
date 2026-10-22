@@ -480,10 +480,15 @@ services:
       # between YAML and Go is how a renamed volume turns into a silently empty
       # container list.
       - "ZG_GATEWAY_APP_COMPOSE_FILE=/run/identity/app-compose.json"
-      # matched_release compares the deployed compose text, byte-for-byte, against
-      # the last 5 published releases — the same lookup pcverify makes, so the
-      # release this panel NAMES and the one pcverify CONFIRMS cannot disagree. Runs
-      # once per boot, not per request.
+      # How many published releases the deployed compose text is compared against,
+      # byte-for-byte, for matched_release — the same lookup pcverify makes, so the
+      # release this panel NAMES and the one pcverify CONFIRMS cannot disagree. Left
+      # at 5, pcverify's default too; runs once per boot, not per request. Uncomment
+      # to disable the lookup — REQUIRED for a CVM with no egress to GitHub: a
+      # failed lookup is retried for the life of the process (every 10 minutes, the
+      # document served incomplete and no-cache), while 0 reports matched_release:
+      # null as a settled answer.
+      # - "ZG_GATEWAY_IDENTITY_RELEASES=0"
       #
       # The PROVIDER half of the same panel, at /v1/providers/{address}/identity
       # (issue #80): what this gateway verified about each provider it sealed to.
