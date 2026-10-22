@@ -158,15 +158,15 @@ func main() {
 	// of "*" anyway.
 	//
 	// Which models this deployment seals — and so whether it seals at all. See
-	// sealModels for why the dial is the model and deliberately not a percentage,
-	// and parseSealModels for why "seal nothing" is a word rather than an empty value.
+	// sealModels for why the dial is the model and deliberately not a percentage.
+	// An EMPTY value is honored as set (EnvOr branches on presence), and seals nothing.
 	sealModelsCSV := flag.String("seal-models", proxycli.EnvOr("ZG_GATEWAY_SEAL_MODELS", sealModelsAll),
 		"which models to seal: \""+sealModelsAll+"\" (the default) seals every model; a comma-separated "+
 			"list of model ids seals only those and proxies every other model to the router in the "+
-			"clear, marked "+openaiproxy.HeaderE2EE+": "+openaiproxy.E2EEValueNone+"; \""+sealModelsOff+"\" "+
-			"seals nothing, which makes this gateway behave as the plain router. An entry '<service "+
-			"type>:*' (e.g. 'embedding:*') seals every model on that service type's surfaces. Empty "+
-			"is refused rather than read as either end (env ZG_GATEWAY_SEAL_MODELS)")
+			"clear, marked "+openaiproxy.HeaderE2EE+": "+openaiproxy.E2EEValueNone+"; EMPTY seals nothing, "+
+			"which makes this gateway behave as the plain router. An entry '<service type>:*' (e.g. "+
+			"'embedding:*') seals every model on that service type's surfaces; \""+sealModelsAll+"\" "+
+			"mixed with other entries is refused (env ZG_GATEWAY_SEAL_MODELS)")
 	// Directory holding the public attestation evidence bundle to serve at
 	// /evidences/ — in the TEE deployment, the `evidences` volume dstack-ingress
 	// writes, mounted read-only. Empty (the default) mounts no such route, which is
@@ -623,7 +623,7 @@ type entryPolicy struct {
 	// defense pass everything. See the startup warning for the full reasoning; the
 	// short version is that an API open to every origin is a keys-only API.
 	openOrigins bool
-	// sealModels decides WHICH models are sealed, and with sealModelsOff whether
+	// sealModels decides WHICH models are sealed, and when empty whether
 	// anything is. Its zero value seals ALL — the same zero-value-is-the-ordinary-
 	// deployment rule as the field above.
 	sealModels sealModels
@@ -692,7 +692,7 @@ func (p entryPolicy) newCatalogCache() *catalogCache {
 func (p entryPolicy) credentialsAllowed() bool { return !p.openOrigins }
 
 // sealingOn reports whether this deployment seals the inference surfaces at all.
-// Only an explicit sealModelsOff turns it off; the zero value seals.
+// Only an explicit empty -seal-models turns it off; the zero value seals.
 func (p entryPolicy) sealingOn() bool { return !p.sealModels.off }
 
 // canonicalPath serves r through h with r.URL.Path replaced by path, for the one
@@ -1001,7 +1001,7 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 		// somewhere else being right.
 		mux.Handle(surface+"/", passthrough)
 		mux.Handle(surface, passthrough)
-		// Sealing off (-seal-models=off): this gateway is a transparent proxy for the
+		// Sealing off (-seal-models=""): this gateway is a transparent proxy for the
 		// whole surface, POST included — it lands on the two patterns above because no
 		// more specific `POST <path>` is registered. Nothing here is a leak the way an
 		// unmounted row would be: cleartext to the router IS the configured behaviour,

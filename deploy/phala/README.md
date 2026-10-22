@@ -302,7 +302,7 @@ cleartext alike) and lifts when the body has been read, so it never cuts a
 streamed response. 60 s covers a 20 MiB body at about 2.8 Mbit/s; it is a
 constant in the binary (`defaultBodyReadTimeout`), so changing it is a gateway
 release. (All of this assumes sealing is on, as deployed. With
-`ZG_GATEWAY_SEAL_MODELS=off` the inference routes are a plain passthrough: outside
+an empty `ZG_GATEWAY_SEAL_MODELS` the inference routes are a plain passthrough: outside
 the in-flight cap, unbuffered, and bounded only by the backstop below.)
 
 Every other route — the catch-all to the router, which streams bodies through

@@ -503,18 +503,18 @@ func TestSealModelsMetricLabelIsBounded(t *testing.T) {
 	}
 }
 
-// -seal-models=off seals nothing: a model that would be sealed under any list is
+// An empty -seal-models seals nothing: a model that would be sealed under any list is
 // forwarded in the clear, marked as such.
 func TestSealModelsOffSealsNothing(t *testing.T) {
 	rr := &recordingRouter{}
 	router := rr.server(nil)
 	defer router.Close()
-	gw := catalogGateway(t, router, entryPolicy{sealModels: mustSealModels(t, sealModelsOff)})
+	gw := catalogGateway(t, router, entryPolicy{sealModels: mustSealModels(t, sealModelsNone)})
 
 	body := modelBody(sealedModel)
 	resp, _ := postChat(t, gw.URL, body, "application/json")
 	if m := resp.Header.Get(openaiproxy.HeaderE2EE); m != openaiproxy.E2EEValueNone {
-		t.Errorf("%s = %q, want %q: -seal-models=off seals no model",
+		t.Errorf("%s = %q, want %q: an empty -seal-models seals no model",
 			openaiproxy.HeaderE2EE, m, openaiproxy.E2EEValueNone)
 	}
 	_, _, bodies := rr.snapshot()
@@ -554,7 +554,7 @@ func TestTrailingSlashSpellingAlsoRoutesByModel(t *testing.T) {
 
 // composeSealModels reads the deployed default out of the compose manifest.
 var composeSealModels = regexp.MustCompile(
-	`ZG_GATEWAY_SEAL_MODELS=\$\{ZG_GATEWAY_SEAL_MODELS:-([^}]*)\}`)
+	`ZG_GATEWAY_SEAL_MODELS=\$\{ZG_GATEWAY_SEAL_MODELS(:?)-([^}]*)\}`)
 
 // The deployed model list is pinned here because a typo in it does not fail —
 // it SEALS NOTHING for the misspelt model and forwards its prompts to the
@@ -572,24 +572,29 @@ func TestComposeSealModelsSealsTheIntendedModel(t *testing.T) {
 	}
 	m := composeSealModels.FindSubmatch(compose)
 	if m == nil {
-		t.Fatalf("no ZG_GATEWAY_SEAL_MODELS=${...:-<default>} entry in %s; if the entry was "+
+		t.Fatalf("no ZG_GATEWAY_SEAL_MODELS=${...-<default>} entry in %s; if the entry was "+
 			"reshaped deliberately, update this test rather than dropping it", composePath)
 	}
-	// Startup refuses an unparseable value (an empty one, a stray `*`, an unknown
-	// `<service type>:*` entry), so one here would fail the deploy rather than just
-	// this test.
-	deployed, err := parseSealModels(string(m[1]))
+	// `${VAR-default}`, not `${VAR:-default}`: an empty value is how sealing is turned
+	// off, and the colon form would silently replace it with the default list.
+	if len(m[1]) != 0 {
+		t.Errorf("the compose interpolates ZG_GATEWAY_SEAL_MODELS with `:-`, which replaces an " +
+			"EMPTY value — the only way to turn sealing off — with the default; use `${VAR-…}`")
+	}
+	// Startup refuses an unparseable value (a stray `*`, an unknown `<service type>:*`
+	// entry), so one here would fail the deploy rather than just this test.
+	deployed, err := parseSealModels(string(m[2]))
 	if err != nil {
-		t.Fatalf("the deployed list %q does not parse: %v", m[1], err)
+		t.Fatalf("the deployed list %q does not parse: %v", m[2], err)
 	}
 	if deployed.off {
-		t.Fatalf("the compose seal-model list is %q, which seals NOTHING. If that is "+
-			"deliberate, say so here (%q)", sealModelsOff, m[1])
+		t.Fatalf("the compose seal-model default is empty, which seals NOTHING. If that is " +
+			"deliberate, say so here")
 	}
 	if deployed.all() {
 		t.Fatalf("the compose seal-model list is %q, which seals EVERY model — including the "+
 			"ones with no sealable provider, whose route-preview comes back empty and is "+
-			"terminal. If that is deliberate, say so here (%q)", sealModelsAll, m[1])
+			"terminal. If that is deliberate, say so here (%q)", sealModelsAll, m[2])
 	}
 
 	// The 0G in-house model, and its only registry alias — the on-chain spelling,
@@ -669,23 +674,31 @@ func mustSealModels(t testing.TB, csv string) sealModels {
 	return s
 }
 
-// The two ends are words, and everything ambiguous is refused at startup rather
-// than read as either end — the question is whether prompts are encrypted.
+// `*` seals everything, empty seals nothing, and `*` mixed with models is refused
+// at startup rather than read as either — the question is whether prompts are
+// encrypted.
 func TestParseSealModelsEnds(t *testing.T) {
 	if s := mustSealModels(t, sealModelsAll); !s.all() || s.off {
 		t.Errorf("%q = %+v, want every model sealed", sealModelsAll, s)
 	}
-	if s := mustSealModels(t, " OFF "); !s.off {
-		t.Errorf("%q = %+v, want nothing sealed", "OFF", s)
+	for _, empty := range []string{sealModelsNone, " ", " , ,, "} {
+		if s := mustSealModels(t, empty); !s.off {
+			t.Errorf("%q = %+v, want nothing sealed", empty, s)
+		}
 	}
-	for _, bad := range []string{"", " , ,, ", "*,glm-5", "off,glm-5", "*,off"} {
+	// "off" is not a keyword: it is a model id like any other, so it seals only a
+	// model of that name and is NOT a way to turn sealing off.
+	if s := mustSealModels(t, "off"); s.off || !s.seals("off") || s.seals("glm-5") {
+		t.Errorf(`"off" = %+v, want an ordinary one-model list`, s)
+	}
+	for _, bad := range []string{"*,glm-5", "glm-5, *"} {
 		if _, err := parseSealModels(bad); err == nil {
-			t.Errorf("parseSealModels(%q) succeeded; an empty or mixed value must be refused", bad)
+			t.Errorf("parseSealModels(%q) succeeded; `*` mixed with models must be refused", bad)
 		}
 	}
 	// The built-in default is the sealing end: a gateway that says nothing keeps
 	// sealing rather than silently stopping.
-	if !(entryPolicy{}).sealingOn() || (entryPolicy{sealModels: mustSealModels(t, sealModelsOff)}).sealingOn() {
-		t.Error("sealingOn must be true for the zero policy and false only for off")
+	if !(entryPolicy{}).sealingOn() || (entryPolicy{sealModels: mustSealModels(t, sealModelsNone)}).sealingOn() {
+		t.Error("sealingOn must be true for the zero policy and false only for an empty list")
 	}
 }
