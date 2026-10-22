@@ -798,9 +798,15 @@ could not do anyway, since JS cannot see its own connection's peer certificate
 | `ZG_GATEWAY_APP_COMPOSE_FILE=/run/identity/app-compose.json` | gateway | where the container list comes from. Spelled out here, not defaulted in the binary, because the path is a contract between containers: it appears three times in the compose, and splitting it between YAML and Go is how a renamed volume becomes a silently empty list. |
 
 The file is the only source; a missing or stale one costs the container list and
-nothing else. The route is always mounted, and `matched_release` compares against the
-last 5 published releases, matching pcverify's own default; a CVM with no egress to
-GitHub reports `matched_release: null`.
+nothing else. The route is always mounted.
+
+`ZG_GATEWAY_IDENTITY_RELEASES` is left at its built-in default and appears in the
+compose only as a commented-out line: `matched_release` compares against the last `5`
+published releases, matching pcverify's own default. **A CVM with no egress to GitHub
+must set it to `0`.** A failed lookup is not a settled answer — it is retried for the
+life of the process (backing off to every 10 minutes, logging `identity: incomplete,
+will retry`), and the document stays marked incomplete and is served no-cache. `0`
+skips the lookup and reports `matched_release: null` as settled.
 
 **It is not evidence, and the code is written to keep it that way.** The gateway signs
 nothing here and does not DCAP-verify its own quote; the response carries no

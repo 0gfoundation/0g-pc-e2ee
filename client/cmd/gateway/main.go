@@ -222,6 +222,20 @@ func main() {
 		"path to the app-compose.json written by cmd/cvmid, read for "+identityPath+"'s container "+
 			"list after checking it against the quote's compose_hash; empty reports no container "+
 			"list (env ZG_GATEWAY_APP_COMPOSE_FILE)")
+	// How many published releases the deployed compose text is compared against for
+	// the endpoint's matched_release. The same lookup, and the same byte-for-byte
+	// comparison, that `pcverify -releases N` performs — so the release the panel
+	// names and the release pcverify confirms cannot disagree.
+	//
+	// Kept as a flag although nothing deployed changes it, because 0 is not a tuning
+	// value but the only way out for a CVM with no egress to GitHub: a failed lookup
+	// is recorded as pending, so without it the assembly retries for the life of the
+	// process and the document stays incomplete (served no-cache) — the very loop
+	// errNoAppComposeSource exists to avoid. 0 makes matched_release a settled null.
+	identityReleases := flag.Int("identity-releases", proxycli.EnvIntOr("ZG_GATEWAY_IDENTITY_RELEASES", defaultIdentityReleases),
+		"how many published releases to compare the deployed compose text against for "+
+			identityPath+"'s matched_release; 0 disables the GitHub lookup, which a CVM with no "+
+			"egress to GitHub needs (env ZG_GATEWAY_IDENTITY_RELEASES)")
 	// -health turns the binary into its OWN container health probe: it makes one
 	// GET /healthz to the -listen port, prints the result, and exits 0 (healthy)
 	// or 1 — it starts no server. The image is distroless (no shell, no curl,
@@ -384,7 +398,7 @@ func main() {
 		AppID:          runtimeAppID,
 		QuotePath:      quotePath,
 		AppComposePath: *appComposeFile,
-		Releases:       defaultIdentityReleases,
+		Releases:       *identityReleases,
 		Chain:          built.ChainRoot(),
 		OSImages:       osImages,
 		Timeout:        identityLookupTimeout,
