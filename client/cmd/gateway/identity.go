@@ -31,9 +31,9 @@ const identityPath = "/v1/gateway/identity"
 const defaultIdentityReleases = 5
 
 // identityLookupTimeout bounds the one outbound lookup the assembly makes — the
-// GitHub release listing. It is
-// generous because nothing waits on it: the work happens in the background and a
-// slow lookup costs a later answer, never a slower request.
+// GitHub release listing. It is generous because nothing waits on it: the work
+// happens in the background and a slow lookup costs a later answer, never a slower
+// request.
 const identityLookupTimeout = 20 * time.Second
 
 // THIS ENDPOINT IS NOT EVIDENCE. It is the gateway describing ITSELF: values it
@@ -401,14 +401,6 @@ func classifySource(image string) string {
 		return sourceOwn
 	}
 	return sourceThirdParty
-}
-
-// deref reads an optional string field, "" when it is null.
-func deref(s *string) string {
-	if s == nil {
-		return ""
-	}
-	return *s
 }
 
 // readQuoteBody reads and structurally parses the bundle's quote.json. See
