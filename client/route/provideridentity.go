@@ -327,9 +327,9 @@ type ProviderIdentitySource interface {
 // puts it above the warmer's default interval (proxycli.defaultWarmInterval, 4m),
 // which is what makes a warmed record CONTINUOUSLY available rather than
 // intermittently: each sweep replaces the entry before the previous one expires, so
-// a panel loading at an arbitrary moment finds an answer. A deployment that widens
-// -warm-interval past this TTL gets gaps between sweeps, and the endpoint honestly
-// 404s in them rather than reporting a verification that has lapsed.
+// a panel loading at an arbitrary moment finds an answer. Widening that interval
+// past this TTL would leave gaps between sweeps, in which the endpoint honestly
+// 404s rather than reporting a verification that has lapsed.
 const providerIdentityTTL = 5 * time.Minute
 
 // maxProviderIdentities caps how many records are held.

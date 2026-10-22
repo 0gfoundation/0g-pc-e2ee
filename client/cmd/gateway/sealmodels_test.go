@@ -45,7 +45,7 @@ func TestSealModelsRoutesByModel(t *testing.T) {
 	rr := &recordingRouter{}
 	router := rr.server(nil)
 	defer router.Close()
-	gw := catalogGateway(t, router, entryPolicy{sealModels: parseSealModels(sealedModel)})
+	gw := catalogGateway(t, router, entryPolicy{sealModels: mustSealModels(t, sealedModel)})
 
 	// Not on the list → the router's own answer, marked unencrypted.
 	body := modelBody("some-other-model")
@@ -82,10 +82,6 @@ func TestEmptySealModelsSealsEverything(t *testing.T) {
 	if !(sealModels{}).seals("anything") {
 		t.Error("the zero sealModels must seal an arbitrary model")
 	}
-	// A list of nothing but separators is still a list of nothing.
-	if !parseSealModels(" , ,, ").all() {
-		t.Error(`parseSealModels(" , ,, ") must be empty, not a set of blank model names`)
-	}
 
 	rr := &recordingRouter{}
 	router := rr.server(nil)
@@ -110,7 +106,7 @@ func TestUnreadableModelIsSealedNotForwarded(t *testing.T) {
 	rr := &recordingRouter{}
 	router := rr.server(nil)
 	defer router.Close()
-	gw := catalogGateway(t, router, entryPolicy{sealModels: parseSealModels(sealedModel)})
+	gw := catalogGateway(t, router, entryPolicy{sealModels: mustSealModels(t, sealedModel)})
 
 	for _, tc := range []struct{ name, body, contentType string }{
 		{"not json", `this is not json at all`, "application/json"},
@@ -192,7 +188,7 @@ func TestMultipartModelRoutesByModel(t *testing.T) {
 	rr := &recordingRouter{}
 	router := rr.server(nil)
 	defer router.Close()
-	gw := catalogGateway(t, router, entryPolicy{sealModels: parseSealModels(sealedModel)})
+	gw := catalogGateway(t, router, entryPolicy{sealModels: mustSealModels(t, sealedModel)})
 
 	// A transcription model nobody listed: to the router, in the clear, marked.
 	resp := postSpeech(t, gw.URL, "whisper-1")
@@ -235,7 +231,7 @@ func TestMultipartModelFieldPosition(t *testing.T) {
 			if reason != "" {
 				t.Fatalf("reason = %q, want the model to be readable", reason)
 			}
-			if !parseSealModels(sealedModel).seals(model) {
+			if !mustSealModels(t, sealedModel).seals(model) {
 				t.Errorf("model = %q, which does not match the configured %q", model, sealedModel)
 			}
 		})
@@ -324,7 +320,7 @@ func TestSealModelsOnlyAppliesToSealedSurfaces(t *testing.T) {
 	router := rr.server(nil)
 	defer router.Close()
 	// The list names a completions model. It must not change what that path does.
-	gw := catalogGateway(t, router, entryPolicy{sealModels: parseSealModels("gpt-3.5-turbo-instruct")})
+	gw := catalogGateway(t, router, entryPolicy{sealModels: mustSealModels(t, "gpt-3.5-turbo-instruct")})
 
 	body := `{"model":"gpt-3.5-turbo-instruct","prompt":"hello"}`
 	req, _ := http.NewRequest(http.MethodPost, gw.URL+unsealedPath, strings.NewReader(body))
@@ -369,7 +365,7 @@ func TestSealModelsRoutesEmbeddingsByModel(t *testing.T) {
 		rr := &recordingRouter{}
 		router := rr.server(nil)
 		defer router.Close()
-		gw := catalogGateway(t, router, entryPolicy{sealModels: parseSealModels(sealedModel)})
+		gw := catalogGateway(t, router, entryPolicy{sealModels: mustSealModels(t, sealedModel)})
 
 		resp := post(t, gw.URL, body)
 		if m := resp.Header.Get(openaiproxy.HeaderE2EE); m != openaiproxy.E2EEValueNone {
@@ -384,7 +380,7 @@ func TestSealModelsRoutesEmbeddingsByModel(t *testing.T) {
 		rr := &recordingRouter{}
 		router := rr.server(nil)
 		defer router.Close()
-		gw := catalogGateway(t, router, entryPolicy{sealModels: parseSealModels(sealedModel + "," + embeddingModel)})
+		gw := catalogGateway(t, router, entryPolicy{sealModels: mustSealModels(t, sealedModel+","+embeddingModel)})
 
 		resp := post(t, gw.URL, body)
 		if m := resp.Header.Get(openaiproxy.HeaderE2EE); m != openaiproxy.E2EEValueSealed {
@@ -401,7 +397,7 @@ func TestSealModelsRoutesEmbeddingsByModel(t *testing.T) {
 // `<service type>:*` claims every row of that service type, and nothing else is
 // read as one: a model id may contain `:`, but never `*`.
 func TestParseSealModelsServiceTypeEntries(t *testing.T) {
-	s := parseSealModels("glm-5, Embedding:* ,chatbot:*,qwen3:8b,video-to-text:*,embedding:x")
+	s := mustSealModels(t, "glm-5, Embedding:* ,chatbot:*,qwen3:8b,embedding:x")
 
 	wantSurfaces := map[string]string{
 		endpoint.Embedding.Path: "embedding:*",
@@ -421,12 +417,14 @@ func TestParseSealModelsServiceTypeEntries(t *testing.T) {
 			t.Errorf("seals(%q) = false: an entry without the `:*` suffix is a model id", model)
 		}
 	}
-	if len(s.unknown) != 1 || s.unknown[0] != "video-to-text:*" {
-		t.Errorf("unknown = %v, want [video-to-text:*]: startup must refuse it", s.unknown)
+	// A service type no row has is refused, not ignored: it would leave the surface
+	// the operator meant to seal in the clear while reading as configured.
+	if _, err := parseSealModels("glm-5,video-to-text:*"); err == nil || !strings.Contains(err.Error(), "video-to-text:*") {
+		t.Errorf("err = %v, want video-to-text:* refused by name", err)
 	}
 
 	// A list of service-type entries only is still a list.
-	if parseSealModels("embedding:*").all() {
+	if mustSealModels(t, "embedding:*").all() {
 		t.Error("a list naming only `embedding:*` must not read as \"seal every model\"")
 	}
 }
@@ -438,7 +436,7 @@ func TestServiceTypeEntrySealsEveryModelOnItsSurface(t *testing.T) {
 	rr := &recordingRouter{}
 	router := rr.server(nil)
 	defer router.Close()
-	gw := catalogGateway(t, router, entryPolicy{sealModels: parseSealModels(sealedModel + ",embedding:*")})
+	gw := catalogGateway(t, router, entryPolicy{sealModels: mustSealModels(t, sealedModel+",embedding:*")})
 
 	post := func(t *testing.T, path, body string) *http.Response {
 		t.Helper()
@@ -480,7 +478,7 @@ func TestServiceTypeEntrySealsEveryModelOnItsSurface(t *testing.T) {
 // Matching is case-insensitive in both directions, so a caller's casing cannot
 // silently drop a model out of the sealed set.
 func TestSealModelsMatchingIsCaseInsensitive(t *testing.T) {
-	s := parseSealModels("GLM-5, Claude-Opus-5 ")
+	s := mustSealModels(t, "GLM-5, Claude-Opus-5 ")
 	for _, m := range []string{"glm-5", "GLM-5", "gLm-5", "claude-opus-5", "CLAUDE-OPUS-5"} {
 		if !s.seals(m) {
 			t.Errorf("seals(%q) = false, want true", m)
@@ -494,7 +492,7 @@ func TestSealModelsMatchingIsCaseInsensitive(t *testing.T) {
 // The metric label is bounded by the CONFIGURED set, never by what a caller
 // sends — otherwise one client could mint a Prometheus time series per request.
 func TestSealModelsMetricLabelIsBounded(t *testing.T) {
-	s := parseSealModels("glm-5,claude-opus-5")
+	s := mustSealModels(t, "glm-5,claude-opus-5")
 	if got := s.label("GLM-5"); got != "glm-5" {
 		t.Errorf("label(%q) = %q, want the canonical configured name", "GLM-5", got)
 	}
@@ -505,21 +503,18 @@ func TestSealModelsMetricLabelIsBounded(t *testing.T) {
 	}
 }
 
-// -seal-policy=off wins outright: with nothing sealed there is no per-model
-// decision to make, and a model on the list must not be sealed anyway.
-func TestSealPolicyOffBeatsTheModelList(t *testing.T) {
+// -seal-models=off seals nothing: a model that would be sealed under any list is
+// forwarded in the clear, marked as such.
+func TestSealModelsOffSealsNothing(t *testing.T) {
 	rr := &recordingRouter{}
 	router := rr.server(nil)
 	defer router.Close()
-	gw := catalogGateway(t, router, entryPolicy{
-		sealPolicy: sealPolicyOff,
-		sealModels: parseSealModels(sealedModel),
-	})
+	gw := catalogGateway(t, router, entryPolicy{sealModels: mustSealModels(t, sealModelsOff)})
 
 	body := modelBody(sealedModel)
 	resp, _ := postChat(t, gw.URL, body, "application/json")
 	if m := resp.Header.Get(openaiproxy.HeaderE2EE); m != openaiproxy.E2EEValueNone {
-		t.Errorf("%s = %q, want %q: -seal-policy=off is not overridable per model",
+		t.Errorf("%s = %q, want %q: -seal-models=off seals no model",
 			openaiproxy.HeaderE2EE, m, openaiproxy.E2EEValueNone)
 	}
 	_, _, bodies := rr.snapshot()
@@ -536,7 +531,7 @@ func TestTrailingSlashSpellingAlsoRoutesByModel(t *testing.T) {
 	rr := &recordingRouter{}
 	router := rr.server(nil)
 	defer router.Close()
-	gw := catalogGateway(t, router, entryPolicy{sealModels: parseSealModels(sealedModel)})
+	gw := catalogGateway(t, router, entryPolicy{sealModels: mustSealModels(t, sealedModel)})
 
 	req, _ := http.NewRequest(http.MethodPost, gw.URL+endpoint.Chat.Path+"/",
 		strings.NewReader(modelBody(sealedModel)))
@@ -580,18 +575,21 @@ func TestComposeSealModelsSealsTheIntendedModel(t *testing.T) {
 		t.Fatalf("no ZG_GATEWAY_SEAL_MODELS=${...:-<default>} entry in %s; if the entry was "+
 			"reshaped deliberately, update this test rather than dropping it", composePath)
 	}
-	deployed := parseSealModels(string(m[1]))
-	if deployed.all() {
-		t.Fatalf("the compose seal-model list is empty, which seals EVERY model — including the "+
-			"ones with no sealable provider, whose route-preview comes back empty and is "+
-			"terminal. If that is deliberate, say so here rather than leaving it to look "+
-			"like a deletion (%q)", m[1])
+	// Startup refuses an unparseable value (an empty one, a stray `*`, an unknown
+	// `<service type>:*` entry), so one here would fail the deploy rather than just
+	// this test.
+	deployed, err := parseSealModels(string(m[1]))
+	if err != nil {
+		t.Fatalf("the deployed list %q does not parse: %v", m[1], err)
 	}
-
-	// Startup refuses an unknown `<service type>:*` entry, so one here would fail
-	// the deploy rather than just this test.
-	if len(deployed.unknown) > 0 {
-		t.Errorf("the deployed list %q names service types no surface has: %v", m[1], deployed.unknown)
+	if deployed.off {
+		t.Fatalf("the compose seal-model list is %q, which seals NOTHING. If that is "+
+			"deliberate, say so here (%q)", sealModelsOff, m[1])
+	}
+	if deployed.all() {
+		t.Fatalf("the compose seal-model list is %q, which seals EVERY model — including the "+
+			"ones with no sealable provider, whose route-preview comes back empty and is "+
+			"terminal. If that is deliberate, say so here (%q)", sealModelsAll, m[1])
 	}
 
 	// The 0G in-house model, and its only registry alias — the on-chain spelling,
@@ -625,7 +623,7 @@ func TestCleartextCapIsWiderThanTheSealedOne(t *testing.T) {
 	rr := &recordingRouter{}
 	router := rr.server(nil)
 	defer router.Close()
-	gw := catalogGateway(t, router, entryPolicy{sealModels: parseSealModels(sealedModel)})
+	gw := catalogGateway(t, router, entryPolicy{sealModels: mustSealModels(t, sealedModel)})
 	between := openaiproxy.MaxRequestBytes + (maxPassthroughBytes-openaiproxy.MaxRequestBytes)/2
 	forwarded := func() []string {
 		var out []string
@@ -658,5 +656,36 @@ func TestCleartextCapIsWiderThanTheSealedOne(t *testing.T) {
 	}
 	if f := forwarded(); len(f) != 1 {
 		t.Errorf("router got %d chat bodies, want still 1: neither oversize request may be forwarded", len(f))
+	}
+}
+
+// mustSealModels parses a -seal-models value a test knows to be valid.
+func mustSealModels(t testing.TB, csv string) sealModels {
+	t.Helper()
+	s, err := parseSealModels(csv)
+	if err != nil {
+		t.Fatalf("parseSealModels(%q): %v", csv, err)
+	}
+	return s
+}
+
+// The two ends are words, and everything ambiguous is refused at startup rather
+// than read as either end — the question is whether prompts are encrypted.
+func TestParseSealModelsEnds(t *testing.T) {
+	if s := mustSealModels(t, sealModelsAll); !s.all() || s.off {
+		t.Errorf("%q = %+v, want every model sealed", sealModelsAll, s)
+	}
+	if s := mustSealModels(t, " OFF "); !s.off {
+		t.Errorf("%q = %+v, want nothing sealed", "OFF", s)
+	}
+	for _, bad := range []string{"", " , ,, ", "*,glm-5", "off,glm-5", "*,off"} {
+		if _, err := parseSealModels(bad); err == nil {
+			t.Errorf("parseSealModels(%q) succeeded; an empty or mixed value must be refused", bad)
+		}
+	}
+	// The built-in default is the sealing end: a gateway that says nothing keeps
+	// sealing rather than silently stopping.
+	if !(entryPolicy{}).sealingOn() || (entryPolicy{sealModels: mustSealModels(t, sealModelsOff)}).sealingOn() {
+		t.Error("sealingOn must be true for the zero policy and false only for off")
 	}
 }

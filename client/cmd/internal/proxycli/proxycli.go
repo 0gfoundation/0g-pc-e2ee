@@ -186,15 +186,13 @@ type Flags struct {
 	chainRPCURL     *string
 	servingContract *string
 	warmOn          *bool
-	warmInterval    *time.Duration
 	pccsURL         *string
-	collateralTTL   *time.Duration
 	runtimeReleases *bool
 	providerEnforce *bool
 }
 
-// defaultWarmInterval is the refresh-ahead period the background quote-cache
-// warmer uses when -warm is set without an explicit -warm-interval. It sits
+// defaultWarmInterval is the refresh-ahead period of the background quote-cache
+// warmer (-warm). Not a flag: nothing ever set it to anything else. It sits
 // under the route package's quote-cache TTL (5m) so a cached entry is
 // re-verified before it expires and requests keep hitting a warm cache (see
 // route.RunWarmer).
@@ -206,7 +204,7 @@ const defaultWarmInterval = 4 * time.Minute
 // deliberately bounded: a cached CRL delays observing a fresh revocation until it
 // expires, so this is the accepted revocation-lag window — long enough to dedup
 // across a warmer cycle and the ~dozens of providers, far under collateral's
-// nextUpdate. Tunable via -collateral-ttl (0 disables the cache).
+// nextUpdate. Not a flag: nothing ever set it to anything else.
 const defaultCollateralTTL = time.Hour
 
 // RegisterFlags declares the shared startup flags on fs and returns a Flags
@@ -214,8 +212,8 @@ const defaultCollateralTTL = time.Hour
 // "ZG_SIDECAR") selects the environment variables consulted for each flag's
 // default: <envPrefix>_LISTEN, _ROUTER_URL, _PROVIDER_URL,
 // _ATTEST, _ATTEST_ENFORCE, _ONCHAIN, _ONCHAIN_ENFORCE, _NETWORK,
-// _CHAIN_RPC_URL, _SERVING_CONTRACT, _WARM, _WARM_INTERVAL, _PCCS_URL,
-// _COLLATERAL_TTL, _RUNTIME_RELEASES, _PROVIDER_ENFORCE.
+// _CHAIN_RPC_URL, _SERVING_CONTRACT, _WARM, _PCCS_URL, _RUNTIME_RELEASES,
+// _PROVIDER_ENFORCE.
 // defaultListen is the built-in listen address used when neither the flag nor
 // <envPrefix>_LISTEN is set.
 //
@@ -250,12 +248,8 @@ func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen, defaultRouterURL 
 			fmt.Sprintf("InferenceServing contract address for on-chain signer lookups and the recorded deployments' key. Empty means 0G mainnet's (%s) (env %s)", chain.DefaultInferenceServingAddress, env("SERVING_CONTRACT"))),
 		warmOn: fs.Bool("warm", envBool(env("WARM"), false),
 			fmt.Sprintf("run a background warmer that pre-verifies every provider's quote and refreshes it ahead of expiry, so requests hit a warm cache instead of paying the DCAP verify inline; requires -attest and -onchain (env %s)", env("WARM"))),
-		warmInterval: fs.Duration("warm-interval", envDuration(env("WARM_INTERVAL"), defaultWarmInterval),
-			fmt.Sprintf("with -warm, how often to re-verify each provider (should be under the ~5m quote-cache TTL for refresh-ahead) (env %s)", env("WARM_INTERVAL"))),
 		pccsURL: fs.String("pccs-url", envOr(env("PCCS_URL"), ""),
 			fmt.Sprintf("with -attest, fetch Intel PCS collateral (TCB Info, QE Identity, PCK CRL) from this PCCS base (e.g. https://pccs.phala.network) instead of api.trustedservices.intel.com; the root-CA CRL still comes from Intel (env %s)", env("PCCS_URL"))),
-		collateralTTL: fs.Duration("collateral-ttl", envDuration(env("COLLATERAL_TTL"), defaultCollateralTTL),
-			fmt.Sprintf("with -attest, how long to memoize DCAP collateral by URL so it is not re-fetched per provider/sweep; bounds revocation lag, 0 disables (env %s)", env("COLLATERAL_TTL"))),
 		runtimeReleases: fs.Bool("runtime-releases", envBool(env("RUNTIME_RELEASES"), true),
 			fmt.Sprintf("with -attest, judge the broker build each provider's CVM runs now (its RTMR3 runtime records) against the broker's signed release provenance (client/provenance/policy.json), fetching it from ghcr.io and Sigstore's trust root from tuf-repo-cdn.sigstore.dev in the background; observed and logged, and a gate only under -provider-enforce. false for a host with no egress to those (env %s)", env("RUNTIME_RELEASES"))),
 		providerEnforce: fs.Bool("provider-enforce", envBool(env("PROVIDER_ENFORCE"), false),
@@ -493,10 +487,6 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 			os.Exit(1)
 		}
 	}
-	if *f.warmOn && *f.warmInterval <= 0 {
-		logger.Error("-warm requires a positive -warm-interval")
-		os.Exit(1)
-	}
 
 	// Route per request: pick the provider via the router and derive its enc key +
 	// signer from the broker, so no provider key is pinned up front. The router
@@ -513,7 +503,7 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 	var routeOpts []route.Option
 	if *f.attestOn {
 		routeOpts = append(routeOpts, route.WithQuoteVerification(
-			newVerifier(label, *f.attestEnforce, *f.pccsURL, *f.collateralTTL, logger), logger))
+			newVerifier(label, *f.attestEnforce, *f.pccsURL, defaultCollateralTTL, logger), logger))
 		if *f.runtimeReleases {
 			routeOpts = append(routeOpts, route.WithReleaseVerifier(newReleaseVerifier(label, *f.providerEnforce, logger),
 				logger))
@@ -608,7 +598,7 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 		chainRoot: root}
 	if *f.warmOn {
 		b.resolver = resolver
-		b.warmInterval = *f.warmInterval
+		b.warmInterval = defaultWarmInterval
 	}
 	return b
 }
@@ -869,11 +859,6 @@ func EnvBool(key string, def bool) bool { return envBool(key, def) }
 // treatment of a set-but-unparseable value.
 func EnvIntOr(key string, def int) int { return envInt(key, def) }
 
-// EnvDurationOr is EnvOr's duration counterpart, for a binary registering its
-// OWN duration flag (the gateway's -catalog-cache-ttl): same precedence, same
-// fail-loud treatment of a set-but-unparseable value.
-func EnvDurationOr(key string, def time.Duration) time.Duration { return envDuration(key, def) }
-
 // envInt parses an integer environment variable. An unset or empty variable falls
 // back to def; a set-but-unparseable one is fatal rather than silently defaulting,
 // so a typo in a concurrency ceiling cannot quietly restore the built-in value
@@ -910,22 +895,6 @@ func envBool(key string, def bool) bool {
 		log.Fatalf("invalid %s=%q: must be a boolean (true/false)", key, v)
 	}
 	return b
-}
-
-// envDuration parses a duration environment variable (Go duration syntax, e.g.
-// "4m", "90s"). An unset variable falls back to def; a set-but-unparseable value
-// is fatal rather than silently defaulting, so a typo like ZG_GATEWAY_WARM_INTERVAL=4
-// (missing unit) cannot quietly change the refresh cadence.
-func envDuration(key string, def time.Duration) time.Duration {
-	v, ok := os.LookupEnv(key)
-	if !ok {
-		return def
-	}
-	d, err := time.ParseDuration(v)
-	if err != nil {
-		log.Fatalf("invalid %s=%q: must be a Go duration (e.g. 4m, 90s)", key, v)
-	}
-	return d
 }
 
 // builtinBaseline is the per-service compose baseline embedded in this binary

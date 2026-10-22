@@ -297,17 +297,6 @@ services:
       # whatever a developer happens to be serving on those ports. Keep prod to the
       # first-party origins.
       - "ZG_GATEWAY_ALLOWED_ORIGINS=${ZG_GATEWAY_ALLOWED_ORIGINS:-https://0g.ai,https://*.0g.ai}"
-      # The global-entry knob.
-      # Referenced with its OFF default rather than left out, for the same reason
-      # ACME_STAGING is referenced: a variable this file does not mention can never
-      # reach the container, so leaving it out would mean the cutover needs a compose
-      # edit — a new compose_hash, a new measurement, a redeploy — at the moment it can
-      # least afford one. Referenced with a default, the value switches through the
-      # encrypted env and the measured text is untouched. It must therefore be entered
-      # in allowed_envs on EVERY side, including while it is "refuse", and toggled by
-      # value (README "Serving domain", and blue-green.md on why a drifting
-      # allowed_envs list is its own problem).
-      #
       # There is deliberately NO companion variable for cookie credentials: the
       # router's `jwt` cookie is admitted, and the CORS answer is credentialed,
       # whenever ZG_GATEWAY_ALLOWED_ORIGINS names its origins rather than saying "*".
@@ -316,44 +305,37 @@ services:
       # router's hostname, and the setting could only ever be forgotten in the
       # direction that breaks the whole first-party app with a CORS error rather than
       # a 401.
-      # ZG_GATEWAY_SEAL_POLICY decides whether this gateway SEALS at all.
-      # "always" (the default, and today's behaviour) seals every sealed surface's
-      # POST; "off" seals nothing and proxies those paths to the router in the clear,
-      # marked X-0G-E2EE: none — behaviourally the plain router.
+      # ZG_GATEWAY_SEAL_MODELS decides WHICH models get sealed — and so whether this
+      # gateway seals at all:
       #
-      # ⚠️ The global-entry cutover sets this to "off", and that is the whole point:
-      # pointing router-api.0g.ai at a gateway that seals unconditionally would, in
-      # one DNS change, also turn default encryption on for everybody — the provider
-      # pool narrows to the sealable endpoints, web search and file attachments break
-      # by construction, and every request pays a route-preview plus an HPKE seal.
-      # DNS cutover is a deploy; the sealing default is a release, and they get
-      # separate decisions.
+      #   "*"      seals every model (the binary's default).
+      #   a list   seals only those models and proxies the rest to the router in the
+      #            clear, marked X-0G-E2EE: none.
+      #   "off"    seals nothing: every sealed surface is proxied in the clear, marked
+      #            X-0G-E2EE: none — behaviourally the plain router.
       #
-      # The default stays "always" so that nothing changes for the deployments
-      # running today: a gateway that says nothing keeps sealing. An unrecognised
-      # value fails startup rather than guessing — there is no safe direction to
-      # guess in when the question is "is this encrypted".
-      - "ZG_GATEWAY_SEAL_POLICY=${ZG_GATEWAY_SEAL_POLICY:-always}"
-      # ZG_GATEWAY_SEAL_MODELS narrows WHICH models get sealed. Empty (the default)
-      # seals every model — the behaviour before this existed. A comma-separated list
-      # seals only those and proxies the rest to the router in the clear, marked
-      # X-0G-E2EE: none.
+      # An empty value, or "*" / "off" mixed with model ids, fails startup rather
+      # than guessing — there is no safe direction to guess in when the question is
+      # "is this encrypted". (This used to be two variables, ZG_GATEWAY_SEAL_POLICY
+      # for always/off plus this list; "off" here is what SEAL_POLICY=off was.)
       #
       # This is the rollout dial. Only a couple of chat models have E2EE support on
       # the network, so sealing everything fails the rest (a model with no sealable
       # provider gets an empty route-preview, which the client treats as TERMINAL),
       # while sealing nothing gives up encryption for the models that do work.
-      # Add a model, watch, add the next.
+      # Add a model, watch, add the next. "off" is the global-entry escape hatch:
+      # pointing router-api.0g.ai at a gateway that seals would also turn encryption
+      # on for everybody, so DNS cutover and the sealing default are separate
+      # decisions.
       #
-      # ⚠️ Declared HERE, with an inert default, ON PURPOSE — even though nobody is
-      # using it yet. Adding a key to allowed_envs changes the measured app-compose
-      # and so compose_hash, which is an upgrade, which brings up a fresh CVM with an
-      # EMPTY cert-data volume and re-issues the certificate. Let's Encrypt allows 5
-      # duplicate certificates per hostname per rolling week (README "Verify",
-      # blue-green.md "Let's Encrypt limits"), so keys are cheap to add now and
-      # expensive to add on the day you need them. Declaring it now means every later
-      # adjustment changes only the VALUE — the same reason ACME_STAGING is kept
-      # permanently listed rather than added and removed.
+      # ⚠️ Referenced with a default rather than left out: a variable this file does
+      # not mention can never reach the container, and adding a key to allowed_envs
+      # changes the measured app-compose and so compose_hash, which is an upgrade,
+      # which brings up a fresh CVM with an EMPTY cert-data volume and re-issues the
+      # certificate. Let's Encrypt allows 5 duplicate certificates per hostname per
+      # rolling week (README "Verify", blue-green.md "Let's Encrypt limits"), so the
+      # key stays declared and every adjustment changes only the VALUE — the same
+      # reason ACME_STAGING is kept permanently listed.
       #
       # Currently: 0gm-1.0-35b-a3b, the 0G in-house model. ⚠️ Naming ANY model here
       # means every OTHER model stops being sealed — the list is exhaustive, not
@@ -367,49 +349,18 @@ services:
       # 0gm-1.0-35b-a3b-sia is deliberately NOT included; add it by name if it
       # gains E2EE support.
       - "ZG_GATEWAY_SEAL_MODELS=${ZG_GATEWAY_SEAL_MODELS:-0gm-1.0-35b-a3b}"
-      # ZG_GATEWAY_UNSEALED_SUBTREE decides what a sealed surface's sub-resources and
-      # non-sealed methods answer — POST /v1/messages/count_tokens,
-      # GET /v1/chat/completions and the like: "refuse" (501) or "passthrough"
-      # (forward them to the router, marked X-0G-E2EE: none).
+      # A sealed surface's sub-resources and non-sealed methods — POST
+      # /v1/messages/count_tokens, GET /v1/chat/completions and the like — are
+      # forwarded to the router, marked X-0G-E2EE: none. There is no variable for it:
+      # this deployment is the network's ONLY entry, where a 501 would not redirect a
+      # caller elsewhere but delete the feature. WHAT IT COSTS, PLAINLY: those
+      # requests reach the untrusted router in the CLEAR (count_tokens carries the
+      # whole conversation); the marker is what keeps that disclosed instead of
+      # silent. POST on a sealed path is sealed exactly as before.
       #
-      # DEFAULTED HERE TO "passthrough", WHICH IS NOT THE BINARY'S DEFAULT. The flag
-      # defaults to "refuse", and that is right for a gateway used as a library or
-      # run beside a router a caller can still reach directly: a 501 there points at
-      # a door that is open. This file is not that. It is the 0G-operated deployment
-      # whose endpoint becomes the network's ONLY entry, and on the only entry a 501
-      # does not redirect — it deletes the feature.
-      #
-      # Defaulting rather than leaving it to each deployment's encrypted env is the
-      # point: a value nobody remembers to set is the failure mode this deployment
-      # keeps hitting (an allowed_envs key never entered, a flag whose flip does
-      # nothing), and every one of them is silent. Encoding the intended topology
-      # here means the cutover has one less thing to get right on the day.
-      #
-      # WHAT IT COSTS, PLAINLY: those sub-resources reach the untrusted router in
-      # the CLEAR. That is the trade, and X-0G-E2EE: none on the response is what
-      # keeps it disclosed instead of silent. It does not touch the sealed surfaces
-      # themselves — POST on a sealed path is sealed exactly as before.
-      #
-      # A deployment that IS beside a reachable router sets "refuse" in its
-      # encrypted env; the key is declared, so that is a value change.
-      #
-      # An unrecognised value fails startup instead of guessing: one of the two
-      # answers forwards content in the clear, and that is not a thing to infer from
-      # a typo. Inert while ZG_GATEWAY_SEAL_POLICY=off — with nothing sealed there is
-      # no sealed namespace left to decide about — and note that with this default
-      # the gateway's "ignored while seal-policy is off" warning now fires from the
-      # default rather than from something an operator typed. The warning is still
-      # true (everything is proxied in the clear when sealing is off); it is just no
-      # longer evidence that anyone set this.
-      - "ZG_GATEWAY_UNSEALED_SUBTREE=${ZG_GATEWAY_UNSEALED_SUBTREE:-passthrough}"
-      # There is deliberately NO variable for the catalog cache TTL
-      # (-catalog-cache-ttl, default 10s), even though the flag exists for local runs
-      # and the loadtest compose. Inside the CVM it would buy nothing: the measured
-      # compose text is what fixes app_id, so changing this value here is a redeploy
-      # either way — the variable would only add an allowed_envs entry that has to be
-      # carried on EVERY blue/green side, for a knob that can never be turned without
-      # a redeploy anyway. Add one the day a value here can actually be changed
-      # without one.
+      # Likewise there is NO variable for the catalog cache TTL (10s), the body-read
+      # timeout (60s), the warmer interval (4m) or the DCAP collateral TTL (1h): they
+      # are constants in the binary, because nothing ever set them to anything else.
       # DCAP-verify each provider's TDX quote and seal only to the verified enc key,
       # instead of trusting the router-supplied pubkey endpoint. Enforced per request:
       # a provider that fails is rejected.
@@ -471,16 +422,12 @@ services:
       # older-but-still-valid CRL / TCB Info, delaying an observed revocation by up
       # to its nextUpdate: a bounded freshness delegation, not a free one.
       - "ZG_GATEWAY_PCCS_URL=https://pccs.phala.network"
-      # How long DCAP collateral is memoized by URL. Bounds revocation lag; defaults
-      # to 1h, 0 disables.
-      # - "ZG_GATEWAY_COLLATERAL_TTL=1h"
       # Background warmer: pre-verify every provider's quote ahead of expiry so
       # requests hit a warm cache instead of paying the DCAP verify inline. Requires
       # ZG_GATEWAY_ATTEST *and* ZG_GATEWAY_ONCHAIN — both on above; enabling it with
-      # ONCHAIN off exits(1) into a restart loop behind a healthy ingress. Interval
-      # left at its 4m default, under the ~5m quote-cache TTL.
+      # ONCHAIN off exits(1) into a restart loop behind a healthy ingress. It sweeps
+      # every 4m, under the ~5m quote-cache TTL.
       - "ZG_GATEWAY_WARM=true"
-      # - "ZG_GATEWAY_WARM_INTERVAL=4m" # optional; 4m is already the default
       #
       # Soft limit for the Go runtime, and the input the in-flight cap is derived
       # from when ZG_GATEWAY_MAX_INFLIGHT is not set:
@@ -515,12 +462,10 @@ services:
       # browser panel to SHOW what it is connected to. A DESCRIPTION, not evidence —
       # nothing in it is signed, and every value is rederivable with `pcverify
       # -gateway <DOMAIN>`, which also does the step a browser cannot do at all:
-      # comparing the served TLS certificate against the one the quote binds. On by
-      # default — it publishes nothing that /evidences/ and the release assets do
-      # not already make public — so uncomment only to remove the route entirely. Read
-      # the header of client/cmd/gateway/identity.go before extending what it
-      # reports.
-      # - "ZG_GATEWAY_IDENTITY_ENDPOINT=false"
+      # comparing the served TLS certificate against the one the quote binds. Always
+      # on — it publishes nothing that /evidences/ and the release assets do not
+      # already make public. Read the header of client/cmd/gateway/identity.go before
+      # extending what it reports.
       #
       # Where that container list comes from: the manifest cvm-identity wrote to the
       # shared volume. Set here rather than defaulted in the binary because this path
@@ -529,30 +474,17 @@ services:
       # between YAML and Go is how a renamed volume turns into a silently empty
       # container list.
       - "ZG_GATEWAY_APP_COMPOSE_FILE=/run/identity/app-compose.json"
-      # Fallback for the one case the file cannot cover: a replica whose init
-      # container predates -out-app-compose, which is exactly what a rolling
-      # blue/green upgrade looks like mid-flight. Only consulted when the file is
-      # unreadable. This wants the BASE domain, which is exactly what the platform
-      # exports — so read it straight rather than re-deriving it from the ingress's
-      # `_.`-prefixed form; the two then cannot disagree. This side is also the
-      # forgiving one: appIDHost strips a leading "_." if it ever sees one, so only
-      # the ingress line above is sensitive to the platform's spelling.
-      - "ZG_GATEWAY_PLATFORM_BASE_DOMAIN=${DSTACK_GATEWAY_DOMAIN:-}"
-      # How many published releases the deployed compose text is compared against,
-      # byte-for-byte, for matched_release — the same lookup pcverify makes, so the
-      # release this panel NAMES and the one pcverify CONFIRMS cannot disagree. Left
-      # at 5, pcverify's default too; runs once per boot, not per request. Uncomment
-      # to disable the lookup — for a CVM with no egress to GitHub, which then
-      # reports matched_release: null.
-      # - "ZG_GATEWAY_IDENTITY_RELEASES=0"
+      # matched_release compares the deployed compose text, byte-for-byte, against
+      # the last 5 published releases — the same lookup pcverify makes, so the
+      # release this panel NAMES and the one pcverify CONFIRMS cannot disagree. Runs
+      # once per boot, not per request.
       #
       # The PROVIDER half of the same panel, at /v1/providers/{address}/identity
       # (issue #80): what this gateway verified about each provider it sealed to.
       # Unlike the self-description it DOES report verdicts — but RELAYED ones, which
       # a panel must render as "the gateway verified this for you". Requires
-      # ZG_GATEWAY_ATTEST (on above), or the route is not mounted. On by default;
-      # uncomment to remove it. See client/cmd/gateway/provideridentity.go.
-      # - "ZG_GATEWAY_PROVIDER_IDENTITY_ENDPOINT=false"
+      # ZG_GATEWAY_ATTEST (on above), or the route is not mounted. See
+      # client/cmd/gateway/provideridentity.go.
       #
       # Its runtime_release verdict: the broker build each provider's CVM runs NOW (its
       # RTMR3 runtime records) against the broker's signed release provenance, fetched

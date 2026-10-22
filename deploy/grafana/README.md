@@ -57,7 +57,7 @@ screen:
    gateway-wide shedding, because each retrying request holds its concurrency
    slot for the whole retry ceiling.
    Under it, **refused at the door**: the 503 sheds and the 408 body-read timeouts
-   (an admitted request whose body did not arrive within `-body-read-timeout`) as a
+   (an admitted request whose body did not arrive within the 60 s body-read deadline) as a
    count over the selected range, and again as rates on their own axis — on the
    in-flight panel shed/s is drawn against hundreds of in-flight requests and does
    not show. `body-read unbounded` there must stay 0: it counts requests the

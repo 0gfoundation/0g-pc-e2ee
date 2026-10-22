@@ -37,8 +37,8 @@ import (
 //
 //   - Metadata and discovery, always. The model catalog and the provider list
 //     carry no prompt, and this path exists for them.
-//   - A sealed surface's sub-resources, only under -unsealed-subtree=passthrough,
-//     and only because the global-entry topology leaves a caller no other door
+//   - A sealed surface's sub-resources, and only because the global-entry
+//     topology leaves a caller no other door
 //     (see the endpoint.All loop in main.go). That content IS read by the router;
 //     the marker is what keeps it disclosed rather than silent.
 //

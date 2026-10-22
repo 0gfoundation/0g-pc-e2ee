@@ -47,8 +47,8 @@ import (
 // that check, not guessing from the name.
 //
 // This wrapper is also mounted ONLY on the catch-all, never on the per-surface
-// `namespace` handler — that one carries prompts under
-// -unsealed-subtree=passthrough, and those are POSTs to paths not on this list,
+// sealed surface's namespace — that one carries prompts, and those are POSTs to
+// paths not on this list,
 // so they would be rejected twice over. Keeping the mount narrow means the
 // question never depends on the list being right.
 var cacheableCatalogPaths = map[string]bool{

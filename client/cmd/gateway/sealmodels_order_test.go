@@ -60,7 +60,7 @@ func TestCredentiallessRequestBodyIsNeverBuffered(t *testing.T) {
 
 	h := newHandler(allSealedClients(), mustURL(t, router.URL), testOrigins(), "", "",
 		noInFlightCap, nil, nil, nil, discardLogger(),
-		withEntryPolicy(entryPolicy{sealModels: parseSealModels(sealedModel)}))
+		withEntryPolicy(entryPolicy{sealModels: mustSealModels(t, sealedModel)}))
 
 	body := &countingBody{remaining: 9 << 20}
 	req := httptest.NewRequest(http.MethodPost, endpoint.Chat.Path, body)
@@ -103,7 +103,7 @@ func TestShedRequestBodyIsNeverBuffered(t *testing.T) {
 	// One slot for the whole gateway.
 	h := newHandler(allSealedClients(), mustURL(t, router.URL), testOrigins(), "", "",
 		1, nil, nil, nil, discardLogger(),
-		withEntryPolicy(entryPolicy{sealModels: parseSealModels(sealedModel)}))
+		withEntryPolicy(entryPolicy{sealModels: mustSealModels(t, sealedModel)}))
 
 	// An unlisted model → cleartext branch → parks in the router, holding the slot.
 	var holder sync.WaitGroup

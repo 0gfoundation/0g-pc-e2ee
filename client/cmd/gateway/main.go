@@ -73,7 +73,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"strings"
 	"time"
 
@@ -158,54 +157,16 @@ func main() {
 	// — an API open to every origin is a keys-only API, which is the coherent reading
 	// of "*" anyway.
 	//
-	// Whether this gateway seals at all. See sealPolicy* for why this is a switch
-	// rather than a property of the path, and why the default keeps sealing.
-	sealPolicy := flag.String("seal-policy", proxycli.EnvOr("ZG_GATEWAY_SEAL_POLICY", sealPolicyAlways),
-		"whether to seal the inference surfaces: \""+sealPolicyAlways+"\" (default) seals every "+
-			"sealed surface's POST as today; \""+sealPolicyOff+"\" seals nothing and proxies those "+
-			"paths to the router in the clear, marked "+openaiproxy.HeaderE2EE+": "+
-			openaiproxy.E2EEValueNone+", which makes this gateway behave as the plain router. Set "+
-			"\""+sealPolicyOff+"\" for the global-entry cutover, so pointing the router's hostname "+
-			"here is a deploy and not also a release of default encryption "+
-			"(env ZG_GATEWAY_SEAL_POLICY)")
-	// Which models this deployment seals. See sealModels for why the dial is the
-	// model and deliberately not a percentage.
-	sealModelsCSV := flag.String("seal-models", proxycli.EnvOr("ZG_GATEWAY_SEAL_MODELS", ""),
-		"comma-separated model ids to seal; every other model is proxied to the router in "+
-			"the clear, marked "+openaiproxy.HeaderE2EE+": "+openaiproxy.E2EEValueNone+". EMPTY "+
-			"(the default) seals every model, which is the behaviour before this existed. Only "+
-			"a couple of chat models have E2EE support on the network, so this is the rollout "+
-			"dial: add a model, watch, add the next. An entry '<service type>:*' (e.g. "+
-			"'embedding:*') seals every model on that service type's surfaces. Inert while -seal-policy is off "+
-			"(env ZG_GATEWAY_SEAL_MODELS)")
-	// What happens to a sealed surface's NAMESPACE — its subtree, and its own path on
-	// every method but the sealed POST. See the endpoint.All loop in newHandler for
-	// the invariant, and unsealedSubtree* below for what each value means.
-	unsealedSubtree := flag.String("unsealed-subtree", proxycli.EnvOr("ZG_GATEWAY_UNSEALED_SUBTREE", unsealedSubtreeRefuse),
-		"how to answer a sealed surface's sub-resources and non-sealed methods (e.g. "+
-			"POST /v1/messages/count_tokens, GET /v1/chat/completions): \""+unsealedSubtreeRefuse+"\" (default) "+
-			"answers 501 rather than forwarding content the router would read in the clear; \""+
-			unsealedSubtreePassthrough+"\" forwards them to the router like any other unsealed path, marked "+
-			openaiproxy.HeaderE2EE+": "+openaiproxy.E2EEValueNone+". Required by the global-entry topology, "+
-			"where calling the router directly is no longer an option (env ZG_GATEWAY_UNSEALED_SUBTREE)")
-	// How long to reuse a public catalog read (catalogcache.go). Not a mere
-	// optimization in the global-entry topology: the router rate-limits these paths
-	// PER CLIENT IP, and this gateway forwards no client IP, so without the cache
-	// every user on earth shares one 120/min bucket.
-	// How long a sealed-path request's body may take to arrive once it holds an
-	// in-flight slot (openaiproxy.BoundBodyRead). Without it a client that sends
-	// headers and trickles the body holds a slot indefinitely.
-	bodyReadTimeout := flag.Duration("body-read-timeout", proxycli.EnvDurationOr("ZG_GATEWAY_BODY_READ_TIMEOUT", defaultBodyReadTimeout),
-		"how long an inference request's body may take to arrive once it is admitted under "+
-			"-max-inflight; past it the request is answered 408 and its slot freed. The bound "+
-			"lifts when the body has been read, so it never cuts a streamed response. 0 disables it "+
-			"(env ZG_GATEWAY_BODY_READ_TIMEOUT)")
-	catalogCacheTTL := flag.Duration("catalog-cache-ttl", proxycli.EnvDurationOr("ZG_GATEWAY_CATALOG_CACHE_TTL", defaultCatalogCacheTTL),
-		"how long to reuse the router's public catalog reads (/v1/models, /v1/providers, "+
-			"/v1/service-types, /status, the public stats groups) across callers, collapsing "+
-			"concurrent misses onto one upstream request. The router rate-limits these per "+
-			"client IP and this gateway forwards none, so the cache is what keeps that budget "+
-			"from becoming one global limit. 0 disables it (env ZG_GATEWAY_CATALOG_CACHE_TTL)")
+	// Which models this deployment seals — and so whether it seals at all. See
+	// sealModels for why the dial is the model and deliberately not a percentage,
+	// and parseSealModels for why "seal nothing" is a word rather than an empty value.
+	sealModelsCSV := flag.String("seal-models", proxycli.EnvOr("ZG_GATEWAY_SEAL_MODELS", sealModelsAll),
+		"which models to seal: \""+sealModelsAll+"\" (the default) seals every model; a comma-separated "+
+			"list of model ids seals only those and proxies every other model to the router in the "+
+			"clear, marked "+openaiproxy.HeaderE2EE+": "+openaiproxy.E2EEValueNone+"; \""+sealModelsOff+"\" "+
+			"seals nothing, which makes this gateway behave as the plain router. An entry '<service "+
+			"type>:*' (e.g. 'embedding:*') seals every model on that service type's surfaces. Empty "+
+			"is refused rather than read as either end (env ZG_GATEWAY_SEAL_MODELS)")
 	// Directory holding the public attestation evidence bundle to serve at
 	// /evidences/ — in the TEE deployment, the `evidences` volume dstack-ingress
 	// writes, mounted read-only. Empty (the default) mounts no such route, which is
@@ -251,74 +212,16 @@ func main() {
 		"serve the Go runtime profiler at /debug/pprof/ on the -metrics-listen address (requires -metrics-listen). "+
 			"For load testing and diagnosis only — it exposes process internals, so never enable it on a listener "+
 			"reachable from outside the CVM (env ZG_GATEWAY_PPROF)")
-	// The self-description endpoint (GET /v1/gateway/identity, issue #78): what this
-	// CVM is, assembled server-side from its own quote and manifest so a browser
-	// panel does not have to reimplement pcverify in JavaScript — which it could not
-	// do anyway, since JS cannot see its own connection's peer certificate. ON by
-	// default: it publishes nothing that /evidences/ and the published releases do
-	// not already make public, and a panel that silently shows nothing is worse than
-	// one that shows nulls. The switch is here for a deployment that wants the
-	// surface gone entirely.
-	//
-	// It is a DESCRIPTION, not a proof — see identity.go's header before extending
-	// what it reports.
-	identityOn := flag.Bool("identity-endpoint", proxycli.EnvBool("ZG_GATEWAY_IDENTITY_ENDPOINT", true),
-		"serve this CVM's self-description at "+identityPath+" (app_id, compose_hash, OS image, "+
-			"container list, matching release). Public, unauthenticated, and NOT evidence — every "+
-			"value is independently rederivable with pcverify (env ZG_GATEWAY_IDENTITY_ENDPOINT)")
-	// The provider-side counterpart (GET /v1/providers/{address}/identity, issue #80):
-	// what this gateway VERIFIED about a provider — the DCAP verdict on that provider's
-	// quote, the on-chain signer comparison, the boot-chain verdict, its compose hash.
-	// The gateway already does all of it before sealing, and again on every warmer
-	// sweep (see client/route); the endpoint exists because those results used to die
-	// with the verification, leaving a verification panel with nothing to show for the
-	// broker hop. With -warm on it answers for the whole catalog, so the panel is not
-	// blank until the user's first prompt.
-	//
-	// ON by default, like the self-description, and for the same reason: every value is
-	// obtainable by fetching that provider's own public /v1/quote, so there is nothing
-	// here to authorize. It differs in one important way — see provideridentity.go —
-	// in that it DOES report verdicts, because unlike the self-description they are
-	// verifications this process genuinely performed on a third party.
-	//
-	// The route is mounted only when there is a source that can ever answer: router
-	// mode with -attest on (see proxycli.Built.ProviderIdentities). Without quote
-	// verification nothing is verified, and a route that could only ever 404 is worse
-	// than an absent one.
-	providerIdentityOn := flag.Bool("provider-identity-endpoint", proxycli.EnvBool("ZG_GATEWAY_PROVIDER_IDENTITY_ENDPOINT", true),
-		"serve what this gateway verified about each provider at "+providerIdentityPath+
-			" (DCAP verdict, on-chain signer check, boot-chain verdict, compose_hash). Public and "+
-			"unauthenticated; answers only for providers this gateway has verified itself — those it "+
-			"has sealed to, plus every provider the -warm sweep covers — and never fetches a quote "+
-			"for an address on demand; requires -attest (env ZG_GATEWAY_PROVIDER_IDENTITY_ENDPOINT)")
-	// Where the endpoint's container list comes from: the manifest cmd/cvmid wrote to
-	// the shared identity volume. Preferred over the platform lookup below because it
-	// needs no network, no third-party host and no DNS — and, like -identity-file, it
-	// keeps the gateway off the guest-agent socket. The bytes are checked against the
-	// quote's compose_hash before anything is read out of them, so an absent or stale
-	// file costs the container list and nothing else.
+	// Where /v1/gateway/identity's container list comes from: the manifest cmd/cvmid
+	// wrote to the shared identity volume. It is the only source: it needs no network,
+	// no third-party host and no DNS — and, like -identity-file, it keeps the gateway
+	// off the guest-agent socket. The bytes are checked against the quote's
+	// compose_hash before anything is read out of them, so an absent or stale file
+	// costs the container list and nothing else.
 	appComposeFile := flag.String("app-compose-file", proxycli.EnvOr("ZG_GATEWAY_APP_COMPOSE_FILE", ""),
 		"path to the app-compose.json written by cmd/cvmid, read for "+identityPath+"'s container "+
-			"list after checking it against the quote's compose_hash; empty falls back to "+
-			"-platform-base-domain (env ZG_GATEWAY_APP_COMPOSE_FILE)")
-	// The fallback: the platform's per-app guest-agent host,
-	// `<app_id>-8090.<base_domain>`. For a replica whose init container predates
-	// -out-app-compose — the shape a rolling blue/green upgrade has — and for nothing
-	// else. Empty (the default) disables it, which is right for a local run and for
-	// any deployment where the file is present.
-	platformBaseDomain := flag.String("platform-base-domain", proxycli.EnvOr("ZG_GATEWAY_PLATFORM_BASE_DOMAIN", ""),
-		"dstack platform base domain (e.g. in1.phala.network) to fetch this app's app-compose from "+
-			"when -app-compose-file is unavailable; empty disables the fallback "+
-			"(env ZG_GATEWAY_PLATFORM_BASE_DOMAIN)")
-	// How many published releases the deployed compose text is compared against for
-	// the endpoint's matched_release. The same lookup, and the same byte-for-byte
-	// comparison, that `pcverify -releases N` performs — so the release the panel
-	// names and the release pcverify confirms cannot disagree. 0 disables the GitHub
-	// call, which is the setting for a CVM with no egress to it.
-	identityReleases := flag.Int("identity-releases", proxycli.EnvIntOr("ZG_GATEWAY_IDENTITY_RELEASES", defaultIdentityReleases),
-		"how many published releases to compare the deployed compose text against for "+
-			identityPath+"'s matched_release; 0 disables the GitHub lookup "+
-			"(env ZG_GATEWAY_IDENTITY_RELEASES)")
+			"list after checking it against the quote's compose_hash; empty reports no container "+
+			"list (env ZG_GATEWAY_APP_COMPOSE_FILE)")
 	// -health turns the binary into its OWN container health probe: it makes one
 	// GET /healthz to the -listen port, prints the result, and exits 0 (healthy)
 	// or 1 — it starts no server. The image is distroless (no shell, no curl,
@@ -423,50 +326,16 @@ func main() {
 		}
 	}
 
-	// A misspelled -seal-policy decides whether prompts are encrypted at all, so it
-	// fails the deploy rather than guessing. Falling back to "always" would seal a
-	// deployment that meant to be transparent — turning the cutover into a silent
-	// release of default encryption, the one outcome §2 exists to prevent — and
-	// falling back to "off" would silently stop encrypting for everyone already
-	// relying on it. There is no safe guess, only a loud stop.
-	if *sealPolicy != sealPolicyAlways && *sealPolicy != sealPolicyOff {
-		logger.Error("invalid -seal-policy", "value", *sealPolicy,
-			"want", []string{sealPolicyAlways, sealPolicyOff})
-		os.Exit(1)
-	}
-	// A `<service type>:*` entry naming no surface would leave that surface in the
-	// clear while reading as configured, so it fails the deploy like the others.
-	sealModelsList := parseSealModels(*sealModelsCSV)
-	if len(sealModelsList.unknown) > 0 {
-		var known []string
-		for _, ep := range endpoint.All {
-			if e := ep.ServiceType + surfaceWildcard; !slices.Contains(known, e) {
-				known = append(known, e)
-			}
-		}
-		logger.Error("invalid -seal-models: no sealed surface has this service type",
-			"entries", sealModelsList.unknown, "want_one_of", known)
-		os.Exit(1)
-	}
-	// -unsealed-subtree only decides what a SEALED surface's namespace answers, so
-	// with sealing off it has nothing to decide — every one of those paths is
-	// proxied. Say so rather than letting an operator read the two settings and
-	// believe the subtree is still being refused.
-	if *sealPolicy == sealPolicyOff && *unsealedSubtree != unsealedSubtreeRefuse {
-		logger.Warn("-unsealed-subtree is ignored while -seal-policy is off: with nothing sealed, "+
-			"every inference path is proxied to the router in the clear",
-			"unsealed_subtree", *unsealedSubtree)
-	}
-
-	// A misspelled -unsealed-subtree decides whether a sealed surface's
-	// sub-resources reach the router in the clear, so it fails the deploy rather
-	// than falling back to either value. Falling back to "refuse" would break the
-	// topology that needs passthrough with a 501 nobody asked for; falling back to
-	// "passthrough" would forward content on a deployment that meant to refuse it.
-	// Neither is a default worth guessing at from a typo.
-	if *unsealedSubtree != unsealedSubtreeRefuse && *unsealedSubtree != unsealedSubtreePassthrough {
-		logger.Error("invalid -unsealed-subtree", "value", *unsealedSubtree,
-			"want", []string{unsealedSubtreeRefuse, unsealedSubtreePassthrough})
+	// A -seal-models value this cannot read decides whether prompts are encrypted at
+	// all, so it fails the deploy rather than guessing: falling back to sealing every
+	// model would turn a deployment that meant to be transparent into a silent release
+	// of default encryption, and falling back to sealing nothing would silently stop
+	// encrypting for everyone already relying on it. The same goes for a
+	// `<service type>:*` entry naming no surface, which would leave that surface in
+	// the clear while reading as configured. See parseSealModels for what is refused.
+	sealModelsList, err := parseSealModels(*sealModelsCSV)
+	if err != nil {
+		logger.Error("invalid -seal-models", "value", *sealModelsCSV, "err", err)
 		os.Exit(1)
 	}
 
@@ -492,41 +361,40 @@ func main() {
 	// the endpoint then reports the instance id and nulls. That is the local-run
 	// shape, and it is a legitimate one: the route stays honest about knowing
 	// nothing rather than being absent.
-	var identity *identityCache
-	stopIdentity := func() {}
-	if *identityOn {
-		// The embedded allowlist. A failure here is a mistake in THIS repository (a
-		// malformed osimages.json), not anything about the deployment — loud, but never
-		// fatal: an operational display must not be able to take the inference path
-		// down. The endpoint then reports os_image as null.
-		osImages, err := evidence.BuiltinOSImages()
-		if err != nil {
-			logger.Error("embedded OS-image allowlist is malformed; identity will report no OS image", "err", err)
-		}
-		quotePath := ""
-		if *evidenceDir != "" {
-			quotePath = filepath.Join(*evidenceDir, evidenceQuoteFile)
-		}
-		identity, stopIdentity = startIdentity(identityConfig{
-			InstanceID:     instanceID,
-			AppID:          runtimeAppID,
-			QuotePath:      quotePath,
-			AppComposePath: *appComposeFile,
-			BaseDomain:     *platformBaseDomain,
-			Releases:       *identityReleases,
-			Chain:          built.ChainRoot(),
-			OSImages:       osImages,
-			Timeout:        identityLookupTimeout,
-		}, logger)
+	//
+	// Always mounted: it publishes nothing that /evidences/ and the published
+	// releases do not already make public, so there is no deployment it should be
+	// hidden from, and a verification panel that silently shows nothing is worse than
+	// one that shows nulls.
+	//
+	// The embedded allowlist. A failure here is a mistake in THIS repository (a
+	// malformed osimages.json), not anything about the deployment — loud, but never
+	// fatal: an operational display must not be able to take the inference path
+	// down. The endpoint then reports os_image as null.
+	osImages, err := evidence.BuiltinOSImages()
+	if err != nil {
+		logger.Error("embedded OS-image allowlist is malformed; identity will report no OS image", "err", err)
 	}
+	quotePath := ""
+	if *evidenceDir != "" {
+		quotePath = filepath.Join(*evidenceDir, evidenceQuoteFile)
+	}
+	identity, stopIdentity := startIdentity(identityConfig{
+		InstanceID:     instanceID,
+		AppID:          runtimeAppID,
+		QuotePath:      quotePath,
+		AppComposePath: *appComposeFile,
+		Releases:       defaultIdentityReleases,
+		Chain:          built.ChainRoot(),
+		OSImages:       osImages,
+		Timeout:        identityLookupTimeout,
+	}, logger)
 
-	// The provider-side records the endpoint above publishes. Nil — so the route stays
-	// unmounted — whenever this build can never produce one: direct-broker mode (no
-	// on-chain provider address to key a record by) or -attest off (nothing verified).
-	var providerIdentities route.ProviderIdentitySource
-	if *providerIdentityOn {
-		providerIdentities = built.ProviderIdentities()
-	}
+	// The provider-side records (GET /v1/providers/{address}/identity, see
+	// provideridentity.go). Nil — so the route stays unmounted — whenever this build
+	// can never produce one: direct-broker mode (no on-chain provider address to key a
+	// record by) or -attest off (nothing verified).
+	providerIdentities := built.ProviderIdentities()
 
 	// Start the background quote-cache warmer (a no-op unless -warm is set) so
 	// requests hit a warm cache instead of paying the DCAP verify inline; stop it
@@ -559,20 +427,12 @@ func main() {
 		Handler: newHandler(built.Clients, routerTarget, origins, instanceID, *evidenceDir, *maxInFlight,
 			identity, providerIdentities, built.Readiness(), logger,
 			withEntryPolicy(entryPolicy{
-				openOrigins:     openOrigins,
-				sealPolicy:      *sealPolicy,
-				sealModels:      sealModelsList,
-				unsealedSubtree: *unsealedSubtree,
-				// The flag says "0 disables" (the conventional spelling for an
-				// operator); entryPolicy says "0 means the default" (so its zero value
-				// is the ordinary deployment). Both are right for their own reader, and
-				// this is the one line that translates — see entryPolicy.catalogCacheTTL.
-				catalogCacheTTL: disabledIfZero(*catalogCacheTTL),
-				bodyReadTimeout: disabledIfZero(*bodyReadTimeout),
+				openOrigins: openOrigins,
+				sealModels:  sealModelsList,
 			})),
 		ReadHeaderTimeout: 10 * time.Second, // mitigate slow-header (Slowloris) clients
 		// Backstop for every route: see serverReadTimeout. The sealed inference
-		// routes are bounded tighter, from admission, by -body-read-timeout.
+		// routes are bounded tighter, from admission, by defaultBodyReadTimeout.
 		ReadTimeout: serverReadTimeout,
 		IdleTimeout: proxycli.IdleTimeout, // bound idle keep-alives; unset means unbounded
 	}
@@ -603,19 +463,13 @@ func main() {
 	// /evidences 404" needs to see which side of that the process is on. Empty means
 	// the route is not mounted at all.
 	//
-	// identity_endpoint is here for the same reason, and it is the more confusing of
-	// the two when it is off: the endpoint answers 200 with nulls when its SOURCES
-	// are missing and 404s (via the router catch-all) when the route itself is off,
-	// which are very different diagnoses for the same-looking symptom.
-	//
-	// provider_identity_endpoint reports whether the route is MOUNTED, not merely
-	// whether it was asked for: it also needs -attest (nothing to report without it),
-	// and "asked for but silently absent" is precisely the diagnosis an operator would
-	// otherwise have to reconstruct from two other flags.
+	// provider_identity_endpoint reports whether that route is MOUNTED: it needs
+	// -attest (nothing to report without it), and "silently absent" is precisely the
+	// diagnosis an operator would otherwise have to reconstruct from another flag.
 	logger.Info("gateway listening", "listen", *f.Listen, "router_url", *f.RouterURL,
-		"seal_policy", *sealPolicy, "seal_models", *sealModelsCSV, "unsealed_subtree", *unsealedSubtree,
+		"seal_models", *sealModelsCSV,
 		"cors_allowed_origins", origins, "max_inflight", *maxInFlight,
-		"evidence_dir", *evidenceDir, "identity_endpoint", *identityOn,
+		"evidence_dir", *evidenceDir,
 		"provider_identity_endpoint", providerIdentities != nil,
 		"go_memlimit_bytes", currentMemoryLimit(), "gomaxprocs", runtime.GOMAXPROCS(0))
 	err = proxycli.Serve(srv, logger)
@@ -753,64 +607,10 @@ func runHealthCheck(listen string) int {
 	return 0
 }
 
-// The two values of -unsealed-subtree. They decide what a sealed surface's
-// NAMESPACE answers — its sub-resources, and its own path on every method but the
-// sealed POST — and nothing else: the sealed POST itself is always sealed, and
-// always refused on a build that holds no client for it, under either value.
-//
-//   - refuse: 501, the standalone default. Correct while a caller who wants the
-//     router's own handling of those paths can call the router directly, which is
-//     the premise the whole refusal was written on (see the endpoint.All loop).
-//   - passthrough: forward them to the router like any other unsealed path. What
-//     the global-entry topology needs, because there the gateway IS the router's
-//     hostname and "call the router directly" no longer exists, so a 501 is not a
-//     redirection to a different choice — it is the feature being gone.
-//
-// The leak the refusal guards is real either way (an Anthropic SDK's
-// messages.count_tokens() POSTs the whole conversation), so passthrough does not
-// pretend otherwise: those responses are marked X-0G-E2EE: none, which makes "this
-// one was not encrypted" a thing a client can see and refuse, rather than something
-// it has to infer from a path.
-// The two values of -seal-policy. They decide whether this gateway SEALS the
-// inference surfaces at all, which is a different axis from -unsealed-subtree
-// (that one only decides what a sealed surface's NAMESPACE answers).
-//
-//   - always: seal every sealed surface's POST, refuse nothing on that account.
-//     Today's behaviour, and the built-in default, so a deployment that says
-//     nothing keeps sealing rather than silently stopping.
-//   - off: do not seal anything. Every sealed surface — its path, its subtree and
-//     its POST — is proxied to the router in the clear, marked
-//     X-0G-E2EE: none. Behaviourally this gateway becomes the plain router.
-//
-// `off` exists for the global-entry cutover, and it is the whole reason sealing
-// has to stop being decided by the PATH. Pointing router-api.0g.ai at a gateway
-// that seals unconditionally would, in one DNS change, also turn on default
-// encryption for everybody: the provider pool narrows to the sealable ones (a
-// model with none gets an empty route-preview, which the client treats as
-// terminal), web search and file attachments break by construction
-// (SealedPromptInjectionConflict), and every request pays a route-preview plus an
-// HPKE seal. DNS cutover is a deploy; the sealing default is a release.
-//
-// This is the GLOBAL switch, deliberately built before the per-request and
-// per-model ones. Only a couple of chat models have E2EE support on the network
-// today, so the eventual shape is partial: seal the models that can be sealed,
-// pass the rest through. That needs a capability signal per model and a contract
-// for how a caller asks — neither of which should be invented while the set is
-// "two", and neither of which the cutover waits on.
-const (
-	sealPolicyAlways = "always"
-	sealPolicyOff    = "off"
-)
-
-const (
-	unsealedSubtreeRefuse      = "refuse"
-	unsealedSubtreePassthrough = "passthrough"
-)
-
 // entryPolicy holds what a deployment says about the shape it is serving.
 //
 // The zero value is the ORDINARY deployment: a named origin allowlist, so ambient
-// credentials are on, and sealed subtrees refused. Both fields therefore name the
+// credentials are on, and every model sealed. The fields therefore name the
 // exception rather than the rule, which is deliberate — a caller that passes no
 // option (every test that is about something else, and any future call site) gets
 // the configuration a real gateway runs, not a stripped-down one. Getting that
@@ -823,37 +623,27 @@ type entryPolicy struct {
 	// defense pass everything. See the startup warning for the full reasoning; the
 	// short version is that an API open to every origin is a keys-only API.
 	openOrigins bool
-	// unsealedSubtree is one of the two constants above. Anything else — which
-	// startup validation makes unreachable in a real deployment — reads as refuse,
-	// because of the two, refusing is the one that cannot leak.
-	unsealedSubtree string
-	// sealPolicy is one of the two constants above, and the EMPTY string reads as
-	// sealPolicyAlways — the zero value of this struct has to be the ordinary
-	// deployment, and the ordinary deployment (today, and every deployment before
-	// the cutover) seals. Only an explicit "off" turns sealing off.
-	sealPolicy string
-	// sealModels narrows WHICH models sealPolicy applies to. Its zero value is the
-	// empty set, which means ALL — the same zero-value-is-the-ordinary-deployment
-	// rule as the fields above, and the reason the list can only ever subtract.
+	// sealModels decides WHICH models are sealed, and with sealModelsOff whether
+	// anything is. Its zero value seals ALL — the same zero-value-is-the-ordinary-
+	// deployment rule as the field above.
 	sealModels sealModels
 	// catalogCacheTTL is how long a public catalog read is reused (catalogcache.go).
 	//
 	// ZERO MEANS defaultCatalogCacheTTL, not "off". That reads backwards for a
 	// duration, and it is the point: the ordinary deployment caches, so per this
 	// type's contract the zero value has to be the one that does. A NEGATIVE value
-	// turns it off, and is what -catalog-cache-ttl=0 maps to — the flag keeps the
-	// conventional "0 disables" spelling for the operator, and the translation
-	// happens once, at the flag, rather than being a second meaning for zero here.
+	// turns it off. Not a flag: a deployment has no reason to change it, so only
+	// tests set it.
 	catalogCacheTTL time.Duration
 	// bodyReadTimeout bounds a sealed-path body read (openaiproxy.BoundBodyRead).
 	// Same convention as catalogCacheTTL: ZERO MEANS defaultBodyReadTimeout, and a
-	// negative value — what -body-read-timeout=0 maps to — turns it off.
+	// negative value turns it off.
 	bodyReadTimeout time.Duration
 }
 
 // serverReadTimeout bounds reading any request, headers and body, on the public
-// listener. It is the backstop for the routes -body-read-timeout does not cover —
-// the catch-all, which streams bodies to the router unbuffered and holds no
+// listener. It is the backstop for the routes defaultBodyReadTimeout does not
+// cover — the catch-all, which streams bodies to the router unbuffered and holds no
 // in-flight slot, so a slow body there costs a connection (dstack-ingress allows
 // 4096 in all) rather than a slot. The router already ends such a body at its own
 // ReadTimeout (60 s by default); this keeps the bound from depending on it, and
@@ -861,10 +651,15 @@ type entryPolicy struct {
 // net/http lifts it at the body's EOF, so it does not reach a streamed response.
 const serverReadTimeout = 90 * time.Second
 
-// defaultBodyReadTimeout is long enough for the largest body these routes admit —
-// maxPassthroughBytes (20 MiB), a chat turn carrying a video — on a ~2.8 Mbit/s
-// uplink, and far shorter than the time a trickled body could otherwise hold a
-// slot, which was unbounded.
+// defaultBodyReadTimeout is how long a sealed-path request's body may take to
+// arrive once it holds an in-flight slot (openaiproxy.BoundBodyRead); past it the
+// request is answered 408 and its slot freed. Without it a client that sends
+// headers and trickles the body holds a slot indefinitely.
+//
+// It is long enough for the largest body these routes admit — maxPassthroughBytes
+// (20 MiB), a chat turn carrying a video — on a ~2.8 Mbit/s uplink, and far
+// shorter than the time a trickled body could otherwise hold a slot, which was
+// unbounded.
 const defaultBodyReadTimeout = 60 * time.Second
 
 // bodyRead resolves bodyReadTimeout's zero value to the default; a negative one
@@ -874,17 +669,6 @@ func (p entryPolicy) bodyRead() time.Duration {
 		return defaultBodyReadTimeout
 	}
 	return p.bodyReadTimeout
-}
-
-// disabledIfZero maps a flag's "0 disables" convention onto entryPolicy's
-// "0 means the default" one. A negative value passes through, so
-// -catalog-cache-ttl=-1s disables it just as 0 does rather than quietly
-// becoming the default.
-func disabledIfZero(d time.Duration) time.Duration {
-	if d == 0 {
-		return -1
-	}
-	return d
 }
 
 // newCatalogCache builds this deployment's catalog cache, resolving the zero
@@ -907,14 +691,9 @@ func (p entryPolicy) newCatalogCache() *catalogCache {
 // is the hardest shape to diagnose.
 func (p entryPolicy) credentialsAllowed() bool { return !p.openOrigins }
 
-// sealingOn reports whether this deployment seals the inference surfaces.
-//
-// Written as "anything but off" rather than "== always" so that the zero value,
-// and any value startup validation somehow let through, land on SEALING. Of the
-// two, sealing is the one that cannot put a prompt the caller expected to be
-// encrypted onto the cleartext path — the same fail-safe direction
-// unsealedSubtree takes when it reads an unrecognised value as refuse.
-func (p entryPolicy) sealingOn() bool { return p.sealPolicy != sealPolicyOff }
+// sealingOn reports whether this deployment seals the inference surfaces at all.
+// Only an explicit sealModelsOff turns it off; the zero value seals.
+func (p entryPolicy) sealingOn() bool { return !p.sealModels.off }
 
 // canonicalPath serves r through h with r.URL.Path replaced by path, for the one
 // case where two spellings name one resource and only one of them is registered
@@ -988,8 +767,8 @@ func sealedNamespaceGuard(surfaces []string, mux http.Handler) http.Handler {
 				r = withPath(r, surface)
 			case len(p) > len(surface) && strings.EqualFold(p[:len(surface)+1], surface+"/"):
 				// A sub-resource: fold only the surface prefix and leave the rest
-				// verbatim, so the namespace handler (refuse, or passthrough to the
-				// router) decides it exactly as it decides the canonical spelling.
+				// verbatim, so the namespace handler decides it exactly as it decides
+				// the canonical spelling.
 				r = withPath(r, surface+p[len(surface):])
 			default:
 				continue
@@ -1040,8 +819,8 @@ func withEntryPolicy(p entryPolicy) handlerOption {
 //
 // identity, when non-nil, mounts this CVM's self-description at
 // /v1/gateway/identity. Nil leaves the route unmounted — the same fall-through as
-// an unset evidenceDir — which is what -identity-endpoint=false and every test
-// that is not about the route get.
+// an unset evidenceDir — which is what every test that is not about the route
+// gets. main always passes one.
 //
 // providerIdentities, when non-nil, mounts the provider-side counterpart at
 // /v1/providers/{address}/identity: what this gateway verified about the providers
@@ -1053,9 +832,9 @@ func withEntryPolicy(p entryPolicy) handlerOption {
 // the /healthz vs /readyz split at the routes below.
 //
 // opts carries the entryPolicy. Passing NONE is the ordinary deployment — ambient
-// credentials on, sealed subtrees refused — because the policy's fields name the
+// credentials on, every model sealed — because the policy's fields name the
 // exceptions rather than the rule (see entryPolicy). main always passes one, built
-// from the allowlist and the -unsealed-subtree flag; every test that is about
+// from the allowlist and -seal-models; every test that is about
 // something else passes none and gets the shape a real gateway runs.
 func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedOrigins []string, instanceID, evidenceDir string,
 	maxInFlight int, identity *identityCache, providerIdentities route.ProviderIdentitySource,
@@ -1065,8 +844,7 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 		opt(&policy)
 	}
 	// The cleartext passthrough to the router, built once: it is the catch-all, and
-	// under unsealedSubtreePassthrough it is also what a sealed surface's namespace
-	// resolves to. Marked as unencrypted at the one place every cleartext response
+	// it is also what a sealed surface's namespace resolves to. Marked as unencrypted at the one place every cleartext response
 	// leaves this process, so no route can forget to say so.
 	//
 	// Two wrappings of ONE proxy (one connection pool): the namespace handler gets
@@ -1174,34 +952,29 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	// catch-all — each named the rows by hand, and a divergence between them was
 	// exactly the leak described above.
 	//
-	// A row also claims its SUBTREE, and that is the same guarantee at the scope
-	// the leak actually has. Mounting the exact path alone left every sub-resource
-	// of a sealed surface falling through: an Anthropic SDK's
-	// messages.count_tokens() POSTs the whole conversation and system prompt to
-	// /v1/messages/count_tokens, which matches no pattern and so reached the
-	// catch-all — the full payload, in the clear, to the untrusted router, with a
-	// 200 back as if nothing had happened. Message Batches
-	// (/v1/messages/batches) carries the same payload the same way.
+	// A row also claims its SUBTREE — the namespace, not a list of known
+	// sub-resources, which would go stale the day the API grows another one. An
+	// Anthropic SDK's messages.count_tokens() POSTs the whole conversation and system
+	// prompt to /v1/messages/count_tokens, and Message Batches (/v1/messages/batches)
+	// carries the same payload; neither is sealed by this gateway.
 	//
-	// Claiming the subtree rather than those two paths is deliberate: the unit is a
-	// sealed surface's NAMESPACE, and a list of known sub-resources is a rule
-	// narrower than the thing it guards — it would go stale the day the API grows a
-	// third one, silently and in the leaking direction. So the namespace gets ONE
-	// answer, and -unsealed-subtree is which:
+	// The namespace is FORWARDED to the router, in the clear, and marked X-0G-E2EE:
+	// none so the caller can see what it got. That is a deliberate trade, not an
+	// oversight: this gateway IS the router's hostname (the global entry), so a client
+	// has no other door to take those requests to, and refusing them would not point
+	// it elsewhere — it would delete the feature. The leak is real and disclosed
+	// rather than silent. (A `refuse` mode answering 501 existed for a deployment
+	// beside a router callers could still reach directly; no deployment had that shape
+	// any longer, and it was removed.)
 	//
-	//   - refuse (default): nothing under these prefixes is sealed by this gateway,
-	//     so nothing under them may be proxied. A client that wants the router's own
-	//     cleartext handling of them calls the router directly, which is a choice
-	//     rather than a surprise.
-	//   - passthrough: the choice above does not exist — this gateway IS the router's
-	//     hostname — so refusing is not pointing at another door, it is closing the
-	//     only one. Forward them, and mark them X-0G-E2EE: none so the caller can see
-	//     what it got. The leak is the same leak; what changes is that it is now
-	//     disclosed and deliberate instead of impossible.
+	// Claiming the namespace explicitly rather than leaving it to the catch-all still
+	// matters: it routes these prompt-carrying requests through the PLAIN passthrough,
+	// never the catalog cache, and it is what lets the trailing-slash form below be
+	// pinned to the sealed POST instead of the namespace.
 	//
 	// Either way the sealed POST is untouched: it seals, or it is refused on a build
-	// with no client for it. Neither value can put a prompt that WOULD have been
-	// sealed onto the cleartext path.
+	// with no client for it. Nothing that WOULD have been sealed lands on the
+	// cleartext path.
 	// Collected for sealedNamespaceGuard, which has to fold every spelling of these
 	// prefixes before the mux matches. Built from the same table the loop registers
 	// from, so a row added later is guarded the day it lands.
@@ -1216,62 +989,27 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	surfaces = append(surfaces, strings.TrimSuffix(openaiproxy.AsyncJobsPrefix, "/"))
 	for _, ep := range endpoint.All {
 		surface := ep.Path
-		// Seal policy off: this gateway is a transparent proxy for the whole
-		// surface — path, subtree and POST alike — so none of the machinery below
-		// applies and -unsealed-subtree has nothing left to decide. Registering the
-		// two patterns (exact and subtree) covers every method and every
-		// sub-resource, and the POST lands on them because no more specific
-		// `POST <path>` is registered in this branch.
+		// The subtree, and the exact path on every method but the sealed POST, go to
+		// the cleartext passthrough (see above). The method-less exact pattern is the
+		// LESS specific of the two on that path, so `POST <path>` below still wins for
+		// the sealed method; without it Go's ServeMux answers a slash-less request with
+		// an implicit 307 into the subtree (a redirect nobody asked for).
 		//
-		// The PLAIN passthrough, never the cached one: these carry prompts. The
-		// cache would refuse them anyway (allowlist, GET-only), and that is exactly
-		// why it should not be in the way — the safety of this path must not rest
-		// on a list somewhere else being right.
-		//
-		// Nothing here is a leak the way an unmounted row would be: with sealing
-		// off, cleartext to the router IS the configured behaviour, and every
-		// response says so (X-0G-E2EE: none, applied by the marker around
+		// The PLAIN passthrough, never the cached one: these carry prompts. The cache
+		// would refuse them anyway (allowlist, GET-only), and that is exactly why it
+		// should not be in the way — the safety of this path must not rest on a list
+		// somewhere else being right.
+		mux.Handle(surface+"/", passthrough)
+		mux.Handle(surface, passthrough)
+		// Sealing off (-seal-models=off): this gateway is a transparent proxy for the
+		// whole surface, POST included — it lands on the two patterns above because no
+		// more specific `POST <path>` is registered. Nothing here is a leak the way an
+		// unmounted row would be: cleartext to the router IS the configured behaviour,
+		// and every response says so (X-0G-E2EE: none, applied by the marker around
 		// `passthrough`).
 		if !sealingOn {
-			mux.Handle(surface+"/", passthrough)
-			mux.Handle(surface, passthrough)
 			continue
 		}
-		// Registered for EVERY row, served or not, and before the branch below:
-		// whether this build seals the surface itself has no bearing on whether its
-		// sub-resources may leak.
-		// ...but it does bear on what the refusal may CLAIM. In direct-broker mode
-		// this build holds a chat client only, so telling an operator debugging
-		// /v1/messages there that "this gateway seals it at POST /v1/messages" is
-		// simply false, and it contradicts the POST refusal below on the same path.
-		// One reason, two accurate wordings, decided here where the answer is known.
-		served := clients[ep.Path] != nil
-		var namespace http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			reason := fmt.Sprintf("this build does not serve the sealed %s surface at all", surface)
-			if served {
-				reason = fmt.Sprintf("it is part of the sealed %s surface, which this gateway seals only at POST %s",
-					surface, surface)
-			}
-			openaiproxy.WriteError(w, http.StatusNotImplemented, "gateway",
-				fmt.Sprintf("%s %s is not served by this gateway: %s, so it is refused rather than "+
-					"forwarded in the clear", r.Method, r.URL.Path, reason))
-		})
-		// Compared against the passthrough constant rather than the refuse one, so the
-		// unreachable third value (startup validation rejects it) lands on refuse: of
-		// the two, refusing is the one that cannot forward a payload in the clear.
-		if policy.unsealedSubtree == unsealedSubtreePassthrough {
-			namespace = passthrough
-		}
-		// The subtree, and the exact path on every method but the sealed POST. The
-		// method-less exact pattern is the LESS specific of the two on that path, so
-		// `POST <path>` below still wins for the sealed method; without it Go's
-		// ServeMux answers a slash-less request with an implicit 307 into the subtree
-		// (a redirect nobody asked for), and before it a GET on the surface's own path
-		// went to the cleartext proxy — which is what passthrough now does on purpose,
-		// for the whole namespace and with a marker, rather than for one method by
-		// omission.
-		mux.Handle(surface+"/", namespace)
-		mux.Handle(surface, namespace)
 		if c := clients[ep.Path]; c != nil {
 			// WithCleartext: an async submit asking for url format goes to the
 			// router in the clear rather than being refused (see the option).
@@ -1282,9 +1020,8 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 			//
 			// To Go's ServeMux, `POST /v1/chat/completions/` matches the subtree pattern
 			// `/v1/chat/completions/` — `POST /v1/chat/completions` does not match a path
-			// with a trailing slash. Under `refuse` that was a loud 501 and merely
-			// unhelpful. Under `passthrough` it made the subtree handler the reverse
-			// proxy, so the request was answered 200 with the WHOLE PROMPT forwarded to
+			// with a trailing slash, so it would land on the namespace's reverse proxy
+			// and be answered 200 with the WHOLE PROMPT forwarded to
 			// the router in the clear: exactly the leak the subtree claim exists to
 			// prevent, reached by a single character, and invisible to the caller because
 			// the router's gin then 307s the retry onto the real path and it works.
@@ -1305,8 +1042,8 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 		// attribution — the one gateway error a client could not attribute.
 		//
 		// Registered on the trailing-slash form too, for the reason above: an unserved
-		// row must refuse BOTH spellings, or `passthrough` would forward the prompt of
-		// a surface this build cannot seal.
+		// row must refuse BOTH spellings, or the namespace passthrough would forward
+		// the prompt of a surface this build cannot seal.
 		path := ep.Path
 		unserved := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			openaiproxy.WriteError(w, http.StatusNotImplemented, "gateway",
@@ -1315,8 +1052,7 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 		mux.Handle("POST "+path, unserved)
 		mux.Handle("POST "+path+"/{$}", unserved)
 	}
-	// The async poll (SPEC §7.5.4), registered whatever the seal policy or model
-	// list says: a poll carries no model to decide on, and a job sealed by an
+	// The async poll (SPEC §7.5.4), registered whatever -seal-models says: a poll carries no model to decide on, and a job sealed by an
 	// earlier configuration must stay readable. The job id decides. With a key
 	// segment it is a job this gateway sealed — opened through the gate; without
 	// one, the cleartext passthrough, which refuses to relay a sealed frame.
@@ -1420,7 +1156,7 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	// newRouterProxy).
 	//
 	// The cached wrapping is mounted HERE and nowhere else. The namespace handler
-	// under -unsealed-subtree=passthrough carries prompts, so it gets the uncached
+	// carries prompts, so it gets the uncached
 	// `passthrough`: keeping them separate means that path's safety rests on the
 	// cache not being there at all, rather than on the allowlist being right.
 	mux.Handle("/", cachedPassthrough)

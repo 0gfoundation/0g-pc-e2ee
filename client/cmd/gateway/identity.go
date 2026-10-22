@@ -30,8 +30,8 @@ const identityPath = "/v1/gateway/identity"
 // strong signal.
 const defaultIdentityReleases = 5
 
-// identityLookupTimeout bounds each outbound lookup the assembly makes — the
-// GitHub release listing and the fallback platform app-compose fetch. It is
+// identityLookupTimeout bounds the one outbound lookup the assembly makes — the
+// GitHub release listing. It is
 // generous because nothing waits on it: the work happens in the background and a
 // slow lookup costs a later answer, never a slower request.
 const identityLookupTimeout = 20 * time.Second
@@ -176,18 +176,13 @@ type identityConfig struct {
 	// AppID is this CVM's app_id as the RUNTIME reports it (cmd/cvmid read it from the
 	// guest agent). Empty falls back to compose_hash's leading bytes, which is a guess:
 	// dstack fixes an app's id when the app is created and keeps it across upgrades, so
-	// the two agree only until the first redeploy. The difference is not cosmetic — it
-	// is the address the platform routes by, so the fallback lookup in loadAppCompose
-	// asks about an app that does not exist and hangs until its timeout.
+	// the two agree only until the first redeploy.
 	AppID string
 	// QuotePath is the cert-binding quote in the evidence bundle. It is the source
 	// of app_id, compose_hash and the boot chain. Empty disables all three.
 	QuotePath string
 	// AppComposePath is the manifest cmd/cvmid published on the shared volume.
 	AppComposePath string
-	// BaseDomain enables the fallback app-compose lookup against the platform's
-	// per-app guest-agent host when the file is unavailable. Empty disables it.
-	BaseDomain string
 	// Releases is how many published releases the compose text is compared against.
 	// 0 disables the GitHub lookup entirely.
 	Releases int
@@ -201,7 +196,7 @@ type identityConfig struct {
 	// OSImages is the allowlist the boot chain is compared against. Callers pass
 	// evidence.BuiltinOSImages(); tests pass their own.
 	OSImages []evidence.OSImage
-	// Timeout bounds each outbound lookup (the platform app-compose fetch, GitHub).
+	// Timeout bounds each outbound lookup (the GitHub release listing).
 	Timeout time.Duration
 }
 
@@ -295,7 +290,7 @@ func buildIdentity(ctx context.Context, cfg identityConfig, logger *slog.Logger)
 	// endpoint is careful not to do — worse than publishing null.
 	var composeText []byte
 	if haveHash {
-		raw, source, err := loadAppCompose(ctx, cfg, deref(res.doc.AppID))
+		raw, source, err := loadAppCompose(cfg.AppComposePath)
 		switch {
 		// Configured but not readable yet — nothing orders cvm-identity before this
 		// process, so retry.
@@ -431,53 +426,37 @@ func readQuoteBody(path string) (attest.QuoteBody, []byte, error) {
 	return body, reply, err
 }
 
-// loadAppCompose returns the raw app-compose bytes and where they came from.
+// loadAppCompose returns the raw app-compose bytes cmd/cvmid published, and where
+// they came from. The file needs no network, no third-party host and no DNS, and it
+// is there from boot. It is not trusted: the caller checks these bytes against the
+// quote's compose_hash before reading anything out of them.
 //
-// The file cmd/cvmid published wins: it needs no network, no third-party host and
-// no DNS, and it is there from boot. The platform's per-app guest-agent host is
-// the fallback for a replica whose init container predates -out-app-compose (a
-// rolling blue/green upgrade has exactly that shape) — its TLS terminates in the
-// PLATFORM's gateway rather than in this CVM, which is acceptable only because
-// the caller checks these bytes against the quote's compose_hash. Neither source
-// is trusted; both are checked.
-//
-// appID is the value the document reports, which is the RUNTIME's app_id whenever
-// cmd/cvmid supplied one (see identityConfig.AppID). That matters here and nowhere
-// else in this file: it is the name the platform routes by, and the derivation from
-// compose_hash stops being that name the first time the app is upgraded.
-func loadAppCompose(ctx context.Context, cfg identityConfig, appID string) ([]byte, string, error) {
-	var errs []error
-	if cfg.AppComposePath != "" {
-		raw, err := os.ReadFile(cfg.AppComposePath)
-		if err == nil {
-			return raw, "file:" + cfg.AppComposePath, nil
-		}
-		errs = append(errs, fmt.Errorf("file %s: %w", cfg.AppComposePath, err))
-	}
-	if cfg.BaseDomain != "" && appID != "" {
-		hc := &http.Client{Timeout: cfg.Timeout}
-		raw, err := evidence.FetchAppCompose(ctx, hc, appID, cfg.BaseDomain)
-		if err == nil {
-			return raw, "platform:" + cfg.BaseDomain, nil
-		}
-		errs = append(errs, fmt.Errorf("platform %s: %w", cfg.BaseDomain, err))
-	}
-	if len(errs) == 0 {
+// There used to be a second source, the platform's per-app guest-agent host
+// (`<app_id>-8090.<base_domain>`), for a replica whose init container predated
+// -out-app-compose. Every deployed init container writes the file now, so it was
+// removed along with the -platform-base-domain flag: a missing file costs the
+// container list and nothing else.
+func loadAppCompose(path string) ([]byte, string, error) {
+	if path == "" {
 		return nil, "", errNoAppComposeSource
 	}
-	return nil, "", errors.Join(errs...)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, "", fmt.Errorf("file %s: %w", path, err)
+	}
+	return raw, "file:" + path, nil
 }
 
-// errNoAppComposeSource means neither manifest source was configured, as opposed
-// to being configured and unavailable.
+// errNoAppComposeSource means no manifest source was configured, as opposed to
+// being configured and unavailable.
 //
-// The difference decides whether the assembly retries. Both paths are fixed at
+// The difference decides whether the assembly retries. The path is fixed at
 // startup, so "nothing configured" cannot become true later — recording it as
 // pending would leave the builder looping at its backoff cap for the life of the
 // process, warning every pass, and would keep the document permanently marked
 // incomplete (and so served no-cache) over a configuration choice that was
-// deliberate. A configured-but-unreadable source is the opposite: cvm-identity may
-// simply not have written the file yet, since nothing orders it before the gateway.
+// deliberate. A configured-but-unreadable file is the opposite: cvm-identity may
+// simply not have written it yet, since nothing orders it before the gateway.
 var errNoAppComposeSource = errors.New("no app-compose source configured")
 
 // identityCache holds the assembled document. It is rebuilt in the background
