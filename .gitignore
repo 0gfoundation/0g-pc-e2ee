@@ -2,6 +2,7 @@
 /client/gateway
 /client/pcverify
 /client/cmd/pcverify/pcverify
+/client/cmd/gateway/gateway
 
 # Env files: these carry the DNS API token for the TEE deployment (deploy/phala/),
 # and this repository is public. Covers .env, prod.env and .env.production alike.

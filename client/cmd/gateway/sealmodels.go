@@ -37,14 +37,14 @@ import (
 // per-account percentage would be coherent, and is a separate decision for
 // later; per-model is a real dial that costs none of that.
 //
-// # The two ends: `*` and `off`
+// # The two ends: `*` and empty
 //
 // `*` (the built-in default) seals every model, so a gateway that says nothing
-// keeps sealing rather than silently stopping. `off` seals nothing: every sealed
+// keeps sealing rather than silently stopping. An EMPTY value seals nothing: every sealed
 // surface — its path, its subtree and its POST — is proxied to the router in the
 // clear, marked X-0G-E2EE: none, and this gateway behaves as the plain router.
 //
-// `off` exists for the global-entry cutover. Pointing router-api.0g.ai at a gateway
+// Sealing nothing exists for the global-entry cutover. Pointing router-api.0g.ai at a gateway
 // that seals unconditionally would, in one DNS change, also turn on default
 // encryption for everybody: the provider pool narrows to the sealable ones, web
 // search and file attachments break by construction
@@ -52,8 +52,11 @@ import (
 // HPKE seal. DNS cutover is a deploy; the sealing default is a release.
 //
 // These used to be a separate -seal-policy switch (`always` | `off`) beside this
-// list, which made one dial two knobs whose combinations had to be explained. They
-// are words rather than an empty value on purpose: see parseSealModels.
+// list, which made one dial two knobs whose combinations had to be explained.
+// Empty used to mean "seal everything"; it now means the opposite, and the default
+// moved to `*` so an unset variable still seals. Only a value SET to empty turns
+// sealing off — which is why the compose interpolates it with `${VAR-…}`, not
+// `${VAR:-…}`: the colon form would replace a deliberate empty with the default.
 //
 // # Only narrow on evidence
 //
@@ -110,7 +113,7 @@ import (
 //
 // The zero value seals every model, which is what `*` parses to.
 type sealModels struct {
-	// off reports that nothing is sealed (`off`).
+	// off reports that nothing is sealed (an empty -seal-models).
 	off bool
 	// allow is the lower-cased set of models to seal. See all() for what an
 	// empty list means.
@@ -123,26 +126,22 @@ type sealModels struct {
 const (
 	// sealModelsAll seals every model; the built-in default.
 	sealModelsAll = "*"
-	// sealModelsOff seals nothing.
-	sealModelsOff = "off"
+	// sealModelsNone seals nothing.
+	sealModelsNone = ""
 )
 
 // surfaceWildcard is the suffix that turns an entry into a whole-service-type one.
 const surfaceWildcard = ":*"
 
-// parseSealModels builds the set from -seal-models: `*`, `off`, or a
+// parseSealModels builds the set from -seal-models: `*`, empty, or a
 // comma-separated list. Entries are trimmed and lower-cased (model ids are matched
 // case-insensitively, the way the router's own canonical-id comparison does), and
-// empty entries are dropped so a trailing comma is not a model named "".
+// empty entries are dropped so a trailing comma is not a model named "" — which
+// also means a value of nothing but separators is empty, and seals nothing.
 //
 // It refuses rather than guesses, because the question is "is this encrypted":
 //
-//   - An EMPTY value. It used to mean "seal everything" and reads naturally as
-//     "seal nothing", so either answer is a guess one way or the other. It is also
-//     what a misrendered or forgotten env var produces, and the compose's `${…:-}`
-//     interpolation cannot deliver it deliberately anyway — so the two ends are
-//     words.
-//   - `*` or `off` mixed with anything else, which says two things at once.
+//   - `*` mixed with anything else, which says two things at once.
 //   - A `<service type>:*` entry naming no surface, which would leave that surface
 //     in the clear while reading as configured.
 func parseSealModels(csv string) (sealModels, error) {
@@ -155,13 +154,11 @@ func parseSealModels(csv string) (sealModels, error) {
 	}
 	switch {
 	case len(entries) == 0:
-		return s, fmt.Errorf("empty; use %q to seal every model or %q to seal none", sealModelsAll, sealModelsOff)
-	case len(entries) > 1 && (slices.Contains(entries, sealModelsAll) || slices.Contains(entries, sealModelsOff)):
-		return s, fmt.Errorf("%q and %q stand alone and cannot be combined with other entries", sealModelsAll, sealModelsOff)
-	case entries[0] == sealModelsAll:
-		return s, nil
-	case entries[0] == sealModelsOff:
 		s.off = true
+		return s, nil
+	case len(entries) > 1 && slices.Contains(entries, sealModelsAll):
+		return s, fmt.Errorf("%q stands alone and cannot be combined with other entries", sealModelsAll)
+	case entries[0] == sealModelsAll:
 		return s, nil
 	}
 	var unknown []string

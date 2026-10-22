@@ -12,7 +12,7 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 )
 
-// With -seal-models=off the gateway is the plain router: every sealed surface's
+// With an empty -seal-models the gateway is the plain router: every sealed surface's
 // POST is FORWARDED, not sealed and not refused.
 //
 // This is what makes the DNS cutover a deploy rather than a release. Pointing
