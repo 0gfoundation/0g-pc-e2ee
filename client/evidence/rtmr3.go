@@ -122,14 +122,18 @@ type ImageRecord struct {
 
 // UpstreamSet is one zg-upstream-set (§4.3): every destination the primary broker may
 // forward unsealed plaintext to, or Invalidated when the controller could not state it.
+// When the broker serves several providers in-process, every member names the provider
+// whose config permits it.
 type UpstreamSet struct {
 	Invalidated bool
 	Members     []Upstream
 }
 
-// Upstream is one member of an upstream set.
+// Upstream is one member of an upstream set. Provider is the on-chain address (0x + 40
+// lowercase hex) of the provider the member belongs to, empty in a set recorded for one
+// provider.
 type Upstream struct {
-	Name, URL, Identity string
+	Name, URL, Identity, Provider string
 }
 
 // Host is the upstream's host, without the port.
@@ -362,6 +366,9 @@ func parseImageUpdate(payload []byte) (ImageRecord, error) {
 // upstreamName is an upstream's name (§4.3).
 var upstreamName = regexp.MustCompile(`^[a-z0-9]([a-z0-9_-]{0,61}[a-z0-9])?$`)
 
+// upstreamProvider is a member's provider field (§4.3): tagged, one spelling per address.
+var upstreamProvider = regexp.MustCompile(`^provider=0x[0-9a-f]{40}$`)
+
 const (
 	maxUpstreamLine    = 4096
 	maxUpstreamMembers = 1024
@@ -396,22 +403,40 @@ func parseUpstreamSet(payload []byte) (UpstreamSet, error) {
 	}
 	set := UpstreamSet{}
 	seen := map[string]bool{}
+	withProvider := 0
 	for _, m := range members {
 		f := strings.Split(m, " ")
+		provider := ""
+		if len(f) > 2 && strings.HasPrefix(f[len(f)-1], "provider=") {
+			if !upstreamProvider.MatchString(f[len(f)-1]) {
+				return UpstreamSet{}, fmt.Errorf("member %q: %q is not provider=0x and 40 lowercase hex digits", m, f[len(f)-1])
+			}
+			provider = strings.TrimPrefix(f[len(f)-1], "provider=")
+			f = f[:len(f)-1]
+		}
 		if len(f) != 2 && len(f) != 3 {
-			return UpstreamSet{}, fmt.Errorf("member %q is not `<name> <base URL> [<identity>]`", m)
+			return UpstreamSet{}, fmt.Errorf("member %q is not `<name> <base URL> [<identity>] [provider=<address>]`", m)
 		}
 		if !upstreamName.MatchString(f[0]) {
 			return UpstreamSet{}, fmt.Errorf("member name %q is not [a-z0-9]([a-z0-9_-]{0,61}[a-z0-9])?", f[0])
 		}
-		if seen[f[0]] {
+		// Every member names its provider or none does: a member without one in a set
+		// that has them would belong to nobody the record says.
+		if len(set.Members) > 0 && (provider != "") != (withProvider > 0) {
+			return UpstreamSet{}, fmt.Errorf("member %q: a set names the provider of every member or of none", m)
+		}
+		if provider != "" {
+			withProvider++
+		}
+		// Names are unique per provider: two providers fronting one engine are two members.
+		if seen[provider+" "+f[0]] {
 			return UpstreamSet{}, fmt.Errorf("member %q appears twice", f[0])
 		}
-		seen[f[0]] = true
+		seen[provider+" "+f[0]] = true
 		if err := checkBaseURL(f[1]); err != nil {
 			return UpstreamSet{}, fmt.Errorf("member %q: %v", f[0], err)
 		}
-		u := Upstream{Name: f[0], URL: f[1]}
+		u := Upstream{Name: f[0], URL: f[1], Provider: provider}
 		if len(f) == 3 {
 			if f[2] == "" {
 				return UpstreamSet{}, fmt.Errorf("member %q has an empty identity", f[0])

@@ -814,6 +814,9 @@ func reportRuntime(out io.Writer, pq providerQuote, opts providerOpts, man manif
 			if m.Identity != "" {
 				id = " identity=" + m.Identity
 			}
+			if m.Provider != "" {
+				id += " provider=" + m.Provider
+			}
 			fmt.Fprintf(out, "    %-24s %s%s — %s\n", m.Name, m.URL, id, where)
 		}
 	}
