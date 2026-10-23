@@ -355,13 +355,27 @@ func TestRuntime_Records(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		want := []Upstream{{"local", "http://0gm-sglang:8000/v1", ""}, {"zg-a_b", "https://api.example.com/v1/chat", "openai"},
-			{"bare", "https://x.example", ""}}
+		want := []Upstream{{"local", "http://0gm-sglang:8000/v1", "", ""}, {"zg-a_b", "https://api.example.com/v1/chat", "openai", ""},
+			{"bare", "https://x.example", "", ""}}
 		if !reflect.DeepEqual(st.Upstreams.Members, want) || st.Upstreams.Members[0].Host() != "0gm-sglang" {
 			t.Fatalf("upstreams %+v", st.Upstreams)
 		}
 		if st, err := readSynth(t, rtEntry{event: recUpstreamSet, payload: "invalidated"}); err != nil || !st.Upstreams.Invalidated {
 			t.Fatalf("invalidated: %+v, %v", st.Upstreams, err)
+		}
+	})
+	t.Run("upstream sets naming providers", func(t *testing.T) {
+		a, b := "0x"+strings.Repeat("a", 40), "0x"+strings.Repeat("b", 40)
+		st, err := readSynth(t, rtEntry{event: recUpstreamSet,
+			payload: "count=3\nlocal http://engine:8000/v1 provider=" + a + "\nlocal http://engine:8000/v1 provider=" + b +
+				"\nvendor https://api.example.com/v1 openai provider=" + b})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []Upstream{{"local", "http://engine:8000/v1", "", a}, {"local", "http://engine:8000/v1", "", b},
+			{"vendor", "https://api.example.com/v1", "openai", b}}
+		if !reflect.DeepEqual(st.Upstreams.Members, want) {
+			t.Fatalf("upstreams %+v", st.Upstreams)
 		}
 	})
 }
@@ -372,41 +386,46 @@ func TestRuntime_GrammarRefusals(t *testing.T) {
 	img := func(p string) rtEntry { return rtEntry{event: recImageUpdate, payload: p} }
 	ups := func(p string) rtEntry { return rtEntry{event: recUpstreamSet, payload: p} }
 	for name, e := range map[string]rtEntry{
-		"image: two fields":             img(brokerRepoName + "@" + synthDigest + " " + synthSigner),
-		"image: a double space":         img(brokerRepoName + "@" + synthDigest + "  " + synthSigner + " " + synthEncPub),
-		"image: a trailing newline":     img(brokerRepoName + "@" + synthDigest + " " + synthSigner + " " + synthEncPub + "\n"),
-		"image: a tag":                  img(brokerRepoName + ":v0.5.4 " + synthSigner + " " + synthEncPub),
-		"image: an uppercase digest":    img(brokerRepoName + "@sha256:" + strings.ToUpper(hex64) + " " + synthSigner + " " + synthEncPub),
-		"image: a short signer":         img(brokerRepoName + "@" + synthDigest + " 0x" + hex40[:38] + " " + synthEncPub),
-		"image: a signer without 0x":    img(brokerRepoName + "@" + synthDigest + " " + hex40 + " " + synthEncPub),
-		"image: an uppercase enc_pub":   img(brokerRepoName + "@" + synthDigest + " " + synthSigner + " " + strings.ToUpper(hex64)),
-		"image: no repository":          img("@" + synthDigest + " " + synthSigner + " " + synthEncPub),
-		"config: uppercase":             {event: recConfigUpdate, payload: strings.ToUpper(hex64)},
-		"config: short":                 {event: recConfigUpdate, payload: hex64[:63]},
-		"instance: no value":            {event: recInstanceConfigUpdate, payload: "b1"},
-		"instance: a bad hash":          {event: recInstanceConfigUpdate, payload: "b1 " + hex64[:10]},
-		"upstreams: no count":           ups("local http://a:1/v1"),
-		"upstreams: count too high":     ups("count=2\nlocal http://a:1/v1"),
-		"upstreams: count too low":      ups("count=1\nlocal http://a:1/v1\nother http://b:1/v1"),
-		"upstreams: a leading zero":     ups("count=01\nlocal http://a:1/v1"),
-		"upstreams: a trailing line":    ups("count=1\nlocal http://a:1/v1\n"),
-		"upstreams: an uppercase name":  ups("count=1\nLocal http://a:1/v1"),
-		"upstreams: a name ending in -": ups("count=1\nlocal- http://a:1/v1"),
-		"upstreams: a duplicate name":   ups("count=2\nlocal http://a:1/v1\nlocal http://b:1/v1"),
-		"upstreams: an empty identity":  ups("count=1\nlocal http://a:1/v1 "),
-		"url: another scheme":           ups("count=1\nlocal ftp://a/v1"),
-		"url: an uppercase scheme":      ups("count=1\nlocal HTTP://a/v1"),
-		"url: an uppercase host":        ups("count=1\nlocal http://A.example/v1"),
-		"url: userinfo":                 ups("count=1\nlocal https://u:p@a.example/v1"),
-		"url: a query":                  ups("count=1\nlocal https://a.example/v1?x=1"),
-		"url: a fragment":               ups("count=1\nlocal https://a.example/v1#x"),
-		"url: the default port":         ups("count=1\nlocal https://a.example:443/v1"),
-		"url: a trailing slash":         ups("count=1\nlocal https://a.example/v1/"),
-		"url: a bare slash":             ups("count=1\nlocal https://a.example/"),
-		"url: a dot segment":            ups("count=1\nlocal https://a.example/v1/../v2"),
-		"url: percent-encoding":         ups("count=1\nlocal https://a.example/v%31"),
-		"url: a non-ASCII host":         ups("count=1\nlocal https://ä.example/v1"),
-		"url: a bad port":               ups("count=1\nlocal https://a.example:0/v1"),
+		"image: two fields":                           img(brokerRepoName + "@" + synthDigest + " " + synthSigner),
+		"image: a double space":                       img(brokerRepoName + "@" + synthDigest + "  " + synthSigner + " " + synthEncPub),
+		"image: a trailing newline":                   img(brokerRepoName + "@" + synthDigest + " " + synthSigner + " " + synthEncPub + "\n"),
+		"image: a tag":                                img(brokerRepoName + ":v0.5.4 " + synthSigner + " " + synthEncPub),
+		"image: an uppercase digest":                  img(brokerRepoName + "@sha256:" + strings.ToUpper(hex64) + " " + synthSigner + " " + synthEncPub),
+		"image: a short signer":                       img(brokerRepoName + "@" + synthDigest + " 0x" + hex40[:38] + " " + synthEncPub),
+		"image: a signer without 0x":                  img(brokerRepoName + "@" + synthDigest + " " + hex40 + " " + synthEncPub),
+		"image: an uppercase enc_pub":                 img(brokerRepoName + "@" + synthDigest + " " + synthSigner + " " + strings.ToUpper(hex64)),
+		"image: no repository":                        img("@" + synthDigest + " " + synthSigner + " " + synthEncPub),
+		"config: uppercase":                           {event: recConfigUpdate, payload: strings.ToUpper(hex64)},
+		"config: short":                               {event: recConfigUpdate, payload: hex64[:63]},
+		"instance: no value":                          {event: recInstanceConfigUpdate, payload: "b1"},
+		"instance: a bad hash":                        {event: recInstanceConfigUpdate, payload: "b1 " + hex64[:10]},
+		"upstreams: no count":                         ups("local http://a:1/v1"),
+		"upstreams: count too high":                   ups("count=2\nlocal http://a:1/v1"),
+		"upstreams: count too low":                    ups("count=1\nlocal http://a:1/v1\nother http://b:1/v1"),
+		"upstreams: a leading zero":                   ups("count=01\nlocal http://a:1/v1"),
+		"upstreams: a trailing line":                  ups("count=1\nlocal http://a:1/v1\n"),
+		"upstreams: an uppercase name":                ups("count=1\nLocal http://a:1/v1"),
+		"upstreams: a name ending in -":               ups("count=1\nlocal- http://a:1/v1"),
+		"upstreams: a duplicate name":                 ups("count=2\nlocal http://a:1/v1\nlocal http://b:1/v1"),
+		"upstreams: an empty identity":                ups("count=1\nlocal http://a:1/v1 "),
+		"upstreams: a provider on some members only":  ups("count=2\nlocal http://a:1/v1 provider=0x" + hex40 + "\nother http://b:1/v1"),
+		"upstreams: an uppercase provider":            ups("count=1\nlocal http://a:1/v1 provider=0x" + strings.ToUpper(hex40)),
+		"upstreams: a short provider":                 ups("count=1\nlocal http://a:1/v1 provider=0x" + hex40[:38]),
+		"upstreams: the provider before the identity": ups("count=1\nlocal http://a:1/v1 provider=0x" + hex40 + " openai"),
+		"upstreams: a name twice for one provider":    ups("count=2\nlocal http://a:1/v1 provider=0x" + hex40 + "\nlocal http://b:1/v1 provider=0x" + hex40),
+		"url: another scheme":                         ups("count=1\nlocal ftp://a/v1"),
+		"url: an uppercase scheme":                    ups("count=1\nlocal HTTP://a/v1"),
+		"url: an uppercase host":                      ups("count=1\nlocal http://A.example/v1"),
+		"url: userinfo":                               ups("count=1\nlocal https://u:p@a.example/v1"),
+		"url: a query":                                ups("count=1\nlocal https://a.example/v1?x=1"),
+		"url: a fragment":                             ups("count=1\nlocal https://a.example/v1#x"),
+		"url: the default port":                       ups("count=1\nlocal https://a.example:443/v1"),
+		"url: a trailing slash":                       ups("count=1\nlocal https://a.example/v1/"),
+		"url: a bare slash":                           ups("count=1\nlocal https://a.example/"),
+		"url: a dot segment":                          ups("count=1\nlocal https://a.example/v1/../v2"),
+		"url: percent-encoding":                       ups("count=1\nlocal https://a.example/v%31"),
+		"url: a non-ASCII host":                       ups("count=1\nlocal https://ä.example/v1"),
+		"url: a bad port":                             ups("count=1\nlocal https://a.example:0/v1"),
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := readSynth(t, e)
