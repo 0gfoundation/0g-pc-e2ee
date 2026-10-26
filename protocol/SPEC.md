@@ -77,7 +77,10 @@ HPKE per **RFC 9180**, single ciphersuite in v1:
 | KDF  | HKDF-SHA256 | `0x0001` |
 | AEAD | ChaCha20Poly1305 | `0x0003` |
 
-- HPKE **mode**: `mode_base` (`0x00`) in v1 — no PSK, no sender auth.
+- HPKE **mode**: `mode_base` (`0x00`) for the request and, by default, the
+  response. A response to a request carrying the response binding uses
+  `mode_psk` (`0x01`), keyed by a value only the sender and the enclave hold
+  (§7.6). No other mode is used.
 - **Request** confidentiality: HPKE `Seal` of the sealed-field object to the
   provider enc key; cleartext fields are bound as AAD (§5, §6).
 - **Response** confidentiality: a **fresh HPKE `Seal` from the enclave to the
@@ -770,7 +773,7 @@ recipient. Streaming frames are sealed under one response context (its internal
 sequence increments per `Seal`, so frames MUST be opened in order).
 
 ```
-(resp_enc, resp_ctx) = HPKE.SetupBaseS(client_eph_pub, info="0g-pc/v1/resp")
+(resp_enc, resp_ctx) = HPKE.SetupBaseS(client_eph_pub, info="0g-pc/v1/resp")   // SetupPSKS when the request carried _bind, §7.6
 // per frame, in order:
 sealed_obj = { field: value  for field in sealed_fields }   // e.g. { "choices": [...] }
 aad        = JCS(frame_json without _e2ee.ciphertext and without _e2ee.unbound_fields)
@@ -1365,6 +1368,69 @@ user_job_id = jobId + "." + base64url(eph_priv)        // unpadded; 32 bytes →
   code only. The body is never relayed verbatim (a relayed upstream error may
   carry request text), and the error never includes `user_job_id`.
 
+### 7.6 Response binding (synchronous profiles)
+
+`client_eph_pub` is cleartext in the request envelope and HPKE base mode does
+not authenticate the sender, so anyone who saw the request — the router
+included — can seal a response the client will open. On a non-streaming
+response §8 catches this before delivery. A **stream** is handed to the caller
+frame by frame and §8 runs only after the final frame, so a router that drops the
+enclave's stream and answers with one of its own has its text delivered first
+and reported as a failure afterwards. It cannot splice a frame into the genuine
+stream (later frames are bound to the first frame's context by the AEAD
+sequence); it replaces the whole stream, starting at the first frame.
+
+The response binding closes this. It applies to every synchronous profile
+(chat, anthropic, image, speech, embedding); async-image has its own (§7.5.1).
+
+```
+bind = HKDF-SHA256(ikm = eph_priv, salt = "", info = "0g-pc/v1/resp-bind", L = 32)
+_bind = base64url(bind)                      // unpadded, a JSON string
+
+// enclave, when the opened request carried _bind:
+(resp_enc, resp_ctx) = HPKE.SetupPSKS(client_eph_pub, info = "0g-pc/v1/resp",
+                                      psk = bind, psk_id = "0g-pc/v1/resp-bind")
+// client:
+resp_ctx = HPKE.SetupPSKR(resp_enc, eph_priv, info = "0g-pc/v1/resp",
+                          psk = bind, psk_id = "0g-pc/v1/resp-bind")
+```
+
+Everything else in §7 is unchanged: frames, sealed sets, AAD and `_e2ee` are
+the same, and nothing is added to a frame.
+
+- **Request.** The sender MAY add `_bind` to the request. When it does, it MUST
+  seal it. A request carrying `_bind` in the clear MUST be refused by the
+  sender at seal time and by the enclave at open (a cleartext value is one the
+  router holds).
+- **Enclave.** After Open, if the request carries `_bind`, the enclave MUST
+  remove it before the upstream call (protocol metadata, not a model parameter)
+  and MUST seal the response in mode_psk keyed by it. Without `_bind`, it seals
+  in base mode as before.
+- **Receiver.** A sender that attached `_bind` MUST open the response in
+  mode_psk with the `bind` it derives from `eph_priv`, and MUST refuse a
+  response whose first frame does not open, before delivering any of it.
+
+Why this holds: `bind` is derived from `eph_priv`, which never leaves the sender,
+and travels only sealed to the enclave. A party without it — the router, or
+anyone else holding `client_eph_pub` — can set up only a context the receiver's
+cannot match, so its first frame fails to open. Every later frame shares that
+first frame's context. One check at the first frame therefore authenticates the
+whole stream, which is why the binding keys the context rather than riding in a
+frame: no frame-shape rule changes (Anthropic's `message_start` still seals
+nothing, §7.2), and no frame grows.
+
+**Opt-in per request.** An enclave that predates this section forwards `_bind`
+upstream and seals in base mode, and a client that attached `_bind` would refuse
+every response from it. A sender therefore attaches `_bind` only for an enclave
+it knows implements §7.6. How it learns that is outside this format. The 0G
+broker advertises `"e2ee_features": ["resp-bind"]` in its `/v1/quote` reply, and
+the gateway reads it only from the provider's on-chain serving URL, which the
+router cannot redirect. A sender that relied on anything the router relays
+could be downgraded into not attaching it.
+
+Known answer: `eph_priv` = bytes `00 01 02 … 1f` → `bind` =
+`99711ebcd2996833c92f9fd7ddc8ac3e9c2bb5513b36d3ce72049b34c21e4a8b`.
+
 ## 8. Response signature
 
 Each response carries a TEE signature that authenticates it as the enclave's
@@ -1550,6 +1616,7 @@ other, that party's column is the load-bearing one.
 | a conditionally sealed RESPONSE field is sealed when the frame carries it — speech: `segments` / `words` / `language` (§7.3) | yes | **yes — client**. A field still in the received cleartext was never sealed, and that is the receiver's only evidence: a router forwards such a frame unremarkably and the transcript rides through it in the clear. Same shape as the request side's conditional payload field, direction reversed |
 | a required quantity's LOCATOR field is neither sealed nor `unbound` — speech's `duration` as well as its `usage` (§5.2 table) | yes | **yes — client**, on every frame. The floor list is the name `usage`, so nothing else in this document reaches a top-level `duration`: derive the rule from the profile's locators rather than from names. The SEALED half is not redundant with the presence check once a quantity has alternatives — see §5.2 |
 | async-image: `_bind` is sealed in the request and echoed sealed in the result, and equals the value derived from the receiver's `eph_priv` (§7.5.1) | yes — sender attaches and seals it; enclave strips it before the upstream and echoes it | **yes — enclave** refuses a request without it; **yes — sender** refuses a result without it or with a different value. The sender's half is the one that stops a router-submitted request carrying the victim's key: Open and §8 both pass on that frame |
+| synchronous profiles: a request carrying `_bind` seals it, and the response to it is sealed in mode_psk keyed by it (§7.6) | yes — sender seals it; enclave strips it before the upstream and keys the response context with it | **yes — enclave** refuses a cleartext `_bind`; **yes — sender** opens only in mode_psk with the value it derived, and refuses the response at the first frame otherwise. The sender's half is the one that stops a router-substituted stream, and the only one that stops it before delivery |
 | async-image: result frame is `completed`, names the polled broker job id, and frees nothing beyond `model` / `x_0g_trace` (§7.5.2) | yes — enclave declares the unbound set at completion | **yes — sender**. `jobId` in the AAD is what refuses a replay's result on the original job; an unbound `jobId` would make that check sender-controlled |
 | async-image: no upstream error text in a sealed job's `failed` body (§7.5.2) | **yes — enclave**, the only side holding the text | sender replaces an unknown `errorMessage`, but cannot tell a code from text that happens to look like one |
 | async-image: the key segment of `user_job_id` never reaches the router or a log (§7.5.3) | **yes — sender** | n/a — no other party sees it |

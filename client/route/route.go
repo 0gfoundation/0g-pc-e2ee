@@ -273,6 +273,10 @@ type Router struct {
 	// waiting for a release verdict (see enforceWait).
 	providerEnforce       bool
 	providerEnforceWaitTO time.Duration
+	// respBind, when non-nil, is which providers the warmer saw advertise the
+	// response binding (respbind.go); requests to them carry it. Nil leaves every
+	// request unbound.
+	respBind *respBindStore
 	// identities keeps, per provider address, the outcome of the checks this process
 	// ran before sealing to that provider — read by the gateway's provider-identity
 	// endpoint (see provideridentity.go). Written only from the path that materializes
@@ -1011,6 +1015,9 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 		// also where its §8 response signature is served — the router does not
 		// proxy /v1/proxy/signature. Carry it so verification can fetch direct.
 		Endpoint: prov.Endpoint,
+		// Whether the warmer saw this provider advertise the response binding at its
+		// on-chain URL (respbind.go) — never anything this request path read.
+		BindResponse: c.router.bindsResponse(prov.Address),
 	}, nil
 }
 
@@ -1189,6 +1196,9 @@ func (r *Router) verifyQuoteAt(ctx context.Context, quoteURL string) (res quoteR
 		facts.containers = r.containersOf(appCompose, composeHash, quoteURL)
 	}
 	facts.manifest = r.readManifest(appCompose, composeHash, haveHash, quoteURL)
+	// Recorded for every verification but trusted only from the warmer's, which
+	// fetched quoteURL from the provider's on-chain URL — see respbind.go.
+	facts.respBind = quoteAdvertisesRespBind(reply)
 	// The same reply, so the log cannot belong to another quote; and the RTMR3 it must
 	// replay to is the verified one, never a value read out of the reply.
 	facts.runtime = runtimeFacts{signer: verified.SignerAddr, encPub: verified.EncPub}

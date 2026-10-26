@@ -445,6 +445,11 @@ func (r *Router) WarmOnce(ctx context.Context, endpoints EndpointResolver) {
 		// our own shutdown.
 		if ctx.Err() == nil {
 			if quoteVerified {
+				// The one place the response binding is decided (respbind.go): this quote
+				// came from the provider's on-chain URL, not from anything the router chose.
+				if r.respBind != nil {
+					r.respBind.observe(addr, verified.facts.respBind)
+				}
 				r.recordWarmedProviderIdentity(providerIdentityOf(addr, info.URL, verified, onchain))
 				r.observeBaseline(addr, verified.facts.manifest)
 				// Under provider enforce, a provider whose checks do not pass is one a

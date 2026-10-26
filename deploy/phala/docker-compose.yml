@@ -434,6 +434,12 @@ services:
       # ONCHAIN off exits(1) into a restart loop behind a healthy ingress. It sweeps
       # every 4m, under the ~5m quote-cache TTL.
       - "ZG_GATEWAY_WARM=true"
+      # Response binding (SPEC §7.6) is ON by default with the warmer: a request to a
+      # provider whose quote, read by the warmer at its on-chain URL, advertises
+      # "e2ee_features": ["resp-bind"] is sealed so that a stream the router
+      # substitutes is refused at its first frame. Inert until brokers advertise it.
+      # Kill switch:
+      # - "ZG_GATEWAY_RESP_BIND=false"
       #
       # Soft limit for the Go runtime, and the input the in-flight cap is derived
       # from when ZG_GATEWAY_MAX_INFLIGHT is not set:

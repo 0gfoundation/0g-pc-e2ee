@@ -222,6 +222,20 @@ type Provider struct {
 	// the request's model as-is" (a static provider, or a caller that already
 	// pinned the model).
 	Model string
+	// BindResponse asks this provider for a bound response (SPEC §7.6): the
+	// client seals a `_bind` derived from its ephemeral key into the request,
+	// and opens the response only under that binding. A response sealed by
+	// anyone else — a router that answers with a stream of its own, sealed to the
+	// cleartext client_eph_pub — is then refused at its first frame, before any
+	// of it reaches the caller, instead of after the whole stream by the §8
+	// signature.
+	//
+	// Set it only for a provider known to implement §7.6: one that does not
+	// forwards `_bind` upstream and seals in base mode, and every response from
+	// it would be refused (as a fall-back-able open failure). The route resolver
+	// sets it from the provider's quote reply, read at its on-chain URL. Ignored
+	// on a surface the binding does not apply to (async-image has its own).
+	BindResponse bool
 }
 
 // Client is the shared client core: it seals a request's sensitive fields to
@@ -780,7 +794,7 @@ func (c *Client) completeOnce(parent context.Context, provider Provider, req wir
 	ctx, cancel := context.WithTimeout(parent, bufferedTimeout)
 	defer cancel()
 
-	sealed, err := c.seal(provider, req, ephPub)
+	sealed, err := c.seal(provider, req, ephPriv, ephPub)
 	if err != nil {
 		// A seal failure depends on the request, not the provider (e.g. no messages
 		// to seal), so it would fail identically for every candidate — terminal.
@@ -836,11 +850,16 @@ func (c *Client) completeOnce(parent context.Context, provider Provider, req wir
 		outcome = UpstreamUndecodable
 		return nil, true, stageErr(StageUpstream, fmt.Errorf("decode sealed response: %w", err))
 	}
-	out, err := wire.OpenResponseFor(c.ep.Profile, ephPriv, sealedResp)
+	var out wire.Response
+	if c.bindsResponse(provider) {
+		out, err = wire.OpenBoundResponseFor(c.ep.Profile, ephPriv, sealedResp)
+	} else {
+		out, err = wire.OpenResponseFor(c.ep.Profile, ephPriv, sealedResp)
+	}
 	if err != nil {
 		c.logOpenFailure(0, sealedResp, err)
 		outcome = UpstreamUndecodable
-		return nil, true, stageErr(StageUpstream, fmt.Errorf("open response: %w", err))
+		return nil, true, stageErr(StageUpstream, fmt.Errorf("open response: %w", openErr(c.bindsResponse(provider), err)))
 	}
 	// Response-signature verification (hop 11), fail-closed. A response that
 	// opened but fails the §8 signature is an integrity/authenticity failure of
@@ -974,10 +993,42 @@ func (c *Client) doRequest(ctx context.Context, provider Provider, env wire.Requ
 // usage reporting on a streaming request, then seals the sensitive fields to the
 // provider's enc key. Called once per fallback attempt because the canonical
 // model and enc key differ per candidate.
-func (c *Client) seal(provider Provider, req wire.Request, ephPub []byte) (wire.Request, error) {
+//
+// For a provider that binds its response (Provider.BindResponse) it also attaches
+// the sealed `_bind` (SPEC §7.6); the opener on the response side must then be
+// the bound one — see bindsResponse.
+func (c *Client) seal(provider Provider, req wire.Request, ephPriv crypto.PrivateKey, ephPub []byte) (wire.Request, error) {
 	req = withModel(req, provider.Model)
 	req = withStreamUsage(c.ep.Profile, req)
-	return wire.SealRequestFor(c.ep.Profile, provider.EncPubKey, req, c.sealedFieldsFor(req), provider.SignerAddr, ephPub, c.unboundFields...)
+	fields := c.sealedFieldsFor(req)
+	if c.bindsResponse(provider) {
+		var err error
+		if req, err = wire.AttachResponseBind(c.ep.Profile, req, ephPriv); err != nil {
+			return nil, err
+		}
+		if !slices.Contains(fields, "_bind") {
+			fields = append(fields, "_bind")
+		}
+	}
+	return wire.SealRequestFor(c.ep.Profile, provider.EncPubKey, req, fields, provider.SignerAddr, ephPub, c.unboundFields...)
+}
+
+// bindsResponse reports whether a request to provider carries the response
+// binding (SPEC §7.6), and so whether its response must be opened bound. One
+// predicate for the seal and the open, so the two cannot disagree.
+func (c *Client) bindsResponse(provider Provider) bool {
+	return provider.BindResponse && wire.ResponseBindApplies(c.ep.Profile)
+}
+
+// openErr names the response binding in an open failure on a bound request. The
+// two causes look identical from here — a substituted response, or a provider
+// advertised as binding that sealed in base mode — and the line an operator
+// reads should say which mechanism refused it.
+func openErr(bound bool, err error) error {
+	if !bound {
+		return err
+	}
+	return fmt.Errorf("%w (bound response, SPEC §7.6: not sealed under this request's binding — substituted in transit, or the provider does not implement it)", err)
 }
 
 // withStreamUsage forces "stream_options":{"include_usage":true} on a streaming

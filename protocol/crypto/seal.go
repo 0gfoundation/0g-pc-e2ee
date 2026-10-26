@@ -130,6 +130,70 @@ func SetupReceiver(priv PrivateKey, enc, info []byte) (*Opener, error) {
 	return &Opener{inner: opener}, nil
 }
 
+// SetupSenderPSK is SetupSender in HPKE mode_psk (RFC 9180 §5.1.2): the
+// context's keys depend on psk as well as on the KEM shared secret, so only a
+// sender that knows psk can produce ciphertext the receiver will open. Base mode
+// authenticates nobody — anyone holding pub can seal to it — and this is the
+// standard way to add sender authentication when the two ends already share a
+// secret. pskID names the PSK and must match the receiver's; neither may be
+// empty (RFC 9180 §5.1, VerifyPSKInputs), and psk should carry at least 32 bytes
+// of entropy (§9.5).
+func SetupSenderPSK(pub PublicKey, info, psk, pskID []byte) (enc []byte, s *Sealer, err error) {
+	if err := checkPSKInputs(psk, pskID); err != nil {
+		return nil, nil, err
+	}
+	pk, err := kemScheme().UnmarshalBinaryPublicKey(pub)
+	if err != nil {
+		return nil, nil, fmt.Errorf("bad recipient public key: %w", err)
+	}
+	sender, err := suite().NewSender(pk, info)
+	if err != nil {
+		return nil, nil, fmt.Errorf("new sender: %w", err)
+	}
+	enc, sealer, err := sender.SetupPSK(rand.Reader, psk, pskID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("sender psk setup: %w", err)
+	}
+	return enc, &Sealer{inner: sealer}, nil
+}
+
+// SetupReceiverPSK is SetupReceiver in HPKE mode_psk. info, psk and pskID must
+// all match the sender's; a context set up with any of them different opens
+// nothing (the first Open fails), which is what makes the PSK an authenticator.
+func SetupReceiverPSK(priv PrivateKey, enc, info, psk, pskID []byte) (*Opener, error) {
+	if err := checkPSKInputs(psk, pskID); err != nil {
+		return nil, err
+	}
+	sk, err := kemScheme().UnmarshalBinaryPrivateKey(priv)
+	if err != nil {
+		return nil, fmt.Errorf("bad recipient private key: %w", err)
+	}
+	receiver, err := suite().NewReceiver(sk, info)
+	if err != nil {
+		return nil, fmt.Errorf("new receiver: %w", err)
+	}
+	opener, err := receiver.SetupPSK(enc, psk, pskID)
+	if err != nil {
+		return nil, fmt.Errorf("receiver psk setup: %w", err)
+	}
+	return &Opener{inner: opener}, nil
+}
+
+// minPSKLen is RFC 9180 §9.5's floor: a PSK MUST have at least 32 bytes of
+// entropy. Checked here rather than left to the library, which accepts any
+// non-empty PSK.
+const minPSKLen = 32
+
+func checkPSKInputs(psk, pskID []byte) error {
+	if len(psk) < minPSKLen {
+		return fmt.Errorf("psk must be at least %d bytes, got %d", minPSKLen, len(psk))
+	}
+	if len(pskID) == 0 {
+		return fmt.Errorf("psk id must not be empty")
+	}
+	return nil
+}
+
 // Seal is the one-shot form for a single message whose aad does NOT depend on
 // the encapsulated key: it sets up a sender, seals once, and returns enc +
 // ciphertext together. When aad must include enc, use SetupSender instead.

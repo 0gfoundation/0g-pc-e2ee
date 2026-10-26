@@ -100,7 +100,7 @@ func (c *Client) submitOnce(parent context.Context, provider Provider, req wire.
 	if err != nil {
 		return nil, 0, false, stageErr(StageRequest, fmt.Errorf("bind request: %w", err))
 	}
-	sealed, err := c.seal(provider, bound, ephPub)
+	sealed, err := c.seal(provider, bound, ephPriv, ephPub)
 	if err != nil {
 		return nil, 0, false, stageErr(StageRequest, fmt.Errorf("seal request: %w", err))
 	}
