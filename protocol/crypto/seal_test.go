@@ -121,3 +121,73 @@ func TestSetupSenderReceiverRoundTrip(t *testing.T) {
 		t.Fatalf("round trip mismatch: got %q", got)
 	}
 }
+
+// mode_psk: the receiver opens a PSK context only with the sender's psk, and a
+// base-mode sender — which is what anyone holding the public key can be —
+// produces nothing a PSK receiver will open. That second half is the property
+// the response binding relies on (SPEC §7.6).
+func TestPSKModeAuthenticatesTheSender(t *testing.T) {
+	priv, pub, err := GenerateRecipientKey()
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	psk := bytes.Repeat([]byte{7}, 32)
+	pskID := []byte("test-psk")
+	aad := []byte("aad")
+
+	enc, s, err := SetupSenderPSK(pub, testInfo, psk, pskID)
+	if err != nil {
+		t.Fatalf("psk sender: %v", err)
+	}
+	ct, err := s.Seal([]byte("hello"), aad)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	o, err := SetupReceiverPSK(priv, enc, testInfo, psk, pskID)
+	if err != nil {
+		t.Fatalf("psk receiver: %v", err)
+	}
+	if pt, err := o.Open(ct, aad); err != nil || string(pt) != "hello" {
+		t.Fatalf("open = %q, %v", pt, err)
+	}
+
+	// A different psk opens nothing.
+	other := bytes.Repeat([]byte{8}, 32)
+	o2, err := SetupReceiverPSK(priv, enc, testInfo, other, pskID)
+	if err != nil {
+		t.Fatalf("psk receiver: %v", err)
+	}
+	if _, err := o2.Open(ct, aad); err == nil {
+		t.Fatal("a PSK context with the wrong psk opened the ciphertext")
+	}
+
+	// A base-mode sender (no psk) is not accepted by a PSK receiver.
+	enc3, s3, err := SetupSender(pub, testInfo)
+	if err != nil {
+		t.Fatalf("base sender: %v", err)
+	}
+	ct3, err := s3.Seal([]byte("forged"), aad)
+	if err != nil {
+		t.Fatalf("seal: %v", err)
+	}
+	o3, err := SetupReceiverPSK(priv, enc3, testInfo, psk, pskID)
+	if err != nil {
+		t.Fatalf("psk receiver: %v", err)
+	}
+	if _, err := o3.Open(ct3, aad); err == nil {
+		t.Fatal("a PSK receiver opened a base-mode ciphertext")
+	}
+}
+
+func TestPSKInputsAreChecked(t *testing.T) {
+	_, pub, err := GenerateRecipientKey()
+	if err != nil {
+		t.Fatalf("keygen: %v", err)
+	}
+	if _, _, err := SetupSenderPSK(pub, testInfo, make([]byte, 31), []byte("id")); err == nil {
+		t.Error("a 31-byte psk was accepted")
+	}
+	if _, _, err := SetupSenderPSK(pub, testInfo, make([]byte, 32), nil); err == nil {
+		t.Error("an empty psk id was accepted")
+	}
+}

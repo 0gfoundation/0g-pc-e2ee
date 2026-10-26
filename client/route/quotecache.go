@@ -79,6 +79,10 @@ type quoteFacts struct {
 	// (composebaseline.go). The comparison itself needs the provider's address, which this
 	// cache, keyed by endpoint, does not have; it runs where the record is written and read.
 	manifest manifestFacts
+	// respBind is whether the reply advertised the response binding (SPEC §7.6). The
+	// reply is unauthenticated and, on the request path, came from a URL the router
+	// chose, so only the warmer acts on it (respbind.go).
+	respBind bool
 }
 
 func newQuoteCache(ttl time.Duration) *quoteCache {

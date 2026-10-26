@@ -189,6 +189,7 @@ type Flags struct {
 	pccsURL         *string
 	runtimeReleases *bool
 	providerEnforce *bool
+	respBind        *bool
 }
 
 // defaultWarmInterval is the refresh-ahead period of the background quote-cache
@@ -213,7 +214,7 @@ const defaultCollateralTTL = time.Hour
 // default: <envPrefix>_LISTEN, _ROUTER_URL, _PROVIDER_URL,
 // _ATTEST, _ATTEST_ENFORCE, _ONCHAIN, _ONCHAIN_ENFORCE, _NETWORK,
 // _CHAIN_RPC_URL, _SERVING_CONTRACT, _WARM, _PCCS_URL, _RUNTIME_RELEASES,
-// _PROVIDER_ENFORCE.
+// _PROVIDER_ENFORCE, _RESP_BIND.
 // defaultListen is the built-in listen address used when neither the flag nor
 // <envPrefix>_LISTEN is set.
 //
@@ -254,6 +255,8 @@ func RegisterFlags(fs *flag.FlagSet, envPrefix, defaultListen, defaultRouterURL 
 			fmt.Sprintf("with -attest, judge the broker build each provider's CVM runs now (its RTMR3 runtime records) against the broker's signed release provenance (client/provenance/policy.json), fetching it from ghcr.io and Sigstore's trust root from tuf-repo-cdn.sigstore.dev in the background; observed and logged, and a gate only under -provider-enforce. false for a host with no egress to those (env %s)", env("RUNTIME_RELEASES"))),
 		providerEnforce: fs.Bool("provider-enforce", envBool(env("PROVIDER_ENFORCE"), false),
 			fmt.Sprintf("seal only to a provider whose manifest is the deployment recorded for it (client/evidence/compose/brokercompose.json) and whose broker build running now is an accepted release; skip any other, including one nobody recorded and one whose checks could not run. Requires -attest, -onchain-enforce (which binds the router-supplied address the record is keyed by) and -runtime-releases; not in direct-broker mode. Turn it on only once every provider being routed to is recorded and on a release (env %s)", env("PROVIDER_ENFORCE"))),
+		respBind: fs.Bool("resp-bind", envBool(env("RESP_BIND"), true),
+			fmt.Sprintf("seal requests with the response binding (SPEC §7.6) to every provider whose quote, read by the -warm warmer at the provider's on-chain URL, advertises it, so a stream the router substitutes is refused at its first frame instead of after the whole stream; inert without -warm, which is the only source it trusts. false is the kill switch (env %s)", env("RESP_BIND"))),
 	}
 }
 
@@ -591,8 +594,14 @@ func (f *Flags) Build(label string, logger *slog.Logger, opts ...BuildOption) *B
 	for _, ep := range served {
 		warmTypes = append(warmTypes, ep.ServiceType)
 	}
-	router := route.New(*f.RouterURL, append(append([]route.Option{}, routeOpts...),
-		route.WithWarmServiceTypes(warmTypes...))...)
+	// The response binding is decided only from what the warmer reads at each
+	// provider's on-chain URL (route/respbind.go), so it is wired only with it.
+	routerOpts := append(append([]route.Option{}, routeOpts...), route.WithWarmServiceTypes(warmTypes...))
+	if *f.warmOn && *f.respBind {
+		routerOpts = append(routerOpts, route.WithResponseBinding())
+		logger.Info("response binding enabled for providers that advertise it", "label", label)
+	}
+	router := route.New(*f.RouterURL, routerOpts...)
 
 	b := &Built{Clients: sealingClients(router, served, coreOpts), router: router, verifiesQuotes: *f.attestOn,
 		chainRoot: root}

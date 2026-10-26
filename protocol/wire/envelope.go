@@ -146,10 +146,12 @@ const (
 	// clientEphPubLen is the byte length of an X25519 public key — the client's
 	// response ephemeral key (SPEC §3 suite).
 	clientEphPubLen = 32
-	// fieldBind is the async-image profile's result-binding value (SPEC §7.5):
-	// derived from the client's ephemeral PRIVATE key, sealed inside the request,
-	// echoed sealed inside the result. It is a sealed field on both sides and
-	// never reaches the upstream — see async.go.
+	// fieldBind carries a binding value derived from the client's ephemeral
+	// PRIVATE key, always sealed and never forwarded upstream. On async-image it
+	// is the result binding (SPEC §7.5.1): mandatory, and echoed sealed inside the
+	// result — see async.go. On every synchronous profile it is the optional
+	// response binding (§7.6): the enclave keys the response's HPKE context with
+	// it — see respbind.go.
 	fieldBind = "_bind"
 )
 
@@ -1075,6 +1077,15 @@ func validatePayloadSealedFor(p Profile, fields []string, msg Request) error {
 		}
 		return fmt.Errorf("%s-profile request carries %q in cleartext: it is payload and MUST be sealed whenever present", p, f.name)
 	}
+	// `_bind` on every profile, not only where `payload` lists it: on a
+	// synchronous profile it is the optional response binding (§7.6), and a
+	// binding value in the clear is one the router holds too — it could then
+	// seal a response of its own that the client opens as bound.
+	if _, present := msg[fieldBind]; present {
+		if _, isSealed := sealed[fieldBind]; !isSealed {
+			return fmt.Errorf("%s-profile request carries %q in cleartext: a binding value MUST be sealed", p, fieldBind)
+		}
+	}
 	return nil
 }
 
@@ -1438,6 +1449,11 @@ func SealRequestFor(profile Profile, encPub crypto.PublicKey, req Request, seale
 	}
 	if sealedFields == nil {
 		sealedFields = presentSubset(DefaultSealedFieldsFor(profile), req)
+		// The response binding (§7.6) is not payload of any synchronous profile,
+		// so the default set does not name it; seal it when the request carries it.
+		if _, ok := req[fieldBind]; ok && !slices.Contains(sealedFields, fieldBind) {
+			sealedFields = append(sealedFields, fieldBind)
+		}
 	}
 	if err := validateSealInputs(profile, spec, sealedFields, unboundFields, signerAddr, clientEphPub); err != nil {
 		return nil, err

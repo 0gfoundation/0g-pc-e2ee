@@ -1309,7 +1309,11 @@ and warmer liveness).
   does not vouch for it (`ZG_GATEWAY_ONCHAIN`, `ZG_GATEWAY_ONCHAIN_ENFORCE`), and each
   response's §8 TEE signature is verified
   fail-closed against that signer (`ZG_GATEWAY_VERIFY_RESPONSES`). A background
-  warmer (`ZG_GATEWAY_WARM`) pre-verifies quotes so requests hit a warm cache.
+  warmer (`ZG_GATEWAY_WARM`) pre-verifies quotes so requests hit a warm cache, and is
+  also the only source of the **response binding** decision (`ZG_GATEWAY_RESP_BIND`,
+  on by default, SPEC §7.6): a provider whose quote at its on-chain URL advertises
+  `"e2ee_features": ["resp-bind"]` gets requests whose response the router cannot
+  substitute, refused at the first frame rather than after the stream.
   The **boot-chain** check (hop 3) is **enforced** (`ZG_GATEWAY_ATTEST_ENFORCE`): a
   provider whose boot chain is not in the allowlist is refused rather than warned about,
   and the request falls back to the next candidate — with a single provider registered

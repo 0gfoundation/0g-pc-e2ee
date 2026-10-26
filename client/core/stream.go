@@ -82,7 +82,7 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 			c.metricFallback(FallbackMaterialize, i, cands.Len())
 			continue
 		}
-		sealed, err := c.seal(provider, req, ephPub)
+		sealed, err := c.seal(provider, req, ephPriv, ephPub)
 		if err != nil {
 			// Request-level failure — identical for every candidate; fail fast.
 			return stageErr(StageRequest, fmt.Errorf("seal request: %w", err))
@@ -267,7 +267,11 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 		}
 		if opener == nil {
 			// The first frame carries enc; it sets up the shared HPKE context.
-			opener, err = wire.NewResponseOpenerFor(c.ep.Profile, ephPriv, frame)
+			if c.bindsResponse(provider) {
+				opener, err = wire.NewBoundResponseOpenerFor(c.ep.Profile, ephPriv, frame)
+			} else {
+				opener, err = wire.NewResponseOpenerFor(c.ep.Profile, ephPriv, frame)
+			}
 			if err != nil {
 				c.logOpenFailure(frameIdx, frame, err)
 				outcome = UpstreamUndecodable
@@ -278,6 +282,11 @@ func (c *Client) streamOnce(parent context.Context, provider Provider, sealed wi
 		if err != nil {
 			c.logOpenFailure(frameIdx, frame, err)
 			outcome = UpstreamUndecodable
+			if frameIdx == 0 {
+				// A bound stream's first frame is where a substituted one is refused
+				// (SPEC §7.6); every later frame is tied to it by the AEAD sequence.
+				err = openErr(c.bindsResponse(provider), err)
+			}
 			return !committed, stageErr(StageUpstream, fmt.Errorf("open stream frame %d: %w", frameIdx, err))
 		}
 		// Bind the sealed frame (not the opened plaintext) for §8 verification, in

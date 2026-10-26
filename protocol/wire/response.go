@@ -921,6 +921,12 @@ func NewResponseSealer(clientEphPub crypto.PublicKey, unboundFields ...string) (
 // required cleartext (see validateResponseCleartextFor); it is the send-side
 // mirror of NewResponseOpenerFor and, like it, is not carried on the wire.
 func NewResponseSealerFor(profile Profile, clientEphPub crypto.PublicKey, unboundFields ...string) (*ResponseSealer, error) {
+	return newResponseSealer(profile, clientEphPub, nil, unboundFields)
+}
+
+// newResponseSealer sets up the response context in base mode, or in mode_psk
+// keyed by psk when psk is non-nil (the response binding, §7.6).
+func newResponseSealer(profile Profile, clientEphPub crypto.PublicKey, psk []byte, unboundFields []string) (*ResponseSealer, error) {
 	if _, err := profile.spec(); err != nil {
 		return nil, err
 	}
@@ -930,7 +936,16 @@ func NewResponseSealerFor(profile Profile, clientEphPub crypto.PublicKey, unboun
 	if err := validateResponseUnboundFieldsFor(profile, unboundFields); err != nil {
 		return nil, err
 	}
-	enc, s, err := crypto.SetupSender(clientEphPub, []byte(RespInfo))
+	var (
+		enc []byte
+		s   *crypto.Sealer
+		err error
+	)
+	if psk != nil {
+		enc, s, err = crypto.SetupSenderPSK(clientEphPub, []byte(RespInfo), psk, []byte(RespBindPSKID))
+	} else {
+		enc, s, err = crypto.SetupSender(clientEphPub, []byte(RespInfo))
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -1059,6 +1074,12 @@ func NewResponseOpener(clientEphPriv crypto.PrivateKey, firstFrame Response) (*R
 // every intermediary read it. It is the response-side twin of a request whose
 // sealed set omits the prompt, and it is silent in the same way.
 func NewResponseOpenerFor(profile Profile, clientEphPriv crypto.PrivateKey, firstFrame Response) (*ResponseOpener, error) {
+	return newResponseOpener(profile, clientEphPriv, firstFrame, nil)
+}
+
+// newResponseOpener sets up the receive context in base mode, or in mode_psk
+// keyed by psk when psk is non-nil (the response binding, §7.6).
+func newResponseOpener(profile Profile, clientEphPriv crypto.PrivateKey, firstFrame Response, psk []byte) (*ResponseOpener, error) {
 	if _, err := profile.spec(); err != nil {
 		return nil, err
 	}
@@ -1076,7 +1097,12 @@ func NewResponseOpenerFor(profile Profile, clientEphPriv crypto.PrivateKey, firs
 	if err != nil {
 		return nil, fmt.Errorf("bad enc: %w", err)
 	}
-	o, err := crypto.SetupReceiver(clientEphPriv, enc, []byte(RespInfo))
+	var o *crypto.Opener
+	if psk != nil {
+		o, err = crypto.SetupReceiverPSK(clientEphPriv, enc, []byte(RespInfo), psk, []byte(RespBindPSKID))
+	} else {
+		o, err = crypto.SetupReceiver(clientEphPriv, enc, []byte(RespInfo))
+	}
 	if err != nil {
 		return nil, err
 	}
