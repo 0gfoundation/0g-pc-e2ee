@@ -35,11 +35,9 @@ import (
 	"slices"
 	"strings"
 	"sync"
-)
 
-// featureRespBind is the /v1/quote `e2ee_features` entry a broker implementing
-// SPEC §7.6 advertises.
-const featureRespBind = "resp-bind"
+	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
+)
 
 // WithResponseBinding makes the Router seal requests with the response binding
 // (SPEC §7.6) to every provider whose quote, fetched by the warmer at the
@@ -61,7 +59,7 @@ func quoteAdvertisesRespBind(reply []byte) bool {
 	if err := json.Unmarshal(reply, &r); err != nil {
 		return false
 	}
-	return slices.Contains(r.Features, featureRespBind)
+	return slices.Contains(r.Features, wire.FeatureResponseBind)
 }
 
 // respBindStore holds, per provider address, whether the warmer last saw that

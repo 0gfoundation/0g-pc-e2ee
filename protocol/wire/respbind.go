@@ -50,6 +50,11 @@ const (
 	RespBindInfo = "0g-pc/v1/resp-bind"
 	// RespBindPSKID is the HPKE psk_id a bound response context is set up with.
 	RespBindPSKID = "0g-pc/v1/resp-bind"
+	// FeatureResponseBind is the entry an enclave implementing §7.6 lists in the
+	// `e2ee_features` array of its /v1/quote reply, so a sender knows it may attach
+	// `_bind` on the synchronous profiles. A sender MUST read it only over a path the
+	// router cannot redirect (SPEC §7.6).
+	FeatureResponseBind = "resp-bind"
 	// respBindLen is the byte length of the binding value — RFC 9180 §9.5's
 	// floor for a PSK.
 	respBindLen = 32
