@@ -22,19 +22,6 @@ updates:
       - dependency-name: "github.com/sigstore/*"
       - dependency-name: "github.com/theupdateframework/*"
       - dependency-name: "github.com/in-toto/*"
-    # Each floor below is the first release whose go.mod says `go 1.27`. Taking one
-    # raises our modules' `go` line to 1.27, which the golang:1.26 build images and the
-    # govulncheck the Security workflow installs cannot build (#168). Remove the block
-    # together with the move to Go 1.27, not before.
-    ignore:
-      - dependency-name: "github.com/sigstore/rekor"
-        versions: [">= 1.5.5"]
-      - dependency-name: "github.com/sigstore/rekor-tiles/v2"
-        versions: [">= 2.4.0"]
-      - dependency-name: "github.com/sigstore/sigstore"
-        versions: [">= 1.10.10"]
-      - dependency-name: "github.com/sigstore/timestamp-authority/v2"
-        versions: [">= 2.1.4-rc.1"]
     groups:
       sigstore:
         patterns:
