@@ -99,6 +99,31 @@
       "rtmr2": "e9000e338f33233e8f51b7fd031e1c158bdcf8572eab041c0bc8eb7fef48b23259a6a556e6c8e2af99999fc39c793179"
     },
     {
+      "name": "dstack-0.6.1",
+      "os_image_hash": "ec43cb8c5e04b6bb6c53b33b16076a01d83d01f7f4b703f2f78a0d947d6247e6",
+      "source": "github.com/Dstack-TEE/dstack releases/download/mkosi-os-v0.6.1/dstack-0.6.1.tar.gz",
+      "page_add": "two-pass (dstack-mr two_pass_add_pages=true, which is what a host reporting vm_config.qemu_single_pass_add_pages=true yields)",
+      "derivation": [
+        "THE SAME IMAGE AS THE ENTRY ABOVE, on a host that builds the TD with two-pass",
+        "page add. Same name, os_image_hash, RTMR1 and RTMR2; only MRTD differs. The mode",
+        "belongs to the cluster, not the deployment: dstack-pha-prod5 is two-pass, so a",
+        "provider moved there reports this MRTD without a byte of it changing.",
+        "1. Same artifact and checks as the entry above.",
+        "2. Same dstack-mr run (Dstack-TEE/dstack 7f143148cc49f4a09799958835d310e050137cb3)",
+        "   with two_pass_add_pages=true, at 1/2G, 8/32G, 64/512G and 128/1024G; matches",
+        "   the two-pass dstack-0.6.1 entry in osimages.json. Computed, not copied.",
+        "3. ALL THREE CONFIRMED by live quotes. A broker CVM on dstack-pha-prod5 (app",
+        "   9bbca75c…, 2026-10-27, quote from Phala Cloud's attestations API, os-image-hash",
+        "   event = the os_image_hash above, compose carrying BROKER_CONFIG) reports",
+        "   exactly this MRTD, RTMR1 and RTMR2 — so this is the entry a provider on that",
+        "   cluster actually needs. The router-api.0g.ai gateway CVM (DCAP-verified via",
+        "   pcverify -gateway) reports the same three."
+      ],
+      "mrtd": "2a674327c50218dba880066b349b8d559d749ed68dce33fd651c184a877d084b07a9e583767a7ad5da13ed91deec2b70",
+      "rtmr1": "89ef86c5125b986c325f0a94acfa87718a4ef3a4d4f237dbb72dda3cf777fd2c054555fb4407eb53338d7d67329a7333",
+      "rtmr2": "e9000e338f33233e8f51b7fd031e1c158bdcf8572eab041c0bc8eb7fef48b23259a6a556e6c8e2af99999fc39c793179"
+    },
+    {
       "name": "dstack-nvidia-0.5.12",
       "os_image_hash": "91fd5d69ccee3e5ea4f2aeb8c9b632c4358c4ecfc29ba1aa6fb1e402af209829",
       "source": "github.com/Dstack-TEE/meta-dstack releases/download/v0.5.12/dstack-nvidia-0.5.12.tar.gz",
