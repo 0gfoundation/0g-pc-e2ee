@@ -2,7 +2,7 @@ module github.com/0gfoundation/0g-pc-e2ee/client
 
 go 1.26.0
 
-toolchain go1.26.9
+toolchain go1.26.10
 
 // The client core will import the shared protocol module. Kept as a local
 // replace for multi-module development in this repo until protocol is tagged.
