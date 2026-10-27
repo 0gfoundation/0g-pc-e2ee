@@ -146,12 +146,10 @@ const (
 	// clientEphPubLen is the byte length of an X25519 public key — the client's
 	// response ephemeral key (SPEC §3 suite).
 	clientEphPubLen = 32
-	// fieldBind carries a binding value derived from the client's ephemeral
-	// PRIVATE key, always sealed and never forwarded upstream. On async-image it
-	// is the result binding (SPEC §7.5.1): mandatory, and echoed sealed inside the
-	// result — see async.go. On every synchronous profile it is the optional
-	// response binding (§7.6): the enclave keys the response's HPKE context with
-	// it — see respbind.go.
+	// fieldBind carries the response-binding value (SPEC §7.6), derived from the
+	// client's ephemeral PRIVATE key: always sealed, never forwarded upstream, and
+	// the PSK the enclave seals the response with — see respbind.go. Optional on
+	// the synchronous profiles, mandatory on async-image (§7.5.1).
 	fieldBind = "_bind"
 )
 
@@ -213,14 +211,15 @@ const (
 	// `dimensions` (it truncates the vector; the vector is sealed regardless).
 	ProfileEmbedding Profile = "embedding"
 	// ProfileAsyncImage is /v1/async/images/generations (SPEC §7.5): the image
-	// profile split in time. The request is image's plus a sealed `_bind`, and
-	// the result — sealed by the enclave when the job completes, returned on every
-	// poll — is image's response plus the echoed `_bind`.
+	// profile split in time. The request is image's plus a mandatory sealed
+	// `_bind`, and the result — sealed by the enclave when the job completes,
+	// returned on every poll — is image's response, sealed in mode_psk keyed by
+	// that `_bind` (§7.6).
 	//
 	// It is a profile of its own rather than ProfileImage with a flag because the
-	// `_bind` requirement must be checked by name on both ends: a sealed set that
-	// omits it opens cleanly and loses the only thing tying the result to the
-	// request (see async.go for the attack it closes).
+	// `_bind` requirement must hold on both ends: a request without it, or a
+	// result in base mode, loses the only thing tying the result to the request
+	// (see async.go for the attack it closes).
 	ProfileAsyncImage Profile = "async-image"
 )
 
@@ -288,17 +287,18 @@ type profileSpec struct {
 	bound []string
 }
 
-// bindsResult reports whether this profile's responses carry the result-binding
-// value (§7.5.1), so the opener must compare it against the one derived from its
-// key.
+// requiresBind reports whether every request of this profile carries the
+// binding value as MANDATORY payload, and so every response to it is bound
+// (SPEC §7.6): async-image, where the result is fetched by a stateless poll and
+// nothing else ties it to the request (§7.5.1). The response sealer and opener
+// refuse base mode for such a profile.
 //
-// Derived from responsePayload rather than declared as a flag of its own: a
-// profile that lists `_bind` there but forgot a separate flag would require the
-// field, seal it, ship it — and never compare it, which is the attack the field
-// exists to stop, passing every test. Declaring `_bind` is now what turns the
-// comparison on.
-func (s profileSpec) bindsResult() bool {
-	return slices.ContainsFunc(s.responsePayload, func(f payloadField) bool { return f.name == fieldBind })
+// Derived from the payload declaration rather than kept as a flag of its own: a
+// profile that made `_bind` mandatory but forgot a separate flag would require
+// the field, seal it, ship it — and still accept a base-mode response, which is
+// the attack the field exists to stop, passing every test.
+func (s profileSpec) requiresBind() bool {
+	return slices.ContainsFunc(s.payload, func(f payloadField) bool { return f.name == fieldBind && !f.optional })
 }
 
 // payloadField is one sensitive request field of a profile: something the sealed
@@ -638,12 +638,14 @@ func (s frameShape) sealedFieldsFor(frame Response) []string {
 
 var profiles = map[Profile]profileSpec{
 	ProfileAsyncImage: {
-		// Image's payload plus `_bind`, MANDATORY on both sides. Mandatory rather
-		// than optional because its absence is exactly the attack: a request or a
-		// result without a sealed `_bind` cannot be tied to the other half, and
-		// the receiver-side checks below refuse it by name before anything opens.
+		// Image's payload plus `_bind`, MANDATORY. Mandatory rather than optional
+		// (as it is on the synchronous profiles) because its absence is exactly the
+		// attack: a result that is not bound to the request cannot be told from one
+		// for a request the router submitted itself (§7.5.1). Declaring it here is
+		// also what makes the response sealer and opener refuse base mode for this
+		// profile — see requiresBind.
 		payload:         []payloadField{{name: fieldPrompt}, {name: fieldBind}},
-		responsePayload: []payloadField{{name: fieldData}, {name: fieldBind}},
+		responsePayload: []payloadField{{name: fieldData}},
 		// Same pin as ProfileImage, for the same reason (§7.1): `url` would have
 		// the broker persist the images and serve them from a plain URL, outside
 		// the sealed channel — and on the async path, for the whole result TTL.

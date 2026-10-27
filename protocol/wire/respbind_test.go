@@ -27,12 +27,13 @@ func TestDeriveResponseBindKnownAnswer(t *testing.T) {
 	if hex.EncodeToString(got) != want {
 		t.Fatalf("DeriveResponseBind KAT = %x, want %s", got, want)
 	}
-	async, err := wire.DeriveAsyncBind(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if hex.EncodeToString(async) == want {
-		t.Fatal("the response binding and the async result binding derive the same value: their info strings must differ")
+}
+
+func TestDeriveResponseBindRejectsWrongKeyLength(t *testing.T) {
+	for _, n := range []int{0, 31, 33, 64} {
+		if _, err := wire.DeriveResponseBind(make(crypto.PrivateKey, n)); err == nil {
+			t.Errorf("a %d-byte key was accepted", n)
+		}
 	}
 }
 
@@ -54,9 +55,6 @@ func TestAttachResponseBind(t *testing.T) {
 	}
 	if _, err := wire.AttachResponseBind(wire.ProfileChat, out, priv); err == nil {
 		t.Fatal("a request already carrying _bind was accepted: a caller-supplied value would be sealed as if derived")
-	}
-	if _, err := wire.AttachResponseBind(wire.ProfileAsyncImage, wire.Request{"prompt": json.RawMessage(`"p"`)}, priv); err == nil {
-		t.Fatal("the response binding was attached on the async-image profile, which has its own")
 	}
 	if _, err := wire.AttachResponseBind(wire.Profile("nope"), req, priv); err == nil {
 		t.Fatal("an unknown profile was accepted")
@@ -137,8 +135,8 @@ func TestTakeResponseBindAbsent(t *testing.T) {
 	if _, _, err := wire.TakeResponseBind(wire.ProfileChat, wire.Request{"_bind": json.RawMessage(`"short"`)}); err == nil {
 		t.Fatal("a malformed binding value was accepted")
 	}
-	if _, _, err := wire.TakeResponseBind(wire.ProfileAsyncImage, opened); err == nil {
-		t.Fatal("TakeResponseBind accepted the async-image profile, whose _bind has another meaning")
+	if _, _, err := wire.TakeResponseBind(wire.ProfileAsyncImage, wire.Request{"prompt": json.RawMessage(`"p"`)}); err == nil {
+		t.Fatal("an async-image request without _bind was accepted: its result would have nothing to be bound with")
 	}
 }
 
@@ -373,7 +371,7 @@ func TestBoundAnthropicMessageStart(t *testing.T) {
 	}
 }
 
-func TestBoundHelpersRefuseAsyncImage(t *testing.T) {
+func TestBoundSealerRefusesAShortBinding(t *testing.T) {
 	ephPriv, ephPub, err := crypto.GenerateRecipientKey()
 	if err != nil {
 		t.Fatal(err)
@@ -381,12 +379,6 @@ func TestBoundHelpersRefuseAsyncImage(t *testing.T) {
 	bind, err := wire.DeriveResponseBind(ephPriv)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if _, err := wire.NewBoundResponseSealerFor(wire.ProfileAsyncImage, ephPub, bind); err == nil {
-		t.Error("NewBoundResponseSealerFor accepted async-image")
-	}
-	if _, err := wire.NewBoundResponseOpenerFor(wire.ProfileAsyncImage, ephPriv, wire.Response{}); err == nil {
-		t.Error("NewBoundResponseOpenerFor accepted async-image")
 	}
 	if _, err := wire.NewBoundResponseSealerFor(wire.ProfileChat, ephPub, bind[:16]); err == nil {
 		t.Error("a 16-byte binding value was accepted")

@@ -1,7 +1,6 @@
 package wire
 
 import (
-	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"slices"
@@ -927,8 +926,12 @@ func NewResponseSealerFor(profile Profile, clientEphPub crypto.PublicKey, unboun
 // newResponseSealer sets up the response context in base mode, or in mode_psk
 // keyed by psk when psk is non-nil (the response binding, §7.6).
 func newResponseSealer(profile Profile, clientEphPub crypto.PublicKey, psk []byte, unboundFields []string) (*ResponseSealer, error) {
-	if _, err := profile.spec(); err != nil {
+	spec, err := profile.spec()
+	if err != nil {
 		return nil, err
+	}
+	if psk == nil && spec.requiresBind() {
+		return nil, fmt.Errorf("%s-profile responses are always bound (§7.6): seal with the request's binding value", profile)
 	}
 	// Before any key material: an unbound set that frees a field the signature
 	// must cover would produce frames that verify no matter what an intermediary
@@ -939,7 +942,6 @@ func newResponseSealer(profile Profile, clientEphPub crypto.PublicKey, psk []byt
 	var (
 		enc []byte
 		s   *crypto.Sealer
-		err error
 	)
 	if psk != nil {
 		enc, s, err = crypto.SetupSenderPSK(clientEphPub, []byte(RespInfo), psk, []byte(RespBindPSKID))
@@ -1048,10 +1050,6 @@ func (rs *ResponseSealer) SealFrame(frame Response, sealedFields []string, final
 type ResponseOpener struct {
 	opener  *crypto.Opener
 	profile Profile
-	// bind is the expected `_bind` for a profile whose responses carry one
-	// (profileSpec.bindsResult, §7.5.1), derived from the key the opener was
-	// built with; nil otherwise.
-	bind []byte
 }
 
 // NewResponseOpener builds the receive context from the first frame (which
@@ -1080,8 +1078,14 @@ func NewResponseOpenerFor(profile Profile, clientEphPriv crypto.PrivateKey, firs
 // newResponseOpener sets up the receive context in base mode, or in mode_psk
 // keyed by psk when psk is non-nil (the response binding, §7.6).
 func newResponseOpener(profile Profile, clientEphPriv crypto.PrivateKey, firstFrame Response, psk []byte) (*ResponseOpener, error) {
-	if _, err := profile.spec(); err != nil {
+	spec, err := profile.spec()
+	if err != nil {
 		return nil, err
+	}
+	// The receiver's half of requiresBind, and the one that matters: a base-mode
+	// opener would accept a result anyone holding client_eph_pub sealed.
+	if psk == nil && spec.requiresBind() {
+		return nil, fmt.Errorf("%s-profile responses are always bound (§7.6): open with the request's binding value", profile)
 	}
 	e2ee, err := firstFrame.E2EE()
 	if err != nil {
@@ -1106,13 +1110,7 @@ func newResponseOpener(profile Profile, clientEphPriv crypto.PrivateKey, firstFr
 	if err != nil {
 		return nil, err
 	}
-	ro := &ResponseOpener{opener: o, profile: profile}
-	if spec, _ := profile.spec(); spec.bindsResult() {
-		if ro.bind, err = DeriveAsyncBind(clientEphPriv); err != nil {
-			return nil, err
-		}
-	}
-	return ro, nil
+	return &ResponseOpener{opener: o, profile: profile}, nil
 }
 
 // OpenFrame opens one frame and returns it reconstructed (cleartext ∪
@@ -1168,18 +1166,6 @@ func (ro *ResponseOpener) OpenFrame(frame Response) (Response, error) {
 	}
 	if !sameKeys(sealedObj, e2ee.SealedFields) {
 		return nil, fmt.Errorf("decrypted fields do not match sealed_fields")
-	}
-	// The result binding (§7.5.1): the frame opened under our key, but HPKE base
-	// mode does not say who sealed it, and anyone holding our public key can.
-	// The binding value can only come from the enclave that opened OUR request.
-	if ro.bind != nil {
-		got, err := decodeBind(sealedObj[fieldBind])
-		if err != nil {
-			return nil, err
-		}
-		if subtle.ConstantTimeCompare(got, ro.bind) != 1 {
-			return nil, fmt.Errorf("%s-profile frame's %q does not match this request: it was produced for a different request sealed to the same key", ro.profile, fieldBind)
-		}
 	}
 
 	out := make(Response, len(frame)+len(sealedObj))

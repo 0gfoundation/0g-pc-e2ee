@@ -1,8 +1,6 @@
 package wire
 
 import (
-	"crypto/hkdf"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"slices"
@@ -26,12 +24,13 @@ import (
 //     cleartext in the request envelope, so a router can submit a request OF ITS
 //     OWN carrying the victim's key: a genuine enclave serves it, seals the result
 //     to the victim, signs it — under the router's `reqH` — and the router returns
-//     that frame on the victim's poll. It opens; it verifies; the content is the
-//     router's. `_bind` closes it without state: a value derived from the
-//     ephemeral PRIVATE key, sealed inside the request, echoed sealed inside the
-//     result. Only the victim's request carries it, and only the enclave that
-//     request was sealed to can learn it, so a frame that opens AND carries it
-//     came from that enclave for that request.
+//     that frame on the victim's poll. In base mode it opens; it verifies; the
+//     content is the router's. The response binding (§7.6, respbind.go) closes it
+//     without state, and on this profile it is mandatory: a `_bind` derived from
+//     the ephemeral PRIVATE key is sealed inside the request, and the enclave
+//     seals the result in mode_psk keyed by it. Only the victim's request carries
+//     that value and only the enclave that request was sealed to can learn it, so
+//     a result frame that opens at all came from that enclave for that request.
 //  2. Which job. The result frame's cleartext `jobId` is bound in its AAD, and
 //     the receiver compares it with the id it is polling, so a frame from another
 //     job — a replay of the victim's own request included — is refused.
@@ -39,10 +38,6 @@ import (
 //     keeps (UserJobID), so the sender needs no key and no state of its own.
 
 const (
-	// AsyncBindInfo is the HKDF info string for the result-binding value.
-	AsyncBindInfo = "0g-pc/v1/async-bind"
-	// asyncBindLen is the byte length of the binding value.
-	asyncBindLen = 32
 	// ephPrivLen is the byte length of a marshaled X25519 private key.
 	ephPrivLen = 32
 	// fieldJobID / fieldStatus are the poll envelope's cleartext fields that the
@@ -83,67 +78,24 @@ func AsyncImageResultUnboundFields() []string {
 	return slices.Clone(asyncImageResultUnbound)
 }
 
-// DeriveAsyncBind derives the result-binding value from the client's ephemeral
-// private key: HKDF-SHA256(ikm = eph_priv, salt = empty, info = AsyncBindInfo,
-// L = 32).
-//
-// Deriving it rather than drawing it at random is what keeps the sender
-// stateless: the key is already carried in the user's job id, so the value can
-// be recomputed at poll time instead of stored.
-func DeriveAsyncBind(ephPriv crypto.PrivateKey) ([]byte, error) {
-	if len(ephPriv) != ephPrivLen {
-		return nil, fmt.Errorf("ephemeral private key must be %d bytes, got %d", ephPrivLen, len(ephPriv))
-	}
-	return hkdf.Key(sha256.New, ephPriv, nil, AsyncBindInfo, asyncBindLen)
-}
-
 // AttachAsyncBind returns a copy of req carrying the `_bind` field derived from
-// ephPriv, ready for SealRequestFor(ProfileAsyncImage, …), whose default sealed
-// set then seals it alongside the prompt.
+// ephPriv (the response binding, §7.6), ready for SealRequestFor(ProfileAsyncImage,
+// …), whose default sealed set then seals it alongside the prompt. It is
+// AttachResponseBind on this profile, where the binding is mandatory.
 //
-// A request that already carries `_bind` is refused: the name is reserved by
-// this profile, and a caller-supplied value would be sealed as if derived.
+// A request that already carries `_bind` is refused: the name is reserved, and a
+// caller-supplied value would be sealed as if derived.
 func AttachAsyncBind(req Request, ephPriv crypto.PrivateKey) (Request, error) {
-	if _, ok := req[fieldBind]; ok {
-		return nil, fmt.Errorf("request already carries %q, which the async-image profile reserves", fieldBind)
-	}
-	bind, err := DeriveAsyncBind(ephPriv)
-	if err != nil {
-		return nil, err
-	}
-	raw, err := json.Marshal(b64.EncodeToString(bind))
-	if err != nil {
-		return nil, err
-	}
-	out := make(Request, len(req)+1)
-	for k, v := range req {
-		out[k] = v
-	}
-	out[fieldBind] = raw
-	return out, nil
+	return AttachResponseBind(ProfileAsyncImage, req, ephPriv)
 }
 
 // TakeAsyncBind is the enclave's half on the request side: given a request that
 // OpenRequestFor(ProfileAsyncImage, …) reconstructed, it returns the binding
-// value to echo in the result, and the request WITHOUT `_bind` — the one to
+// value to seal the result with, and the request WITHOUT `_bind` — the one to
 // forward upstream. `_bind` is protocol metadata, not a model parameter, and an
 // upstream that rejects unknown fields would otherwise fail every sealed job.
 func TakeAsyncBind(opened Request) (bind []byte, forward Request, err error) {
-	raw, ok := opened[fieldBind]
-	if !ok {
-		return nil, nil, fmt.Errorf("opened async-image request carries no %q", fieldBind)
-	}
-	bind, err = decodeBind(raw)
-	if err != nil {
-		return nil, nil, err
-	}
-	forward = make(Request, len(opened)-1)
-	for k, v := range opened {
-		if k != fieldBind {
-			forward[k] = v
-		}
-	}
-	return bind, forward, nil
+	return TakeResponseBind(ProfileAsyncImage, opened)
 }
 
 // SealAsyncImageResult is the enclave's half on the result side: it seals a
@@ -151,16 +103,13 @@ func TakeAsyncBind(opened Request) (bind []byte, forward Request, err error) {
 //
 // result is the poll envelope as the broker will return it, minus `_e2ee`: the
 // cleartext `jobId`, `status`, timestamps, `model` and `usage.output_images`,
-// plus `data` — the provider JSON — which is sealed. bind is what TakeAsyncBind
-// returned for this job's request.
+// plus `data` — the provider JSON — which is sealed, in mode_psk keyed by bind
+// (§7.6). bind is what TakeAsyncBind returned for this job's request.
 //
 // It refuses a frame that does not name its job or is not `completed`, since
 // those are the two fields the receiver keys off, and declares the profile's
 // unbound set itself.
 func SealAsyncImageResult(clientEphPub crypto.PublicKey, result Response, bind []byte) (Response, error) {
-	if len(bind) != asyncBindLen {
-		return nil, fmt.Errorf("binding value must be %d bytes, got %d", asyncBindLen, len(bind))
-	}
 	if _, ok := result[fieldBind]; ok {
 		return nil, fmt.Errorf("result already carries %q", fieldBind)
 	}
@@ -174,16 +123,7 @@ func SealAsyncImageResult(clientEphPub crypto.PublicKey, result Response, bind [
 	if status != AsyncStatusCompleted {
 		return nil, fmt.Errorf("only a %q job has a result frame, got status %q", AsyncStatusCompleted, status)
 	}
-	raw, err := json.Marshal(b64.EncodeToString(bind))
-	if err != nil {
-		return nil, err
-	}
-	frame := make(Response, len(result)+1)
-	for k, v := range result {
-		frame[k] = v
-	}
-	frame[fieldBind] = raw
-	return SealResponseFor(ProfileAsyncImage, clientEphPub, frame, nil, asyncImageResultUnbound...)
+	return SealBoundResponseFor(ProfileAsyncImage, clientEphPub, bind, result, nil, asyncImageResultUnbound...)
 }
 
 // OpenAsyncImageResult is the sender's half at poll time: it opens an
@@ -194,13 +134,13 @@ func SealAsyncImageResult(clientEphPub crypto.PublicKey, result Response, bind [
 //
 //   - an unbound set within the profile's own, so `jobId` and `status` are bound;
 //   - `status` == "completed" and `jobId` == wantJobID, both in cleartext;
-//   - every OpenResponseFor(ProfileAsyncImage) check — `data` and `_bind` sealed,
-//     a final frame, a cleartext `usage.output_images` — and the AEAD itself,
-//     which authenticates the two fields above as AAD;
-//   - the sealed `_bind` equal to the value derived from ephPriv.
+//   - every profile check — `data` sealed, a final frame, a cleartext
+//     `usage.output_images` — and the AEAD itself, in mode_psk keyed by the
+//     binding derived from ephPriv (§7.6). That one step both authenticates the
+//     two fields above as AAD and proves the frame came from the enclave this
+//     job's request was sealed to.
 //
-// The returned response has `_bind` removed: the caller gets the poll envelope
-// in its ordinary shape, `data` restored.
+// The caller gets the poll envelope in its ordinary shape, `data` restored.
 func OpenAsyncImageResult(ephPriv crypto.PrivateKey, frame Response, wantJobID string) (Response, error) {
 	if len(ephPriv) != ephPrivLen {
 		return nil, fmt.Errorf("ephemeral private key must be %d bytes, got %d", ephPrivLen, len(ephPriv))
@@ -229,14 +169,9 @@ func OpenAsyncImageResult(ephPriv crypto.PrivateKey, frame Response, wantJobID s
 		// Neither id is echoed: the caller's may sit next to a key in its logs.
 		return nil, fmt.Errorf("result frame names a different job than the one polled")
 	}
-	// The profile checks, the AEAD, and the `_bind` comparison (the opener derives
-	// the expected value from ephPriv; see profileSpec.bindsResult).
-	opened, err := OpenResponseFor(ProfileAsyncImage, ephPriv, frame)
-	if err != nil {
-		return nil, err
-	}
-	delete(opened, fieldBind)
-	return opened, nil
+	// The profile checks and the AEAD, in mode_psk under the binding derived from
+	// ephPriv: a result sealed for any other request does not open.
+	return OpenBoundResponseFor(ProfileAsyncImage, ephPriv, frame)
 }
 
 // UserJobID returns the id the user keeps for an async job: the broker job id,
@@ -319,8 +254,8 @@ func decodeBind(raw json.RawMessage) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%q is not unpadded base64url", fieldBind)
 	}
-	if len(b) != asyncBindLen {
-		return nil, fmt.Errorf("%q must decode to %d bytes, got %d", fieldBind, asyncBindLen, len(b))
+	if len(b) != respBindLen {
+		return nil, fmt.Errorf("%q must decode to %d bytes, got %d", fieldBind, respBindLen, len(b))
 	}
 	return b, nil
 }

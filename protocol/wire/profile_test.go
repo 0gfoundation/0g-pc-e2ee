@@ -246,10 +246,11 @@ func TestProfileDefaults(t *testing.T) {
 	}{
 		wire.ProfileChat:  {request: []string{"messages", "tools", "tool_choice"}, response: []string{"choices"}},
 		wire.ProfileImage: {request: []string{"prompt"}, response: []string{"data"}},
-		// Image's sets plus `_bind` on both sides, both MANDATORY: the binding
-		// value is what ties a result to its request (§7.5), so neither side's
-		// default may be narrowed to omit it.
-		wire.ProfileAsyncImage: {request: []string{"prompt", "_bind"}, response: []string{"data", "_bind"}},
+		// Image's request set plus a MANDATORY `_bind`: the binding value is what
+		// ties a result to its request (§7.5.1), so the request default may not be
+		// narrowed to omit it. The response is image's: the binding keys the
+		// result's HPKE context (§7.6) rather than riding in the frame.
+		wire.ProfileAsyncImage: {request: []string{"prompt", "_bind"}, response: []string{"data"}},
 		wire.ProfileAnthropic: {
 			request:  []string{"messages", "system", "tools", "tool_choice"},
 			response: []string{},

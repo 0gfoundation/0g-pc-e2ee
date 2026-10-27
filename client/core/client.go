@@ -234,7 +234,8 @@ type Provider struct {
 	// forwards `_bind` upstream and seals in base mode, and every response from
 	// it would be refused (as a fall-back-able open failure). The route resolver
 	// sets it from the provider's quote reply, read at its on-chain URL. Ignored
-	// on a surface the binding does not apply to (async-image has its own).
+	// where the binding is not a choice: async-image always binds, through its
+	// own submit and poll path.
 	BindResponse bool
 }
 

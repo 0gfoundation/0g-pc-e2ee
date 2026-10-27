@@ -50,3 +50,16 @@ func NewResponseSealerNonConforming(clientEphPub crypto.PublicKey, unboundFields
 func ValidateResponseSealedFieldsForTest(p Profile, fields []string) error {
 	return validateResponseSealedFieldsFor(p, fields)
 }
+
+// SealBoundResponseNonConforming is SealResponseNonConforming in mode_psk keyed
+// by bind (§7.6), for the frames a non-conforming enclave would emit on a profile
+// whose responses are always bound (async-image): a base-mode frame there is
+// refused before any profile check is reached, so it would not test them.
+func SealBoundResponseNonConforming(clientEphPub crypto.PublicKey, bind []byte, resp Response, sealedFields []string, unboundFields ...string) (Response, error) {
+	rs, err := newResponseSealer(ProfileChat, clientEphPub, bind, unboundFields)
+	if err != nil {
+		return nil, err
+	}
+	rs.nonConforming = true
+	return rs.SealFrame(resp, sealedFields, true)
+}
