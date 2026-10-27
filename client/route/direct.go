@@ -111,6 +111,16 @@ func (c directCandidates) Len() int { return 1 }
 // it, and Address / Model are left empty (no routing pin, caller's model passes
 // through).
 func (c directCandidates) Provider(ctx context.Context, _ int) (core.Provider, error) {
+	return c.materialize(ctx, nil)
+}
+
+// RefreshProvider implements core.KeyRefresher, as routeCandidates does: the same
+// materialization, re-reading the key past a cache that still holds stale.
+func (c directCandidates) RefreshProvider(ctx context.Context, _ int, stale crypto.PublicKey) (core.Provider, error) {
+	return c.materialize(ctx, stale)
+}
+
+func (c directCandidates) materialize(ctx context.Context, stale crypto.PublicKey) (core.Provider, error) {
 	d := c.d
 	var (
 		encPub crypto.PublicKey
@@ -118,12 +128,14 @@ func (c directCandidates) Provider(ctx context.Context, _ int) (core.Provider, e
 		err    error
 	)
 	if d.router.verifier != nil {
-		encPub, signer, err = d.router.verifiedKeys(ctx, d.providerURL)
+		var res quoteResult
+		res, _, err = d.router.freshProvider(ctx, d.providerURL, stale)
+		encPub, signer = res.encPub, res.signer
 	} else {
 		var pubkeyURL string
 		pubkeyURL, err = derivePubkeyURL(d.providerURL)
 		if err == nil {
-			encPub, signer, err = d.router.pubkey(ctx, pubkeyURL)
+			encPub, signer, err = d.router.freshPubkey(ctx, pubkeyURL, stale)
 		} else {
 			err = upstream(0, fmt.Errorf("provider endpoint: %w", err))
 		}

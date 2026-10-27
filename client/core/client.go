@@ -328,6 +328,11 @@ type MetricsHook interface {
 	// signal that the ranking the untrusted router hands us puts bad providers
 	// first — invisible in the request outcome, which the fallback repaired.
 	CandidateFallback(reason string)
+	// KeyRefresh is called each time a provider rejected a request for a stale enc
+	// key and the client re-read that key, with one of the KeyRefresh* outcomes.
+	// "resealed" is the expected rate of broker key rotations meeting cached
+	// quotes; "unchanged" is a 409 the provider's own current key contradicts.
+	KeyRefresh(outcome string)
 }
 
 // Attempt kinds and outcomes reported through MetricsHook.UpstreamAttempt, named
@@ -748,14 +753,20 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 			continue
 		}
 
-		attemptStart := time.Now()
-		out, retry, err := c.completeOnce(ctx, provider, req, ephPub, ephPriv)
+		// A failed attempt is wasted caller time and is charged to the walk; a
+		// stale-key rejection is re-sealed to the provider's current key once.
+		var out wire.Response
+		retry, err := c.attemptRekeying(ctx, &walk, &fail, cands, i, provider, func(p Provider) (bool, error) {
+			var (
+				retry bool
+				err   error
+			)
+			out, retry, err = c.completeOnce(ctx, p, req, ephPub, ephPriv)
+			return retry, err
+		})
 		if err == nil {
 			return out, nil
 		}
-		// A failed attempt is wasted caller time and is charged to the walk.
-		walk.charge(time.Since(attemptStart))
-		fail.record(tierAttempt, err)
 		if retry {
 			// Same two reasons to stop, and for the same reasons: a disconnect mid-body
 			// also surfaces as a retryable failure, and counting it would file the
