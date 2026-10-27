@@ -100,6 +100,17 @@ func TestBuiltinBrokerImages_PinsTheAudited061(t *testing.T) {
 		"e9000e338f33233e8f51b7fd031e1c158bdcf8572eab041c0bc8eb7fef48b23259a6a556e6c8e2af99999fc39c793179")
 }
 
+// dstack-0.6.1 again, for two-pass hosts such as dstack-pha-prod5. Same image as the
+// single-pass pin above; all three registers equal a live broker quote on prod5.
+func TestBuiltinBrokerImages_PinsTheAudited061TwoPass(t *testing.T) {
+	requirePinned(t,
+		"dstack-0.6.1",
+		"ec43cb8c5e04b6bb6c53b33b16076a01d83d01f7f4b703f2f78a0d947d6247e6",
+		"2a674327c50218dba880066b349b8d559d749ed68dce33fd651c184a877d084b07a9e583767a7ad5da13ed91deec2b70",
+		"89ef86c5125b986c325f0a94acfa87718a4ef3a4d4f237dbb72dda3cf777fd2c054555fb4407eb53338d7d67329a7333",
+		"e9000e338f33233e8f51b7fd031e1c158bdcf8572eab041c0bc8eb7fef48b23259a6a556e6c8e2af99999fc39c793179")
+}
+
 // dstack-nvidia-0.5.12's registers, pinned on the same terms. Computed with dstack-mr
 // from the published meta-dstack v0.5.12 release, single-pass. MRTD and RTMR1 equal a
 // live quote from a CVM on the base dstack-0.5.12 image (same firmware and kernel);
@@ -154,6 +165,9 @@ func TestBuiltinBrokerImages_PinsTheAudited0541(t *testing.T) {
 // registers. Shared by the pins above so that adding one is writing down the values and
 // nothing else — a second copy of the comparison is a second chance for one of them to
 // check something weaker than the other.
+//
+// An entry is found by name AND MRTD, because one image can be listed once per page-add
+// mode (dstack-0.6.1 is), and those entries share a name and differ only in MRTD.
 func requirePinned(t *testing.T, name, hash, mrtd, rtmr1, rtmr2 string) {
 	t.Helper()
 	imgs, err := BuiltinBrokerImages()
@@ -162,14 +176,14 @@ func requirePinned(t *testing.T, name, hash, mrtd, rtmr1, rtmr2 string) {
 	}
 	var got *OSImage
 	for i := range imgs {
-		if imgs[i].Name == name {
+		if imgs[i].Name == name && hex.EncodeToString(imgs[i].BootChain.MRTD[:]) == mrtd {
 			got = &imgs[i]
 			break
 		}
 	}
 	if got == nil {
-		t.Fatalf("%s is not in the allowlist; if it was removed on purpose, remove this "+
-			"test in the same change and say why", name)
+		t.Fatalf("%s with MRTD %.16s… is not in the allowlist; if it was removed on purpose, "+
+			"remove this test in the same change and say why", name, mrtd)
 	}
 	if got.OSImageHash != hash {
 		t.Errorf("os_image_hash = %s, want %s", got.OSImageHash, hash)
