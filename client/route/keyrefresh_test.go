@@ -3,8 +3,10 @@ package route
 import (
 	"bytes"
 	"context"
+	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
@@ -172,4 +174,61 @@ func TestRefreshProvider_Direct(t *testing.T) {
 func otherKey() (crypto.PublicKey, error) {
 	_, pub, err := crypto.GenerateRecipientKey()
 	return pub, err
+}
+
+// A broker rollout under steady traffic: many requests sealed to the old key are
+// rejected while the first refresh's live verification is still running. They must
+// join that verification, not be turned away by the throttle it already stamped —
+// with a single candidate, a request turned away fails outright.
+func TestRefreshProvider_ConcurrentRejectionsShareOneVerification(t *testing.T) {
+	const n = 8
+	var quoteHits int32
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	srv := countingQVServer(t, &quoteHits, entered, release)
+	t.Cleanup(unblock) // registered after the server, so it runs before srv.Close
+	live := mustHex(t, qvEncPubHex)
+	rd := rotatedReportData(t, live)
+	r := New(srv.URL, WithQuoteVerification(rotatingVerifier(t, qvMeasurement(0xaa), &rd), discardLogger()))
+
+	stale := bytes.Repeat([]byte{0x11}, 32)
+	kr := refresherFor(t, r, srv.URL, stale)
+
+	type result struct {
+		key []byte
+		err error
+	}
+	results := make(chan result, n)
+	refresh := func() {
+		p, err := kr.RefreshProvider(context.Background(), 0, stale)
+		results <- result{p.EncPubKey, err}
+	}
+	go refresh()
+	<-entered // the leader's live verification is in flight, the cache still stale
+	for i := 1; i < n; i++ {
+		go refresh()
+	}
+	// Turned-away callers return at once; joiners wait for the leader.
+	select {
+	case res := <-results:
+		t.Fatalf("a refresh returned while the verification was still running: err=%v", res.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	unblock()
+
+	for i := 0; i < n; i++ {
+		res := <-results
+		if res.err != nil {
+			t.Errorf("refresh %d: %v", i, res.err)
+			continue
+		}
+		if !bytes.Equal(res.key, live) {
+			t.Errorf("refresh %d: key = %x, want %x", i, res.key, live)
+		}
+	}
+	if got := atomic.LoadInt32(&quoteHits); got != 1 {
+		t.Errorf("quote fetches = %d, want 1", got)
+	}
 }
