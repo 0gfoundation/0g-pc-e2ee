@@ -1,7 +1,6 @@
 package wire_test
 
 import (
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"strings"
@@ -10,34 +9,6 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
-
-// The binding value is the one derived quantity in the async-image profile that a
-// second implementation (a TS gateway, a Rust enclave) must reproduce bit for bit,
-// so it is pinned to a known answer rather than only round-tripped. Computed
-// independently from RFC 5869 (HMAC-SHA256, empty salt = 32 zero bytes, one
-// output block).
-func TestDeriveAsyncBindKnownAnswer(t *testing.T) {
-	key := make(crypto.PrivateKey, 32)
-	for i := range key {
-		key[i] = byte(i)
-	}
-	got, err := wire.DeriveAsyncBind(key)
-	if err != nil {
-		t.Fatal(err)
-	}
-	const want = "b52d9b2bf6b7e94c9be3c8b73539ab2dbebfa058562c80c839af86de2a52abb3"
-	if hex.EncodeToString(got) != want {
-		t.Fatalf("DeriveAsyncBind KAT = %x, want %s", got, want)
-	}
-}
-
-func TestDeriveAsyncBindRejectsWrongKeyLength(t *testing.T) {
-	for _, n := range []int{0, 31, 33, 64} {
-		if _, err := wire.DeriveAsyncBind(make(crypto.PrivateKey, n)); err == nil {
-			t.Errorf("a %d-byte key was accepted", n)
-		}
-	}
-}
 
 func TestAttachAsyncBindRefusesACallerSuppliedBind(t *testing.T) {
 	priv, _, err := crypto.GenerateRecipientKey()
@@ -83,7 +54,7 @@ func TestTakeAsyncBind(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, _ := wire.DeriveAsyncBind(priv)
+	want, _ := wire.DeriveResponseBind(priv)
 	if hex.EncodeToString(bind) != hex.EncodeToString(want) {
 		t.Fatal("TakeAsyncBind returned a different value than was attached")
 	}
@@ -187,20 +158,22 @@ func TestParseUserJobIDRefusesWithoutEchoingTheInput(t *testing.T) {
 }
 
 // asyncFrame is a completed async-image poll body, before sealing.
-func asyncFrame(t *testing.T, ephPriv crypto.PrivateKey) wire.Response {
-	t.Helper()
-	bind, err := wire.DeriveAsyncBind(ephPriv)
-	if err != nil {
-		t.Fatal(err)
-	}
-	bindJSON, _ := json.Marshal(base64.RawURLEncoding.EncodeToString(bind))
+func asyncFrame() wire.Response {
 	return wire.Response{
 		"jobId":  json.RawMessage(`"job_1"`),
 		"status": json.RawMessage(`"completed"`),
 		"usage":  json.RawMessage(`{"output_images":1}`),
 		"data":   json.RawMessage(`{"data":[{"b64_json":"x"}]}`),
-		"_bind":  bindJSON,
 	}
+}
+
+func mustBind(t *testing.T, ephPriv crypto.PrivateKey) []byte {
+	t.Helper()
+	bind, err := wire.DeriveResponseBind(ephPriv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return bind
 }
 
 // `jobId` and `status` are bound by PROFILE declaration, so every seal and open
@@ -212,20 +185,21 @@ func TestAsyncImageJobIDAndStatusAreBoundOnEveryPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	bind := mustBind(t, ephPriv)
 	for _, f := range []string{"jobId", "status"} {
 		t.Run(f, func(t *testing.T) {
-			if _, err := wire.SealResponseFor(wire.ProfileAsyncImage, ephPub, asyncFrame(t, ephPriv), nil, f, "x_0g_trace"); err == nil {
+			if _, err := wire.SealBoundResponseFor(wire.ProfileAsyncImage, ephPub, bind, asyncFrame(), nil, f, "x_0g_trace"); err == nil {
 				t.Fatalf("a conforming sealer declared %q unbound", f)
 			}
-			if _, err := wire.SealResponseFor(wire.ProfileAsyncImage, ephPub, asyncFrame(t, ephPriv), []string{"data", "_bind", f}); err == nil {
+			if _, err := wire.SealBoundResponseFor(wire.ProfileAsyncImage, ephPub, bind, asyncFrame(), []string{"data", f}); err == nil {
 				t.Fatalf("a conforming sealer sealed %q away", f)
 			}
 			// What a non-conforming enclave would emit.
-			sealed, err := wire.SealResponseNonConforming(ephPub, asyncFrame(t, ephPriv), []string{"data", "_bind"}, f, "x_0g_trace")
+			sealed, err := wire.SealBoundResponseNonConforming(ephPub, bind, asyncFrame(), []string{"data"}, f, "x_0g_trace")
 			if err != nil {
 				t.Fatal(err)
 			}
-			if _, err := wire.OpenResponseFor(wire.ProfileAsyncImage, ephPriv, sealed); err == nil {
+			if _, err := wire.OpenBoundResponseFor(wire.ProfileAsyncImage, ephPriv, sealed); err == nil {
 				t.Fatalf("the generic opener accepted a frame with %q unbound", f)
 			}
 			if _, err := wire.OpenAsyncImageResult(ephPriv, sealed, "job_1"); err == nil {
@@ -235,10 +209,33 @@ func TestAsyncImageJobIDAndStatusAreBoundOnEveryPath(t *testing.T) {
 	}
 }
 
-// The `_bind` comparison runs in the generic opener, so a caller that opens with
-// OpenResponseFor(ProfileAsyncImage, …) instead of the wrapper still refuses a
-// result produced for someone else's request sealed to its key.
-func TestAsyncImageGenericOpenerChecksTheBinding(t *testing.T) {
+// The binding is not a property of the wrapper: async-image responses are
+// always bound, so neither end will set up a base-mode context for the profile,
+// whichever entry point a caller uses.
+func TestAsyncImageIsAlwaysBound(t *testing.T) {
+	ephPriv, ephPub, err := crypto.GenerateRecipientKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wire.SealResponseFor(wire.ProfileAsyncImage, ephPub, asyncFrame(), nil, wire.AsyncImageResultUnboundFields()...); err == nil {
+		t.Fatal("an async-image result was sealed in base mode")
+	}
+	honest, err := wire.SealAsyncImageResult(ephPub, asyncFrame(), mustBind(t, ephPriv))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wire.OpenResponseFor(wire.ProfileAsyncImage, ephPriv, honest); err == nil {
+		t.Fatal("an async-image result was opened in base mode")
+	}
+	if _, ok := honest["_bind"]; ok {
+		t.Fatal("the result frame carries _bind: the binding keys the context, it does not ride in the frame")
+	}
+}
+
+// The attack of §7.5.1: the router submits a request of its own carrying the
+// victim's client_eph_pub, and a genuine enclave seals the result to the victim
+// under the ROUTER's binding value. It does not open for the victim.
+func TestAsyncImageResultForAnotherRequestIsRefused(t *testing.T) {
 	victimPriv, victimPub, err := crypto.GenerateRecipientKey()
 	if err != nil {
 		t.Fatal(err)
@@ -247,27 +244,22 @@ func TestAsyncImageGenericOpenerChecksTheBinding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Sealed to the victim's key, carrying the attacker's binding value — what a
-	// genuine enclave produces for a router-submitted request reusing the
-	// victim's client_eph_pub.
-	forged, err := wire.SealResponseFor(wire.ProfileAsyncImage, victimPub, asyncFrame(t, attackerPriv), nil, wire.AsyncImageResultUnboundFields()...)
+	forged, err := wire.SealAsyncImageResult(victimPub, asyncFrame(), mustBind(t, attackerPriv))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := wire.OpenResponseFor(wire.ProfileAsyncImage, victimPriv, forged); err == nil {
-		t.Fatal("the generic opener accepted a frame bound to a different request")
+	if _, err := wire.OpenAsyncImageResult(victimPriv, forged, "job_1"); err == nil {
+		t.Fatal("a result sealed under another request's binding was accepted")
 	}
-	// And the honest frame opens on the generic path too, `_bind` still present
-	// for the caller to drop.
-	honest, err := wire.SealResponseFor(wire.ProfileAsyncImage, victimPub, asyncFrame(t, victimPriv), nil, wire.AsyncImageResultUnboundFields()...)
+	honest, err := wire.SealAsyncImageResult(victimPub, asyncFrame(), mustBind(t, victimPriv))
 	if err != nil {
 		t.Fatal(err)
 	}
-	opened, err := wire.OpenResponseFor(wire.ProfileAsyncImage, victimPriv, honest)
+	opened, err := wire.OpenAsyncImageResult(victimPriv, honest, "job_1")
 	if err != nil {
-		t.Fatalf("honest frame refused on the generic path: %v", err)
+		t.Fatalf("honest result refused: %v", err)
 	}
-	if _, ok := opened["_bind"]; !ok {
-		t.Fatal("generic open dropped _bind; only the wrapper strips it")
+	if string(opened["data"]) != `{"data":[{"b64_json":"x"}]}` {
+		t.Fatalf("data = %s", opened["data"])
 	}
 }

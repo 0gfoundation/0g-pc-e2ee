@@ -601,9 +601,17 @@ What shipped, and every place it differs from the plan above.
   (409 `e2ee_key_mismatch`) or a bad envelope (400) is answered on the submit,
   before any job row or billing record exists. The plaintext rides only the
   in-memory queue; the row stores the envelope.
+- **The result binding keys the HPKE context instead of riding in the result**
+  (changed after the plan, before the feature was enabled anywhere; 0g-pc-e2ee#169).
+  The request still seals a mandatory `_bind`, but the enclave no longer echoes it:
+  it seals the result in HPKE `mode_psk` with `psk = bind`, and the gateway opens
+  only in `mode_psk`. Same guarantee, using the standard RFC 9180 mechanism
+  instead of a field compare, and the same one the synchronous profiles use
+  (SPEC §7.6). The derivation's info string is `0g-pc/v1/resp-bind`, not
+  `0g-pc/v1/async-bind`, and the result frame's `sealed_fields` is `["data"]`.
 - **The §8 signature is not persisted** (plan §5 said it would be). It stays in
   the broker's in-process cache, as for plaintext async jobs. The gateway does
-  not need it: a sealed result is authenticated by `_bind`. Persisting it is a
+  not need it: a sealed result is authenticated by the binding. Persisting it is a
   separate change covering sealed and plaintext jobs alike.
 - **Storage** is as §3.9: two nullable columns, `sealed_frame` (BLOB, the frame
   with its ciphertext emptied) and `sealed_result` (LONGBLOB, raw ciphertext).

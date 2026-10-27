@@ -210,8 +210,10 @@ func TestAsyncImageForeignRequestWithVictimsKeyIsRefused(t *testing.T) {
 
 	if _, err := wire.OpenAsyncImageResult(victimPriv, routerRelay(t, forgedFrame), "job_victim"); err == nil {
 		t.Fatal("a result for the router's own request, sealed to the victim's key, was accepted: the content would be router-chosen")
-	} else if !strings.Contains(err.Error(), "_bind") {
-		t.Fatalf("refused, but not by the binding check: %v", err)
+	} else if !strings.Contains(err.Error(), "authentication failed") {
+		// The binding keys the result's HPKE context (§7.6), so a result sealed
+		// under the router's value fails the AEAD itself.
+		t.Fatalf("refused, but not by the binding: %v", err)
 	}
 }
 
@@ -305,8 +307,9 @@ func TestAsyncImageCleartextEditsAreRefused(t *testing.T) {
 	}
 }
 
-// A result sealed without `_bind` — e.g. by an enclave serving it as a plain
-// image response — is refused by the profile check before anything opens.
+// A result sealed in base mode — e.g. by an enclave serving it as a plain image
+// response, ignoring the request's `_bind` — does not open: the receiver sets up
+// only a context keyed by the binding (§7.6).
 func TestAsyncImageFrameWithoutSealedBindIsRefused(t *testing.T) {
 	ephPriv, ephPub, err := crypto.GenerateRecipientKey()
 	if err != nil {
@@ -323,7 +326,7 @@ func TestAsyncImageFrameWithoutSealedBindIsRefused(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := wire.OpenAsyncImageResult(ephPriv, sealed, "job_1"); err == nil {
-		t.Fatal("a result frame with no sealed _bind was accepted")
+		t.Fatal("a result frame sealed in base mode was accepted")
 	}
 }
 
@@ -334,7 +337,7 @@ func TestSealAsyncImageResultRefusesNonTerminalOrUnnamedFrames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	bind, _ := wire.DeriveAsyncBind(ephPriv)
+	bind, _ := wire.DeriveResponseBind(ephPriv)
 	base := func() wire.Response {
 		return wire.Response{
 			"jobId":  json.RawMessage(`"job_1"`),
