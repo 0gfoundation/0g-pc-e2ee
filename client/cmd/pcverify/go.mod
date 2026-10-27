@@ -11,7 +11,7 @@ module github.com/0gfoundation/0g-pc-e2ee/client/cmd/pcverify
 
 go 1.26.0
 
-toolchain go1.26.9
+toolchain go1.26.10
 
 require (
 	github.com/0gfoundation/0g-pc-e2ee/client v0.0.0
