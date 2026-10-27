@@ -87,6 +87,32 @@ func TestBuiltinBrokerImages_PinsTheAuditedNvidia0541(t *testing.T) {
 		"89e73cedf48f976ffebe8ac1129790ff59a0f52d54d969cb73455b1a79793f1dc16edc3b1fccc0fd65ea5905774bbd57")
 }
 
+// dstack-0.6.1's registers, pinned on the same terms. Computed with dstack-mr from the
+// published Dstack-TEE/dstack mkosi-os-v0.6.1 release, single-pass. RTMR1/RTMR2 equal
+// what the router-api.0g.ai gateway CVM's quote reports; that host is two-pass, so this
+// MRTD is computed, with the two-pass counterpart confirmed on the same quote.
+func TestBuiltinBrokerImages_PinsTheAudited061(t *testing.T) {
+	requirePinned(t,
+		"dstack-0.6.1",
+		"ec43cb8c5e04b6bb6c53b33b16076a01d83d01f7f4b703f2f78a0d947d6247e6",
+		"83baf004a06c83f6371d4d9e19c8bb1ead734ba7696e56d6b52271011394a6f24efecc27af3b5c1da41594dbfa706e97",
+		"89ef86c5125b986c325f0a94acfa87718a4ef3a4d4f237dbb72dda3cf777fd2c054555fb4407eb53338d7d67329a7333",
+		"e9000e338f33233e8f51b7fd031e1c158bdcf8572eab041c0bc8eb7fef48b23259a6a556e6c8e2af99999fc39c793179")
+}
+
+// dstack-nvidia-0.5.12's registers, pinned on the same terms. Computed with dstack-mr
+// from the published meta-dstack v0.5.12 release, single-pass. MRTD and RTMR1 equal a
+// live quote from a CVM on the base dstack-0.5.12 image (same firmware and kernel);
+// RTMR2 differs between flavours, so it is computed only.
+func TestBuiltinBrokerImages_PinsTheAuditedNvidia0512(t *testing.T) {
+	requirePinned(t,
+		"dstack-nvidia-0.5.12",
+		"91fd5d69ccee3e5ea4f2aeb8c9b632c4358c4ecfc29ba1aa6fb1e402af209829",
+		"df4d77c857de652bd0fafa343a2026b51071ee03773d076d283abf1a7d36ff91ffa279ee4a617ac664f7e2a2c8d5891b",
+		"4ae609807c765916a31d724786ed74bcb97e168a9d937b04936aeef2015c907eba5ac352c6bcd749c246fd62ffb659ec",
+		"bd67ab7554dc27ab03a077bc1447a1a67d0624ff547c4c809a8626f12d6a89712f8ec60e781e99b98208574065d21a71")
+}
+
 // requirePinned asserts the embedded allowlist still carries `name` with exactly these
 // registers. Shared by the pins above so that adding one is writing down the values and
 // nothing else — a second copy of the comparison is a second chance for one of them to
