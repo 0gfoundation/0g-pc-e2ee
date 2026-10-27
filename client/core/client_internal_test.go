@@ -214,12 +214,13 @@ func TestLogOpenFailureNilLoggerIsNoop(t *testing.T) {
 // verification failures by reason, data-plane attempts by "kind/outcome",
 // candidate fallbacks by reason, and stream first-frame observations.
 type countingHook struct {
-	n         int
-	verify    map[string]int
-	attempts  map[string]int
-	fallbacks map[string]int
-	ttff      int
-	budgetCut int
+	n          int
+	verify     map[string]int
+	attempts   map[string]int
+	fallbacks  map[string]int
+	keyRefresh map[string]int
+	ttff       int
+	budgetCut  int
 }
 
 func (h *countingHook) ResponseOpenFailure() { h.n++ }
@@ -246,6 +247,13 @@ func (h *countingHook) CandidateFallback(reason string) {
 		h.fallbacks = map[string]int{}
 	}
 	h.fallbacks[reason]++
+}
+
+func (h *countingHook) KeyRefresh(outcome string) {
+	if h.keyRefresh == nil {
+		h.keyRefresh = map[string]int{}
+	}
+	h.keyRefresh[outcome]++
 }
 
 // The metrics hook must fire on every open failure and, critically, independently

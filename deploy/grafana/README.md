@@ -264,6 +264,13 @@ highest-signal ones:
   wrong, which is a router-side fix, not a gateway one. Split by `reason` before
   escalating — `upstream` is providers failing under load, `materialize` is
   candidates we cannot even prepare (quote, key or on-chain grounding).
+- `sum(rate(zg_gateway_key_refreshes_total{outcome="unchanged"}[5m])) > 0.1` — a
+  provider keeps rejecting requests for a stale enc key (409 `e2ee_key_mismatch`)
+  while its own freshly verified quote still carries that key. The 409 comes through
+  the router, so sustained, this is the router (or the broker) sending 409s the
+  enclave's quote contradicts. `outcome="resealed"` is the healthy case: a broker
+  rotated its key, our cached quote still held the old one, and the request was
+  re-sealed to the new key and sent again; expect a burst per broker rollout.
 - `sum(rate(zg_gateway_upstream_attempts_total{outcome=~"undecodable|unverified"}[5m])) > 0`
   — a provider answered 2xx with a body that would not open, or one whose §8
   signature was retrieved and did not verify. Both are integrity signals, not

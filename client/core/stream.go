@@ -82,20 +82,20 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 			c.metricFallback(FallbackMaterialize, i, cands.Len())
 			continue
 		}
-		sealed, err := c.seal(provider, req, ephPriv, ephPub)
-		if err != nil {
-			// Request-level failure — identical for every candidate; fail fast.
-			return stageErr(StageRequest, fmt.Errorf("seal request: %w", err))
-		}
-		attemptStart := time.Now()
-		retry, err := c.streamOnce(ctx, provider, sealed, ephPriv, onFrame)
+		// Charged like Complete's: a stream that stalled before its first frame spent
+		// the caller's time and produced nothing (see resolveBudget). A stale-key
+		// rejection arrives as the status, before any frame, so re-sealing is safe.
+		retry, err := c.attemptRekeying(ctx, &walk, &fail, cands, i, provider, func(p Provider) (bool, error) {
+			sealed, err := c.seal(p, req, ephPriv, ephPub)
+			if err != nil {
+				// Request-level failure — identical for every candidate; fail fast.
+				return false, stageErr(StageRequest, fmt.Errorf("seal request: %w", err))
+			}
+			return c.streamOnce(ctx, p, sealed, ephPriv, onFrame)
+		})
 		if err == nil {
 			return nil
 		}
-		// Charged like Complete's: a stream that stalled before its first frame spent
-		// the caller's time and produced nothing (see resolveBudget).
-		walk.charge(time.Since(attemptStart))
-		fail.record(tierAttempt, err)
 		if retry {
 			// Nothing was delivered yet and the failure is provider-transient — try
 			// the next candidate, unless the caller has gone or that time was all the

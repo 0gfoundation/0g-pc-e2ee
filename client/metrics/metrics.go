@@ -281,6 +281,16 @@ var (
 			"either way means the ranking the router hands us is putting bad providers first.",
 	}, []string{"reason"})
 
+	keyRefreshes = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "key_refreshes_total",
+		Help: "Times a provider rejected a request for a stale enc key (409 e2ee_key_mismatch) and " +
+			"the client re-read that key, by outcome: resealed (the key had rotated; re-sealed and " +
+			"sent again), unchanged (the re-read key is the one just rejected; fell back), failed " +
+			"(the re-read failed or was throttled; fell back) or unsupported (static provider). " +
+			"resealed tracks broker key rotations meeting cached quotes; sustained unchanged means " +
+			"409s the provider's own current key contradicts.",
+	}, []string{"outcome"})
+
 	// §8 response-signature fetch (route.SignatureFetcher), which goes DIRECT to the
 	// provider's broker — the router does not proxy it — once per response.
 	signatureFetchCalls = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -410,7 +420,7 @@ func init() {
 		httpRequests, httpDuration, httpInFlight, inFlightLimit, requestsShed, bodyReadTimeouts, bodyReadUnbounded,
 		completions, openFailures, verificationFailures, sealDecisions,
 		previewAttempts, previewCalls, previewDuration, previewRetrySuppressed,
-		upstreamAttempts, upstreamDuration, streamTTFF, candidateFallbacks, walkBudgetExhausted,
+		upstreamAttempts, upstreamDuration, streamTTFF, candidateFallbacks, keyRefreshes, walkBudgetExhausted,
 		signatureFetchCalls, signatureFetchDuration,
 		quoteVerify, quoteVerifyDuration, quoteCache, measurementUntrusted, runtimeRelease, composeBaseline, providerEnforceRefusals,
 		onchainGrounding, onchainRevalidations,
@@ -574,6 +584,9 @@ func WalkBudgetExhausted() { walkBudgetExhausted.Inc() }
 // could not be prepared at all).
 func CandidateFallback(reason string) { candidateFallbacks.WithLabelValues(reason).Inc() }
 
+// KeyRefresh records one re-read of a provider enc key after a stale-key rejection.
+func KeyRefresh(outcome string) { keyRefreshes.WithLabelValues(outcome).Inc() }
+
 // SignatureFetch records one §8 signature fetch — one per verified response — and
 // its end-to-end latency including retries. outcome is a fixed low-cardinality
 // label; the metric's Help is the one place the set is described, because this
@@ -677,6 +690,9 @@ func (CoreMetrics) WalkBudgetExhausted() { WalkBudgetExhausted() }
 
 // CandidateFallback implements core.MetricsHook.
 func (CoreMetrics) CandidateFallback(reason string) { CandidateFallback(reason) }
+
+// KeyRefresh implements core.MetricsHook.
+func (CoreMetrics) KeyRefresh(outcome string) { KeyRefresh(outcome) }
 
 func result(ok bool) string {
 	if ok {

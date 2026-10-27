@@ -59,13 +59,23 @@ func (c *Client) SubmitAsync(ctx context.Context, req wire.Request) (wire.Respon
 			continue
 		}
 
-		attemptStart := time.Now()
-		out, status, retry, err := c.submitOnce(ctx, provider, req)
+		// The broker refuses a stale key before it creates a job, so re-sealing to
+		// the same provider cannot leave a second job behind.
+		var (
+			out    wire.Response
+			status int
+		)
+		retry, err := c.attemptRekeying(ctx, &walk, &fail, cands, i, provider, func(p Provider) (bool, error) {
+			var (
+				retry bool
+				err   error
+			)
+			out, status, retry, err = c.submitOnce(ctx, p, req)
+			return retry, err
+		})
 		if err == nil {
 			return out, status, nil
 		}
-		walk.charge(time.Since(attemptStart))
-		fail.record(tierAttempt, err)
 		if retry {
 			if canceledBy(ctx) {
 				break

@@ -828,6 +828,21 @@ func (c *routeCandidates) Len() int { return len(c.providers) }
 // enc key from the broker (cached). It fails (so core skips to the next
 // candidate) if the candidate lacks the endpoint/address the seal + pin need.
 func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, error) {
+	return c.materialize(ctx, i, nil)
+}
+
+// RefreshProvider implements core.KeyRefresher: it materializes candidate i again
+// after the provider rejected a request sealed to stale, re-reading the key past a
+// cache that still holds it (see Router.freshProvider). Everything else — the
+// on-chain grounding, the identity record, the enforce gate — runs exactly as on
+// a first materialization, against the re-read quote.
+func (c *routeCandidates) RefreshProvider(ctx context.Context, i int, stale crypto.PublicKey) (core.Provider, error) {
+	return c.materialize(ctx, i, stale)
+}
+
+// materialize is Provider and RefreshProvider. stale is nil for an ordinary
+// materialization.
+func (c *routeCandidates) materialize(ctx context.Context, i int, stale crypto.PublicKey) (core.Provider, error) {
 	prov := c.providers[i]
 	// Address is the routing pin core sends so the router forwards to exactly this
 	// provider; without it the router could re-route to a provider whose key can't
@@ -868,13 +883,13 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 		err         error
 	)
 	if c.router.verifier != nil {
-		verified, quoteCached, err = c.router.verifiedProviderCached(ctx, prov.Endpoint)
+		verified, quoteCached, err = c.router.freshProvider(ctx, prov.Endpoint, stale)
 		encPub, signer = verified.encPub, verified.signer
 	} else {
 		var pubkeyURL string
 		pubkeyURL, err = derivePubkeyURL(prov.Endpoint)
 		if err == nil {
-			encPub, signer, err = c.router.pubkey(ctx, pubkeyURL)
+			encPub, signer, err = c.router.freshPubkey(ctx, pubkeyURL, stale)
 		} else {
 			err = upstream(0, fmt.Errorf("provider endpoint: %w", err))
 		}
@@ -1019,6 +1034,29 @@ func (c *routeCandidates) Provider(ctx context.Context, i int) (core.Provider, e
 		// on-chain URL (respbind.go) — never anything this request path read.
 		BindResponse: c.router.bindsResponse(prov.Address),
 	}, nil
+}
+
+// freshProvider is verifiedProviderCached for a key the provider may have just
+// rejected. With stale nil it is exactly verifiedProviderCached. Otherwise, when the
+// cache still holds stale, it forces a live re-verification instead of handing the
+// rejected key back; when the cache already holds a different key — another request
+// that hit the same rotation refreshed it first — that key is used as is.
+//
+// The forced re-verification is reverifiedProvider's, so it shares that path's
+// once-per-TTL throttle with the grounding recovery. The rejection that triggers it
+// comes through the untrusted router, and without the throttle a router replaying
+// 409s could turn every request into a live DCAP verification. A throttled re-read
+// is an error here, and the client falls back to the next candidate.
+func (r *Router) freshProvider(ctx context.Context, endpoint string, stale crypto.PublicKey) (quoteResult, bool, error) {
+	res, cached, err := r.verifiedProviderCached(ctx, endpoint)
+	if err != nil || stale == nil || !cached || !bytes.Equal(res.encPub, stale) {
+		return res, cached, err
+	}
+	fresh, err := r.reverifiedProvider(ctx, endpoint)
+	if err != nil {
+		return quoteResult{}, false, err
+	}
+	return fresh, false, nil
 }
 
 // verifiedKeys is the keys-only form, for the callers that seal but report nothing:
@@ -1956,6 +1994,19 @@ func (r *Router) pubkey(ctx context.Context, pubkeyURL string) (crypto.PublicKey
 	return encPub, signer, nil
 }
 
+// freshPubkey is pubkey for a key the provider may have just rejected: when the
+// cache still holds stale it drops the entry and fetches again. The legacy pubkey
+// path verifies nothing and is one cheap GET, so unlike freshProvider it is not
+// throttled; the client re-reads at most once per candidate per request.
+func (r *Router) freshPubkey(ctx context.Context, pubkeyURL string, stale crypto.PublicKey) (crypto.PublicKey, string, error) {
+	if stale != nil {
+		if encPub, _, ok := r.cache.get(pubkeyURL); ok && bytes.Equal(encPub, stale) {
+			r.cache.del(pubkeyURL)
+		}
+	}
+	return r.pubkey(ctx, pubkeyURL)
+}
+
 // validatePubkey checks the broker's reply is one this client can seal to and
 // returns the decoded enc key and signer address.
 func validatePubkey(pk pubkeyResponse) (crypto.PublicKey, string, error) {
@@ -2128,6 +2179,13 @@ func (c *pubkeyCache) get(key string) (crypto.PublicKey, string, bool) {
 		return nil, "", false
 	}
 	return e.encPub, e.signer, true
+}
+
+// del drops a cached key, for a provider that has rejected it (freshPubkey).
+func (c *pubkeyCache) del(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.m, key)
 }
 
 func (c *pubkeyCache) put(key string, encPub crypto.PublicKey, signer string) {
