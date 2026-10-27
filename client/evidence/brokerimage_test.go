@@ -125,6 +125,31 @@ func TestBuiltinBrokerImages_PinsTheAudited0512(t *testing.T) {
 		"764489f277a8540189761e72b4238ba36d4d647e11bd958d8ab5522af2a4867b0ff63e06b0c4967f1857236244040a5d")
 }
 
+// dstack-0.5.9's registers, the base flavour, pinned on the same terms. Computed with
+// dstack-mr from the published meta-dstack v0.5.9 release, single-pass. RTMR1/RTMR2
+// equal a live quote on this image (two-pass host); MRTD and RTMR1 equal the
+// quote-confirmed dstack-nvidia-0.5.9 entry.
+func TestBuiltinBrokerImages_PinsTheAudited059(t *testing.T) {
+	requirePinned(t,
+		"dstack-0.5.9",
+		"bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033",
+		"b24d3b24e9e3c16012376b52362ca09856c4adecb709d5fac33addf1c47e193da075b125b6c364115771390a5461e217",
+		"07e6f51aa763abfe75c3ddfbf4f425fe3f0ceff66d807a75e049303dce9addf68e7218729bd419638af63a370f65878c",
+		"df67e467e60edc1737bcf8e682d48131bfb427f523226aa7f197a7608e9b3784783fa759ef5b28191fa12f9ddb36b858")
+}
+
+// dstack-0.5.4.1's registers, the base flavour, pinned on the same terms. Computed with
+// dstack-mr from the published meta-dstack v0.5.4.1 release, single-pass. Only MRTD is
+// anchored to a live quote (shared with dstack-nvidia-0.5.4.1); RTMR1/RTMR2 are computed.
+func TestBuiltinBrokerImages_PinsTheAudited0541(t *testing.T) {
+	requirePinned(t,
+		"dstack-0.5.4.1",
+		"1fbb0cf9cc6cfbf23d6b779776fabad2c5403d643badb9e5e238615e4960a78a",
+		"b24d3b24e9e3c16012376b52362ca09856c4adecb709d5fac33addf1c47e193da075b125b6c364115771390a5461e217",
+		"90c97d4e0438b5cd6d220f0e64a287416215fab8e8d95df9ced2df74fb6e11637a96ebcc5ea0ddd122d5483720cfc478",
+		"5a68ce140df12f3614931e7880e5aab1e16938d9edf605e009868730e88116fe0563572bd884d3e2fdd07aa3dcc88419")
+}
+
 // requirePinned asserts the embedded allowlist still carries `name` with exactly these
 // registers. Shared by the pins above so that adding one is writing down the values and
 // nothing else — a second copy of the comparison is a second chance for one of them to

@@ -189,6 +189,36 @@
       "rtmr2": "f1c82667a354194467cd8419efd14a714560dd9b85b4c13b25c11e44bf4e126248c2255fad58c303fb0ca2921765d53a"
     },
     {
+      "name": "dstack-0.5.9",
+      "os_image_hash": "bd369a8c2f9edb2b52dad48ac8e0b32dde5f1337c423a506b48d07403a7d8033",
+      "source": "github.com/Dstack-TEE/meta-dstack releases/download/v0.5.9/dstack-0.5.9.tar.gz",
+      "page_add": "single-pass (dstack-mr two_pass_add_pages=false; two_pass_add_pages=true gives f06dfda6… instead)",
+      "derivation": [
+        "The BASE flavour of 0.5.9, for forwarding providers (a broker in front of a",
+        "centralized upstream), which do not run the nvidia image. Same ovmf.fd and",
+        "bzImage as dstack-nvidia-0.5.9, so the same MRTD and RTMR1; only RTMR2 (cmdline",
+        "rootfs_hash + initrd) separates the two flavours.",
+        "1. Downloaded the release above. `sha256sum -c sha256sum.txt` passed for all",
+        "   four members, and sha256(sha256sum.txt) equals digest.txt — which IS the",
+        "   os_image_hash above. metadata.json: version 0.5.9, is_dev false (production",
+        "   flavour), git_revision e3655d13, the commit meta-dstack's v0.5.9 tag names.",
+        "2. dstack-mr (Dstack-TEE/dstack 7f143148cc49f4a09799958835d310e050137cb3),",
+        "   tdx::tdx_measurements_for_image_dir_without_rtmr0, two_pass_add_pages false",
+        "   and true, at 1/2G, 8/32G, 64/512G and 128/1024G. RTMR1/RTMR2 identical in",
+        "   every case; MRTD moves with the page-add mode only. No value below was read",
+        "   off a deployment.",
+        "3. Independently matches the dstack-0.5.9 entries in osimages.json.",
+        "4. Confirmed on real hardware piecewise: RTMR1 and RTMR2 equal what the",
+        "   router-api-tee-staging.0g.ai CVM's quote reported on this image (recorded in",
+        "   osimages.json; that host was two-pass), and this MRTD and RTMR1 are",
+        "   byte-identical to the dstack-nvidia-0.5.9 entry's, which a live single-pass",
+        "   provider quote confirmed."
+      ],
+      "mrtd": "b24d3b24e9e3c16012376b52362ca09856c4adecb709d5fac33addf1c47e193da075b125b6c364115771390a5461e217",
+      "rtmr1": "07e6f51aa763abfe75c3ddfbf4f425fe3f0ceff66d807a75e049303dce9addf68e7218729bd419638af63a370f65878c",
+      "rtmr2": "df67e467e60edc1737bcf8e682d48131bfb427f523226aa7f197a7608e9b3784783fa759ef5b28191fa12f9ddb36b858"
+    },
+    {
       "name": "dstack-nvidia-0.5.4.1",
       "os_image_hash": "86b181377635db21c415f9ece8cc8505f7d4936ad3be7043969005a8c4690c1a",
       "source": "github.com/nearai/private-ml-sdk releases/download/v0.5.4.1/dstack-nvidia-0.5.4.1.tar.gz",
@@ -221,6 +251,35 @@
       "mrtd": "b24d3b24e9e3c16012376b52362ca09856c4adecb709d5fac33addf1c47e193da075b125b6c364115771390a5461e217",
       "rtmr1": "6e1afb7464ed0b941e8f5bf5b725cf1df9425e8105e3348dca52502f27c453f3018a28b90749cf05199d5a17820101a7",
       "rtmr2": "89e73cedf48f976ffebe8ac1129790ff59a0f52d54d969cb73455b1a79793f1dc16edc3b1fccc0fd65ea5905774bbd57"
+    },
+    {
+      "name": "dstack-0.5.4.1",
+      "os_image_hash": "1fbb0cf9cc6cfbf23d6b779776fabad2c5403d643badb9e5e238615e4960a78a",
+      "source": "github.com/Dstack-TEE/meta-dstack releases/download/v0.5.4.1/dstack-0.5.4.1.tar.gz",
+      "page_add": "single-pass (dstack-mr two_pass_add_pages=false; two_pass_add_pages=true gives f06dfda6… instead)",
+      "derivation": [
+        "The BASE flavour of 0.5.4.1, for forwarding providers. NOTE the source: the",
+        "nvidia 0.5.4.1 above comes from nearai/private-ml-sdk, but the base image of",
+        "that version is published by meta-dstack (private-ml-sdk has no base tarball).",
+        "They are separate builds with different kernels, so unlike 0.5.9/0.5.12 the two",
+        "0.5.4.1 flavours differ in RTMR1 as well as RTMR2; only MRTD (same ovmf.fd) is",
+        "shared.",
+        "1. Downloaded the release above. `sha256sum -c sha256sum.txt` passed for all",
+        "   four members, and sha256(sha256sum.txt) equals digest.txt — which IS the",
+        "   os_image_hash above. metadata.json: version 0.5.4.1, is_dev false (production",
+        "   flavour), git_revision 4b38f2c0, the commit meta-dstack's v0.5.4.1 tag names.",
+        "2. dstack-mr (Dstack-TEE/dstack 7f143148cc49f4a09799958835d310e050137cb3),",
+        "   tdx::tdx_measurements_for_image_dir_without_rtmr0, two_pass_add_pages false",
+        "   and true, at 1/2G, 8/32G, 64/512G and 128/1024G. RTMR1/RTMR2 identical in",
+        "   every case; MRTD moves with the page-add mode only. No value below was read",
+        "   off a deployment.",
+        "3. NOT YET CONFIRMED by a live quote of this image. MRTD is byte-identical to the",
+        "   dstack-nvidia-0.5.4.1 entry's, which a live provider quote confirmed; RTMR1 and",
+        "   RTMR2 rest on step 2 until a CVM on base dstack-0.5.4.1 is quoted."
+      ],
+      "mrtd": "b24d3b24e9e3c16012376b52362ca09856c4adecb709d5fac33addf1c47e193da075b125b6c364115771390a5461e217",
+      "rtmr1": "90c97d4e0438b5cd6d220f0e64a287416215fab8e8d95df9ced2df74fb6e11637a96ebcc5ea0ddd122d5483720cfc478",
+      "rtmr2": "5a68ce140df12f3614931e7880e5aab1e16938d9edf605e009868730e88116fe0563572bd884d3e2fdd07aa3dcc88419"
     }
   ]
 }
