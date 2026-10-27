@@ -75,7 +75,15 @@ jobs:
         # cannot be told apart from a gate reacting to a real change. The database it
         # queries is live regardless — pinning the tool costs no freshness, and this
         # line is the thing to bump deliberately.
-        run: go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+        #
+        # Built with the toolchain protocol/go.mod pins, not whatever `go install` picks
+        # outside a module: govulncheck type-checks the code with the go/types it was
+        # compiled with, so a binary older than the modules' `go` line cannot load them
+        # at all ("package requires newer Go version").
+        run: |
+          GOTOOLCHAIN="$(cd protocol && go env GOVERSION)" \
+            go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+          go version "$(command -v govulncheck)"
 
       - name: Scan (per module)
         id: scan
