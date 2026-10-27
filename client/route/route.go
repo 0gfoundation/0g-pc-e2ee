@@ -260,6 +260,10 @@ type Router struct {
 	// quote-verification path (verifier != nil).
 	quoteCache *quoteCache
 	quoteSF    singleflight.Group
+	// refreshSF collapses concurrent stale-key refreshes per quote URL (see
+	// freshProvider). Separate from quoteSF because what it guards begins before the
+	// verification: the cache re-check and the throttle stamp.
+	refreshSF singleflight.Group
 	// releases, when non-nil, judges the broker build each verified provider's CVM runs
 	// now (runtimerelease.go). Observed, unless providerEnforce makes it a gate.
 	releases *releaseJudge
@@ -1047,16 +1051,50 @@ func (c *routeCandidates) materialize(ctx context.Context, i int, stale crypto.P
 // comes through the untrusted router, and without the throttle a router replaying
 // 409s could turn every request into a live DCAP verification. A throttled re-read
 // is an error here, and the client falls back to the next candidate.
+//
+// Concurrent refreshes for one provider run as one, under refreshSF. The throttle
+// is stamped when a verification STARTS and the cache is updated only when it
+// ends, so without this every request rejected while the first refresh was still
+// verifying — the dense middle of a rollout — saw the stale key, hit the stamp and
+// was turned away. Inside the flight the cache is read again before anything is
+// stamped: a caller that saw the stale key just as the previous flight finished
+// starts a new one, and finds the key that flight cached.
 func (r *Router) freshProvider(ctx context.Context, endpoint string, stale crypto.PublicKey) (quoteResult, bool, error) {
 	res, cached, err := r.verifiedProviderCached(ctx, endpoint)
 	if err != nil || stale == nil || !cached || !bytes.Equal(res.encPub, stale) {
 		return res, cached, err
 	}
-	fresh, err := r.reverifiedProvider(ctx, endpoint)
+	quoteURL, err := deriveQuoteURL(endpoint)
 	if err != nil {
-		return quoteResult{}, false, err
+		return quoteResult{}, false, upstream(0, fmt.Errorf("provider endpoint: %w", err))
 	}
-	return fresh, false, nil
+	type refreshed struct {
+		res    quoteResult
+		cached bool
+	}
+	// Detached from the caller that happened to lead, as in verifyAndCache: one
+	// caller going away must not fail the refresh for those that joined it. The
+	// verification inside is still bounded by quoteVerifyTimeout.
+	ch := r.refreshSF.DoChan(quoteURL, func() (any, error) {
+		if res, ok := r.quoteCache.get(quoteURL); ok && !bytes.Equal(res.encPub, stale) {
+			return refreshed{res, true}, nil
+		}
+		fresh, err := r.reverifiedProvider(context.WithoutCancel(ctx), endpoint)
+		if err != nil {
+			return nil, err
+		}
+		return refreshed{fresh, false}, nil
+	})
+	select {
+	case <-ctx.Done():
+		return quoteResult{}, false, upstream(0, fmt.Errorf("provider key refresh: %w", ctx.Err()))
+	case out := <-ch:
+		if out.Err != nil {
+			return quoteResult{}, false, out.Err
+		}
+		got := out.Val.(refreshed)
+		return got.res, got.cached, nil
+	}
 }
 
 // verifiedKeys is the keys-only form, for the callers that seal but report nothing:
