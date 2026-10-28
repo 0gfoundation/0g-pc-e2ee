@@ -164,7 +164,7 @@ EXTRA_ENV=()
 OUT="" ERR="" RC=0
 run() { # args…
   RC=0
-  OUT="$(env -i PATH="$WORK/bin:$PATH" HOME="$WORK" FAKE_DIR="$S" FAKE_NEW_APP="$NEW_APP" \
+  OUT="$(env -i PATH="$WORK/bin:$PATH" HOME="$WORK" SECRETS_ENV=/nonexistent FAKE_DIR="$S" FAKE_NEW_APP="$NEW_APP" \
     DOMAIN="$DOMAIN" DELEGATION_ZONE="$DZ" PLATFORM_BASE="_.${BASE}" \
     CVM_NAME_PREFIX=gw-mainnet PHALA_INSTANCE_TYPE=tdx.4xlarge PHALA_NODE_ID=7 \
     CLOUDFLARE_API_TOKEN=cf-secret ZG_PROM_ENV=mainnet ZG_PROM_REMOTE_WRITE_URL=https://prom.test/w \
@@ -296,7 +296,7 @@ for f in "$HERE"/env/*.env; do
   check "${name} sets only keys the scripts read${unknown:+ (unknown:$unknown)}" [ -z "$unknown" ]
   # Loaded the way the scripts load it, with nothing else in the environment.
   RC=0
-  ERR="$(env -i PATH="$WORK/bin:$PATH" HOME="$WORK" bash "$DEPLOY" b --env-file "$f" \
+  ERR="$(env -i PATH="$WORK/bin:$PATH" HOME="$WORK" SECRETS_ENV=/nonexistent bash "$DEPLOY" b --env-file "$f" \
     --compose "$COMPOSE" --dry-run 2>&1 >/dev/null)" || RC=$?
   if grep -qE "^[^#]*=CHANGEME$" "$f"; then
     expect_err "${name} loads, and its placeholders are refused" "still CHANGEME"
@@ -304,6 +304,17 @@ for f in "$HERE"/env/*.env; do
     expect_err "${name} loads, and only the secrets are missing" "set CLOUDFLARE_API_TOKEN"
   fi
 done
+
+# A filled-in config file plus a local secrets.env is a complete configuration.
+fresh
+sed 's/=CHANGEME$/=filled.example/; s/^PLATFORM_BASE=.*/PLATFORM_BASE=in1.phala.network/' \
+  "$HERE/env/mainnet.env" >"$WORK/filled.env"
+printf '%s\n' CLOUDFLARE_API_TOKEN=cf-secret ZG_PROM_REMOTE_WRITE_PASSWORD=pw >"$WORK/secrets.env"
+RC=0
+ERR="$(env -i PATH="$WORK/bin:$PATH" HOME="$WORK" FAKE_DIR="$S" SECRETS_ENV="$WORK/secrets.env" \
+  bash "$DEPLOY" b --env-file "$WORK/filled.env" --compose "$COMPOSE" --dry-run 2>&1 >/dev/null)" || RC=$?
+expect_rc "a filled env file and secrets.env are enough for a dry run" 0
+check "…and secrets.env was loaded" err_has "loading env from $WORK/secrets.env"
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ]

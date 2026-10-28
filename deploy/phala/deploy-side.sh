@@ -62,11 +62,13 @@
 # and in git every change is reviewed and diffable between deployments. The
 # secrets (CLOUDFLARE_API_TOKEN, ZG_PROM_REMOTE_WRITE_PASSWORD, PHALA_CLOUD_API_KEY)
 # come from the environment only: in the workflow, from the deploy-<target>
-# Environment. A value still reading CHANGEME is refused.
+# Environment; locally, from `secrets.env` next to this script (git-ignored, see
+# secrets.env.example; SECRETS_ENV names another path), loaded after the config
+# file, or exported. A value still reading CHANGEME is refused.
 #
 # Usage:
 #   ./deploy-side.sh b --env-file env/mainnet.env --compose docker-compose.release.yml \
-#       --release release-2026.10.28.1        # secrets exported in the environment
+#       --release release-2026.10.28.1        # secrets in ./secrets.env, or exported
 #   ./deploy-side.sh b --env-file … --compose … --dry-run   # preflight only
 #
 # Flags:
@@ -361,6 +363,8 @@ if [ -n "$ENV_FILE" ]; then
 elif [ -f "${SCRIPT_DIR}/deploy.env" ]; then
   load_env_file "${SCRIPT_DIR}/deploy.env"
 fi
+SECRETS_ENV="${SECRETS_ENV:-${SCRIPT_DIR}/secrets.env}"
+if [ -f "$SECRETS_ENV" ]; then load_env_file "$SECRETS_ENV"; fi
 
 DELEGATION_ZONE="${DELEGATION_ZONE:-integratenetwork.work}"
 PLATFORM_BASE="${PLATFORM_BASE:-}"; PLATFORM_BASE="${PLATFORM_BASE#_.}"

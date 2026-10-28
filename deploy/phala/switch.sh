@@ -55,7 +55,10 @@
 # overrides in `switch.env` next to this script (see switch.env.example) and it
 # is loaded automatically; the real environment still wins over the file, so
 # `CF_API_TOKEN=… ./switch.sh …` overrides it for a one-off. `switch.env` is
-# git-ignored (it holds the Cloudflare token). Point elsewhere with --env-file.
+# git-ignored (it holds the Cloudflare token). Point elsewhere with --env-file —
+# typically the checked-in, secret-free env/<target>.env, with the token in
+# `secrets.env` next to this script (also git-ignored, see secrets.env.example),
+# which is loaded after either file; SECRETS_ENV names another path.
 #
 # Usage:
 #   ./switch.sh status                               # (reads switch.env if present)
@@ -973,13 +976,16 @@ done
 set -- "${POSITIONAL[@]:-}"
 
 # Load config from an env file before resolving defaults. Precedence:
-#   real environment  >  --env-file / $ENV_FILE  >  ./switch.env next to script
-# The real environment always wins (load_env_file skips keys already set).
+#   real environment  >  --env-file / $ENV_FILE  >  ./switch.env  >  ./secrets.env
+# The real environment always wins (load_env_file skips keys already set), and
+# the config files and secrets.env hold different keys anyway.
 if [ -n "$ENV_FILE" ]; then
   load_env_file "$ENV_FILE"
 elif [ -f "${SCRIPT_DIR}/switch.env" ]; then
   load_env_file "${SCRIPT_DIR}/switch.env"
 fi
+SECRETS_ENV="${SECRETS_ENV:-${SCRIPT_DIR}/secrets.env}"
+if [ -f "$SECRETS_ENV" ]; then load_env_file "$SECRETS_ENV"; fi
 
 # ---------------------------------------------------------------------------
 # Config (env / env-file, with defaults for the current production deployment)
@@ -1016,7 +1022,7 @@ ADDR_SWITCH="${TXT_PREFIX}.${DOMAIN}.${DELEGATION_ZONE}"
 ACME_SWITCH="_acme-challenge.${DOMAIN}.${DELEGATION_ZONE}"
 
 need curl; need jq
-: "${CF_API_TOKEN:?set CF_API_TOKEN (Cloudflare token for ${CF_ZONE}); put it in ${SCRIPT_DIR}/switch.env or export it}"
+: "${CF_API_TOKEN:?set CF_API_TOKEN (Cloudflare token for ${CF_ZONE}); put it in ${SECRETS_ENV} or export it}"
 
 cmd="${1:-status}"
 case "$cmd" in

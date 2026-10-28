@@ -515,8 +515,8 @@ repository admin:
    (`DOMAIN`, `CF_ZONE`, `DELEGATION_ZONE`, `PLATFORM_BASE`, `PLATFORM_BASE_COLD`).
    The workflow passes it with `--env-file` and refuses a file with no `DOMAIN`
    (rather than fall back to switch.sh's mainnet default) or with a `CHANGEME`
-   left in those keys. Locally, the same file: `CF_API_TOKEN=… ./switch.sh
-   --env-file env/mainnet.env status`.
+   left in those keys. Locally, the same file, with the token in `secrets.env`
+   ([below](#running-it-locally)): `./switch.sh --env-file env/mainnet.env status`.
 4. **Admins only.** The workflow refuses to run — any command, `status`
    included — unless the account that triggered it has *admin* on this repository
    (organization owners do), and refuses if it cannot look that up. Anyone with write
@@ -616,6 +616,25 @@ change the env file (merged to `main`) or the secret, run **Phala deploy** on th
 set changes its `compose_hash`, with no previous side to roll back to. Each new
 side issues a certificate, against the 5-per-week limit for the hostname, so
 batch environment changes with releases where you can.
+
+### Running it locally
+
+The fallback for when GitHub is down — the same scripts, without the approvals,
+the run record or the one-deploy-at-a-time lock, so do not run it alongside the
+workflow on the same deployment. Secrets go in `secrets.env` next to the scripts
+(git-ignored; copy [`secrets.env.example`](./secrets.env.example)), which both
+load after the config file. GitHub cannot show an Environment secret back, so
+keep your own copy of each. Needs `phala` (1.1.22, as the workflow), `dig`,
+`curl`, `jq`, `openssl`.
+
+```sh
+gh release download release-YYYY.MM.DD.N --pattern docker-compose.release.yml --dir /tmp/rel
+cd deploy/phala
+./switch.sh --env-file env/staging.env acme b
+./deploy-side.sh b --env-file env/staging.env --compose /tmp/rel/docker-compose.release.yml \
+  --release release-YYYY.MM.DD.N --dry-run      # then again without --dry-run
+./switch.sh --env-file env/staging.env switch b
+```
 
 ## Cross-cluster fallback
 
