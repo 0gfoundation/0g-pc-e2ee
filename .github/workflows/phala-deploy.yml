@@ -29,8 +29,8 @@ name: Phala deploy
 # the deploy job names that environment. A fork's pull request never runs this
 # workflow (dispatch-only).
 #
-# Logs are public in a public repository. deploy-side.sh prints names, app ids,
-# DNS records and the env KEYS it passes, never their values; the values go to a
+# Logs are public in a public repository. deploy-side.sh prints names, app ids
+# and DNS records, never the CVM's env; the values go to a
 # 0600 temp file and are encrypted to the CVM by the CLI. Actions masks secrets
 # regardless.
 
