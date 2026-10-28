@@ -138,7 +138,13 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-c_red=$'\033[31m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_dim=$'\033[2m'; c_rst=$'\033[0m'
+# Colour only on a terminal: the DNS switch workflow captures this output into the
+# run summary, which is Markdown and shows escape codes as literal `�[32m` junk.
+if [ -t 1 ] && [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
+  c_red=$'\033[31m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_dim=$'\033[2m'; c_rst=$'\033[0m'
+else
+  c_red=''; c_grn=''; c_yel=''; c_dim=''; c_rst=''
+fi
 log()  { printf '%s\n' "$*" >&2; }
 info() { printf '%s==>%s %s\n' "$c_grn" "$c_rst" "$*" >&2; }
 warn() { printf '%swarn:%s %s\n' "$c_yel" "$c_rst" "$*" >&2; }
