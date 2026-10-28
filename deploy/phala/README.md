@@ -336,7 +336,7 @@ is idle. Check both after any resize.
 When bringing up a **new** hostname, do the first round trips against Let's
 Encrypt's staging CA by setting `ACME_STAGING=true` in the CVM's encrypted
 environment (with [`deploy-side.sh`](./deploy-side.sh), add `ACME_STAGING=true`
-to `CVM_EXTRA_ENV`). To switch a *running* CVM between staging and real in place,
+as `CVM_ENV_ACME_STAGING=true` to the deployment's `env/<target>.env`). To switch a *running* CVM between staging and real in place,
 keep the key listed in `allowed_envs` and change the **value**, not the key:
 `allowed_envs` is part of the measured app-compose, so editing the list changes
 `compose_hash`. Under blue/green, where each change is a new side, leaving the key

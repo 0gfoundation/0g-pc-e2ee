@@ -510,10 +510,13 @@ repository admin:
      handed the token. With a single operator, leave *Prevent self-review* off, or
      nobody can approve. Required reviewers are available on every plan for a public
      repository.
-3. **Environment variables** on each: `DOMAIN` (required — the workflow
-   refuses to fall back to switch.sh's mainnet default), `PLATFORM_BASE`, and if
-   used `PLATFORM_BASE_COLD`, `CF_ZONE`, `DELEGATION_ZONE` — the same values as
-   `switch.env`.
+3. **No environment variables.** The config is checked in, one file per
+   deployment: [`env/staging.env`](./env/staging.env), [`env/mainnet.env`](./env/mainnet.env)
+   (`DOMAIN`, `CF_ZONE`, `DELEGATION_ZONE`, `PLATFORM_BASE`, `PLATFORM_BASE_COLD`).
+   The workflow passes it with `--env-file` and refuses a file with no `DOMAIN`
+   (rather than fall back to switch.sh's mainnet default) or with a `CHANGEME`
+   left in those keys. Locally, the same file: `CF_API_TOKEN=… ./switch.sh
+   --env-file env/mainnet.env status`.
 4. **Admins only.** The workflow refuses to run — any command, `status`
    included — unless the account that triggered it has *admin* on this repository
    (organization owners do), and refuses if it cannot look that up. Anyone with write
@@ -557,9 +560,10 @@ app_id and the release. A side that fails is left running for inspection.
 **Setup**, once, by a repository admin — on top of the `dns-*` environments above:
 
 1. **Two environments**, `deploy-staging` and `deploy-mainnet`, protected like the
-   `dns-*` ones (*main* only, required reviewers, admins may not bypass). The Phala
-   API key creates and deletes the CVMs and the CVM's Cloudflare token can point the
-   served name anywhere, so these two never go in repository secrets.
+   `dns-*` ones (*main* only, required reviewers, admins may not bypass), holding
+   the secrets and nothing else. The Phala API key creates and deletes the CVMs and
+   the CVM's Cloudflare token can point the served name anywhere, so these two never
+   go in repository secrets.
 
    | Secret | |
    |---|---|
@@ -568,33 +572,45 @@ app_id and the release. A side that fails is left running for inspection.
    | `ZG_PROM_REMOTE_WRITE_PASSWORD` | remote_write password |
    | `SMOKE_API_KEY` | optional: an `sk-` key for `scripts/smoke-gateway.sh`. It crosses a connection with `--insecure` (the side's `-443s` host serves the domain's cert), so give it a small credit limit |
 
-   | Variable | |
+   The Prometheus password is the same for both deployments, so it may instead be
+   set once as a repository secret (an environment secret of the same name would
+   override it). Weigh that: repository secrets reach any workflow run on any
+   branch, without the environment's reviewers — acceptable for a write-only
+   metrics credential, never for the two above.
+
+2. **Fill in the config**, [`env/staging.env`](./env/staging.env) and
+   [`env/mainnet.env`](./env/mainnet.env), through a pull request like any code.
+   Nothing in them is confidential — hostnames and clusters are in public DNS, the
+   CVM's shape and OS image in its public quote — and in git every change is
+   reviewed, and the two deployments can be diffed. `deploy-side.sh` refuses any
+   `CHANGEME` left in them, and CI fails if a secret's key appears in one.
+
+   | Key | |
    |---|---|
    | `DOMAIN` | served hostname (required; no default) |
-   | `DELEGATION_ZONE` | base delegation zone; the side's is `<side>.<this>` |
+   | `DELEGATION_ZONE`, `CF_ZONE` | base delegation zone; a side's is `<side>.<DELEGATION_ZONE>` |
    | `PLATFORM_BASE`, `PLATFORM_BASE_COLD` | the clusters, as for `switch.sh` |
-   | `CVM_NAME_PREFIX` | CVMs are named `<prefix>-<side>`, e.g. `pc-gateway-mainnet-b` |
+   | `CVM_NAME_PREFIX` | CVMs are named `<prefix>-<side>`: `pc-gateway-mainnet-b` |
    | `PHALA_INSTANCE_TYPE` | the shape ([README](./README.md#cvm-shape--and-the-one-setting-that-depends-on-it)) |
    | `PHALA_NODE_ID`, `PHALA_NODE_ID_COLD` | optional: pin the node, so a side lands in its cluster rather than being caught after it boots elsewhere |
    | `PHALA_OS_IMAGE` | optional: pin the OS image |
    | `ZG_PROM_ENV`, `ZG_PROM_REMOTE_WRITE_URL`, `ZG_PROM_REMOTE_WRITE_USERNAME` | metrics ([README](./README.md#metrics-prometheus)) |
-   | `CVM_EXTRA_ENV` | optional: further `KEY=VALUE` lines for the CVM, e.g. `ZG_GATEWAY_ROUTER_URL=…` on staging |
+   | `CVM_ENV_<KEY>` | optional: a further variable for the CVM, passed as `<KEY>` — e.g. `CVM_ENV_ZG_GATEWAY_ROUTER_URL` on staging |
    | `SMOKE_SEALED_MODEL`, `SMOKE_PLAIN_MODEL` | optional: the smoke test's models |
 
-   A value shared by both deployments — the Prometheus URL, username and password —
-   may instead be set once at repository level; an environment value of the same
-   name overrides it. Weigh that for the password: repository secrets reach any
-   workflow run on any branch, without the environment's reviewers. (Fine for a
-   write-only metrics credential; never for the two above.)
-
-2. **The CVM's environment is the variables above, and only them.** The script
-   passes a fixed key set — `DOMAIN`, `DELEGATION_ZONE`, `DNS_SETUP_MODE=print`,
-   `CLOUDFLARE_API_TOKEN`, the four `ZG_PROM_*` — plus `CVM_EXTRA_ENV`, which may add
-   keys but not override those. That set becomes the measured `allowed_envs`, so
-   both sides of a deployment get the same list by construction.
+   **What reaches the CVM.** On the runner, the script merges the CVM's keys from
+   the file with the two secrets into one 0600 temp file, deleted on exit; the CLI
+   encrypts it to the app's env key before sending, so Phala Cloud receives
+   ciphertext and the key names, and only the CVM decrypts. The key set is fixed —
+   `DOMAIN`, `DELEGATION_ZONE=<side>.<DZ>`, `DNS_SETUP_MODE=print`,
+   `CLOUDFLARE_API_TOKEN`, the four `ZG_PROM_*` — plus the `CVM_ENV_*` ones, which
+   may not override those. That set becomes the measured `allowed_envs`, so both
+   sides of a deployment get the same list by construction. The rest of the file
+   (`PLATFORM_BASE`, the shape, the node…) is for the script and never reaches the
+   CVM.
 
 **Changing the environment** of a running deployment is a release of the same build:
-change the variable or secret, run **Phala deploy** on the standby side with
+change the env file (merged to `main`) or the secret, run **Phala deploy** on the standby side with
 `release` set to the tag that is live now (not `latest`, which may be newer), then
 `switch`. Not an in-place update of the live CVM: that restarts it, and a changed key
 set changes its `compose_hash`, with no previous side to roll back to. Each new

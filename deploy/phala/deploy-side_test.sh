@@ -155,7 +155,11 @@ fresh() {
   record TXT "_dstack-app-address.${DOMAIN}.b.${DZ}" "${OLD_B}:443"
   echo "[{\"appId\": \"app_${OLD_A}\", \"cvmName\": \"gw-mainnet-a\", \"status\": \"running\"}]" >"$S/cvms.json"
   echo release-2026.10.28.1 >"$S/release"
+  EXTRA_ENV=()
 }
+
+# Extra assignments for the next run (CVM_ENV_* keys, overrides); fresh clears them.
+EXTRA_ENV=()
 
 OUT="" ERR="" RC=0
 run() { # args…
@@ -165,7 +169,7 @@ run() { # args…
     CVM_NAME_PREFIX=gw-mainnet PHALA_INSTANCE_TYPE=tdx.4xlarge PHALA_NODE_ID=7 \
     CLOUDFLARE_API_TOKEN=cf-secret ZG_PROM_ENV=mainnet ZG_PROM_REMOTE_WRITE_URL=https://prom.test/w \
     ZG_PROM_REMOTE_WRITE_USERNAME=gw ZG_PROM_REMOTE_WRITE_PASSWORD='p#ss word' \
-    CVM_EXTRA_ENV="${EXTRA:-}" POLL_INTERVAL=0 WAIT_PUBLISH=1 WAIT_READY=1 WAIT_IDENTITY=1 \
+    "${EXTRA_ENV[@]}" POLL_INTERVAL=0 WAIT_PUBLISH=1 WAIT_READY=1 WAIT_IDENTITY=1 \
     bash "$DEPLOY" "$@" 2>"$WORK/err")" || RC=$?
   ERR="$(cat "$WORK/err")"
 }
@@ -220,9 +224,14 @@ expect_err "refuses a compose with a floating gateway tag" "not pinned by digest
 fresh; run c --compose "$COMPOSE" --yes
 expect_err "refuses side c without a cold cluster" "set PLATFORM_BASE_COLD"
 
-fresh; EXTRA=$'ZG_GATEWAY_NETWORK=testnet\nDNS_SETUP_MODE=wait' run b --compose "$COMPOSE" --yes
-expect_err "CVM_EXTRA_ENV cannot override a fixed key" "DNS_SETUP_MODE is set by this script"
+fresh; EXTRA_ENV=(CVM_ENV_ZG_GATEWAY_NETWORK=testnet CVM_ENV_DNS_SETUP_MODE=wait)
+run b --compose "$COMPOSE" --yes
+expect_err "CVM_ENV_* cannot override a fixed key" "DNS_SETUP_MODE is set by this script"
 not_created "override"
+
+fresh; EXTRA_ENV=(PHALA_INSTANCE_TYPE=CHANGEME CVM_ENV_ZG_GATEWAY_ROUTER_URL=CHANGEME)
+run b --compose "$COMPOSE" --dry-run
+expect_err "refuses placeholders, naming each" "still CHANGEME in the config: PHALA_INSTANCE_TYPE CVM_ENV_ZG_GATEWAY_ROUTER_URL"
 
 fresh; run b --compose "$COMPOSE"
 expect_err "refuses to create non-interactively without --yes" "without --yes"
@@ -230,12 +239,13 @@ expect_err "refuses to create non-interactively without --yes" "without --yes"
 # ---------------------------------------------------------------------------
 # Create and wait
 # ---------------------------------------------------------------------------
-fresh; EXTRA=$'# per-deployment\nZG_GATEWAY_NETWORK=testnet' run b --compose "$COMPOSE" --release release-2026.10.28.1 --yes
+fresh; EXTRA_ENV=(CVM_ENV_ZG_GATEWAY_NETWORK=testnet CVM_ENV_GOMEMLIMIT=1GiB)
+run b --compose "$COMPOSE" --release release-2026.10.28.1 --yes
 expect_rc "creates side b and waits for it" 0
 check "prints app_id and url on stdout" \
   [ "$OUT" = $'app_id='"$NEW_APP"$'\nurl=https://'"$NEW_APP"'-443s.'"$BASE" ]
-check "the env file has exactly the fixed keys, then the extra ones" \
-  [ "$(cut -d= -f1 "$S/deploy.env" | tr '\n' ' ')" = "DOMAIN DELEGATION_ZONE DNS_SETUP_MODE CLOUDFLARE_API_TOKEN ZG_PROM_ENV ZG_PROM_REMOTE_WRITE_URL ZG_PROM_REMOTE_WRITE_USERNAME ZG_PROM_REMOTE_WRITE_PASSWORD ZG_GATEWAY_NETWORK " ]
+check "the env file has exactly the fixed keys, then the CVM_ENV_ ones by name" \
+  [ "$(cut -d= -f1 "$S/deploy.env" | tr '\n' ' ')" = "DOMAIN DELEGATION_ZONE DNS_SETUP_MODE CLOUDFLARE_API_TOKEN ZG_PROM_ENV ZG_PROM_REMOTE_WRITE_URL ZG_PROM_REMOTE_WRITE_USERNAME ZG_PROM_REMOTE_WRITE_PASSWORD GOMEMLIMIT ZG_GATEWAY_NETWORK " ]
 check "DELEGATION_ZONE is the side's sub-zone" grep -qx "DELEGATION_ZONE='b.${DZ}'" "$S/deploy.env"
 check "DNS_SETUP_MODE is print" grep -qx "DNS_SETUP_MODE='print'" "$S/deploy.env"
 check "a value with # and a space survives, quoted" grep -qx "ZG_PROM_REMOTE_WRITE_PASSWORD='p#ss word'" "$S/deploy.env"
@@ -265,6 +275,35 @@ expect_err "fails when the side matches a different release" "not release-2026.1
 fresh; : >"$S/release"
 run b --compose "$COMPOSE" --release release-2026.10.28.1 --yes
 expect_err "fails when matched_release never settles" "matched_release not reported"
+
+# ---------------------------------------------------------------------------
+# The checked-in config (env/*.env)
+# ---------------------------------------------------------------------------
+# Public files: a secret's key in one is a secret about to be committed. And every
+# key must be one the scripts read, so a typo does not silently fall back to a
+# default.
+SECRET_KEYS=" CF_API_TOKEN CLOUDFLARE_API_TOKEN ZG_PROM_REMOTE_WRITE_PASSWORD PHALA_CLOUD_API_KEY SMOKE_API_KEY "
+KNOWN_KEYS=" DOMAIN CF_ZONE DELEGATION_ZONE PLATFORM_BASE PLATFORM_BASE_COLD CVM_NAME_PREFIX PHALA_INSTANCE_TYPE PHALA_NODE_ID PHALA_NODE_ID_COLD PHALA_OS_IMAGE ZG_PROM_ENV ZG_PROM_REMOTE_WRITE_URL ZG_PROM_REMOTE_WRITE_USERNAME SMOKE_SEALED_MODEL SMOKE_PLAIN_MODEL "
+for f in "$HERE"/env/*.env; do
+  name="env/$(basename "$f")"
+  keys="$(sed -n 's/^[[:space:]]*\(export[[:space:]]\+\)\?\([A-Za-z_][A-Za-z0-9_]*\)=.*/\2/p' "$f")"
+  leaked="" unknown=""
+  for k in $keys; do
+    [[ "$SECRET_KEYS" == *" $k "* ]] && leaked+=" $k"
+    [[ "$KNOWN_KEYS" == *" $k "* || "$k" == CVM_ENV_?* ]] || unknown+=" $k"
+  done
+  check "${name} holds no secret${leaked:+ (has:$leaked)}" [ -z "$leaked" ]
+  check "${name} sets only keys the scripts read${unknown:+ (unknown:$unknown)}" [ -z "$unknown" ]
+  # Loaded the way the scripts load it, with nothing else in the environment.
+  RC=0
+  ERR="$(env -i PATH="$WORK/bin:$PATH" HOME="$WORK" bash "$DEPLOY" b --env-file "$f" \
+    --compose "$COMPOSE" --dry-run 2>&1 >/dev/null)" || RC=$?
+  if grep -qE "^[^#]*=CHANGEME$" "$f"; then
+    expect_err "${name} loads, and its placeholders are refused" "still CHANGEME"
+  else
+    expect_err "${name} loads, and only the secrets are missing" "set CLOUDFLARE_API_TOKEN"
+  fi
+done
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" = 0 ]

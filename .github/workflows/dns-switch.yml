@@ -176,14 +176,13 @@ jobs:
 
       - name: switch.sh
         env:
-          # Secret: only this step sees it. Config: environment variables, so the
-          # two deployments differ in their environments and nowhere else.
+          # Secret: only this step sees it. Config: the checked-in
+          # deploy/phala/env/<target>.env, reviewed like code. It is NOT mapped from
+          # Environment variables here: switch.sh lets the real environment win over
+          # the file, and a mapped-but-unset variable is set (to empty), which would
+          # silently shadow the file's value.
           CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
-          DOMAIN: ${{ vars.DOMAIN }}
-          CF_ZONE: ${{ vars.CF_ZONE }}
-          DELEGATION_ZONE: ${{ vars.DELEGATION_ZONE }}
-          PLATFORM_BASE: ${{ vars.PLATFORM_BASE }}
-          PLATFORM_BASE_COLD: ${{ vars.PLATFORM_BASE_COLD }}
+          TARGET: ${{ inputs.target }}
           COMMAND: ${{ inputs.command }}
           SIDE: ${{ inputs.side }}
           DRY_RUN: ${{ inputs.dry_run }}
@@ -192,16 +191,20 @@ jobs:
         run: |
           set -euo pipefail
           [ -n "$CF_API_TOKEN" ] || { echo "::error::CF_API_TOKEN is not set in this environment"; exit 1; }
-          [ -n "$DOMAIN" ] || { echo "::error::the DOMAIN variable is not set in this environment"; exit 1; }
+          env_file="deploy/phala/env/${TARGET}.env"
+          [ -f "$env_file" ] || { echo "::error::no ${env_file}"; exit 1; }
           # DOMAIN is required here although switch.sh defaults it to mainnet's: a
-          # staging environment missing it must fail, not operate on mainnet. The
-          # rest may be empty — switch.sh defaults an empty value like an unset one.
-          args=("$COMMAND")
+          # staging file missing it must fail, not operate on mainnet. And nothing
+          # switch.sh reads may still be a placeholder.
+          grep -qE '^DOMAIN=.+' "$env_file" || { echo "::error::${env_file} sets no DOMAIN"; exit 1; }
+          if grep -nE '^(DOMAIN|CF_ZONE|DELEGATION_ZONE|PLATFORM_BASE|PLATFORM_BASE_COLD)=CHANGEME$' "$env_file"; then
+            echo "::error::${env_file} still has placeholders (above)"; exit 1
+          fi
+          args=("$COMMAND" --env-file "$env_file")
           [ "$SIDE" = "-" ] || args+=("$SIDE")
           if [ "$DRY_RUN" = true ]; then args+=(--dry-run); else args+=(--yes); fi
           [ -z "$PROBE_URL" ] || args+=(--probe-url "$PROBE_URL")
           [ "$NO_VERIFY" = false ] || args+=(--no-verify)
-          # No env file: the runner's environment is the whole configuration.
           rc=0
           ./deploy/phala/switch.sh "${args[@]}" > switch.log 2>&1 || rc=$?
           cat switch.log
