@@ -182,7 +182,7 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           ZG_PROM_REMOTE_WRITE_PASSWORD: ${{ secrets.ZG_PROM_REMOTE_WRITE_PASSWORD }}
           # Optional: KEY=VALUE lines for the CVM that stay out of the repository
-          # (staging's router URL). Unset is empty, and empty adds nothing.
+          # (none today). Unset is empty, and empty adds nothing.
           CVM_SECRET_ENV: ${{ secrets.CVM_SECRET_ENV }}
           TARGET: ${{ inputs.target }}
           SIDE: ${{ inputs.side }}
