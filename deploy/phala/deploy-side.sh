@@ -9,9 +9,10 @@
 # the traffic switch flips between app_ids (blue-green.md, "Why blue/green here is a
 # DNS pointer flip"). An in-place upgrade keeps the app_id, so the switch record
 # still names it and the platform spreads traffic across old and new instances — a
-# silent half-cutover. `phala deploy` upgrades instead of creating whenever it is
-# given --cvm-id or finds a phala.toml with a cvm_id in the working directory, so
-# this script never passes the first and runs the CLI from an empty directory.
+# silent half-cutover. The CVM is created by provision.cjs, which has no update
+# path at all — it calls the Phala Cloud API's create endpoints, as `phala deploy`
+# does, because that CLI (1.1.22) cannot pin the node: the API wants the node as a
+# string HashID and the CLI sends a number. The CLI is still used to LIST CVMs.
 #
 # Before creating anything it refuses when:
 #   - the side is live (the traffic switch points at it);
@@ -89,11 +90,14 @@
 #   CVM_NAME_PREFIX      CVM name is <prefix>-<side> (required)
 #   PHALA_INSTANCE_TYPE  e.g. tdx.4xlarge            (required: the shape is fixed at
 #                        create time and GOMEMLIMIT depends on it — README, "CVM shape")
-#   PHALA_NODE_ID        node for sides a and b      (optional: auto-selected, then
-#   PHALA_NODE_ID_COLD   node for side c              check 2 catches a wrong cluster)
+#   PHALA_NODE_ID        node for sides a and b      (required: a node HashID such as
+#   PHALA_NODE_ID_COLD   node for side c              node_aOwADKBd — node_id_hashid in
+#                                                     `phala api /teepods/cvm-create-resources`)
 #   PHALA_OS_IMAGE       OS image                    (optional: auto-selected)
-#   PHALA_CLOUD_API_KEY  read by the CLI itself
+#   PHALA_CLOUD_API_KEY  read by the CLI and by provision.cjs
 #   PHALA                CLI command                 (default: phala)
+#   NODE_BIN             node command, for provision.cjs (default: node; it needs
+#                        `npm ci` run in this directory first)
 #   CLOUDFLARE_API_TOKEN, ZG_PROM_*, CVM_ENV_*, CVM_SECRET_ENV   the CVM's environment, above
 #   CVM_REQUIRED_KEYS    keys the CVM must get with a non-empty value, space-
 #                        separated (optional): for one that comes from a secret, so
@@ -419,10 +423,17 @@ COMPOSE="$(cd -- "$(dirname -- "$COMPOSE")" && pwd)/$(basename -- "$COMPOSE")"
 BASE="$(side_base "$SIDE")"
 [ -n "$BASE" ] || die "side ${SIDE} has no cluster: set $([ "$SIDE" = c ] && echo PLATFORM_BASE_COLD || echo PLATFORM_BASE)"
 NODE="$(side_node "$SIDE")"
+# Pinned, always: a side the platform places elsewhere is caught only after it
+# boots and has spent a certificate. And a HashID, not the number `phala nodes ls`
+# shows — the API refuses that.
+[ -n "$NODE" ] || die "side ${SIDE} has no node: set $([ "$SIDE" = c ] && echo PHALA_NODE_ID_COLD || echo PHALA_NODE_ID) to the node's HashID (node_id_hashid in \`phala api /teepods/cvm-create-resources\`)"
+[[ "$NODE" =~ ^(node|teepod)_[A-Za-z0-9]+$ ]] \
+  || die "the node for side ${SIDE} is ${NODE}, not a HashID such as node_aOwADKBd (node_id_hashid in \`phala api /teepods/cvm-create-resources\`; the number \`phala nodes ls\` shows is refused by the API)"
 NAME="${CVM_NAME_PREFIX}-${SIDE}"
 [[ "$NAME" =~ ^[A-Za-z][A-Za-z0-9-]{4,62}$ ]] || die "CVM name '${NAME}' is not 5-63 letters, digits or hyphens starting with a letter"
 
-need "$PHALA"; need dig; need curl; need jq; need openssl
+NODE_BIN="${NODE_BIN:-node}"
+need "$PHALA"; need "$NODE_BIN"; need dig; need curl; need jq; need openssl
 
 # --- preflight ---------------------------------------------------------------
 # The release workflow pins both gateway image lines by digest; a compose that does
@@ -468,34 +479,29 @@ for k in ${CVM_REQUIRED_KEYS:-}; do
     || die "${k} is required for this deployment (CVM_REQUIRED_KEYS) but nothing sets it to a value — is its secret configured?"
 done
 
-args=(deploy --json -n "$NAME" -c "$COMPOSE" -e "$TMP/cvm.env" -t "$PHALA_INSTANCE_TYPE")
-[ -n "$NODE" ] && args+=(--node-id "$NODE")
+args=("${SCRIPT_DIR}/provision.cjs" --name "$NAME" --compose "$COMPOSE" --env-file "$TMP/cvm.env"
+  --instance-type "$PHALA_INSTANCE_TYPE" --node "$NODE")
 [ -n "${PHALA_OS_IMAGE:-}" ] && args+=(--image "$PHALA_OS_IMAGE")
 
 info "compose     : ${COMPOSE} (sha256 ${COMPOSE_SHA})${RELEASE:+, release ${RELEASE}}"
-info "instance    : ${PHALA_INSTANCE_TYPE}, node ${NODE:-auto}, image ${PHALA_OS_IMAGE:-auto}"
-[ -n "$NODE" ] || warn "no node pinned: the platform picks one, and a side outside ${BASE} is caught only after it boots"
+info "instance    : ${PHALA_INSTANCE_TYPE}, node ${NODE}, image ${PHALA_OS_IMAGE:-auto}"
 
 if [ "$DRY_RUN" = 1 ]; then
-  info "dry run: would run ${PHALA} ${args[*]}"
+  info "dry run: would run ${NODE_BIN} ${args[*]}"
   exit 0
 fi
 confirm "Create CVM ${NAME} as side ${SIDE}?" || die "aborted"
 
 # --- create --------------------------------------------------------------------
-# From an empty directory, so no phala.toml there can turn this into an upgrade.
-# With --json the CLI writes its error to stdout too, as a JSON object, so on
-# failure that output IS the reason: print it. It holds no env value (the env is
-# encrypted before it leaves this machine).
+# provision.cjs reports the API's refusal on stderr, which reaches the log as is;
+# stdout carries only the result, {"success":true,"app_id":…}.
 rc=0
-out="$(cd "$TMP" && mkdir -p cwd && cd cwd && "$PHALA" "${args[@]}")" || rc=$?
-[ "$rc" = 0 ] || die "phala deploy failed (exit ${rc}):
-${out:-<no output>}
+out="$("$NODE_BIN" "${args[@]}")" || rc=$?
+[ "$rc" = 0 ] || die "provision.cjs failed (exit ${rc}), its reason above.
 Check \`phala cvms ls\` before retrying: if a CVM named ${NAME} was created, delete it first."
-# Progress lines come before the JSON object on stdout; take the object.
-APP_ID="$(sed -n '/^{/,$p' <<<"$out" | jq -r '.app_id // empty' 2>/dev/null || true)"
+APP_ID="$(jq -r '.app_id // empty' <<<"$out" 2>/dev/null || true)"
 APP_ID="$(norm_app_id "$APP_ID")"
-[[ "$APP_ID" =~ ^[0-9a-f]{40}$ ]] || die "could not read an app_id from phala deploy's output:
+[[ "$APP_ID" =~ ^[0-9a-f]{40}$ ]] || die "could not read an app_id from provision.cjs's output:
 ${out}"
 [ "$APP_ID" != "$old_app" ] || die "the new CVM has the old app_id ${APP_ID}: that is an upgrade, not a new side"
 HOST="${APP_ID}-443s.${BASE}"

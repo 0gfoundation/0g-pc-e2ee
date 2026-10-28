@@ -14,3 +14,6 @@
 # deploy/phala/secrets.env (or switch.env / deploy.env), which stay ignored.
 !/deploy/phala/env/staging.env
 !/deploy/phala/env/mainnet.env
+
+# provision.cjs's dependency, installed by `npm ci` in deploy/phala.
+/deploy/phala/node_modules/

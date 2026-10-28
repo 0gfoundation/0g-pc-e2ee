@@ -54,3 +54,6 @@ jobs:
 
       - name: deploy-side.sh tests
         run: deploy/phala/deploy-side_test.sh
+
+      - name: provision.cjs parses
+        run: node --check deploy/phala/provision.cjs

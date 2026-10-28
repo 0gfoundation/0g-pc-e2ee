@@ -8,15 +8,14 @@
 #
 #   dns/<TYPE>/<name>  the answer the nameserver gives for that record
 #   cvms.json          the account's CVMs, as `phala cvms list --json` items
-#   deploy.args        written by the fake `phala deploy`: one argument per line
+#   deploy.args        written by the fake `node provision.cjs`: one argument per line
 #   deploy.env         written by it too: the env file it was handed
-#   deploy.cwd         and the files in the directory it ran in
 #   cluster            the cluster a created CVM lands in (in1.phala.network if absent)
 #   readyz             the status /readyz answers (200 if absent)
 #   release            the tag /v1/gateway/identity reports as matched_release
 #   cert_bad           if present, the side serves no valid certificate
 #
-# `phala deploy` stands in for the new CVM's ingress too: it publishes the side's
+# `node provision.cjs` stands in for the new CVM's ingress too: it publishes the side's
 # app-address TXT and serving CNAME at once, as a booted ingress would.
 #
 # Run: ./deploy/phala/deploy-side_test.sh   (needs bash, jq)
@@ -64,34 +63,37 @@ case "$1 ${2:-}" in
     while [ $# -gt 0 ]; do [ "$1" = --search ] && search="$2"; shift; done
     jq --arg q "$search" '{success: true, items: [.[] | select((.cvmName | contains($q)) or (.appId | contains($q)))]}' "$S/cvms.json"
     ;;
-  "deploy --json")
-    if [ -f "$S/deploy_fails" ]; then
-      echo "Provisioning CVM..."
-      printf '{\n  "success": false,\n  "error": "%s"\n}\n' "$(cat "$S/deploy_fails")"
-      exit 1
-    fi
-    printf '%s\n' "$@" >"$S/deploy.args"
-    env=""; name=""
-    while [ $# -gt 0 ]; do
-      case "$1" in -e) env="$2" ;; -n) name="$2" ;; esac; shift
-    done
-    cp "$env" "$S/deploy.env"
-    ls -A >"$S/deploy.cwd"
-    app="${FAKE_NEW_APP}"
-    jq --arg n "$name" --arg a "app_${app}" '. + [{appId: $a, cvmName: $n, status: "running"}]' \
-      "$S/cvms.json" >"$S/cvms.tmp" && mv "$S/cvms.tmp" "$S/cvms.json"
-    # The ingress, booting: it writes into the delegation zone it was given.
-    dz="$(sed -n "s/^DELEGATION_ZONE='\(.*\)'$/\1/p" "$env")"
-    dom="$(sed -n "s/^DOMAIN='\(.*\)'$/\1/p" "$env")"
-    mkdir -p "$S/dns/TXT" "$S/dns/CNAME"
-    echo "${app}:443" >"$S/dns/TXT/_dstack-app-address.${dom}.${dz}"
-    echo "_.$(cat "$S/cluster" 2>/dev/null || echo in1.phala.network)" >"$S/dns/CNAME/${dom}.${dz}"
-    echo "Provisioning CVM ${name}..."
-    printf '{\n  "success": true,\n  "vm_uuid": "u-1",\n  "name": "%s",\n  "app_id": "app_%s"\n}\n' "$name" "$app"
-    ;;
   *) echo "fake phala: unexpected: $*" >&2; exit 2 ;;
 esac
 FAKE_PHALA
+
+cat >"$WORK/bin/node" <<'FAKE_NODE'
+#!/usr/bin/env bash
+# Stands in for `node provision.cjs …`, which creates the CVM.
+set -euo pipefail
+S="$FAKE_DIR"
+case "${1:-}" in */provision.cjs) shift ;; *) echo "fake node: unexpected: $*" >&2; exit 2 ;; esac
+if [ -f "$S/deploy_fails" ]; then
+  printf 'provision: provision refused:\n%s\n' "$(cat "$S/deploy_fails")" >&2
+  exit 1
+fi
+printf '%s\n' "$@" >"$S/deploy.args"
+env=""; name=""
+while [ $# -gt 0 ]; do
+  case "$1" in --env-file) env="$2" ;; --name) name="$2" ;; esac; shift
+done
+cp "$env" "$S/deploy.env"
+app="${FAKE_NEW_APP}"
+jq --arg n "$name" --arg a "app_${app}" '. + [{appId: $a, cvmName: $n, status: "running"}]' \
+  "$S/cvms.json" >"$S/cvms.tmp" && mv "$S/cvms.tmp" "$S/cvms.json"
+# The ingress, booting: it writes into the delegation zone it was given.
+dz="$(sed -n "s/^DELEGATION_ZONE='\(.*\)'$/\1/p" "$env")"
+dom="$(sed -n "s/^DOMAIN='\(.*\)'$/\1/p" "$env")"
+mkdir -p "$S/dns/TXT" "$S/dns/CNAME"
+echo "${app}:443" >"$S/dns/TXT/_dstack-app-address.${dom}.${dz}"
+echo "_.$(cat "$S/cluster" 2>/dev/null || echo in1.phala.network)" >"$S/dns/CNAME/${dom}.${dz}"
+printf '{\n  "success": true,\n  "vm_uuid": "u-1",\n  "name": "%s",\n  "app_id": "%s"\n}\n' "$name" "$app"
+FAKE_NODE
 
 cat >"$WORK/bin/curl" <<'FAKE_CURL'
 #!/usr/bin/env bash
@@ -171,7 +173,7 @@ run() { # args…
   RC=0
   OUT="$(env -i PATH="$WORK/bin:$PATH" HOME="$WORK" SECRETS_ENV=/nonexistent FAKE_DIR="$S" FAKE_NEW_APP="$NEW_APP" \
     DOMAIN="$DOMAIN" DELEGATION_ZONE="$DZ" PLATFORM_BASE="_.${BASE}" \
-    CVM_NAME_PREFIX=gw-mainnet PHALA_INSTANCE_TYPE=tdx.4xlarge PHALA_NODE_ID=7 \
+    CVM_NAME_PREFIX=gw-mainnet PHALA_INSTANCE_TYPE=tdx.4xlarge PHALA_NODE_ID=node_test7 \
     CLOUDFLARE_API_TOKEN=cf-secret ZG_PROM_ENV=mainnet ZG_PROM_REMOTE_WRITE_URL=https://prom.test/w \
     ZG_PROM_REMOTE_WRITE_USERNAME=gw ZG_PROM_REMOTE_WRITE_PASSWORD='p#ss word' \
     "${EXTRA_ENV[@]}" POLL_INTERVAL=0 WAIT_PUBLISH=1 WAIT_READY=1 WAIT_IDENTITY=1 \
@@ -194,7 +196,7 @@ not_created() { check "$1: nothing created" [ ! -f "$S/deploy.args" ]; }
 fresh; run b --compose "$COMPOSE" --release release-2026.10.28.1 --dry-run
 expect_rc "dry run on the standby passes" 0
 not_created "dry run"
-check "dry run shows the pinned node" err_has "--node-id 7"
+check "dry run shows the pinned node" err_has "--node node_test7"
 check_not "dry run prints no secret value" grep -q 'cf-secret\|p#ss' <<<"$ERR$OUT"
 
 fresh; run a --compose "$COMPOSE" --yes
@@ -281,15 +283,22 @@ check_not "…and is never printed" grep -q hidden.test <<<"$ERR$OUT"
 check "DNS_SETUP_MODE is print" grep -qx "DNS_SETUP_MODE='print'" "$S/deploy.env"
 check "a value with # and a space survives, quoted" grep -qx "ZG_PROM_REMOTE_WRITE_PASSWORD='p#ss word'" "$S/deploy.env"
 check_not "ACME_STAGING is not passed" grep -q ACME_STAGING "$S/deploy.env"
-check_not "never passes --cvm-id" grep -qx -- --cvm-id "$S/deploy.args"
-check "runs the CLI from an empty directory" [ ! -s "$S/deploy.cwd" ]
+check "pins the node by its HashID" grep -qx node_test7 "$S/deploy.args"
 check "names the CVM <prefix>-<side>" grep -qx gw-mainnet-b "$S/deploy.args"
 check "with the configured shape" grep -qx tdx.4xlarge "$S/deploy.args"
 
-fresh; echo "Instance type tdx.small is not available on node 26" >"$S/deploy_fails"
+fresh; echo '{"status": 422, "detail": "Instance type tdx.small is not available on node 26"}' >"$S/deploy_fails"
 run b --compose "$COMPOSE" --yes
-expect_err "a failed phala deploy prints the CLI's own error" "not available on node 26"
-check "…with the exit status" err_has "phala deploy failed (exit 1)"
+expect_err "a refused provision shows the API's reason" "not available on node 26"
+check "…and the exit status" err_has "provision.cjs failed (exit 1)"
+not_created "refused provision"
+
+fresh; EXTRA_ENV=(PHALA_NODE_ID=26)
+run b --compose "$COMPOSE" --dry-run
+expect_err "refuses a numeric node id, which the API rejects" "not a HashID"
+fresh; EXTRA_ENV=(PHALA_NODE_ID=)
+run b --compose "$COMPOSE" --dry-run
+expect_err "refuses an unpinned node" "side b has no node"
 
 fresh; echo in2.phala.network >"$S/cluster"
 run b --compose "$COMPOSE" --yes
