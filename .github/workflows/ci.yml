@@ -47,7 +47,10 @@ jobs:
 
       # shellcheck and jq ship on the ubuntu-latest image.
       - name: shellcheck
-        run: shellcheck deploy/phala/switch.sh deploy/phala/switch_test.sh scripts/smoke-gateway.sh
+        run: shellcheck deploy/phala/switch.sh deploy/phala/switch_test.sh deploy/phala/deploy-side.sh deploy/phala/deploy-side_test.sh scripts/smoke-gateway.sh
 
       - name: switch.sh tests
         run: deploy/phala/switch_test.sh
+
+      - name: deploy-side.sh tests
+        run: deploy/phala/deploy-side_test.sh

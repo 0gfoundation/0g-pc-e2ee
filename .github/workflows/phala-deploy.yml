@@ -1,0 +1,245 @@
+name: Phala deploy
+
+# Creates one blue/green side of the gateway as a NEW Phala Cloud app from a
+# published release, and waits until it can serve: deploy/phala/deploy-side.sh, run
+# from a runner. It moves no traffic — cutting over stays a separate run of the
+# "DNS switch" workflow (`switch <side>`). blue-green.md, "Deploying a side from
+# GitHub Actions", has the setup.
+#
+#   plan    admins only; resolves the release (default: the newest release-*).
+#   acme    calls dns-switch.yml with `acme <side>`, so the new side's ingress can
+#           answer its ACME challenge on first boot. Waits for approval under
+#           dns-<target>, which holds the Cloudflare token for the switch records.
+#   deploy  deploy-side.sh under deploy-<target>: preflight, create, wait; then
+#           the smoke test, when the environment has an API key for it.
+#
+# Delete the side's previous CVM first, by hand (phala cvms delete): the script
+# refuses to create a side that still has one, so it never upgrades in place.
+# `acme` runs before that refusal can be seen — on a run that is then refused, the
+# issuance switch is left on the side you named; `switch` moves it with traffic,
+# and until then the live side cannot renew (weeks of margin, but do not forget).
+#
+# THE SECRETS HERE ARE THE DEPLOYMENT, as in dns-switch.yml: the Phala API key can
+# create and delete the CVMs, and the CVM's Cloudflare token can point the served
+# name anywhere. They live ONLY in Environment secrets — deploy-staging and
+# deploy-mainnet, each admitting only main and with required reviewers — and only
+# the deploy job names that environment. A fork's pull request never runs this
+# workflow (dispatch-only).
+#
+# Logs are public in a public repository. deploy-side.sh prints names, app ids,
+# DNS records and the env KEYS it passes, never their values; the values go to a
+# 0600 temp file and are encrypted to the CVM by the CLI. Actions masks secrets
+# regardless.
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Deployment"
+        required: true
+        type: choice
+        options: [staging, mainnet]
+      side:
+        description: "Side to create (must not be live, and its old CVM must be deleted)"
+        required: true
+        type: choice
+        options: [a, b, c]
+      release:
+        description: "Release tag (release-YYYY.MM.DD.N), or latest"
+        required: false
+        type: string
+        default: latest
+      dry_run:
+        description: "Preflight only: point nothing, create nothing"
+        required: false
+        type: boolean
+        default: true
+      smoke:
+        description: "Run scripts/smoke-gateway.sh against the new side (needs SMOKE_API_KEY)"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+# One deploy per deployment at a time. Its own group, not dns-switch's: the acme
+# job runs dns-switch.yml, whose group would otherwise wait on this run forever.
+concurrency:
+  group: phala-deploy-${{ inputs.target }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # releases, and the implicit metadata read the permission lookup needs
+    outputs:
+      tag: ${{ steps.plan.outputs.tag }}
+    steps:
+      - id: plan
+        env:
+          TARGET: ${{ inputs.target }}
+          SIDE: ${{ inputs.side }}
+          RELEASE: ${{ inputs.release }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          ACTOR: ${{ github.actor }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          permission="$(gh api "repos/${REPO}/collaborators/${ACTOR}/permission" --jq .permission)" \
+            || fail "could not read ${ACTOR}'s permission on ${REPO}; refusing"
+          [ "$permission" = admin ] \
+            || fail "${ACTOR} has '${permission}' on ${REPO}; only an admin may deploy"
+
+          # Only tags release.yml makes. "latest" is the newest of those by creation
+          # time, not GitHub's "Latest" badge, which another kind of release could take.
+          tag_re='^release-[0-9]{4}\.[0-9]{2}\.[0-9]{2}\.[0-9]+$'
+          releases="$(gh release list --repo "$REPO" --limit 200 --exclude-drafts \
+            --json tagName,createdAt,isPrerelease)"
+          if [ "$RELEASE" = latest ]; then
+            tag="$(jq -r --arg re "$tag_re" '[.[] | select((.tagName | test($re)) and (.isPrerelease | not))]
+              | sort_by(.createdAt) | last | .tagName // empty' <<<"$releases")"
+            [ -n "$tag" ] || fail "no release-* release found"
+          else
+            [[ "$RELEASE" =~ $tag_re ]] || fail "release must be latest or release-YYYY.MM.DD.N"
+            tag="$RELEASE"
+          fi
+          # Pinned here, so what is approved is what is deployed even if a newer
+          # release is published while the run waits.
+          assets="$(gh release view "$tag" --repo "$REPO" --json assets,targetCommitish \
+            --jq '[.targetCommitish, (.assets[].name)] | @tsv')" || fail "no release ${tag}"
+          grep -qw docker-compose.release.yml <<<"$assets" \
+            || fail "release ${tag} has no docker-compose.release.yml"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Phala deploy: side \`$SIDE\` on $TARGET"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| release | [\`$tag\`](https://github.com/${REPO}/releases/tag/${tag}) (asked: \`$RELEASE\`) |"
+            echo "| commit | \`$(cut -f1 <<<"$assets")\` |"
+            echo "| dry run | $DRY_RUN |"
+            echo "| environments | \`dns-${TARGET}\` (acme), \`deploy-${TARGET}\` (create) |"
+            echo "| triggered by | @$ACTOR |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The issuance switch, aimed at the side before it exists: its ingress issues
+  # the certificate on first boot (blue-green.md, fast path step 1).
+  acme:
+    needs: plan
+    permissions:
+      contents: read
+    uses: ./.github/workflows/dns-switch.yml
+    with:
+      target: ${{ inputs.target }}
+      command: acme
+      side: ${{ inputs.side }}
+      dry_run: ${{ inputs.dry_run }}
+
+  deploy:
+    needs: [plan, acme]
+    runs-on: ubuntu-latest
+    # Boot and image pull, first certificate, a cold warmer sweep, then the smoke
+    # test: deploy-side.sh's own waits add up to ~55 minutes at most.
+    timeout-minutes: 90
+    environment: deploy-${{ inputs.target }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Fetch the release compose
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --repo "$REPO" --pattern docker-compose.release.yml \
+            --dir "$RUNNER_TEMP/release"
+          sha256sum "$RUNNER_TEMP/release/docker-compose.release.yml"
+
+      # Pinned: it handles the secrets and decides create-versus-upgrade.
+      - name: Install the Phala CLI
+        run: npm install --global --ignore-scripts phala@1.1.22
+
+      - name: deploy-side.sh
+        id: deploy
+        env:
+          # Secrets: the Phala API key, and the CVM's own environment.
+          PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          ZG_PROM_REMOTE_WRITE_PASSWORD: ${{ secrets.ZG_PROM_REMOTE_WRITE_PASSWORD }}
+          # Config: environment variables, so the deployments differ there only.
+          DOMAIN: ${{ vars.DOMAIN }}
+          DELEGATION_ZONE: ${{ vars.DELEGATION_ZONE }}
+          PLATFORM_BASE: ${{ vars.PLATFORM_BASE }}
+          PLATFORM_BASE_COLD: ${{ vars.PLATFORM_BASE_COLD }}
+          CVM_NAME_PREFIX: ${{ vars.CVM_NAME_PREFIX }}
+          PHALA_INSTANCE_TYPE: ${{ vars.PHALA_INSTANCE_TYPE }}
+          PHALA_NODE_ID: ${{ vars.PHALA_NODE_ID }}
+          PHALA_NODE_ID_COLD: ${{ vars.PHALA_NODE_ID_COLD }}
+          PHALA_OS_IMAGE: ${{ vars.PHALA_OS_IMAGE }}
+          ZG_PROM_ENV: ${{ vars.ZG_PROM_ENV }}
+          ZG_PROM_REMOTE_WRITE_URL: ${{ vars.ZG_PROM_REMOTE_WRITE_URL }}
+          ZG_PROM_REMOTE_WRITE_USERNAME: ${{ vars.ZG_PROM_REMOTE_WRITE_USERNAME }}
+          CVM_EXTRA_ENV: ${{ vars.CVM_EXTRA_ENV }}
+          SIDE: ${{ inputs.side }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          # DOMAIN has no default in the script either; checked here so a missing
+          # variable is named before anything else runs.
+          [ -n "$DOMAIN" ] || { echo "::error::the DOMAIN variable is not set in this environment"; exit 1; }
+          args=("$SIDE" --compose "$RUNNER_TEMP/release/docker-compose.release.yml" --release "$TAG")
+          if [ "$DRY_RUN" = true ]; then args+=(--dry-run); else args+=(--yes); fi
+          # The log streams to the job log and is kept for the summary; stdout (the
+          # app_id and url lines) goes to fd 3 and on to the step outputs.
+          rc=0
+          { ./deploy/phala/deploy-side.sh "${args[@]}" 2>&1 >&3 | tee deploy.log >&2; } 3> result.txt || rc=$?
+          cat result.txt >> "$GITHUB_OUTPUT"
+          {
+            echo '```'
+            cat deploy.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
+      # Through the side's own -443s host, before any traffic points at it: that
+      # host serves the served domain's certificate, so --insecure, and the key
+      # crosses a connection nothing authenticated. Use a key with a small credit
+      # limit for it.
+      - name: Smoke test
+        if: ${{ !inputs.dry_run && inputs.smoke }}
+        env:
+          ZG_API_KEY: ${{ secrets.SMOKE_API_KEY }}
+          URL: ${{ steps.deploy.outputs.url }}
+          SEALED: ${{ vars.SMOKE_SEALED_MODEL }}
+          PLAIN: ${{ vars.SMOKE_PLAIN_MODEL }}
+        run: |
+          set -euo pipefail
+          if [ -z "$ZG_API_KEY" ]; then
+            echo "::notice::SMOKE_API_KEY is not set in this environment; skipping the smoke test"
+            exit 0
+          fi
+          args=(--insecure --gateway "$URL")
+          [ -z "$SEALED" ] || args+=(--sealed-model "$SEALED")
+          [ -z "$PLAIN" ] || args+=(--plain-model "$PLAIN")
+          ./scripts/smoke-gateway.sh "${args[@]}"
+
+      - name: Next step
+        if: ${{ !inputs.dry_run }}
+        env:
+          SIDE: ${{ inputs.side }}
+          TARGET: ${{ inputs.target }}
+        run: |
+          {
+            echo
+            echo "Side \`$SIDE\` is ready. Cut over with **DNS switch** → \`$TARGET\`, \`switch\`, side \`$SIDE\`."
+          } >> "$GITHUB_STEP_SUMMARY"

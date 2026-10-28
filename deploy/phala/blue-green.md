@@ -83,10 +83,12 @@ and releasing = repointing `_dstack-app-address.<DOMAIN>` from one to the other.
 > operational reasons rather than identity ones: a key you never enter is a key
 > the container can never receive, and a list that drifts makes the two sides'
 > measured config differ for no reason anyone can explain later. Enter
-> `DNS_SETUP_MODE` and `ACME_STAGING` on **both** sides always — `ACME_STAGING`
-> even when it is `false` — and toggle by *value*. Today's staging pair shows what
-> skipping that costs: side b's list has no `ACME_STAGING`, so side b cannot be
-> put on the staging CA at all without a config change and redeploy.
+> `DNS_SETUP_MODE` on **both** sides always (it must be `print`, see below).
+> `ACME_STAGING` is needed only if you ever want to flip a running side to the
+> staging CA *in place*; since every change here is a new side anyway, it can be
+> left out and added on the deploy that needs it. [`deploy-side.sh`](./deploy-side.sh)
+> (and the workflow that runs it) fixes the key set in code, so the two sides'
+> lists cannot drift.
 
 > **No percentage canary.** If you need gradual rollout, it has to be a *replica*
 > story (same `app_id`, more instances) or a second layer you build yourself.
@@ -100,12 +102,18 @@ below.
 
 ```sh
 ./switch.sh acme b           # 1. aim the issuance switch at side b FIRST
-phala cvm create ...         # 2. deploy side b — a NEW app (=> its own app_id),
+./deploy-side.sh b ...       # 2. deploy side b — a NEW app (=> its own app_id),
                              #    DELEGATION_ZONE=b.integratenetwork.work, DNS_SETUP_MODE=print
 ./switch.sh switch b         # 3. probe b's /readyz directly, flip traffic, confirm b is
                              #    really serving (cert changed) + /healthz; auto-rollback otherwise
 phala cvm delete <side a>    # 4. once b is confirmed live, retire a to free resources
 ```
+
+From GitHub instead: **Phala deploy** does steps 1–2 and **DNS switch** step 3
+([Deploying a side from GitHub Actions](#deploying-a-side-from-github-actions)).
+Step 4 may wait until the next release — keeping a around makes `rollback`
+instant — but `deploy-side.sh` refuses to create a side whose previous CVM still
+exists, so it has to be gone before that side is deployed again.
 
 Step 3 checks side b's **readiness** (on `PLATFORM_BASE`, which `switch` requires)
 before the flip — can it actually serve, not just is it listening — so a b that
@@ -363,12 +371,12 @@ from memory.
    | `DNS_SETUP_MODE` | `print` | `print` |
    | `DOMAIN` | `router-api.0g.ai` | `router-api.0g.ai` |
 
-   Enter the **same set of keys** on both sides, `DNS_SETUP_MODE` and
-   `ACME_STAGING` always among them (`ACME_STAGING` even when it is `false`) —
-   Phala Cloud builds `allowed_envs` from the keys you actually enter, dstack drops
-   any encrypted var not listed, and a key you skipped is one the container can
-   never receive until you redeploy. Toggle both by **value**, never by
-   adding/removing the key. `GATEWAY_DOMAIN` is **not** among them any more: the
+   Enter the **same set of keys** on both sides, `DNS_SETUP_MODE` always among
+   them — Phala Cloud builds `allowed_envs` from the keys you actually enter,
+   dstack drops any encrypted var not listed, and a key you skipped is one the
+   container can never receive until you redeploy. (`ACME_STAGING` is optional:
+   it defaults to `false`, and a side that needs the staging CA is a new deploy
+   with the key added.) [`deploy-side.sh`](./deploy-side.sh) passes exactly this set. `GATEWAY_DOMAIN` is **not** among them any more: the
    compose derives it from the platform's `DSTACK_GATEWAY_DOMAIN`, so setting it as
    a secret does nothing. Everything else (`CLOUDFLARE_API_TOKEN`, gateway env)
    stays as in the shared compose. Each side,
@@ -517,6 +525,81 @@ repository admin:
 Logs are public in a public repository. The script prints record names, targets
 and app ids — all already served by public DNS, and certificate issuance is in
 public CT logs anyway — and never the token, which Actions masks regardless.
+
+## Deploying a side from GitHub Actions
+
+[`.github/workflows/phala-deploy.yml`](../../.github/workflows/phala-deploy.yml)
+runs [`deploy-side.sh`](./deploy-side.sh) from a runner: Actions → **Phala deploy**
+→ *Run workflow*, with the deployment, the side, the release (`latest` = the newest
+`release-*`; pinned when the run starts) and `dry_run` (on by default: preflight
+only). It moves no traffic. A release is then:
+
+1. delete the side's previous CVM (`phala cvms delete`, or the dashboard) — by hand,
+   on purpose;
+2. **Phala deploy** on that side. It calls **DNS switch** for `acme <side>` (approve
+   under `dns-<target>`), then creates the side under `deploy-<target>` (approve
+   again) and waits until it is ready;
+3. **DNS switch** → `switch <side>`.
+
+What `deploy-side.sh` refuses, and what it waits for, is in its header. In short:
+it will not touch a live side, a side whose old CVM still exists (by name or by
+the app_id the side still publishes — `switch.sh status` cannot tell a deleted CVM
+from a crashed one), a side the issuance switch does not point at, or a compose
+whose gateway image is not pinned by digest; and it never passes `--cvm-id` and
+runs the CLI from an empty directory, so `phala deploy` can only *create*. After
+creating, it waits for the side's own records with the new app_id, fails at once if
+the side published a cluster other than its configured one (the silent failure in
+[Where `GATEWAY_DOMAIN` does and does not matter](#where-gateway_domain-does-and-does-not-matter),
+now checked instead of eyeballed), then requires a certificate for the domain and
+`/readyz` 200 on `<app_id>-443s.<base>`, and `/v1/gateway/identity` naming the new
+app_id and the release. A side that fails is left running for inspection.
+
+**Setup**, once, by a repository admin — on top of the `dns-*` environments above:
+
+1. **Two environments**, `deploy-staging` and `deploy-mainnet`, protected like the
+   `dns-*` ones (*main* only, required reviewers, admins may not bypass). The Phala
+   API key creates and deletes the CVMs and the CVM's Cloudflare token can point the
+   served name anywhere, so these two never go in repository secrets.
+
+   | Secret | |
+   |---|---|
+   | `PHALA_CLOUD_API_KEY` | Phala Cloud API key for the workspace holding the CVMs |
+   | `CLOUDFLARE_API_TOKEN` | the CVM's token, scoped to the delegation zone ([README](./README.md#serving-domain)) |
+   | `ZG_PROM_REMOTE_WRITE_PASSWORD` | remote_write password |
+   | `SMOKE_API_KEY` | optional: an `sk-` key for `scripts/smoke-gateway.sh`. It crosses a connection with `--insecure` (the side's `-443s` host serves the domain's cert), so give it a small credit limit |
+
+   | Variable | |
+   |---|---|
+   | `DOMAIN` | served hostname (required; no default) |
+   | `DELEGATION_ZONE` | base delegation zone; the side's is `<side>.<this>` |
+   | `PLATFORM_BASE`, `PLATFORM_BASE_COLD` | the clusters, as for `switch.sh` |
+   | `CVM_NAME_PREFIX` | CVMs are named `<prefix>-<side>`, e.g. `pc-gateway-mainnet-b` |
+   | `PHALA_INSTANCE_TYPE` | the shape ([README](./README.md#cvm-shape--and-the-one-setting-that-depends-on-it)) |
+   | `PHALA_NODE_ID`, `PHALA_NODE_ID_COLD` | optional: pin the node, so a side lands in its cluster rather than being caught after it boots elsewhere |
+   | `PHALA_OS_IMAGE` | optional: pin the OS image |
+   | `ZG_PROM_ENV`, `ZG_PROM_REMOTE_WRITE_URL`, `ZG_PROM_REMOTE_WRITE_USERNAME` | metrics ([README](./README.md#metrics-prometheus)) |
+   | `CVM_EXTRA_ENV` | optional: further `KEY=VALUE` lines for the CVM, e.g. `ZG_GATEWAY_ROUTER_URL=…` on staging |
+   | `SMOKE_SEALED_MODEL`, `SMOKE_PLAIN_MODEL` | optional: the smoke test's models |
+
+   A value shared by both deployments — the Prometheus URL, username and password —
+   may instead be set once at repository level; an environment value of the same
+   name overrides it. Weigh that for the password: repository secrets reach any
+   workflow run on any branch, without the environment's reviewers. (Fine for a
+   write-only metrics credential; never for the two above.)
+
+2. **The CVM's environment is the variables above, and only them.** The script
+   passes a fixed key set — `DOMAIN`, `DELEGATION_ZONE`, `DNS_SETUP_MODE=print`,
+   `CLOUDFLARE_API_TOKEN`, the four `ZG_PROM_*` — plus `CVM_EXTRA_ENV`, which may add
+   keys but not override those. That set becomes the measured `allowed_envs`, so
+   both sides of a deployment get the same list by construction.
+
+**Changing the environment** of a running deployment is a release of the same build:
+change the variable or secret, run **Phala deploy** on the standby side with
+`release` set to the tag that is live now (not `latest`, which may be newer), then
+`switch`. Not an in-place update of the live CVM: that restarts it, and a changed key
+set changes its `compose_hash`, with no previous side to roll back to. Each new
+side issues a certificate, against the 5-per-week limit for the hostname, so
+batch environment changes with releases where you can.
 
 ## Cross-cluster fallback
 
