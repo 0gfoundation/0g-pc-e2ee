@@ -172,9 +172,16 @@ jobs:
             --dir "$RUNNER_TEMP/release"
           sha256sum "$RUNNER_TEMP/release/docker-compose.release.yml"
 
-      # Pinned: it handles the secrets and decides create-versus-upgrade.
+      # Pinned. deploy-side.sh uses it to list CVMs (the preflight's "does this
+      # side still have one"); creating is provision.cjs's.
       - name: Install the Phala CLI
         run: npm install --global --ignore-scripts phala@1.1.22
+
+      # provision.cjs creates the CVM (the CLI cannot pin the node; see its header).
+      # Its one dependency, the Phala SDK, from the committed lockfile.
+      - name: Install provision.cjs's dependency
+        working-directory: deploy/phala
+        run: npm ci --ignore-scripts --no-audit --no-fund
 
       - name: deploy-side.sh
         id: deploy

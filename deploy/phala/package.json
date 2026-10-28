@@ -1,0 +1,8 @@
+{
+  "name": "pc-gateway-deploy",
+  "private": true,
+  "description": "provision.cjs's one dependency, pinned: the Phala Cloud SDK phala CLI 1.1.22 ships.",
+  "dependencies": {
+    "@phala/cloud": "0.4.0"
+  }
+}

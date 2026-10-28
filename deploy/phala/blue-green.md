@@ -594,7 +594,7 @@ app_id and the release. A side that fails is left running for inspection.
    | `PLATFORM_BASE`, `PLATFORM_BASE_COLD` | the clusters, as for `switch.sh` |
    | `CVM_NAME_PREFIX` | CVMs are named `<prefix>-<side>`: `pc-gateway-mainnet-b` |
    | `PHALA_INSTANCE_TYPE` | the shape ([README](./README.md#cvm-shape--and-the-one-setting-that-depends-on-it)) |
-   | `PHALA_NODE_ID`, `PHALA_NODE_ID_COLD` | optional: pin the node, so a side lands in its cluster rather than being caught after it boots elsewhere |
+   | `PHALA_NODE_ID`, `PHALA_NODE_ID_COLD` | required: the node, as its **HashID** (`node_id_hashid` in `phala api /teepods/cvm-create-resources`, e.g. prod5 is `node_aOwADKBd`), so a side lands in its cluster rather than being caught after it boots elsewhere. Not the number `phala nodes ls` shows: the API refuses it, and phala CLI 1.1.22 can send only that — which is why the CVM is created by [`provision.cjs`](./provision.cjs), the CLI's two API calls with the node as a string |
    | `PHALA_OS_IMAGE` | optional: pin the OS image |
    | `ZG_PROM_ENV` | the metrics `env` label: `staging` / `mainnet` |
    | `CVM_REQUIRED_KEYS` | optional: CVM keys that must be set — staging lists `ZG_GATEWAY_ROUTER_URL`, so losing that line (or, for a key from `CVM_SECRET_ENV`, the secret) stops the deploy instead of the production default taking over |
@@ -627,8 +627,9 @@ the run record or the one-deploy-at-a-time lock, so do not run it alongside the
 workflow on the same deployment. Secrets go in `secrets.env` next to the scripts
 (git-ignored; copy [`secrets.env.example`](./secrets.env.example)), which both
 load after the config file. GitHub cannot show an Environment secret back, so
-keep your own copy of each. Needs `phala` (1.1.22, as the workflow), `dig`,
-`curl`, `jq`, `openssl`.
+keep your own copy of each. Needs `phala` (1.1.22, as the workflow), Node.js,
+`dig`, `curl`, `jq`, `openssl`, and `npm ci` run once in `deploy/phala` for
+`provision.cjs`.
 
 ```sh
 gh release download release-YYYY.MM.DD.N --pattern docker-compose.release.yml --dir /tmp/rel
