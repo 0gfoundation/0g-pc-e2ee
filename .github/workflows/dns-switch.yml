@@ -29,7 +29,8 @@ name: DNS switch
 #
 # Called from phala-deploy.yml (for `acme <side>` before a side is created), the
 # same checks hold: github.actor is still whoever dispatched that run, and the run
-# job still waits for dns-<target>'s approval. A call's inputs are plain strings,
+# job still waits for dns-<target>'s approval. The caller must pass `secrets:
+# inherit`, or CF_API_TOKEN reads empty here even after that approval. A call's inputs are plain strings,
 # not choices, so the plan job validates every one of them itself.
 #
 # Logs are public in a public repository. switch.sh prints record names, targets and

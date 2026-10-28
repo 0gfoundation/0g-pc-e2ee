@@ -136,6 +136,11 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/dns-switch.yml
+    # A called workflow sees no secrets at all — not even those of the
+    # environment its own job names — unless the caller passes them. inherit
+    # does not loosen anything: CF_API_TOKEN lives only in dns-<target>, and the
+    # called job still waits for that environment's approval before it gets it.
+    secrets: inherit
     with:
       target: ${{ inputs.target }}
       command: acme
