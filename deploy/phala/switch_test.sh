@@ -248,7 +248,7 @@ run() {
   while [ "$1" != "--" ]; do envs+=("$1"); shift; done
   shift
   set +e
-  OUT="$(env -i PATH="$WORK/bin:$PATH" HOME="$WORK" \
+  OUT="$(env -i PATH="$WORK/bin:$PATH" HOME="$WORK" SECRETS_ENV=/nonexistent \
     FAKE_DIR="$S" FAKE_DOMAIN="$DOMAIN" FAKE_ADDR_SWITCH="$ADDR_SWITCH" FAKE_ALIAS="$ALIAS" \
     CF_API_TOKEN=test PROBE_RETRIES=3 PROBE_INTERVAL=0 VERIFY_RETRIES=3 VERIFY_INTERVAL=0 \
     "${envs[@]}" bash "$SWITCH" --env-file "$S/env" "$@" 2>&1)"
