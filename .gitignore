@@ -9,3 +9,7 @@
 *.env
 .env.*
 !*.example
+# …except the checked-in, secret-free deployment config. deploy-side_test.sh fails
+# if a secret's key appears in one; keep tokens in the environment or a local
+# switch.env / deploy.env, which stay ignored.
+!/deploy/phala/env/*.env

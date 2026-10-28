@@ -47,16 +47,27 @@
 #   DOMAIN, DELEGATION_ZONE=<side>.<DZ>, DNS_SETUP_MODE=print, CLOUDFLARE_API_TOKEN,
 #   ZG_PROM_ENV, ZG_PROM_REMOTE_WRITE_URL, ZG_PROM_REMOTE_WRITE_USERNAME,
 #   ZG_PROM_REMOTE_WRITE_PASSWORD
-# plus whatever CVM_EXTRA_ENV adds (KEY=VALUE per line: per-deployment gateway
-# overrides such as ZG_GATEWAY_ROUTER_URL or ZG_GATEWAY_NETWORK). DNS_SETUP_MODE
+# plus one key per CVM_ENV_<KEY> variable, passed as <KEY> (per-deployment gateway
+# overrides: CVM_ENV_ZG_GATEWAY_ROUTER_URL=… reaches the CVM as
+# ZG_GATEWAY_ROUTER_URL=…), in name order. DNS_SETUP_MODE
 # is not configurable: every blue/green side must run `print`, and under the
 # default `wait` the ingress blocks on a one-hop CNAME check that never passes.
 # The values are encrypted to the CVM by the CLI, written to a 0600 temp file
 # only, and never printed.
 #
+# WHERE CONFIG COMES FROM ----------------------------------------------------
+# Everything that is not a secret is checked in, one file per deployment:
+# env/staging.env, env/mainnet.env. None of it is confidential — the hostnames and
+# clusters are in public DNS, the CVM's shape and image are in its public quote —
+# and in git every change is reviewed and diffable between deployments. The
+# secrets (CLOUDFLARE_API_TOKEN, ZG_PROM_REMOTE_WRITE_PASSWORD, PHALA_CLOUD_API_KEY)
+# come from the environment only: in the workflow, from the deploy-<target>
+# Environment. A value still reading CHANGEME is refused.
+#
 # Usage:
-#   ./deploy-side.sh b --compose docker-compose.release.yml --release release-2026.10.28.1
-#   ./deploy-side.sh b --compose … --dry-run     # preflight only; creates nothing
+#   ./deploy-side.sh b --env-file env/mainnet.env --compose docker-compose.release.yml \
+#       --release release-2026.10.28.1        # secrets exported in the environment
+#   ./deploy-side.sh b --env-file … --compose … --dry-run   # preflight only
 #
 # Flags:
 #   --compose PATH   the release's docker-compose.release.yml (required)
@@ -79,7 +90,7 @@
 #   PHALA_OS_IMAGE       OS image                    (optional: auto-selected)
 #   PHALA_CLOUD_API_KEY  read by the CLI itself
 #   PHALA                CLI command                 (default: phala)
-#   CLOUDFLARE_API_TOKEN, ZG_PROM_*, CVM_EXTRA_ENV   the CVM's environment, above
+#   CLOUDFLARE_API_TOKEN, ZG_PROM_*, CVM_ENV_*       the CVM's environment, above
 #   WAIT_PUBLISH         seconds for checks 1–2      (default: 1800; image pull + boot)
 #   WAIT_READY           seconds for check 3         (default: 900; cert + cold warmer sweep)
 #   WAIT_IDENTITY        seconds for check 4         (default: 600)
@@ -217,13 +228,13 @@ cvm_status() { # app_id -> status, or empty
 # ---------------------------------------------------------------------------
 ENV_KEYS=()
 
-# Write KEY='VALUE' lines to $1: the fixed keys in a fixed order, then
-# CVM_EXTRA_ENV's. Extra keys may not override fixed ones — that would be a second,
-# unreviewed place to set DNS_SETUP_MODE or DELEGATION_ZONE. Single quotes, because
+# Write KEY='VALUE' lines to $1: the fixed keys in a fixed order, then the
+# CVM_ENV_* ones by name. Those may not override fixed keys — that would be a
+# second, unreviewed place to set DNS_SETUP_MODE or DELEGATION_ZONE. Single quotes, because
 # the CLI's dotenv parser takes an unquoted `#` as a comment; so a value may not
 # contain one, nor a newline.
 write_env() { # path
-  local f="$1" k v line
+  local f="$1" v k
   emit() {
     case "$2" in *"'"*|*$'\n'*) die "the value of $1 contains a single quote or a newline; the env file cannot carry it" ;; esac
     printf "%s='%s'\n" "$1" "$2" >>"$f"
@@ -238,16 +249,12 @@ write_env() { # path
   emit ZG_PROM_REMOTE_WRITE_URL "$ZG_PROM_REMOTE_WRITE_URL"
   emit ZG_PROM_REMOTE_WRITE_USERNAME "$ZG_PROM_REMOTE_WRITE_USERNAME"
   emit ZG_PROM_REMOTE_WRITE_PASSWORD "$ZG_PROM_REMOTE_WRITE_PASSWORD"
-  while IFS= read -r line || [ -n "$line" ]; do
-    line="${line%$'\r'}"
-    line="${line#"${line%%[![:space:]]*}"}"
-    case "$line" in ''|'#'*) continue ;; esac
-    k="${line%%=*}"; v="${line#*=}"
-    [ "$k" != "$line" ] && [[ "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
-      || die "CVM_EXTRA_ENV: not a KEY=VALUE line: ${k}"
-    [[ " ${ENV_KEYS[*]} " == *" $k "* ]] && die "CVM_EXTRA_ENV: ${k} is set by this script or given twice"
-    emit "$k" "$v"
-  done <<<"${CVM_EXTRA_ENV:-}"
+  for v in $(compgen -v CVM_ENV_ | LC_ALL=C sort); do
+    k="${v#CVM_ENV_}"
+    [ -n "$k" ] || die "CVM_ENV_ names no key"
+    [[ " ${ENV_KEYS[*]} " == *" $k "* ]] && die "${v}: ${k} is set by this script; it cannot be overridden"
+    emit "$k" "${!v}"
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -364,6 +371,14 @@ WAIT_READY="${WAIT_READY:-900}"
 WAIT_IDENTITY="${WAIT_IDENTITY:-600}"
 POLL_INTERVAL="${POLL_INTERVAL:-15}"
 
+# A checked-in env file holds CHANGEME until someone fills it in.
+placeholders=()
+for v in DOMAIN DELEGATION_ZONE PLATFORM_BASE PLATFORM_BASE_COLD CVM_NAME_PREFIX \
+  PHALA_INSTANCE_TYPE PHALA_NODE_ID PHALA_NODE_ID_COLD PHALA_OS_IMAGE ZG_PROM_ENV \
+  ZG_PROM_REMOTE_WRITE_URL ZG_PROM_REMOTE_WRITE_USERNAME $(compgen -v CVM_ENV_ || true); do
+  [ "${!v:-}" = CHANGEME ] && placeholders+=("$v")
+done
+[ "${#placeholders[@]}" -eq 0 ] || die "still CHANGEME in the config: ${placeholders[*]}"
 : "${DOMAIN:?set DOMAIN (the served hostname)}"
 : "${CVM_NAME_PREFIX:?set CVM_NAME_PREFIX (the CVM is named <prefix>-<side>)}"
 : "${PHALA_INSTANCE_TYPE:?set PHALA_INSTANCE_TYPE (README, \"CVM shape\")}"
