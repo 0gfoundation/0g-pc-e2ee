@@ -229,6 +229,22 @@ run b --compose "$COMPOSE" --yes
 expect_err "CVM_ENV_* cannot override a fixed key" "DNS_SETUP_MODE is set by this script"
 not_created "override"
 
+fresh; EXTRA_ENV=(CVM_ENV_GOMEMLIMIT=1GiB CVM_SECRET_ENV=$'GOMEMLIMIT=2GiB')
+run b --compose "$COMPOSE" --yes
+expect_err "CVM_SECRET_ENV cannot repeat a CVM_ENV_ key" "CVM_SECRET_ENV: GOMEMLIMIT is already set"
+not_created "secret repeat"
+fresh; EXTRA_ENV=(CVM_SECRET_ENV=$'DOMAIN=evil.example')
+run b --compose "$COMPOSE" --yes
+expect_err "CVM_SECRET_ENV cannot override a fixed key" "CVM_SECRET_ENV: DOMAIN is already set"
+check_not "…and the error does not print the line" err_has "evil.example"
+
+fresh; EXTRA_ENV=(CVM_REQUIRED_KEYS=ZG_GATEWAY_ROUTER_URL)
+run b --compose "$COMPOSE" --dry-run
+expect_err "a required key nothing sets is refused, even in a dry run" "ZG_GATEWAY_ROUTER_URL is required"
+fresh; EXTRA_ENV=(CVM_REQUIRED_KEYS=ZG_GATEWAY_ROUTER_URL CVM_SECRET_ENV=ZG_GATEWAY_ROUTER_URL=https://hidden.test)
+run b --compose "$COMPOSE" --dry-run
+expect_rc "…and accepted once CVM_SECRET_ENV sets it" 0
+
 fresh; EXTRA_ENV=(PHALA_INSTANCE_TYPE=CHANGEME CVM_ENV_ZG_GATEWAY_ROUTER_URL=CHANGEME)
 run b --compose "$COMPOSE" --dry-run
 expect_err "refuses placeholders, naming each" "still CHANGEME in the config: PHALA_INSTANCE_TYPE CVM_ENV_ZG_GATEWAY_ROUTER_URL"
@@ -239,14 +255,17 @@ expect_err "refuses to create non-interactively without --yes" "without --yes"
 # ---------------------------------------------------------------------------
 # Create and wait
 # ---------------------------------------------------------------------------
-fresh; EXTRA_ENV=(CVM_ENV_ZG_GATEWAY_NETWORK=testnet CVM_ENV_GOMEMLIMIT=1GiB)
+fresh; EXTRA_ENV=(CVM_ENV_ZG_GATEWAY_NETWORK=testnet CVM_ENV_GOMEMLIMIT=1GiB
+  CVM_SECRET_ENV=$'# kept out of git\nZG_GATEWAY_ROUTER_URL=https://hidden.test')
 run b --compose "$COMPOSE" --release release-2026.10.28.1 --yes
 expect_rc "creates side b and waits for it" 0
 check "prints app_id and url on stdout" \
   [ "$OUT" = $'app_id='"$NEW_APP"$'\nurl=https://'"$NEW_APP"'-443s.'"$BASE" ]
-check "the env file has exactly the fixed keys, then the CVM_ENV_ ones by name" \
-  [ "$(cut -d= -f1 "$S/deploy.env" | tr '\n' ' ')" = "DOMAIN DELEGATION_ZONE DNS_SETUP_MODE CLOUDFLARE_API_TOKEN ZG_PROM_ENV ZG_PROM_REMOTE_WRITE_URL ZG_PROM_REMOTE_WRITE_USERNAME ZG_PROM_REMOTE_WRITE_PASSWORD GOMEMLIMIT ZG_GATEWAY_NETWORK " ]
+check "the env file has exactly the fixed keys, the CVM_ENV_ ones by name, then CVM_SECRET_ENV's" \
+  [ "$(cut -d= -f1 "$S/deploy.env" | tr '\n' ' ')" = "DOMAIN DELEGATION_ZONE DNS_SETUP_MODE CLOUDFLARE_API_TOKEN ZG_PROM_ENV ZG_PROM_REMOTE_WRITE_URL ZG_PROM_REMOTE_WRITE_USERNAME ZG_PROM_REMOTE_WRITE_PASSWORD GOMEMLIMIT ZG_GATEWAY_NETWORK ZG_GATEWAY_ROUTER_URL " ]
 check "DELEGATION_ZONE is the side's sub-zone" grep -qx "DELEGATION_ZONE='b.${DZ}'" "$S/deploy.env"
+check "a CVM_SECRET_ENV value reaches the env file" grep -qx "ZG_GATEWAY_ROUTER_URL='https://hidden.test'" "$S/deploy.env"
+check_not "…and is never printed" grep -q hidden.test <<<"$ERR$OUT"
 check "DNS_SETUP_MODE is print" grep -qx "DNS_SETUP_MODE='print'" "$S/deploy.env"
 check "a value with # and a space survives, quoted" grep -qx "ZG_PROM_REMOTE_WRITE_PASSWORD='p#ss word'" "$S/deploy.env"
 check_not "ACME_STAGING is not passed" grep -q ACME_STAGING "$S/deploy.env"
@@ -282,8 +301,8 @@ expect_err "fails when matched_release never settles" "matched_release not repor
 # Public files: a secret's key in one is a secret about to be committed. And every
 # key must be one the scripts read, so a typo does not silently fall back to a
 # default.
-SECRET_KEYS=" CF_API_TOKEN CLOUDFLARE_API_TOKEN ZG_PROM_REMOTE_WRITE_PASSWORD PHALA_CLOUD_API_KEY SMOKE_API_KEY "
-KNOWN_KEYS=" DOMAIN CF_ZONE DELEGATION_ZONE PLATFORM_BASE PLATFORM_BASE_COLD CVM_NAME_PREFIX PHALA_INSTANCE_TYPE PHALA_NODE_ID PHALA_NODE_ID_COLD PHALA_OS_IMAGE ZG_PROM_ENV ZG_PROM_REMOTE_WRITE_URL ZG_PROM_REMOTE_WRITE_USERNAME SMOKE_SEALED_MODEL SMOKE_PLAIN_MODEL "
+SECRET_KEYS=" CF_API_TOKEN CLOUDFLARE_API_TOKEN ZG_PROM_REMOTE_WRITE_PASSWORD PHALA_CLOUD_API_KEY SMOKE_API_KEY CVM_SECRET_ENV "
+KNOWN_KEYS=" CVM_REQUIRED_KEYS DOMAIN CF_ZONE DELEGATION_ZONE PLATFORM_BASE PLATFORM_BASE_COLD CVM_NAME_PREFIX PHALA_INSTANCE_TYPE PHALA_NODE_ID PHALA_NODE_ID_COLD PHALA_OS_IMAGE ZG_PROM_ENV ZG_PROM_REMOTE_WRITE_URL ZG_PROM_REMOTE_WRITE_USERNAME SMOKE_SEALED_MODEL SMOKE_PLAIN_MODEL "
 for f in "$HERE"/env/*.env; do
   name="env/$(basename "$f")"
   keys="$(sed -n 's/^[[:space:]]*\(export[[:space:]]\+\)\?\([A-Za-z_][A-Za-z0-9_]*\)=.*/\2/p' "$f")"
