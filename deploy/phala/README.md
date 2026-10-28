@@ -220,6 +220,11 @@ dashboard, or via the CLI, passing the environment above:
 phala cvm create --compose deploy/phala/docker-compose.yml
 ```
 
+For a blue/green side, use [`deploy-side.sh`](./deploy-side.sh) or the **Phala
+deploy** workflow instead: it deploys a release's digest-pinned compose as a new
+app, fixes the env key set, and checks the side before you switch to it
+([blue-green.md](./blue-green.md#deploying-a-side-from-github-actions)).
+
 ### CVM shape — and the one setting that depends on it
 
 > The intended mainnet shape is **16 vCPU / 32 GiB**. The shape is chosen at
@@ -330,10 +335,12 @@ is idle. Check both after any resize.
 
 When bringing up a **new** hostname, do the first round trips against Let's
 Encrypt's staging CA by setting `ACME_STAGING=true` in the CVM's encrypted
-environment. Keep `ACME_STAGING` **permanently listed in `allowed_envs`** (its
-default is `false`) and switch between staging and real by the **value**, not by
-adding/removing the key: `allowed_envs` is part of the measured app-compose, so
-editing the list changes `compose_hash`. Every *successful* issuance for the same
+environment (with [`deploy-side.sh`](./deploy-side.sh), add `ACME_STAGING=true`
+to `CVM_EXTRA_ENV`). To switch a *running* CVM between staging and real in place,
+keep the key listed in `allowed_envs` and change the **value**, not the key:
+`allowed_envs` is part of the measured app-compose, so editing the list changes
+`compose_hash`. Under blue/green, where each change is a new side, leaving the key
+out until a deploy needs it is fine (its default is `false`). Every *successful* issuance for the same
 hostname counts against the 5-duplicate-certificates-per-week limit, and each
 fresh CVM issues again from an empty `cert-data` volume, so iterating on
 production directly can leave the hostname uncertifiable for days. Staging's

@@ -24,7 +24,13 @@ name: DNS switch
 # A job is handed an environment's secrets only after its protection rules pass,
 # and only if it names that environment — so a branch with an edited copy of this
 # file cannot reach them (deployment branches: main only), and a fork's pull request
-# never runs this workflow at all (it is dispatch-only).
+# never runs this workflow at all (it is dispatch-only, or called by phala-deploy.yml,
+# itself dispatch-only).
+#
+# Called from phala-deploy.yml (for `acme <side>` before a side is created), the
+# same checks hold: github.actor is still whoever dispatched that run, and the run
+# job still waits for dns-<target>'s approval. A call's inputs are plain strings,
+# not choices, so the plan job validates every one of them itself.
 #
 # Logs are public in a public repository. switch.sh prints record names, targets and
 # app ids, all of which public DNS already serves; it never prints the token, and
@@ -62,6 +68,30 @@ on:
         description: "switch / failover: skip the post-switch check and its auto-rollback (--no-verify)"
         required: false
         type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      target:
+        type: string
+        required: true
+      command:
+        type: string
+        required: true
+      side:
+        type: string
+        required: false
+        default: "-"
+      dry_run:
+        type: boolean
+        required: false
+        default: true
+      probe_url:
+        type: string
+        required: false
+        default: ""
+      no_verify:
+        type: boolean
+        required: false
         default: false
 
 permissions:
@@ -103,6 +133,11 @@ jobs:
             || fail "could not read ${ACTOR}'s permission on ${REPO}; refusing"
           [ "$permission" = admin ] \
             || fail "${ACTOR} has '${permission}' on ${REPO}; only an admin may run the DNS switch"
+          # A dispatch can only offer the choices; a call can pass anything. An unknown
+          # target would name an environment that does not exist, which GitHub creates
+          # on the spot, unprotected.
+          case "$TARGET" in staging|mainnet) ;; *) fail "unknown target: $TARGET" ;; esac
+          case "$SIDE" in -|a|b|c) ;; *) fail "unknown side: $SIDE" ;; esac
           case "$COMMAND" in
             acme|switch|failover) [ "$SIDE" != "-" ] || fail "$COMMAND needs a side" ;;
             status|rollback)      [ "$SIDE" = "-" ] || fail "$COMMAND takes no side" ;;
