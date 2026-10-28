@@ -233,6 +233,10 @@ fresh; EXTRA_ENV=(CVM_ENV_GOMEMLIMIT=1GiB CVM_SECRET_ENV=$'GOMEMLIMIT=2GiB')
 run b --compose "$COMPOSE" --yes
 expect_err "CVM_SECRET_ENV cannot repeat a CVM_ENV_ key" "CVM_SECRET_ENV: GOMEMLIMIT is already set"
 not_created "secret repeat"
+fresh; EXTRA_ENV=(CVM_SECRET_ENV=$'ZG_GATEWAY_NETWORK=testnet\nnot-a-pair-s3cret')
+run b --compose "$COMPOSE" --dry-run
+expect_err "a CVM_SECRET_ENV line that is not KEY=VALUE is refused" "CVM_SECRET_ENV: a line is not KEY=VALUE"
+check_not "…without printing it" err_has "s3cret"
 fresh; EXTRA_ENV=(CVM_SECRET_ENV=$'DOMAIN=evil.example')
 run b --compose "$COMPOSE" --yes
 expect_err "CVM_SECRET_ENV cannot override a fixed key" "CVM_SECRET_ENV: DOMAIN is already set"
