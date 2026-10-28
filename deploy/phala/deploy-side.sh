@@ -272,8 +272,9 @@ write_env() { # path
     line="${line#"${line%%[![:space:]]*}"}"
     case "$line" in ''|'#'*) continue ;; esac
     k="${line%%=*}"
-    [ "$k" != "$line" ] && [[ "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
-      || die "CVM_SECRET_ENV: a line is not KEY=VALUE"
+    if [ "$k" = "$line" ] || ! [[ "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+      die "CVM_SECRET_ENV: a line is not KEY=VALUE"
+    fi
     [[ " ${ENV_KEYS[*]} " == *" $k "* ]] && die "CVM_SECRET_ENV: ${k} is already set (fixed, a CVM_ENV_ key, or twice)"
     emit "$k" "${line#*=}"
   done <<<"${CVM_SECRET_ENV:-}"
