@@ -474,7 +474,6 @@ args=(deploy --json -n "$NAME" -c "$COMPOSE" -e "$TMP/cvm.env" -t "$PHALA_INSTAN
 
 info "compose     : ${COMPOSE} (sha256 ${COMPOSE_SHA})${RELEASE:+, release ${RELEASE}}"
 info "instance    : ${PHALA_INSTANCE_TYPE}, node ${NODE:-auto}, image ${PHALA_OS_IMAGE:-auto}"
-info "env keys    : ${ENV_KEYS[*]}"
 [ -n "$NODE" ] || warn "no node pinned: the platform picks one, and a side outside ${BASE} is caught only after it boots"
 
 if [ "$DRY_RUN" = 1 ]; then
@@ -485,7 +484,14 @@ confirm "Create CVM ${NAME} as side ${SIDE}?" || die "aborted"
 
 # --- create --------------------------------------------------------------------
 # From an empty directory, so no phala.toml there can turn this into an upgrade.
-out="$(cd "$TMP" && mkdir -p cwd && cd cwd && "$PHALA" "${args[@]}")" || die "phala deploy failed"
+# With --json the CLI writes its error to stdout too, as a JSON object, so on
+# failure that output IS the reason: print it. It holds no env value (the env is
+# encrypted before it leaves this machine).
+rc=0
+out="$(cd "$TMP" && mkdir -p cwd && cd cwd && "$PHALA" "${args[@]}")" || rc=$?
+[ "$rc" = 0 ] || die "phala deploy failed (exit ${rc}):
+${out:-<no output>}
+Check \`phala cvms ls\` before retrying: if a CVM named ${NAME} was created, delete it first."
 # Progress lines come before the JSON object on stdout; take the object.
 APP_ID="$(sed -n '/^{/,$p' <<<"$out" | jq -r '.app_id // empty' 2>/dev/null || true)"
 APP_ID="$(norm_app_id "$APP_ID")"

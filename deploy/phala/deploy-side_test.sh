@@ -65,6 +65,11 @@ case "$1 ${2:-}" in
     jq --arg q "$search" '{success: true, items: [.[] | select((.cvmName | contains($q)) or (.appId | contains($q)))]}' "$S/cvms.json"
     ;;
   "deploy --json")
+    if [ -f "$S/deploy_fails" ]; then
+      echo "Provisioning CVM..."
+      printf '{\n  "success": false,\n  "error": "%s"\n}\n' "$(cat "$S/deploy_fails")"
+      exit 1
+    fi
     printf '%s\n' "$@" >"$S/deploy.args"
     env=""; name=""
     while [ $# -gt 0 ]; do
@@ -280,6 +285,11 @@ check_not "never passes --cvm-id" grep -qx -- --cvm-id "$S/deploy.args"
 check "runs the CLI from an empty directory" [ ! -s "$S/deploy.cwd" ]
 check "names the CVM <prefix>-<side>" grep -qx gw-mainnet-b "$S/deploy.args"
 check "with the configured shape" grep -qx tdx.4xlarge "$S/deploy.args"
+
+fresh; echo "Instance type tdx.small is not available on node 26" >"$S/deploy_fails"
+run b --compose "$COMPOSE" --yes
+expect_err "a failed phala deploy prints the CLI's own error" "not available on node 26"
+check "…with the exit status" err_has "phala deploy failed (exit 1)"
 
 fresh; echo in2.phala.network >"$S/cluster"
 run b --compose "$COMPOSE" --yes
