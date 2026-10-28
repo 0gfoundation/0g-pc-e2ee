@@ -49,7 +49,9 @@
 #   ZG_PROM_REMOTE_WRITE_PASSWORD
 # plus one key per CVM_ENV_<KEY> variable, passed as <KEY> (per-deployment gateway
 # overrides: CVM_ENV_ZG_GATEWAY_ROUTER_URL=… reaches the CVM as
-# ZG_GATEWAY_ROUTER_URL=…), in name order. DNS_SETUP_MODE
+# ZG_GATEWAY_ROUTER_URL=…), in name order; and then one per line of
+# CVM_SECRET_ENV (KEY=VALUE lines), for a value that should stay out of the
+# repository — in the workflow it is a deploy-<target> secret. DNS_SETUP_MODE
 # is not configurable: every blue/green side must run `print`, and under the
 # default `wait` the ingress blocks on a one-hop CNAME check that never passes.
 # The values are encrypted to the CVM by the CLI, written to a 0600 temp file
@@ -92,7 +94,10 @@
 #   PHALA_OS_IMAGE       OS image                    (optional: auto-selected)
 #   PHALA_CLOUD_API_KEY  read by the CLI itself
 #   PHALA                CLI command                 (default: phala)
-#   CLOUDFLARE_API_TOKEN, ZG_PROM_*, CVM_ENV_*       the CVM's environment, above
+#   CLOUDFLARE_API_TOKEN, ZG_PROM_*, CVM_ENV_*, CVM_SECRET_ENV   the CVM's environment, above
+#   CVM_REQUIRED_KEYS    keys the CVM must get, space-separated (optional): for one
+#                        that comes from a secret, so a missing secret fails here
+#                        instead of the compose default silently taking over
 #   WAIT_PUBLISH         seconds for checks 1–2      (default: 1800; image pull + boot)
 #   WAIT_READY           seconds for check 3         (default: 900; cert + cold warmer sweep)
 #   WAIT_IDENTITY        seconds for check 4         (default: 600)
@@ -231,12 +236,13 @@ cvm_status() { # app_id -> status, or empty
 ENV_KEYS=()
 
 # Write KEY='VALUE' lines to $1: the fixed keys in a fixed order, then the
-# CVM_ENV_* ones by name. Those may not override fixed keys — that would be a
-# second, unreviewed place to set DNS_SETUP_MODE or DELEGATION_ZONE. Single quotes, because
+# CVM_ENV_* ones by name, then CVM_SECRET_ENV's lines in order. Neither may
+# override a fixed key — that would be a second, unreviewed place to set
+# DNS_SETUP_MODE or DELEGATION_ZONE — nor set a key twice. Single quotes, because
 # the CLI's dotenv parser takes an unquoted `#` as a comment; so a value may not
 # contain one, nor a newline.
 write_env() { # path
-  local f="$1" v k
+  local f="$1" v k line
   emit() {
     case "$2" in *"'"*|*$'\n'*) die "the value of $1 contains a single quote or a newline; the env file cannot carry it" ;; esac
     printf "%s='%s'\n" "$1" "$2" >>"$f"
@@ -257,6 +263,17 @@ write_env() { # path
     [[ " ${ENV_KEYS[*]} " == *" $k "* ]] && die "${v}: ${k} is set by this script; it cannot be overridden"
     emit "$k" "${!v}"
   done
+  # Errors name the key only: the line is a secret.
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    case "$line" in ''|'#'*) continue ;; esac
+    k="${line%%=*}"
+    [ "$k" != "$line" ] && [[ "$k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
+      || die "CVM_SECRET_ENV: a line is not KEY=VALUE"
+    [[ " ${ENV_KEYS[*]} " == *" $k "* ]] && die "CVM_SECRET_ENV: ${k} is already set (fixed, a CVM_ENV_ key, or twice)"
+    emit "$k" "${line#*=}"
+  done <<<"${CVM_SECRET_ENV:-}"
 }
 
 # ---------------------------------------------------------------------------
@@ -441,6 +458,10 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 ( umask 077; : >"$TMP/cvm.env" )
 write_env "$TMP/cvm.env"
+for k in ${CVM_REQUIRED_KEYS:-}; do
+  [[ " ${ENV_KEYS[*]} " == *" $k "* ]] \
+    || die "${k} is required for this deployment (CVM_REQUIRED_KEYS) but nothing sets it — is the CVM_SECRET_ENV secret configured?"
+done
 
 args=(deploy --json -n "$NAME" -c "$COMPOSE" -e "$TMP/cvm.env" -t "$PHALA_INSTANCE_TYPE")
 [ -n "$NODE" ] && args+=(--node-id "$NODE")
