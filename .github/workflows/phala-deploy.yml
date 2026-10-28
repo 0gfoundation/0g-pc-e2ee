@@ -183,9 +183,11 @@ jobs:
           ZG_PROM_REMOTE_WRITE_URL: ${{ secrets.ZG_PROM_REMOTE_WRITE_URL }}
           ZG_PROM_REMOTE_WRITE_USERNAME: ${{ secrets.ZG_PROM_REMOTE_WRITE_USERNAME }}
           ZG_PROM_REMOTE_WRITE_PASSWORD: ${{ secrets.ZG_PROM_REMOTE_WRITE_PASSWORD }}
-          # The CORS allowlist: some of its sites are not public. Required by both
-          # env files, so an unset (empty) secret stops the deploy.
-          CVM_ENV_ZG_GATEWAY_ALLOWED_ORIGINS: ${{ secrets.ZG_GATEWAY_ALLOWED_ORIGINS }}
+          # The CORS allowlist: some of its sites are not public. A secret, or a
+          # variable if the team should be able to read it (a variable is not
+          # masked in logs, but nothing here prints a CVM value). Required by both
+          # env files, so neither being set stops the deploy.
+          CVM_ENV_ZG_GATEWAY_ALLOWED_ORIGINS: ${{ secrets.ZG_GATEWAY_ALLOWED_ORIGINS || vars.ZG_GATEWAY_ALLOWED_ORIGINS }}
           # Optional: KEY=VALUE lines for the CVM that stay out of the repository
           # (none today). Unset is empty, and empty adds nothing.
           CVM_SECRET_ENV: ${{ secrets.CVM_SECRET_ENV }}

@@ -570,7 +570,7 @@ app_id and the release. A side that fails is left running for inspection.
    | `PHALA_CLOUD_API_KEY` | Phala Cloud API key for the workspace holding the CVMs |
    | `CLOUDFLARE_API_TOKEN` | the CVM's token, scoped to the delegation zone ([README](./README.md#serving-domain)) |
    | `ZG_PROM_REMOTE_WRITE_URL`, `ZG_PROM_REMOTE_WRITE_USERNAME`, `ZG_PROM_REMOTE_WRITE_PASSWORD` | the metrics endpoint and its credentials ([README](./README.md#metrics-prometheus)) |
-   | `ZG_GATEWAY_ALLOWED_ORIGINS` | the gateway's CORS allowlist (some of its sites are not public); required by both env files. The same for both deployments, so a repository secret is the natural home |
+   | `ZG_GATEWAY_ALLOWED_ORIGINS` | the gateway's CORS allowlist (some of its sites are not public); required by both env files. The same for both deployments, so set it at repository level — as a secret, or as a **variable** if the team should be able to read it (nobody can read a secret back; collaborators can read a variable, the public cannot unless something prints it, and nothing here prints CVM values). The secret wins if both exist |
    | `CVM_SECRET_ENV` | optional: `KEY=VALUE` lines for the CVM that stay out of the repository, for a value that must not be public. None today. Unset adds nothing |
    | `SMOKE_API_KEY` | optional: an `sk-` key for `scripts/smoke-gateway.sh`. It crosses a connection with `--insecure` (the side's `-443s` host serves the domain's cert), so give it a small credit limit |
 
