@@ -174,13 +174,18 @@ jobs:
       - name: deploy-side.sh
         id: deploy
         env:
-          # Secrets only: the Phala API key, and the CVM's two. Everything else is
+          # Secrets only: the Phala API key, and the CVM's. Everything else is
           # the checked-in deploy/phala/env/<target>.env — not mapped from
           # Environment variables, which would shadow the file (the real environment
           # wins, and a mapped-but-unset variable is set, to empty).
           PHALA_CLOUD_API_KEY: ${{ secrets.PHALA_CLOUD_API_KEY }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          ZG_PROM_REMOTE_WRITE_URL: ${{ secrets.ZG_PROM_REMOTE_WRITE_URL }}
+          ZG_PROM_REMOTE_WRITE_USERNAME: ${{ secrets.ZG_PROM_REMOTE_WRITE_USERNAME }}
           ZG_PROM_REMOTE_WRITE_PASSWORD: ${{ secrets.ZG_PROM_REMOTE_WRITE_PASSWORD }}
+          # The CORS allowlist: some of its sites are not public. Required by both
+          # env files, so an unset (empty) secret stops the deploy.
+          CVM_ENV_ZG_GATEWAY_ALLOWED_ORIGINS: ${{ secrets.ZG_GATEWAY_ALLOWED_ORIGINS }}
           # Optional: KEY=VALUE lines for the CVM that stay out of the repository
           # (none today). Unset is empty, and empty adds nothing.
           CVM_SECRET_ENV: ${{ secrets.CVM_SECRET_ENV }}

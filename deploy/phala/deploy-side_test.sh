@@ -244,6 +244,9 @@ expect_err "a required key nothing sets is refused, even in a dry run" "ZG_GATEW
 fresh; EXTRA_ENV=(CVM_REQUIRED_KEYS=ZG_GATEWAY_ROUTER_URL CVM_SECRET_ENV=ZG_GATEWAY_ROUTER_URL=https://hidden.test)
 run b --compose "$COMPOSE" --dry-run
 expect_rc "…and accepted once CVM_SECRET_ENV sets it" 0
+fresh; EXTRA_ENV=(CVM_REQUIRED_KEYS=ZG_GATEWAY_ALLOWED_ORIGINS CVM_ENV_ZG_GATEWAY_ALLOWED_ORIGINS=)
+run b --compose "$COMPOSE" --dry-run
+expect_err "a required key mapped from an unset secret (empty) is refused" "ZG_GATEWAY_ALLOWED_ORIGINS is required"
 
 fresh; EXTRA_ENV=(PHALA_INSTANCE_TYPE=CHANGEME CVM_ENV_ZG_GATEWAY_ROUTER_URL=CHANGEME)
 run b --compose "$COMPOSE" --dry-run
@@ -301,8 +304,8 @@ expect_err "fails when matched_release never settles" "matched_release not repor
 # Public files: a secret's key in one is a secret about to be committed. And every
 # key must be one the scripts read, so a typo does not silently fall back to a
 # default.
-SECRET_KEYS=" CF_API_TOKEN CLOUDFLARE_API_TOKEN ZG_PROM_REMOTE_WRITE_PASSWORD PHALA_CLOUD_API_KEY SMOKE_API_KEY CVM_SECRET_ENV "
-KNOWN_KEYS=" CVM_REQUIRED_KEYS DOMAIN CF_ZONE DELEGATION_ZONE PLATFORM_BASE PLATFORM_BASE_COLD CVM_NAME_PREFIX PHALA_INSTANCE_TYPE PHALA_NODE_ID PHALA_NODE_ID_COLD PHALA_OS_IMAGE ZG_PROM_ENV ZG_PROM_REMOTE_WRITE_URL ZG_PROM_REMOTE_WRITE_USERNAME SMOKE_SEALED_MODEL SMOKE_PLAIN_MODEL "
+SECRET_KEYS=" CF_API_TOKEN CLOUDFLARE_API_TOKEN ZG_PROM_REMOTE_WRITE_URL ZG_PROM_REMOTE_WRITE_USERNAME ZG_PROM_REMOTE_WRITE_PASSWORD PHALA_CLOUD_API_KEY SMOKE_API_KEY CVM_SECRET_ENV CVM_ENV_ZG_GATEWAY_ALLOWED_ORIGINS "
+KNOWN_KEYS=" CVM_REQUIRED_KEYS DOMAIN CF_ZONE DELEGATION_ZONE PLATFORM_BASE PLATFORM_BASE_COLD CVM_NAME_PREFIX PHALA_INSTANCE_TYPE PHALA_NODE_ID PHALA_NODE_ID_COLD PHALA_OS_IMAGE ZG_PROM_ENV SMOKE_SEALED_MODEL SMOKE_PLAIN_MODEL "
 for f in "$HERE"/env/*.env; do
   name="env/$(basename "$f")"
   keys="$(sed -n 's/^[[:space:]]*\(export[[:space:]]\+\)\?\([A-Za-z_][A-Za-z0-9_]*\)=.*/\2/p' "$f")"
@@ -328,7 +331,9 @@ done
 fresh
 sed 's/=CHANGEME$/=filled.example/; s/^PLATFORM_BASE=.*/PLATFORM_BASE=in1.phala.network/' \
   "$HERE/env/mainnet.env" >"$WORK/filled.env"
-printf '%s\n' CLOUDFLARE_API_TOKEN=cf-secret ZG_PROM_REMOTE_WRITE_PASSWORD=pw >"$WORK/secrets.env"
+printf '%s\n' CLOUDFLARE_API_TOKEN=cf-secret ZG_PROM_REMOTE_WRITE_URL=https://prom.test/w \
+  ZG_PROM_REMOTE_WRITE_USERNAME=gw ZG_PROM_REMOTE_WRITE_PASSWORD=pw \
+  "CVM_ENV_ZG_GATEWAY_ALLOWED_ORIGINS='https://a.test,https://*.b.test'" >"$WORK/secrets.env"
 RC=0
 ERR="$(env -i PATH="$WORK/bin:$PATH" HOME="$WORK" FAKE_DIR="$S" SECRETS_ENV="$WORK/secrets.env" \
   bash "$DEPLOY" b --env-file "$WORK/filled.env" --compose "$COMPOSE" --dry-run 2>&1 >/dev/null)" || RC=$?

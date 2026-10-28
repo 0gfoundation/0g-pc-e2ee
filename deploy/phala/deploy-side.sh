@@ -62,7 +62,7 @@
 # env/staging.env, env/mainnet.env. None of it is confidential — the hostnames and
 # clusters are in public DNS, the CVM's shape and image are in its public quote —
 # and in git every change is reviewed and diffable between deployments. The
-# secrets (CLOUDFLARE_API_TOKEN, ZG_PROM_REMOTE_WRITE_PASSWORD, PHALA_CLOUD_API_KEY)
+# secrets (CLOUDFLARE_API_TOKEN, the three ZG_PROM_REMOTE_WRITE_*, PHALA_CLOUD_API_KEY)
 # come from the environment only: in the workflow, from the deploy-<target>
 # Environment; locally, from `secrets.env` next to this script (git-ignored, see
 # secrets.env.example; SECRETS_ENV names another path), loaded after the config
@@ -95,9 +95,10 @@
 #   PHALA_CLOUD_API_KEY  read by the CLI itself
 #   PHALA                CLI command                 (default: phala)
 #   CLOUDFLARE_API_TOKEN, ZG_PROM_*, CVM_ENV_*, CVM_SECRET_ENV   the CVM's environment, above
-#   CVM_REQUIRED_KEYS    keys the CVM must get, space-separated (optional): for one
-#                        that comes from a secret, so a missing secret fails here
-#                        instead of the compose default silently taking over
+#   CVM_REQUIRED_KEYS    keys the CVM must get with a non-empty value, space-
+#                        separated (optional): for one that comes from a secret, so
+#                        a missing secret fails here instead of the compose default
+#                        silently taking over
 #   WAIT_PUBLISH         seconds for checks 1–2      (default: 1800; image pull + boot)
 #   WAIT_READY           seconds for check 3         (default: 900; cert + cold warmer sweep)
 #   WAIT_IDENTITY        seconds for check 4         (default: 600)
@@ -234,6 +235,7 @@ cvm_status() { # app_id -> status, or empty
 # The CVM's environment
 # ---------------------------------------------------------------------------
 ENV_KEYS=()
+SET_KEYS=()  # the subset with a non-empty value
 
 # Write KEY='VALUE' lines to $1: the fixed keys in a fixed order, then the
 # CVM_ENV_* ones by name, then CVM_SECRET_ENV's lines in order. Neither may
@@ -247,8 +249,9 @@ write_env() { # path
     case "$2" in *"'"*|*$'\n'*) die "the value of $1 contains a single quote or a newline; the env file cannot carry it" ;; esac
     printf "%s='%s'\n" "$1" "$2" >>"$f"
     ENV_KEYS+=("$1")
+    if [ -n "$2" ]; then SET_KEYS+=("$1"); fi
   }
-  : >"$f"; ENV_KEYS=()
+  : >"$f"; ENV_KEYS=(); SET_KEYS=()
   emit DOMAIN "$DOMAIN"
   emit DELEGATION_ZONE "${SIDE}.${DELEGATION_ZONE}"
   emit DNS_SETUP_MODE print
@@ -396,7 +399,7 @@ POLL_INTERVAL="${POLL_INTERVAL:-15}"
 placeholders=()
 for v in DOMAIN DELEGATION_ZONE PLATFORM_BASE PLATFORM_BASE_COLD CVM_NAME_PREFIX \
   PHALA_INSTANCE_TYPE PHALA_NODE_ID PHALA_NODE_ID_COLD PHALA_OS_IMAGE ZG_PROM_ENV \
-  ZG_PROM_REMOTE_WRITE_URL ZG_PROM_REMOTE_WRITE_USERNAME $(compgen -v CVM_ENV_ || true); do
+  $(compgen -v CVM_ENV_ || true); do
   [ "${!v:-}" = CHANGEME ] && placeholders+=("$v")
 done
 [ "${#placeholders[@]}" -eq 0 ] || die "still CHANGEME in the config: ${placeholders[*]}"
@@ -458,9 +461,10 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 ( umask 077; : >"$TMP/cvm.env" )
 write_env "$TMP/cvm.env"
+# Non-empty, not just present: a workflow maps an unset secret to an empty value.
 for k in ${CVM_REQUIRED_KEYS:-}; do
-  [[ " ${ENV_KEYS[*]} " == *" $k "* ]] \
-    || die "${k} is required for this deployment (CVM_REQUIRED_KEYS) but nothing sets it — is the CVM_SECRET_ENV secret configured?"
+  [[ " ${SET_KEYS[*]} " == *" $k "* ]] \
+    || die "${k} is required for this deployment (CVM_REQUIRED_KEYS) but nothing sets it to a value — is its secret configured?"
 done
 
 args=(deploy --json -n "$NAME" -c "$COMPOSE" -e "$TMP/cvm.env" -t "$PHALA_INSTANCE_TYPE")

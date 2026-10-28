@@ -569,7 +569,8 @@ app_id and the release. A side that fails is left running for inspection.
    |---|---|
    | `PHALA_CLOUD_API_KEY` | Phala Cloud API key for the workspace holding the CVMs |
    | `CLOUDFLARE_API_TOKEN` | the CVM's token, scoped to the delegation zone ([README](./README.md#serving-domain)) |
-   | `ZG_PROM_REMOTE_WRITE_PASSWORD` | remote_write password |
+   | `ZG_PROM_REMOTE_WRITE_URL`, `ZG_PROM_REMOTE_WRITE_USERNAME`, `ZG_PROM_REMOTE_WRITE_PASSWORD` | the metrics endpoint and its credentials ([README](./README.md#metrics-prometheus)) |
+   | `ZG_GATEWAY_ALLOWED_ORIGINS` | the gateway's CORS allowlist (some of its sites are not public); required by both env files. The same for both deployments, so a repository secret is the natural home |
    | `CVM_SECRET_ENV` | optional: `KEY=VALUE` lines for the CVM that stay out of the repository, for a value that must not be public. None today. Unset adds nothing |
    | `SMOKE_API_KEY` | optional: an `sk-` key for `scripts/smoke-gateway.sh`. It crosses a connection with `--insecure` (the side's `-443s` host serves the domain's cert), so give it a small credit limit |
 
@@ -595,7 +596,7 @@ app_id and the release. A side that fails is left running for inspection.
    | `PHALA_INSTANCE_TYPE` | the shape ([README](./README.md#cvm-shape--and-the-one-setting-that-depends-on-it)) |
    | `PHALA_NODE_ID`, `PHALA_NODE_ID_COLD` | optional: pin the node, so a side lands in its cluster rather than being caught after it boots elsewhere |
    | `PHALA_OS_IMAGE` | optional: pin the OS image |
-   | `ZG_PROM_ENV`, `ZG_PROM_REMOTE_WRITE_URL`, `ZG_PROM_REMOTE_WRITE_USERNAME` | metrics ([README](./README.md#metrics-prometheus)) |
+   | `ZG_PROM_ENV` | the metrics `env` label: `staging` / `mainnet` |
    | `CVM_REQUIRED_KEYS` | optional: CVM keys that must be set — staging lists `ZG_GATEWAY_ROUTER_URL`, so losing that line (or, for a key from `CVM_SECRET_ENV`, the secret) stops the deploy instead of the production default taking over |
    | `CVM_ENV_<KEY>` | optional: a further variable for the CVM, passed as `<KEY>` — e.g. `CVM_ENV_ZG_GATEWAY_ROUTER_URL` on staging |
    | `SMOKE_SEALED_MODEL`, `SMOKE_PLAIN_MODEL` | optional: the smoke test's models |
