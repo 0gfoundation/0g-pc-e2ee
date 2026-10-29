@@ -102,7 +102,7 @@
 #   HEALTH_PATH      public health path             (default: /healthz — post-switch check)
 #   PROBE_PATH       standby readiness path         (default: /readyz — pre-switch gate 2)
 #   TTL              CNAME TTL in seconds           (default: 60)
-#   VERIFY_RETRIES   post-switch health attempts    (default: 20; window must outlast the route cache)
+#   VERIFY_RETRIES   post-switch health attempts    (default: 40; window must outlast the route cache)
 #   VERIFY_INTERVAL  seconds between attempts       (default: 6)
 #   PROBE_RETRIES    pre-switch target probe tries  (default: 30, PROBE_INTERVAL apart)
 #   PROBE_INTERVAL   seconds between probe attempts (default: 10)
@@ -1009,7 +1009,7 @@ SIDE_C_LABEL="${SIDE_C_LABEL:-c}"
 TXT_PREFIX="${TXT_PREFIX:-_dstack-app-address}"
 HEALTH_PATH="${HEALTH_PATH:-/healthz}"
 TTL="${TTL:-60}"
-VERIFY_RETRIES="${VERIFY_RETRIES:-20}"   # ~2x TTL by default, to outlast the gateway route cache
+VERIFY_RETRIES="${VERIFY_RETRIES:-40}"   # 40x6s = 4 min: the route cache took ~90s to flush on prod5 (blue-green.md, Limitations)
 VERIFY_INTERVAL="${VERIFY_INTERVAL:-6}"
 PROBE_PATH="${PROBE_PATH:-/readyz}"      # standby readiness path (gate 2); /healthz is liveness only
 PROBE_RETRIES="${PROBE_RETRIES:-30}"     # pre-switch target probe attempts before refusing to switch

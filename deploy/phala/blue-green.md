@@ -455,7 +455,7 @@ switch to the production compose only once it works.
    `/healthz` can return 200 from the *old* side for a while after the flip — the
    fingerprint check refuses to be fooled by that, waiting until traffic genuinely
    lands on b. If it never does within the window (`VERIFY_RETRIES` × `VERIFY_INTERVAL`,
-   ~2× `TTL` by default), it **auto-rolls-back** to a and exits non-zero.
+   40 × 6 s = 4 minutes by default), it **auto-rolls-back** to a and exits non-zero.
 
 Useful flags: `--dry-run` (print the Cloudflare changes, apply nothing),
 `--yes` (no prompt, for automation), `--probe-url URL` (override the per-side
@@ -972,10 +972,12 @@ Two consequences for testing it:
   [Health-checking the standby](#health-checking-the-standby-side).
 - **Cutover latency** is the switch-layer `TTL` (default 60 s) plus the dstack
   gateway's cache of `_dstack-app-address`, which follows the record's TTL
-  (**observed ~30 s** on `in1.phala.network`).
+  (**observed ~30 s** on `in1.phala.network`; **~90 s** on
+  `dstack-pha-prod5.phala.network`, the 2026-10-28 staging cutover, which needed 15
+  of the then-default 20 attempts).
   The flip is not sub-second; the post-switch verify window
-  (`VERIFY_RETRIES` × `VERIFY_INTERVAL`) must exceed this cache or a slow flush
-  reads as a failed switch and triggers an unnecessary rollback.
+  (`VERIFY_RETRIES` × `VERIFY_INTERVAL`, now 4 minutes) must exceed this cache or a
+  slow flush reads as a failed switch and triggers an unnecessary rollback.
 - **Post-switch verification needs `openssl`** for the cache-proof cert-fingerprint
   check; without it, `switch.sh` falls back to `/healthz`-only, which a cached
   route to the old side can satisfy (it warns when it does).
