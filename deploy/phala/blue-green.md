@@ -427,7 +427,11 @@ would fail to renew. In that case point it back until you cut over:
 
 ```sh
 ./switch.sh acme a        # only if b will sit staged for a long time
+./switch.sh acme live     # the same, without having to know which side is live
 ```
+
+`acme live` reads the live side off the traffic switch when it runs, as `rollback`
+does, and refuses if the switch points at no side.
 
 Rule of thumb: **the issuance switch should rest on whichever side is live**,
 borrowed only for the minutes it takes the standby to issue.
@@ -555,7 +559,11 @@ only). It moves no traffic. A release is then:
    on purpose;
 2. **Phala deploy** on that side. It calls **DNS switch** for `acme <side>` (approve
    under `dns-<target>`), then creates the side under `deploy-<target>` (approve
-   again) and waits until it is ready;
+   again) and waits until it is ready. If that deploy fails or is cancelled, it
+   calls **DNS switch** once more for `acme live` (approve under `dns-<target>`
+   again), so issuance goes back to the side serving traffic; decline that
+   approval only if you mean to retry straight away, and run `acme` → `live`
+   yourself otherwise;
 3. **DNS switch** → `switch <side>`.
 
 What `deploy-side.sh` refuses, and what it waits for, is in its header. In short:
@@ -693,7 +701,7 @@ answer, so publishing two values does not help either.
    `app_id`), with `DELEGATION_ZONE=c.integratenetwork.work` and the same keys as a
    and b ([One-time setup](#one-time-setup), step 2). Lend it issuance first so it
    can get its certificate: `./switch.sh acme c`, wait for it to issue,
-   `./switch.sh acme <live side>`.
+   `./switch.sh acme live`.
 2. Name its cluster in `switch.env`, read off **c's** CVM (`kms_info.gateway_app_url`):
 
    ```sh
@@ -717,7 +725,7 @@ things decay while it waits, and `status` checks both:
 - **Its certificate.** Only the side the issuance switch points at can renew, so
   c's certificate runs down. `status` warns when fewer than `CERT_WARN_DAYS` (21)
   remain; renew it by lending c issuance for the few minutes it needs
-  (`acme c`, wait, `acme <live side>`). With Let's Encrypt's 90-day certificates
+  (`acme c`, wait, `acme live`). With Let's Encrypt's 90-day certificates
   that is roughly every two months. See
   [Certificates](#certificates-the-issuance-switch-and-rate-limits).
 - **Its build.** An old build keeps looking healthy until something it depends on

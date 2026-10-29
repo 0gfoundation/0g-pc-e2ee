@@ -12,12 +12,18 @@ name: Phala deploy
 #           dns-<target>, which holds the Cloudflare token for the switch records.
 #   deploy  deploy-side.sh under deploy-<target>: preflight, create, wait; then
 #           the smoke test, when the environment has an API key for it.
+#   acme-restore
+#           only when deploy fails or is cancelled after acme moved: dns-switch.yml
+#           with `acme live`, handing issuance back to the side serving traffic.
+#           Another approval under dns-<target>.
 #
 # Delete the side's previous CVM first, by hand (phala cvms delete): the script
 # refuses to create a side that still has one, so it never upgrades in place.
-# `acme` runs before that refusal can be seen — on a run that is then refused, the
-# issuance switch is left on the side you named; `switch` moves it with traffic,
-# and until then the live side cannot renew (weeks of margin, but do not forget).
+# `acme` runs before that refusal can be seen, so a refused or failed deploy leaves
+# the issuance switch on a side that is not serving, and the live side cannot renew
+# until it moves back. acme-restore moves it back; if its approval is declined or
+# it fails, run DNS switch `acme` with side `live` yourself (weeks of margin, but
+# do not forget). A deploy that succeeds keeps it: `switch` moves it with traffic.
 #
 # Config is the checked-in deploy/phala/env/<target>.env; the Environments hold
 # only secrets.
@@ -257,3 +263,21 @@ jobs:
             echo
             echo "Side \`$SIDE\` is ready. Cut over with **DNS switch** → \`$TARGET\`, \`switch\`, side \`$SIDE\`."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # Without this, a deploy refused at its preflight (the side still has a CVM, say)
+  # or failing later leaves issuance on a side that serves nothing, and the live
+  # side's next renewal fails. `live` is read from the traffic switch when this
+  # runs, not remembered from before the deploy. always(): a cancelled run needs it
+  # as much as a failed one. Not after a dry run, which moved nothing.
+  acme-restore:
+    needs: [acme, deploy]
+    if: ${{ always() && !inputs.dry_run && needs.acme.result == 'success' && needs.deploy.result != 'success' }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/dns-switch.yml
+    secrets: inherit
+    with:
+      target: ${{ inputs.target }}
+      command: acme
+      side: live
+      dry_run: false

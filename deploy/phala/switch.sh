@@ -72,6 +72,7 @@
 #   ./switch.sh rollback                             # flip to the other main side (live side read
 #                                                    # from DNS; stateless). Refused while c is live
 #   ./switch.sh acme b                               # point ONLY the issuance switch at b
+#   ./switch.sh acme live                            # ...and back at the live side (read from DNS)
 #   CF_API_TOKEN=... ./switch.sh status              # or supply config via the environment
 #
 # Common flags:
@@ -916,14 +917,28 @@ cmd_rollback() {
 }
 
 cmd_acme() {
-  [ -n "${1:-}" ] || die "usage: $0 acme <a|b|c>"
-  local target; target="$(side_name "$1")"
+  [ -n "${1:-}" ] || die "usage: $0 acme <a|b|c|live>"
+  local target
+  if [ "$1" = live ]; then
+    # Back to whichever side the traffic switch names, read now, like `rollback`
+    # reads it: phala-deploy.yml restores issuance this way when a deploy fails,
+    # and a side remembered from before the deploy could have been switched since.
+    resolve_zone_id
+    target="$(which_side "$(current_cname "$ADDR_SWITCH")")"
+    if [ -z "$target" ] || [ "$target" = "?" ]; then
+      die "traffic switch points at neither side; no live side to point issuance at — use: $0 acme <a|b|c>"
+    fi
+    info "live side read from DNS: ${target}"
+  else
+    target="$(side_name "$1")"
+  fi
   info "pointing issuance switch (_acme-challenge.${DOMAIN}) at side ${target}"
   info "this lets side ${target}'s dstack-ingress answer the ACME dns-01 challenge"
   confirm "Point _acme-challenge for ${DOMAIN} at side ${target}?" || { warn "aborted"; exit 1; }
   move_switches "$target" --acme-only
+  [ "$1" = live ] && return 0
   info "done. Remember to point it back at the live side once side ${target} has its cert,"
-  info "so the live side can keep renewing:  $0 acme <live-side>"
+  info "so the live side can keep renewing:  $0 acme live"
 }
 
 cmd_setup() { # [side]
@@ -1049,5 +1064,5 @@ case "$cmd" in
   rollback) cmd_rollback ;;
   acme)     cmd_acme "${2:-}" ;;
   ""|-h|--help|help) usage 0 ;;
-  *) die "unknown command '$cmd' (want: setup [a|b|c] | status | switch <a|b|c> | failover <a|b|c> | rollback | acme <a|b|c>)" ;;
+  *) die "unknown command '$cmd' (want: setup [a|b|c] | status | switch <a|b|c> | failover <a|b|c> | rollback | acme <a|b|c|live>)" ;;
 esac

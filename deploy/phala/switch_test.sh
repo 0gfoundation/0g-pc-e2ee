@@ -539,6 +539,28 @@ run -- acme b --yes
 expect_rc 0 && expect_cname "$ACME_SWITCH" "$(acme_side b)" && expect_cname "$ADDR_SWITCH" "$(addr_side a)" \
   && expect_not_probed && ok
 
+t "acme live: points issuance back at the side the traffic switch names"
+point "$ACME_SWITCH" "$(acme_side b)"
+run -- acme live --yes
+expect_rc 0 && expect_out "live side read from DNS: a" && expect_writes "PUT ${ACME_SWITCH} CNAME $(acme_side a)" \
+  && expect_cname "$ADDR_SWITCH" "$(addr_side a)" && ok
+
+t "acme live: follows the traffic switch, wherever it is now"
+on_c
+point "$ACME_SWITCH" "$(acme_side b)"
+run "${Y[@]}" -- acme live --yes
+expect_rc 0 && expect_cname "$ACME_SWITCH" "$(acme_side c)" && expect_cname "$ADDR_SWITCH" "$(addr_side c)" && ok
+
+t "acme live: refuses when no side is live"
+drop "$ADDR_SWITCH"
+run -- acme live --yes
+expect_fail && expect_out "points at neither side" && expect_no_writes && ok
+
+t "acme live: refuses an unrecognized traffic switch"
+point "$ADDR_SWITCH" "elsewhere.example."
+run -- acme live --yes
+expect_fail && expect_out "points at neither side" && expect_no_writes && ok
+
 t "switch: within one cluster, the serving alias is not written"
 run PLATFORM_BASE=$BASE -- switch b --yes
 expect_rc 0 && expect_writes "PUT ${ACME_SWITCH} CNAME $(acme_side b)" "PUT ${ADDR_SWITCH} CNAME $(addr_side b)" && ok
