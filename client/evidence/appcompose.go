@@ -203,11 +203,14 @@ const maxCNAMEHops = 8
 // DeriveBaseDomain works out the platform base domain for a served gateway domain
 // by following its CNAME chain to the end.
 //
-// A dstack deployment points its served name, via its delegation zone, at the
-// cluster's GATEWAY_DOMAIN, which by convention is `_.<base_domain>` (see the
-// DELEGATION_ZONE / GATEWAY_DOMAIN contract in deploy/phala/). So the last hop of
-// the chain names the base domain, and an operator does not have to know — or
-// correctly retype — their cluster's topology to run a verification.
+// A dstack deployment points its served name, via its delegation zone, at a host
+// under the cluster's wildcard record: `gw.<base_domain>`, or `_.<base_domain>`,
+// dstack's own GATEWAY_DOMAIN spelling (see deploy/phala/). So the last hop of the
+// chain names the base domain, and an operator does not have to know — or
+// correctly retype — their cluster's topology to run a verification. Our
+// deployments moved to `gw.` because Android's resolver rejects a `_` label in a
+// CNAME chain (0gfoundation/0g-router#1178); `_.` is still read, for deployments
+// that have not.
 //
 // **DNS is not authenticated, and this does not pretend otherwise.** The result is
 // used only to LOCATE the app-compose bytes; those bytes are then checked against
@@ -241,19 +244,22 @@ func deriveBaseDomain(ctx context.Context, domain string, lookupCNAME func(conte
 		}
 		last = cname
 	}
-	// The gateway domain is the `_.<base>` form; anything else means this name is not
-	// fronted by a dstack gateway the way the deployment docs describe.
-	base, ok := strings.CutPrefix(last, "_.")
+	// The gateway hop is `gw.<base>` or `_.<base>`; anything else means this name is
+	// not fronted by a dstack gateway the way the deployment docs describe.
+	base, ok := strings.CutPrefix(last, "gw.")
+	if !ok {
+		base, ok = strings.CutPrefix(last, "_.")
+	}
 	if !ok || base == "" {
-		return "", fmt.Errorf("CNAME chain for %s ends at %q, which is not a dstack gateway domain (_.<base>); pass the base domain explicitly", name, last)
+		return "", fmt.Errorf("CNAME chain for %s ends at %q, which is not a dstack gateway domain (gw.<base> or _.<base>); pass the base domain explicitly", name, last)
 	}
 	return base, nil
 }
 
 // appIDHost builds the platform's per-app hostname for the guest agent. baseDomain
-// may be given bare ("in1.phala.network") or as a URL; a leading "_." — the form
-// that appears in a dstack GATEWAY_DOMAIN — is stripped, since operators tend to
-// copy it from there.
+// may be given bare ("in1.phala.network") or as a URL; a leading "_." or "gw." —
+// the forms in a dstack GATEWAY_DOMAIN and our serving alias — is stripped, since
+// operators tend to copy it from there.
 func appIDHost(appID, baseDomain string) string {
 	d := strings.TrimSpace(baseDomain)
 	if d == "" {
@@ -266,6 +272,7 @@ func appIDHost(appID, baseDomain string) string {
 	}
 	d = strings.Trim(d, "/")
 	d = strings.TrimPrefix(d, "_.")
+	d = strings.TrimPrefix(d, "gw.")
 	if d == "" {
 		return ""
 	}

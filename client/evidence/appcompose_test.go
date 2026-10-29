@@ -196,6 +196,8 @@ func TestAppIDHost(t *testing.T) {
 		"in1.phala.network/",
 		// The form an operator is most likely to copy out of a dstack GATEWAY_DOMAIN.
 		"_.in1.phala.network",
+		// …and the one in our serving alias.
+		"gw.in1.phala.network",
 	} {
 		if got := appIDHost(app, base); got != want {
 			t.Errorf("appIDHost(_, %q) = %q, want %q", base, got, want)
@@ -392,6 +394,21 @@ func TestDeriveBaseDomain(t *testing.T) {
 	}
 	if got != "in1.phala.network" {
 		t.Errorf("base domain = %q, want in1.phala.network", got)
+	}
+	// The gw. form our serving alias now uses (0gfoundation/0g-router#1178).
+	gw := map[string]string{
+		"router-api.0g.ai":                       "router-api.0g.ai.integratenetwork.work.",
+		"router-api.0g.ai.integratenetwork.work": "gw.dstack-pha-prod5.phala.network.",
+		"gw.dstack-pha-prod5.phala.network":      "gw.dstack-pha-prod5.phala.network.",
+	}
+	gwLookup := func(_ context.Context, name string) (string, error) {
+		if c, ok := gw[name]; ok {
+			return c, nil
+		}
+		return "", fmt.Errorf("no such host: %s", name)
+	}
+	if got, err := deriveBaseDomain(context.Background(), "router-api.0g.ai", gwLookup); err != nil || got != "dstack-pha-prod5.phala.network" {
+		t.Errorf("gw. chain: base domain = %q, %v; want dstack-pha-prod5.phala.network", got, err)
 	}
 	// A port and a trailing dot are both things an operator may paste.
 	for _, in := range []string{"router-api-tee-staging.0g.ai:443", "Router-API-TEE-Staging.0G.AI."} {

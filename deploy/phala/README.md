@@ -108,6 +108,14 @@ kms_info.gateway_app_url    https://gateway.dstack-pha-prod5.phala.network
                             CNAME → _.dstack-pha-in2.phala.network        ❌ wrong cluster
 ```
 
+Under blue/green this record is not on any client's path (the serving alias is
+`switch.sh`'s, `gw.<base>`), so its `_.` does no harm there. **In a
+single-instance deployment it is the served name's last hop**, and Android's resolver rejects
+the `_` label: the name does not resolve on Android
+([0gfoundation/0g-router#1178](https://github.com/0gfoundation/0g-router/issues/1178)).
+A single-instance deployment that serves browsers on Android needs
+`GATEWAY_DOMAIN=gw.${DSTACK_GATEWAY_DOMAIN}` in the compose instead.
+
 Nothing in the compose catches either wrong shape, and under blue/green neither
 has any symptom ([blue-green.md](./blue-green.md), "Where `GATEWAY_DOMAIN` does
 and does not matter") — this check is what stands between a wrong value and a

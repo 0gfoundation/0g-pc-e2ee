@@ -545,8 +545,8 @@ does not.
    — fetches the app-compose from Phala Cloud's public attestations API
    (`evidence.FetchAppComposeFromCloud`, no API key), falling back to the CVM's guest
    agent at `<app_id>-8090.<base_domain>` with the base domain derived from the served
-   domain's CNAME chain (`evidence.DeriveBaseDomain` — dstack points a served name at
-   `_.<base_domain>`), and checks `sha256 == compose_hash`
+   domain's CNAME chain (`evidence.DeriveBaseDomain` — the served name ends at
+   `gw.<base_domain>`, or dstack's `_.<base_domain>`), and checks `sha256 == compose_hash`
    (`evidence.VerifyAppCompose`) before believing anything in it. With several
    instances the one whose manifest hashes to *this* quote's `compose_hash` is the one
    read, so a blue/green pair cannot be reported as a mismatch. `-app-compose`

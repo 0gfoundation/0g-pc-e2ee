@@ -169,7 +169,7 @@ collide with the other side's:
      _acme-challenge.router-api.0g.ai      CNAME → _acme-challenge.router-api.0g.ai.integratenetwork.work
 
 ② delegation zone integratenetwork.work — the SWITCH LAYER (switch.sh owns these):
-     router-api.0g.ai.integratenetwork.work                     CNAME → _.<live side's cluster> ← serving alias
+     router-api.0g.ai.integratenetwork.work                     CNAME → gw.<live side's cluster> ← serving alias
      _dstack-app-address.router-api.0g.ai.integratenetwork.work CNAME → …a… | …b… (| …c…)    ← ★ traffic switch
      _acme-challenge.router-api.0g.ai.integratenetwork.work     CNAME → …a… | …b… (| …c…)    ← issuance switch
 
@@ -231,9 +231,23 @@ Cloudflare zones. One token scoped to `integratenetwork.work` covers both sides
 
 **What actually moves on a release.** Only the **traffic switch** (② line 2).
 The **issuance switch** moves only when a side needs to obtain/renew its cert;
-the **serving alias** (② line 1) names the live side's cluster, `_.<base>`, so it
+the **serving alias** (② line 1) names the live side's cluster, `gw.<base>`, so it
 moves only when the target side runs in a different cluster — see
 [Cross-cluster fallback](#cross-cluster-fallback).
+
+> **Why `gw.<base>` and not dstack's `_.<base>`.** The serving alias is the only
+> hop of this whole structure a client resolves (① line 1 → it → the cluster's
+> wildcard A record). Android's system resolver (bionic `res_hnok`) rejects any
+> name in a CNAME chain with a `_` label, so with `_.<base>` the served name did
+> not resolve on Android at all — about half of Android sign-ins failed, every one
+> in an in-app browser ([0gfoundation/0g-router#1178](https://github.com/0gfoundation/0g-router/issues/1178)).
+> The cluster's domain is a wildcard, so `gw.<base>` reaches the same gateway; `gw`
+> is a label nothing else claims (`gateway.<base>` is Phala's own service). The
+> `_`-named records — `_dstack-app-address…`, `_acme-challenge…` — are fine: only
+> the gateway and the CA look them up. So are the per-side `<DOMAIN>.<side>.<DZ>`
+> CNAMEs in ③, still `_.<base>`: nothing points at them. `switch.sh` reads `_.<base>`
+> as the same cluster, so an alias written before the change is not a split state;
+> `setup` or the next `switch` rewrites it, and `status` says so until then.
 
 **Each side must run `DNS_SETUP_MODE=print`.** dstack-ingress boots with a strict
 pre-check (default `DNS_SETUP_MODE=wait`): it blocks until the served
@@ -340,13 +354,13 @@ from memory.
 
 1. **Serving alias (once).** The one record you create by hand in the delegation
    zone: `router-api.0g.ai.integratenetwork.work` CNAME → the cluster's dstack
-   gateway, `_.<cluster>.phala.network`. This is the hop that carries traffic (②
+   gateway, `gw.<cluster>.phala.network` (not `_.`: see above). This is the hop that carries traffic (②
    above), and it is the operator's to set — the CVMs no longer take a cluster
    value from you at all. With both sides in one cluster it never changes, and one
    static value serves both. `switch.sh setup` writes it from `PLATFORM_BASE`:
 
    ```sh
-   ./switch.sh setup            # serving alias -> _.${PLATFORM_BASE}
+   ./switch.sh setup            # serving alias -> gw.${PLATFORM_BASE}
    ```
 
    `status` warns if the live alias later drifts from the live side's cluster. Without
@@ -662,8 +676,8 @@ alias names must always be the same cluster, and moving traffic onto or off c
 means moving both records:
 
 ```
-on the main pair   serving alias → _.<main cluster>   traffic switch → …a… | …b…
-on c               serving alias → _.<cold cluster>   traffic switch → …c…
+on the main pair   serving alias → gw.<main cluster>   traffic switch → …a… | …b…
+on c               serving alias → gw.<cold cluster>   traffic switch → …c…
 ```
 
 Between a and b the alias write is a no-op, so releases are unchanged.
