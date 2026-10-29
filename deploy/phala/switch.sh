@@ -30,7 +30,7 @@
 #   delegation zone <DZ>=integratenetwork.work — the SWITCH LAYER (this script):
 #     _dstack-app-address.<DOMAIN>.<DZ>  CNAME -> _dstack-app-address.<DOMAIN>.a.<DZ>  | .b. | .c.  <-- traffic
 #     _acme-challenge.<DOMAIN>.<DZ>      CNAME -> _acme-challenge.<DOMAIN>.a.<DZ>      | .b. | .c.  <-- issuance
-#     <DOMAIN>.<DZ>                      CNAME -> _.<live side's cluster>                             <-- serving alias
+#     <DOMAIN>.<DZ>                      CNAME -> gw.<live side's cluster>                            <-- serving alias
 #
 #   delegation zone <DZ> — PER-SIDE records, written by each CVM's dstack-ingress:
 #     a side (DELEGATION_ZONE=a.<DZ>):  _dstack-app-address.<DOMAIN>.a.<DZ> TXT = <app_id_a>:443
@@ -94,7 +94,8 @@
 #                    side c runs. Required by any command that moves traffic onto or
 #                    off c. A side's cluster is where its pre-switch probe goes
 #                    (<app_id>-443s.<base>) and what the serving alias names
-#                    (_.<base>) while it is live. A leading `_.` is accepted on both.
+#                    (gw.<base>) while it is live. A leading `_.` or `gw.` is
+#                    accepted on both.
 #   SIDE_A_LABEL     sub-zone label for side a      (default: a)
 #   SIDE_B_LABEL     sub-zone label for side b      (default: b)
 #   SIDE_C_LABEL     sub-zone label for side c      (default: c)
@@ -202,11 +203,21 @@ side_name() {
 other_side() { case "$(side_name "$1")" in a) echo b;; b) echo a;; c) return 1;; esac; }
 
 # The cluster (dstack platform base domain) a side runs in, and the serving-alias
-# value that sends traffic to that cluster's gateway: its wildcard hop `_.<base>`,
-# never the bare base — `pcverify` rejects a CNAME chain that does not end at
-# `_.<base>` (client/evidence/appcompose.go, deriveBaseDomain).
+# value that sends traffic to that cluster's gateway: a name under the cluster's
+# wildcard record, `gw.<base>`, never the bare base — `pcverify` derives the base
+# from that last hop (client/evidence/appcompose.go, deriveBaseDomain).
+#
+# Not `_.<base>`, dstack's own spelling, which this used to write: the serving
+# alias is the one hop a client resolves, and Android's resolver (bionic res_hnok)
+# rejects a name with a `_` label, so the whole lookup fails there — about half of
+# Android sign-ins (0gfoundation/0g-router#1178). Any label resolves the same
+# through the wildcard; `gw` is one nothing else claims. `_.` is still READ as a
+# gateway hop, so an alias written before the change is not a split state; `setup`
+# or the next `switch` rewrites it.
 side_base() { case "$(side_name "$1")" in a|b) echo "$PLATFORM_BASE" ;; c) echo "$PLATFORM_BASE_COLD" ;; esac; }
-side_gateway() { local b; b="$(side_base "$1")" || return 1; [ -n "$b" ] && echo "_.${b}"; }
+side_gateway() { local b; b="$(side_base "$1")" || return 1; [ -n "$b" ] && echo "gw.${b}"; }
+# The cluster a serving-alias value names, or "" if it is not a gateway hop.
+gateway_base() { case "$1" in gw.?*) echo "${1#gw.}" ;; _.?*) echo "${1#_.}" ;; esac; }
 
 # per-side target names for a side label. side_label's die runs in the `$(...)`
 # subshell, so it can't abort us directly; check its status with `|| return 1`
@@ -462,7 +473,7 @@ need_bases() { # side…
 alias_mismatch() { # side alias-now
   local want; want="$(side_gateway "$1")"
   if [ -z "$2" ]; then echo "the serving alias ${SERVING_ALIAS} is unset (want ${want})"
-  elif [ "$2" != "$want" ]; then echo "the serving alias ${SERVING_ALIAS} -> $2, but side $1 runs on ${want}"
+  elif [ "$(gateway_base "$2")" != "$(side_base "$1")" ]; then echo "the serving alias ${SERVING_ALIAS} -> $2, but side $1 runs on ${want}"
   fi
 }
 
@@ -495,13 +506,17 @@ cmd_status() {
       warn "  Repair: $0 failover ${addr_side}  (or failover to the side the alias's cluster hosts)"
     fi
   fi
-  # Right cluster, wrong form: the alias must name the gateway's wildcard hop.
-  # A bare base domain is not one, and the cluster check above cannot see it
-  # because it compares the two with `_.` stripped.
-  if [ -n "$alias_now" ] && [ "$alias_now" = "${alias_now#_.}" ]; then
-    warn "serving alias is not a gateway hop (wants _.<base>): ${alias_now}"
+  # Right cluster, wrong form: the alias must name a host under the gateway's
+  # wildcard. A bare base domain is not one, and the cluster check above cannot
+  # see it because it compares clusters only.
+  if [ -n "$alias_now" ] && [ -z "$(gateway_base "$alias_now")" ]; then
+    warn "serving alias is not a gateway hop (wants gw.<base>): ${alias_now}"
     warn "  traffic will not reach a dstack gateway, and pcverify cannot derive"
     warn "  a base domain from this chain. Re-run 'setup' to rewrite it."
+  elif [ "${alias_now#_.}" != "$alias_now" ]; then
+    warn "serving alias is in the old _.<base> form: ${alias_now}"
+    warn "  Android's resolver rejects the _ label, so the served name does not resolve"
+    warn "  there. Re-run 'setup' (or the next 'switch') to rewrite it as gw.<base>."
   fi
   printf 'traffic switch  : %s\n' "${TXT_PREFIX}.${DOMAIN}"
   printf '   -> %s  [%s]\n' "${addr_now:-<unset>}" "${addr_side:-none}"
@@ -744,7 +759,8 @@ cutover() { # target-side previous-side rollback|stay
   local from_gw to_gw
   from_gw="$(current_cname "$SERVING_ALIAS")"
   to_gw="$(side_gateway "$target")"
-  if [ -n "$from_gw" ] && [ "$from_gw" != "$to_gw" ]; then
+  # Same cluster in the old _.<base> spelling is a rewrite, not a move.
+  if [ -n "$from_gw" ] && [ "$(gateway_base "$from_gw")" != "$(side_base "$target")" ]; then
     warn "cross-cluster: the serving alias moves ${from_gw} -> ${to_gw}."
     warn "  New connections from clients still holding the old alias fail once the old"
     warn "  cluster's gateway refreshes its app-address, until their DNS cache (TTL ${TTL}s)"
@@ -998,11 +1014,11 @@ PLATFORM_BASE="${PLATFORM_BASE:-}"     # dstack platform base domain (e.g. in1.p
 # this value straight into `<app_id>-443s.${PLATFORM_BASE}` and a `_.` in it makes
 # an unresolvable host — a failure that only shows up as gate 2 timing out for
 # PROBE_RETRIES x PROBE_INTERVAL (~5 min by default) and then refusing, on
-# `switch` AND on `rollback`. Accepting the `_.` form is deliberate: it is how
-# the serving alias spells the same cluster, and operators copy it from there.
-PLATFORM_BASE="${PLATFORM_BASE#_.}"
+# `switch` AND on `rollback`. Accepting the `gw.` and `_.` forms is deliberate: it
+# is how the serving alias spells the same cluster, and operators copy it from there.
+PLATFORM_BASE="${PLATFORM_BASE#_.}"; PLATFORM_BASE="${PLATFORM_BASE#gw.}"
 # The cold standby's cluster (side c). Empty = no cold standby.
-PLATFORM_BASE_COLD="${PLATFORM_BASE_COLD:-}"; PLATFORM_BASE_COLD="${PLATFORM_BASE_COLD#_.}"
+PLATFORM_BASE_COLD="${PLATFORM_BASE_COLD:-}"; PLATFORM_BASE_COLD="${PLATFORM_BASE_COLD#_.}"; PLATFORM_BASE_COLD="${PLATFORM_BASE_COLD#gw.}"
 SIDE_A_LABEL="${SIDE_A_LABEL:-a}"
 SIDE_B_LABEL="${SIDE_B_LABEL:-b}"
 SIDE_C_LABEL="${SIDE_C_LABEL:-c}"
@@ -1017,7 +1033,7 @@ PROBE_INTERVAL="${PROBE_INTERVAL:-10}"   # seconds between them: 30x10s ≈ 5min
 CERT_WARN_DAYS="${CERT_WARN_DAYS:-21}"   # `status` warns when a side's cert is valid for fewer days than this
 
 # Switch-layer record names (in the delegation zone) that this script owns.
-SERVING_ALIAS="${DOMAIN}.${DELEGATION_ZONE}"           # -> _.<live side's cluster> (`setup`, and moved by `switch`/`failover`)
+SERVING_ALIAS="${DOMAIN}.${DELEGATION_ZONE}"           # -> gw.<live side's cluster> (`setup`, and moved by `switch`/`failover`)
 ADDR_SWITCH="${TXT_PREFIX}.${DOMAIN}.${DELEGATION_ZONE}"
 ACME_SWITCH="_acme-challenge.${DOMAIN}.${DELEGATION_ZONE}"
 

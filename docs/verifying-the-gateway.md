@@ -745,7 +745,8 @@ diff deployed-compose.yml docker-compose.release.yml
 ```
 
 The platform base domain is the end of the served domain's CNAME chain
-(`dig +short CNAME` repeatedly; it ends at `_.<base-domain>`).
+(`dig +short CNAME` repeatedly; it ends at `gw.<base-domain>`, or `_.<base-domain>`
+on a deployment that still uses dstack's spelling).
 
 Step **7** — the OS image — is the one part that needs the image itself. Fetch the
 guest-OS release the CVM reports (`vm_config.os_image_hash` is its `digest.txt`, i.e.
