@@ -27,7 +27,8 @@ name: DNS switch
 # never runs this workflow at all (it is dispatch-only, or called by phala-deploy.yml,
 # itself dispatch-only).
 #
-# Called from phala-deploy.yml (for `acme <side>` before a side is created), the
+# Called from phala-deploy.yml (for `acme <side>` before a side is created, and
+# `acme live` to hand issuance back when that deploy fails), the
 # same checks hold: github.actor is still whoever dispatched that run, and the run
 # job still waits for dns-<target>'s approval. The caller must pass `secrets:
 # inherit`, or CF_API_TOKEN reads empty here even after that approval. A call's inputs are plain strings,
@@ -51,11 +52,11 @@ on:
         type: choice
         options: [status, acme, switch, failover, rollback, setup]
       side:
-        description: "Side, for acme / switch / failover (required) and setup (optional)"
+        description: "Side, for acme / switch / failover (required) and setup (optional); acme also takes live"
         required: false
         type: choice
         default: "-"
-        options: ["-", a, b, c]
+        options: ["-", a, b, c, live]
       dry_run:
         description: "Show the changes without applying them"
         required: false
@@ -138,7 +139,9 @@ jobs:
           # target would name an environment that does not exist, which GitHub creates
           # on the spot, unprotected.
           case "$TARGET" in staging|mainnet) ;; *) fail "unknown target: $TARGET" ;; esac
-          case "$SIDE" in -|a|b|c) ;; *) fail "unknown side: $SIDE" ;; esac
+          case "$SIDE" in -|a|b|c|live) ;; *) fail "unknown side: $SIDE" ;; esac
+          # live: the side the traffic switch names, read by switch.sh when it runs.
+          [ "$SIDE" != live ] || [ "$COMMAND" = acme ] || fail "side live is for acme only"
           case "$COMMAND" in
             acme|switch|failover) [ "$SIDE" != "-" ] || fail "$COMMAND needs a side" ;;
             status|rollback)      [ "$SIDE" = "-" ] || fail "$COMMAND takes no side" ;;
