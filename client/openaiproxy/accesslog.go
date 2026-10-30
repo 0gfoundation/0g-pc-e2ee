@@ -15,6 +15,14 @@ import (
 // echoes on the way out, so one request can be stitched across a fronting proxy,
 // the proxy's own access log, and (later) a provider's logs. A caller or ingress
 // may supply one; absent or malformed, the proxy mints its own.
+//
+// The response carries ONE value. When the router answered, it is the router's:
+// that id is usage_logs.request_id, the only one a customer can reconcile a
+// charge with, and the passthrough relays it. The proxy's id fills the header
+// only when the router did not set one (the proxy's own refusals and errors).
+// Setting ours up front, as this once did, let the passthrough's Add append the
+// router's beside it, and a client reading the first value got an id no billing
+// record knows.
 const requestIDHeader = "X-Request-Id"
 
 // providerPinHeader is the routing directive a caller sets to pin a specific
@@ -68,7 +76,6 @@ func LogRequests(logger *slog.Logger, h http.Handler) http.Handler {
 		defer metrics.DecInFlight()
 
 		id := requestID(r)
-		w.Header().Set(requestIDHeader, id)
 
 		// Carry a marker the overload limiter can set from further down the chain
 		// (see markShed). A pointer in the context is the same mechanism the core
@@ -77,9 +84,12 @@ func LogRequests(logger *slog.Logger, h http.Handler) http.Handler {
 		// response header would have to be sent to the caller to be readable.
 		r, shed := withShedFlag(r)
 
-		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK, requestID: id}
 		start := time.Now()
 		h.ServeHTTP(rec, r)
+		// A handler that wrote nothing leaves the headers to net/http, which sends
+		// them after this returns; still unsent, so the id can go on now.
+		rec.ensureRequestID()
 		dur := time.Since(start)
 
 		metrics.HTTPRequest(route, r.Method, rec.status, dur)
@@ -114,6 +124,11 @@ func LogRequests(logger *slog.Logger, h http.Handler) http.Handler {
 			slog.Int("bytes_out", rec.bytes),
 			slog.Bool("provider_pinned", r.Header.Get(providerPinHeader) != ""),
 			slog.Bool("stream", rec.streamed()),
+		}
+		// The router's id, when it answered, is what the caller holds; logging it
+		// beside ours joins this line to the router's billing record.
+		if sent := rec.Header().Get(requestIDHeader); sent != id {
+			attrs = append(attrs, slog.String("router_request_id", sent))
 		}
 		if shed.load() {
 			attrs = append(attrs, slog.Bool("shed", true))
@@ -161,12 +176,22 @@ type statusRecorder struct {
 	status      int
 	bytes       int
 	wroteHeader bool
+	requestID   string
+}
+
+// ensureRequestID sets the proxy's id unless the handler already set one (the
+// router's, relayed). Called at the last moment the headers can still change.
+func (s *statusRecorder) ensureRequestID() {
+	if !s.wroteHeader && s.Header().Get(requestIDHeader) == "" {
+		s.Header().Set(requestIDHeader, s.requestID)
+	}
 }
 
 func (s *statusRecorder) WriteHeader(code int) {
 	if s.wroteHeader {
 		return
 	}
+	s.ensureRequestID()
 	s.status = code
 	s.wroteHeader = true
 	s.ResponseWriter.WriteHeader(code)
@@ -186,6 +211,7 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 // streamed response into a buffered one.
 func (s *statusRecorder) Flush() {
 	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		s.ensureRequestID()
 		s.wroteHeader = true
 		f.Flush()
 	}
