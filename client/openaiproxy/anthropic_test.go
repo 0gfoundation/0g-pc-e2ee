@@ -267,3 +267,79 @@ func TestChatStreamingKeepsItsOpenAIFraming(t *testing.T) {
 		t.Errorf("a chat stream must still end with [DONE], got:\n%s", raw)
 	}
 }
+
+// Claude Code's `tool_addition` blocks are folded into `tools` before sealing.
+// The router cannot do it on this path (0g-router #1146 folds them, but here it
+// only sees ciphertext), and an upstream that does not know the block answers
+// 400, after which Claude Code strips the blocks for the rest of the session.
+// Asserted through the real handler: what the enclave opens has the tool in
+// `tools` and no block in `messages`, and what the router sees has neither.
+func TestAnthropicFoldsToolAdditionsBeforeSealing(t *testing.T) {
+	encPriv, encPub, _ := crypto.GenerateRecipientKey()
+	signer := "0x" + strings.Repeat("a", 40)
+	var sawSystem, sawStreamOptions string
+	broker := mockAnthropicBroker(t, encPriv, &sawSystem, &sawStreamOptions)
+	defer broker.Close()
+
+	var wireBody []byte
+	var opened wire.Request
+	recorder := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		wireBody, _ = io.ReadAll(r.Body)
+		var env wire.Request
+		if err := json.Unmarshal(wireBody, &env); err == nil {
+			opened, _ = wire.OpenRequestFor(wire.ProfileAnthropic, encPriv, env)
+		}
+		resp, err := http.Post(broker.URL+r.URL.Path, r.Header.Get("Content-Type"), bytes.NewReader(wireBody))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+	}))
+	defer recorder.Close()
+
+	client := core.New(
+		core.Provider{URL: recorder.URL, EncPubKey: encPub, SignerAddr: signer},
+		core.WithEndpoint(endpoint.Anthropic),
+	)
+	mux := http.NewServeMux()
+	openaiproxy.Register(mux, endpoint.Anthropic, client)
+	proxy := httptest.NewServer(mux)
+	defer proxy.Close()
+
+	const userReq = `{"model":"0GM-1.0-35B-A3B","max_tokens":1024,"stream":true,` +
+		`"tools":[{"name":"Bash","input_schema":{"type":"object"}}],` +
+		`"messages":[{"role":"user","content":"hi"},` +
+		`{"role":"system","content":[{"type":"text","text":"New tools."},` +
+		`{"type":"tool_addition","tool":{"type":"tool_definition","definition":{"name":"secret_deferred_tool","input_schema":{"type":"object"}}},"cache_control":{"type":"ephemeral"}}]}]}`
+	httpResp, err := http.Post(proxy.URL+endpoint.Anthropic.Path, "application/json", strings.NewReader(userReq))
+	if err != nil {
+		t.Fatalf("post to proxy: %v", err)
+	}
+	defer httpResp.Body.Close()
+	if httpResp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(httpResp.Body)
+		t.Fatalf("got %d: %s", httpResp.StatusCode, b)
+	}
+	_, _ = io.ReadAll(httpResp.Body)
+
+	if opened == nil {
+		t.Fatal("the recorder could not open the sealed request")
+	}
+	if bytes.Contains(opened["messages"], []byte("tool_addition")) {
+		t.Errorf("the enclave received a tool_addition block: %s", opened["messages"])
+	}
+	var tools []struct{ Name string }
+	if err := json.Unmarshal(opened["tools"], &tools); err != nil {
+		t.Fatalf("opened tools = %s: %v", opened["tools"], err)
+	}
+	if len(tools) != 2 || tools[0].Name != "Bash" || tools[1].Name != "secret_deferred_tool" {
+		t.Errorf("opened tools = %s, want Bash then secret_deferred_tool", opened["tools"])
+	}
+	if bytes.Contains(wireBody, []byte("secret_deferred_tool")) {
+		t.Error("the folded tool definition is readable by the router")
+	}
+}
