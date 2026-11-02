@@ -11,8 +11,9 @@
 // under), read over the unix socket the runtime mounts into the container.
 //
 // The socket is a privileged surface — the same endpoint also derives keys and
-// issues quotes — so this package deliberately implements ONLY Info: identity and
-// the manifest that Info already carries, nothing else. In the deployed form it is
+// issues quotes — so this package implements only Info (identity and the manifest it
+// carries) and GetQuote. GetQuote is used by cmd/quoter alone, which fixes the
+// report_data it asks for; see docs/design/cloud-gateway.md §6.1. In the deployed form it is
 // kept off the GATEWAY specifically: cmd/cvmid opens the socket once at boot,
 // writes the identity file and the app-compose, and exits, so the container that
 // handles user prompts reads plain files and never touches the agent
@@ -33,6 +34,7 @@ package dstack
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -104,7 +106,7 @@ type Info struct {
 // carry on rather than refusing to serve, because this is telemetry, not a
 // security control.
 func FetchInfo(ctx context.Context, socket string) (Info, error) {
-	body, err := postInfo(ctx, socket)
+	body, err := post(ctx, socket, "Info", "{}")
 	if err != nil {
 		return Info{}, err
 	}
@@ -160,7 +162,7 @@ type tcbInfoEnvelope struct {
 // — no reformatting, no re-marshalling, no re-indenting, each of which would change
 // the digest while leaving the JSON "equal".
 func FetchAppCompose(ctx context.Context, socket string) ([]byte, error) {
-	body, err := postInfo(ctx, socket)
+	body, err := post(ctx, socket, "Info", "{}")
 	if err != nil {
 		return nil, err
 	}
@@ -187,13 +189,38 @@ func FetchAppCompose(ctx context.Context, socket string) ([]byte, error) {
 	return []byte(tcb.AppCompose), nil
 }
 
-// postInfo makes the guest agent's Info call and returns the raw reply body.
+// GetQuote asks the guest agent for a TDX quote over reportData, used verbatim (the
+// agent's GetQuote does not hash or prefix it). It returns the raw quote bytes. An
+// empty socket path uses DefaultSocket.
+func GetQuote(ctx context.Context, socket string, reportData [64]byte) ([]byte, error) {
+	req, err := json.Marshal(map[string]string{"report_data": hex.EncodeToString(reportData[:])})
+	if err != nil {
+		return nil, err
+	}
+	body, err := post(ctx, socket, "GetQuote", string(req))
+	if err != nil {
+		return nil, err
+	}
+	var reply struct {
+		Quote string `json:"quote"`
+	}
+	if err := json.Unmarshal(body, &reply); err != nil {
+		return nil, fmt.Errorf("dstack guest agent at %s: decode GetQuote: %w", socket, err)
+	}
+	quote, err := hex.DecodeString(strings.TrimPrefix(reply.Quote, "0x"))
+	if err != nil || len(quote) == 0 {
+		return nil, fmt.Errorf("dstack guest agent at %s: GetQuote returned no usable quote", socket)
+	}
+	return quote, nil
+}
+
+// post makes one guest-agent call and returns the raw reply body.
 //
 // The guest agent speaks plain HTTP/JSON over the unix socket: POST /<Method> with
 // a JSON body (dstack SDK's DstackClient, PATH_PREFIX "/"). The host in the URL is
 // ignored — the dialer always lands on the socket — but it must be present and
 // syntactically valid for net/http to build the request.
-func postInfo(ctx context.Context, socket string) ([]byte, error) {
+func post(ctx context.Context, socket, method, reqBody string) ([]byte, error) {
 	if socket == "" {
 		socket = DefaultSocket
 	}
@@ -207,7 +234,7 @@ func postInfo(ctx context.Context, socket string) ([]byte, error) {
 	}
 	defer client.CloseIdleConnections()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://dstack-guest-agent/Info", strings.NewReader("{}"))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://dstack-guest-agent/"+method, strings.NewReader(reqBody))
 	if err != nil {
 		return nil, err
 	}
@@ -219,16 +246,16 @@ func postInfo(ctx context.Context, socket string) ([]byte, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("dstack guest agent at %s: Info -> %s", socket, resp.Status)
+		return nil, fmt.Errorf("dstack guest agent at %s: %s -> %s", socket, method, resp.Status)
 	}
 	// One byte past the cap, so an oversized reply is reported rather than silently
 	// truncated into a decode error that names the wrong problem.
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("dstack guest agent at %s: read Info: %w", socket, err)
+		return nil, fmt.Errorf("dstack guest agent at %s: read %s: %w", socket, method, err)
 	}
 	if len(body) > maxResponseBytes {
-		return nil, fmt.Errorf("dstack guest agent at %s: Info reply is larger than %d bytes", socket, maxResponseBytes)
+		return nil, fmt.Errorf("dstack guest agent at %s: %s reply is larger than %d bytes", socket, method, maxResponseBytes)
 	}
 	return body, nil
 }

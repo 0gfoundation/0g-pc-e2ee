@@ -381,7 +381,7 @@ func containersOf(services []compose.Service) []containerRef {
 // the namespace .github/workflows/release.yml publishes to — which answers
 // "third-party" for ghcr.io/0gfoundation/0g-serving-broker: 0G's own broker image,
 // stamped as someone else's for the sole reason that it ships from a different
-// repository. On the gateway's own four containers the two rules agree; on a
+// repository. On the gateway's own containers the two rules agree; on a
 // provider's they do not, and the repo-scoped one is simply wrong there.
 //
 // It stays a fact about the image reference in the authenticated compose text, never

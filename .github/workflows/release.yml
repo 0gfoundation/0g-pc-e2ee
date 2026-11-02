@@ -118,9 +118,10 @@ jobs:
 
           # Replace EVERY `image:` mapping line referencing the gateway image,
           # whatever it currently is (:latest, :tag, or @sha256). There is more than
-          # one: the `gateway` service and the `cvm-identity` init container, which
-          # runs the cvmid binary out of the same artifact and must therefore carry
-          # the SAME digest — one substitution with one ${DIGEST} guarantees that.
+          # one: the `gateway` service, the `cvm-identity` init container and the
+          # `quoter` service, which run the cvmid and quoter binaries out of the same
+          # artifact and must therefore carry the SAME digest — one substitution with
+          # one ${DIGEST} guarantees that.
           # The `^\s*image:` anchor skips the comments that also mention the image
           # name. Every other byte is preserved, so the release manifest cannot
           # drift from the compose at this commit.
@@ -151,7 +152,7 @@ jobs:
             echo "::error::expected digest pin missing in $OUT"; exit 1
           fi
           # Every gateway-image line survived the substitution and carries THIS
-          # digest — so the gateway and cvm-identity cannot end up on different
+          # digest — so the gateway, cvm-identity and quoter cannot end up on different
           # builds of an artifact they are required to share.
           if [[ "${SRC_N:-0}" -eq 0 || "${SRC_N:-0}" -ne "${OUT_N:-0}" ]]; then
             echo "::error::expected ${SRC_N:-0} gateway-image line(s) pinned to ${DIGEST}, found ${OUT_N:-0}"; exit 1

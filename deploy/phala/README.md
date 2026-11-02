@@ -8,8 +8,8 @@ model (tier 2.5: confidential by default, cheating publicly detectable).
 
 ## How it works
 
-One CVM, one measured compose file, four containers — the two on the request path
-plus two that only support them:
+One CVM, one measured compose file, five containers — the two on the request path
+plus three that only support them:
 
 ```
 client ──TLS──> platform host front end ──> dstack gateway ──passthrough──┐
@@ -19,13 +19,17 @@ client ──TLS──> platform host front end ──> dstack gateway ──pas
                                        │ dstack-ingress ──plaintext──> gateway    │
                                        │                                          │
                                        │ cvm-identity (init, exits)               │
+                                       │ quoter ◀── gateway (GET /evidence only)  │
                                        │ prometheus-agent ──metrics out──▶        │
                                        └──────────────────────────────────────────┘
 ```
 
-The two support containers are covered below: [`cvm-identity`](#telling-replicas-apart)
+The support containers are covered below: [`cvm-identity`](#telling-replicas-apart)
 writes this replica's `instance_id`/`app_id` once at boot and exits, and
-[`prometheus-agent`](#metrics-prometheus) ships telemetry out.
+[`prometheus-agent`](#metrics-prometheus) ships telemetry out. `quoter` holds the
+dstack guest-agent socket and mints the per-request quote the gateway relays at
+`GET /evidence?nonce=` (see [docs/verifying-the-gateway.md](../../docs/verifying-the-gateway.md#nonce-bound-quote-get-evidence));
+the gateway itself never holds that socket.
 
 - [dstack-ingress](https://github.com/Dstack-TEE/dstack-examples/tree/main/custom-domain)
   terminates TLS **inside this CVM**: it generates the key in the enclave, gets a
@@ -52,7 +56,7 @@ writes this replica's `instance_id`/`app_id` once at boot and exits, and
   `mr_config_id` commits to `compose_hash`, the SHA-256 of the app-compose manifest
   that embeds this compose file verbatim. So one
   quote proves *"a CVM running exactly this app-compose obtained this certificate
-  inside the TEE"*, covering all four containers. See [Verify](#verify) for the steps
+  inside the TEE"*, covering every container. See [Verify](#verify) for the steps
   the quote cannot do for you.
 - The gateway also **describes itself** at `/v1/gateway/identity` — the `app_id`,
   OS image, container list and matching release read out of the same quote and

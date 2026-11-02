@@ -183,6 +183,25 @@ controlled only by that enclave?"**
 > binding its own signing key; we have **decided not to add gateway response
 > signing** (see §6.2), so no gateway quote is needed at all. Inference
 > authenticity rides the provider's own SPEC §8 signature instead.
+>
+> **One narrow exception: `GET /evidence?nonce=` (nonce-bound quote).** A verifier
+> that is not on the TLS connection — e.g. an AntSeed buyer, which only sees what
+> its seller relays — cannot do the handshake step above, so a quote fixed at
+> certificate issuance gives it no freshness. For that case the CVM mints a quote
+> per request with `report_data[0:32] = SHA-256(nonce_hex ‖ e2e_pubkey_b64)` (zero
+> padded; AntSeed's `nonce-pubkey-sha256-v1`), where `e2e_pubkey` is the served
+> certificate's SubjectPublicKeyInfo. This does not reopen the decision above:
+> - **no new key** — it binds the same ingress certificate key `/evidences` binds,
+>   only refreshed with a caller's nonce;
+> - **no gateway response signing** — §6.2 is unchanged;
+> - **hardware-signed, not self-described** — §6.3 is unaffected.
+>
+> The quote is minted by a separate `quoter` container that holds the guest-agent
+> socket; the gateway only relays it. The quoter accepts only a nonce and reads the
+> public key from the certificate file itself, so a compromised gateway still cannot
+> obtain a quote over any other `report_data`. What the quote proves is freshness and
+> "a CVM running this compose holds this certificate key"; tying that to the
+> connection a request actually used remains the consumer's job.
 
 1. **Cert-binding quote**: a TDX quote from inside the CVM that commits to the served
    cert (via `report_data`) and to the deployment's `compose_hash` (via
@@ -247,7 +266,7 @@ Two properties follow, and both are enforced in code (`client/cmd/gateway/identi
   mismatch reports `containers: null` rather than a list. Publishing a container list
   out of unchecked bytes would be the gateway vouching for itself, which is precisely
   what §6.2 says it must not do.
-- **`containers[].source` says who published each image.** All four containers are
+- **`containers[].source` says who published each image.** All the containers are
   covered by `compose_hash`; what differs is who answers for the contents. The label
   reads the reference's registry and namespace — our namespace on `ghcr.io`, the only
   registry we publish through — so it is a fact about the
@@ -256,8 +275,9 @@ Two properties follow, and both are enforced in code (`client/cmd/gateway/identi
   third-party images (`dstack-ingress`, `prometheus`) get a digest and never a release
   link. The same label, computed the same way, appears on §6.4's provider list.
 
-This does not reopen the "no `/quote` route" decision: publishing a parsed
-*description* of an attestation is a different act from signing one.
+This does not reopen the "no `/quote` route" decision (§6.1, including its one
+exception for `GET /evidence`): publishing a parsed *description* of an attestation
+is a different act from signing one.
 
 ### 6.4 What the gateway says about a *provider* is a relay — and it does carry verdicts
 

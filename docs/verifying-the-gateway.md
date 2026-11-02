@@ -288,6 +288,46 @@ compared.
 
 ---
 
+## Nonce-bound quote (`GET /evidence`)
+
+The bundle above is minted once per certificate, so it says nothing about *when* it
+was produced. A verifier that is not on the TLS connection itself — for example a
+marketplace buyer that only sees what an intermediary relays — needs freshness
+instead. For that, the gateway serves a quote minted for each request:
+
+```sh
+NONCE=$(openssl rand -hex 32)
+curl -s "https://<gateway-domain>/evidence?nonce=$NONCE" > fresh.json
+# {"quote":"<base64 TDX quote>","e2e_pubkey":"<base64 SubjectPublicKeyInfo>"}
+```
+
+The quote's `report_data` is
+
+```
+report_data[0:32]  = SHA-256(nonce_hex ‖ e2e_pubkey_b64)   # both as ASCII strings
+report_data[32:64] = 0
+```
+
+with `nonce_hex` in lowercase. This is the `nonce-pubkey-sha256-v1` layout used by
+AntSeed's verifier. `e2e_pubkey` is the public key of the certificate this replica
+serves — the same certificate the bundle binds — and the quote's `mr_config_id`
+carries `compose_hash` exactly as in step 2.
+
+```bash
+jq -r .quote fresh.json | base64 -d > fresh.quote
+# DCAP-verify fresh.quote as in step 2, then compare its report_data with:
+printf '%s%s' "$NONCE" "$(jq -r .e2e_pubkey fresh.json)" | sha256sum
+# and, if you are on a TLS connection to the gateway, the key you were served:
+openssl s_client -connect <gateway-domain>:443 -servername <gateway-domain> </dev/null 2>/dev/null \
+  | openssl x509 -pubkey -noout | openssl pkey -pubin -outform DER | base64 -w0
+```
+
+What it adds is freshness only. The binding to the connection a request actually used
+is still the handshake comparison in step 4; a consumer that cannot do that has to get
+it from whoever is on the connection. The route answers every origin, is never cached,
+returns `429` when too many quotes are being minted at once, and `503` before the
+certificate has been issued. Each replica answers for itself, like the bundle.
+
 ## What the gateway says about itself
 
 A deployment also serves a one-line summary of its own identity:
