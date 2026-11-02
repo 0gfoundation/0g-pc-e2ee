@@ -20,9 +20,10 @@ const (
 // block stays in the history for the rest of the session. Upstreams that check
 // content blocks against a fixed list of types reject it with a 400 (the 0GM
 // sglang /v1/messages and the glm-5.3 Anthropic endpoint both do). Claude Code
-// answers that 400 by stripping the blocks from every later request, which is
-// not a request those upstreams handle either, so the session stays broken.
-// Declaring the tool up front means the same thing and every upstream accepts it.
+// answers that 400 by stripping the blocks from every later request; on
+// 2026-11-02 the 0GM engine answered each of those stripped requests with a 500,
+// so the session stayed broken. Declaring the tool up front means the same thing
+// and every upstream accepts it, so the 400 that starts this never happens.
 //
 // The router already does this fold (0g-router #1146, foldToolAdditions), but on
 // a sealed request it only sees ciphertext: `messages` is sealed payload. So the
