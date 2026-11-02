@@ -39,6 +39,13 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
         -o /out/cvmid ./cmd/cvmid
 
+# quoter: mints the nonce-bound quote behind GET /evidence (see cmd/quoter). Same
+# image for the same reason as cvmid.
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
+        -o /out/quoter ./cmd/quoter
+
 FROM gcr.io/distroless/static-debian12:nonroot
 
 LABEL org.opencontainers.image.source="https://github.com/0gfoundation/0g-pc-e2ee"
@@ -47,6 +54,7 @@ LABEL org.opencontainers.image.description="0G Private Computer cloud-TEE gatewa
 
 COPY --from=build /out/gateway /usr/local/bin/gateway
 COPY --from=build /out/cvmid /usr/local/bin/cvmid
+COPY --from=build /out/quoter /usr/local/bin/quoter
 
 # The gateway is the default. Because there is no CMD, a compose `command:` would
 # be APPENDED to this entrypoint rather than replacing it — so the identity init

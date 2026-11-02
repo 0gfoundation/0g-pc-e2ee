@@ -4,9 +4,9 @@
 # 0G-operated — inside an attested CVM, behind dstack-ingress. dstack-ingress
 # terminates TLS *inside this CVM* (the key is generated in the enclave and never
 # leaves it) and forwards plaintext to the gateway over the compose network, so the
-# gateway must NOT do TLS and the two have to share one compose / one CVM. Two more
+# gateway must NOT do TLS and the two have to share one compose / one CVM. Three more
 # containers ride along: `cvm-identity`, a one-shot init container naming this
-# replica, and `prometheus-agent`.
+# replica, `quoter` (GET /evidence), and `prometheus-agent`.
 #
 # EVERY byte below is measured into compose_hash — images, volumes, depends_on, env
 # blocks. Editing this file, comments included, changes compose_hash, and so the
@@ -470,6 +470,11 @@ services:
       # list governs who may drive SEALED INFERENCE through the enclave, while this
       # is static public data any `curl` already fetches. Empty unmounts the route.
       - "ZG_GATEWAY_EVIDENCE_DIR=/evidences"
+      # GET /evidence?nonce=: a quote minted per request, bound to the nonce and the
+      # served certificate's public key (cloud-gateway.md §6.1). Relayed from the
+      # `quoter` service below, which holds the guest-agent socket so this container
+      # does not.
+      - "ZG_GATEWAY_QUOTER_URL=http://quoter:8090"
       # This CVM's self-description at /v1/gateway/identity (issue #78), for a
       # browser panel to SHOW what it is connected to. A DESCRIPTION, not evidence —
       # nothing in it is signed, and every value is rederivable with `pcverify
@@ -528,6 +533,28 @@ services:
       - evidences:/evidences:ro
     # The gateway itself holds no secret: no pinned provider key, and no TLS material
     # — the cert and its key belong to dstack-ingress above.
+
+  # Mints the nonce-bound quote behind the gateway's GET /evidence. It holds the
+  # guest-agent socket so the gateway does not; the caller supplies only a nonce,
+  # and the public key it binds is read from the certificate file, so no other
+  # report_data can be requested through it. Compose network only, no port.
+  quoter:
+    # Same image and pin as the gateway (the release workflow pins every line).
+    image: ghcr.io/0gfoundation/0g-pc-e2ee-gateway:latest
+    restart: unless-stopped
+    entrypoint: ["/usr/local/bin/quoter"]
+    # Root, like dstack-ingress and cvm-identity, to open the guest-agent socket.
+    user: "0:0"
+    command:
+      - "-listen"
+      - ":8090"
+      - "-cert"
+      - "/evidences/cert-${DOMAIN}.pem"
+    expose:
+      - "8090"
+    volumes:
+      - /var/run/dstack.sock:/var/run/dstack.sock
+      - evidences:/evidences:ro
 
   # Scrapes the gateway's internal /metrics over the CVM docker network and
   # remote_writes to a central store. AGENT MODE (--enable-feature=agent): no local

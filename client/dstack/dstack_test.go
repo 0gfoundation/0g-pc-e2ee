@@ -299,3 +299,42 @@ func mustJSONString(t *testing.T, s string) string {
 	}
 	return string(b)
 }
+
+func TestGetQuote(t *testing.T) {
+	var gotPath string
+	var gotReq map[string]string
+	path := serveSocket(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&gotReq)
+		// The agent returns more than the quote; only the quote is read.
+		_, _ = io.WriteString(w, `{"quote":"0x0400abcd","event_log":"[]","vm_config":"{}"}`)
+	}))
+
+	var rd [64]byte
+	rd[0], rd[63] = 0x01, 0xff
+	quote, err := GetQuote(context.Background(), path, rd)
+	if err != nil {
+		t.Fatalf("GetQuote: %v", err)
+	}
+	if gotPath != "/GetQuote" {
+		t.Errorf("path = %q, want /GetQuote", gotPath)
+	}
+	// report_data goes over verbatim, all 64 bytes, as hex — no hashing, no prefix.
+	if want := "01" + strings.Repeat("00", 62) + "ff"; gotReq["report_data"] != want {
+		t.Errorf("report_data = %q, want %q", gotReq["report_data"], want)
+	}
+	if string(quote) != "\x04\x00\xab\xcd" {
+		t.Errorf("quote = %x", quote)
+	}
+}
+
+func TestGetQuoteRejectsEmptyOrBadQuote(t *testing.T) {
+	for _, reply := range []string{`{}`, `{"quote":""}`, `{"quote":"zz"}`} {
+		path := serveSocket(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = io.WriteString(w, reply)
+		}))
+		if _, err := GetQuote(context.Background(), path, [64]byte{}); err == nil {
+			t.Errorf("reply %s: GetQuote succeeded, want an error", reply)
+		}
+	}
+}

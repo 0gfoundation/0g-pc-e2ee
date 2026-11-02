@@ -177,6 +177,11 @@ func main() {
 		"directory to serve the public attestation evidence bundle from at /evidences/ (the read-only "+
 			"dstack-ingress `evidences` volume); empty mounts no such route. Served with "+
 			"Access-Control-Allow-Origin: * so browser verifiers can read it (env ZG_GATEWAY_EVIDENCE_DIR)")
+	// The quoter behind GET /evidence (cmd/quoter, on the compose network). Empty
+	// mounts no such route.
+	quoterURL := flag.String("quoter-url", proxycli.EnvOr("ZG_GATEWAY_QUOTER_URL", ""),
+		"base URL of the quoter that mints the nonce-bound quote served at GET /evidence, e.g. "+
+			"http://quoter:8090; empty mounts no such route (env ZG_GATEWAY_QUOTER_URL)")
 	// Where this CVM's own identity comes from. A gateway app can be backed by
 	// several replicas sharing one app_id, so without it a merged log stream and a
 	// shared metrics store cannot tell them apart.
@@ -364,6 +369,15 @@ func main() {
 			os.Exit(1)
 		}
 	}
+	var quoter *url.URL
+	if *quoterURL != "" {
+		u, err := url.Parse(*quoterURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			logger.Error("invalid -quoter-url", "url", *quoterURL)
+			os.Exit(1)
+		}
+		quoter = u
+	}
 
 	// Assemble this CVM's self-description in the background (see identity.go). It
 	// deliberately does not gate startup: every input is optional, the first pass is
@@ -443,7 +457,8 @@ func main() {
 			withEntryPolicy(entryPolicy{
 				openOrigins: openOrigins,
 				sealModels:  sealModelsList,
-			})),
+			}),
+			withQuoter(quoter)),
 		ReadHeaderTimeout: 10 * time.Second, // mitigate slow-header (Slowloris) clients
 		// Backstop for every route: see serverReadTimeout. The sealed inference
 		// routes are bounded tighter, from admission, by defaultBodyReadTimeout.
@@ -801,15 +816,26 @@ func sealedNamespaceGuard(surfaces []string, mux http.Handler) http.Handler {
 	})
 }
 
-// handlerOption configures newHandler's entryPolicy. It is variadic and last so
-// the callers with no opinion — every test that is about something else — keep
-// naming only what they care about.
-type handlerOption func(*entryPolicy)
+// handlerOption configures newHandler beyond its positional arguments. It is
+// variadic and last so the callers with no opinion — every test that is about
+// something else — keep naming only what they care about.
+type handlerOption func(*handlerConfig)
+
+type handlerConfig struct {
+	policy entryPolicy
+	// quoterURL, when set, mounts GET /evidence (freshEvidenceRoute).
+	quoterURL *url.URL
+}
 
 // withEntryPolicy sets the whole policy in one call, which is how main passes it:
 // both fields come from the same startup validation and mean one thing together.
 func withEntryPolicy(p entryPolicy) handlerOption {
-	return func(dst *entryPolicy) { *dst = p }
+	return func(dst *handlerConfig) { dst.policy = p }
+}
+
+// withQuoter mounts GET /evidence, served by the quoter at u.
+func withQuoter(u *url.URL) handlerOption {
+	return func(dst *handlerConfig) { dst.quoterURL = u }
 }
 
 // newHandler mounts the shared OpenAI proxy, the gateway-only operational routes
@@ -853,10 +879,11 @@ func withEntryPolicy(p entryPolicy) handlerOption {
 func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedOrigins []string, instanceID, evidenceDir string,
 	maxInFlight int, identity *identityCache, providerIdentities route.ProviderIdentitySource,
 	ready func() error, logger *slog.Logger, opts ...handlerOption) http.Handler {
-	var policy entryPolicy
+	var cfg handlerConfig
 	for _, opt := range opts {
-		opt(&policy)
+		opt(&cfg)
 	}
+	policy := cfg.policy
 	// The cleartext passthrough to the router, built once: it is the catch-all, and
 	// it is also what a sealed surface's namespace resolves to. Marked as unencrypted
 	// at the one place every cleartext response leaves this process, so no route can
@@ -1157,12 +1184,14 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	if providerIdentities != nil {
 		mux.Handle("GET "+providerIdentityPath, providerIdentityHandler(providerIdentities))
 	}
-	// The gateway exposes no /quote route: it emits no attestation quote of its
-	// own. Endpoint/code identity comes from dstack-ingress's in-CVM cert-binding
-	// attestation (/evidences, which commits to app_id and so covers this image);
-	// see docs/design/cloud-gateway.md §6. The gateway does SERVE that bundle when
-	// -evidence-dir is set — dstack-ingress produces it, this process publishes it
-	// with an origin-independent CORS header (evidenceRoute, mounted below).
+	// The gateway mints no attestation quote of its own. Endpoint/code identity comes
+	// from dstack-ingress's in-CVM cert-binding attestation (/evidences, which commits
+	// to app_id and so covers this image); see docs/design/cloud-gateway.md §6. The
+	// gateway does SERVE that bundle when -evidence-dir is set — dstack-ingress
+	// produces it, this process publishes it with an origin-independent CORS header
+	// (evidenceRoute, mounted below). GET /evidence, the nonce-bound variant, is
+	// relayed from cmd/quoter, which holds the guest-agent socket so this process
+	// does not (freshEvidenceRoute, §6.1).
 	//
 	// Everything else — the router's non-sealed OpenAI surface (model catalog,
 	// discovery) a thin client needs — is reverse-proxied to the router as-is. The
@@ -1188,10 +1217,12 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	// evidenceRoute sits between StampInstance and CORS: the public evidence bundle
 	// answers EVERY origin (`*`), which is a different policy from the sealed API's
 	// allowlist and must not be filtered through it, while still being logged and
-	// still carrying the serving replica's id. See evidenceRoute.
+	// still carrying the serving replica's id. See evidenceRoute. freshEvidenceRoute
+	// (GET /evidence) sits beside it for the same reasons.
 	return openaiproxy.LogRequests(logger,
 		openaiproxy.StampInstance(instanceID,
 			evidenceRoute(evidenceDir,
-				openaiproxy.CORS(allowedOrigins, policy.credentialsAllowed(),
-					sealedNamespaceGuard(surfaces, mux)))))
+				freshEvidenceRoute(cfg.quoterURL,
+					openaiproxy.CORS(allowedOrigins, policy.credentialsAllowed(),
+						sealedNamespaceGuard(surfaces, mux))))))
 }
