@@ -150,6 +150,7 @@ var Anthropic = Endpoint{
 	Path:         "/v1/messages",
 	UpstreamPath: "/v1/messages",
 	Streams:      true,
+	PreSeal:      anthropicPreSeal,
 }
 
 // Image is POST /v1/images/generations: the OpenAI image-generation surface.
