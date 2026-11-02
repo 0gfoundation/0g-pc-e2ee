@@ -13,8 +13,8 @@
 // The socket is a privileged surface — the same endpoint also derives keys and
 // issues quotes — so this package implements only Info (identity and the manifest it
 // carries) and GetQuote. GetQuote is used by cmd/quoter alone, which fixes the
-// report_data it asks for; see docs/design/cloud-gateway.md §6.1. In the deployed form it is
-// kept off the GATEWAY specifically: cmd/cvmid opens the socket once at boot,
+// report_data it asks for (docs/design/cloud-gateway.md §6.1). In the deployed form
+// it is kept off the GATEWAY specifically: cmd/cvmid opens the socket once at boot,
 // writes the identity file and the app-compose, and exits, so the container that
 // handles user prompts reads plain files and never touches the agent
 // (WriteIdentityFile / ReadIdentityFile / FetchAppCompose). Other containers of the

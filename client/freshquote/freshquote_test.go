@@ -15,8 +15,9 @@ import (
 	"time"
 )
 
-// TestReportDataVector pins the byte layout against a value computed with AntSeed's
-// own builder (antseed-verifier src/report-data.ts, noncePubkeySha256V1.build):
+// TestReportDataVector pins the byte layout against a value computed in Node exactly
+// as AntSeed's builder does it (antseed-verifier src/report-data.ts,
+// noncePubkeySha256V1.build):
 //
 //	createHash('sha256').update(nonceHex,'utf8').update(pubkeyB64,'utf8').digest('hex')
 //
