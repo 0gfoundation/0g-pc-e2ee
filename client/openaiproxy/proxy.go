@@ -77,6 +77,7 @@ var passthroughResponseHeaders = []string{
 	"X-ZG-Failure-Source",
 	"Retry-After",
 	"X-Request-ID",
+	"X-Client-Request-Id",
 	"X-RateLimit-Limit-Requests",
 	"X-RateLimit-Remaining-Requests",
 	"X-RateLimit-Reset-Requests",
@@ -408,6 +409,11 @@ var attributionHeaders = map[string]bool{
 	// hashes them (salted per account) — so they ride cleartext like X-0G-*.
 	"x-session-id":             true,
 	"x-claude-code-session-id": true,
+	// OpenAI's caller-chosen request id. The router echoes it and logs it beside
+	// its own request id, so a caller that gave up before the response headers
+	// (the request is still billed) can quote it to find the charge. Opaque and
+	// caller-chosen, like the session ids above.
+	"x-client-request-id": true,
 }
 
 // routingHeaders selects the headers the router legitimately consumes — the

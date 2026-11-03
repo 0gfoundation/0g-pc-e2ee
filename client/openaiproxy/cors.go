@@ -73,7 +73,7 @@ const corsAllowMethods = "GET, POST, PUT, PATCH, DELETE, OPTIONS"
 // for the two conditions that would require narrowing it). Keeping the known names
 // here means a preflight that requests nothing still shows a client which routing
 // directives exist, and it documents them next to the code that forwards them.
-const corsAllowHeaders = "Origin, Content-Type, Authorization, x-api-key, X-Request-Id, " +
+const corsAllowHeaders = "Origin, Content-Type, Authorization, x-api-key, X-Request-Id, X-Client-Request-Id, " +
 	"X-0G-Source-Id, HTTP-Referer, X-Title, " +
 	"X-0G-Provider-Address, X-0G-Provider-Identity, X-0G-Provider-Sort, X-0G-Provider-Trust-Mode, X-0G-Provider-Allow-Fallbacks, " +
 	"X-0G-Provider-Require-Parameters, X-0G-Provider-Max-Price-Usd-Prompt, " +
