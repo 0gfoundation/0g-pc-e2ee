@@ -30,8 +30,12 @@ func TestResolve_EncryptedTransit(t *testing.T) {
 
 	for _, v := range []string{"required", "preferred", ""} {
 		router.transit = v
-		if cands, err := r.Resolve(core.WithCleartextFallback(context.Background()), endpoint.Chat, chatReq()); err != nil || cands.Len() == 0 {
-			t.Errorf("%q: Resolve = %v; want candidates", v, err)
+		cands, err := r.Resolve(core.WithCleartextFallback(context.Background()), endpoint.Chat, chatReq())
+		if err != nil || cands.Len() == 0 {
+			t.Fatalf("%q: Resolve = %v; want candidates", v, err)
+		}
+		if tc, ok := cands.(core.TransitCandidates); !ok || tc.EncryptedTransit() != v {
+			t.Errorf("%q: candidates do not carry the policy for core's preferred downgrade", v)
 		}
 		if got, _ := r.EncryptedTransit(context.Background(), endpoint.Chat, chatReq()); got != v {
 			t.Errorf("EncryptedTransit = %q, want %q", got, v)

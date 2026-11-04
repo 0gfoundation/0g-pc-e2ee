@@ -727,6 +727,7 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 	// bookkeeping about a candidate we could not prepare (see walkErr).
 	var fail walkErr
 	walk := candidateWalk{budget: c.resolveBudgetTO}
+	attempted := false // a sealed request was sent (or a seal tried); see downgradeUnsent
 	for i := 0; i < cands.Len(); i++ {
 		provider, err := walk.provider(ctx, cands, i)
 		if err != nil {
@@ -756,6 +757,7 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 		// A failed attempt is wasted caller time and is charged to the walk; a
 		// stale-key rejection is re-sealed to the provider's current key once.
 		var out wire.Response
+		attempted = true
 		retry, err := c.attemptRekeying(ctx, &walk, &fail, cands, i, provider, func(p Provider) (bool, error) {
 			var (
 				retry bool
@@ -784,8 +786,13 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 		return nil, err
 	}
 
-	// The chain was exhausted without a success. fail is set whenever Len() > 0
-	// (a candidate was tried); guard the impossible empty-chain case anyway.
+	// The chain was exhausted without a success. Under encrypted_transit=preferred a
+	// chain that never got as far as sending goes out in the clear instead.
+	if downgradeUnsent(ctx, cands, attempted) {
+		return nil, ErrNoEncryptedProvider
+	}
+	// fail is set whenever Len() > 0 (a candidate was tried); guard the impossible
+	// empty-chain case anyway.
 	if fail.err == nil {
 		return nil, stageErr(StageUpstream, fmt.Errorf("no provider candidates to try"))
 	}

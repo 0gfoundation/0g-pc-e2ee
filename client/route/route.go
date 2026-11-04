@@ -791,7 +791,7 @@ func (r *Router) Resolve(ctx context.Context, ep endpoint.Endpoint, req wire.Req
 	if transit == core.TransitOff && core.CleartextFallbackFrom(ctx) {
 		return nil, core.ErrEncryptedTransitOff
 	}
-	return &routeCandidates{router: r, providers: providers, upstreamURL: upstream}, nil
+	return &routeCandidates{router: r, providers: providers, upstreamURL: upstream, transit: transit}, nil
 }
 
 // EncryptedTransit implements core.TransitPolicyResolver: the request's
@@ -842,9 +842,16 @@ type routeCandidates struct {
 	// so every candidate materialized from this list agrees on where the sealed
 	// request goes.
 	upstreamURL string
+	// transit is the preview's encrypted_transit, for core's preferred
+	// downgrade (core.TransitCandidates).
+	transit string
 }
 
 func (c *routeCandidates) Len() int { return len(c.providers) }
+
+// EncryptedTransit implements core.TransitCandidates: the preview's
+// encrypted_transit ("" when the router sent none).
+func (c *routeCandidates) EncryptedTransit() string { return c.transit }
 
 // Provider materializes the i-th candidate into a core.Provider, fetching its
 // enc key from the broker (cached). It fails (so core skips to the next
