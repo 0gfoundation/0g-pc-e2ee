@@ -1,0 +1,40 @@
+package route
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/0gfoundation/0g-pc-e2ee/client/core"
+	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
+)
+
+// The preview's encrypted_transit is read (case-folded), and off turns into
+// core.ErrEncryptedTransitOff only for a caller with a cleartext path.
+func TestResolve_EncryptedTransit(t *testing.T) {
+	router := newMockRouter(t, newMockBroker(t))
+	r := New(router.srv.URL)
+
+	router.transit = "Off"
+	if got, err := r.EncryptedTransit(context.Background(), endpoint.Chat, chatReq()); err != nil || got != core.TransitOff {
+		t.Fatalf("EncryptedTransit = %q, %v; want off", got, err)
+	}
+	_, err := r.Resolve(core.WithCleartextFallback(context.Background()), endpoint.Chat, chatReq())
+	if !errors.Is(err, core.ErrEncryptedTransitOff) {
+		t.Fatalf("off with a cleartext path: err = %v, want ErrEncryptedTransitOff", err)
+	}
+	cands, err := r.Resolve(context.Background(), endpoint.Chat, chatReq())
+	if err != nil || cands.Len() == 0 {
+		t.Fatalf("off without a cleartext path must still resolve candidates: %v", err)
+	}
+
+	for _, v := range []string{"required", "preferred", ""} {
+		router.transit = v
+		if cands, err := r.Resolve(core.WithCleartextFallback(context.Background()), endpoint.Chat, chatReq()); err != nil || cands.Len() == 0 {
+			t.Errorf("%q: Resolve = %v; want candidates", v, err)
+		}
+		if got, _ := r.EncryptedTransit(context.Background(), endpoint.Chat, chatReq()); got != v {
+			t.Errorf("EncryptedTransit = %q, want %q", got, v)
+		}
+	}
+}
