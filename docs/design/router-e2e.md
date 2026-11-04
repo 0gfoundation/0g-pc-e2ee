@@ -206,3 +206,31 @@ rotation and CDN multi-cert fronting; only an optional secondary check.
   target users?
 - Candidate-list freshness/caching policy and how it interacts with the router's
   live load view.
+
+## Encrypted transit (0g-router #1215, G1)
+
+The router decides, per request, how much encryption the caller requires —
+`encrypted_transit`: `off` | `preferred` (default) | `required`, merged from the
+account's and the API key's routing rules and the `X-0G-Encrypted-Transit`
+request header (which may only make it stricter) — and returns the effective value
+as a top-level `encrypted_transit` in the route-preview reply. The gateway reads it
+from the preview it already makes for every sealed request, and acts on it:
+
+| `encrypted_transit` | the gateway |
+|---|---|
+| `off` | forwards the request to the router in the clear instead of sealing it (`core.ErrEncryptedTransitOff`, only where a cleartext path exists — the sidecar seals anyway) |
+| `preferred`, or absent (a router with its routing policy off) | seals, as before; a request the channel cannot carry (an async image submit asking for `response_format: "url"`) goes out in the clear, marked `X-0G-Encrypted-Transit-Reason` |
+| `required` | seals; the router lists only providers that can be sealed to (none → its `503 no_provider_for_encrypted_transit` is relayed), and a request the channel cannot carry is refused with `400 encrypted_transit_unsupported_feature` |
+
+Every inference response carries `X-0G-Encrypted-Transit-Status: encrypted | plaintext`
+(the same statement as the older `X-0G-E2EE: sealed | none`, which is still sent
+during the transition). Requests sent in the clear or refused because of the policy
+are counted in `zg_gateway_encrypted_transit_decisions_total{outcome,policy,reason}`;
+its `plaintext` rows under `preferred` are the downgrades, the evidence for
+retiring `response_format: "url"`.
+
+The router is the backstop: it refuses a plaintext request under `required`
+itself (`403 encrypted_transit_mismatch`), so a request that never reaches this
+logic — a model outside `-seal-models`, which the gateway passes through without a
+preview — is still not served in the clear against the caller's rule.
+

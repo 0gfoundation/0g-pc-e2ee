@@ -9,6 +9,7 @@
 package openaiproxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -172,8 +173,9 @@ type Option func(*options)
 
 type options struct {
 	verboseUpstreamErrors bool
-	// cleartext is where an async surface sends a request it will not seal; see
-	// WithCleartext. nil refuses such a request instead.
+	// cleartext is where a surface sends a request it will not seal; see
+	// WithCleartext. nil refuses such a request instead, and seals a request
+	// whose encrypted_transit is off.
 	cleartext http.Handler
 }
 
@@ -359,11 +361,22 @@ func Register(mux *http.ServeMux, ep endpoint.Endpoint, c *core.Client, opts ...
 		// user, who can fetch and audit the §8 signature from the broker.
 		meta := &core.ResponseMeta{}
 		ctx = core.WithResponseMeta(ctx, meta)
+		// encrypted_transit=off sends the request in the clear, as the body
+		// arrived; see forwardOff.
+		var off func()
+		if o.cleartext != nil {
+			ctx = core.WithCleartextFallback(ctx)
+			off = func() { o.forwardOff(w, r, body) }
+		}
 		if stream {
-			serveStream(ctx, w, ep, c, req, o, meta)
+			serveStream(ctx, w, ep, c, req, o, meta, off)
 			return
 		}
 		resp, err := c.Complete(ctx, req)
+		if off != nil && errors.Is(err, core.ErrEncryptedTransitOff) {
+			off()
+			return
+		}
 		recordCompletion(err)
 		if err != nil {
 			o.writeError(w, err)
@@ -531,7 +544,7 @@ func statusFor(err error) int {
 // protocol — an Anthropic SDK dispatches on the event name, so unnamed frames
 // arrive unusable, and the trailing `[DONE]` is an event its taxonomy has no
 // rule for.
-func serveStream(ctx context.Context, w http.ResponseWriter, ep endpoint.Endpoint, c *core.Client, req wire.Request, o options, meta *core.ResponseMeta) {
+func serveStream(ctx context.Context, w http.ResponseWriter, ep endpoint.Endpoint, c *core.Client, req wire.Request, o options, meta *core.ResponseMeta, off func()) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeGatewayError(w, http.StatusInternalServerError, "streaming not supported by server")
@@ -579,6 +592,12 @@ func serveStream(ctx context.Context, w http.ResponseWriter, ep endpoint.Endpoin
 		flusher.Flush()
 		return nil
 	})
+	if off != nil && !wroteHeader && errors.Is(err, core.ErrEncryptedTransitOff) {
+		// Answered before any frame: nothing was sent, so the request can still
+		// go out in the clear.
+		off()
+		return
+	}
 	recordCompletion(err)
 	if err != nil {
 		if !wroteHeader {
@@ -631,6 +650,23 @@ func writeSSEEvent(w io.Writer, name string, payload []byte) error {
 	}
 	_, err := fmt.Fprintf(w, "data: %s\n\n", payload)
 	return err
+}
+
+// forwardOff sends a request whose effective encrypted_transit is off to the
+// cleartext path, with the body exactly as it arrived (the sealed path read it
+// whole, so it is rewound here). The caller allowed plaintext, so this is not a
+// downgrade: the response is marked plaintext and carries no
+// HeaderEncryptedTransitReason.
+func (o options) forwardOff(w http.ResponseWriter, r *http.Request, body []byte) {
+	metrics.EncryptedTransitDecision("plaintext", core.TransitOff, "policy_off")
+	forwardCleartext(w, r, body, o.cleartext)
+}
+
+// forwardCleartext hands r to h with its body rewound to body.
+func forwardCleartext(w http.ResponseWriter, r *http.Request, body []byte, h http.Handler) {
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.ContentLength = int64(len(body))
+	h.ServeHTTP(w, r)
 }
 
 // writeErrorObject emits a JSON error response body at the given status.

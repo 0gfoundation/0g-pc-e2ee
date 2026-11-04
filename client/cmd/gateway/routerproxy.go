@@ -92,7 +92,7 @@ func newRouterProxy(target *url.URL, logger *slog.Logger) *httputil.ReverseProxy
 			// emitted this name would APPEND to ours, and a client reading the header
 			// would see two contradictory values on one response. The router does not send
 			// it today; this makes that fact stop mattering.
-			resp.Header.Del(openaiproxy.HeaderE2EE)
+			openaiproxy.StripTransitHeaders(resp.Header)
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {

@@ -311,7 +311,8 @@ func TestCORSActualRequestAllowed(t *testing.T) {
 // X-0G-E2EE) lead the list; everything after them is the passthrough set, in order.
 func TestCORSExposeHeadersTracksPassthrough(t *testing.T) {
 	got := strings.Split(corsExposeHeaders, ", ")
-	want := append([]string{headerResKey, headerProvider, HeaderGatewayInstance, HeaderE2EE}, passthroughResponseHeaders...)
+	want := append([]string{headerResKey, headerProvider, HeaderGatewayInstance, HeaderE2EE,
+		HeaderEncryptedTransitStatus, HeaderEncryptedTransitReason}, passthroughResponseHeaders...)
 	if len(got) != len(want) {
 		t.Fatalf("Expose-Headers has %d entries, want %d (the proxy-originated headers + every passthrough header)", len(got), len(want))
 	}

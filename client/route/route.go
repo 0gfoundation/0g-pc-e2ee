@@ -778,11 +778,29 @@ func (r *Router) Resolve(ctx context.Context, ep endpoint.Endpoint, req wire.Req
 	if err != nil {
 		return nil, err
 	}
-	providers, err := r.preview(ctx, ep, req)
+	providers, transit, err := r.previewTransit(ctx, ep, req)
 	if err != nil {
 		return nil, err
 	}
+	// encrypted_transit=off (0g-router #1215): the caller allowed plaintext.
+	// Answer that to a front end with a cleartext path and let it forward the
+	// request there; one without (the sidecar) seals anyway, since off permits
+	// plaintext rather than demanding it. required and preferred need nothing
+	// here — under required the router already listed only providers that can
+	// be sealed to.
+	if transit == core.TransitOff && core.CleartextFallbackFrom(ctx) {
+		return nil, core.ErrEncryptedTransitOff
+	}
 	return &routeCandidates{router: r, providers: providers, upstreamURL: upstream}, nil
+}
+
+// EncryptedTransit implements core.TransitPolicyResolver: the request's
+// effective encrypted_transit, as route-preview reports it ("" from a router
+// that does not send one). It costs one preview; the gateway asks only for a
+// request it cannot seal, to decide between downgrading and refusing it.
+func (r *Router) EncryptedTransit(ctx context.Context, ep endpoint.Endpoint, req wire.Request) (string, error) {
+	_, transit, err := r.previewTransit(ctx, ep, req)
+	return transit, err
 }
 
 // upstreamURL is the router endpoint a sealed request of this service type is
@@ -1738,6 +1756,12 @@ type previewResponse struct {
 	Object      string            `json:"object"`
 	ServiceType string            `json:"service_type"`
 	Providers   []previewProvider `json:"providers"`
+	// EncryptedTransit is the request's effective encrypted_transit — off |
+	// preferred | required — merged by the router from the account's, the API
+	// key's and the X-0G-Encrypted-Transit header's values. Absent from a router
+	// that predates it or runs with its routing policy off; "" then means
+	// preferred, today's behaviour.
+	EncryptedTransit string `json:"encrypted_transit"`
 }
 
 // preview asks the router to rank providers for req and returns the full ordered
@@ -1753,6 +1777,13 @@ type previewResponse struct {
 // the policy and its sizing); a definitive one is returned on the first attempt,
 // so a caller's 401 or 404 is never delayed by a retry that cannot change it.
 func (r *Router) preview(ctx context.Context, ep endpoint.Endpoint, req wire.Request) ([]previewProvider, error) {
+	providers, _, err := r.previewTransit(ctx, ep, req)
+	return providers, err
+}
+
+// previewTransit is preview that also returns the reply's encrypted_transit,
+// lower-cased ("" when the router sent none).
+func (r *Router) previewTransit(ctx context.Context, ep endpoint.Endpoint, req wire.Request) ([]previewProvider, string, error) {
 	withheld := r.withheldFor(ep)
 	payload := make(map[string]json.RawMessage, len(req)+2)
 	for k, v := range req {
@@ -1819,7 +1850,7 @@ func (r *Router) preview(ctx context.Context, ep endpoint.Endpoint, req wire.Req
 	body, err := json.Marshal(payload)
 	if err != nil {
 		outcome = previewInternal.callOutcome()
-		return nil, upstream(0, fmt.Errorf("marshal preview request: %w", err))
+		return nil, "", upstream(0, fmt.Errorf("marshal preview request: %w", err))
 	}
 
 	backoff := previewRetryBackoff
@@ -1846,12 +1877,12 @@ func (r *Router) preview(ctx context.Context, ep endpoint.Endpoint, req wire.Req
 			case <-ctx.Done():
 				t.Stop()
 				outcome = "canceled"
-				return nil, upstream(0, fmt.Errorf("route preview: %w (last error: %v)", ctx.Err(), lastErr))
+				return nil, "", upstream(0, fmt.Errorf("route preview: %w (last error: %v)", ctx.Err(), lastErr))
 			case <-t.C:
 			}
 			backoff *= 2
 		}
-		providers, res, err := r.previewOnce(ctx, body, req)
+		pr, res, err := r.previewOnce(ctx, body, req)
 		if err == nil {
 			metrics.PreviewAttempt(string(res))
 			r.previewRetries.answered()
@@ -1863,7 +1894,7 @@ func (r *Router) preview(ctx context.Context, ep endpoint.Endpoint, req wire.Req
 			if attempt > 0 {
 				outcome = "ok_retried"
 			}
-			return providers, nil
+			return pr.Providers, strings.ToLower(strings.TrimSpace(pr.EncryptedTransit)), nil
 		}
 		// Only a RETRYABLE failure may be re-attributed to the caller, and the test is
 		// an allowlist for the same reason verifyOutcome's is: written as "anything
@@ -1884,14 +1915,14 @@ func (r *Router) preview(ctx context.Context, ep endpoint.Endpoint, req wire.Req
 			// Does not touch the retry gate: only a preview that SUCCEEDED reopens it
 			// (retryGate.answered explains why a definitive reply does not).
 			outcome = res.callOutcome()
-			return nil, err
+			return nil, "", err
 		}
 	}
 	// Out of attempts (or out of budget, or out of retry allowance) with only
 	// retryable failures behind us: we never got a usable answer, which is the one
 	// shape that is squarely the router's — and the one the gate counts.
 	r.previewRetries.noAnswer()
-	return nil, lastErr
+	return nil, "", lastErr
 }
 
 // previewOnce performs a single route-preview POST with the already-marshaled
@@ -1917,7 +1948,7 @@ func (r *Router) preview(ctx context.Context, ep endpoint.Endpoint, req wire.Req
 // The attempt runs under its own previewAttemptTimeout, which is what bounds it:
 // the shared client caps only the wait for headers, so without this a slow body
 // would leave the attempt (and the retry ceiling built on it) unbounded.
-func (r *Router) previewOnce(ctx context.Context, body []byte, req wire.Request) ([]previewProvider, previewResult, error) {
+func (r *Router) previewOnce(ctx context.Context, body []byte, req wire.Request) (previewResponse, previewResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, r.attemptTimeout())
 	defer cancel()
 
@@ -1927,7 +1958,7 @@ func (r *Router) previewOnce(ctx context.Context, body []byte, req wire.Request)
 		// configuration, not the router misbehaving. (The gateway parses -router-url at
 		// startup and exits, so this is near-unreachable; label it honestly anyway,
 		// because "broken" sends a runbook at the router.)
-		return nil, previewInternal, upstream(0, err)
+		return previewResponse{}, previewInternal, upstream(0, err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	// Forward routing directives first, then the credential, so the credential
@@ -1943,28 +1974,28 @@ func (r *Router) previewOnce(ctx context.Context, body []byte, req wire.Request)
 
 	resp, err := r.http.Do(httpReq)
 	if err != nil {
-		return nil, previewRetryable, upstream(0, fmt.Errorf("route preview request: %w", err))
+		return previewResponse{}, previewRetryable, upstream(0, fmt.Errorf("route preview request: %w", err))
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxControlBodyBytes))
 	if err != nil {
-		return nil, previewRetryable, upstream(0, fmt.Errorf("read route preview response: %w", err))
+		return previewResponse{}, previewRetryable, upstream(0, fmt.Errorf("read route preview response: %w", err))
 	}
 	if resp.StatusCode != http.StatusOK {
 		// Surface the router's status verbatim (401/404/503 are meaningful) and carry
 		// its body as Error.Body; the proxy decides whether to pass the router's
 		// client-facing error through (sidecar / structured passthrough) or withhold
 		// it (see openaiproxy.errorEnvelope).
-		return nil, previewStatusResult(resp.StatusCode),
+		return previewResponse{}, previewStatusResult(resp.StatusCode),
 			upstreamBody(resp.StatusCode, raw, fmt.Errorf("route preview returned %d", resp.StatusCode))
 	}
 
 	var pr previewResponse
 	if err := json.Unmarshal(raw, &pr); err != nil {
-		return nil, previewBroken, upstream(0, fmt.Errorf("decode route preview response: %w", err))
+		return previewResponse{}, previewBroken, upstream(0, fmt.Errorf("decode route preview response: %w", err))
 	}
 	if len(pr.Providers) == 0 {
-		return nil, previewRejected, upstream(http.StatusServiceUnavailable, fmt.Errorf("no provider available for %s", modelDesc(req)))
+		return previewResponse{}, previewRejected, upstream(http.StatusServiceUnavailable, fmt.Errorf("no provider available for %s", modelDesc(req)))
 	}
 	// The router returns candidates ranked best-first; core pins the head and
 	// falls back down the rest (SPEC §4.4). Per-candidate validation is deferred
@@ -1974,7 +2005,7 @@ func (r *Router) previewOnce(ctx context.Context, body []byte, req wire.Request)
 	if len(pr.Providers) > maxPreviewCandidates {
 		pr.Providers = pr.Providers[:maxPreviewCandidates]
 	}
-	return pr.Providers, previewOK, nil
+	return pr, previewOK, nil
 }
 
 // previewStatusResult classifies a non-200 route-preview status. Only a 5xx is

@@ -1,9 +1,10 @@
 package openaiproxy
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
+	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
@@ -34,12 +36,18 @@ const maxPollResponseBytes = 48 << 20
 // a stored result.
 const pollTimeout = 2 * time.Minute
 
-// WithCleartext gives an async surface the handler a request it will not seal
-// is sent to: the cleartext passthrough. Today that is a submit asking for
-// `response_format: "url"`, which cannot be served sealed (the images would be
-// published outside the channel, SPEC §7.1). It is forwarded in the clear,
-// marked X-0G-E2EE: none, rather than refused — a product decision that is
-// still open, made in this one place so changing it is one edit.
+// WithCleartext gives a surface the handler a request it will not seal is sent
+// to: the cleartext passthrough. Two kinds of request go there:
+//
+//   - any request whose effective encrypted_transit is off (the caller allowed
+//     plaintext; see core.ErrEncryptedTransitOff), on every surface;
+//   - an async submit asking for `response_format: "url"`, which cannot be
+//     served sealed (the images would be published outside the channel, SPEC
+//     §7.1), unless encrypted_transit is required — then it is refused with
+//     400 encrypted_transit_unsupported_feature instead (see registerAsync).
+//
+// Either way the response is marked plaintext; a downgrade also carries
+// HeaderEncryptedTransitReason.
 func WithCleartext(h http.Handler) Option {
 	return func(o *options) { o.cleartext = h }
 }
@@ -58,14 +66,9 @@ func registerAsync(mux *http.ServeMux, ep endpoint.Endpoint, c *core.Client, o o
 			writeGatewayError(w, http.StatusBadRequest, "request body is not a JSON object")
 			return
 		}
-		// Not metered here: the router's router_image_request_options_total already
-		// counts these (endpoint async-text-to-image, response_format url, sealed
-		// false), and the seal-decision metric has recorded this request once already
-		// in sealModels.dispatch.
 		if wantsURLFormat(req) && o.cleartext != nil {
-			r.Body = io.NopCloser(bytes.NewReader(body))
-			r.ContentLength = int64(len(body))
-			o.cleartext.ServeHTTP(w, r)
+			o.serveUnsealable(w, r, c, req, body, "response_format", "url",
+				`use "response_format": "b64_json" to receive the images inside the encrypted channel`)
 			return
 		}
 		stream, err := streamRequested(req)
@@ -87,7 +90,14 @@ func registerAsync(mux *http.ServeMux, ep endpoint.Endpoint, c *core.Client, o o
 		ctx = core.WithForwardedHeaders(ctx, routingHeaders(r.Header))
 		meta := &core.ResponseMeta{}
 		ctx = core.WithResponseMeta(ctx, meta)
+		if o.cleartext != nil {
+			ctx = core.WithCleartextFallback(ctx)
+		}
 		resp, status, err := c.SubmitAsync(ctx, req)
+		if o.cleartext != nil && errors.Is(err, core.ErrEncryptedTransitOff) {
+			o.forwardOff(w, r, body)
+			return
+		}
 		recordCompletion(err)
 		if err != nil {
 			o.writeError(w, err)
@@ -104,6 +114,53 @@ func registerAsync(mux *http.ServeMux, ep endpoint.Endpoint, c *core.Client, o o
 		w.WriteHeader(status)
 		_, _ = w.Write(out)
 	})
+}
+
+// serveUnsealable handles a request this surface cannot seal because of one of
+// its fields (field=value), according to the request's encrypted_transit, which
+// it asks the router for (one route-preview):
+//
+//   - required: refused with 400 encrypted_transit_unsupported_feature, naming
+//     the field and how to send it sealed (hint) — the caller required
+//     encryption, so it is not quietly given plaintext;
+//   - off: forwarded in the clear as the caller allowed;
+//   - preferred, or a router that sends no value: forwarded in the clear, as
+//     before, now marked with HeaderEncryptedTransitReason — the downgrade.
+//
+// When the router answers the preview with an error (a 401, or under required a
+// model with no supply to seal to) that answer is relayed: the request would
+// get it anyway. When it cannot be reached the request is forwarded as before;
+// the router refuses a plaintext request under required itself.
+func (o options) serveUnsealable(w http.ResponseWriter, r *http.Request, c *core.Client, req wire.Request, body []byte, field, value, hint string) {
+	ctx := core.WithCredential(r.Context(), credential(r))
+	ctx = core.WithForwardedHeaders(ctx, routingHeaders(r.Header))
+	policy, err := c.EncryptedTransit(ctx, req)
+	var ce *core.Error
+	if err != nil && errors.As(err, &ce) && ce.Status >= 400 {
+		o.writeError(w, err)
+		return
+	}
+	reason := field + "_" + value
+	switch policy {
+	case core.TransitRequired:
+		metrics.EncryptedTransitDecision("refused", policy, reason)
+		writeErrorObject(w, http.StatusBadRequest, map[string]any{
+			"error": map[string]any{
+				"message": fmt.Sprintf("%s %q cannot be sent end-to-end encrypted, and encrypted_transit is required: %s", field, value, hint),
+				"type":    "invalid_request_error",
+				"param":   field,
+				"code":    "encrypted_transit_unsupported_feature",
+			},
+			"_0g": map[string]any{"source": "gateway"},
+		})
+		return
+	case core.TransitOff:
+		metrics.EncryptedTransitDecision("plaintext", policy, "policy_off")
+	default:
+		metrics.EncryptedTransitDecision("plaintext", policy, reason)
+		w.Header().Set(HeaderEncryptedTransitReason, field+"="+value)
+	}
+	forwardCleartext(w, r, body, o.cleartext)
 }
 
 // wantsURLFormat reports whether the request asks for `response_format: "url"`.
