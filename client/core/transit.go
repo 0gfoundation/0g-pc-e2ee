@@ -33,6 +33,18 @@ const (
 // request on its cleartext path.
 var ErrEncryptedTransitOff = errors.New("encrypted_transit is off: forward the request in the clear")
 
+// ErrNoEncryptedProvider is returned by Complete, CompleteStream and
+// SubmitAsync when the request's encrypted_transit is preferred, the caller
+// can forward in the clear (WithCleartextFallback), and no candidate could be
+// prepared for sealing — every one failed before anything was sent (no key to
+// seal to, an attestation that did not verify), so the request has reached no
+// provider. preferred means "encrypt when the model can be": here it cannot,
+// so the front end forwards the original request in the clear and says why.
+//
+// Never for a walk that sent a request: a provider may already be serving it,
+// and sending it again in the clear would run it twice.
+var ErrNoEncryptedProvider = errors.New("no provider could be sealed to: forward the request in the clear")
+
 type cleartextFallbackKey struct{}
 
 // WithCleartextFallback marks ctx as belonging to a request the front end can
@@ -48,6 +60,25 @@ func WithCleartextFallback(ctx context.Context) context.Context {
 func CleartextFallbackFrom(ctx context.Context) bool {
 	v, _ := ctx.Value(cleartextFallbackKey{}).(bool)
 	return v
+}
+
+// TransitCandidates is implemented by Candidates that know the request's
+// effective encrypted_transit (the route resolver's, from route-preview).
+type TransitCandidates interface {
+	EncryptedTransit() string
+}
+
+// downgradeUnsent reports whether a walk that ended without a success may be
+// handed back as ErrNoEncryptedProvider: nothing was sent (attempted false),
+// the caller is still there, has a cleartext path, and the router said
+// preferred. Only an explicit preferred: a router that sends no value (its
+// routing policy off) keeps today's error.
+func downgradeUnsent(ctx context.Context, cands Candidates, attempted bool) bool {
+	if attempted || canceledBy(ctx) || !CleartextFallbackFrom(ctx) {
+		return false
+	}
+	t, ok := cands.(TransitCandidates)
+	return ok && t.EncryptedTransit() == TransitPreferred
 }
 
 // TransitPolicyResolver is implemented by a resolver that can tell the

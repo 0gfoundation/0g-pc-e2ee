@@ -47,8 +47,9 @@ const HeaderEncryptedTransitStatus = "X-0G-Encrypted-Transit-Status"
 
 // HeaderEncryptedTransitReason says why a request this gateway would have
 // sealed went to the router in the clear: the request field the encrypted
-// channel cannot carry, as `field=value` (`response_format=url`). Present only
-// on such a downgrade (encrypted_transit=preferred); absent on a sealed
+// channel cannot carry, as `field=value` (`response_format=url`), or
+// `no_encrypted_provider` when no provider of the model could be sealed to.
+// Present only on such a downgrade (encrypted_transit=preferred); absent on a sealed
 // response, on cleartext the caller asked for (encrypted_transit=off), and on
 // the metadata passthrough, which was never going to be sealed.
 const HeaderEncryptedTransitReason = "X-0G-Encrypted-Transit-Reason"

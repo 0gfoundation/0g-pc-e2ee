@@ -166,8 +166,9 @@ var (
 	// Requests on a sealed surface that went to the router in the clear, or were
 	// refused, because of their encrypted_transit (0g-router #1215, G1) — by the
 	// policy that applied (off | preferred | required | unknown, for a router that
-	// sends none) and why: `policy_off` (the caller allowed plaintext), or the
-	// request field the encrypted channel cannot carry (`response_format_url`).
+	// sends none) and why: `policy_off` (the caller allowed plaintext), the
+	// request field the encrypted channel cannot carry (`response_format_url`),
+	// or `no_encrypted_provider` (no provider of the model could be sealed to).
 	// The plaintext rows under `preferred` are the downgrades: the evidence for
 	// retiring `response_format: "url"` once few callers still need it.
 	transitDecisions = prometheus.NewCounterVec(prometheus.CounterOpts{
@@ -730,7 +731,7 @@ func RecordSealDecision(model, decision, reason string) {
 // EncryptedTransitDecision counts one request sent in the clear (outcome
 // "plaintext") or refused ("refused") because of its encrypted_transit. policy
 // is the effective value, "unknown" when the router sent none; reason is one of
-// a small closed set (policy_off, response_format_url).
+// a small closed set (policy_off, response_format_url, no_encrypted_provider).
 func EncryptedTransitDecision(outcome, policy, reason string) {
 	if policy == "" {
 		policy = "unknown"

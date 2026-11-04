@@ -41,6 +41,8 @@ const pollTimeout = 2 * time.Minute
 //
 //   - any request whose effective encrypted_transit is off (the caller allowed
 //     plaintext; see core.ErrEncryptedTransitOff), on every surface;
+//   - under preferred, a request none of whose candidates could be prepared for
+//     sealing, before anything was sent (core.ErrNoEncryptedProvider);
 //   - an async submit asking for `response_format: "url"`, which cannot be
 //     served sealed (the images would be published outside the channel, SPEC
 //     §7.1), unless encrypted_transit is required — then it is refused with
@@ -90,12 +92,12 @@ func registerAsync(mux *http.ServeMux, ep endpoint.Endpoint, c *core.Client, o o
 		ctx = core.WithForwardedHeaders(ctx, routingHeaders(r.Header))
 		meta := &core.ResponseMeta{}
 		ctx = core.WithResponseMeta(ctx, meta)
-		if o.cleartext != nil {
+		fallback := o.transitFallback(w, r, body)
+		if fallback != nil {
 			ctx = core.WithCleartextFallback(ctx)
 		}
 		resp, status, err := c.SubmitAsync(ctx, req)
-		if o.cleartext != nil && errors.Is(err, core.ErrEncryptedTransitOff) {
-			o.forwardOff(w, r, body)
+		if fallback != nil && fallback(err) {
 			return
 		}
 		recordCompletion(err)

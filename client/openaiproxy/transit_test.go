@@ -23,6 +23,9 @@ type transitResolver struct {
 	transit  string
 	err      error
 	resolved bool
+	// unsealable: resolve to candidates none of which can be prepared for
+	// sealing, carrying transit — the shape the preferred downgrade acts on.
+	unsealable bool
 }
 
 func (t *transitResolver) Resolve(ctx context.Context, _ endpoint.Endpoint, _ wire.Request) (core.Candidates, error) {
@@ -30,7 +33,19 @@ func (t *transitResolver) Resolve(ctx context.Context, _ endpoint.Endpoint, _ wi
 	if t.transit == core.TransitOff && core.CleartextFallbackFrom(ctx) {
 		return nil, core.ErrEncryptedTransitOff
 	}
+	if t.unsealable {
+		return unsealableCands{t.transit}, nil
+	}
 	return nil, errors.New("sealed path reached")
+}
+
+// unsealableCands: two candidates, neither with a key to seal to.
+type unsealableCands struct{ transit string }
+
+func (unsealableCands) Len() int                   { return 2 }
+func (u unsealableCands) EncryptedTransit() string { return u.transit }
+func (unsealableCands) Provider(context.Context, int) (core.Provider, error) {
+	return core.Provider{}, errors.New("no key to seal to")
 }
 
 func (t *transitResolver) EncryptedTransit(context.Context, endpoint.Endpoint, wire.Request) (string, error) {
@@ -171,5 +186,32 @@ func TestMarkE2EE_TransitStatus(t *testing.T) {
 	StripTransitHeaders(h)
 	if len(h) != 0 {
 		t.Errorf("StripTransitHeaders left %v", h)
+	}
+}
+
+// preferred and no provider could be sealed to, nothing sent: the request goes
+// out in the clear, body intact, marked with the reason — sync, streamed and
+// async alike. With no value from the router (its policy off) it stays an error.
+func TestTransitPreferred_NoEncryptedProviderDowngrades(t *testing.T) {
+	for _, tc := range []struct {
+		ep   endpoint.Endpoint
+		body string
+	}{
+		{endpoint.Chat, `{"model":"glm-5","messages":[{"role":"user","content":"hi"}]}`},
+		{endpoint.Chat, `{"model":"glm-5","stream":true,"messages":[{"role":"user","content":"hi"}]}`},
+		{endpoint.AsyncImage, `{"model":"z-image","prompt":"p"}`},
+	} {
+		rec, ct := serveTransit(t, tc.ep, &transitResolver{transit: core.TransitPreferred, unsealable: true}, true, tc.body)
+		if !ct.hit || ct.body != tc.body {
+			t.Fatalf("%s: cleartext reached = %v, body %q (status %d %s)", tc.body, ct.hit, ct.body, rec.Code, rec.Body)
+		}
+		if got := rec.Header().Get(HeaderEncryptedTransitReason); got != "no_encrypted_provider" {
+			t.Errorf("%s: Reason = %q, want no_encrypted_provider", tc.body, got)
+		}
+
+		rec, ct = serveTransit(t, tc.ep, &transitResolver{unsealable: true}, true, tc.body)
+		if ct.hit || rec.Code < 400 {
+			t.Errorf("%s with no value from the router: cleartext %v, status %d; want the error as before", tc.body, ct.hit, rec.Code)
+		}
 	}
 }

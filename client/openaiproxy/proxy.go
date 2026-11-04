@@ -361,20 +361,18 @@ func Register(mux *http.ServeMux, ep endpoint.Endpoint, c *core.Client, opts ...
 		// user, who can fetch and audit the §8 signature from the broker.
 		meta := &core.ResponseMeta{}
 		ctx = core.WithResponseMeta(ctx, meta)
-		// encrypted_transit=off sends the request in the clear, as the body
-		// arrived; see forwardOff.
-		var off func()
-		if o.cleartext != nil {
+		// encrypted_transit can send the request in the clear, as the body
+		// arrived; see transitFallback.
+		fallback := o.transitFallback(w, r, body)
+		if fallback != nil {
 			ctx = core.WithCleartextFallback(ctx)
-			off = func() { o.forwardOff(w, r, body) }
 		}
 		if stream {
-			serveStream(ctx, w, ep, c, req, o, meta, off)
+			serveStream(ctx, w, ep, c, req, o, meta, fallback)
 			return
 		}
 		resp, err := c.Complete(ctx, req)
-		if off != nil && errors.Is(err, core.ErrEncryptedTransitOff) {
-			off()
+		if fallback != nil && fallback(err) {
 			return
 		}
 		recordCompletion(err)
@@ -544,7 +542,7 @@ func statusFor(err error) int {
 // protocol — an Anthropic SDK dispatches on the event name, so unnamed frames
 // arrive unusable, and the trailing `[DONE]` is an event its taxonomy has no
 // rule for.
-func serveStream(ctx context.Context, w http.ResponseWriter, ep endpoint.Endpoint, c *core.Client, req wire.Request, o options, meta *core.ResponseMeta, off func()) {
+func serveStream(ctx context.Context, w http.ResponseWriter, ep endpoint.Endpoint, c *core.Client, req wire.Request, o options, meta *core.ResponseMeta, fallback func(error) bool) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		writeGatewayError(w, http.StatusInternalServerError, "streaming not supported by server")
@@ -592,10 +590,9 @@ func serveStream(ctx context.Context, w http.ResponseWriter, ep endpoint.Endpoin
 		flusher.Flush()
 		return nil
 	})
-	if off != nil && !wroteHeader && errors.Is(err, core.ErrEncryptedTransitOff) {
+	if fallback != nil && !wroteHeader && fallback(err) {
 		// Answered before any frame: nothing was sent, so the request can still
 		// go out in the clear.
-		off()
 		return
 	}
 	recordCompletion(err)
@@ -651,6 +648,39 @@ func writeSSEEvent(w io.Writer, name string, payload []byte) error {
 	_, err := fmt.Fprintf(w, "data: %s\n\n", payload)
 	return err
 }
+
+// transitFallback returns what to do with a core error that hands the request
+// back to be sent in the clear, or nil when this surface has no cleartext path
+// (then the core never hands one back: see core.WithCleartextFallback). The
+// returned func reports whether it handled err:
+//
+//   - core.ErrEncryptedTransitOff: the caller allowed plaintext (forwardOff);
+//   - core.ErrNoEncryptedProvider: encrypted_transit is preferred and no
+//     provider could be sealed to, with nothing sent — the downgrade, marked
+//     with HeaderEncryptedTransitReason: no_encrypted_provider.
+func (o options) transitFallback(w http.ResponseWriter, r *http.Request, body []byte) func(error) bool {
+	if o.cleartext == nil {
+		return nil
+	}
+	return func(err error) bool {
+		switch {
+		case errors.Is(err, core.ErrEncryptedTransitOff):
+			o.forwardOff(w, r, body)
+		case errors.Is(err, core.ErrNoEncryptedProvider):
+			metrics.EncryptedTransitDecision("plaintext", core.TransitPreferred, reasonNoEncryptedProvider)
+			w.Header().Set(HeaderEncryptedTransitReason, reasonNoEncryptedProvider)
+			forwardCleartext(w, r, body, o.cleartext)
+		default:
+			return false
+		}
+		return true
+	}
+}
+
+// reasonNoEncryptedProvider is HeaderEncryptedTransitReason (and the metric's
+// reason) for a preferred request that went out in the clear because no
+// provider of its model could be sealed to.
+const reasonNoEncryptedProvider = "no_encrypted_provider"
 
 // forwardOff sends a request whose effective encrypted_transit is off to the
 // cleartext path, with the body exactly as it arrived (the sealed path read it

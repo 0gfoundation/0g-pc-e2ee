@@ -219,7 +219,8 @@ from the preview it already makes for every sealed request, and acts on it:
 | `encrypted_transit` | the gateway |
 |---|---|
 | `off` | forwards the request to the router in the clear instead of sealing it (`core.ErrEncryptedTransitOff`, only where a cleartext path exists — the sidecar seals anyway) |
-| `preferred`, or absent (a router with its routing policy off) | seals, as before; a request the channel cannot carry (an async image submit asking for `response_format: "url"`) goes out in the clear, marked `X-0G-Encrypted-Transit-Reason` |
+| `preferred` | seals when it can, and otherwise sends in the clear, marked `X-0G-Encrypted-Transit-Reason`: a request the channel cannot carry (an async image submit asking for `response_format: "url"` → `response_format=url`), or one none of whose candidates could be prepared for sealing — no key to seal to, an attestation that did not verify — before anything was sent (`no_encrypted_provider`, `core.ErrNoEncryptedProvider`). A walk that already sent a sealed request is never re-sent in the clear: a provider may be serving it |
+| absent (a router with its routing policy off) | as before: seals; the `url` submit goes out in the clear (now with the Reason header); a model with nothing to seal to is an error |
 | `required` | seals; the router lists only providers that can be sealed to (none → its `503 no_provider_for_encrypted_transit` is relayed), and a request the channel cannot carry is refused with `400 encrypted_transit_unsupported_feature` |
 
 Every inference response carries `X-0G-Encrypted-Transit-Status: encrypted | plaintext`
