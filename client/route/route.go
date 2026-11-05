@@ -1740,20 +1740,20 @@ type previewResponse struct {
 	Providers   []previewProvider `json:"providers"`
 }
 
-// preview asks the router to rank providers for req and returns the full ordered
-// candidate list (the router's provider-retry budget — the fallback chain). It
-// sends the routing-relevant fields (the request minus the sealed fields) plus
-// the surface's service_type and api_format, forwarding the caller's credential
-// and X-0G-* directives so the router authenticates/bills and steers exactly as
-// it would for the sealed request. "model" is optional and passes through when
-// present (it is not a sealed field): present → candidates are that model's
-// providers; omitted → candidates are any provider of the service type.
-//
-// A transient failure is retried (see previewAttempts and previewRetryBudget for
-// the policy and its sizing); a definitive one is returned on the first attempt,
-// so a caller's 401 or 404 is never delayed by a retry that cannot change it.
-func (r *Router) preview(ctx context.Context, ep endpoint.Endpoint, req wire.Request) ([]previewProvider, error) {
-	withheld := r.withheldFor(ep)
+// PreviewPayload is the route-preview body the sealed path sends for req on ep:
+// the request minus the surface's sealed fields (a capability signal standing in
+// for a withheld field the router routes on), plus service_type and the surface's
+// api_format. Exported for the gateway's "0g/auto" layer, which previews the same
+// request before it is sealed and must withhold exactly the same fields.
+func PreviewPayload(ep endpoint.Endpoint, req wire.Request) map[string]json.RawMessage {
+	withheld := map[string]struct{}{}
+	for _, f := range sensitiveFieldsFor(ep) {
+		withheld[f] = struct{}{}
+	}
+	return previewPayload(withheld, ep, req)
+}
+
+func previewPayload(withheld map[string]struct{}, ep endpoint.Endpoint, req wire.Request) map[string]json.RawMessage {
 	payload := make(map[string]json.RawMessage, len(req)+2)
 	for k, v := range req {
 		if _, sensitive := withheld[k]; sensitive {
@@ -1800,6 +1800,24 @@ func (r *Router) preview(ctx context.Context, ep endpoint.Endpoint, req wire.Req
 	} else {
 		delete(payload, "api_format")
 	}
+
+	return payload
+}
+
+// preview asks the router to rank providers for req and returns the full ordered
+// candidate list (the router's provider-retry budget — the fallback chain). It
+// sends the routing-relevant fields (the request minus the sealed fields) plus
+// the surface's service_type and api_format, forwarding the caller's credential
+// and X-0G-* directives so the router authenticates/bills and steers exactly as
+// it would for the sealed request. "model" is optional and passes through when
+// present (it is not a sealed field): present → candidates are that model's
+// providers; omitted → candidates are any provider of the service type.
+//
+// A transient failure is retried (see previewAttempts and previewRetryBudget for
+// the policy and its sizing); a definitive one is returned on the first attempt,
+// so a caller's 401 or 404 is never delayed by a retry that cannot change it.
+func (r *Router) preview(ctx context.Context, ep endpoint.Endpoint, req wire.Request) ([]previewProvider, error) {
+	payload := previewPayload(r.withheldFor(ep), ep, req)
 
 	// One call-level observation on EVERY exit path, recorded by a defer rather than
 	// at each return so the counter cannot drift from the control flow as this loop
