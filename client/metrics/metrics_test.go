@@ -223,3 +223,35 @@ func histCount(t *testing.T, o prometheus.Observer) float64 {
 	}
 	return float64(pb.GetHistogram().GetSampleCount())
 }
+
+// The decision metric's policy label is bounded to off / preferred / required /
+// unknown whatever the caller passes, so a value from the router (untrusted)
+// can never mint a series of its own.
+func TestEncryptedTransitDecisionBoundsPolicy(t *testing.T) {
+	for _, in := range []string{"required_strict", "", "Off", "x\ny"} {
+		EncryptedTransitDecision("refused", in, "test_bound")
+	}
+	EncryptedTransitDecision("refused", "required", "test_bound")
+	if got := testutil.ToFloat64(transitDecisions.WithLabelValues("refused", "unknown", "test_bound")); got != 4 {
+		t.Errorf("unknown = %v, want 4", got)
+	}
+	if got := testutil.ToFloat64(transitDecisions.WithLabelValues("refused", "required", "test_bound")); got != 1 {
+		t.Errorf("required = %v, want 1", got)
+	}
+	n := 0
+	ch := make(chan prometheus.Metric, 64)
+	transitDecisions.Collect(ch)
+	close(ch)
+	for m := range ch {
+		var d dto.Metric
+		_ = m.Write(&d)
+		for _, l := range d.GetLabel() {
+			if l.GetName() == "reason" && l.GetValue() == "test_bound" {
+				n++
+			}
+		}
+	}
+	if n != 2 {
+		t.Errorf("series for reason=test_bound = %d, want 2 (unknown, required)", n)
+	}
+}

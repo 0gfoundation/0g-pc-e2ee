@@ -223,6 +223,8 @@ from the preview it already makes for every sealed request, and acts on it:
 | absent (a router with its routing policy off) | as before: seals; the `url` submit goes out in the clear (now with the Reason header); a model with nothing to seal to is an error |
 | `required` | seals; the router lists only providers that can be sealed to (none → its `503 no_provider_for_encrypted_transit` is relayed), and a request the channel cannot carry is refused with `400 encrypted_transit_unsupported_feature` |
 
+The value comes from the router, so it is not trusted as sent: route.normalizeTransit folds it onto `off` / `preferred` / `required` / absent, and reads any other value as `required` — most likely a stricter value added after this build, which must not turn into a downgrade — counting each in `zg_gateway_encrypted_transit_unknown_total` (non-zero: the gateway predates its router).
+
 Every inference response carries `X-0G-Encrypted-Transit-Status: encrypted | plaintext`
 (the same statement as the older `X-0G-E2EE: sealed | none`, which is still sent
 during the transition). Requests sent in the clear or refused because of the policy
