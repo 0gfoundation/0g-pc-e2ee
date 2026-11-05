@@ -190,6 +190,20 @@ var Embedding = Endpoint{
 	Streams:      false,
 }
 
+// Decisions is POST /v1/decisions: typed questions about an application state,
+// typed answers back (the OpenRouter Decisions API shape). The router's service
+// type is "decisions".
+//
+// No PreSeal: ProfileDecisions pins nothing (SPEC §7.7). No streaming shape, so
+// `"stream": true` is refused.
+var Decisions = Endpoint{
+	ServiceType:  "decisions",
+	Profile:      wire.ProfileDecisions,
+	Path:         "/v1/decisions",
+	UpstreamPath: "/v1/decisions",
+	Streams:      false,
+}
+
 // All is every surface this module knows how to seal, and adding a row here is
 // what makes a surface exist. The gateway mounts every row — as the sealed
 // handler when its build serves it, as an explicit refusal when not, never left
@@ -209,7 +223,7 @@ var Embedding = Endpoint{
 // silently confused with another. A ByServiceType("chatbot") would have returned
 // whichever chat row came first in this slice and shadowed the other with no
 // error anywhere.
-var All = []Endpoint{Chat, Anthropic, Image, Speech, Embedding, AsyncImage}
+var All = []Endpoint{Chat, Anthropic, Image, Speech, Embedding, Decisions, AsyncImage}
 
 // fieldResponseFormat is the image profile's pinned cleartext field (SPEC §7.1).
 const fieldResponseFormat = "response_format"

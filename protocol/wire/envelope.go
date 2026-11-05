@@ -48,6 +48,15 @@ const (
 	// instruction attached, and for the retrieval corpora these requests usually
 	// carry, the text IS the private asset.
 	fieldInput = "input"
+	// fieldState / fieldQuestions are the two fields a decisions request MUST
+	// always seal (SPEC §7.7). `state` is the application state the questions are
+	// asked about — for a router-style caller, the conversation itself. The
+	// `questions` are the caller's own text too: each one's instructions, its
+	// criteria and even the names it is keyed by describe what is being decided,
+	// in the caller's vocabulary, so sealing only `state` would leave the intent
+	// readable.
+	fieldState     = "state"
+	fieldQuestions = "questions"
 	// fieldTools is the tool/function schema list both chat and Anthropic carry.
 	// It is payload for the reason `messages` is: a schema names an operation the
 	// calling application performs, so the set of them describes what the user is
@@ -82,6 +91,11 @@ const (
 	// the field name, so the two never consult each other's spec.
 	fieldChoices = "choices"
 	fieldData    = "data"
+	// fieldAnswers is a sealed decisions response's content: one typed answer per
+	// question, keyed by the question's name, with the probabilities behind it
+	// and, for span questions, character offsets into `state` — which reveal the
+	// state's structure, so the whole object is sealed.
+	fieldAnswers = "answers"
 	// The Anthropic response carries its generated content in a different field
 	// per event shape (SPEC §7.2) — see anthropicFrames.
 	fieldContent      = "content"       // the whole content array (non-streaming, and message.content)
@@ -107,6 +121,11 @@ const (
 	// mustStayCleartextInResponse does NOT supply it — that list forbids SEALING
 	// the field, it never requires the field to exist.
 	fieldPromptTokens = "prompt_tokens"
+	// fieldInputTokens is the decisions profile's billable count (SPEC §7.7). The
+	// Decisions API reports usage in Anthropic's vocabulary (input_tokens /
+	// output_tokens), and output is not billed, so input is the one quantity a
+	// sealed decisions response must restate.
+	fieldInputTokens = "input_tokens"
 	// The speech profile's request fields (SPEC §5.3.2). The request reaches this
 	// protocol JSON-ified: the audio that was a multipart file part is a base64
 	// string in fieldFileBase64, which is why the payload field has a name at all
@@ -210,6 +229,12 @@ const (
 	// destination, so there is nothing for a pin to protect. Same answer for
 	// `dimensions` (it truncates the vector; the vector is sealed regardless).
 	ProfileEmbedding Profile = "embedding"
+	// ProfileDecisions is /v1/decisions (SPEC §7.7): the payload is "state" and
+	// "questions", and the response seals "answers". It is embedding's shape —
+	// already JSON, non-streaming, nothing pinned, one frame that seals one field
+	// and restates one billable quantity — with two mandatory payload fields
+	// instead of one.
+	ProfileDecisions Profile = "decisions"
 	// ProfileAsyncImage is /v1/async/images/generations (SPEC §7.5): the image
 	// profile split in time. The request is image's plus a mandatory sealed
 	// `_bind`, and the result — sealed by the enclave when the job completes,
@@ -852,6 +877,26 @@ var profiles = map[Profile]profileSpec{
 			locators: []cleartextNumber{{field: fieldUsage, key: fieldPromptTokens}},
 			kind:     numberWhole,
 			what:     "the billable count of input tokens actually embedded",
+		}},
+	},
+	ProfileDecisions: {
+		// Both fields are mandatory: a Decisions request without either is not a
+		// request (the router refuses it), and sealing one while the other stays
+		// readable would leak what ProfileDecisions says each one carries.
+		payload:         []payloadField{{name: fieldState}, {name: fieldQuestions}},
+		responsePayload: []payloadField{{name: fieldAnswers}},
+		// Nothing pinned: the endpoint has no `stream` and no field that sends
+		// the answers anywhere but this response.
+		//
+		// The billable count is required for embedding's reason, and the gap is
+		// the opposite way round: the router's fallback for a provider that
+		// omits usage measures the raw request body, which here is the sealed
+		// envelope — so it would bill the ciphertext's size, not the input's.
+		// The enclave holds the decrypted request and writes the count.
+		requiredResponseCleartext: []cleartextQuantity{{
+			locators: []cleartextNumber{{field: fieldUsage, key: fieldInputTokens}},
+			kind:     numberWhole,
+			what:     "the billable count of input tokens actually decided on",
 		}},
 	},
 }

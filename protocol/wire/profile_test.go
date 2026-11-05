@@ -267,6 +267,7 @@ func TestProfileDefaults(t *testing.T) {
 		// halves. If either of these ever comes back empty, something has made a
 		// mandatory field optional.
 		wire.ProfileEmbedding: {request: []string{"input"}, response: []string{"data"}},
+		wire.ProfileDecisions: {request: []string{"state", "questions"}, response: []string{"answers"}},
 	}
 
 	profiles := wire.Profiles()

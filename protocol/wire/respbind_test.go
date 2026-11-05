@@ -390,7 +390,7 @@ func b64dec(s string) ([]byte, error) {
 }
 
 func TestResponseBindApplies(t *testing.T) {
-	for _, p := range []wire.Profile{wire.ProfileChat, wire.ProfileAnthropic, wire.ProfileImage, wire.ProfileSpeech, wire.ProfileEmbedding} {
+	for _, p := range []wire.Profile{wire.ProfileChat, wire.ProfileAnthropic, wire.ProfileImage, wire.ProfileSpeech, wire.ProfileEmbedding, wire.ProfileDecisions} {
 		if !wire.ResponseBindApplies(p) {
 			t.Errorf("%s: the response binding should apply", p)
 		}
