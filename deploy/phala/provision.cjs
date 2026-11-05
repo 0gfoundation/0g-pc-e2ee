@@ -3,12 +3,13 @@
 // provision.cjs — create one CVM through the Phala Cloud API, taking the steps
 // `phala deploy` takes, for the one thing phala CLI 1.1.22 cannot do: pin the node.
 //
-// The API identifies a node by a string HashID (node_aOwADKBd, or the older
-// teepod_E9w0oKbx), and refuses a number: "External HashID must be a string, got
-// int". The CLI turns --node-id into a number and its SDK schema accepts only one,
-// so `phala deploy --node-id` cannot work. This script makes the same two calls
-// with the same SDK (@phala/cloud, pinned in package.json), through its raw
-// client.post so the node goes through as a string:
+// The API picks a node by its physical name, the NAME column of `phala nodes ls`
+// (prod5, usw5), sent as `node`. Since 2026-11 it refuses node_id and teepod_id
+// outright: "node_id and teepod_id are not supported for node selection"
+// (ERR-01-011). CLI 1.1.22 can send only a numeric node_id, so `phala deploy`
+// cannot pin the node. This script makes the same two calls with the same SDK
+// (@phala/cloud, pinned in package.json), through its raw client.post so the body
+// carries `node` as is:
 //
 //   1. POST /cvms/provision  the compose, the env KEYS (allowed_envs), the shape,
 //                            image and node. Returns the app_id, compose_hash and
@@ -25,7 +26,7 @@
 //
 // Usage (deploy-side.sh calls it; PHALA_CLOUD_API_KEY in the environment):
 //   node provision.cjs --name N --compose FILE --env-file FILE --instance-type T \
-//       --node HASHID [--image IMAGE]
+//       --node NODE_NAME [--image IMAGE]
 // The env file is deploy-side.sh's: KEY='VALUE' per line.
 //
 // Prints {"success":true,"vm_uuid":…,"name":…,"app_id":…} on stdout, the shape
@@ -66,12 +67,15 @@ function readEnv(path) {
   return envs;
 }
 
-// Which field the node HashID goes in: the API takes node_id (current) or
-// teepod_id (deprecated), each with its own HashID. A bare number is what fails.
-function nodeField(node) {
-  if (/^node_[A-Za-z0-9]+$/.test(node)) return 'node_id';
-  if (/^teepod_[A-Za-z0-9]+$/.test(node)) return 'teepod_id';
-  fail(`--node must be a node HashID such as node_aOwADKBd (node_id_hashid in \`phala api /teepods/cvm-create-resources\`), not ${JSON.stringify(node)}`);
+// The node is its physical name (prod5): what `phala nodes ls` shows as NAME. A
+// HashID (node_…, teepod_…) or a number is what the API used to take and now
+// refuses, so say so here rather than after a round trip.
+function nodeName(node) {
+  if (/^(node|teepod)_[A-Za-z0-9]+$/.test(node) || /^[0-9]+$/.test(node)) {
+    fail(`--node is ${JSON.stringify(node)}, a node id; the API now takes the node's name, such as prod5 (NAME in \`phala nodes ls\`)`);
+  }
+  if (!/^[A-Za-z][A-Za-z0-9-]*$/.test(node)) fail(`--node must be a node name such as prod5, not ${JSON.stringify(node)}`);
+  return node;
 }
 
 // The API's own words, without the request (and its X-API-Key header).
@@ -85,6 +89,7 @@ function describe(err) {
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
+  const node = nodeName(opts.node);
   if (!process.env.PHALA_CLOUD_API_KEY) fail('PHALA_CLOUD_API_KEY is not set');
   const compose = fs.readFileSync(opts.compose, 'utf8');
   const envs = readEnv(opts['env-file']);
@@ -106,7 +111,7 @@ async function main() {
     listed: false,
     instance_type: opts['instance-type'],
     kms: 'PHALA',
-    [nodeField(opts.node)]: opts.node,
+    node,
     compose_file: {
       name: '',
       docker_compose_file: compose,

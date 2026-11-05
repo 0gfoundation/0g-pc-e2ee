@@ -11,8 +11,9 @@
 # still names it and the platform spreads traffic across old and new instances — a
 # silent half-cutover. The CVM is created by provision.cjs, which has no update
 # path at all — it calls the Phala Cloud API's create endpoints, as `phala deploy`
-# does, because that CLI (1.1.22) cannot pin the node: the API wants the node as a
-# string HashID and the CLI sends a number. The CLI is still used to LIST CVMs.
+# does, because that CLI (1.1.22) cannot pin the node: the API wants the node's
+# name in `node` and the CLI sends a numeric node_id. The CLI is still used to
+# LIST CVMs.
 #
 # Before creating anything it refuses when:
 #   - the side is live (the traffic switch points at it);
@@ -90,9 +91,8 @@
 #   CVM_NAME_PREFIX      CVM name is <prefix>-<side> (required)
 #   PHALA_INSTANCE_TYPE  e.g. tdx.4xlarge            (required: the shape is fixed at
 #                        create time and GOMEMLIMIT depends on it — README, "CVM shape")
-#   PHALA_NODE_ID        node for sides a and b      (required: a node HashID such as
-#   PHALA_NODE_ID_COLD   node for side c              node_aOwADKBd — node_id_hashid in
-#                                                     `phala api /teepods/cvm-create-resources`)
+#   PHALA_NODE_ID        node for sides a and b      (required: the node's name, such
+#   PHALA_NODE_ID_COLD   node for side c              as prod5 — NAME in `phala nodes ls`)
 #   PHALA_OS_IMAGE       OS image                    (optional: auto-selected)
 #   PHALA_CLOUD_API_KEY  read by the CLI and by provision.cjs
 #   PHALA                CLI command                 (default: phala)
@@ -424,11 +424,14 @@ BASE="$(side_base "$SIDE")"
 [ -n "$BASE" ] || die "side ${SIDE} has no cluster: set $([ "$SIDE" = c ] && echo PLATFORM_BASE_COLD || echo PLATFORM_BASE)"
 NODE="$(side_node "$SIDE")"
 # Pinned, always: a side the platform places elsewhere is caught only after it
-# boots and has spent a certificate. And a HashID, not the number `phala nodes ls`
-# shows — the API refuses that.
-[ -n "$NODE" ] || die "side ${SIDE} has no node: set $([ "$SIDE" = c ] && echo PHALA_NODE_ID_COLD || echo PHALA_NODE_ID) to the node's HashID (node_id_hashid in \`phala api /teepods/cvm-create-resources\`)"
-[[ "$NODE" =~ ^(node|teepod)_[A-Za-z0-9]+$ ]] \
-  || die "the node for side ${SIDE} is ${NODE}, not a HashID such as node_aOwADKBd (node_id_hashid in \`phala api /teepods/cvm-create-resources\`; the number \`phala nodes ls\` shows is refused by the API)"
+# boots and has spent a certificate. And by name: the API refuses a node id, the
+# HashID (node_…, teepod_…) and the number alike.
+[ -n "$NODE" ] || die "side ${SIDE} has no node: set $([ "$SIDE" = c ] && echo PHALA_NODE_ID_COLD || echo PHALA_NODE_ID) to the node's name, such as prod5 (NAME in \`phala nodes ls\`)"
+if [[ "$NODE" =~ ^(node|teepod)_[A-Za-z0-9]+$ || "$NODE" =~ ^[0-9]+$ ]]; then
+  die "the node for side ${SIDE} is ${NODE}, a node id: the API now takes the node's name, such as prod5 (NAME in \`phala nodes ls\`)"
+fi
+[[ "$NODE" =~ ^[A-Za-z][A-Za-z0-9-]*$ ]] \
+  || die "the node for side ${SIDE} is ${NODE}, not a node name such as prod5 (NAME in \`phala nodes ls\`)"
 NAME="${CVM_NAME_PREFIX}-${SIDE}"
 [[ "$NAME" =~ ^[A-Za-z][A-Za-z0-9-]{4,62}$ ]] || die "CVM name '${NAME}' is not 5-63 letters, digits or hyphens starting with a letter"
 

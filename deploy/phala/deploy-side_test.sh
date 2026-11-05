@@ -173,7 +173,7 @@ run() { # args…
   RC=0
   OUT="$(env -i PATH="$WORK/bin:$PATH" HOME="$WORK" SECRETS_ENV=/nonexistent FAKE_DIR="$S" FAKE_NEW_APP="$NEW_APP" \
     DOMAIN="$DOMAIN" DELEGATION_ZONE="$DZ" PLATFORM_BASE="_.${BASE}" \
-    CVM_NAME_PREFIX=gw-mainnet PHALA_INSTANCE_TYPE=tdx.4xlarge PHALA_NODE_ID=node_test7 \
+    CVM_NAME_PREFIX=gw-mainnet PHALA_INSTANCE_TYPE=tdx.4xlarge PHALA_NODE_ID=test7 \
     CLOUDFLARE_API_TOKEN=cf-secret ZG_PROM_ENV=mainnet ZG_PROM_REMOTE_WRITE_URL=https://prom.test/w \
     ZG_PROM_REMOTE_WRITE_USERNAME=gw ZG_PROM_REMOTE_WRITE_PASSWORD='p#ss word' \
     "${EXTRA_ENV[@]}" POLL_INTERVAL=0 WAIT_PUBLISH=1 WAIT_READY=1 WAIT_IDENTITY=1 \
@@ -196,7 +196,7 @@ not_created() { check "$1: nothing created" [ ! -f "$S/deploy.args" ]; }
 fresh; run b --compose "$COMPOSE" --release release-2026.10.28.1 --dry-run
 expect_rc "dry run on the standby passes" 0
 not_created "dry run"
-check "dry run shows the pinned node" err_has "--node node_test7"
+check "dry run shows the pinned node" err_has "--node test7"
 check_not "dry run prints no secret value" grep -q 'cf-secret\|p#ss' <<<"$ERR$OUT"
 
 fresh; run a --compose "$COMPOSE" --yes
@@ -283,7 +283,7 @@ check_not "…and is never printed" grep -q hidden.test <<<"$ERR$OUT"
 check "DNS_SETUP_MODE is print" grep -qx "DNS_SETUP_MODE='print'" "$S/deploy.env"
 check "a value with # and a space survives, quoted" grep -qx "ZG_PROM_REMOTE_WRITE_PASSWORD='p#ss word'" "$S/deploy.env"
 check_not "ACME_STAGING is not passed" grep -q ACME_STAGING "$S/deploy.env"
-check "pins the node by its HashID" grep -qx node_test7 "$S/deploy.args"
+check "pins the node by its name" grep -qx test7 "$S/deploy.args"
 check "names the CVM <prefix>-<side>" grep -qx gw-mainnet-b "$S/deploy.args"
 check "with the configured shape" grep -qx tdx.4xlarge "$S/deploy.args"
 
@@ -295,7 +295,10 @@ not_created "refused provision"
 
 fresh; EXTRA_ENV=(PHALA_NODE_ID=26)
 run b --compose "$COMPOSE" --dry-run
-expect_err "refuses a numeric node id, which the API rejects" "not a HashID"
+expect_err "refuses a numeric node id, which the API rejects" "a node id"
+fresh; EXTRA_ENV=(PHALA_NODE_ID=node_aOwADKBd)
+run b --compose "$COMPOSE" --dry-run
+expect_err "refuses a node HashID, which the API now rejects" "a node id"
 fresh; EXTRA_ENV=(PHALA_NODE_ID=)
 run b --compose "$COMPOSE" --dry-run
 expect_err "refuses an unpinned node" "side b has no node"
