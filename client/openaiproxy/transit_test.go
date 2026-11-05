@@ -215,3 +215,13 @@ func TestTransitPreferred_NoEncryptedProviderDowngrades(t *testing.T) {
 		}
 	}
 }
+
+// A policy this build does not know, from a resolver that did not fold it, is
+// refused like required — never downgraded.
+func TestTransit_UnknownPolicyIsNotADowngrade(t *testing.T) {
+	rec, ct := serveTransit(t, endpoint.AsyncImage, &transitResolver{transit: "required_strict"}, true,
+		`{"model":"z-image","prompt":"p","response_format":"url"}`)
+	if rec.Code != http.StatusBadRequest || ct.hit {
+		t.Errorf("status %d, cleartext reached = %v; want the required refusal", rec.Code, ct.hit)
+	}
+}

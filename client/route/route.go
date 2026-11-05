@@ -1901,7 +1901,7 @@ func (r *Router) previewTransit(ctx context.Context, ep endpoint.Endpoint, req w
 			if attempt > 0 {
 				outcome = "ok_retried"
 			}
-			return pr.Providers, strings.ToLower(strings.TrimSpace(pr.EncryptedTransit)), nil
+			return pr.Providers, normalizeTransit(pr.EncryptedTransit), nil
 		}
 		// Only a RETRYABLE failure may be re-attributed to the caller, and the test is
 		// an allowlist for the same reason verifyOutcome's is: written as "anything
@@ -1930,6 +1930,30 @@ func (r *Router) previewTransit(ctx context.Context, ep endpoint.Endpoint, req w
 	// shape that is squarely the router's — and the one the gate counts.
 	r.previewRetries.noAnswer()
 	return nil, "", lastErr
+}
+
+// normalizeTransit folds the preview's encrypted_transit onto the values this
+// gateway acts on: off | preferred | required, or "" when the router sent none
+// (its routing policy off), which keeps today's behaviour.
+//
+// Any other value is read as required. The field comes from the router, and a
+// value this build does not know is most likely a stricter one added after it —
+// read as anything laxer, an old gateway would downgrade a request its caller
+// asked to keep encrypted. Failing closed costs at worst a refused request; the
+// router still applies the rule itself. Each such answer is counted
+// (metrics.UnknownEncryptedTransit), so a gateway older than its router shows up.
+//
+// Normalizing here, the one place the value enters, also bounds everything
+// downstream to these four strings — the decision metric's policy label among
+// them, which must not grow a series per string an untrusted peer sends.
+func normalizeTransit(v string) string {
+	switch t := strings.ToLower(strings.TrimSpace(v)); t {
+	case "", core.TransitOff, core.TransitPreferred, core.TransitRequired:
+		return t
+	default:
+		metrics.UnknownEncryptedTransit()
+		return core.TransitRequired
+	}
 }
 
 // previewOnce performs a single route-preview POST with the already-marshaled

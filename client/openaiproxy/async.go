@@ -127,7 +127,10 @@ func registerAsync(mux *http.ServeMux, ep endpoint.Endpoint, c *core.Client, o o
 //     encryption, so it is not quietly given plaintext;
 //   - off: forwarded in the clear as the caller allowed;
 //   - preferred, or a router that sends no value: forwarded in the clear, as
-//     before, now marked with HeaderEncryptedTransitReason — the downgrade.
+//     before, now marked with HeaderEncryptedTransitReason — the downgrade;
+//   - anything else: refused as under required. The route resolver already
+//     folds an unknown value onto required (route.normalizeTransit); this keeps
+//     a resolver that does not from turning it into a downgrade.
 //
 // When the router answers the preview with an error (a 401, or under required a
 // model with no supply to seal to) that answer is relayed: the request would
@@ -144,7 +147,12 @@ func (o options) serveUnsealable(w http.ResponseWriter, r *http.Request, c *core
 	}
 	reason := field + "_" + value
 	switch policy {
-	case core.TransitRequired:
+	case core.TransitOff:
+		metrics.EncryptedTransitDecision("plaintext", policy, "policy_off")
+	case core.TransitPreferred, "":
+		metrics.EncryptedTransitDecision("plaintext", policy, reason)
+		w.Header().Set(HeaderEncryptedTransitReason, field+"="+value)
+	default: // required, and any value this build does not know
 		metrics.EncryptedTransitDecision("refused", policy, reason)
 		writeErrorObject(w, http.StatusBadRequest, map[string]any{
 			"error": map[string]any{
@@ -156,11 +164,6 @@ func (o options) serveUnsealable(w http.ResponseWriter, r *http.Request, c *core
 			"_0g": map[string]any{"source": "gateway"},
 		})
 		return
-	case core.TransitOff:
-		metrics.EncryptedTransitDecision("plaintext", policy, "policy_off")
-	default:
-		metrics.EncryptedTransitDecision("plaintext", policy, reason)
-		w.Header().Set(HeaderEncryptedTransitReason, field+"="+value)
 	}
 	forwardCleartext(w, r, body, o.cleartext)
 }
