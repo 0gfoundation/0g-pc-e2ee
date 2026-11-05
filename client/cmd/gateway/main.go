@@ -167,6 +167,9 @@ func main() {
 			"which makes this gateway behave as the plain router. An entry '<service type>:*' (e.g. "+
 			"'embedding:*') seals every model on that service type's surfaces; \""+sealModelsAll+"\" "+
 			"mixed with other entries is refused (env ZG_GATEWAY_SEAL_MODELS)")
+	// The model that classifies a "0g/auto" conversation (autoroute.go).
+	autoClassifier := flag.String("auto-classifier-model", proxycli.EnvOr("ZG_GATEWAY_AUTO_CLASSIFIER_MODEL", defaultAutoClassifierModel),
+		"the decisions model that classifies a \"0g/auto\" conversation's opening (env ZG_GATEWAY_AUTO_CLASSIFIER_MODEL)")
 	// Directory holding the public attestation evidence bundle to serve at
 	// /evidences/ — in the TEE deployment, the `evidences` volume dstack-ingress
 	// writes, mounted read-only. Empty (the default) mounts no such route, which is
@@ -455,8 +458,9 @@ func main() {
 		Handler: newHandler(built.Clients, routerTarget, origins, instanceID, *evidenceDir, *maxInFlight,
 			identity, providerIdentities, built.Readiness(), logger,
 			withEntryPolicy(entryPolicy{
-				openOrigins: openOrigins,
-				sealModels:  sealModelsList,
+				openOrigins:    openOrigins,
+				sealModels:     sealModelsList,
+				autoClassifier: *autoClassifier,
 			}),
 			withQuoter(quoter)),
 		ReadHeaderTimeout: 10 * time.Second, // mitigate slow-header (Slowloris) clients
@@ -656,6 +660,9 @@ type entryPolicy struct {
 	// anything is. Its zero value seals ALL — the same zero-value-is-the-ordinary-
 	// deployment rule as the field above.
 	sealModels sealModels
+	// autoClassifier is the model that classifies "0g/auto" conversations
+	// (-auto-classifier-model); empty means defaultAutoClassifierModel.
+	autoClassifier string
 	// catalogCacheTTL is how long a public catalog read is reused (catalogcache.go).
 	//
 	// ZERO MEANS defaultCatalogCacheTTL, not "off". That reads backwards for a
@@ -966,7 +973,10 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	gated := http.NewServeMux()
 	gated.Handle("GET "+openaiproxy.AsyncJobsPrefix+"{id}",
 		openaiproxy.AsyncJobPoll(routerTarget, &http.Client{Transport: core.NewPooledTransport()}))
-	gated.Handle("/", policy.sealModels.dispatch(sealed, passthrough))
+	// "0g/auto" (autoroute.go) runs here, inside both guards for the same
+	// reason the dispatcher does: it reads the body.
+	gated.Handle("/", policy.sealModels.dispatchAuto(sealed, passthrough,
+		newAutoRouter(routerTarget, policy.sealModels, policy.autoClassifier, logger)))
 	// The body-read bound sits INSIDE the cap, so its clock starts when a slot is
 	// held — the slot is what a trickled body would otherwise keep — and outside
 	// everything that reads the body, the model dispatcher included.

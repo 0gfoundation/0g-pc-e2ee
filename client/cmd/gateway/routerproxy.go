@@ -48,6 +48,13 @@ import (
 // path — routing it through this proxy would hand that content to the untrusted
 // router in the clear, defeating the gateway's whole purpose.
 //
+// One request that carries content does not travel this proxy but goes to the
+// router in the clear all the same, on purpose: "0g/auto" sends a conversation's
+// opening (truncated, once per conversation) to the classifier at
+// POST /v1/decisions, which has no end-to-end encryption yet. The response says
+// so (X-0G-Auto-Classifier-E2EE: none); see autoroute.go. When decisions can be
+// sealed, that call is to be sealed and this paragraph removed.
+//
 // A sealed surface's own POST never reaches here, in ANY spelling of its path. An
 // earlier version of this note claimed that for "either spelling (with or without
 // a trailing slash)", which was wrong and was wrong in the direction that matters:

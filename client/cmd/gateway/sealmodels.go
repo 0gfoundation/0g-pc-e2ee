@@ -10,6 +10,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
@@ -287,6 +288,14 @@ const maxPassthroughBytes = 20 << 20 // 20 MiB
 // 413 by being sealed. Enforcing it here would mean a second place that writes
 // that error, and two places to keep saying the same thing.
 func (s sealModels) dispatch(sealed, cleartext http.Handler) http.Handler {
+	return s.dispatchAuto(sealed, cleartext, nil)
+}
+
+// dispatchAuto is dispatch with the "0g/auto" layer (autoroute.go): a chat
+// request naming that model first has its model chosen and rewritten, and is
+// then dispatched as a request naming the chosen model. auto is nil when
+// every model is sealed or none is, which is when newAutoRouter returns nil.
+func (s sealModels) dispatchAuto(sealed, cleartext http.Handler, auto *autoRouter) http.Handler {
 	if s.all() {
 		return sealed
 	}
@@ -304,8 +313,20 @@ func (s sealModels) dispatch(sealed, cleartext http.Handler) http.Handler {
 		// where r.Body still holds the remainder we did not read.
 		r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(buf), r.Body))
 
+		model, reason := modelOf(buf, r.Header.Get("Content-Type"), err, len(buf))
+		if auto != nil && reason == "" && isAutoRequest(r, model) {
+			out, chosen, ok := auto.resolve(w, r, buf)
+			if !ok {
+				return
+			}
+			buf, model = out, chosen
+			r.Body = io.NopCloser(bytes.NewReader(buf))
+			r.ContentLength = int64(len(buf))
+			r.Header.Set("Content-Length", strconv.Itoa(len(buf)))
+		}
+
 		// Three cases, and only the last one reaches the router.
-		switch model, reason := modelOf(buf, r.Header.Get("Content-Type"), err, len(buf)); {
+		switch {
 		case reason != "":
 			// Could not tell. Seal, which is what this request got yesterday.
 			metrics.RecordSealDecision(s.label(model), "sealed", reason)
