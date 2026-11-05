@@ -306,6 +306,11 @@ func Register(mux *http.ServeMux, ep endpoint.Endpoint, c *core.Client, opts ...
 			readBodyError(w, err)
 			return
 		}
+		// The caller asked for plaintext in its own header: forward as sent.
+		if o.cleartext != nil && callerTransit(r) == core.TransitOff {
+			o.forwardOff(w, r, body)
+			return
+		}
 		// A surface with a DecodeMultipart converts a multipart body into the
 		// JSON-ified request it seals (SPEC §5.3) — speech today, since every
 		// OpenAI SDK posts multipart to /v1/audio/transcriptions. Content-type is
@@ -361,11 +366,11 @@ func Register(mux *http.ServeMux, ep endpoint.Endpoint, c *core.Client, opts ...
 		// user, who can fetch and audit the §8 signature from the broker.
 		meta := &core.ResponseMeta{}
 		ctx = core.WithResponseMeta(ctx, meta)
-		// encrypted_transit can send the request in the clear, as the body
-		// arrived; see transitFallback.
+		// The caller's header may permit a downgrade when nothing can be
+		// sealed; see transitFallback.
 		fallback := o.transitFallback(w, r, body)
 		if fallback != nil {
-			ctx = core.WithCleartextFallback(ctx)
+			ctx = core.WithPlaintextPermitted(ctx)
 		}
 		if stream {
 			serveStream(ctx, w, ep, c, req, o, meta, fallback)
@@ -373,6 +378,9 @@ func Register(mux *http.ServeMux, ep endpoint.Endpoint, c *core.Client, opts ...
 		}
 		resp, err := c.Complete(ctx, req)
 		if fallback != nil && fallback(err) {
+			// Not recorded as a completion: nothing was sealed or sent, and the
+			// request is now the cleartext path's (counted in
+			// encrypted_transit_decisions_total instead).
 			return
 		}
 		recordCompletion(err)
@@ -592,7 +600,7 @@ func serveStream(ctx context.Context, w http.ResponseWriter, ep endpoint.Endpoin
 	})
 	if fallback != nil && !wroteHeader && fallback(err) {
 		// Answered before any frame: nothing was sent, so the request can still
-		// go out in the clear.
+		// go out in the clear. Not a completion, as in Register.
 		return
 	}
 	recordCompletion(err)
@@ -649,30 +657,45 @@ func writeSSEEvent(w io.Writer, name string, payload []byte) error {
 	return err
 }
 
-// transitFallback returns what to do with a core error that hands the request
-// back to be sent in the clear, or nil when this surface has no cleartext path
-// (then the core never hands one back: see core.WithCleartextFallback). The
-// returned func reports whether it handled err:
-//
-//   - core.ErrEncryptedTransitOff: the caller allowed plaintext (forwardOff);
-//   - core.ErrNoEncryptedProvider: encrypted_transit is preferred and no
-//     provider could be sealed to, with nothing sent — the downgrade, marked
-//     with HeaderEncryptedTransitReason: no_encrypted_provider.
+// HeaderEncryptedTransit is the caller's own encrypted_transit for the request:
+// off | preferred | required (0g-router #1215). Read here, from the request the
+// caller sent this gateway, because it is the only statement about plaintext the
+// gateway can trust: the router's merged value (route-preview) may only make the
+// requirement stricter. It is forwarded to the router with the other X-0G-*
+// headers, which merges it with the account's and the key's rules.
+const HeaderEncryptedTransit = "X-0G-Encrypted-Transit"
+
+// callerTransit is the caller's HeaderEncryptedTransit, folded onto core's
+// Transit* values, or "" when absent. A value that is none of them is "": it
+// permits nothing (the router refuses it with a 400 anyway).
+func callerTransit(r *http.Request) string {
+	switch v := strings.ToLower(strings.TrimSpace(r.Header.Get(HeaderEncryptedTransit))); v {
+	case core.TransitOff, core.TransitPreferred, core.TransitRequired:
+		return v
+	default:
+		return ""
+	}
+}
+
+// transitFallback returns what to do with core.ErrNoEncryptedProvider — no
+// provider could be sealed to and nothing was sent — or nil when a downgrade is
+// not permitted: this surface has no cleartext path, or the caller's own
+// header does not say preferred (absent, required, or unreadable: never a
+// downgrade). The router cannot grant it; its required vetoes it inside the
+// core (core.WithPlaintextPermitted). The returned func reports whether it
+// handled err; the downgrade is marked HeaderEncryptedTransitReason:
+// no_encrypted_provider.
 func (o options) transitFallback(w http.ResponseWriter, r *http.Request, body []byte) func(error) bool {
-	if o.cleartext == nil {
+	if o.cleartext == nil || callerTransit(r) != core.TransitPreferred {
 		return nil
 	}
 	return func(err error) bool {
-		switch {
-		case errors.Is(err, core.ErrEncryptedTransitOff):
-			o.forwardOff(w, r, body)
-		case errors.Is(err, core.ErrNoEncryptedProvider):
-			metrics.EncryptedTransitDecision("plaintext", core.TransitPreferred, reasonNoEncryptedProvider)
-			w.Header().Set(HeaderEncryptedTransitReason, reasonNoEncryptedProvider)
-			forwardCleartext(w, r, body, o.cleartext)
-		default:
+		if !errors.Is(err, core.ErrNoEncryptedProvider) {
 			return false
 		}
+		metrics.EncryptedTransitDecision("plaintext", core.TransitPreferred, reasonNoEncryptedProvider)
+		w.Header().Set(HeaderEncryptedTransitReason, reasonNoEncryptedProvider)
+		forwardCleartext(w, r, body, o.cleartext)
 		return true
 	}
 }
@@ -682,11 +705,12 @@ func (o options) transitFallback(w http.ResponseWriter, r *http.Request, body []
 // provider of its model could be sealed to.
 const reasonNoEncryptedProvider = "no_encrypted_provider"
 
-// forwardOff sends a request whose effective encrypted_transit is off to the
-// cleartext path, with the body exactly as it arrived (the sealed path read it
-// whole, so it is rewound here). The caller allowed plaintext, so this is not a
-// downgrade: the response is marked plaintext and carries no
-// HeaderEncryptedTransitReason.
+// forwardOff sends a request whose caller asked for encrypted_transit=off in its
+// own header to the cleartext path at once, without a preview, with the body
+// exactly as it arrived (read whole by the sealed path, so rewound here). The
+// router still merges that header with the account's and key's rules and
+// refuses the plaintext request if either requires encryption. Not a downgrade:
+// the response is marked plaintext and carries no HeaderEncryptedTransitReason.
 func (o options) forwardOff(w http.ResponseWriter, r *http.Request, body []byte) {
 	metrics.EncryptedTransitDecision("plaintext", core.TransitOff, "policy_off")
 	forwardCleartext(w, r, body, o.cleartext)

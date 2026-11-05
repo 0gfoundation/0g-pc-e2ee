@@ -91,7 +91,7 @@ func (c *Client) SubmitAsync(ctx context.Context, req wire.Request) (wire.Respon
 		}
 		return nil, 0, err
 	}
-	if downgradeUnsent(ctx, cands, attempted) {
+	if downgradeUnsent(ctx, cands, attempted || walk.exhausted()) {
 		return nil, 0, ErrNoEncryptedProvider
 	}
 	if fail.err == nil {

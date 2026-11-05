@@ -8,90 +8,98 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
-// Encrypted transit (0g-router issue #1215, step G1): the router merges the
-// account's, the API key's and the request's `encrypted_transit` and returns
-// the effective value from route-preview. This client acts on it:
+// Encrypted transit (0g-router issue #1215, step G1). The values of
+// `encrypted_transit`, from least to most strict:
 //
-//   - off: the caller allowed plaintext. A front end that has a cleartext path
-//     (WithCleartextFallback) forwards the request there instead of sealing it.
-//   - preferred (the default, and what an older router that sends no value
-//     means): seal when the request can be sealed — today's behaviour.
-//   - required: seal or refuse. The router has already narrowed the candidates
-//     to providers that can be sealed to, and refuses a plaintext request
-//     itself; a front end refuses, rather than downgrades, a request it cannot
-//     seal.
+//   - off: plaintext is fine;
+//   - preferred: encrypt when the model can be, otherwise plaintext;
+//   - required: encrypt or refuse.
+//
+// Two parties speak about it, and they are not trusted alike:
+//
+//   - The CALLER, through its own X-0G-Encrypted-Transit request header, which
+//     the front end reads directly. Only this can permit plaintext for a request
+//     this client would otherwise seal: the front end marks such a request with
+//     WithPlaintextPermitted.
+//   - The ROUTER, which merges the account's, the API key's and the header's
+//     values and reports the result in route-preview. The router is untrusted
+//     (it must never be able to make a sealed model's prompt go out in the
+//     clear), so its value can only make the requirement STRICTER: under its
+//     required nothing is downgraded, and its off or preferred permit nothing.
+//
+// Plaintext therefore needs the caller's header AND a router that does not say
+// required. A permission set only in the Console (account or key rules) is not
+// honoured here; it would have to reach the gateway by a path the router cannot
+// forge.
 const (
 	TransitOff       = "off"
 	TransitPreferred = "preferred"
 	TransitRequired  = "required"
 )
 
-// ErrEncryptedTransitOff is returned by Resolve (through Complete,
-// CompleteStream and SubmitAsync) when the effective encrypted_transit is off
-// and the caller said it can forward in the clear (WithCleartextFallback).
-// Nothing has been sent upstream yet: the front end forwards the original
-// request on its cleartext path.
-var ErrEncryptedTransitOff = errors.New("encrypted_transit is off: forward the request in the clear")
-
 // ErrNoEncryptedProvider is returned by Complete, CompleteStream and
-// SubmitAsync when the request's encrypted_transit is preferred, the caller
-// can forward in the clear (WithCleartextFallback), and no candidate could be
-// prepared for sealing — every one failed before anything was sent (no key to
-// seal to, an attestation that did not verify), so the request has reached no
-// provider. preferred means "encrypt when the model can be": here it cannot,
-// so the front end forwards the original request in the clear and says why.
+// SubmitAsync when no candidate could be prepared for sealing — every one
+// failed before anything was sent (no key to seal to, an attestation that did
+// not verify) — and plaintext is permitted: the caller's own header permits it
+// (WithPlaintextPermitted) and the router does not say required. The request
+// has reached no provider; the front end forwards it in the clear and says why.
 //
-// Never for a walk that sent a request: a provider may already be serving it,
-// and sending it again in the clear would run it twice.
+// Never for a walk that sent a request (a provider may already be serving it,
+// and sending it again in the clear would run it twice), one cut short by the
+// walk budget (the caller has already waited all of it), or a caller that went
+// away.
 var ErrNoEncryptedProvider = errors.New("no provider could be sealed to: forward the request in the clear")
 
-type cleartextFallbackKey struct{}
+type plaintextPermittedKey struct{}
 
-// WithCleartextFallback marks ctx as belonging to a request the front end can
-// forward in the clear, so a resolver may answer ErrEncryptedTransitOff
-// instead of sealing it. Without it an `off` request is sealed anyway: off
-// PERMITS plaintext, it does not demand it, so a client with no cleartext path
-// (the sidecar) keeps sealing.
-func WithCleartextFallback(ctx context.Context) context.Context {
-	return context.WithValue(ctx, cleartextFallbackKey{}, true)
+// WithPlaintextPermitted marks ctx as belonging to a request whose CALLER, in
+// its own X-0G-Encrypted-Transit header, permits plaintext, and which the front
+// end can forward in the clear. Only a front end that read that header itself
+// may set it: nothing the router says can.
+func WithPlaintextPermitted(ctx context.Context) context.Context {
+	return context.WithValue(ctx, plaintextPermittedKey{}, true)
 }
 
-// CleartextFallbackFrom reports whether WithCleartextFallback marked ctx.
-func CleartextFallbackFrom(ctx context.Context) bool {
-	v, _ := ctx.Value(cleartextFallbackKey{}).(bool)
+// PlaintextPermittedFrom reports whether WithPlaintextPermitted marked ctx.
+func PlaintextPermittedFrom(ctx context.Context) bool {
+	v, _ := ctx.Value(plaintextPermittedKey{}).(bool)
 	return v
 }
 
-// TransitCandidates is implemented by Candidates that know the request's
-// effective encrypted_transit (the route resolver's, from route-preview).
+// TransitCandidates is implemented by Candidates that know the router's
+// encrypted_transit for the request (the route resolver's, from route-preview,
+// already folded onto the Transit* values or "").
 type TransitCandidates interface {
 	EncryptedTransit() string
 }
 
 // downgradeUnsent reports whether a walk that ended without a success may be
-// handed back as ErrNoEncryptedProvider: nothing was sent (attempted false),
-// the caller is still there, has a cleartext path, and the router said
-// preferred. Only an explicit preferred: a router that sends no value (its
-// routing policy off) keeps today's error.
-func downgradeUnsent(ctx context.Context, cands Candidates, attempted bool) bool {
-	if attempted || canceledBy(ctx) || !CleartextFallbackFrom(ctx) {
+// handed back as ErrNoEncryptedProvider: nothing was sent and the walk was not
+// cut short (spent false), the caller is still there, the caller permitted
+// plaintext (WithPlaintextPermitted), and the router does not veto it by saying
+// required. The router's value can only veto; it never grants.
+func downgradeUnsent(ctx context.Context, cands Candidates, spent bool) bool {
+	if spent || canceledBy(ctx) || !PlaintextPermittedFrom(ctx) {
 		return false
 	}
-	t, ok := cands.(TransitCandidates)
-	return ok && t.EncryptedTransit() == TransitPreferred
+	if t, ok := cands.(TransitCandidates); ok && t.EncryptedTransit() == TransitRequired {
+		return false
+	}
+	return true
 }
 
-// TransitPolicyResolver is implemented by a resolver that can tell the
-// effective encrypted_transit of a request without materializing candidates —
-// for a front end that must decide, before sealing, what to do with a request
-// that cannot be sealed (an async image submit asking for a URL).
+// TransitPolicyResolver is implemented by a resolver that can tell the router's
+// encrypted_transit for a request without materializing candidates — for a
+// front end that must decide, before sealing, what to do with a request that
+// cannot be sealed (an async image submit asking for a URL).
 type TransitPolicyResolver interface {
 	EncryptedTransit(ctx context.Context, ep endpoint.Endpoint, req wire.Request) (string, error)
 }
 
-// EncryptedTransit returns the effective encrypted_transit of req: one of the
+// EncryptedTransit returns the router's encrypted_transit for req: one of the
 // Transit* values, or "" when the resolver cannot tell (a static resolver, or a
-// router that does not send one), which callers treat as preferred.
+// router that does not send one). It is the router's word, so callers may use
+// it to refuse (required) but never as permission for plaintext.
 func (c *Client) EncryptedTransit(ctx context.Context, req wire.Request) (string, error) {
 	r, ok := c.resolver.(TransitPolicyResolver)
 	if !ok {
