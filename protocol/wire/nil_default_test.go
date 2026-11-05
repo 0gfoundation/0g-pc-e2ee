@@ -42,6 +42,8 @@ func TestNilSealedSetNeverLeavesPayloadCleartext(t *testing.T) {
 		// routes on.
 		wire.ProfileEmbedding: `{"model":"m","input":["chunk one","chunk two"],` +
 			`"encoding_format":"base64","dimensions":256}`,
+		wire.ProfileDecisions: `{"model":"m","state":"<user_message>fix my build</user_message>",` +
+			`"questions":{"task":{"type":"choice","criteria":{"code:debugging":"Finding a bug"}}}}`,
 	}
 
 	for _, p := range wire.Profiles() {

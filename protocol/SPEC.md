@@ -10,7 +10,7 @@ MUST agree on it. Keywords MUST / SHOULD / MAY per RFC 2119.
 > attestation binding, **field-level request sealing (E2E confidentiality of the
 > sensitive fields)**, **response sealing**, and **response-signature
 > verification**, for the **chat**, **image**, **anthropic**, **speech**,
-> **embedding** and **async-image** request profiles (§5.1).
+> **embedding**, **decisions** and **async-image** request profiles (§5.1).
 > Candidate scoring is the router's own internal concern
 > (surfaced through its candidate API), not part of this protocol.
 >
@@ -266,6 +266,7 @@ signed-text format.)
 | `anthropic` | `/v1/messages` | `messages`, **and `system` / `tools` / `tool_choice` whenever present** | — | `messages`, `system`, `tools`, `tool_choice` | per frame shape (§7.2) |
 | `speech` | `/v1/audio/transcriptions` (JSON-ified, §5.3) | `file_base64`, **and `filename` / `language` / `prompt` whenever present** | `response_format` ∈ {`json`, `verbose_json`} (§5.3.2); `stream` = `false` **when present** (§5.3.3) | `file_base64`, `filename`, `language`, `prompt` | `text`, **and `segments` / `words` / `language` whenever present** (§7.3) |
 | `embedding` | `/v1/embeddings` | `input` | — | `input` | `data` (§7.4) |
+| `decisions` | `/v1/decisions` | `state`, `questions` | — | `state`, `questions` | `answers` (§7.7) |
 | `async-image` | `/v1/async/images/generations` (result returned by `GET /v1/async/jobs/{id}`) | `prompt` **and `_bind`** | `response_format` = `b64_json` (§7.1) | `prompt`, `_bind` | `data`, `_bind` (§7.5) |
 
 A **pinned cleartext field** is one that stays readable but may hold only a
@@ -756,7 +757,8 @@ enclave MUST reject (no plaintext fallback).
 The response is **field-level, symmetric with the request**: the enclave seals
 only the sensitive fields (chat profile: **`choices`** — the generated content
 and per-choice `finish_reason`; image profile: **`data`** — the generated
-images; embedding profile: **`data`** — the vectors, §7.4; speech profile:
+images; embedding profile: **`data`** — the vectors, §7.4; decisions profile:
+**`answers`**, §7.7; speech profile:
 **`text`** and its conditional siblings, §7.3; anthropic profile: **a field per
 event shape** — §7.2), and leaves the rest cleartext so the router can bill
 on them. Cleartext response fields (`usage`, `model`, `id`, `created`,
@@ -1377,7 +1379,8 @@ stream (later frames are bound to the first frame's context by the AEAD
 sequence); it replaces the whole stream, starting at the first frame.
 
 The response binding closes this. It applies to every profile: optional, per
-request, on the synchronous ones (chat, anthropic, image, speech, embedding), and
+request, on the synchronous ones (chat, anthropic, image, speech, embedding,
+decisions), and
 mandatory on async-image, whose stateless sender has nothing else to tie a
 result to its request (§7.5.1).
 
@@ -1428,6 +1431,41 @@ could be downgraded into not attaching it.
 
 Known answer: `eph_priv` = bytes `00 01 02 … 1f` → `bind` =
 `99711ebcd2996833c92f9fd7ddc8ac3e9c2bb5513b36d3ce72049b34c21e4a8b`.
+
+### 7.7 Decisions responses
+
+A decisions request (`POST /v1/decisions`) asks typed questions about an
+application state and gets typed answers back. Both request fields are payload:
+`state` is the content the questions are about, and `questions` is the caller's
+own text — each question's instructions, its criteria, even the names it is keyed
+by describe what is being decided. Sealing only `state` would leave the intent
+readable, so both are mandatory and neither is optional. Nothing is pinned: the
+endpoint has no `stream` and no field that sends the answers anywhere but this
+response.
+
+The response is one non-streaming frame with `answers` sealed:
+
+```json
+{
+  "usage": { "input_tokens": 212, "output_tokens": 0 },
+  "_e2ee": { "v": 1, "enc": "…", "sealed_fields": ["answers"], "final": true, "ciphertext": "…" }
+}
+```
+
+`answers` is sealed whole: the chosen criterion and the probabilities behind it
+are conclusions drawn from `state`, and a span answer's character offsets reveal
+the state's structure.
+
+**`usage.input_tokens` is the billable count and MUST be cleartext on the final
+frame**, written by the enclave even when the upstream omitted it — §7.4's rule,
+for the same reason (kept readable is not required present), with the gap the
+other way round. Output is not billed on this endpoint, and a router that
+receives no usage estimates from the raw request body, which here is the sealed
+envelope: it would bill the ciphertext's size rather than the input's.
+`output_tokens` is not required.
+
+**What stays visible**: `model`, and through `usage.input_tokens` the length of
+the state and questions together — the same floor every profile has.
 
 ## 8. Response signature
 
@@ -1610,6 +1648,7 @@ other, that party's column is the load-bearing one.
 | final frame carries the profile's billable cleartext — image: `usage.output_images` (§7.1) | yes | **yes — client** (a router cannot distinguish an omitted count from a zero, so it bills nothing and reports nothing) |
 | final frame carries the profile's billable cleartext — speech: `usage.seconds` OR top-level `duration`, written by the enclave even when the upstream omitted it (§7.3) | yes | **yes — client**, and more load-bearing than the image row. A router with no usage block on this endpoint estimates from the transcript text, which sealing makes empty, so it falls through to a flat constant: the omission does not under-bill quietly, it bills a fabricated number nothing downstream can distinguish from a real one |
 | final frame carries the profile's billable cleartext — embedding: `usage.prompt_tokens`, written by the enclave even when the upstream omitted it (§7.4) | yes | **yes — client**. Same shape as the speech row and for the same reason, one step worse: a router with no usage block here has nothing in the RESPONSE to estimate from (no text is echoed back), so it estimates from the request's `input` — which this profile seals — and floors to a constant. The enclave meanwhile holds the decrypted input and bills the provider accurately, so the two sides transact the same request at different prices. The sender's column is not sufficient on its own for the reason every row in this table exists: a third-party enclave that skips it produces a frame only the client can refuse |
+| final frame carries the profile's billable cleartext — decisions: `usage.input_tokens`, written by the enclave even when the upstream omitted it (§7.7) | yes | **yes — client**. The embedding row's reason, the other way round: a router with no usage here estimates from the raw request body, which is the sealed envelope, so it bills the ciphertext's size rather than the input's |
 | where a billable cleartext has ALTERNATIVE locators, a frame carrying both states the same value — speech (§7.3) | **yes — sealer**, the only side that can compare both against the audio it measured | client (it can detect the disagreement, but not which locator is honest). The sealer's column is load-bearing because the two readers differ: a client opening one locator while a router bills the other would silently transact on different numbers for one response |
 | a conditionally sealed RESPONSE field is sealed when the frame carries it — speech: `segments` / `words` / `language` (§7.3) | yes | **yes — client**. A field still in the received cleartext was never sealed, and that is the receiver's only evidence: a router forwards such a frame unremarkably and the transcript rides through it in the clear. Same shape as the request side's conditional payload field, direction reversed |
 | a required quantity's LOCATOR field is neither sealed nor `unbound` — speech's `duration` as well as its `usage` (§5.2 table) | yes | **yes — client**, on every frame. The floor list is the name `usage`, so nothing else in this document reaches a top-level `duration`: derive the rule from the profile's locators rather than from names. The SEALED half is not redundant with the presence check once a quantity has alternatives — see §5.2 |
