@@ -1788,7 +1788,24 @@ func (r *Router) preview(ctx context.Context, ep endpoint.Endpoint, req wire.Req
 // previewTransit is preview that also returns the reply's encrypted_transit,
 // lower-cased ("" when the router sent none).
 func (r *Router) previewTransit(ctx context.Context, ep endpoint.Endpoint, req wire.Request) ([]previewProvider, string, error) {
-	withheld := r.withheldFor(ep)
+	payload := previewPayload(r.withheldFor(ep), ep, req)
+	return r.previewSend(ctx, req, payload)
+}
+
+// PreviewPayload is the route-preview body the sealed path sends for req on ep:
+// the request minus the surface's sealed fields (a capability signal standing in
+// for a withheld field the router routes on), plus service_type and the surface's
+// api_format. Exported for the gateway's "0g/auto" layer, which previews the same
+// request before it is sealed and must withhold exactly the same fields.
+func PreviewPayload(ep endpoint.Endpoint, req wire.Request) map[string]json.RawMessage {
+	withheld := map[string]struct{}{}
+	for _, f := range sensitiveFieldsFor(ep) {
+		withheld[f] = struct{}{}
+	}
+	return previewPayload(withheld, ep, req)
+}
+
+func previewPayload(withheld map[string]struct{}, ep endpoint.Endpoint, req wire.Request) map[string]json.RawMessage {
 	payload := make(map[string]json.RawMessage, len(req)+2)
 	for k, v := range req {
 		if _, sensitive := withheld[k]; sensitive {
@@ -1835,7 +1852,11 @@ func (r *Router) previewTransit(ctx context.Context, ep endpoint.Endpoint, req w
 	} else {
 		delete(payload, "api_format")
 	}
+	return payload
+}
 
+// previewSend posts a built preview payload, with previewTransit's retry policy.
+func (r *Router) previewSend(ctx context.Context, req wire.Request, payload map[string]json.RawMessage) ([]previewProvider, string, error) {
 	// One call-level observation on EVERY exit path, recorded by a defer rather than
 	// at each return so the counter cannot drift from the control flow as this loop
 	// grows. "failed" is the honest default: it is what falling out of the loop

@@ -312,7 +312,8 @@ func TestCORSActualRequestAllowed(t *testing.T) {
 func TestCORSExposeHeadersTracksPassthrough(t *testing.T) {
 	got := strings.Split(corsExposeHeaders, ", ")
 	want := append([]string{headerResKey, headerProvider, HeaderGatewayInstance, HeaderE2EE,
-		HeaderEncryptedTransitStatus, HeaderEncryptedTransitReason}, passthroughResponseHeaders...)
+		HeaderEncryptedTransitStatus, HeaderEncryptedTransitReason,
+		HeaderAutoTask, HeaderAutoModel, HeaderAutoClassifierE2EE}, passthroughResponseHeaders...)
 	if len(got) != len(want) {
 		t.Fatalf("Expose-Headers has %d entries, want %d (the proxy-originated headers + every passthrough header)", len(got), len(want))
 	}

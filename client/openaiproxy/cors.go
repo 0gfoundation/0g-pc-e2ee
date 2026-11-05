@@ -189,7 +189,8 @@ const corsMaxAge = "43200"
 // the toggle would put a deployment flag into the CORS answer for no gain.
 var corsExposeHeaders = strings.Join(append(
 	[]string{headerResKey, headerProvider, HeaderGatewayInstance, HeaderE2EE,
-		HeaderEncryptedTransitStatus, HeaderEncryptedTransitReason}, passthroughResponseHeaders...), ", ")
+		HeaderEncryptedTransitStatus, HeaderEncryptedTransitReason,
+		HeaderAutoTask, HeaderAutoModel, HeaderAutoClassifierE2EE}, passthroughResponseHeaders...), ", ")
 
 // ParseOrigins splits a comma-separated origin allowlist into trimmed, non-empty
 // patterns. An empty (or all-blank) value yields nil — no origin matches, i.e.
