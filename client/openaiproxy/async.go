@@ -37,18 +37,20 @@ const maxPollResponseBytes = 48 << 20
 const pollTimeout = 2 * time.Minute
 
 // WithCleartext gives a surface the handler a request it will not seal is sent
-// to: the cleartext passthrough. Two kinds of request go there:
+// to: the cleartext passthrough. Three kinds of request go there, and only the
+// caller's own X-0G-Encrypted-Transit header (callerTransit) or a field it sent
+// can put one there — never a value the router reports:
 //
-//   - any request whose effective encrypted_transit is off (the caller allowed
-//     plaintext; see core.ErrEncryptedTransitOff), on every surface;
-//   - under preferred, a request none of whose candidates could be prepared for
-//     sealing, before anything was sent (core.ErrNoEncryptedProvider);
+//   - the caller's header says off: forwarded as sent, without a preview;
+//   - the caller's header says preferred, and none of the request's candidates
+//     could be prepared for sealing before anything was sent
+//     (core.ErrNoEncryptedProvider) — unless the router says required;
 //   - an async submit asking for `response_format: "url"`, which cannot be
 //     served sealed (the images would be published outside the channel, SPEC
-//     §7.1), unless encrypted_transit is required — then it is refused with
-//     400 encrypted_transit_unsupported_feature instead (see registerAsync).
+//     §7.1). It always went out in the clear; now it is refused instead under
+//     required, from the caller's header or the router (see serveUnsealable).
 //
-// Either way the response is marked plaintext; a downgrade also carries
+// Each is marked plaintext; the last two, which are downgrades, also carry
 // HeaderEncryptedTransitReason.
 func WithCleartext(h http.Handler) Option {
 	return func(o *options) { o.cleartext = h }
@@ -61,6 +63,11 @@ func registerAsync(mux *http.ServeMux, ep endpoint.Endpoint, c *core.Client, o o
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxRequestBytes))
 		if err != nil {
 			readBodyError(w, err)
+			return
+		}
+		// The caller asked for plaintext in its own header (see Register).
+		if o.cleartext != nil && callerTransit(r) == core.TransitOff {
+			o.forwardOff(w, r, body)
 			return
 		}
 		var req wire.Request
@@ -94,11 +101,11 @@ func registerAsync(mux *http.ServeMux, ep endpoint.Endpoint, c *core.Client, o o
 		ctx = core.WithResponseMeta(ctx, meta)
 		fallback := o.transitFallback(w, r, body)
 		if fallback != nil {
-			ctx = core.WithCleartextFallback(ctx)
+			ctx = core.WithPlaintextPermitted(ctx)
 		}
 		resp, status, err := c.SubmitAsync(ctx, req)
 		if fallback != nil && fallback(err) {
-			return
+			return // not a completion; see Register
 		}
 		recordCompletion(err)
 		if err != nil {
@@ -119,41 +126,42 @@ func registerAsync(mux *http.ServeMux, ep endpoint.Endpoint, c *core.Client, o o
 }
 
 // serveUnsealable handles a request this surface cannot seal because of one of
-// its fields (field=value), according to the request's encrypted_transit, which
-// it asks the router for (one route-preview):
+// its fields (field=value). Such a request always went to the router in the
+// clear; it still does, marked with HeaderEncryptedTransitReason, unless the
+// requirement is required — from the caller's own header, or from the router's
+// value, which it asks for with one route-preview (the router may tighten,
+// never loosen) — and then it is refused with 400
+// encrypted_transit_unsupported_feature, naming the field and how to send it
+// sealed (hint). A router value this build does not know reads as required
+// (route.normalizeTransit; and the default arm below for a resolver that does
+// not fold it).
 //
-//   - required: refused with 400 encrypted_transit_unsupported_feature, naming
-//     the field and how to send it sealed (hint) — the caller required
-//     encryption, so it is not quietly given plaintext;
-//   - off: forwarded in the clear as the caller allowed;
-//   - preferred, or a router that sends no value: forwarded in the clear, as
-//     before, now marked with HeaderEncryptedTransitReason — the downgrade;
-//   - anything else: refused as under required. The route resolver already
-//     folds an unknown value onto required (route.normalizeTransit); this keeps
-//     a resolver that does not from turning it into a downgrade.
-//
-// When the router answers the preview with an error (a 401, or under required a
-// model with no supply to seal to) that answer is relayed: the request would
-// get it anyway. When it cannot be reached the request is forwarded as before;
+// A definitive answer from the router to that preview — a 4xx, or its own 503
+// no_provider_for_encrypted_transit — is relayed: the request would get it
+// anyway. Anything else (a 5xx left after retries, a router that cannot be
+// reached) leaves the request to go out as it did before there was a preview;
 // the router refuses a plaintext request under required itself.
 func (o options) serveUnsealable(w http.ResponseWriter, r *http.Request, c *core.Client, req wire.Request, body []byte, field, value, hint string) {
-	ctx := core.WithCredential(r.Context(), credential(r))
-	ctx = core.WithForwardedHeaders(ctx, routingHeaders(r.Header))
-	policy, err := c.EncryptedTransit(ctx, req)
-	var ce *core.Error
-	if err != nil && errors.As(err, &ce) && ce.Status >= 400 {
-		o.writeError(w, err)
-		return
-	}
 	reason := field + "_" + value
-	switch policy {
-	case core.TransitOff:
-		metrics.EncryptedTransitDecision("plaintext", policy, "policy_off")
-	case core.TransitPreferred, "":
-		metrics.EncryptedTransitDecision("plaintext", policy, reason)
-		w.Header().Set(HeaderEncryptedTransitReason, field+"="+value)
-	default: // required, and any value this build does not know
-		metrics.EncryptedTransitDecision("refused", policy, reason)
+	policy := callerTransit(r)
+	label := policy // the metric's policy; bounded by metrics.EncryptedTransitDecision
+	if policy != core.TransitRequired {
+		ctx := core.WithCredential(r.Context(), credential(r))
+		ctx = core.WithForwardedHeaders(ctx, routingHeaders(r.Header))
+		routerPolicy, err := c.EncryptedTransit(ctx, req)
+		switch {
+		case err == nil:
+			if routerPolicy != core.TransitOff && routerPolicy != core.TransitPreferred && routerPolicy != "" {
+				// required, or a value this build does not know (labelled unknown).
+				policy, label = core.TransitRequired, routerPolicy
+			}
+		case definitivePreviewError(err):
+			o.writeError(w, err)
+			return
+		}
+	}
+	if policy == core.TransitRequired {
+		metrics.EncryptedTransitDecision("refused", label, reason)
 		writeErrorObject(w, http.StatusBadRequest, map[string]any{
 			"error": map[string]any{
 				"message": fmt.Sprintf("%s %q cannot be sent end-to-end encrypted, and encrypted_transit is required: %s", field, value, hint),
@@ -165,7 +173,29 @@ func (o options) serveUnsealable(w http.ResponseWriter, r *http.Request, c *core
 		})
 		return
 	}
+	metrics.EncryptedTransitDecision("plaintext", label, reason)
+	w.Header().Set(HeaderEncryptedTransitReason, field+"="+value)
 	forwardCleartext(w, r, body, o.cleartext)
+}
+
+// definitivePreviewError reports whether a route-preview failure is the router
+// answering for this request, and so worth relaying rather than routing
+// around: a 4xx (the caller's credential, the request's shape, a header laxer
+// than the key's rule), or the router's own 503 no_provider_for_encrypted_transit.
+// A 5xx otherwise, or no answer at all, says nothing about the request.
+func definitivePreviewError(err error) bool {
+	var ce *core.Error
+	if !errors.As(err, &ce) {
+		return false
+	}
+	switch {
+	case ce.Status >= 400 && ce.Status < 500:
+		return true
+	case ce.Status == http.StatusServiceUnavailable:
+		obj, ok := parseUpstreamErrorObject(ce.Body)
+		return ok && obj["code"] == "no_provider_for_encrypted_transit"
+	}
+	return false
 }
 
 // wantsURLFormat reports whether the request asks for `response_format: "url"`.

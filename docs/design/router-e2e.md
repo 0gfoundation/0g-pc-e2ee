@@ -209,31 +209,53 @@ rotation and CDN multi-cert fronting; only an optional secondary check.
 
 ## Encrypted transit (0g-router #1215, G1)
 
-The router decides, per request, how much encryption the caller requires —
-`encrypted_transit`: `off` | `preferred` (default) | `required`, merged from the
-account's and the API key's routing rules and the `X-0G-Encrypted-Transit`
-request header (which may only make it stricter) — and returns the effective value
-as a top-level `encrypted_transit` in the route-preview reply. The gateway reads it
-from the preview it already makes for every sealed request, and acts on it:
+`encrypted_transit` is how much encryption a request requires: `off` |
+`preferred` | `required`. Two parties speak about it, and the gateway trusts them
+differently, because the router is untrusted and must never be able to make a
+sealed model's prompt go out in the clear:
 
-| `encrypted_transit` | the gateway |
-|---|---|
-| `off` | forwards the request to the router in the clear instead of sealing it (`core.ErrEncryptedTransitOff`, only where a cleartext path exists — the sidecar seals anyway) |
-| `preferred` | seals when it can, and otherwise sends in the clear, marked `X-0G-Encrypted-Transit-Reason`: a request the channel cannot carry (an async image submit asking for `response_format: "url"` → `response_format=url`), or one none of whose candidates could be prepared for sealing — no key to seal to, an attestation that did not verify — before anything was sent (`no_encrypted_provider`, `core.ErrNoEncryptedProvider`). A walk that already sent a sealed request is never re-sent in the clear: a provider may be serving it |
-| absent (a router with its routing policy off) | as before: seals; the `url` submit goes out in the clear (now with the Reason header); a model with nothing to seal to is an error |
-| `required` | seals; the router lists only providers that can be sealed to (none → its `503 no_provider_for_encrypted_transit` is relayed), and a request the channel cannot carry is refused with `400 encrypted_transit_unsupported_feature` |
+- **The caller**, through its own `X-0G-Encrypted-Transit` request header, which the
+  gateway reads directly. This is the only thing that can permit plaintext.
+- **The router**, which merges the account's and the API key's routing rules with that
+  header and returns the result as `encrypted_transit` in the route-preview reply. The
+  gateway lets this value make the requirement **stricter only**: under its `required`
+  nothing is downgraded and an unsealable request is refused; its `off` or `preferred`
+  permit nothing.
 
-The value comes from the router, so it is not trusted as sent: route.normalizeTransit folds it onto `off` / `preferred` / `required` / absent, and reads any other value as `required` — most likely a stricter value added after this build, which must not turn into a downgrade — counting each in `zg_gateway_encrypted_transit_unknown_total` (non-zero: the gateway predates its router).
+So account- or key-level loosening set in the Console (`off` or `preferred` on the
+account or a key) is **not honoured by the gateway**: without the caller's header a
+sealed model stays sealed, as before. Honouring it would need a path the router
+cannot forge; that is a separate design.
+
+| caller's header | router says | the gateway |
+|---|---|---|
+| `off` | anything | forwards the request to the router in the clear at once, without a preview (`forwardOff`). The router still merges that header with the account's and key's rules and refuses the plaintext request (`403 encrypted_transit_mismatch`) if either requires encryption |
+| `preferred` | not `required` | seals; if no candidate could be prepared for sealing (no key, an attestation that did not verify) and nothing was sent, forwards in the clear marked `X-0G-Encrypted-Transit-Reason: no_encrypted_provider` (`core.ErrNoEncryptedProvider`). Never after a sealed request was sent (a provider may be serving it), after the walk budget ran out, or for a caller that went away |
+| absent, `required`, or unreadable | not `required` | seals, as before: a model with nothing to seal to is an error |
+| any | `required` | seals; the router lists only providers that can be sealed to (none → its `503 no_provider_for_encrypted_transit` is relayed) |
+
+An async image submit asking for `response_format: "url"` cannot be sealed and always
+went out in the clear; it still does, marked `X-0G-Encrypted-Transit-Reason:
+response_format=url`, unless the caller's header or the router says `required` — then
+it is refused with `400 encrypted_transit_unsupported_feature` (send `b64_json`). The
+gateway asks the router with one preview for this request only; it relays a definitive
+answer (a 4xx, or `503 no_provider_for_encrypted_transit`) and otherwise — a 5xx after
+retries, no answer — forwards as before.
+
+The router's value is folded where it enters (`route.normalizeTransit`) onto `off` /
+`preferred` / `required` / absent; any other value reads as `required` — most likely a
+stricter value added after this build — and is counted in
+`zg_gateway_encrypted_transit_unknown_total` (non-zero: the gateway predates its router).
 
 Every inference response carries `X-0G-Encrypted-Transit-Status: encrypted | plaintext`
-(the same statement as the older `X-0G-E2EE: sealed | none`, which is still sent
-during the transition). Requests sent in the clear or refused because of the policy
-are counted in `zg_gateway_encrypted_transit_decisions_total{outcome,policy,reason}`;
-its `plaintext` rows under `preferred` are the downgrades, the evidence for
-retiring `response_format: "url"`.
+(the same statement as the older `X-0G-E2EE: sealed | none`, still sent during the
+transition). Requests sent in the clear or refused because of `encrypted_transit` are
+counted in `zg_gateway_encrypted_transit_decisions_total{outcome,policy,reason}`, its
+`policy` label bounded to `off` / `preferred` / `required` / `unknown`. The
+`no_encrypted_provider` rows are worth an alert (see `deploy/grafana/README.md`): a
+broker or attestation outage turns into plaintext for every caller that permitted it.
 
-The router is the backstop: it refuses a plaintext request under `required`
-itself (`403 encrypted_transit_mismatch`), so a request that never reaches this
-logic — a model outside `-seal-models`, which the gateway passes through without a
-preview — is still not served in the clear against the caller's rule.
-
+The router is the backstop: it refuses a plaintext request under `required` itself
+(`403 encrypted_transit_mismatch`), so a request that never reaches this logic — a model
+outside `-seal-models`, passed through without a preview — is still not served in the
+clear against the caller's rule.

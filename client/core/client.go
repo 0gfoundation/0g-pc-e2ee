@@ -786,9 +786,9 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 		return nil, err
 	}
 
-	// The chain was exhausted without a success. Under encrypted_transit=preferred a
-	// chain that never got as far as sending goes out in the clear instead.
-	if downgradeUnsent(ctx, cands, attempted) {
+	// The chain was exhausted without a success. A chain that never got as far as
+	// sending may go out in the clear instead, when the caller permitted it.
+	if downgradeUnsent(ctx, cands, attempted || walk.exhausted()) {
 		return nil, ErrNoEncryptedProvider
 	}
 	// fail is set whenever Len() > 0 (a candidate was tried); guard the impossible

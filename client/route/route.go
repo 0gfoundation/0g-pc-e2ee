@@ -782,22 +782,17 @@ func (r *Router) Resolve(ctx context.Context, ep endpoint.Endpoint, req wire.Req
 	if err != nil {
 		return nil, err
 	}
-	// encrypted_transit=off (0g-router #1215): the caller allowed plaintext.
-	// Answer that to a front end with a cleartext path and let it forward the
-	// request there; one without (the sidecar) seals anyway, since off permits
-	// plaintext rather than demanding it. required and preferred need nothing
-	// here — under required the router already listed only providers that can
-	// be sealed to.
-	if transit == core.TransitOff && core.CleartextFallbackFrom(ctx) {
-		return nil, core.ErrEncryptedTransitOff
-	}
+	// The router's encrypted_transit rides on the candidates so core can honour
+	// its required (no downgrade). It never permits plaintext on its own: the
+	// router is untrusted, and only the caller's own header can (see
+	// core.WithPlaintextPermitted).
 	return &routeCandidates{router: r, providers: providers, upstreamURL: upstream, transit: transit}, nil
 }
 
-// EncryptedTransit implements core.TransitPolicyResolver: the request's
-// effective encrypted_transit, as route-preview reports it ("" from a router
-// that does not send one). It costs one preview; the gateway asks only for a
-// request it cannot seal, to decide between downgrading and refusing it.
+// EncryptedTransit implements core.TransitPolicyResolver: the router's
+// encrypted_transit for the request, as route-preview reports it ("" from a
+// router that does not send one). It costs one preview; the gateway asks only
+// for a request it cannot seal, and uses the answer only to refuse it.
 func (r *Router) EncryptedTransit(ctx context.Context, ep endpoint.Endpoint, req wire.Request) (string, error) {
 	_, transit, err := r.previewTransit(ctx, ep, req)
 	return transit, err
@@ -842,8 +837,8 @@ type routeCandidates struct {
 	// so every candidate materialized from this list agrees on where the sealed
 	// request goes.
 	upstreamURL string
-	// transit is the preview's encrypted_transit, for core's preferred
-	// downgrade (core.TransitCandidates).
+	// transit is the preview's encrypted_transit, so core can let the
+	// router's required veto a downgrade (core.TransitCandidates).
 	transit string
 }
 

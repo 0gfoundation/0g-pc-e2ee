@@ -117,7 +117,7 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 		return err
 	}
 
-	if downgradeUnsent(ctx, cands, attempted) {
+	if downgradeUnsent(ctx, cands, attempted || walk.exhausted()) {
 		return ErrNoEncryptedProvider
 	}
 	if fail.err == nil {
