@@ -155,6 +155,9 @@ type mockRouter struct {
 	failStatus     int    // status returned for failPin (0 = 503)
 	badBodyPin     string // data plane returns 200 with an unopenable body for this pin
 	truncBodyPin   string // data plane returns 200 then truncates the body mid-read for this pin
+	// transit is the preview reply's encrypted_transit ("" omits it, as a router
+	// predating the field does).
+	transit string
 }
 
 func newMockRouter(t *testing.T, broker *mockBroker) *mockRouter {
@@ -195,9 +198,10 @@ func newMockRouter(t *testing.T, broker *mockBroker) *mockRouter {
 			providers = nil
 		}
 		_ = json.NewEncoder(w).Encode(previewResponse{
-			Object:      "routing.preview",
-			ServiceType: "chatbot",
-			Providers:   providers,
+			Object:           "routing.preview",
+			ServiceType:      "chatbot",
+			Providers:        providers,
+			EncryptedTransit: m.transit,
 		})
 	})
 

@@ -163,6 +163,26 @@ var (
 		Help: "Inference requests by seal decision (sealed|passthrough) and reason, " +
 			"with the model bucketed to the configured allowlist or \"other\".",
 	}, []string{"model", "decision", "reason"})
+	// Requests on a sealed surface that went to the router in the clear, or were
+	// refused, because of their encrypted_transit (0g-router #1215, G1) — by the
+	// policy that applied (off | preferred | required | unknown, for a router that
+	// sends none) and why: `policy_off` (the caller allowed plaintext), the
+	// request field the encrypted channel cannot carry (`response_format_url`),
+	// or `no_encrypted_provider` (no provider of the model could be sealed to).
+	// The plaintext rows under `preferred` are the downgrades: the evidence for
+	// retiring `response_format: "url"` once few callers still need it.
+	transitDecisions = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "encrypted_transit_decisions_total",
+		Help: "Sealed-surface requests sent in the clear or refused because of encrypted_transit, " +
+			"by outcome (plaintext|refused), policy and reason.",
+	}, []string{"outcome", "policy", "reason"})
+	// route-preview answers whose encrypted_transit this build does not know,
+	// read as required (route.normalizeTransit). Non-zero means the router has a
+	// value the gateway predates: upgrade the gateway.
+	unknownTransit = prometheus.NewCounter(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "encrypted_transit_unknown_total",
+		Help: "Route-preview answers with an encrypted_transit value this gateway does not know, read as required.",
+	})
 	verificationFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "response_verification_failures_total",
 		Help: "§8 response-signature verification failures by reason (fetch|signature).",
@@ -418,7 +438,7 @@ func init() {
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		httpRequests, httpDuration, httpInFlight, inFlightLimit, requestsShed, bodyReadTimeouts, bodyReadUnbounded,
-		completions, openFailures, verificationFailures, sealDecisions,
+		completions, openFailures, verificationFailures, sealDecisions, transitDecisions, unknownTransit,
 		previewAttempts, previewCalls, previewDuration, previewRetrySuppressed,
 		upstreamAttempts, upstreamDuration, streamTTFF, candidateFallbacks, keyRefreshes, walkBudgetExhausted,
 		signatureFetchCalls, signatureFetchDuration,
@@ -714,3 +734,24 @@ func hitMiss(hit bool) string {
 func RecordSealDecision(model, decision, reason string) {
 	sealDecisions.WithLabelValues(model, decision, reason).Inc()
 }
+
+// EncryptedTransitDecision counts one request sent in the clear (outcome
+// "plaintext") or refused ("refused") because of its encrypted_transit. policy
+// is the effective value, "unknown" when the router sent none; reason is one of
+// a small closed set (policy_off, response_format_url, no_encrypted_provider).
+//
+// policy is bounded here too, whatever the caller passes: off, preferred and
+// required keep their name and anything else — "" included — is "unknown", so
+// the label set cannot grow past four however the value was obtained.
+func EncryptedTransitDecision(outcome, policy, reason string) {
+	switch policy {
+	case "off", "preferred", "required":
+	default:
+		policy = "unknown"
+	}
+	transitDecisions.WithLabelValues(outcome, policy, reason).Inc()
+}
+
+// UnknownEncryptedTransit counts one route-preview answer whose
+// encrypted_transit this build does not know.
+func UnknownEncryptedTransit() { unknownTransit.Inc() }

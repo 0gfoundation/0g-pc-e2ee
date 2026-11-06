@@ -33,7 +33,32 @@ import (
 // it, which is a different and weaker claim than the §8 response signature having
 // verified (see setProvider for the same distinction on X-Provider). Nothing here
 // is evidence; it is the gateway reporting which of its two paths served you.
+//
+// Deprecated: superseded by HeaderEncryptedTransitStatus, which says the same
+// thing under the name the router's encrypted_transit rule uses. Both are sent
+// for a transition period; read the new one.
 const HeaderE2EE = "X-0G-E2EE"
+
+// HeaderEncryptedTransitStatus is HeaderE2EE under its public name
+// (0g-router #1215): "encrypted" where HeaderE2EE says "sealed", "plaintext"
+// where it says "none". Stamped by MarkE2EE alongside the old header, on the
+// same responses and with the same meaning.
+const HeaderEncryptedTransitStatus = "X-0G-Encrypted-Transit-Status"
+
+// HeaderEncryptedTransitReason says why a request this gateway would have
+// sealed went to the router in the clear: the request field the encrypted
+// channel cannot carry, as `field=value` (`response_format=url`), or
+// `no_encrypted_provider` when no provider of the model could be sealed to.
+// Present only on such a downgrade (encrypted_transit=preferred); absent on a sealed
+// response, on cleartext the caller asked for (encrypted_transit=off), and on
+// the metadata passthrough, which was never going to be sealed.
+const HeaderEncryptedTransitReason = "X-0G-Encrypted-Transit-Reason"
+
+// Values of HeaderEncryptedTransitStatus.
+const (
+	TransitStatusEncrypted = "encrypted"
+	TransitStatusPlaintext = "plaintext"
+)
 
 const (
 	// E2EEValueSealed: the request was sealed to a provider enclave and the response
@@ -60,9 +85,27 @@ const (
 // Add, so a router that ever emitted this name would APPEND to ours and put two
 // values on one response. newRouterProxy strips it upstream-side for that reason,
 // the same way it strips the upstream's CORS headers.
+//
+// It stamps HeaderEncryptedTransitStatus with the matching value too, so the two
+// names can never disagree on a response.
 func MarkE2EE(value string, h http.Handler) http.Handler {
+	status := TransitStatusPlaintext
+	if value == E2EEValueSealed {
+		status = TransitStatusEncrypted
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(HeaderE2EE, value)
+		w.Header().Set(HeaderEncryptedTransitStatus, status)
 		h.ServeHTTP(w, r)
 	})
+}
+
+// StripTransitHeaders removes the encrypted-transit markers from an upstream
+// header block, for a reverse proxy that copies upstream headers with Add on
+// top of the ones MarkE2EE already set: an upstream that ever sent them would
+// otherwise put two contradictory values on one response.
+func StripTransitHeaders(h http.Header) {
+	h.Del(HeaderE2EE)
+	h.Del(HeaderEncryptedTransitStatus)
+	h.Del(HeaderEncryptedTransitReason)
 }

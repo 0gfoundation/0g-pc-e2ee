@@ -295,6 +295,15 @@ highest-signal ones:
   that caller's own 401/404/429 or reporting an empty fleet, and `internal` is a
   request this gateway could not even build; none of the three says anything about
   whether the router is degrading, so none belongs on either side of the fraction.
+- `sum(rate(zg_gateway_encrypted_transit_decisions_total{reason="no_encrypted_provider"}[5m])) > 0`
+  — requests whose caller permitted plaintext (`X-0G-Encrypted-Transit: preferred`)
+  went out in the clear because no provider of their model could be sealed to. A
+  broker or attestation outage turns into plaintext for every such caller, quietly:
+  each request succeeds. Notify, and look at `materialize` fallbacks and the quote
+  verification series alongside it.
+- `zg_gateway_encrypted_transit_unknown_total > 0` (increase over any window) — the
+  router sent an `encrypted_transit` value this gateway does not know; it is read as
+  `required`, so callers may be refused. Upgrade the gateway.
 - `rate(zg_gateway_onchain_grounding_total{outcome="mismatch"}[5m]) > 0` — a
   provider's quote-bound signer disagreed with the chain, and still disagreed after
   a live re-read. Not an operational blip: it means the enclave that answered is not

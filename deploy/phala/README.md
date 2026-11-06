@@ -648,8 +648,17 @@ for models listed in `ZG_GATEWAY_SEAL_MODELS` (SPEC §7.5):
   verification is refused (`502`, `e2ee_verification_failed`), never returned.
 - A failed job reports a fixed code in `errorMessage` (`upstream_error:<status>`,
   `timeout`, `broker_error`, otherwise `job_failed`), never the upstream's text.
-- `response_format: "url"` is **not** sealed: it is forwarded to the router in the
-  clear and marked `X-0G-E2EE: none`. Check that header if it matters.
+- `response_format: "url"` is **not** sealed. It is forwarded to the router in the
+  clear, marked `X-0G-Encrypted-Transit-Status: plaintext` and
+  `X-0G-Encrypted-Transit-Reason: response_format=url`, unless `encrypted_transit` is
+  `required` — from the caller's own `X-0G-Encrypted-Transit` header or from the
+  router's route-preview — and then it is refused with
+  `400 encrypted_transit_unsupported_feature` (send `b64_json` instead). Only the
+  caller's header can permit plaintext for a request the gateway would seal (`off`:
+  forwarded at once; `preferred`: forwarded only when nothing could be sealed); the
+  router's value can only make the requirement stricter (and since 0g-router #1296 an
+  account or key can only set `required`). `X-0G-E2EE: none` is still sent
+  alongside, for now.
 - A job id without a key segment is polled in the clear, as before. Async image
   edits and video are not sealed.
 

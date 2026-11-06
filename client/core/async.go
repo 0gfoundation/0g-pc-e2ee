@@ -42,6 +42,7 @@ func (c *Client) SubmitAsync(ctx context.Context, req wire.Request) (wire.Respon
 
 	var fail walkErr
 	walk := candidateWalk{budget: c.resolveBudgetTO}
+	attempted := false // see downgradeUnsent
 	for i := 0; i < cands.Len(); i++ {
 		provider, err := walk.provider(ctx, cands, i)
 		if err != nil {
@@ -65,6 +66,7 @@ func (c *Client) SubmitAsync(ctx context.Context, req wire.Request) (wire.Respon
 			out    wire.Response
 			status int
 		)
+		attempted = true
 		retry, err := c.attemptRekeying(ctx, &walk, &fail, cands, i, provider, func(p Provider) (bool, error) {
 			var (
 				retry bool
@@ -88,6 +90,9 @@ func (c *Client) SubmitAsync(ctx context.Context, req wire.Request) (wire.Respon
 			continue
 		}
 		return nil, 0, err
+	}
+	if downgradeUnsent(ctx, cands, attempted || walk.exhausted()) {
+		return nil, 0, ErrNoEncryptedProvider
 	}
 	if fail.err == nil {
 		return nil, 0, stageErr(StageUpstream, fmt.Errorf("no provider candidates to try"))

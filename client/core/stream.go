@@ -64,6 +64,7 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 	// the same failure tiering (walkErr).
 	var fail walkErr
 	walk := candidateWalk{budget: c.resolveBudgetTO}
+	attempted := false // see downgradeUnsent
 	for i := 0; i < cands.Len(); i++ {
 		provider, err := walk.provider(ctx, cands, i)
 		if err != nil {
@@ -85,6 +86,7 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 		// Charged like Complete's: a stream that stalled before its first frame spent
 		// the caller's time and produced nothing (see resolveBudget). A stale-key
 		// rejection arrives as the status, before any frame, so re-sealing is safe.
+		attempted = true
 		retry, err := c.attemptRekeying(ctx, &walk, &fail, cands, i, provider, func(p Provider) (bool, error) {
 			sealed, err := c.seal(p, req, ephPriv, ephPub)
 			if err != nil {
@@ -115,6 +117,9 @@ func (c *Client) CompleteStream(ctx context.Context, req wire.Request, onFrame f
 		return err
 	}
 
+	if downgradeUnsent(ctx, cands, attempted || walk.exhausted()) {
+		return ErrNoEncryptedProvider
+	}
 	if fail.err == nil {
 		return stageErr(StageUpstream, fmt.Errorf("no provider candidates to try"))
 	}
