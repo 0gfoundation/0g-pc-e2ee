@@ -222,10 +222,14 @@ sealed model's prompt go out in the clear:
   nothing is downgraded and an unsealable request is refused; its `off` or `preferred`
   permit nothing.
 
-So account- or key-level loosening set in the Console (`off` or `preferred` on the
-account or a key) is **not honoured by the gateway**: without the caller's header a
-sealed model stays sealed, as before. Honouring it would need a path the router
-cannot forge; that is a separate design.
+So loosening is the caller's alone: without its header a sealed model stays sealed,
+as before. The router agrees: since 0g-router #1296 an account or a key can set
+`encrypted_transit` only to `required` (or leave it unset), and the router refuses
+`off` / `preferred` there with `400 invalid_routing_policy`. That validation is not
+what protects the caller — the gateway would ignore a laxer router value anyway — it
+only keeps the Console from offering a setting that could never take effect.
+Loosening from the Console would need a statement the router cannot forge; that is a
+separate design.
 
 | caller's header | router says | the gateway |
 |---|---|---|
