@@ -125,7 +125,13 @@ async function main() {
       // 0.5.9+). dstack-ingress requires it (ACCEPT_PROXY_PROTOCOL in
       // docker-compose.yml): without this, every connection is refused. Part of
       // app-compose, so it is measured into compose_hash with the rest.
-      port_policy: { ports: [{ port: 443, pp: true }] },
+      //
+      // restrict_mode stays false, and is spelled out because @phala/cloud's schema
+      // marks it required (dstack itself defaults it to false). True would make the
+      // dstack gateway forward ONLY the ports listed here (dstack-types PortPolicy),
+      // cutting off the guest agent at <app_id>-8090.<base_domain>, which pcverify
+      // falls back to for this CVM's app-compose.
+      port_policy: { ports: [{ port: 443, pp: true }], restrict_mode: false },
     },
   };
   if (opts.image) body.image = opts.image;
