@@ -92,9 +92,12 @@ services:
       - identity:/run/identity
 
   dstack-ingress:
-    # Official upstream image. 2.3 is the floor: it is the first release with the
-    # DNS-01 DELEGATION_ZONE feature (Dstack-TEE/dstack-examples #104/#108).
-    image: dstacktee/dstack-ingress:2.3@sha256:527c53523b9226782a11dbd800a3ff55e8a1f0b88e6224e8f7e4db7419769fbe
+    # Official upstream image, published to GHCR from 2.6 on (earlier releases were
+    # on Docker Hub as dstacktee/dstack-ingress). 2.8 is the floor: it is the release the
+    # PROXY protocol switches below were reviewed against (they arrived in 2.7), and
+    # it publishes the evidence bundle atomically. DELEGATION_ZONE needs 2.3+.
+    # Digest from upstream's own pin commit (Dstack-TEE/dstack-examples 93c5690).
+    image: ghcr.io/dstack-tee/dstack-ingress:2.8@sha256:60e682449534715a2f2e5b72326ca4229209c8e26c931c6f34d27e02200ac086
     restart: unless-stopped
     # HEALTHY, not merely created: HAProxy resolves the `gateway` backend name once
     # at startup, so coming up before the gateway serves risks a dead backend on
@@ -108,6 +111,12 @@ services:
       # passes SNI it holds no wildcard cert for straight through at L4, taking the
       # target from the `_dstack-app-address` TXT record, so TLS is never terminated
       # outside this CVM.
+      #
+      # The app's port policy marks this port `pp` (provision.cjs), so the dstack
+      # gateway prepends a PROXY protocol header carrying the client's address to
+      # every connection it relays here. ACCEPT_PROXY_PROTOCOL below is the other
+      # half: HAProxy refuses a connection without one. So nothing may reach 443
+      # except through the dstack gateway — no host mapping, no other container.
       - "443:443"
     environment:
       - DNS_PROVIDER=cloudflare
@@ -136,9 +145,11 @@ services:
       # expression never fires; guarding the inner variable instead would work, but
       # it fails the compose at PARSE time, taking the gateway down with the ingress
       # over a value that under blue/green nothing reads. Left ungated, the blast
-      # radius is the ingress alone: it tries to write `_.` as a CNAME target, the
-      # provider rejects it, and that container crash-loops with the reason in its
-      # log while the gateway keeps serving. If the platform ever exports the `_.`
+      # radius is the ingress alone — but that is the whole public endpoint, because
+      # the ingress is where TLS ends: since 2.8 dstack-ingress validates
+      # GATEWAY_DOMAIN at startup, rejects the bare `_.` and exits, and the
+      # container crash-loops with the reason in its log. The gateway process keeps
+      # running behind it, unreachable. If the platform ever exports the `_.`
       # form itself, this yields `_._.<base>` and compose cannot defend either way
       # (interpolation has no prefix stripping; `${VAR#_.}` is an interpolation
       # error). Evidence it is bare today: the same pre-launch script builds
@@ -167,6 +178,14 @@ services:
       # the direct mode only when asked, so ask — the same record either way.
       - SET_CAA=true
       - TARGET_ENDPOINT=gateway:8443 # forward decrypted traffic to the gateway
+      # The client's address, end to end (README "Client address"). ACCEPT reads the
+      # PROXY header the dstack gateway prepends (port policy `pp`, see `ports:`);
+      # SEND writes a v2 header carrying the same address onto the connection to the
+      # gateway, which requires it (ZG_GATEWAY_PROXY_PROTOCOL). The three switch
+      # together or not at all: a header one end does not expect, or one it expects
+      # and does not get, fails every connection.
+      - ACCEPT_PROXY_PROTOCOL=true
+      - SEND_PROXY_PROTOCOL=true
       # Default `wait` blocks on boot until the served CNAMEs resolve to
       # `<name>.<DOMAIN>.<DELEGATION_ZONE>` — a strict one-hop match, correct for a
       # single instance. Blue/green (blue-green.md) pins the served CNAMEs at the
@@ -260,6 +279,13 @@ services:
       # note above. Must STAY all-interfaces — a localhost bind would be unreachable
       # from dstack-ingress across the compose network.
       - "ZG_GATEWAY_LISTEN=0.0.0.0:8443"
+      # Every non-loopback connection to the listen port must open with the PROXY v2
+      # header dstack-ingress writes (SEND_PROXY_PROTOCOL above), and r.RemoteAddr is
+      # the client address it names. Loopback is exempt, which keeps the -health
+      # probe working. Sound only while 8443 stays unpublished (see `expose:`): the
+      # header is believed because the ingress is the only peer that can send one.
+      # The client address is not logged: this CVM's logs are public.
+      - "ZG_GATEWAY_PROXY_PROTOCOL=true"
       # Prometheus /metrics on a separate internal listener, never published to the
       # host and not fronted by dstack-ingress, so it is reachable only over the
       # compose network — by the prometheus-agent below. Empty/unset disables it.

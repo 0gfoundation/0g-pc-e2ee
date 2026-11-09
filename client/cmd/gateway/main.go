@@ -77,6 +77,7 @@ import (
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/cmd/internal/proxycli"
+	"github.com/0gfoundation/0g-pc-e2ee/client/cmd/internal/proxyproto"
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/dstack"
 	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
@@ -105,6 +106,16 @@ func main() {
 	// (e.g. 0.0.0.0:9464) that the compose neither publishes to the host nor fronts
 	// with dstack-ingress, so /metrics is reachable only over the CVM-internal
 	// compose network (the co-located Prometheus-agent scraper), never publicly.
+	// PROXY protocol on the listen port: the client's address, as dstack-ingress
+	// relays it (cmd/internal/proxyproto has the chain). Off by default because a
+	// gateway that expects the header refuses every non-loopback connection without
+	// one — the local and sidecar-style runs have no proxy in front. The TEE
+	// deployment turns it on together with the ingress's ACCEPT_/SEND_PROXY_PROTOCOL
+	// and the app's port policy; all three or none (deploy/phala/README.md).
+	proxyProtocol := flag.Bool("proxy-protocol", proxycli.EnvOr("ZG_GATEWAY_PROXY_PROTOCOL", "") == "true",
+		"require a PROXY protocol v2 header on every non-loopback connection to -listen and take the "+
+			"client address from it; loopback peers (the -health probe) are exempt "+
+			"(env ZG_GATEWAY_PROXY_PROTOCOL=true)")
 	metricsListen := flag.String("metrics-listen", os.Getenv("ZG_GATEWAY_METRICS_LISTEN"),
 		"address to serve Prometheus /metrics on; empty disables it. Bind an INTERNAL "+
 			"address never published through the public ingress (env ZG_GATEWAY_METRICS_LISTEN)")
@@ -499,9 +510,28 @@ func main() {
 		"seal_models", *sealModelsCSV,
 		"cors_allowed_origins", origins, "max_inflight", *maxInFlight,
 		"evidence_dir", *evidenceDir,
+		"proxy_protocol", *proxyProtocol,
 		"provider_identity_endpoint", providerIdentities != nil,
 		"go_memlimit_bytes", currentMemoryLimit(), "gomaxprocs", runtime.GOMAXPROCS(0))
-	err = proxycli.Serve(srv, logger)
+	if *proxyProtocol {
+		ln, lerr := net.Listen("tcp", *f.Listen)
+		if lerr != nil {
+			logger.Error("gateway server exited", "err", lerr)
+			os.Exit(1)
+		}
+		// The peer address logged here is the ingress's, never a client's: this
+		// CVM's logs are public (public_logs), and the client address is not for
+		// publishing.
+		err = proxycli.ServeListener(srv, &proxyproto.Listener{
+			Listener: ln,
+			OnError: func(peer net.Addr, err error) {
+				logger.Warn("refused a connection without a valid PROXY protocol header; is the ingress's SEND_PROXY_PROTOCOL on?",
+					"peer", peer.String(), "err", err)
+			},
+		}, logger)
+	} else {
+		err = proxycli.Serve(srv, logger)
+	}
 	stopWarmer()
 	stopIdentity()
 	stopMetrics()

@@ -804,6 +804,47 @@ curl -sSI -H 'Origin: https://example.invalid' "https://<DOMAIN>/evidences/quote
 pcverify -gateway <DOMAIN>
 ```
 
+## Client address (PROXY protocol)
+
+The gateway sees each client's real address as `r.RemoteAddr`. Without help it would
+see HAProxy's: the client's TCP connection ends at the dstack gateway (an L4 relay)
+and again at dstack-ingress, which terminates TLS here and opens a new connection to
+the gateway. Three switches carry the address across both hops, and **they go
+together or not at all**: a PROXY header one end does not expect, or one it expects
+and does not get, fails every connection.
+
+| Where | Setting | Effect |
+|---|---|---|
+| app-compose (`provision.cjs`) | `port_policy: {ports: [{port: 443, pp: true}]}` | The dstack gateway prepends a PROXY header to what it relays to 443. Needs dstack-gateway and guest OS 0.5.9+. |
+| dstack-ingress | `ACCEPT_PROXY_PROTOCOL=true` | HAProxy reads that header; refuses a connection without one. |
+| dstack-ingress | `SEND_PROXY_PROTOCOL=true` | HAProxy writes a v2 header with the same address onto its connection to `gateway:8443`. |
+| gateway | `ZG_GATEWAY_PROXY_PROTOCOL=true` | Every non-loopback connection to 8443 must open with a v2 header; `r.RemoteAddr` is the address it names. Loopback (the `-health` probe) is exempt. |
+
+**Why the header is believed.** Only because nothing but the dstack gateway can reach
+443 (no host port mapping beyond the one `ports:` entry, which the dstack gateway
+fronts) and nothing but dstack-ingress can reach 8443 (`expose:`, never `ports:`).
+Publishing 8443, or adding a container that dials it, would let that peer name any
+client address it likes.
+
+**The address is not logged.** This CVM's logs are public (`public_logs`), so the
+gateway never writes a client address to them; a refused connection is logged with
+the *peer's* address, which is the ingress's. Anything that starts using the client
+address must keep it out of logs and metric labels for the same reason.
+
+**What it does not do.** The gateway does not pass the address on: the router still
+sees this CVM's egress address for every E2EE request. Telling the router who the
+client is would be a decision about what the untrusted router is told, not a
+transport detail.
+
+**Rollout.** All four settings are measured (`compose_hash`), so they land as one new
+side under blue/green. Check on the new side, before the switch:
+
+- `curl https://<side host>/healthz` answers — a missing or unexpected header fails
+  at the TLS layer, not with an HTTP error;
+- the gateway log has no `refused a connection without a valid PROXY protocol header`;
+- dstack-ingress logs its version line (`dstack-ingress 2.8 revision …`) and no
+  `Invalid or missing GATEWAY_DOMAIN`.
+
 ## Gateway self-description (`/v1/gateway/identity`)
 
 A public, unauthenticated route that answers "what is this CVM?" in one request, so a

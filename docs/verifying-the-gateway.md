@@ -348,8 +348,8 @@ curl -s https://<gateway-domain>/v1/gateway/identity
   "containers": [
     { "name": "gateway", "image": "ghcr.io/0gfoundation/0g-pc-e2ee-gateway",
       "digest": "sha256:9c41ab7e…", "source": "0g-release" },
-    { "name": "dstack-ingress", "image": "dstacktee/dstack-ingress",
-      "digest": "sha256:527c5352…", "source": "third-party" }
+    { "name": "dstack-ingress", "image": "ghcr.io/dstack-tee/dstack-ingress",
+      "digest": "sha256:60e68244…", "source": "third-party" }
   ],
   "evidence_url": "/evidences/",
   "verify": "self-reported by this gateway; verify independently with: pcverify -gateway <domain>"
