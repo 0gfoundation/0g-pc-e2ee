@@ -340,6 +340,8 @@ var knownAppComposeFields = map[string]bool{
 	// connection, not what the CVM runs, so it needs no rule here. Whatever client
 	// address that header carries is the relay's word; a service acting on it trusts
 	// the relay that far, which is a question about the service, not this field.
+	// Its other key, `restrict_mode`, limits which ports the relay forwards at all;
+	// that narrows exposure and is not reviewed further either.
 	"port_policy":       true,
 	"pre_launch_script": true,
 	"public_logs":       true,

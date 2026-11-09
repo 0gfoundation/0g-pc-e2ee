@@ -815,7 +815,7 @@ and does not get, fails every connection.
 
 | Where | Setting | Effect |
 |---|---|---|
-| app-compose (`provision.cjs`) | `port_policy: {ports: [{port: 443, pp: true}]}` | The dstack gateway prepends a PROXY header to what it relays to 443. Needs dstack-gateway and guest OS 0.5.9+. |
+| app-compose (`provision.cjs`) | `port_policy: {ports: [{port: 443, pp: true}], restrict_mode: false}` | The dstack gateway prepends a PROXY header to what it relays to 443. Needs dstack-gateway and guest OS 0.5.9+. `restrict_mode` must stay `false`: `true` forwards only the listed ports and cuts off the guest agent (`<app_id>-8090`) that `pcverify` falls back to. |
 | dstack-ingress | `ACCEPT_PROXY_PROTOCOL=true` | HAProxy reads that header; refuses a connection without one. |
 | dstack-ingress | `SEND_PROXY_PROTOCOL=true` | HAProxy writes a v2 header with the same address onto its connection to `gateway:8443`. |
 | gateway | `ZG_GATEWAY_PROXY_PROTOCOL=true` | Every non-loopback connection to 8443 must open with a v2 header; `r.RemoteAddr` is the address it names. Loopback (the `-health` probe) is exempt. |
