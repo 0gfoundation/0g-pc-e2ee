@@ -106,19 +106,19 @@ func main() {
 	// (e.g. 0.0.0.0:9464) that the compose neither publishes to the host nor fronts
 	// with dstack-ingress, so /metrics is reachable only over the CVM-internal
 	// compose network (the co-located Prometheus-agent scraper), never publicly.
+	metricsListen := flag.String("metrics-listen", os.Getenv("ZG_GATEWAY_METRICS_LISTEN"),
+		"address to serve Prometheus /metrics on; empty disables it. Bind an INTERNAL "+
+			"address never published through the public ingress (env ZG_GATEWAY_METRICS_LISTEN)")
 	// PROXY protocol on the listen port: the client's address, as dstack-ingress
 	// relays it (cmd/internal/proxyproto has the chain). Off by default because a
 	// gateway that expects the header refuses every non-loopback connection without
 	// one — the local and sidecar-style runs have no proxy in front. The TEE
 	// deployment turns it on together with the ingress's ACCEPT_/SEND_PROXY_PROTOCOL
 	// and the app's port policy; all three or none (deploy/phala/README.md).
-	proxyProtocol := flag.Bool("proxy-protocol", proxycli.EnvOr("ZG_GATEWAY_PROXY_PROTOCOL", "") == "true",
+	proxyProtocol := flag.Bool("proxy-protocol", proxycli.EnvBool("ZG_GATEWAY_PROXY_PROTOCOL", false),
 		"require a PROXY protocol v2 header on every non-loopback connection to -listen and take the "+
 			"client address from it; loopback peers (the -health probe) are exempt "+
 			"(env ZG_GATEWAY_PROXY_PROTOCOL=true)")
-	metricsListen := flag.String("metrics-listen", os.Getenv("ZG_GATEWAY_METRICS_LISTEN"),
-		"address to serve Prometheus /metrics on; empty disables it. Bind an INTERNAL "+
-			"address never published through the public ingress (env ZG_GATEWAY_METRICS_LISTEN)")
 	// The browser origin allowlist for CORS — a gateway-only concern, like
 	// -metrics-listen above: the gateway is the form that serves browsers
 	// (no-install / thin clients), while the sidecar is a single-user localhost

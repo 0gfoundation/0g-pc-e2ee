@@ -334,12 +334,12 @@ var knownAppComposeFields = map[string]bool{
 	"manifest_version":           true,
 	"name":                       true,
 	"no_instance_id":             true,
-	// port_policy tells the dstack gateway, per port, whether to prepend a PROXY
-	// protocol header to the connections it relays (`pp`). It changes what the
-	// untrusted relay WRITES in front of a connection, nothing the CVM runs or
-	// trusts, so it needs no rule. The address it carries is the relay's word: a
-	// service that acts on it is trusting the relay for that much, which is a
-	// question about the service, not about this field.
+	// port_policy is the dstack gateway's per-port relay policy. The key this
+	// deployment sets, `pp`, makes the untrusted relay prepend a PROXY protocol
+	// header to the connections it forwards: it changes bytes in front of a
+	// connection, not what the CVM runs, so it needs no rule here. Whatever client
+	// address that header carries is the relay's word; a service acting on it trusts
+	// the relay that far, which is a question about the service, not this field.
 	"port_policy":       true,
 	"pre_launch_script": true,
 	"public_logs":       true,
