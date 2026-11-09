@@ -832,11 +832,17 @@ and does not get, fails every connection.
 | dstack-ingress | `SEND_PROXY_PROTOCOL=true` | HAProxy writes a v2 header with the same address onto its connection to `gateway:8443`. |
 | gateway | `ZG_GATEWAY_PROXY_PROTOCOL=true` | Every non-loopback connection to 8443 must open with a v2 header; `r.RemoteAddr` is the address it names. Loopback (the `-health` probe) is exempt. |
 
-**Why the header is believed.** Only because nothing but the dstack gateway can reach
-443 (no host port mapping beyond the one `ports:` entry, which the dstack gateway
-fronts) and nothing but dstack-ingress can reach 8443 (`expose:`, never `ports:`).
-Publishing 8443, or adding a container that dials it, would let that peer name any
-client address it likes.
+**Why the header is believed.** The gateway believes it because nothing but
+dstack-ingress can reach 8443 (`expose:`, never `ports:`); dstack-ingress believes the
+one in front of it because 443 is meant to be reached only through the dstack gateway.
+Publishing 8443, adding a container that dials it, or any path to 443 that bypasses
+the dstack gateway would let that peer name any client address it likes. If the
+dstack gateway itself sits behind an L4 load balancer, its operator must enable
+`inbound_pp_enabled` there, or the address relayed is the load balancer's.
+
+The address is also only as honest as the dstack gateway, which is outside the TEE.
+Use it for abuse controls and operations, not for anything the attestation is meant
+to guarantee.
 
 **The address is not logged.** This CVM's logs are public (`public_logs`), so the
 gateway never writes a client address to them; a refused connection is logged with
@@ -851,8 +857,9 @@ transport detail.
 **Rollout.** All four settings are measured (`compose_hash`), so they land as one new
 side under blue/green. Check on the new side, before the switch:
 
-- `curl https://<side host>/healthz` answers — a missing or unexpected header fails
-  at the TLS layer, not with an HTTP error;
+- `curl https://<side host>/healthz` answers 200 — a header missing or unexpected at
+  either hop drops the connection, so it shows as a TLS or empty-reply error from
+  curl, never as an HTTP status;
 - the gateway log has no `refused a connection without a valid PROXY protocol header`;
 - dstack-ingress logs its version line (`dstack-ingress 2.8 revision …`) and no
   `Invalid or missing GATEWAY_DOMAIN`.
