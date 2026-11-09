@@ -1261,7 +1261,7 @@ func (r *Router) verifyQuoteAt(ctx context.Context, quoteURL string) (res quoteR
 	}
 	verified, err := r.verifier.Verify(raw)
 	if err != nil {
-		return quoteResult{}, upstream(0, fmt.Errorf("provider quote: %w", err))
+		return quoteResult{}, upstream(0, refusal(fmt.Errorf("provider quote: %w", err)))
 	}
 	if !verified.MeasurementTrusted {
 		metrics.MeasurementUntrusted()
@@ -1582,7 +1582,7 @@ func signerAgrees(onchain chain.Signer, signer string) bool {
 func (r *Router) onchainVerdict(outcome groundingOutcome, revalidated bool, msg string) (grounding, error) {
 	g := grounding{outcome: outcome, revalidated: revalidated}
 	if r.onchainEnforce {
-		return g, upstream(0, errors.New(msg))
+		return g, upstream(0, refusal(errors.New(msg)))
 	}
 	r.logger.Warn("on-chain signer check failed; proceeding (onchain warn mode)", "detail", msg)
 	return g, nil
@@ -2210,6 +2210,22 @@ func modelDesc(req wire.Request) string {
 func upstream(status int, err error) error {
 	return &core.Error{Stage: core.StageUpstream, Status: status, Err: err}
 }
+
+// refusal marks err as this gateway's own verification refusing a candidate
+// (core.ErrProviderRefused), so the walk never answers it by forwarding the request
+// in the clear. Only for verdicts about the provider — a quote that did not verify,
+// an on-chain signer that contradicts it, the provider checks — never for a fetch or
+// a chain read that failed, which say nothing about the provider. A verification
+// error is not sorted further by cause, so one the verifier hit fetching its own
+// collateral is marked too: the mistake that leaves is an error, never plaintext.
+// The message is err's, unchanged.
+func refusal(err error) error { return refusedErr{err} }
+
+type refusedErr struct{ err error }
+
+func (e refusedErr) Error() string        { return e.err.Error() }
+func (e refusedErr) Unwrap() error        { return e.err }
+func (e refusedErr) Is(target error) bool { return target == core.ErrProviderRefused }
 
 // upstreamBody is upstream() carrying the raw upstream response body — used for a
 // non-2xx control-plane reply (route-preview / pubkey / quote) so the router's or

@@ -788,7 +788,7 @@ func (c *Client) Complete(ctx context.Context, req wire.Request) (wire.Response,
 
 	// The chain was exhausted without a success. A chain that never got as far as
 	// sending may go out in the clear instead, when the caller permitted it.
-	if downgradeUnsent(ctx, cands, attempted || walk.exhausted()) {
+	if downgradeUnsent(ctx, cands, &walk, attempted) {
 		return nil, ErrNoEncryptedProvider
 	}
 	// fail is set whenever Len() > 0 (a candidate was tried); guard the impossible

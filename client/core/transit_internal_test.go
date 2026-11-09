@@ -17,26 +17,38 @@ import (
 // transitCands is a candidate list carrying the router's encrypted_transit.
 // With p unset every candidate fails to materialize (nothing is ever sent); with
 // block set each one waits for its context instead; with p set every candidate
-// is p.
+// is p. With refuse set, candidate 1 fails as the route resolver's verification
+// refusal does instead: a message of its own that errors.Is matches to
+// ErrProviderRefused.
 type transitCands struct {
 	transit string
 	n       int
 	p       *Provider
 	block   bool
+	refuse  bool
 }
 
 func (t transitCands) Len() int                 { return t.n }
 func (t transitCands) EncryptedTransit() string { return t.transit }
-func (t transitCands) Provider(ctx context.Context, _ int) (Provider, error) {
+func (t transitCands) Provider(ctx context.Context, i int) (Provider, error) {
 	switch {
 	case t.p != nil:
 		return *t.p, nil
 	case t.block:
 		<-ctx.Done()
 		return Provider{}, ctx.Err()
+	case t.refuse && i == 1:
+		return Provider{}, &Error{Stage: StageUpstream, Err: refusedForTest{errors.New("provider quote: attest: quote verification: bad signature")}}
 	}
 	return Provider{}, errors.New("no key to seal to")
 }
+
+// refusedForTest wraps an error the way route.refusal does.
+type refusedForTest struct{ err error }
+
+func (e refusedForTest) Error() string        { return e.err.Error() }
+func (e refusedForTest) Unwrap() error        { return e.err }
+func (e refusedForTest) Is(target error) bool { return target == ErrProviderRefused }
 
 func transitChatReq() wire.Request {
 	return wire.Request{
@@ -121,5 +133,27 @@ func TestNoEncryptedProvider_NotAfterASend(t *testing.T) {
 	var e *Error
 	if errors.Is(err, ErrNoEncryptedProvider) || !errors.As(err, &e) || e.Status != http.StatusServiceUnavailable {
 		t.Errorf("err = %v, want the provider's 503", err)
+	}
+}
+
+// A walk in which this client's own verification refused a candidate is never
+// downgraded, on any of the three walks, even with the caller's permission and the
+// other candidates merely keyless: a refused attestation or on-chain signer is the
+// sign of an attack, and the answer to it is an error, not the prompt in the clear.
+func TestNoEncryptedProvider_NotAfterARefusal(t *testing.T) {
+	ctx := WithPlaintextPermitted(context.Background())
+	cands := transitCands{transit: TransitPreferred, n: 3, refuse: true}
+	c := NewWithResolver(fixedResolver{cands})
+	if _, err := c.Complete(ctx, transitChatReq()); err == nil || errors.Is(err, ErrNoEncryptedProvider) {
+		t.Errorf("Complete err = %v, want the walk's own error", err)
+	}
+	stream := transitChatReq()
+	stream["stream"] = json.RawMessage(`true`)
+	if err := c.CompleteStream(ctx, stream, func(wire.Response) error { return nil }); err == nil || errors.Is(err, ErrNoEncryptedProvider) {
+		t.Errorf("CompleteStream err = %v, want the walk's own error", err)
+	}
+	async := NewWithResolver(fixedResolver{cands}, WithEndpoint(endpoint.AsyncImage))
+	if _, _, err := async.SubmitAsync(ctx, wire.Request{"model": json.RawMessage(`"z-image"`), "prompt": json.RawMessage(`"p"`)}); err == nil || errors.Is(err, ErrNoEncryptedProvider) {
+		t.Errorf("SubmitAsync err = %v, want the walk's own error", err)
 	}
 }

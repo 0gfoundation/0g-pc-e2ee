@@ -651,10 +651,13 @@ for models listed in `ZG_GATEWAY_SEAL_MODELS` (SPEC §7.5):
   router's route-preview — and then it is refused with
   `400 encrypted_transit_unsupported_feature` (send `b64_json` instead). Only the
   caller's header can permit plaintext for a request the gateway would seal (`off`:
-  forwarded at once; `preferred`: forwarded only when nothing could be sealed); the
-  router's value can only make the requirement stricter (and since 0g-router #1296 an
-  account or key can only set `required`). `X-0G-E2EE: none` is still sent
-  alongside, for now.
+  forwarded at once; `preferred`: forwarded only when nothing could be sealed, and
+  never after the gateway's own verification refused a candidate); the router's value
+  can only make the requirement stricter (and since 0g-router #1296 an account or key
+  can only set `required`). That holds for the router's *value* only: under
+  `preferred` the router decides whether anything can be sealed (it chooses the
+  candidates), so `preferred` gives no confidentiality from the router — see
+  `docs/design/router-e2e.md`. `X-0G-E2EE: none` is still sent alongside, for now.
 - A job id without a key segment is polled in the clear, as before. Async image
   edits and video are not sealed.
 
