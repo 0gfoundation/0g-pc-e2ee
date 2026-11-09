@@ -13,13 +13,18 @@ import (
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 )
 
-// evidenceUmaskFiles are the bundle files whose mode is NOT set explicitly by
-// dstack-ingress. It chmods 644 onto `acme-account.json` and `cert-<domain>.pem`
-// (both arrive via `cp`), but writes these two with a plain shell redirect — so
+// evidenceUmaskFiles are the bundle files whose mode dstack-ingress before 2.8
+// did NOT set explicitly. It chmodded 644 onto `acme-account.json` and `cert-<domain>.pem`
+// (both arrive via `cp`), but wrote these two with a plain shell redirect — so
 // their mode is whatever the ingress container's umask happens to be, and these are
 // the two the gateway's `nonroot` uid could lose access to without anything else
 // changing. They are also the two that matter most: the quote itself and the
 // manifest its report_data commits to.
+//
+// dstack-ingress 2.8 chmods 644 onto every file it publishes, these two included,
+// so on the deployed image this check no longer guards anything upstream leaves to
+// chance. It stays: it costs two opens at boot, and it is what catches a pin moved
+// back, or forward to a release that changes this again.
 var evidenceUmaskFiles = []string{evidenceQuoteFile, "sha256sum.txt"}
 
 // evidenceQuoteFile is the bundle's cert-binding quote. Named here because two
@@ -165,7 +170,7 @@ func evidenceRoute(dir string, next http.Handler) http.Handler {
 	// verifier needs the index to discover the cert-<domain>.pem filename. Files are
 	// read per request from the read-only mount, never cached in-process, so the
 	// bundle dstack-ingress rewrites at each certificate renewal is served as-is.
-	files := http.StripPrefix(evidencePrefix, http.FileServer(http.Dir(dir)))
+	files := http.StripPrefix(evidencePrefix, http.FileServer(dotHidingFS{http.Dir(dir)}))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != strings.TrimSuffix(evidencePrefix, "/") && !strings.HasPrefix(r.URL.Path, evidencePrefix) {
 			next.ServeHTTP(w, r)
@@ -206,6 +211,52 @@ func evidenceRoute(dir string, next http.Handler) http.Handler {
 		// verifier holding a stale quote.json against a fresh certificate sees a
 		// mismatch it cannot explain. Last-Modified still keeps the common case a 304.
 		w.Header().Set("Cache-Control", "no-cache")
+		// dstack-ingress (2.8+) assembles each bundle in a `.staging.XXXXXX`
+		// directory inside this one and renames the files into place, so a reader
+		// never sees a manifest that does not match its quote. That directory is
+		// root-only and transient: hide it, and any other dot-name, rather than
+		// list it in the index or answer 403 for it.
+		if hasDotSegment(strings.TrimPrefix(r.URL.Path, evidencePrefix)) {
+			http.NotFound(w, r)
+			return
+		}
 		files.ServeHTTP(w, r)
 	})
+}
+
+// hasDotSegment reports whether any segment of a slash-separated path starts with
+// a dot.
+func hasDotSegment(p string) bool {
+	for _, seg := range strings.Split(p, "/") {
+		if strings.HasPrefix(seg, ".") {
+			return true
+		}
+	}
+	return false
+}
+
+// dotHidingFS hides dot-names from http.FileServer's directory index (the pattern
+// in net/http's own FileServer example). Opening one directly is refused by the
+// handler's hasDotSegment check before FileServer sees it.
+type dotHidingFS struct{ http.FileSystem }
+
+type dotHidingFile struct{ http.File }
+
+func (fsys dotHidingFS) Open(name string) (http.File, error) {
+	f, err := fsys.FileSystem.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	return dotHidingFile{f}, nil
+}
+
+func (f dotHidingFile) Readdir(n int) ([]fs.FileInfo, error) {
+	all, err := f.File.Readdir(n)
+	kept := all[:0]
+	for _, fi := range all {
+		if !strings.HasPrefix(fi.Name(), ".") {
+			kept = append(kept, fi)
+		}
+	}
+	return kept, err
 }

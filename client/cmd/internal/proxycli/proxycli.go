@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -101,18 +102,34 @@ func Serve(srv *http.Server, logger *slog.Logger) error {
 	return serve(srv, logger, sigCh)
 }
 
+// ServeListener is Serve on a listener the caller built — the gateway wraps its
+// listener to read the PROXY protocol header dstack-ingress sends (see
+// cmd/internal/proxyproto). srv.Addr is ignored; lifecycle is identical to Serve.
+func ServeListener(srv *http.Server, ln net.Listener, logger *slog.Logger) error {
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	return serveWith(srv, func() error { return srv.Serve(ln) }, logger, sigCh)
+}
+
 // serve is the signal-source-independent core of Serve. It takes the trigger
 // channel as a parameter so a test can drive the drain path deterministically
 // without sending a real process signal (which would race every other test in
 // the binary). Production always feeds it an os/signal-backed channel via Serve.
 func serve(srv *http.Server, logger *slog.Logger, sigCh <-chan os.Signal) error {
+	return serveWith(srv, srv.ListenAndServe, logger, sigCh)
+}
+
+// serveWith is serve with the accept loop supplied: srv.ListenAndServe, or
+// srv.Serve on a caller-built listener.
+func serveWith(srv *http.Server, run func() error, logger *slog.Logger, sigCh <-chan os.Signal) error {
 	// ListenAndServe blocks until Shutdown/Close, so run it in a goroutine and
 	// report its outcome here. A clean shutdown surfaces as ErrServerClosed, which
 	// is normal (not an error); anything else is a genuine listen/serve failure
 	// that the select below returns to the caller synchronously.
 	errCh := make(chan error, 1)
 	go func() {
-		err := srv.ListenAndServe()
+		err := run()
 		if errors.Is(err, http.ErrServerClosed) {
 			err = nil
 		}

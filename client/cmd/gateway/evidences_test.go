@@ -384,3 +384,46 @@ func TestEvidenceRouteUnmountedWhenUnset(t *testing.T) {
 		t.Error("wildcard CORS header present with no evidence dir configured")
 	}
 }
+
+// dstack-ingress 2.8 assembles each bundle in a root-only `.staging.XXXXXX`
+// directory inside the volume before renaming the files into place. It must not
+// show in the index, nor be reachable (it would answer 403, or serve a half-built
+// bundle).
+func TestEvidenceHidesStagingDirectory(t *testing.T) {
+	dir := evidenceBundle(t)
+	stage := filepath.Join(dir, ".staging.Ab12Cd")
+	if err := os.Mkdir(stage, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stage, "quote.json"), []byte(`{"half":"built"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gw := evidenceGateway(t, dir)
+
+	resp, err := http.Get(gw.URL + "/evidences/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if strings.Contains(string(body), ".staging") {
+		t.Errorf("index lists the staging directory:\n%s", body)
+	}
+	if !strings.Contains(string(body), "quote.json") {
+		t.Errorf("index lost the bundle:\n%s", body)
+	}
+
+	for _, p := range []string{"/evidences/.staging.Ab12Cd/", "/evidences/.staging.Ab12Cd/quote.json"} {
+		resp, err := http.Get(gw.URL + p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("GET %s = %d, want 404", p, resp.StatusCode)
+		}
+		if got := resp.Header.Get("Access-Control-Allow-Origin"); got != "*" {
+			t.Errorf("GET %s lost the CORS header: %q", p, got)
+		}
+	}
+}

@@ -120,6 +120,12 @@ async function main() {
       public_sysinfo: true,
       public_tcbinfo: true,
       secure_time: false,
+      // The dstack gateway prepends a PROXY protocol header with the client's
+      // address to connections it relays to 443 (dstack-gateway and guest OS
+      // 0.5.9+). dstack-ingress requires it (ACCEPT_PROXY_PROTOCOL in
+      // docker-compose.yml): without this, every connection is refused. Part of
+      // app-compose, so it is measured into compose_hash with the rest.
+      port_policy: { ports: [{ port: 443, pp: true }] },
     },
   };
   if (opts.image) body.image = opts.image;

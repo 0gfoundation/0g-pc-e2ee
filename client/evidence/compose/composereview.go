@@ -334,14 +334,21 @@ var knownAppComposeFields = map[string]bool{
 	"manifest_version":           true,
 	"name":                       true,
 	"no_instance_id":             true,
-	"pre_launch_script":          true,
-	"public_logs":                true,
-	"public_sysinfo":             true,
-	"public_tcbinfo":             true,
-	"runner":                     true,
-	"secure_time":                true,
-	"storage_fs":                 true,
-	"tproxy_enabled":             true,
+	// port_policy tells the dstack gateway, per port, whether to prepend a PROXY
+	// protocol header to the connections it relays (`pp`). It changes what the
+	// untrusted relay WRITES in front of a connection, nothing the CVM runs or
+	// trusts, so it needs no rule. The address it carries is the relay's word: a
+	// service that acts on it is trusting the relay for that much, which is a
+	// question about the service, not about this field.
+	"port_policy":       true,
+	"pre_launch_script": true,
+	"public_logs":       true,
+	"public_sysinfo":    true,
+	"public_tcbinfo":    true,
+	"runner":            true,
+	"secure_time":       true,
+	"storage_fs":        true,
+	"tproxy_enabled":    true,
 }
 
 // rootAccessEnvs are the allowed_envs names that hand the untrusted host a way IN to

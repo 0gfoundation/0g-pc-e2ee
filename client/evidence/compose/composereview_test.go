@@ -1450,3 +1450,14 @@ func TestReviewCompose_AReaderFailureIsNotRead(t *testing.T) {
 		t.Fatalf("got %+v", c)
 	}
 }
+
+// port_policy (the dstack gateway's per-port PROXY protocol switch) is a field this
+// review has read; it is not reported as unknown.
+func TestPortPolicyIsAKnownField(t *testing.T) {
+	r := reviewOf(t, manifest("services:\n  app:\n    image: ghcr.io/0gfoundation/0g-pc-e2ee-gateway@sha256:"+strings.Repeat("b", 64)+"\n", map[string]any{
+		"port_policy": map[string]any{"ports": []any{map[string]any{"port": 443, "pp": true}}},
+	}))
+	if got := find(r, "", "port_policy"); len(got) != 0 {
+		t.Fatalf("port_policy reported: %s", dumpFindings(r))
+	}
+}
