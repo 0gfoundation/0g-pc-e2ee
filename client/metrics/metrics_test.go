@@ -255,3 +255,35 @@ func TestEncryptedTransitDecisionBoundsPolicy(t *testing.T) {
 		t.Errorf("series for reason=test_bound = %d, want 2 (unknown, required)", n)
 	}
 }
+
+// The PROXY outcome counter is registered, counts by result, and has no label
+// that could carry a client address.
+func TestProxyHeaderCounter(t *testing.T) {
+	c := proxyHeaders.WithLabelValues("proxied")
+	before := testutil.ToFloat64(c)
+	ProxyHeader("proxied")
+	if got := testutil.ToFloat64(c) - before; got != 1 {
+		t.Fatalf("proxied delta = %v, want 1", got)
+	}
+
+	srv := httptest.NewServer(Handler())
+	defer srv.Close()
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	var line string
+	for _, l := range strings.Split(string(body), "\n") {
+		if strings.HasPrefix(l, "zg_gateway_proxy_header_connections_total{") {
+			line = l
+		}
+	}
+	if line == "" {
+		t.Fatal("zg_gateway_proxy_header_connections_total not exposed")
+	}
+	if labels := line[strings.Index(line, "{"):strings.Index(line, "}")]; strings.Count(labels, "=") != 1 || !strings.Contains(labels, "result=") {
+		t.Fatalf("unexpected labels %q: only `result` is allowed", labels)
+	}
+}
