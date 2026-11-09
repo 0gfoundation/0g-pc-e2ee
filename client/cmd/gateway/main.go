@@ -528,6 +528,7 @@ func main() {
 				logger.Warn("refused a connection without a valid PROXY protocol header; is the ingress's SEND_PROXY_PROTOCOL on?",
 					"peer", peer.String(), "err", err)
 			},
+			OnResult: metrics.ProxyHeader,
 		}, logger)
 	} else {
 		err = proxycli.Serve(srv, logger)

@@ -73,7 +73,20 @@ type Listener struct {
 	// OnError, if set, is called once for each connection whose header was missing
 	// or malformed. The connection is closed after it returns.
 	OnError func(peer net.Addr, err error)
+	// OnResult, if set, is called once per accepted connection with its outcome:
+	// ResultLoopback at accept, and one of ResultProxied, ResultLocal or
+	// ResultRefused once the header has been read. It carries no address on
+	// purpose (see the metric it feeds).
+	OnResult func(result string)
 }
+
+// Connection outcomes reported to Listener.OnResult.
+const (
+	ResultProxied  = "proxied"  // a v2 header named a TCP client
+	ResultLocal    = "local"    // a valid header naming no client (LOCAL, or a non-TCP family)
+	ResultLoopback = "loopback" // exempt peer; no header expected
+	ResultRefused  = "refused"  // header missing or malformed; connection closed
+)
 
 // Accept returns the next connection. It does not read from it.
 func (l *Listener) Accept() (net.Conn, error) {
@@ -82,20 +95,24 @@ func (l *Listener) Accept() (net.Conn, error) {
 		return nil, err
 	}
 	if isLoopback(c.RemoteAddr()) {
+		if l.OnResult != nil {
+			l.OnResult(ResultLoopback)
+		}
 		return c, nil
 	}
 	timeout := l.HeaderTimeout
 	if timeout <= 0 {
 		timeout = DefaultHeaderTimeout
 	}
-	return &Conn{Conn: c, timeout: timeout, onError: l.OnError}, nil
+	return &Conn{Conn: c, timeout: timeout, onError: l.OnError, onResult: l.OnResult}, nil
 }
 
 // Conn is a connection whose first bytes are a PROXY v2 header.
 type Conn struct {
 	net.Conn
-	timeout time.Duration
-	onError func(peer net.Addr, err error)
+	timeout  time.Duration
+	onError  func(peer net.Addr, err error)
+	onResult func(result string)
 
 	once   sync.Once
 	remote net.Addr // the client address the header named; nil until read, or for LOCAL
@@ -113,6 +130,16 @@ func (c *Conn) readHeader() {
 				c.onError(c.Conn.RemoteAddr(), c.err)
 			}
 			_ = c.Conn.Close()
+		}
+		if c.onResult != nil {
+			switch {
+			case c.err != nil:
+				c.onResult(ResultRefused)
+			case c.remote != nil:
+				c.onResult(ResultProxied)
+			default:
+				c.onResult(ResultLocal)
+			}
 		}
 	})
 }

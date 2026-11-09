@@ -388,6 +388,16 @@ var (
 			"evidence, by what the fresh evidence then said (ok|negative|lookup_failed).",
 	}, []string{"result"})
 
+	// PROXY protocol on the listen port (cmd/internal/proxyproto). Deliberately no
+	// address label: the client address leaves the TEE through remote_write if it is
+	// ever put here, and its cardinality is unbounded.
+	proxyHeaders = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "proxy_header_connections_total",
+		Help: "Connections to the listen port by PROXY protocol outcome: proxied (a v2 header " +
+			"named a TCP client), local (a valid header naming no client: LOCAL or a non-TCP " +
+			"family), loopback (exempt, e.g. the -health probe), refused (header missing or malformed).",
+	}, []string{"result"})
+
 	// Warmer (route/warmer.go) — the background sweep keeping the quote cache hot.
 	warmerSweeps = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: namespace, Subsystem: subsystem, Name: "warmer_sweeps_total",
@@ -444,6 +454,7 @@ func init() {
 		signatureFetchCalls, signatureFetchDuration,
 		quoteVerify, quoteVerifyDuration, quoteCache, measurementUntrusted, runtimeRelease, composeBaseline, providerEnforceRefusals,
 		onchainGrounding, onchainRevalidations,
+		proxyHeaders,
 		warmerSweeps, warmerProviderRefresh, warmerSignerRefresh,
 		warmerReadyProviders, warmerLastSuccess,
 		collateralCache, collateralFetch, collateralFetchDuration,
@@ -647,6 +658,10 @@ func ComposeBaseline(verdict string) { composeBaseline.WithLabelValues(verdict).
 // outcome is a fixed low-cardinality label: ok, ok_stale, mismatch,
 // not_acknowledged, or lookup_failed.
 func OnChainGrounding(outcome string) { onchainGrounding.WithLabelValues(outcome).Inc() }
+
+// ProxyHeader counts one connection to the listen port by its PROXY protocol
+// outcome: proxied, local, loopback or refused. Never pass an address.
+func ProxyHeader(result string) { proxyHeaders.WithLabelValues(result).Inc() }
 
 // OnChainRevalidation records a live re-read forced because a negative verdict
 // would otherwise have rested on stale or cached evidence. result is what the

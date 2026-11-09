@@ -196,3 +196,51 @@ func TestSilentPeerDoesNotBlockAccept(t *testing.T) {
 		t.Fatalf("RemoteAddr = %q", got)
 	}
 }
+
+// Every accepted connection reports exactly one outcome, and none carries an address.
+func TestOnResultReportsEachOutcome(t *testing.T) {
+	results := make(chan string, 8)
+	onResult := func(r string) { results <- r }
+
+	inner, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxied := &Listener{Listener: fakePeer{inner}, HeaderTimeout: 2 * time.Second, OnResult: onResult}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})}
+	go func() { _ = srv.Serve(proxied) }()
+	t.Cleanup(func() { _ = srv.Close() })
+	addr := inner.Addr().String()
+
+	for _, tc := range []struct {
+		prefix []byte
+		want   string
+	}{
+		{v2Header(cmdProxy, famTCP4, tcp4Payload(net.ParseIP("203.0.113.7"), 1)), ResultProxied},
+		{v2Header(cmdLocal, 0x00, nil), ResultLocal},
+		{nil, ResultRefused},
+	} {
+		rawRequest(t, addr, tc.prefix)
+		select {
+		case got := <-results:
+			if got != tc.want {
+				t.Fatalf("result = %q, want %q", got, tc.want)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("no result reported, want %q", tc.want)
+		}
+	}
+
+	loop, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	direct := &Listener{Listener: loop, OnResult: onResult}
+	srv2 := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})}
+	go func() { _ = srv2.Serve(direct) }()
+	t.Cleanup(func() { _ = srv2.Close() })
+	rawRequest(t, loop.Addr().String(), nil)
+	if got := <-results; got != ResultLoopback {
+		t.Fatalf("loopback result = %q", got)
+	}
+}
