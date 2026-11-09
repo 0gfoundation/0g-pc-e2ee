@@ -106,5 +106,5 @@ func (r *Router) refuseProvider(ctx context.Context, address string, facts quote
 	}
 	r.logger.Warn("provider refused: what it runs did not pass the provider checks (provider enforce)",
 		"provider", address, "running", rt.running, "deployment", bl.deployment, "why", strings.Join(why, "; "))
-	return upstream(0, fmt.Errorf("provider %s refused (provider enforce): %s", address, strings.Join(why, "; ")))
+	return upstream(0, refusal(fmt.Errorf("provider %s refused (provider enforce): %s", address, strings.Join(why, "; "))))
 }

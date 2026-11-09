@@ -220,7 +220,8 @@ sealed model's prompt go out in the clear:
   header and returns the result as `encrypted_transit` in the route-preview reply. The
   gateway lets this value make the requirement **stricter only**: under its `required`
   nothing is downgraded and an unsealable request is refused; its `off` or `preferred`
-  permit nothing.
+  permit nothing. That is a statement about the router's *value*; under the caller's
+  `preferred` the router still decides the *outcome* (see below).
 
 So loosening is the caller's alone: without its header a sealed model stays sealed,
 as before. The router agrees: since 0g-router #1296 an account or a key can set
@@ -231,10 +232,30 @@ only keeps the Console from offering a setting that could never take effect.
 Loosening from the Console would need a statement the router cannot forge; that is a
 separate design.
 
+**`preferred` gives no confidentiality from the router.** Whether a candidate can be
+prepared for sealing is decided by things the router controls: the candidate list
+itself and the endpoints in it. A router that wants a `preferred` caller's prompt can
+list nothing, or nothing reachable, and the gateway forwards the prompt to it in the
+clear. A caller that sends `preferred` is trusting the router with the decision; one
+that does not want to sends nothing (or `required`). What the gateway does refuse is to
+answer **its own verification's refusal** with plaintext: when a candidate's quote did
+not verify, the chain contradicted or did not acknowledge its signer (on-chain enforce),
+or the provider checks refused it (`core.ErrProviderRefused`), the walk is never
+downgraded and the caller gets the error. That does not stop a hostile router — it can
+list nothing instead — but a refused verification is the sign of an attack, and its
+answer must be an error someone sees, not the prompt in the clear. Failures that say
+nothing about the provider (a quote that could not be fetched, a chain read that
+failed, a malformed candidate, an empty list) still downgrade: they are also how a
+model without an encrypted provider shows up. Making `preferred` hold against the
+router needs a source it cannot forge for "this model has no encrypted provider" — the
+on-chain registry, enumerated per model — and would mean a `preferred` request for a
+model that has one fails instead of downgrading while that provider is down; that is a
+separate design.
+
 | caller's header | router says | the gateway |
 |---|---|---|
 | `off` | anything | forwards the request to the router in the clear at once, without a preview (`forwardOff`). The router still merges that header with the account's and key's rules and refuses the plaintext request (`403 encrypted_transit_mismatch`) if either requires encryption |
-| `preferred` | not `required` | seals; if no candidate could be prepared for sealing (no key, an attestation that did not verify) and nothing was sent, forwards in the clear marked `X-0G-Encrypted-Transit-Reason: no_encrypted_provider` (`core.ErrNoEncryptedProvider`). Never after a sealed request was sent (a provider may be serving it), after the walk budget ran out, or for a caller that went away |
+| `preferred` | not `required` | seals; if no candidate could be prepared for sealing (no key, a quote that could not be fetched) and nothing was sent, forwards in the clear marked `X-0G-Encrypted-Transit-Reason: no_encrypted_provider` (`core.ErrNoEncryptedProvider`). Never after a sealed request was sent (a provider may be serving it), after the walk budget ran out, after this gateway's own verification refused a candidate, or for a caller that went away. The router decides whether anything can be sealed, so this gives no confidentiality from the router (above) |
 | absent, `required`, or unreadable | not `required` | seals, as before: a model with nothing to seal to is an error |
 | any | `required` | seals; the router lists only providers that can be sealed to (none → its `503 no_provider_for_encrypted_transit` is relayed) |
 
@@ -257,7 +278,8 @@ transition). Requests sent in the clear or refused because of `encrypted_transit
 counted in `zg_gateway_encrypted_transit_decisions_total{outcome,policy,reason}`, its
 `policy` label bounded to `off` / `preferred` / `required` / `unknown`. The
 `no_encrypted_provider` rows are worth an alert (see `deploy/grafana/README.md`): a
-broker or attestation outage turns into plaintext for every caller that permitted it.
+broker outage — or a router that lists nothing sealable — turns into plaintext for every
+caller that permitted it.
 
 The router is the backstop: it refuses a plaintext request under `required` itself
 (`403 encrypted_transit_mismatch`), so a request that never reaches this logic — a model

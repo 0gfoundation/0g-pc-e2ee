@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -113,6 +114,10 @@ const resolveBudget = 90 * time.Second
 type candidateWalk struct {
 	spent  time.Duration
 	budget time.Duration
+	// refused is set once a candidate failed to materialize because this client's
+	// own verification refused it (ErrProviderRefused); such a walk is never
+	// downgraded to plaintext (downgradeUnsent).
+	refused bool
 }
 
 // limit is the walk's budget, defaulted.
@@ -149,6 +154,9 @@ func (w *candidateWalk) provider(ctx context.Context, cands Candidates, i int) (
 	defer cancel()
 	p, err := cands.Provider(ctx, i)
 	w.spent += time.Since(start)
+	if errors.Is(err, ErrProviderRefused) {
+		w.refused = true
+	}
 	return p, err
 }
 

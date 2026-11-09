@@ -31,6 +31,16 @@ import (
 // required. A permission set only in the Console (account or key rules) is not
 // honoured here; it would have to reach the gateway by a path the router cannot
 // forge.
+//
+// What this does NOT give a caller that sent preferred is confidentiality from
+// the router. Whether a candidate can be prepared for sealing is decided by
+// facts the router controls — the candidate list itself, and the endpoints in it
+// — so a router that wants the prompt can list nothing, or nothing reachable, and
+// receive it in the clear. "Stricter only" holds for the router's encrypted_transit
+// VALUE; under preferred the router still decides the OUTCOME. What this client
+// does refuse is to downgrade on its own verification's refusal
+// (ErrProviderRefused): that is a sign of an attack, not of a model without
+// encryption, and answering it with plaintext would point the wrong way.
 const (
 	TransitOff       = "off"
 	TransitPreferred = "preferred"
@@ -39,16 +49,33 @@ const (
 
 // ErrNoEncryptedProvider is returned by Complete, CompleteStream and
 // SubmitAsync when no candidate could be prepared for sealing — every one
-// failed before anything was sent (no key to seal to, an attestation that did
-// not verify) — and plaintext is permitted: the caller's own header permits it
-// (WithPlaintextPermitted) and the router does not say required. The request
-// has reached no provider; the front end forwards it in the clear and says why.
+// failed before anything was sent (no key to seal to, a quote that could not
+// be fetched) and none was refused by verification — and plaintext is
+// permitted: the caller's own header permits it (WithPlaintextPermitted) and
+// the router does not say required. The request has reached no provider; the
+// front end forwards it in the clear and says why.
 //
 // Never for a walk that sent a request (a provider may already be serving it,
 // and sending it again in the clear would run it twice), one cut short by the
-// walk budget (the caller has already waited all of it), or a caller that went
-// away.
+// walk budget (the caller has already waited all of it), one in which this
+// client's own verification refused a candidate (ErrProviderRefused), or a
+// caller that went away.
 var ErrNoEncryptedProvider = errors.New("no provider could be sealed to: forward the request in the clear")
+
+// ErrProviderRefused marks a candidate this client's own verification looked at
+// and refused: an attestation quote that did not verify, a quote-bound signer
+// the on-chain registry contradicts or does not acknowledge, or a provider the
+// provider checks refused. Candidates resolvers wrap such errors so that
+// errors.Is finds it (the message is theirs, unchanged).
+//
+// A walk that met one is never downgraded to plaintext (downgradeUnsent). Not
+// because it stops a router that wants the prompt — that router can list nothing
+// instead — but because a refused verification is the signal of an attack, and
+// the answer to it must be an error someone sees, not the prompt in the clear.
+// Failures that say nothing about the provider (a quote that could not be
+// fetched, a chain read that failed, a malformed candidate) are not marked:
+// they may be how a model without an encrypted provider shows up.
+var ErrProviderRefused = errors.New("provider refused by verification")
 
 type plaintextPermittedKey struct{}
 
@@ -74,12 +101,13 @@ type TransitCandidates interface {
 }
 
 // downgradeUnsent reports whether a walk that ended without a success may be
-// handed back as ErrNoEncryptedProvider: nothing was sent and the walk was not
-// cut short (spent false), the caller is still there, the caller permitted
-// plaintext (WithPlaintextPermitted), and the router does not veto it by saying
-// required. The router's value can only veto; it never grants.
-func downgradeUnsent(ctx context.Context, cands Candidates, spent bool) bool {
-	if spent || canceledBy(ctx) || !PlaintextPermittedFrom(ctx) {
+// handed back as ErrNoEncryptedProvider: nothing was sent (attempted false), the
+// walk was not cut short by its budget, no candidate was refused by
+// verification (ErrProviderRefused), the caller is still there, the caller
+// permitted plaintext (WithPlaintextPermitted), and the router does not veto it
+// by saying required. The router's value can only veto; it never grants.
+func downgradeUnsent(ctx context.Context, cands Candidates, walk *candidateWalk, attempted bool) bool {
+	if attempted || walk.exhausted() || walk.refused || canceledBy(ctx) || !PlaintextPermittedFrom(ctx) {
 		return false
 	}
 	if t, ok := cands.(TransitCandidates); ok && t.EncryptedTransit() == TransitRequired {
