@@ -844,10 +844,23 @@ The address is also only as honest as the dstack gateway, which is outside the T
 Use it for abuse controls and operations, not for anything the attestation is meant
 to guarantee.
 
-**The address is not logged.** This CVM's logs are public (`public_logs`), so the
-gateway never writes a client address to them; a refused connection is logged with
-the *peer's* address, which is the ingress's. Anything that starts using the client
-address must keep it out of logs and metric labels for the same reason.
+**The address is not logged.** This CVM's logs are public (`public_logs`: the guest
+agent serves every container's docker logs to anyone), so:
+
+- the gateway never writes a client address to them; a refused connection is logged
+  with the *peer's* address, which is the ingress's;
+- dstack-ingress runs with `logging: driver: none`. Its HAProxy logs one `tcplog` line
+  per connection to stdout, with no knob in the pinned image, and once it accepts the
+  PROXY header the source on that line is the client's real address. The cost is the
+  ingress's own diagnostics (ACME, DNS setup, its version line); see Rollout for what
+  is left to check it by.
+
+Turning `public_logs` off instead is not a substitute: the guest agent then registers
+no log route at all, and a scoped token cannot unlock one (dstack
+`guest-agent/src/http_routes.rs`), so the owner loses the logs too. The Phala console
+reads logs through that agent, so expect it to show none either. Anything
+that starts using the client address must keep it out of logs and metric labels for
+the same reason.
 
 **What it does not do.** The gateway does not pass the address on: the router still
 sees this CVM's egress address for every E2EE request. Telling the router who the
@@ -860,9 +873,15 @@ side under blue/green. Check on the new side, before the switch:
 - `curl https://<side host>/healthz` answers 200 — a header missing or unexpected at
   either hop drops the connection, so it shows as a TLS or empty-reply error from
   curl, never as an HTTP status;
-- the gateway log has no `refused a connection without a valid PROXY protocol header`;
-- dstack-ingress logs its version line (`dstack-ingress 2.8 revision …`) and no
-  `Invalid or missing GATEWAY_DOMAIN`.
+- the gateway log has no `refused a connection without a valid PROXY protocol header`,
+  and `zg_gateway_proxy_header_connections_total{result="proxied"}` rises with traffic
+  while `result="refused"` stays at zero;
+- dstack-ingress writes no logs (`logging: driver: none`), so check it by its effects:
+  `openssl s_client -connect <side host>:443 -servername <side host>` shows a
+  publicly-trusted certificate for the side (a crash-looping ingress, e.g. one that
+  rejected `GATEWAY_DOMAIN`, serves nothing), and `/evidences/quote.json` is present
+  and fresh. While a side is still being brought up, use `ACME_STAGING=true` as the
+  README "Serving domain" describes.
 
 ## Gateway self-description (`/v1/gateway/identity`)
 

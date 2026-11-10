@@ -99,6 +99,22 @@ services:
     # Digest from upstream's own pin commit (Dstack-TEE/dstack-examples 93c5690).
     image: ghcr.io/dstack-tee/dstack-ingress:2.8@sha256:60e682449534715a2f2e5b72326ca4229209c8e26c931c6f34d27e02200ac086
     restart: unless-stopped
+    # NO LOGS from this container, on purpose. HAProxy here runs `option tcplog` to
+    # stdout (dstack-ingress haproxy-lib.sh; no knob in the pinned image), one line
+    # per connection, and with ACCEPT_PROXY_PROTOCOL the source on that line is the
+    # CLIENT'S real address. This CVM's logs are public (`public_logs` in
+    # provision.cjs: the guest agent serves every container's docker logs to anyone),
+    # so leaving the default driver on would publish every caller's IP and when they
+    # connected. `none` keeps them out of docker logs entirely.
+    #
+    # The price: the ingress's own diagnostics go too — ACME issuance and renewal,
+    # DNS setup, the startup version line, a GATEWAY_DOMAIN rejection. What remains
+    # to see its health from outside: the served certificate (issuer, expiry), the
+    # /evidences/ bundle the gateway serves, and the gateway's /healthz through 443.
+    # Do not "restore" logging here without first taking the client address out of
+    # it or turning public_logs off — README "Client address".
+    logging:
+      driver: none
     # HEALTHY, not merely created: HAProxy resolves the `gateway` backend name once
     # at startup, so coming up before the gateway serves risks a dead backend on
     # first boot. This closes the startup race only — a gateway recreated with a new
