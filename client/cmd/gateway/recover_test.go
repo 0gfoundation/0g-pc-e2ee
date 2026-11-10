@@ -59,6 +59,12 @@ func (fixedRemote) RemoteAddr() net.Addr {
 // request.
 func serveWithLogs(t *testing.T, h http.Handler) (appLog, serverLog string, gotResponse bool) {
 	t.Helper()
+	return serveWithLogsAt(t, "/boom", h)
+}
+
+// serveWithLogsAt is serveWithLogs for a request to path.
+func serveWithLogsAt(t *testing.T, path string, h http.Handler) (appLog, serverLog string, gotResponse bool) {
+	t.Helper()
 	var app, srvLog syncBuffer
 	logger := slog.New(slog.NewTextHandler(&app, nil))
 
@@ -79,7 +85,7 @@ func serveWithLogs(t *testing.T, h http.Handler) (appLog, serverLog string, gotR
 	}
 	defer c.Close()
 	_ = c.SetDeadline(time.Now().Add(5 * time.Second))
-	_, _ = io.WriteString(c, "GET /boom HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+	_, _ = io.WriteString(c, "GET "+path+" HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
 	resp, _ := io.ReadAll(c)
 
 	// The server goroutine logs after the connection is torn down; give it a moment.
@@ -128,5 +134,20 @@ func TestRecoverPassesNormalResponses(t *testing.T) {
 	}))
 	if !gotResponse || appLog != "" {
 		t.Fatalf("normal request disturbed: response=%v log=%q", gotResponse, appLog)
+	}
+}
+
+// An async poll path carries the key that opens the job's result
+// (/v1/async/jobs/{id}.{key}, SPEC §7.5.3). A panic while serving one must not
+// print it: the panic line is public, like the access log, which redacts it too.
+func TestHandlerPanicRedactsTheJobKey(t *testing.T) {
+	const secret = "SECRETkey0123456789"
+	appLog, serverLog, _ := serveWithLogsAt(t, "/v1/async/jobs/abc."+secret,
+		http.HandlerFunc(func(http.ResponseWriter, *http.Request) { panic("kaboom") }))
+	if strings.Contains(appLog, secret) || strings.Contains(serverLog, secret) {
+		t.Fatalf("job key logged:\napp: %s\nserver: %s", appLog, serverLog)
+	}
+	if !strings.Contains(appLog, "/v1/async/jobs/abc.<redacted>") {
+		t.Fatalf("panic line lost the redacted path: %s", appLog)
 	}
 }

@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"net/http"
 	"runtime/debug"
+
+	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 )
 
 // recoverWithoutAddress turns a handler panic into one log line that carries no
@@ -36,10 +38,23 @@ func recoverWithoutAddress(logger *slog.Logger, next http.Handler) http.Handler 
 			if err, ok := v.(error); ok && errors.Is(err, http.ErrAbortHandler) {
 				panic(v)
 			}
-			// method and path are already in the access log for every request;
-			// RemoteAddr is deliberately absent.
+			// What goes on this line, and why, given that it lands in PUBLIC logs:
+			//   - no RemoteAddr: the reason this function exists;
+			//   - the path REDACTED, the same way the access log and the router
+			//     passthrough's ErrorHandler print it: an async poll path is
+			//     /v1/async/jobs/{id}.{key}, and the key is the ephemeral private
+			//     key that opens that job's result (a full job id is a credential,
+			//     SPEC §7.5.3). r.URL.Path excludes the query string;
+			//   - the panic value and stack VERBATIM. This is the one place in the
+			//     gateway that prints an arbitrary panic value into public logs. A
+			//     runtime panic (nil map, index out of range) carries no request
+			//     data, and a stack prints arguments as machine words, not the
+			//     strings they point to; but a panic built from request content —
+			//     panic(fmt.Sprintf("bad body %s", b)), a wrapped error quoting a
+			//     path or a header — would be published as written. Do not panic
+			//     with request data anywhere under this handler.
 			logger.Error("handler panic",
-				"method", r.Method, "path", r.URL.Path,
+				"method", r.Method, "path", openaiproxy.RedactJobPath(r.URL.Path),
 				"panic", v, "stack", string(debug.Stack()))
 			panic(http.ErrAbortHandler)
 		}()
