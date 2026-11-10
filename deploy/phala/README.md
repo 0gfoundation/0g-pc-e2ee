@@ -848,7 +848,9 @@ to guarantee.
 agent serves every container's docker logs to anyone), so:
 
 - the gateway never writes a client address to them; a refused connection is logged
-  with the *peer's* address, which is the ingress's;
+  with the *peer's* address, which is the ingress's. A handler panic is recovered
+  before net/http's own recovery, which would log `http: panic serving <RemoteAddr>`
+  (`recoverWithoutAddress`, cmd/gateway/recover.go);
 - dstack-ingress runs with `logging: driver: none`. Its HAProxy logs one `tcplog` line
   per connection to stdout, with no knob in the pinned image, and once it accepts the
   PROXY header the source on that line is the client's real address. The cost is the

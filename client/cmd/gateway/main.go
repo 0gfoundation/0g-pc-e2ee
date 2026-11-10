@@ -463,13 +463,15 @@ func main() {
 
 	srv := &http.Server{
 		Addr: *f.Listen,
-		Handler: newHandler(built.Clients, routerTarget, origins, instanceID, *evidenceDir, *maxInFlight,
+		// Outermost: a panic must not reach net/http's own recovery, which logs the
+		// RemoteAddr — the client's address under -proxy-protocol — to public logs.
+		Handler: recoverWithoutAddress(logger, newHandler(built.Clients, routerTarget, origins, instanceID, *evidenceDir, *maxInFlight,
 			identity, providerIdentities, built.Readiness(), logger,
 			withEntryPolicy(entryPolicy{
 				openOrigins: openOrigins,
 				sealModels:  sealModelsList,
 			}),
-			withQuoter(quoter)),
+			withQuoter(quoter))),
 		ReadHeaderTimeout: 10 * time.Second, // mitigate slow-header (Slowloris) clients
 		// Backstop for every route: see serverReadTimeout. The sealed inference
 		// routes are bounded tighter, from admission, by defaultBodyReadTimeout.
