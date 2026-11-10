@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"log"
 	"log/slog"
@@ -116,14 +117,30 @@ func TestHandlerPanicLogsNoClientAddress(t *testing.T) {
 	}
 }
 
-// http.ErrAbortHandler (httputil.ReverseProxy uses it when the client goes away) is
-// passed through: no app log line, and net/http logs nothing for it either.
+// A deliberate abort is not logged by anyone: neither here nor by net/http. The
+// wrapped case is the one that matters: net/http compares the sentinel with ==, so
+// a wrapped ErrAbortHandler re-panicked as-is would hit its "panic serving
+// <RemoteAddr>" line and publish the client address.
 func TestAbortHandlerPanicPassesThroughSilently(t *testing.T) {
-	appLog, serverLog, _ := serveWithLogs(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		panic(http.ErrAbortHandler)
-	}))
-	if appLog != "" || serverLog != "" {
-		t.Fatalf("abort was logged:\napp: %s\nserver: %s", appLog, serverLog)
+	for _, tc := range []struct {
+		name string
+		v    any
+	}{
+		{"bare", http.ErrAbortHandler},
+		{"wrapped", fmt.Errorf("copy: %w", http.ErrAbortHandler)},
+		{"double wrapped", fmt.Errorf("proxy: %w", fmt.Errorf("copy: %w", http.ErrAbortHandler))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			appLog, serverLog, gotResponse := serveWithLogs(t, http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				panic(tc.v)
+			}))
+			if appLog != "" || serverLog != "" {
+				t.Fatalf("abort was logged:\napp: %s\nserver: %s", appLog, serverLog)
+			}
+			if gotResponse {
+				t.Fatal("client got a response from an aborted handler")
+			}
+		})
 	}
 }
 

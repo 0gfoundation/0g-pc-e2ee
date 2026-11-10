@@ -240,7 +240,12 @@ func TestOnResultReportsEachOutcome(t *testing.T) {
 	go func() { _ = srv2.Serve(direct) }()
 	t.Cleanup(func() { _ = srv2.Close() })
 	rawRequest(t, loop.Addr().String(), nil)
-	if got := <-results; got != ResultLoopback {
-		t.Fatalf("loopback result = %q", got)
+	select {
+	case got := <-results:
+		if got != ResultLoopback {
+			t.Fatalf("loopback result = %q", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no result reported for the loopback connection")
 	}
 }

@@ -76,7 +76,9 @@ type Listener struct {
 	// OnResult, if set, is called once per accepted connection with its outcome:
 	// ResultLoopback at accept, and one of ResultProxied, ResultLocal or
 	// ResultRefused once the header has been read. It carries no address on
-	// purpose (see the metric it feeds).
+	// purpose (see the metric it feeds). It runs AFTER OnError and, for a refused
+	// connection, after the connection has been closed: it is for counting, and
+	// must not expect a usable connection.
 	OnResult func(result string)
 }
 

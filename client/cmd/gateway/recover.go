@@ -23,8 +23,12 @@ import (
 // Re-panicking with http.ErrAbortHandler keeps the observable behaviour: net/http
 // still closes the connection (or resets the HTTP/2 stream) without writing a
 // response it has not already sent, and it logs nothing for that sentinel. A handler
-// that panics with ErrAbortHandler itself — httputil.ReverseProxy does, when the
-// client goes away mid-copy — is passed through untouched and unlogged, as before.
+// that aborts on purpose — httputil.ReverseProxy panics with ErrAbortHandler when
+// the client goes away mid-copy — is not logged here either. It is re-panicked as
+// the BARE sentinel even when it arrived wrapped (fmt.Errorf("…: %w",
+// http.ErrAbortHandler)): net/http recognises the sentinel by ==, not errors.Is
+// (server.go and the bundled http2 server alike), so re-panicking a wrapped value
+// would land on its "http: panic serving <RemoteAddr>" line after all.
 //
 // It catches only panics on the handler's own goroutine; a goroutine a handler
 // starts that panics still takes the process down, and net/http logs nothing then.
@@ -36,7 +40,7 @@ func recoverWithoutAddress(logger *slog.Logger, next http.Handler) http.Handler 
 				return
 			}
 			if err, ok := v.(error); ok && errors.Is(err, http.ErrAbortHandler) {
-				panic(v)
+				panic(http.ErrAbortHandler) // bare: see above; the wrapped value is dropped
 			}
 			// What goes on this line, and why, given that it lands in PUBLIC logs:
 			//   - no RemoteAddr: the reason this function exists;
