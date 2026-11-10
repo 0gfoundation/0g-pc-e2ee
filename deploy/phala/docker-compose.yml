@@ -304,10 +304,10 @@ services:
       - "ZG_GATEWAY_PROXY_PROTOCOL=true"
       # The client's address, told to the router in signed X-0G-Client-IP headers
       # (README "Client address"). The HMAC key shared with the router comes in
-      # through the encrypted env — a `ZG_GATEWAY_CLIENT_IP_KEY=<hex>` line in the
-      # deploy target's CVM_SECRET_ENV — so only the name is measured here. Unset
-      # or empty (the default) sends nothing; the router then keeps seeing every
-      # gateway user as this CVM's egress address.
+      # through the encrypted env, from the deploy target's ZG_GATEWAY_CLIENT_IP_KEY
+      # secret, so only the name is measured here. Unset or empty (the default)
+      # sends nothing; the router then keeps seeing every gateway user as this
+      # CVM's egress address.
       - "ZG_GATEWAY_CLIENT_IP_KEY=${ZG_GATEWAY_CLIENT_IP_KEY:-}"
       # Prometheus /metrics on a separate internal listener, never published to the
       # host and not fronted by dstack-ingress, so it is reachable only over the
