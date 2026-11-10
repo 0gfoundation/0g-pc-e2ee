@@ -870,7 +870,7 @@ func TestCallerDisconnectIsNotAFallback(t *testing.T) {
 // A slow retryable failure on the LAST candidate is not a ceiling cut: a running
 // attempt is never interrupted by the budget, so there it only decides whether to
 // move on, and there was nothing to move on to. Counting it booked every request
-// whose upstream is slower than resolveBudget (90s, against a 630s bufferedTimeout)
+// whose upstream is slower than resolveBudget (90s, against a 1230s bufferedTimeout)
 // as OUR ceiling firing — in the one series the runbook says means exactly that and
 // tells operators to correlate with the latency p99.
 func TestSlowFailureOnTheLastCandidateIsNotABudgetCut(t *testing.T) {

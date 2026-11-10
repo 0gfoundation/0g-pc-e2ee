@@ -168,7 +168,7 @@ screen:
      exists not to do. And a failed attempt on the *last* candidate: a running
      attempt is never cut by the budget, so there the budget only decides whether
      to move on, and there was nothing to move on to. Counting it would book every
-     request whose upstream is slower than the budget (90s, against a 630s provider
+     request whose upstream is slower than the budget (90s, against a 1230s provider
      timeout) as a ceiling cut — manufacturing exactly the correlation with the
      latency p99 this bullet asks you to read, and on a single-provider deployment
      turning the panel into a slow-failure counter.
