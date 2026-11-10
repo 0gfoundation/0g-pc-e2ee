@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/clientip"
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
@@ -446,6 +447,12 @@ func routingHeaders(h http.Header) http.Header {
 			out = make(http.Header)
 		}
 		out[k] = vs
+	}
+	// The client-address headers are in the X-0G-* namespace but are not the
+	// client's to set: only the gateway signs them (clientip.Stamp, at each
+	// router-bound request).
+	if out != nil {
+		clientip.Strip(out)
 	}
 	return out
 }

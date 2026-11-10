@@ -129,6 +129,11 @@ working. No other header is forwarded: arbitrary client headers
 (cookies, app-internal metadata) must not leak to the router, which terminates
 TLS on the router path.
 
+One exception inside the namespace: `X-0G-Client-IP`, `X-0G-Client-IP-Ts` and
+`X-0G-Client-IP-Sig` are dropped, never forwarded. The cloud gateway may set them
+itself — the client's address, HMAC-signed for the router (`clientip`,
+deploy/phala/README.md "Client address") — and they are not a caller's to set.
+
 ## What it verifies
 
 - **Attestation** — the provider quote is genuine TEE hardware (DCAP-verified;

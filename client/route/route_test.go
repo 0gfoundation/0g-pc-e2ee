@@ -3,18 +3,22 @@ package route
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/clientip"
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
@@ -1927,4 +1931,53 @@ func TestRetryGateNotReopenedByARejection(t *testing.T) {
 	if !r.previewRetries.allow() {
 		t.Error("a successful preview must reopen the gate")
 	}
+}
+
+// Both router-bound calls of a sealed request — the preview and the data-plane
+// POST — carry the client's address signed for the router, and a set the client
+// forwarded is replaced rather than passed along.
+func TestRouterBoundRequestsCarryTheSignedClientIP(t *testing.T) {
+	broker := newMockBroker(t)
+	router := newMockRouter(t, broker)
+
+	const keyHex = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+	signer, err := clientip.NewSigner(keyHex, mustParseURL(t, router.srv.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := core.WithCredential(context.Background(), "Bearer sk-test")
+	ctx = core.WithForwardedHeaders(ctx, http.Header{
+		clientip.HeaderIP:  {"6.6.6.6"},
+		clientip.HeaderSig: {"forged"},
+	})
+	ctx = signer.WithClient(ctx, "203.0.113.7:51000")
+
+	client := core.NewWithResolver(New(router.srv.URL))
+	if _, err := client.Complete(ctx, chatReq()); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	key, _ := hex.DecodeString(keyHex)
+	for name, h := range map[string]http.Header{"preview": router.lastHeaders, "chat": router.lastChatHeaders} {
+		if got := h.Values(clientip.HeaderIP); len(got) != 1 || got[0] != "203.0.113.7" {
+			t.Errorf("%s: X-0G-Client-IP = %v", name, got)
+			continue
+		}
+		ts, err := strconv.ParseInt(h.Get(clientip.HeaderTs), 10, 64)
+		if err != nil {
+			t.Errorf("%s: bad timestamp %q", name, h.Get(clientip.HeaderTs))
+			continue
+		}
+		if want := clientip.Sign(key, "203.0.113.7", ts); h.Get(clientip.HeaderSig) != want {
+			t.Errorf("%s: signature %q does not verify", name, h.Get(clientip.HeaderSig))
+		}
+	}
+}
+
+func mustParseURL(t *testing.T, raw string) *url.URL {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u
 }

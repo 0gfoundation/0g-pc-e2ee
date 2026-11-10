@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/clientip"
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 )
@@ -72,10 +73,15 @@ func newRouterProxy(target *url.URL, logger *slog.Logger) *httputil.ReverseProxy
 			// configured URL (…/api + /v1/models → …/api/v1/models) and merging query
 			// params. SetURL also clears Out.Host, so the Transport sends the router's
 			// host as the Host header (its TLS SNI / vhost routing needs that, not the
-			// gateway's own listen host). We deliberately do NOT SetXForwarded: the
-			// gateway runs inside the enclave behind dstack-ingress and must not
-			// advertise client IPs or its internal hostname to the untrusted router.
+			// gateway's own listen host). We deliberately do NOT SetXForwarded: it
+			// would hand the untrusted router our internal hostname, and an
+			// X-Forwarded-For the router has no way to tell from a client's own.
 			pr.SetURL(target)
+			// The one client fact the router IS told: the client's address, signed so
+			// the router can tell it from a forgery (clientip). Stamp also drops any
+			// X-0G-Client-IP set the client sent, which ReverseProxy would otherwise
+			// copy through with every other inbound header.
+			clientip.Stamp(pr.Out)
 		},
 		ModifyResponse: func(resp *http.Response) error {
 			// The router runs its own CORS middleware off its own allowlist, and this

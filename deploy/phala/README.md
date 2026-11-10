@@ -864,10 +864,34 @@ reads logs through that agent, so expect it to show none either. Anything
 that starts using the client address must keep it out of logs and metric labels for
 the same reason.
 
-**What it does not do.** The gateway does not pass the address on: the router still
-sees this CVM's egress address for every E2EE request. Telling the router who the
-client is would be a decision about what the untrusted router is told, not a
-transport detail.
+**Telling the router (`X-0G-Client-IP`).** By default the router sees every request
+through the gateway as coming from this CVM's egress address, so its per-IP limits put
+every gateway user in one bucket. With `ZG_GATEWAY_CLIENT_IP_KEY` set, each
+router-bound request carries the client's address in three headers, authenticated with
+an HMAC key the gateway and the router share (`client/clientip`):
+
+```
+X-0G-Client-IP:     203.0.113.7
+X-0G-Client-IP-Ts:  1762790000
+X-0G-Client-IP-Sig: hex(HMAC-SHA256(key, "0g-client-ip/v1\n" + ip + "\n" + ts))
+```
+
+- The router believes the address only when the signature verifies with one of its
+  keys and the timestamp is within its window; otherwise it ignores the headers. A
+  forged set, sent to the gateway or straight to the router, gains nothing. The
+  gateway also strips any set a client sends before forwarding.
+- The headers go **only to the router**: they are signed only when the request's
+  scheme, host and port match the configured router URL, so a provider's broker never
+  receives a client's address.
+- This is a change to what the router is told: an operator of the router learns the
+  addresses of E2EE callers, as it already does for callers that reach it directly.
+  The prompt is still sealed.
+- **Key.** 32 random bytes, hex (`openssl rand -hex 32`). Gateway: a
+  `ZG_GATEWAY_CLIENT_IP_KEY=<hex>` line in the deploy target's `CVM_SECRET_ENV`. Router:
+  its `CLIENT_IP_HMAC_KEYS` secret, which accepts a comma-separated list so a key can be
+  rotated: add the new key to the router, switch the gateway, then drop the old key.
+- Requires `-proxy-protocol` (the gateway refuses to start otherwise: without it every
+  request would be signed as dstack-ingress's address). Off when the key is empty.
 
 **Rollout.** All four settings are measured (`compose_hash`), so they land as one new
 side under blue/green. Check on the new side, before the switch:

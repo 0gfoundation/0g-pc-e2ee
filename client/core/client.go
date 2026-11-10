@@ -13,6 +13,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/clientip"
 	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/crypto"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/proof"
@@ -1003,6 +1004,9 @@ func (c *Client) doRequest(ctx context.Context, provider Provider, env wire.Requ
 	if cred := CredentialFrom(ctx); cred != "" {
 		httpReq.Header.Set("Authorization", cred)
 	}
+	// Last, after the forwarded headers: drops any client-sent X-0G-Client-IP set
+	// and, when this goes to the router, signs the client's address (clientip).
+	clientip.Stamp(httpReq)
 	return c.http.Do(httpReq)
 }
 
