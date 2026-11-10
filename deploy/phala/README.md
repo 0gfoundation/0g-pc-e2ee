@@ -887,11 +887,19 @@ X-0G-Client-IP-Sig: hex(HMAC-SHA256(key, "0g-client-ip/v1\n" + ip + "\n" + ts))
   addresses of E2EE callers, as it already does for callers that reach it directly.
   The prompt is still sealed.
 - **Key.** 32 random bytes, hex (`openssl rand -hex 32`). Gateway: a
-  `ZG_GATEWAY_CLIENT_IP_KEY=<hex>` line in the deploy target's `CVM_SECRET_ENV`. Router:
+  `ZG_GATEWAY_CLIENT_IP_KEY` secret of the deploy target's Environment (locally,
+  `CVM_ENV_ZG_GATEWAY_CLIENT_IP_KEY` in `secrets.env`). Router:
   its `CLIENT_IP_HMAC_KEYS` secret, which accepts a comma-separated list so a key can be
   rotated: add the new key to the router, switch the gateway, then drop the old key.
 - Requires `-proxy-protocol` (the gateway refuses to start otherwise: without it every
   request would be signed as dstack-ingress's address). Off when the key is empty.
+- **Make it required once the router uses it.** While the router's
+  `features_client_ip_header` is off, the key is optional, and a deploy without it
+  just sends no header. After the flag is on, and above all once
+  `rate_limit_auth_ip_rpm` is, a deploy that loses the key fails silently: every user
+  falls back into the gateway's one bucket and is locked out together. At that point,
+  add `ZG_GATEWAY_CLIENT_IP_KEY` to `CVM_REQUIRED_KEYS` in `env/<target>.env`, so a
+  missing secret stops the deploy.
 
 **Rollout.** All four settings are measured (`compose_hash`), so they land as one new
 side under blue/green. Check on the new side, before the switch:

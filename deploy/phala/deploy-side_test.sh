@@ -258,6 +258,14 @@ expect_rc "…and accepted once CVM_SECRET_ENV sets it" 0
 fresh; EXTRA_ENV=(CVM_REQUIRED_KEYS=ZG_GATEWAY_ALLOWED_ORIGINS CVM_ENV_ZG_GATEWAY_ALLOWED_ORIGINS=)
 run b --compose "$COMPOSE" --dry-run
 expect_err "a required key mapped from an unset secret (empty) is refused" "ZG_GATEWAY_ALLOWED_ORIGINS is required"
+# The client-IP signing key: optional while it is not listed (an unset secret adds
+# nothing), and stops the deploy once it is required — README "Client address".
+fresh; EXTRA_ENV=(CVM_ENV_ZG_GATEWAY_CLIENT_IP_KEY=)
+run b --compose "$COMPOSE" --dry-run
+expect_rc "an unset ZG_GATEWAY_CLIENT_IP_KEY secret is fine while optional" 0
+fresh; EXTRA_ENV=(CVM_REQUIRED_KEYS=ZG_GATEWAY_CLIENT_IP_KEY CVM_ENV_ZG_GATEWAY_CLIENT_IP_KEY=)
+run b --compose "$COMPOSE" --dry-run
+expect_err "…and refused once required" "ZG_GATEWAY_CLIENT_IP_KEY is required"
 
 fresh; EXTRA_ENV=(PHALA_INSTANCE_TYPE=CHANGEME CVM_ENV_ZG_GATEWAY_ROUTER_URL=CHANGEME)
 run b --compose "$COMPOSE" --dry-run
@@ -330,7 +338,7 @@ expect_err "fails when matched_release never settles" "matched_release not repor
 # Public files: a secret's key in one is a secret about to be committed. And every
 # key must be one the scripts read, so a typo does not silently fall back to a
 # default.
-SECRET_KEYS=" CF_API_TOKEN CLOUDFLARE_API_TOKEN ZG_PROM_REMOTE_WRITE_URL ZG_PROM_REMOTE_WRITE_USERNAME ZG_PROM_REMOTE_WRITE_PASSWORD PHALA_CLOUD_API_KEY SMOKE_API_KEY CVM_SECRET_ENV CVM_ENV_ZG_GATEWAY_ALLOWED_ORIGINS "
+SECRET_KEYS=" CF_API_TOKEN CLOUDFLARE_API_TOKEN ZG_PROM_REMOTE_WRITE_URL ZG_PROM_REMOTE_WRITE_USERNAME ZG_PROM_REMOTE_WRITE_PASSWORD PHALA_CLOUD_API_KEY SMOKE_API_KEY CVM_SECRET_ENV CVM_ENV_ZG_GATEWAY_ALLOWED_ORIGINS CVM_ENV_ZG_GATEWAY_CLIENT_IP_KEY "
 KNOWN_KEYS=" CVM_REQUIRED_KEYS DOMAIN CF_ZONE DELEGATION_ZONE PLATFORM_BASE PLATFORM_BASE_COLD CVM_NAME_PREFIX PHALA_INSTANCE_TYPE PHALA_NODE_ID PHALA_NODE_ID_COLD PHALA_OS_IMAGE ZG_PROM_ENV SMOKE_SEALED_MODEL SMOKE_PLAIN_MODEL "
 for f in "$HERE"/env/*.env; do
   name="env/$(basename "$f")"
