@@ -48,6 +48,7 @@ import (
 	"time"
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/chain"
+	"github.com/0gfoundation/0g-pc-e2ee/client/clientip"
 	"github.com/0gfoundation/0g-pc-e2ee/client/compose"
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
@@ -1625,6 +1626,7 @@ func (r *Router) fetchQuote(ctx context.Context, quoteURL string) (raw, appCompo
 	if err != nil {
 		return nil, nil, nil, upstream(0, err)
 	}
+	clientip.Stamp(httpReq) // router-bound: sign the client address; elsewhere: strip only
 	resp, err := r.http.Do(httpReq)
 	if err != nil {
 		return nil, nil, nil, upstream(0, fmt.Errorf("fetch provider quote: %w", err))
@@ -1998,6 +2000,7 @@ func (r *Router) previewOnce(ctx context.Context, body []byte, req wire.Request)
 		httpReq.Header.Set("Authorization", cred)
 	}
 
+	clientip.Stamp(httpReq) // router-bound: sign the client address; elsewhere: strip only
 	resp, err := r.http.Do(httpReq)
 	if err != nil {
 		return previewResponse{}, previewRetryable, upstream(0, fmt.Errorf("route preview request: %w", err))
@@ -2064,6 +2067,7 @@ func (r *Router) pubkey(ctx context.Context, pubkeyURL string) (crypto.PublicKey
 	if err != nil {
 		return nil, "", upstream(0, err)
 	}
+	clientip.Stamp(httpReq) // router-bound: sign the client address; elsewhere: strip only
 	resp, err := r.http.Do(httpReq)
 	if err != nil {
 		return nil, "", upstream(0, fmt.Errorf("fetch provider pubkey: %w", err))

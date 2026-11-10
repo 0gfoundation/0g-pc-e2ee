@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/clientip"
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
@@ -261,6 +262,7 @@ func AsyncJobPoll(routerBase *url.URL, hc *http.Client) http.Handler {
 			req.Header.Set("Authorization", cred)
 		}
 		req.Header.Set("Accept", "application/json")
+		clientip.Stamp(req) // the poll goes to the router: sign the client address
 		resp, err := hc.Do(req)
 		if err != nil {
 			writeAsyncError(w, http.StatusBadGateway, "upstream", "upstream_error", "upstream request failed")

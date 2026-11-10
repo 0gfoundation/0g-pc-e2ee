@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"time"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/clientip"
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/proof"
@@ -153,6 +154,7 @@ func (f *SignatureFetcher) fetchOnce(ctx context.Context, url string) (proof.Cha
 	if err != nil {
 		return proof.ChatSignature{}, false, fmt.Errorf("%w: %w", errRequestBuild, err)
 	}
+	clientip.Stamp(req) // router-bound: sign the client address; elsewhere: strip only
 	resp, err := f.http.Do(req)
 	if err != nil {
 		return proof.ChatSignature{}, true, fmt.Errorf("get signature: %w", err)

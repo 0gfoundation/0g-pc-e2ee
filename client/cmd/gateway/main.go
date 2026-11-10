@@ -76,6 +76,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/clientip"
 	"github.com/0gfoundation/0g-pc-e2ee/client/cmd/internal/proxycli"
 	"github.com/0gfoundation/0g-pc-e2ee/client/cmd/internal/proxyproto"
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
@@ -119,6 +120,16 @@ func main() {
 		"require a PROXY protocol v2 header on every non-loopback connection to -listen and take the "+
 			"client address from it; loopback peers (the -health probe) are exempt "+
 			"(env ZG_GATEWAY_PROXY_PROTOCOL=true)")
+	// The client's address, told to the router in signed X-0G-Client-IP headers so
+	// its per-IP limits stop putting every gateway user in one bucket (clientip).
+	// The value is the HMAC key shared with the router, hex; it comes in through
+	// the encrypted env, so only its NAME is in the measured compose. Empty (the
+	// default) sends nothing. It needs -proxy-protocol: without it r.RemoteAddr is
+	// dstack-ingress's, and every request would be signed as that one address.
+	clientIPKey := flag.String("client-ip-key", proxycli.EnvOr("ZG_GATEWAY_CLIENT_IP_KEY", ""),
+		"hex HMAC key (>= 32 bytes) shared with the router; when set, router-bound requests carry the "+
+			"client's address in signed X-0G-Client-IP headers. Requires -proxy-protocol. Empty disables it "+
+			"(env ZG_GATEWAY_CLIENT_IP_KEY)")
 	// The browser origin allowlist for CORS — a gateway-only concern, like
 	// -metrics-listen above: the gateway is the form that serves browsers
 	// (no-install / thin clients), while the sidecar is a single-user localhost
@@ -315,6 +326,21 @@ func main() {
 		logger.Error("invalid -router-url", "url", *f.RouterURL, "err", err)
 		os.Exit(1)
 	}
+	// Built before anything serves, and refused loudly rather than degraded: a key
+	// that does not parse, or one set without -proxy-protocol, is a deploy error.
+	// The key itself is never logged.
+	var clientIPSigner *clientip.Signer
+	if *clientIPKey != "" {
+		if !*proxyProtocol {
+			logger.Error("-client-ip-key needs -proxy-protocol: without it every request would be signed as dstack-ingress's address")
+			os.Exit(1)
+		}
+		clientIPSigner, err = clientip.NewSigner(*clientIPKey, routerTarget)
+		if err != nil {
+			logger.Error("invalid -client-ip-key", "err", err)
+			os.Exit(1)
+		}
+	}
 
 	// Validate the origin allowlist at startup, same fail-loud stance: a pattern a
 	// browser Origin can never match (a trailing slash, a missing scheme) would
@@ -465,13 +491,13 @@ func main() {
 		Addr: *f.Listen,
 		// Outermost: a panic must not reach net/http's own recovery, which logs the
 		// RemoteAddr — the client's address under -proxy-protocol — to public logs.
-		Handler: recoverWithoutAddress(logger, newHandler(built.Clients, routerTarget, origins, instanceID, *evidenceDir, *maxInFlight,
+		Handler: recoverWithoutAddress(logger, withClientIP(clientIPSigner, newHandler(built.Clients, routerTarget, origins, instanceID, *evidenceDir, *maxInFlight,
 			identity, providerIdentities, built.Readiness(), logger,
 			withEntryPolicy(entryPolicy{
 				openOrigins: openOrigins,
 				sealModels:  sealModelsList,
 			}),
-			withQuoter(quoter))),
+			withQuoter(quoter)))),
 		ReadHeaderTimeout: 10 * time.Second, // mitigate slow-header (Slowloris) clients
 		// Backstop for every route: see serverReadTimeout. The sealed inference
 		// routes are bounded tighter, from admission, by defaultBodyReadTimeout.
@@ -513,6 +539,7 @@ func main() {
 		"cors_allowed_origins", origins, "max_inflight", *maxInFlight,
 		"evidence_dir", *evidenceDir,
 		"proxy_protocol", *proxyProtocol,
+		"client_ip_header", clientIPSigner != nil,
 		"provider_identity_endpoint", providerIdentities != nil,
 		"go_memlimit_bytes", currentMemoryLimit(), "gomaxprocs", runtime.GOMAXPROCS(0))
 	if *proxyProtocol {
@@ -1258,4 +1285,14 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 				freshEvidenceRoute(cfg.quoterURL,
 					openaiproxy.CORS(allowedOrigins, policy.credentialsAllowed(),
 						sealedNamespaceGuard(surfaces, mux))))))
+}
+
+// withClientIP records each request's client address for clientip.Stamp, when the
+// gateway has a key to sign it with; without one the handler is returned as is,
+// and Stamp only strips client-sent copies of the headers.
+func withClientIP(s *clientip.Signer, h http.Handler) http.Handler {
+	if s == nil {
+		return h
+	}
+	return s.Middleware(h)
 }
