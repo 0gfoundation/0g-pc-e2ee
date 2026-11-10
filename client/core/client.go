@@ -30,20 +30,33 @@ import (
 // 3600s request timeout on mainnet and staging).
 //
 // When the router's limits move, these move with them; check its
-// server.write_timeout and router.stream_idle_timeout_seconds.
+// nonStreamChatMax (pkg/inference/executor.go), server.write_timeout and
+// router.stream_idle_timeout_seconds.
 const (
 	// bufferedTimeout bounds one buffered (non-streaming) attempt end to end, as a
-	// per-attempt context deadline. The router writes a buffered response under
-	// its server.write_timeout (600s; its upstream header wait is 570s inside
-	// that), which still holds after its stream cap went to 3540s — that cap is
-	// for streams only. The async submit shares it: a submit is a buffered round
-	// trip.
-	bufferedTimeout = 10*time.Minute + 30*time.Second
+	// per-attempt context deadline. The router bounds a non-streaming chat request
+	// (chat/completions, messages, responses) at nonStreamChatMax, 20 minutes from
+	// its arrival, with no upstream header wait and no server WriteTimeout on that
+	// path (0g-router#1338): a 32k-token answer at ~50 tok/s takes ~11 minutes
+	// and its headers come only at the end. 30s above that, so the router ends
+	// the request first — it finishes and bills a non-streaming request even after
+	// the caller hangs up (0g-router#1216), so a client that gave up first would
+	// pay for an answer it never receives. Other buffered routes (images, speech)
+	// are still bounded tighter by the router (570s header wait, 600s
+	// WriteTimeout), which answers with its error before this fires.
+	bufferedTimeout = 20*time.Minute + 30*time.Second
+
+	// asyncSubmitTimeout bounds one async submit attempt. A submit is a buffered
+	// round trip, but not a chat completion: the router keeps it on its shared
+	// client (570s header wait) under the 600s server WriteTimeout, so waiting
+	// bufferedTimeout for it would only hold a request the router has already
+	// dropped.
+	asyncSubmitTimeout = 10*time.Minute + 30*time.Second
 
 	// responseHeaderTimeout is the transport's wait for response headers. The
-	// transport is shared by both paths, so it is sized by the slower one: a
-	// buffered response sends its headers with the body, at the end of the whole
-	// generation. A stream's headers come far sooner (the router holds them at
+	// transport is shared by every path, so it is sized by the slowest one: a
+	// buffered chat response sends its headers with the body, at the end of the
+	// whole generation. A stream's headers come far sooner (the router holds them at
 	// most through its 120s prelude failover), so this never bounds a stream that
 	// is working.
 	responseHeaderTimeout = bufferedTimeout

@@ -74,7 +74,7 @@ type Candidates interface {
 // SUCCEEDS there is no fallback to starve, because Complete returns; if it FAILS,
 // those minutes were the caller's, spent on nothing, and are exactly what wants
 // counting. Uncharged, a chain whose candidates each burn the full bufferedTimeout
-// cost N × 10m30s, with N chosen by the untrusted router.
+// cost N × 20m30s, with N chosen by the untrusted router.
 //
 // The budget gates ENTRY to the next candidate and is never imposed on an attempt
 // already running — cutting one would cut a completion that is streaming tokens to
@@ -83,7 +83,7 @@ type Candidates interface {
 // bounds N independently, so neither factor is left to the router. One consequence
 // of gating entry rather than attempts: an attempt that runs to bufferedTimeout
 // blows the budget by itself and the walk stops after it, which is intended — a
-// caller already held ten minutes by one provider is not served by ten more.
+// caller already held twenty minutes by one provider is not served by twenty more.
 //
 // Sized to admit a TYPICAL cold materialization — a cache-miss quote verification
 // (route bounds one at 60s) plus the chain read that grounds it (three eth_call
