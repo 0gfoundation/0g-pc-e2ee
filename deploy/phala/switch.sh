@@ -115,6 +115,8 @@
 #   PROBE_RETRIES    pre-switch target probe tries  (default: 30, PROBE_INTERVAL apart)
 #   PROBE_INTERVAL   seconds between probe attempts (default: 10)
 #   CERT_WARN_DAYS   `status` flags a side cert valid for fewer days (default: 21)
+#   CERT_RETRIES     gate 3 certificate check attempts (default: 3, CERT_INTERVAL apart)
+#   CERT_INTERVAL    seconds between them           (default: 5)
 #
 # The two probes measure different things on purpose. The post-switch check
 # (HEALTH_PATH + VERIFY_*) asks "did traffic land on the new side yet", so its
@@ -527,14 +529,26 @@ side_cert_expiry() { # a|b
 # holds a trusted certificate for DOMAIN (its key is generated in the CVM, and
 # the CAA record pins issuance to that ingress's ACME account). The SNI is the
 # probe host, so the gateway routes it by app_id; the name verified is DOMAIN.
+#
+# Tried CERT_RETRIES times, CERT_INTERVAL apart: one TLS hiccup must not fail a
+# failover that has just waited out gate 2. Short on purpose — the side has
+# already answered its readiness probe through this same host, so a certificate
+# that is still missing after a few tries is a verdict, not a delay.
 side_cert_verified() { # a|b|c
-  local base addr host pem
+  local base addr host pem i
   base="$(side_base "$1")"; addr="$(side_app_addr "$1")"
   [ -n "$base" ] && [ -n "$addr" ] || return 1
   host="${addr%%:*}-443s.${base}"
-  pem="$(echo | openssl s_client -servername "$host" -connect "${host}:443" \
-    -verify_hostname "$DOMAIN" -verify_return_error 2>/dev/null || true)"
-  openssl x509 -noout -checkend 0 <<<"$pem" >/dev/null 2>&1
+  for ((i=1; i<=CERT_RETRIES; i++)); do
+    pem="$(echo | openssl s_client -servername "$host" -connect "${host}:443" \
+      -verify_hostname "$DOMAIN" -verify_return_error 2>/dev/null || true)"
+    openssl x509 -noout -checkend 0 <<<"$pem" >/dev/null 2>&1 && return 0
+    if [ "$i" -lt "$CERT_RETRIES" ]; then
+      log "  certificate check ${i}/${CERT_RETRIES} on ${host} failed, retrying in ${CERT_INTERVAL}s"
+      sleep "$CERT_INTERVAL"
+    fi
+  done
+  return 1
 }
 
 confirm() {
@@ -1160,7 +1174,9 @@ VERIFY_INTERVAL="${VERIFY_INTERVAL:-6}"
 PROBE_PATH="${PROBE_PATH:-/readyz}"      # standby readiness path (gate 2); /healthz is liveness only
 PROBE_RETRIES="${PROBE_RETRIES:-30}"     # pre-switch target probe attempts before refusing to switch
 PROBE_INTERVAL="${PROBE_INTERVAL:-10}"   # seconds between them: 30x10s ≈ 5min, enough for a cold first sweep
-CERT_WARN_DAYS="${CERT_WARN_DAYS:-21}"   # `status` warns when a side's cert is valid for fewer days than this
+CERT_WARN_DAYS="${CERT_WARN_DAYS:-21}"
+CERT_RETRIES="${CERT_RETRIES:-3}"        # gate 3 certificate check attempts…
+CERT_INTERVAL="${CERT_INTERVAL:-5}"      # …and seconds between them   # `status` warns when a side's cert is valid for fewer days than this
 
 # Switch-layer record names (in the delegation zone) that this script owns.
 SERVING_ALIAS="${DOMAIN}.${DELEGATION_ZONE}"           # -> gw.<live side's cluster> (`setup`, and moved by `switch`/`failover`)
