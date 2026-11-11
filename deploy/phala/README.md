@@ -556,11 +556,17 @@ your timeout. Take it from the record the platform routes this domain by:
 ```bash
 APP=$(dig +short TXT _dstack-app-address.<DOMAIN> | tr -d '"' | cut -d: -f1)
 
-# app-compose.json from Phala Cloud's public attestations API — no API key, and no
-# dependency on port 8090 being routed into this app. Several instances is normal
-# (blue/green): take the one whose app_compose hashes to the quote's compose_hash.
-curl -s "https://cloud-api.phala.com/api/v1/apps/$APP/attestations" > attestations.json
-jq -j '.instances[0].tcb_info.app_compose' attestations.json > app-compose.json  # -j: no trailing newline
+# app-compose.json from the gateway itself (GET /v1/gateway/app-compose), verbatim.
+# No trust needed: the sha256 check below compares it with the quote's compose_hash.
+curl -s "https://<DOMAIN>/v1/gateway/app-compose" > app-compose.json
+
+# Older gateways do not serve it (404). The platform paths were the only sources
+# before that — and since 2026-11 both refuse anonymous callers (the API answers 401,
+# the guest agent drops the connection). For a deployment where they still answer:
+# Phala Cloud's attestations API; several instances is normal (blue/green), so take
+# the one whose app_compose hashes to the quote's compose_hash.
+#   curl -s "https://cloud-api.phala.com/api/v1/apps/$APP/attestations" > attestations.json
+#   jq -j '.instances[0].tcb_info.app_compose' attestations.json > app-compose.json  # -j: no trailing newline
 
 # Same document from the CVM's own guest agent, when 8090 is routed (public_tcbinfo
 # defaults on):

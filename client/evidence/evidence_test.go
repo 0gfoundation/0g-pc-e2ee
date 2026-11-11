@@ -19,6 +19,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -155,6 +156,12 @@ type fixture struct {
 	// Defaults to a valid dstack V1 register; a test overrides it (before Check) to
 	// exercise the unsupported-layout paths.
 	mrConfigID [48]byte
+	// endpointAppCompose, when set, is served at EndpointAppComposePath — what a
+	// cloud gateway publishes about itself. Unset, that path is a 404, as on an
+	// endpoint that does not publish its manifest.
+	endpointAppCompose []byte
+	// endpointAppComposeHits counts requests to that path.
+	endpointAppComposeHits atomic.Int32
 }
 
 // newFixture builds the happy path: the bundle names the same certificate the
@@ -180,6 +187,14 @@ func newFixture(t *testing.T, opts ...func(*fixture)) *fixture {
 	f.finalize(t, nil)
 
 	mux := http.NewServeMux()
+	mux.HandleFunc(EndpointAppComposePath, func(w http.ResponseWriter, r *http.Request) {
+		f.endpointAppComposeHits.Add(1)
+		if f.endpointAppCompose == nil {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write(f.endpointAppCompose)
+	})
 	mux.HandleFunc("/evidences/", func(w http.ResponseWriter, r *http.Request) {
 		name := strings.TrimPrefix(r.URL.Path, "/evidences/")
 		body, ok := f.files[name]
@@ -1152,5 +1167,64 @@ func TestCheck_NoteSaysCodeIdentityWasNotEstablished(t *testing.T) {
 			t.Errorf("note contains %q, which presumes code identity was established:\n  %s",
 				presumes, rep.Note)
 		}
+	}
+}
+
+// The endpoint serves its own app-compose: code identity is established from it
+// with no platform path at all (the fixture offers neither), and the report names
+// where the bytes came from.
+func TestCheck_AppComposeFromTheEndpoint(t *testing.T) {
+	f := newFixture(t)
+	f.endpointAppCompose = []byte(testAppCompose)
+	c := f.checker(t, Config{NoCloudAPI: true})
+
+	rep, err := c.Check(context.Background(), testDomain)
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	code := rep.Code
+	if code.FetchErr != nil || code.BoundErr != nil {
+		t.Fatalf("FetchErr=%v BoundErr=%v", code.FetchErr, code.BoundErr)
+	}
+	if code.ComposeFile == nil {
+		t.Fatal("no compose text: the endpoint's app-compose was not used")
+	}
+	if want := "https://" + testDomain + EndpointAppComposePath; code.Source != want {
+		t.Errorf("Source = %q, want %q", code.Source, want)
+	}
+	if !rep.Pass() {
+		t.Error("Pass = false with code identity established")
+	}
+}
+
+// Asking the endpoint is not trusting it: bytes that do not hash to the quote's
+// compose_hash are refused, exactly as a platform answer would be.
+func TestCheck_EndpointAppComposeIsHashGated(t *testing.T) {
+	f := newFixture(t)
+	f.endpointAppCompose = []byte(`{"name":"evil","docker_compose_file":"services:\n  evil:\n    image: evil\n"}`)
+	c := f.checker(t, Config{NoCloudAPI: true})
+
+	rep, err := c.Check(context.Background(), testDomain)
+	if err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if rep.Code.BoundErr == nil {
+		t.Fatal("BoundErr = nil: an app-compose that does not match compose_hash was accepted")
+	}
+	if rep.Code.ComposeFile != nil {
+		t.Errorf("compose text read out of unauthenticated bytes: %q", rep.Code.ComposeFile)
+	}
+}
+
+// NoEndpointCompose leaves the endpoint out of it entirely.
+func TestCheck_NoEndpointComposeDoesNotAsk(t *testing.T) {
+	f := newFixture(t)
+	f.endpointAppCompose = []byte(testAppCompose)
+	c := f.checker(t, Config{NoCloudAPI: true, NoEndpointCompose: true})
+	if _, err := c.Check(context.Background(), testDomain); err != nil {
+		t.Fatalf("Check: %v", err)
+	}
+	if n := f.endpointAppComposeHits.Load(); n != 0 {
+		t.Fatalf("the endpoint was asked %d time(s) despite NoEndpointCompose", n)
 	}
 }

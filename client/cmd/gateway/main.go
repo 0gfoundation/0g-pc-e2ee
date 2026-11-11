@@ -1230,6 +1230,7 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	// from the bundle, so widening the origin policy for it would buy nothing.
 	if identity != nil {
 		mux.Handle("GET "+identityPath, identityHandler(identity))
+		mux.Handle("GET "+appComposePath, appComposeHandler(identity))
 	}
 	// The provider side of the same panel, with the same three placements and the same
 	// reasoning: outside the credential gate (it publishes only what the provider's own
