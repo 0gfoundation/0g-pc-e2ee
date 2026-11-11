@@ -760,20 +760,29 @@ APP=$(dig +short TXT _dstack-app-address.<domain> | tr -d '"' | cut -d: -f1)
 # corporate resolvers do), query the target it names instead. pcverify chases it
 # itself; `dig`/`Resolve-DnsName` may not.
 
+# The gateway serves its own app-compose.json, verbatim. Its source does not matter:
+# the sha256 step below checks the bytes against the quote's compose_hash.
+curl -s "https://<domain>/v1/gateway/app-compose" > app-compose.json
+
+# Older gateways do not serve it (404). For those, the platform paths below were the
+# only sources — but since 2026-11 both refuse anonymous callers (the API answers
+# 401, the guest agent drops the connection), on every node we have checked.
+#
 # Phala Cloud's public attestations API carries the verbatim manifest per instance.
 # Pick the instance whose app_compose hashes to the quote's compose_hash — under
 # blue/green the other one legitimately differs.
-curl -s "https://cloud-api.phala.com/api/v1/apps/$APP/attestations" > attestations.json
-jq -j '.instances[0].tcb_info.app_compose' attestations.json > app-compose.json  # -j: no trailing newline
+#   curl -s "https://cloud-api.phala.com/api/v1/apps/$APP/attestations" > attestations.json
+#   jq -j '.instances[0].tcb_info.app_compose' attestations.json > app-compose.json  # -j: no trailing newline
 
 # Or, equivalently, from the CVM's own guest agent — same document, but it depends on
 # the platform routing port 8090 into this app:
 #   curl -s "https://$APP-8090.<platform-base-domain>/prpc/Info" > info.json
 #   jq -r '.tcb_info' info.json | jq -j '.app_compose' > app-compose.json
 
-# The app's own compose_hash is NOT a field of that reply — see the warning below.
-# Take it from the quote, or from the event log, or just hash the bytes:
-jq -r '.instances[0].tcb_info.event_log[]|select(.event=="compose-hash").event_payload' attestations.json
+# The app's own compose_hash is NOT a field of the platform's reply — see the warning
+# below. Take it from the quote (mr_config_id), or, with the attestations reply in
+# hand, from its event log:
+#   jq -r '.instances[0].tcb_info.event_log[]|select(.event=="compose-hash").event_payload' attestations.json
 
 # the digest must be the compose_hash the quote committed to — THIS is the step
 # that makes the bytes above trustworthy, whatever their source

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -994,5 +995,83 @@ func TestIdentityRoute_PreflightIsAnswered(t *testing.T) {
 	}
 	if got := resp.Header.Get(openaiproxy.HeaderGatewayInstance); got != "" && got != "aa11bb22" {
 		t.Errorf("unexpected instance header %q", got)
+	}
+}
+
+// The app-compose route serves exactly the bytes that matched the quote's
+// compose_hash, so a verifier can hash them and get compose_hash back. It answers
+// 404 — never the router — before they are verified, and never serves a manifest
+// that failed the check.
+func TestAppComposeRoute_ServesTheVerifiedBytes(t *testing.T) {
+	f := newIdentityFixture(t, deployedComposeText)
+	want, err := os.ReadFile(f.appComposePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &identityCache{}
+	c.store(buildFixture(t, f.config()))
+	gw := identityGateway(t, c)
+
+	resp, err := http.Get(gw.URL + appComposePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d: %s", resp.StatusCode, got)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("served bytes differ from the app-compose on disk")
+	}
+	if sha256.Sum256(got) != f.composeHash {
+		t.Fatal("served bytes do not hash to the quote's compose_hash")
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+		t.Errorf("Content-Type = %q", ct)
+	}
+}
+
+func TestAppComposeRoute_UnverifiedIsNotServed(t *testing.T) {
+	// Not assembled yet: nothing verified.
+	gw := identityGateway(t, &identityCache{})
+	resp, err := http.Get(gw.URL + appComposePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("before assembly: status = %d, want 404", resp.StatusCode)
+	}
+
+	// A manifest that does not match the quote (a stale volume): not served.
+	f := newIdentityFixture(t, deployedComposeText)
+	writeFile(t, f.appComposePath, []byte(`{"name":"other","docker_compose_file":"services:\n  evil:\n    image: evil\n"}`))
+	c := &identityCache{}
+	c.store(buildFixture(t, f.config()))
+	gw = identityGateway(t, c)
+	resp, err = http.Get(gw.URL + appComposePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound || bytes.Contains(body, []byte("evil")) {
+		t.Fatalf("mismatched manifest: status = %d body = %s, want 404 and no content", resp.StatusCode, body)
+	}
+}
+
+// Once verified, a later assembly pass that could not re-read the file does not
+// take the bytes back down: they are fixed for the life of the CVM.
+func TestAppComposeRoute_SurvivesALaterFailedRead(t *testing.T) {
+	f := newIdentityFixture(t, deployedComposeText)
+	c := &identityCache{}
+	c.store(buildFixture(t, f.config()))
+	if err := os.Remove(f.appComposePath); err != nil {
+		t.Fatal(err)
+	}
+	c.store(buildFixture(t, f.config()))
+	if c.AppCompose() == nil {
+		t.Fatal("verified bytes were dropped by a later pass that could not read the file")
 	}
 }

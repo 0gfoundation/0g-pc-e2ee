@@ -31,6 +31,7 @@ type gatewayConfig struct {
 	appID              string
 	cloudAPIBase       string
 	noCloudAPI         bool
+	noEndpointCompose  bool
 	noDNSDiscovery     bool
 	osImagesPath       string
 	expectComposePath  string
@@ -113,13 +114,14 @@ func flagSet(fs *flag.FlagSet, name string) bool {
 func newEvidenceChecker(ctx context.Context, out io.Writer, g gatewayConfig) (*evidence.Checker, expectSource, error) {
 	var expect expectSource
 	cfg := evidence.Config{
-		QuoteParser:    dcap.NewQuoteParser(dcap.Config{PCCSBaseURL: g.pccsURL}),
-		Timeout:        g.timeout,
-		BaseDomain:     g.baseDomain,
-		AppID:          g.appID,
-		CloudAPIBase:   g.cloudAPIBase,
-		NoCloudAPI:     g.noCloudAPI,
-		NoDNSDiscovery: g.noDNSDiscovery,
+		QuoteParser:       dcap.NewQuoteParser(dcap.Config{PCCSBaseURL: g.pccsURL}),
+		Timeout:           g.timeout,
+		BaseDomain:        g.baseDomain,
+		AppID:             g.appID,
+		CloudAPIBase:      g.cloudAPIBase,
+		NoCloudAPI:        g.noCloudAPI,
+		NoEndpointCompose: g.noEndpointCompose,
+		NoDNSDiscovery:    g.noDNSDiscovery,
 	}
 	if p := strings.TrimSpace(g.osImagesPath); p != "" {
 		b, err := os.ReadFile(p)

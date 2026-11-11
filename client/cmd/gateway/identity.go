@@ -207,6 +207,10 @@ type identityConfig struct {
 type buildResult struct {
 	doc     identityDoc
 	pending []string // human-readable reasons a retry might do better; empty = settled
+	// appCompose is the app-compose.json bytes, set only once they have been
+	// authenticated against the quote's compose_hash. Served verbatim at
+	// appComposePath; nil until then.
+	appCompose []byte
 }
 
 // buildIdentity assembles the document from whatever is available right now.
@@ -310,6 +314,7 @@ func buildIdentity(ctx context.Context, cfg identityConfig, logger *slog.Logger)
 					"source", source, "err", err)
 				break
 			}
+			res.appCompose = raw
 			composeText = []byte(ac.DockerComposeFile)
 			services, err := compose.ParseServices(composeText)
 			if err != nil {
@@ -461,8 +466,9 @@ type identityCache struct {
 }
 
 type identityState struct {
-	body     []byte // pre-marshalled response
-	complete bool
+	body       []byte // pre-marshalled response
+	complete   bool
+	appCompose []byte // verified app-compose.json bytes; nil until verified
 }
 
 // Doc returns the response body and whether the assembly finished.
@@ -480,7 +486,24 @@ func (c *identityCache) store(res buildResult) {
 		// rather than a reason to lose the previous one.
 		return
 	}
-	c.state.Store(&identityState{body: append(body, '\n'), complete: len(res.pending) == 0})
+	ac := res.appCompose
+	if ac == nil {
+		// Once verified, the bytes are fixed for the life of the CVM: a later pass
+		// that could not re-read the file must not take them back down.
+		if prev := c.state.Load(); prev != nil {
+			ac = prev.appCompose
+		}
+	}
+	c.state.Store(&identityState{body: append(body, '\n'), complete: len(res.pending) == 0, appCompose: ac})
+}
+
+// AppCompose returns the verified app-compose.json bytes, or nil before they
+// have been read and checked against the quote's compose_hash.
+func (c *identityCache) AppCompose() []byte {
+	if s := c.state.Load(); s != nil {
+		return s.appCompose
+	}
+	return nil
 }
 
 // identityRetryStart and identityRetryMax bound the rebuild backoff. The first
@@ -582,5 +605,44 @@ func identityHandler(cache *identityCache) http.Handler {
 			w.Header().Set("Cache-Control", "no-cache")
 		}
 		_, _ = w.Write(body)
+	})
+}
+
+// appComposePath serves this CVM's app-compose.json, verbatim.
+const appComposePath = "/v1/gateway/app-compose"
+
+// appComposeHandler serves the app-compose.json bytes the identity assembly
+// authenticated against the quote's compose_hash, byte for byte.
+//
+// Why the gateway serves its own manifest. A verifier needs these bytes to turn the
+// quote's compose_hash into "this configuration, these images" (code identity).
+// pcverify used to get them only from the platform: Phala Cloud's attestations API
+// and the CVM's guest agent at <app_id>-8090.<base_domain>. Both stopped answering
+// anonymous callers (a 401 and a dropped connection, on every node), which left no
+// outside verifier able to establish code identity at all. Serving them from the
+// endpoint being verified needs nothing from the platform.
+//
+// Why that is safe to believe: it is not believed. The verifier hashes what it gets
+// and compares it with compose_hash from the DCAP-verified quote; bytes that do not
+// match are rejected, whoever served them. The gateway also serves only bytes that
+// already matched, so a stale or foreign file on the identity volume answers 404
+// here rather than a document a verifier would then reject.
+//
+// Nothing in it is secret: app-compose carries the compose text, the NAMES of the
+// encrypted env vars (never their values), and the platform's pre-launch script,
+// all of which the measured configuration publishes anyway.
+func appComposeHandler(cache *identityCache) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw := cache.AppCompose()
+		if raw == nil {
+			openaiproxy.WriteError(w, http.StatusNotFound, "gateway", "app-compose is not available on this gateway")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		// Fixed for the life of the CVM once verified. Same variance note as the
+		// identity route: the CORS middleware reflects Origin.
+		w.Header().Add("Vary", "Origin")
+		w.Header().Set("Cache-Control", identityCompleteMaxAge)
+		_, _ = w.Write(raw)
 	})
 }

@@ -158,6 +158,12 @@ type Config struct {
 	// CloudAPIBase overrides Phala Cloud's API root for the attestations lookup.
 	// Empty uses DefaultCloudAPIBase.
 	CloudAPIBase string
+	// NoEndpointCompose skips asking the endpoint itself for its app-compose
+	// (FetchAppComposeFromEndpoint), leaving only the platform paths. The endpoint
+	// is asked first by default because it is the one source that needs nothing from
+	// the platform; its answer is hash-gated like the others, so skipping it buys no
+	// safety — the flag exists to exercise the platform paths on their own.
+	NoEndpointCompose bool
 	// NoCloudAPI disables the Phala Cloud attestations lookup, leaving the guest
 	// agent as the only fetch path. Set it for a self-hosted dstack cluster, which
 	// has no such API, or to keep a run off Phala's infrastructure entirely.
@@ -756,7 +762,7 @@ func (c *Checker) Check(ctx context.Context, domain string) (rep Report, err err
 	c.checkServedCert(ctx, sess, host, name, certPEM, &rep)
 
 	// Step 6 — code identity, from the same verified quote.
-	c.checkCodeIdentity(ctx, &rep)
+	c.checkCodeIdentity(ctx, &rep, sess, host)
 
 	// Step 7 — is the OS that enforced step 6's binding one we accept? Only meaningful
 	// once the quote verified; before that there is no measurement to compare.
@@ -772,7 +778,7 @@ func (c *Checker) Check(ctx context.Context, domain string) (rep Report, err err
 // checkCodeIdentity walks mr_config_id → compose_hash → app-compose →
 // docker_compose_file, filling rep.Code. The first hop always runs; the rest only
 // when the caller supplied the material (see CodeIdentity).
-func (c *Checker) checkCodeIdentity(ctx context.Context, rep *Report) {
+func (c *Checker) checkCodeIdentity(ctx context.Context, rep *Report, sess *session, host string) {
 	code := &rep.Code
 	// Naming any of the three inputs is a caller asking for these checks, so a failure
 	// to complete them stops being advisory (see OK). AppID counts for the same reason
@@ -833,7 +839,29 @@ func (c *Checker) checkCodeIdentity(ctx context.Context, rep *Report) {
 		// still uses the guess: it needs -base-domain, which IS an input given, and
 		// that pairing is what the flag has always meant.
 		var errs []error
-		cloudUsable := !c.cfg.NoCloudAPI &&
+
+		// The endpoint first: it serves its own manifest (a cloud gateway does, at
+		// EndpointAppComposePath), needs nothing from the platform, and is the host
+		// this run already reached. An endpoint that does not serve one (an older
+		// gateway, anything else) costs one 404 and the platform paths take over.
+		// Hash-gated below like the rest — asking it is not trusting it.
+		//
+		// Over the run's pinned session, so it rides the connection whose certificate
+		// was bound to the quote. A 404 is an absence, not a failed lookup: it is not
+		// counted as an attempt, so an endpoint that simply does not publish its
+		// manifest leaves the stage reporting exactly what it did before.
+		if !c.cfg.NoEndpointCompose {
+			b, src, err := FetchAppComposeFromEndpoint(ctx, sess.client, host)
+			switch {
+			case err == nil:
+				raw, code.Source = b, src
+			case errors.Is(err, ErrEndpointServesNoAppCompose):
+			default:
+				errs = append(errs, err)
+			}
+		}
+
+		cloudUsable := raw == nil && !c.cfg.NoCloudAPI &&
 			(strings.TrimSpace(c.cfg.AppID) != "" || !c.cfg.NoDNSDiscovery)
 		fallbackPossible := strings.TrimSpace(c.cfg.BaseDomain) != "" || !c.cfg.NoDNSDiscovery
 		if cloudUsable {

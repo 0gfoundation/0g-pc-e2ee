@@ -91,7 +91,7 @@
 //	         [-allow-untrusted-cert]
 //	         [-expect-compose-file docker-compose.release.yml | -releases N]
 //	         [-app-compose app-compose.json | -app-id <40 hex> [-base-domain <cluster>.phala.network]]
-//	         [-cloud-api-base https://... | -no-cloud-api]
+//	         [-cloud-api-base https://... | -no-cloud-api] [-no-endpoint-compose]
 //	         [-no-dns-discovery] [-os-image-allowlist osimages.json]
 //
 // Code identity — which configuration, and so which images, the CVM booted — comes
@@ -100,15 +100,21 @@
 // needs no extra arguments. The app_id comes from the served domain's
 // _dstack-app-address TXT record — the record the platform itself routes by, because
 // an app_id is NOT compose_hash[:20] once the app has been upgraded — and the
-// app-compose is fetched from Phala Cloud's public attestations API, falling back to
-// the CVM's guest agent at `<app_id>-8090.<base-domain>` (base domain derived from
-// the served domain's CNAME chain). Whichever answers, the bytes are checked against
+// app-compose is fetched first from the endpoint itself (`https://<domain>/v1/gateway/
+// app-compose`, which the cloud gateway serves), then from Phala Cloud's public
+// attestations API, then from the CVM's guest agent at `<app_id>-8090.<base-domain>`
+// (base domain derived from the served domain's CNAME chain). The endpoint comes
+// first because it is the one source that needs nothing from the platform: in
+// 2026-11 both platform paths stopped answering anonymous callers (a 401, and a
+// dropped connection on every node). An endpoint that answers 404 does not publish
+// its manifest and costs nothing. Whichever answers, the bytes are checked against
 // compose_hash before anything in them is believed, which is why none of these
-// sources has to be trusted.
+// sources — the endpoint included — has to be trusted.
 //
 // -app-compose supplies those bytes from a file instead and skips both lookups;
 // -app-id pins the app_id when the TXT record cannot be read; -base-domain overrides
-// the derived domain; -no-cloud-api leaves the guest agent as the only path (a
+// the derived domain; -no-endpoint-compose skips asking the endpoint (to exercise the
+// platform paths on their own); -no-cloud-api leaves the guest agent as the only path (a
 // self-hosted dstack has no such API); -no-dns-discovery keeps the run to the
 // endpoint and the inputs given.
 //
@@ -305,6 +311,7 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 	baseDomain := fs.String("base-domain", "", "gateway mode: platform base domain (e.g. in1.phala.network) for the guest-agent fallback, `<app_id>-8090.<base-domain>`, used when the Phala Cloud lookup does not answer. Default: derived from the served domain's CNAME chain")
 	appID := fs.String("app-id", "", "gateway mode: the dstack app_id to look the app-compose up by. Default: read from the served domain's _dstack-app-address TXT record, falling back to compose_hash's first 20 bytes — which is only the app_id for an app still running the compose it was created with, so pin this if that lookup cannot be made. It only locates the bytes; the compose_hash gate is what accepts them")
 	cloudAPIBase := fs.String("cloud-api-base", evidence.DefaultCloudAPIBase, "gateway mode: Phala Cloud API root for the app-compose lookup (GET <base>/apps/<app_id>/attestations)")
+	noEndpointCompose := fs.Bool("no-endpoint-compose", false, "gateway mode: do not ask the endpoint for its own app-compose ("+evidence.EndpointAppComposePath+"), leaving only the platform paths; the endpoint's answer is hash-gated like the rest, so this buys no safety and exists to exercise the platform paths on their own")
 	noCloudAPI := fs.Bool("no-cloud-api", false, "gateway mode: do not ask Phala Cloud for the app-compose, leaving the guest agent as the only fetch path (a self-hosted dstack cluster, or a run that must not touch Phala's API)")
 	osImages := fs.String("os-image-allowlist", "", "gateway mode: read the expected OS-image boot-chain measurements from this file instead of the ones built into the binary (see client/evidence/osimages.json). For testing and for pinning an image before it is committed")
 	noDNSDiscovery := fs.Bool("no-dns-discovery", false, "gateway mode: do not derive the platform base domain from DNS; check only what was passed in")
@@ -344,6 +351,7 @@ func run(ctx context.Context, out io.Writer, args []string) int {
 			appID:              *appID,
 			cloudAPIBase:       *cloudAPIBase,
 			noCloudAPI:         *noCloudAPI,
+			noEndpointCompose:  *noEndpointCompose,
 			noDNSDiscovery:     *noDNSDiscovery,
 			osImagesPath:       *osImages,
 			expectComposePath:  *expectComposeFile,
