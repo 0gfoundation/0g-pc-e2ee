@@ -1,0 +1,157 @@
+name: pcverify
+
+# Verifies the deployed cloud gateways end to end, the way an outside verifier
+# would: `pcverify -gateway <domain>` checks the evidence bundle, DCAP-verifies the
+# cert-binding quote, confirms the certificate the domain actually serves is the one
+# the quote committed to, checks the OS image against the embedded allowlist, and
+# matches the booted compose against the published releases.
+#
+# WHY A SCHEDULE. Nothing in this repository changes when a deployment drifts: a
+# certificate renewed by a CVM that is no longer ours, an OS image that falls off
+# the allowlist, a side switched to an unpublished compose, a DNS record pointing
+# somewhere else. Each of those is visible only from outside, so something has to
+# look from outside on a timer. A failure files (or comments on) an issue, because a
+# scheduled run has no reviewer and GitHub's own notification goes only to whoever
+# last edited this file.
+#
+# WHY HERE, AND NOT FROM A LAPTOP OR AN AGENT. The run needs a direct TLS connection
+# to the domain (the served certificate is the load-bearing check), plus Intel PCS,
+# the Phala Cloud API and the CVM's guest agent. A runner has all of that; a
+# sandboxed environment behind a TLS-intercepting proxy has none of it.
+# workflow_dispatch is there so a rollout can be checked on demand, with the same
+# binary and flags as the nightly run.
+
+on:
+  schedule:
+    # Off the hour, like security.yml: on-the-hour crons queue behind everyone's.
+    - cron: "29 2 * * *"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Which gateway to verify"
+        type: choice
+        options: [all, mainnet, staging]
+        default: all
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pcverify-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      domains: ${{ steps.pick.outputs.domains }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pick domains
+        id: pick
+        # The domains come from the checked-in deploy config, so a renamed gateway is
+        # picked up here without anyone remembering this file.
+        run: |
+          target="${{ inputs.target || 'all' }}"
+          domain() { sed -n 's/^DOMAIN=//p' "deploy/phala/env/$1.env" | tr -d "\"'"; }
+          case "$target" in
+            mainnet) list="[\"$(domain mainnet)\"]" ;;
+            staging) list="[\"$(domain staging)\"]" ;;
+            *)       list="[\"$(domain mainnet)\",\"$(domain staging)\"]" ;;
+          esac
+          echo "domains=$list" >> "$GITHUB_OUTPUT"
+          echo "Verifying: $list"
+
+  verify:
+    needs: plan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write # file the nightly report; unused on a manual run
+    strategy:
+      # One gateway failing must not hide the other's state.
+      fail-fast: false
+      matrix:
+        domain: ${{ fromJSON(needs.plan.outputs.domains) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: client/cmd/pcverify/go.mod
+          cache-dependency-path: client/cmd/pcverify/go.sum
+
+      - name: Build pcverify
+        # From this commit, not a release binary: the verifier and the allowlists it
+        # embeds (OS images, broker images) are what main says they are today.
+        run: |
+          cd client/cmd/pcverify
+          go build -o "${RUNNER_TEMP}/pcverify" .
+
+      - name: pcverify -gateway ${{ matrix.domain }}
+        id: verify
+        env:
+          # The releases lookup (which published release the booted compose matches)
+          # goes to the GitHub API; the token keeps a shared runner IP from being
+          # rate-limited into a skipped check.
+          GITHUB_TOKEN: ${{ github.token }}
+        # -strict: a lookup that cannot complete is a failure, not a skip. Exit 3
+        # ("nothing failed, but a check did not run") would otherwise read as green
+        # on exactly the night a check stopped running.
+        run: |
+          report="${RUNNER_TEMP}/pcverify.txt"
+          set +e
+          "${RUNNER_TEMP}/pcverify" -gateway "${{ matrix.domain }}" -strict 2>&1 | tee "$report"
+          rc=${PIPESTATUS[0]}
+          set -e
+          echo "report=${report}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### pcverify -gateway ${{ matrix.domain }} (exit ${rc})"
+            echo '```'
+            cat "$report"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
+      - name: File an issue on a nightly failure
+        if: failure() && steps.verify.outcome == 'failure' && github.event_name == 'schedule'
+        uses: actions/github-script@v7
+        env:
+          REPORT: ${{ steps.verify.outputs.report }}
+          DOMAIN: ${{ matrix.domain }}
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = `pcverify: ${process.env.DOMAIN} failed verification`;
+            // One standing issue per domain: a failure that persists gets a comment
+            // a night, so the thread shows how long it has been broken.
+            const open = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner, repo: context.repo.repo, state: 'open', per_page: 100,
+            });
+            const existing = open.find(i => !i.pull_request && i.title.startsWith(marker));
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            let out = '';
+            try { out = fs.readFileSync(process.env.REPORT, 'utf8'); } catch (e) { out = '(no report: the run failed before pcverify wrote one)'; }
+            if (out.length > 60000) out = out.slice(0, 60000) + '\n…truncated, see the run log.\n';
+            const body = [
+              `\`pcverify -gateway ${process.env.DOMAIN} -strict\` failed on \`${context.sha.slice(0, 7)}\`.`,
+              ``,
+              `A failure here means something an outside verifier would see is wrong with the`,
+              `deployment, or a check could not run. Read the report before assuming either.`,
+              ``,
+              `Run: ${run}`,
+              ``,
+              '```',
+              out.trimEnd(),
+              '```',
+            ].join('\n');
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: existing.number, body,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title: `${marker} (${new Date().toISOString().slice(0, 10)})`, body,
+              });
+            }
