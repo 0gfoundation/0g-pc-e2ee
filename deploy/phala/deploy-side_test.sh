@@ -604,7 +604,8 @@ sed 's/=CHANGEME$/=filled.example/; s/^PLATFORM_BASE=.*/PLATFORM_BASE=in1.phala.
   "$HERE/env/mainnet.env" >"$WORK/filled.env"
 printf '%s\n' CLOUDFLARE_API_TOKEN=cf-secret ZG_PROM_REMOTE_WRITE_URL=https://prom.test/w \
   ZG_PROM_REMOTE_WRITE_USERNAME=gw ZG_PROM_REMOTE_WRITE_PASSWORD=pw \
-  "CVM_ENV_ZG_GATEWAY_ALLOWED_ORIGINS='https://a.test,https://*.b.test'" >"$WORK/secrets.env"
+  "CVM_ENV_ZG_GATEWAY_ALLOWED_ORIGINS='https://a.test,https://*.b.test'" \
+  CVM_ENV_ZG_GATEWAY_CLIENT_IP_KEY=000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f >"$WORK/secrets.env"
 RC=0
 ERR="$(env -i PATH="$WORK/bin:$PATH" HOME="$WORK" FAKE_DIR="$S" SECRETS_ENV="$WORK/secrets.env" \
   bash "$DEPLOY" b --env-file "$WORK/filled.env" --compose "$COMPOSE" --dry-run 2>&1 >/dev/null)" || RC=$?
