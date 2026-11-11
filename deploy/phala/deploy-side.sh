@@ -319,12 +319,15 @@ side_cert_ok() { # host
 
 # Run $2 (a function) every POLL_INTERVAL until it succeeds or $1 seconds pass. The
 # function prints a one-line progress note and returns 1 while it is not there yet,
-# or calls `stop` when waiting cannot help.
+# or calls `stop` when waiting cannot help. What it prints on success is left in
+# WAIT_RESULT: it runs in a subshell, so this is the only way a value it found —
+# the cluster it probed, say — reaches the caller.
+WAIT_RESULT=""
 wait_for() { # seconds fn what
   local deadline=$((SECONDS + $1)) note rc
   while :; do
     rc=0; note="$("$2")" || rc=$?
-    case "$rc" in 0) return 0 ;; 1) ;; *) exit 1 ;; esac
+    case "$rc" in 0) WAIT_RESULT="$note"; return 0 ;; 1) ;; *) exit 1 ;; esac
     [ "$SECONDS" -ge "$deadline" ] && die "gave up after ${1}s waiting for ${3}: ${note}"
     info "waiting for ${3}: ${note}"
     sleep "$POLL_INTERVAL"
@@ -345,25 +348,31 @@ check_published() {
     return 1
   fi
   # Published but malformed is not going to fix itself: stop waiting. Which
-  # cluster it names is reported after the wait, not judged here.
+  # cluster it names is reported after the wait, not judged here; it is printed
+  # for the caller (WAIT_RESULT).
+  published_base_of "$alias"
   [ -n "$(published_base_of "$alias")" ] || stop "side ${SIDE} published ${DOMAIN}.${SIDE}.${DELEGATION_ZONE} -> ${alias}, which is not _.<cluster>: the platform exported a doubled _. prefix, or no gateway domain at all (README, \"Serving domain\"). Nothing can route this side; delete it."
 }
 
-# The side's cluster as it publishes it now. Read afresh on every poll of
-# check_ready rather than once: the TXT that check_published waits for and this
-# CNAME are two writes, and until the new ingress makes the second, the record can
-# still hold the deleted CVM's cluster.
-side_base_now() { published_base_of "$(dns CNAME "${DOMAIN}.${SIDE}.${DELEGATION_ZONE}")"; }
-
+# Probe the side on the cluster it publishes NOW. Read afresh on every poll rather
+# than once: the TXT that check_published waits for and this CNAME are two writes,
+# and until the new ingress makes the second, the record can still hold the
+# deleted CVM's cluster. No answer is "not yet" — a lookup that timed out, or one
+# that caught the ingress mid-rewrite — and only a malformed answer stops the run:
+# stopping here abandons a CVM that has already spent a certificate. On success it
+# prints the cluster it probed (WAIT_RESULT), so the caller uses that value rather
+# than a later lookup that could differ or fail.
 check_ready() {
-  local code base host
-  base="$(side_base_now)"
-  [ -n "$base" ] || stop "side ${SIDE}'s serving CNAME is no longer _.<cluster>"
+  local code raw base host
+  raw="$(dns CNAME "${DOMAIN}.${SIDE}.${DELEGATION_ZONE}")"
+  [ -n "$raw" ] || { echo "${DOMAIN}.${SIDE}.${DELEGATION_ZONE} not answered"; return 1; }
+  base="$(published_base_of "$raw")"
+  [ -n "$base" ] || stop "side ${SIDE}'s serving CNAME is no longer _.<cluster>: ${raw}"
   host="${APP_ID}-443s.${base}"
   side_cert_ok "$host" || { echo "no valid certificate for ${DOMAIN} at ${host} yet"; return 1; }
   code="$(http_status "https://${host}/readyz")"
   case "$code" in
-    2*) return 0 ;;
+    2*) echo "$base"; return 0 ;;
     404) stop "${host}/readyz answered 404: this build predates /readyz, or the -443s route reaches something else" ;;
     *) echo "/readyz answered ${code} at ${host}"; return 1 ;;
   esac
@@ -537,11 +546,12 @@ info "created ${NAME}: app_id ${APP_ID}"
 
 # --- wait ----------------------------------------------------------------------
 wait_for "$WAIT_PUBLISH" check_published "side ${SIDE}'s records"
-info "published: $(addr_target "$SIDE") -> ${APP_ID}, ${DOMAIN}.${SIDE}.${DELEGATION_ZONE} -> _.$(side_base_now)"
+info "published: $(addr_target "$SIDE") -> ${APP_ID}, ${DOMAIN}.${SIDE}.${DELEGATION_ZONE} -> _.${WAIT_RESULT}"
 wait_for "$WAIT_READY" check_ready "the side's /readyz"
-# The side's cluster, as it publishes it once it serves there: what switch.sh
-# will read, and where the checks below go.
-BASE="$(side_base_now)"
+# The side's cluster: the one it was just found ready on (check_ready's result,
+# not a fresh lookup) — what switch.sh will read, and where the checks below go.
+BASE="$WAIT_RESULT"
+[[ "$BASE" == *.* ]] || die "internal: check_ready reported no cluster (${BASE:-empty})"
 HOST="${APP_ID}-443s.${BASE}"
 info "ready: https://${HOST}/readyz"
 if [ -n "$EXPECTED" ] && [ "$BASE" != "$EXPECTED" ]; then
