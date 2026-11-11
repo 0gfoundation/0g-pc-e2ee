@@ -10,6 +10,10 @@
 #   cvms.json          the account's CVMs, as `phala cvms list --json` items
 #   deleted            written by `phala cvms delete`: one deleted app_id per line
 #   delete_fails       if present, `phala cvms delete` fails
+#   list_fails         if present, N: after a delete, that many `phala cvms list`
+#                      calls fail (an API hiccup); `always` keeps failing
+#   dns/<T>/<n>.flip   "N value": after N lookups of that record, it reads `value`
+#                      (someone switching traffic while the run waits)
 #   deploy.args        written by the fake `node provision.cjs`: one argument per line
 #   deploy.env         written by it too: the env file it was handed
 #   cluster            the cluster a created CVM lands in (in1.phala.network if absent)
@@ -58,6 +62,10 @@ args=()
 for a in "$@"; do case "$a" in +short|@*) ;; *) args+=("$a") ;; esac; done
 if [ "${args[0]}" = NS ]; then echo "ns1.fake-dns.test."; exit 0; fi
 f="$FAKE_DIR/dns/${args[0]}/${args[1]}"
+if [ -f "$f.flip" ]; then   # the record changes after N lookups
+  read -r n v <"$f.flip"; c="$f.flipcount"; k=$(( $(cat "$c" 2>/dev/null || echo 0) + 1 )); echo "$k" >"$c"
+  [ "$k" -gt "$n" ] && printf '%s\n' "$v" >"$f"
+fi
 if [ -f "$f.next" ]; then   # a write the ingress has not made yet (cname_lag)
   n="$(cat "$f.lag")"
   if [ "$n" -le 0 ]; then mv "$f.next" "$f"; rm -f "$f.lag"; else echo $((n - 1)) >"$f.lag"; fi
@@ -79,6 +87,11 @@ set -euo pipefail
 S="$FAKE_DIR"
 case "$1 ${2:-}" in
   "cvms list")
+    if [ -f "$S/deleted" ] && [ -f "$S/list_fails" ]; then
+      n="$(cat "$S/list_fails")"
+      if [ "$n" = always ]; then echo "fake phala: list failed" >&2; exit 1; fi
+      if [ "$n" -gt 0 ]; then echo $((n - 1)) >"$S/list_fails"; echo "fake phala: list failed" >&2; exit 1; fi
+    fi
     search=""
     while [ $# -gt 0 ]; do [ "$1" = --search ] && search="$2"; shift; done
     jq --arg q "$search" '{success: true, items: [.[] | select((.cvmName | contains($q)) or (.appId | contains($q)))]}' "$S/cvms.json"
@@ -211,7 +224,7 @@ run() { # args…
     CVM_NAME_PREFIX=gw-mainnet PHALA_INSTANCE_TYPE=tdx.4xlarge PHALA_NODE_ID=test7 \
     CLOUDFLARE_API_TOKEN=cf-secret ZG_PROM_ENV=mainnet ZG_PROM_REMOTE_WRITE_URL=https://prom.test/w \
     ZG_PROM_REMOTE_WRITE_USERNAME=gw ZG_PROM_REMOTE_WRITE_PASSWORD='p#ss word' \
-    "${EXTRA_ENV[@]}" POLL_INTERVAL=0 WAIT_PUBLISH=1 WAIT_READY=1 WAIT_IDENTITY=1 \
+    "${EXTRA_ENV[@]}" POLL_INTERVAL=0 WAIT_PUBLISH=1 WAIT_READY=1 WAIT_IDENTITY=1 WAIT_DELETE=1 \
     bash "$DEPLOY" "$@" 2>"$WORK/err")" || RC=$?
   ERR="$(cat "$WORK/err")"
 }
@@ -338,6 +351,44 @@ record CNAME "_acme-challenge.${DOMAIN}.${DZ}" "_acme-challenge.${DOMAIN}.a.${DZ
 run b --compose "$COMPOSE" --replace --yes
 expect_err "--replace deletes nothing when a later check refuses" "run switch.sh acme b first"
 check "…the old CVM is still there" [ ! -f "$S/deleted" ]
+
+# An empty answer is never "not live": dns() reads NXDOMAIN, SERVFAIL and NODATA
+# alike as "", and a side named explicitly is otherwise only refused when the
+# switch positively names it.
+fresh; echo "[${OLDA_CVM}, ${OLDB_CVM}]" >"$S/cvms.json"
+rm "$S/dns/CNAME/_dstack-app-address.${DOMAIN}.${DZ}"
+record CNAME "_acme-challenge.${DOMAIN}.${DZ}" "_acme-challenge.${DOMAIN}.a.${DZ}"
+run a --compose "$COMPOSE" --replace --yes
+expect_err "--replace refuses when the traffic switch reads as unset" "--replace will not delete anything on an unknown state"
+check "…deleting nothing" [ ! -f "$S/deleted" ]
+not_created "--replace on an unset switch"
+
+fresh; echo "[${OLDA_CVM}, ${OLDB_CVM}]" >"$S/cvms.json"
+rm "$S/dns/TXT/_dstack-app-address.${DOMAIN}.a.${DZ}"
+run b --compose "$COMPOSE" --replace --yes
+expect_err "--replace refuses when the live side's app_id does not read back" "the live side a publishes no app_id"
+check "…deleting nothing" [ ! -f "$S/deleted" ]
+
+# Traffic moves onto the side between the checks and the delete (a local run
+# waiting at its prompt): the delete re-reads the switch first. Lookup 1 is the
+# preflight's, 2 plan_replacement's; from 3 on the switch names b.
+fresh; echo "[${OLDA_CVM}, ${OLDB_CVM}]" >"$S/cvms.json"
+echo "2 _dstack-app-address.${DOMAIN}.b.${DZ}" >"$S/dns/CNAME/_dstack-app-address.${DOMAIN}.${DZ}.flip"
+run b --compose "$COMPOSE" --replace --yes
+expect_err "--replace re-checks just before deleting, and refuses a side that went live" "side b is live (traffic -> b)"
+check "…after planning had passed (so it was the re-check that refused)" err_has "replace     : delete gw-mainnet-b"
+check "…deleting nothing" [ ! -f "$S/deleted" ]
+not_created "--replace onto a side that went live"
+
+fresh; echo "[${OLDA_CVM}, ${OLDB_CVM}]" >"$S/cvms.json"; echo 2 >"$S/list_fails"
+run b --compose "$COMPOSE" --replace --yes
+expect_rc "a CVM list that fails while waiting for the delete is retried" 0
+check "…and the wait says why it is waiting" err_has "could not read the CVM list"
+
+fresh; echo "[${OLDA_CVM}, ${OLDB_CVM}]" >"$S/cvms.json"; echo always >"$S/list_fails"
+run b --compose "$COMPOSE" --replace --yes
+expect_err "a CVM list that keeps failing is not read as deleted" "could not read the CVM list; nothing was created"
+not_created "--replace with the list down"
 
 fresh; echo "[${OLDA_CVM}, ${OLDB_CVM}]" >"$S/cvms.json"; touch "$S/delete_fails"
 run b --compose "$COMPOSE" --replace --yes

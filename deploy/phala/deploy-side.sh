@@ -252,7 +252,7 @@ dns() { # type name -> first answer, trailing dot and TXT quotes stripped
 # Its app_id need not be the one the side publishes: a CVM whose ingress never
 # published (a deploy that failed before boot finished) is still that side's.
 plan_replacement() { # matching-lines
-  local n line cvm app st s other
+  local n line cvm app st
   n="$(grep -c . <<<"$1")"
   [ "$n" = 1 ] || die "side ${SIDE} matches ${n} CVMs; --replace deletes only one. Delete by hand:
 $1"
@@ -262,13 +262,50 @@ $1"
   st="$(sed -n 's/.* status=\([^ ]*\).*/\1/p' <<<"$line")"
   [ "$cvm" = "$NAME" ] || die "side ${SIDE}'s published app_id ${app} belongs to a CVM named ${cvm}, not ${NAME}: renamed by hand? --replace will not delete it; check it and delete it yourself"
   [[ "$app" =~ ^[0-9a-f]{40}$ ]] || die "could not read an app_id for ${cvm} (${line})"
-  for s in a b c; do
-    [ "$s" = "$SIDE" ] && continue
-    other="$(norm_app_id "$(dns TXT "$(addr_target "$s")" | cut -d: -f1)")"
-    [ "$other" != "$app" ] || die "${cvm} (app_id ${app}) is what side ${s} publishes${live:+ (traffic -> ${live})}; --replace will not delete it"
-  done
+  replace_guard "$cvm" "$app"
   REPLACE_APP="$app"
   info "replace     : delete ${cvm} (app_id ${app}, status ${st}), side ${SIDE}'s previous CVM$([ "$app" = "$old_app" ] && echo ", which its record names" || echo "; its record names ${old_app:-nothing}, so it never published")"
+}
+
+# What makes deleting app_id $2 safe, read from the delegation zone NOW — at
+# planning, and again immediately before the delete, since a local run can sit at
+# its confirmation prompt while someone switches traffic. Every record is required
+# to be positively there: dns() reads NXDOMAIN, SERVFAIL and an empty answer all
+# as "", and "" must never pass for "not live".
+#   - the traffic switch names a side, and not this one;
+#   - the live side publishes an app_id, and it is not this one;
+#   - no other side publishes this app_id (a switch or rollback target).
+replace_guard() { # cvm app_id
+  local tgt now s other
+  tgt="$(dns CNAME "_dstack-app-address.${DOMAIN}.${DELEGATION_ZONE}")"
+  now="$(which_side "$tgt" addr)"
+  case "$now" in
+    a|b|c) ;;
+    *) die "the traffic switch reads as ${tgt:-unset}; --replace will not delete anything on an unknown state. Check switch.sh status, or delete ${1} by hand" ;;
+  esac
+  [ "$now" != "$SIDE" ] || die "side ${SIDE} is live (traffic -> ${now}); --replace will not delete ${1}"
+  for s in a b c; do
+    [ "$s" = "$SIDE" ] && continue
+    other="$(dns TXT "$(addr_target "$s")")"
+    other="$(norm_app_id "${other%%:*}")"
+    if [ "$s" = "$now" ] && ! [[ "$other" =~ ^[0-9a-f]{40}$ ]]; then
+      die "the live side ${now} publishes no app_id at $(addr_target "$now") (read ${other:-nothing}); --replace will not delete anything until that reads back"
+    fi
+    [ "$other" != "$2" ] || die "${1} (app_id ${2}) is what side ${s} publishes (traffic -> ${now}); --replace will not delete it"
+  done
+}
+
+# 0 if app_id $1 is in the CVM list, 1 if it is not, 2 if the list could not be
+# read. Unlike cvm_status, a failed lookup is NOT "gone": the wait after a delete
+# must not create a CVM next to one that is still there.
+cvm_listed() { # app_id
+  local out
+  out="$("$PHALA" cvms list --search "$1" --page-size 100 --json 2>/dev/null)" || return 2
+  jq -e '.items | type == "array"' <<<"$out" >/dev/null 2>&1 || return 2
+  if jq -e --arg a "$1" 'any(.items[]; (.appId // "" | ltrimstr("app_") | ascii_downcase) == $a)' <<<"$out" >/dev/null; then
+    return 0
+  fi
+  return 1
 }
 
 # `inactive` -> the main side the traffic switch does NOT point at, read now from
@@ -631,13 +668,20 @@ fi
 # then stops would leave the side with nothing. Waits until the CVM is gone from
 # the list, so the create below cannot collide with it by name.
 if [ -n "$REPLACE_APP" ]; then
+  replace_guard "$NAME" "$REPLACE_APP"   # again: the prompt above can take a while
   info "deleting ${NAME} (app_id ${REPLACE_APP})"
   "$PHALA" cvms delete "app_${REPLACE_APP}" --force >&2 \
     || die "phala cvms delete app_${REPLACE_APP} failed; nothing was created. Check \`phala cvms list\`."
   deadline=$((SECONDS + WAIT_DELETE))
-  while [ -n "$(cvm_status "$REPLACE_APP")" ]; do
-    [ "$SECONDS" -lt "$deadline" ] || die "${NAME} (app_id ${REPLACE_APP}) is still listed ${WAIT_DELETE}s after deleting it; nothing was created"
-    info "waiting for ${NAME} to go: $(cvm_status "$REPLACE_APP")"
+  while :; do
+    rc=0; cvm_listed "$REPLACE_APP" || rc=$?
+    case "$rc" in
+      1) break ;;
+      0) note="still listed" ;;
+      *) note="could not read the CVM list" ;;
+    esac
+    [ "$SECONDS" -lt "$deadline" ] || die "${NAME} (app_id ${REPLACE_APP}) ${WAIT_DELETE}s after deleting it: ${note}; nothing was created. Check \`phala cvms list\` before retrying."
+    info "waiting for ${NAME} to go: ${note}"
     sleep "$POLL_INTERVAL"
   done
   info "deleted ${NAME} (app_id ${REPLACE_APP})"
