@@ -613,14 +613,21 @@ It moves no traffic. A release is then:
    at. It deletes just before the create, after every other check has passed, so a
    refused run leaves the old CVM in place; and it writes `switch.sh status` into the
    run summary first, so the summary shows what was live when it deleted;
-2. **Phala deploy** with side `inactive` (or the side by name). It calls **DNS switch** for `acme <side>` (approve
+2. **Phala deploy** with side `inactive` (or the side by name), and `switch` ticked
+   to have it do step 3 too. It calls **DNS switch** for `acme <side>` (approve
    under `dns-<target>`), then creates the side under `deploy-<target>` (approve
    again) and waits until it is ready. If that deploy fails or is cancelled, it
    calls **DNS switch** once more for `acme live` (approve under `dns-<target>`
    again), so issuance goes back to the side serving traffic; decline that
    approval only if you mean to retry straight away, and run `acme` → `live`
    yourself otherwise;
-3. **DNS switch** → `switch <side>`.
+3. **DNS switch** → `switch <side>` — or, with `switch` ticked in step 2, the
+   deploy's own **switch** job, which runs only after the deploy and its smoke test
+   succeed and waits for its own approval under `dns-<target>`. Read the deploy's
+   summary before approving: it says when the new side runs in another cluster
+   than the live one, which makes the cutover move the serving alias, with a short
+   window ([Cross-cluster fallback](#cross-cluster-fallback)). A cutover that does
+   not verify is rolled back by `switch.sh`, issuance included, as when run by hand.
 
 What `deploy-side.sh` refuses, and what it waits for, is in its header. In short:
 it will not touch a live side, a side whose old CVM still exists (by name or by
