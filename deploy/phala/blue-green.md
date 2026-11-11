@@ -605,8 +605,14 @@ live). It is refused while c is live or nothing is — name a side then. Locally
 `./deploy-side.sh inactive --env-file … --resolve-side` prints which side that is.
 It moves no traffic. A release is then:
 
-1. delete the inactive side's previous CVM (`phala cvms delete`, or the dashboard) —
-   by hand, on purpose;
+1. delete the inactive side's previous CVM — tick `replace` in step 2 to have the run
+   do it, or by hand (`phala cvms delete`, or the dashboard). `replace`
+   (`deploy-side.sh --replace`) deletes only a CVM that is unambiguously that
+   side's previous one: exactly one match, named `<CVM_NAME_PREFIX>-<side>`, with an
+   `app_id` no other side publishes — anything else is refused for a human to look
+   at. It deletes just before the create, after every other check has passed, so a
+   refused run leaves the old CVM in place; and it writes `switch.sh status` into the
+   run summary first, so the summary shows what was live when it deleted;
 2. **Phala deploy** with side `inactive` (or the side by name). It calls **DNS switch** for `acme <side>` (approve
    under `dns-<target>`), then creates the side under `deploy-<target>` (approve
    again) and waits until it is ready. If that deploy fails or is cancelled, it

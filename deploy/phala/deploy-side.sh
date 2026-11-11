@@ -20,7 +20,11 @@
 #   - a CVM named <CVM_NAME_PREFIX>-<side> exists, or one with the app_id the side
 #     currently publishes — the previous CVM of this side has not been deleted.
 #     `switch.sh status` cannot tell this apart: a deleted CVM and a crashed one
-#     both read as "unreachable", and only the second makes a new one unsafe;
+#     both read as "unreachable", and only the second makes a new one unsafe.
+#     With --replace that CVM is deleted instead — just before the create, after
+#     every other check — but only if it is exactly one CVM, named
+#     <CVM_NAME_PREFIX>-<side>, whose app_id no other side publishes; anything
+#     else is still refused;
 #   - the issuance switch does not point at the side. The new side's ingress issues
 #     its certificate on first boot, and a dns-01 challenge aimed at the other side
 #     fails and burns the 5-failed-validations-per-hour budget, which is per
@@ -95,6 +99,8 @@
 #   --env-file PATH  load config from PATH instead of ./deploy.env next to this script
 #   --resolve-side   print side=<a|b|c> (resolving `inactive`) and exit; needs no
 #                    secrets and no --compose
+#   --replace        delete the side's previous CVM first, instead of refusing —
+#                    only that one, after every other check has passed (see below)
 #
 # Config (env or env file; the real environment wins over the file):
 #   DOMAIN               served hostname (required — no default, so a staging run
@@ -122,6 +128,7 @@
 #   WAIT_PUBLISH         seconds for checks 1–2      (default: 1800; image pull + boot)
 #   WAIT_READY           seconds for check 3         (default: 900; cert + cold warmer sweep)
 #   WAIT_IDENTITY        seconds for check 4         (default: 600)
+#   WAIT_DELETE          seconds for a --replace delete to show (default: 300)
 #   POLL_INTERVAL        seconds between polls       (default: 15)
 #
 # On success it prints two lines on stdout, for callers to capture:
@@ -139,6 +146,7 @@ RELEASE=""
 ENV_FILE=""
 SIDE=""
 RESOLVE_SIDE=0
+REPLACE=0
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -231,6 +239,36 @@ dns() { # type name -> first answer, trailing dot and TXT quotes stripped
   v="$(dig +short @"$AUTH_NS" "$1" "$2" 2>/dev/null | head -n1 || true)"
   v="${v%.}"; v="${v#\"}"; v="${v%\"}"
   printf '%s' "$v"
+}
+
+# --replace: which CVM may be deleted to make room for the new one, or die. Only
+# ever the side's own previous CVM, and only when nothing else could be meant:
+#   - exactly one CVM matches (by name or by the app_id the side publishes);
+#   - it is named <CVM_NAME_PREFIX>-<side> — one matched by app_id alone was
+#     renamed by hand, and someone should look at it first;
+#   - its app_id is not published by any OTHER side, so it is not the live one,
+#     nor a side traffic could be switched or rolled back to. (The side itself is
+#     not live: that was refused above.)
+# Its app_id need not be the one the side publishes: a CVM whose ingress never
+# published (a deploy that failed before boot finished) is still that side's.
+plan_replacement() { # matching-lines
+  local n line cvm app st s other
+  n="$(grep -c . <<<"$1")"
+  [ "$n" = 1 ] || die "side ${SIDE} matches ${n} CVMs; --replace deletes only one. Delete by hand:
+$1"
+  line="$1"
+  cvm="${line%% *}"
+  app="$(sed -n 's/.* app_id=\([^ ]*\).*/\1/p' <<<"$line")"
+  st="$(sed -n 's/.* status=\([^ ]*\).*/\1/p' <<<"$line")"
+  [ "$cvm" = "$NAME" ] || die "side ${SIDE}'s published app_id ${app} belongs to a CVM named ${cvm}, not ${NAME}: renamed by hand? --replace will not delete it; check it and delete it yourself"
+  [[ "$app" =~ ^[0-9a-f]{40}$ ]] || die "could not read an app_id for ${cvm} (${line})"
+  for s in a b c; do
+    [ "$s" = "$SIDE" ] && continue
+    other="$(norm_app_id "$(dns TXT "$(addr_target "$s")" | cut -d: -f1)")"
+    [ "$other" != "$app" ] || die "${cvm} (app_id ${app}) is what side ${s} publishes${live:+ (traffic -> ${live})}; --replace will not delete it"
+  done
+  REPLACE_APP="$app"
+  info "replace     : delete ${cvm} (app_id ${app}, status ${st}), side ${SIDE}'s previous CVM$([ "$app" = "$old_app" ] && echo ", which its record names" || echo "; its record names ${old_app:-nothing}, so it never published")"
 }
 
 # `inactive` -> the main side the traffic switch does NOT point at, read now from
@@ -445,6 +483,7 @@ while [ $# -gt 0 ]; do
     --env-file)   ENV_FILE="${2:?--env-file needs a path}"; shift ;;
     --env-file=*) ENV_FILE="${1#*=}" ;;
     --resolve-side) RESOLVE_SIDE=1 ;;
+    --replace)    REPLACE=1 ;;
     -h|--help)    usage 0 ;;
     -*)           die "unknown flag: $1 (try --help)" ;;
     *)            POSITIONAL+=("$1") ;;
@@ -473,6 +512,7 @@ PLATFORM_BASE_SUFFIX="${PLATFORM_BASE_SUFFIX:-phala.network}"
 WAIT_PUBLISH="${WAIT_PUBLISH:-1800}"
 WAIT_READY="${WAIT_READY:-900}"
 WAIT_IDENTITY="${WAIT_IDENTITY:-600}"
+WAIT_DELETE="${WAIT_DELETE:-300}"
 POLL_INTERVAL="${POLL_INTERVAL:-15}"
 
 # A checked-in env file holds CHANGEME until someone fills it in.
@@ -543,11 +583,15 @@ info "side ${SIDE} (${NAME}) on node ${NODE}${EXPECTED:+, expected in ${EXPECTED
 [ "$live" = "$SIDE" ] && die "side ${SIDE} is live: deploy the other side, or switch away first"
 
 existing="$(cvms_matching "$NAME" "$old_app")"
-if [ -n "$existing" ]; then
-  die "side ${SIDE} still has a CVM — delete it first (phala cvms delete <name>), or pick the other side:
+REPLACE_APP=""
+if [ -z "$existing" ]; then
+  [ -n "$old_app" ] && info "side ${SIDE}'s record still names ${old_app}, which no longer exists — fine, the new CVM rewrites it"
+elif [ "$REPLACE" != 1 ]; then
+  die "side ${SIDE} still has a CVM — delete it first (phala cvms delete <name>), pass --replace, or pick the other side:
 ${existing}"
+else
+  plan_replacement "$existing"
 fi
-[ -n "$old_app" ] && info "side ${SIDE}'s record still names ${old_app}, which no longer exists — fine, the new CVM rewrites it"
 
 if [ "$acme" != "$SIDE" ]; then
   [ "$DRY_RUN" = 1 ] || die "the issuance switch points at ${acme:-nothing}, not side ${SIDE}: run switch.sh acme ${SIDE} first, or the new side's certificate request fails (and spends the hourly failed-validation budget the live side shares)"
@@ -572,10 +616,32 @@ info "compose     : ${COMPOSE} (sha256 ${COMPOSE_SHA})${RELEASE:+, release ${REL
 info "instance    : ${PHALA_INSTANCE_TYPE}, node ${NODE}, image ${PHALA_OS_IMAGE:-auto}"
 
 if [ "$DRY_RUN" = 1 ]; then
+  [ -n "$REPLACE_APP" ] && info "dry run: would delete app_${REPLACE_APP}"
   info "dry run: would run ${NODE_BIN} ${args[*]}"
   exit 0
 fi
-confirm "Create CVM ${NAME} as side ${SIDE}?" || die "aborted"
+if [ -n "$REPLACE_APP" ]; then
+  confirm "DELETE CVM ${NAME} (app_id ${REPLACE_APP}) and create a new one as side ${SIDE}?" || die "aborted"
+else
+  confirm "Create CVM ${NAME} as side ${SIDE}?" || die "aborted"
+fi
+
+# --- replace -------------------------------------------------------------------
+# Last, after every check that could refuse: a run that deletes the old CVM and
+# then stops would leave the side with nothing. Waits until the CVM is gone from
+# the list, so the create below cannot collide with it by name.
+if [ -n "$REPLACE_APP" ]; then
+  info "deleting ${NAME} (app_id ${REPLACE_APP})"
+  "$PHALA" cvms delete "app_${REPLACE_APP}" --force >&2 \
+    || die "phala cvms delete app_${REPLACE_APP} failed; nothing was created. Check \`phala cvms list\`."
+  deadline=$((SECONDS + WAIT_DELETE))
+  while [ -n "$(cvm_status "$REPLACE_APP")" ]; do
+    [ "$SECONDS" -lt "$deadline" ] || die "${NAME} (app_id ${REPLACE_APP}) is still listed ${WAIT_DELETE}s after deleting it; nothing was created"
+    info "waiting for ${NAME} to go: $(cvm_status "$REPLACE_APP")"
+    sleep "$POLL_INTERVAL"
+  done
+  info "deleted ${NAME} (app_id ${REPLACE_APP})"
+fi
 
 # --- create --------------------------------------------------------------------
 # provision.cjs reports the API's refusal on stderr, which reaches the log as is;

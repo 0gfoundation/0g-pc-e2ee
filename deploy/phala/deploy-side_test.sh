@@ -8,6 +8,8 @@
 #
 #   dns/<TYPE>/<name>  the answer the nameserver gives for that record
 #   cvms.json          the account's CVMs, as `phala cvms list --json` items
+#   deleted            written by `phala cvms delete`: one deleted app_id per line
+#   delete_fails       if present, `phala cvms delete` fails
 #   deploy.args        written by the fake `node provision.cjs`: one argument per line
 #   deploy.env         written by it too: the env file it was handed
 #   cluster            the cluster a created CVM lands in (in1.phala.network if absent)
@@ -80,6 +82,13 @@ case "$1 ${2:-}" in
     search=""
     while [ $# -gt 0 ]; do [ "$1" = --search ] && search="$2"; shift; done
     jq --arg q "$search" '{success: true, items: [.[] | select((.cvmName | contains($q)) or (.appId | contains($q)))]}' "$S/cvms.json"
+    ;;
+  "cvms delete")
+    [ -f "$S/delete_fails" ] && { echo "fake phala: delete refused" >&2; exit 1; }
+    id="$3"
+    [[ " $* " == *" --force "* ]] || { echo "fake phala: delete without --force would prompt" >&2; exit 2; }
+    jq --arg a "$id" 'map(select(.appId != $a))' "$S/cvms.json" >"$S/cvms.tmp" && mv "$S/cvms.tmp" "$S/cvms.json"
+    echo "$id" >>"$S/deleted"
     ;;
   *) echo "fake phala: unexpected: $*" >&2; exit 2 ;;
 esac
@@ -273,7 +282,68 @@ expect_err "refuses an unrecognized traffic switch" "unrecognized target"
 fresh; echo '[{"appId": "app_9999999999999999999999999999999999999999", "cvmName": "gw-mainnet-b", "status": "stopped"}]' >"$S/cvms.json"
 run b --compose "$COMPOSE" --yes
 expect_err "refuses when a CVM with the side's name exists" "gw-mainnet-b app_id=9999"
+check "…and says --replace would delete it" err_has "pass --replace"
 not_created "existing name"
+
+# --replace: the side's previous CVM, and only it, is deleted just before the create.
+OLDB_CVM="{\"appId\": \"app_${OLD_B}\", \"cvmName\": \"gw-mainnet-b\", \"status\": \"running\"}"
+OLDA_CVM="{\"appId\": \"app_${OLD_A}\", \"cvmName\": \"gw-mainnet-a\", \"status\": \"running\"}"
+fresh; echo "[${OLDA_CVM}, ${OLDB_CVM}]" >"$S/cvms.json"
+run b --compose "$COMPOSE" --release release-2026.10.28.1 --replace --yes
+expect_rc "--replace deletes the side's previous CVM and creates the new one" 0
+check "…deleting exactly that app_id" [ "$(cat "$S/deleted" 2>/dev/null)" = "app_${OLD_B}" ]
+check "…and creating afterwards" [ -f "$S/deploy.args" ]
+check "…saying which CVM it was and that the side's record named it" err_has "delete gw-mainnet-b (app_id ${OLD_B}, status running), side b's previous CVM, which its record names"
+check_not "…and leaves the live side's CVM alone" grep -q "${OLD_A}" "$S/deleted"
+
+fresh; echo "[${OLDA_CVM}, ${OLDB_CVM}]" >"$S/cvms.json"
+run b --compose "$COMPOSE" --replace --dry-run
+expect_rc "--replace --dry-run passes" 0
+check "…and only says what it would delete" err_has "dry run: would delete app_${OLD_B}"
+check "…deleting nothing" [ ! -f "$S/deleted" ]
+not_created "--replace dry run"
+
+fresh; echo "[${OLDA_CVM}, ${OLDB_CVM}]" >"$S/cvms.json"
+run inactive --compose "$COMPOSE" --replace --yes
+expect_rc "inactive and --replace together" 0
+check "…delete the inactive side's CVM" [ "$(cat "$S/deleted" 2>/dev/null)" = "app_${OLD_B}" ]
+
+# A CVM that never published (its deploy failed before its ingress came up) is
+# still the side's own: named for it, and no side publishes its app_id.
+NEVER=3333333333333333333333333333333333333333
+fresh; echo "[${OLDA_CVM}, {\"appId\": \"app_${NEVER}\", \"cvmName\": \"gw-mainnet-b\", \"status\": \"stopped\"}]" >"$S/cvms.json"
+run b --compose "$COMPOSE" --replace --yes
+expect_rc "--replace deletes a CVM of the side that never published" 0
+check "…that one" [ "$(cat "$S/deleted" 2>/dev/null)" = "app_${NEVER}" ]
+check "…and says so" err_has "its record names ${OLD_B}, so it never published"
+
+fresh; echo "[${OLDA_CVM}, {\"appId\": \"app_${OLD_A}\", \"cvmName\": \"gw-mainnet-b\", \"status\": \"running\"}]" >"$S/cvms.json"
+run b --compose "$COMPOSE" --replace --yes
+expect_err "--replace never deletes a CVM whose app_id another side publishes" "is what side a publishes"
+check "…deleting nothing" [ ! -f "$S/deleted" ]
+not_created "--replace onto another side's app"
+
+fresh; echo "[{\"appId\": \"app_${OLD_B}\", \"cvmName\": \"renamed-by-hand\", \"status\": \"running\"}]" >"$S/cvms.json"
+run b --compose "$COMPOSE" --replace --yes
+expect_err "--replace refuses a CVM matched only by app_id (renamed)" "renamed by hand"
+check "…deleting nothing" [ ! -f "$S/deleted" ]
+
+fresh; echo "[${OLDB_CVM}, {\"appId\": \"app_${NEVER}\", \"cvmName\": \"gw-mainnet-b\", \"status\": \"stopped\"}]" >"$S/cvms.json"
+run b --compose "$COMPOSE" --replace --yes
+expect_err "--replace refuses when more than one CVM matches" "matches 2 CVMs"
+check "…deleting nothing" [ ! -f "$S/deleted" ]
+
+fresh; echo "[${OLDA_CVM}, ${OLDB_CVM}]" >"$S/cvms.json"
+record CNAME "_acme-challenge.${DOMAIN}.${DZ}" "_acme-challenge.${DOMAIN}.a.${DZ}"
+run b --compose "$COMPOSE" --replace --yes
+expect_err "--replace deletes nothing when a later check refuses" "run switch.sh acme b first"
+check "…the old CVM is still there" [ ! -f "$S/deleted" ]
+
+fresh; echo "[${OLDA_CVM}, ${OLDB_CVM}]" >"$S/cvms.json"; touch "$S/delete_fails"
+run b --compose "$COMPOSE" --replace --yes
+expect_err "a failed delete stops the run" "phala cvms delete app_${OLD_B} failed; nothing was created"
+not_created "failed delete"
+
 
 fresh; echo "[{\"appId\": \"app_${OLD_B}\", \"cvmName\": \"renamed-by-hand\", \"status\": \"running\"}]" >"$S/cvms.json"
 run b --compose "$COMPOSE" --yes

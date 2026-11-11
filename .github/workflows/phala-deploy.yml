@@ -16,14 +16,19 @@ name: Phala deploy
 #           answer its ACME challenge on first boot. Waits for approval under
 #           dns-<target>, which holds the Cloudflare token for the switch records.
 #   deploy  deploy-side.sh under deploy-<target>: preflight, create, wait; then
-#           the smoke test, when the environment has an API key for it.
+#           the smoke test, when the environment has an API key for it. With
+#           `replace`, it first writes `switch.sh status` into the run summary and
+#           has deploy-side.sh delete the side's previous CVM (--replace) just
+#           before creating the new one — only that CVM, and only after every
+#           other check has passed.
 #   acme-restore
 #           only when deploy fails or is cancelled after acme moved: dns-switch.yml
 #           with `acme live`, handing issuance back to the side serving traffic.
 #           Another approval under dns-<target>.
 #
-# Delete the side's previous CVM first, by hand (phala cvms delete): the script
-# refuses to create a side that still has one, so it never upgrades in place.
+# The side's previous CVM has to go first: the script refuses to create a side
+# that still has one, so it never upgrades in place. Tick `replace` to have it
+# deleted here, or delete it by hand (phala cvms delete).
 # `acme` runs before that refusal can be seen, so a refused or failed deploy leaves
 # the issuance switch on a side that is not serving, and the live side cannot renew
 # until it moves back. acme-restore moves it back; if its approval is declined or
@@ -54,7 +59,7 @@ on:
         type: choice
         options: [staging, mainnet]
       side:
-        description: "Side to create: inactive = the main side traffic is not on (its old CVM must be deleted)"
+        description: "Side to create: inactive = the main side traffic is not on"
         required: true
         type: choice
         default: inactive
@@ -64,8 +69,13 @@ on:
         required: false
         type: string
         default: latest
+      replace:
+        description: "Delete the side's previous CVM first (only that one; refused if it is ambiguous)"
+        required: false
+        type: boolean
+        default: false
       dry_run:
-        description: "Preflight only: point nothing, create nothing"
+        description: "Preflight only: point nothing, create nothing, delete nothing"
         required: false
         type: boolean
         default: true
@@ -114,6 +124,7 @@ jobs:
           TARGET: ${{ inputs.target }}
           SIDE: ${{ steps.side.outputs.side }}
           ASKED_SIDE: ${{ inputs.side }}
+          REPLACE: ${{ inputs.replace }}
           RELEASE: ${{ inputs.release }}
           DRY_RUN: ${{ inputs.dry_run }}
           ACTOR: ${{ github.actor }}
@@ -155,6 +166,7 @@ jobs:
             echo "| release | [\`$tag\`](https://github.com/${REPO}/releases/tag/${tag}) (asked: \`$RELEASE\`) |"
             echo "| commit | \`$(cut -f1 <<<"$assets")\` |"
             echo "| dry run | $DRY_RUN |"
+            echo "| replace | $REPLACE$([ "$REPLACE" = true ] && echo " — deletes side \`$SIDE\`'s previous CVM before creating") |"
             echo "| environments | \`dns-${TARGET}\` (acme), \`deploy-${TARGET}\` (create) |"
             echo "| triggered by | @$ACTOR |"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -213,6 +225,34 @@ jobs:
         working-directory: deploy/phala
         run: npm ci --ignore-scripts --no-audit --no-fund
 
+      # What is live, what each side publishes and whether it answers, at the
+      # moment before deploy-side.sh deletes one of them — so the summary shows
+      # what the deletion was made against. Read-only: switch.sh status with the
+      # CVM's token, which can read the delegation zone. A failure here is noted,
+      # and does not stop the deploy; deploy-side.sh does its own checks.
+      - name: Status before deleting
+        if: ${{ inputs.replace }}
+        continue-on-error: true
+        env:
+          CF_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TARGET: ${{ inputs.target }}
+          SIDE: ${{ needs.plan.outputs.side }}
+          NO_COLOR: "1"
+        run: |
+          set -uo pipefail
+          rc=0
+          out="$(./deploy/phala/switch.sh --env-file "deploy/phala/env/${TARGET}.env" status 2>&1)" || rc=$?
+          printf '%s\n' "$out"
+          {
+            echo "#### \`switch.sh status\` before deleting side \`$SIDE\`'s previous CVM"
+            echo
+            echo '```'
+            printf '%s\n' "$out"
+            echo '```'
+            [ "$rc" = 0 ] || echo "_switch.sh status exited ${rc}; the deploy goes on, with deploy-side.sh's own checks._"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$rc"
+
       - name: deploy-side.sh
         id: deploy
         env:
@@ -244,9 +284,11 @@ jobs:
           SIDE: ${{ needs.plan.outputs.side }}
           TAG: ${{ needs.plan.outputs.tag }}
           DRY_RUN: ${{ inputs.dry_run }}
+          REPLACE: ${{ inputs.replace }}
         run: |
           set -euo pipefail
           args=("$SIDE" --env-file "deploy/phala/env/${TARGET}.env" --compose "$RUNNER_TEMP/release/docker-compose.release.yml" --release "$TAG")
+          if [ "$REPLACE" = true ]; then args+=(--replace); fi
           if [ "$DRY_RUN" = true ]; then args+=(--dry-run); else args+=(--yes); fi
           # The log streams to the job log and is kept for the summary; stdout (the
           # app_id and url lines) goes to fd 3 and on to the step outputs.
