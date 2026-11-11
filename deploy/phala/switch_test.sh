@@ -18,6 +18,8 @@
 #   cluster.<app>  the cluster that app lives in (in1.phala.network if absent)
 #   down.<base>    if present, that whole cluster is unreachable
 #   cert.<app>     days of validity left on that app's cert (80 if absent)
+#   untrusted.<app>  if present, that app's cert does not chain to a trusted CA, or
+#                  is not for DOMAIN: `s_client -verify_return_error` fails on it
 #
 # Routing follows dstack. A connection to the public name goes to the cluster the
 # serving alias names (`gw.<base>`, or the old `_.<base>`); that cluster's gateway follows the traffic
@@ -181,10 +183,13 @@ set -euo pipefail
 case "${1:-}" in
   s_client)
     cat >/dev/null
-    host=""
-    while [ $# -gt 0 ]; do [ "$1" = -connect ] && host="${2%:*}"; shift; done
+    host="" verify=0
+    while [ $# -gt 0 ]; do
+      case "$1" in -connect) host="${2%:*}" ;; -verify_return_error) verify=1 ;; esac; shift
+    done
     app="$(app_for_host "$host")"
     [ -n "$app" ] || exit 1
+    [ "$verify" = 1 ] && [ -f "$S/untrusted.$app" ] && exit 1
     echo "CERT $app" ;;
   x509)
     read -r _ app || exit 1
@@ -763,6 +768,45 @@ t "setup: names the cluster side a publishes, with no PLATFORM_BASE"
 pub a "$NB"; drop "$ALIAS"
 run -- setup --yes
 expect_rc 0 && expect_cname "$ALIAS" "gw.${NB}" && ok
+
+# The published value comes from /dstack/user_config, which the host can set, and
+# it is written into the alias every client resolves. Two checks keep it honest.
+t "a published cluster outside PLATFORM_BASE_SUFFIX is ignored, not followed"
+pub b "$BASE" "_.attacker.example"
+run PLATFORM_BASE=$BASE -- switch b --yes --no-verify
+expect_rc 0 && expect_cname "$ALIAS" "gw.${BASE}" && expect_no_out "attacker" && ok
+
+t "…and with no PLATFORM_BASE to fall back on, refused"
+pub b "$BASE" "_.attacker.example"
+run -- switch b --yes
+expect_fail && expect_out "no cluster known for side b" && expect_not_probed && expect_no_writes && ok
+
+t "PLATFORM_BASE_SUFFIX widens what a side may publish"
+pub b "$BASE"; pub a "$BASE"
+echo "c1.other.example" >"$S/cluster.appb"; point "${DOMAIN}.b.${DZ}" "_.c1.other.example"
+run PLATFORM_BASE_SUFFIX="phala.network other.example" -- switch b --yes --no-verify
+expect_rc 0 && expect_cname "$ALIAS" "gw.c1.other.example" && ok
+
+t "gate 3: a side that is ready but has no trusted cert for DOMAIN is refused"
+pub a "$BASE"; pub b "$NB"; touch "$S/untrusted.appb"
+run PLATFORM_BASE=$BASE -- switch b --yes
+expect_fail && expect_probed "appb-443s.${NB}/readyz" && expect_out "does not present a trusted certificate" \
+  && expect_no_writes && ok
+
+t "gate 3: applies with --probe-url too, on the cluster the alias would name"
+pub a "$BASE"; pub b "$NB"; touch "$S/untrusted.appb"
+run PLATFORM_BASE=$BASE -- switch b --yes --probe-url https://appb-443s.${NB}/readyz
+expect_fail && expect_out "does not present a trusted certificate" && expect_no_writes && ok
+
+t "gate 3: failover is refused as well"
+pub b "$NB"; touch "$S/untrusted.appb"
+run PLATFORM_BASE=$BASE -- failover b --yes
+expect_fail && expect_out "does not present a trusted certificate" && expect_no_writes && ok
+
+t "setup: refuses a deployed side's cluster it cannot verify"
+pub a "$NB"; drop "$ALIAS"; touch "$S/untrusted.appa"
+run -- setup --yes
+expect_fail && expect_out "refusing to point the serving alias there" && expect_no_writes && ok
 
 t "status: reads each side's published cluster once"
 pub a "$BASE"; pub b "$BASE"

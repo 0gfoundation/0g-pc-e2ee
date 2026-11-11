@@ -93,6 +93,8 @@
 #   DELEGATION_ZONE      base delegation zone        (default: integratenetwork.work)
 #   PLATFORM_BASE        cluster a and b are expected in (optional: only compared
 #   PLATFORM_BASE_COLD   cluster c is expected in     against what the side publishes)
+#   PLATFORM_BASE_SUFFIX domains the side's published cluster may be under,
+#                        space-separated (default: phala.network)
 #   CVM_NAME_PREFIX      CVM name is <prefix>-<side> (required)
 #   PHALA_INSTANCE_TYPE  e.g. tdx.4xlarge            (required: the shape is fixed at
 #                        create time and GOMEMLIMIT depends on it — README, "CVM shape")
@@ -191,14 +193,16 @@ acme_target() { echo "_acme-challenge.${DOMAIN}.$1.${DELEGATION_ZONE}"; }
 norm_app_id() { local a="${1#app_}"; printf '%s' "${a,,}"; }
 
 # The cluster in a side's serving CNAME, `_.<base>` -> <base>; "" for anything
-# else, a doubled `_._.` prefix included. Same rule as switch.sh, which reads the
-# same record to find the side.
+# else: a doubled `_._.` prefix, or a host outside PLATFORM_BASE_SUFFIX — the value
+# comes from /dstack/user_config, which the host can set. Same rule as switch.sh,
+# which reads the same record to find the side and writes it into the serving alias.
 published_base_of() {
-  local b="${1%.}"
+  local b="${1%.}" sfx
   case "$b" in _.?*) b="${b#_.}" ;; *) return 0 ;; esac
-  if [[ "$b" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]; then
-    echo "$b"
-  fi
+  [[ "$b" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]] || return 0
+  for sfx in $PLATFORM_BASE_SUFFIX; do
+    if [[ "${b,,}" == *".${sfx,,}" ]]; then echo "$b"; return 0; fi
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -309,10 +313,15 @@ http_status() { # url -> HTTP status, 000 if unreachable
 }
 
 # The side's certificate, read through its -443s host (routed by app_id). 0 if it
-# covers DOMAIN and is valid for another week, 1 otherwise.
+# chains to a trusted CA, covers DOMAIN and is valid for another week, 1 otherwise.
+# Chain and name are checked in the handshake (-verify_hostname with
+# -verify_return_error), so a self-signed certificate for DOMAIN does not pass: the
+# cluster this proves the side runs in is what switch.sh will write into the
+# serving alias.
 side_cert_ok() { # host
   local pem
-  pem="$(echo | openssl s_client -servername "$1" -connect "${1}:443" 2>/dev/null || true)"
+  pem="$(echo | openssl s_client -servername "$1" -connect "${1}:443" \
+    -verify_hostname "$DOMAIN" -verify_return_error 2>/dev/null || true)"
   openssl x509 -noout -checkend $((7 * 86400)) <<<"$pem" >/dev/null 2>&1 || return 1
   openssl x509 -noout -checkhost "$DOMAIN" <<<"$pem" 2>/dev/null | grep -q 'does match'
 }
@@ -351,7 +360,7 @@ check_published() {
   # cluster it names is reported after the wait, not judged here; it is printed
   # for the caller (WAIT_RESULT).
   published_base_of "$alias"
-  [ -n "$(published_base_of "$alias")" ] || stop "side ${SIDE} published ${DOMAIN}.${SIDE}.${DELEGATION_ZONE} -> ${alias}, which is not _.<cluster>: the platform exported a doubled _. prefix, or no gateway domain at all (README, \"Serving domain\"). Nothing can route this side; delete it."
+  [ -n "$(published_base_of "$alias")" ] || stop "side ${SIDE} published ${DOMAIN}.${SIDE}.${DELEGATION_ZONE} -> ${alias}, which is not _.<cluster> under ${PLATFORM_BASE_SUFFIX}: the platform exported a doubled _. prefix, or no gateway domain at all, or the host set another (README, \"Serving domain\"). Nothing can route this side; delete it."
 }
 
 # Probe the side on the cluster it publishes NOW. Read afresh on every poll rather
@@ -431,6 +440,7 @@ DELEGATION_ZONE="${DELEGATION_ZONE:-integratenetwork.work}"
 PLATFORM_BASE="${PLATFORM_BASE:-}"; PLATFORM_BASE="${PLATFORM_BASE#_.}"
 PLATFORM_BASE_COLD="${PLATFORM_BASE_COLD:-}"; PLATFORM_BASE_COLD="${PLATFORM_BASE_COLD#_.}"
 PHALA="${PHALA:-phala}"
+PLATFORM_BASE_SUFFIX="${PLATFORM_BASE_SUFFIX:-phala.network}"
 WAIT_PUBLISH="${WAIT_PUBLISH:-1800}"
 WAIT_READY="${WAIT_READY:-900}"
 WAIT_IDENTITY="${WAIT_IDENTITY:-600}"
