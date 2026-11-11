@@ -599,11 +599,15 @@ public CT logs anyway — and never the token, which Actions masks regardless.
 runs [`deploy-side.sh`](./deploy-side.sh) from a runner: Actions → **Phala deploy**
 → *Run workflow*, with the deployment, the side, the release (`latest` = the newest
 `release-*`; pinned when the run starts) and `dry_run` (on by default: preflight
-only). It moves no traffic. A release is then:
+only). The side defaults to `inactive`: the main side the traffic switch does not
+name, read from DNS when the run starts and shown in its summary (b while a is
+live). It is refused while c is live or nothing is — name a side then. Locally,
+`./deploy-side.sh inactive --env-file … --resolve-side` prints which side that is.
+It moves no traffic. A release is then:
 
-1. delete the side's previous CVM (`phala cvms delete`, or the dashboard) — by hand,
-   on purpose;
-2. **Phala deploy** on that side. It calls **DNS switch** for `acme <side>` (approve
+1. delete the inactive side's previous CVM (`phala cvms delete`, or the dashboard) —
+   by hand, on purpose;
+2. **Phala deploy** with side `inactive` (or the side by name). It calls **DNS switch** for `acme <side>` (approve
    under `dns-<target>`), then creates the side under `deploy-<target>` (approve
    again) and waits until it is ready. If that deploy fails or is cancelled, it
    calls **DNS switch** once more for `acme live` (approve under `dns-<target>`
@@ -619,9 +623,10 @@ from a crashed one), a side the issuance switch does not point at, or a compose
 whose gateway image is not pinned by digest; and it never passes `--cvm-id` and
 runs the CLI from an empty directory, so `phala deploy` can only *create*. After
 creating, it waits for the side's own records with the new app_id, fails at once if
-the side published a cluster other than its configured one (the silent failure in
-[Where `GATEWAY_DOMAIN` does and does not matter](#where-gateway_domain-does-and-does-not-matter),
-now checked instead of eyeballed), then requires a certificate for the domain and
+the cluster it published is malformed or outside `PLATFORM_BASE_SUFFIX`, and reports
+— not refuses — one that differs from `PLATFORM_BASE` or the live side's
+([Where each side's cluster comes from](#where-each-sides-cluster-comes-from)); then
+it requires a trusted certificate for the domain and
 `/readyz` 200 on `<app_id>-443s.<base>`, and `/v1/gateway/identity` naming the new
 app_id and the release. A side that fails is left running for inspection.
 

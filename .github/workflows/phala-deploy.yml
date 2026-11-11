@@ -6,7 +6,12 @@ name: Phala deploy
 # "DNS switch" workflow (`switch <side>`). blue-green.md, "Deploying a side from
 # GitHub Actions", has the setup.
 #
-#   plan    admins only; resolves the release (default: the newest release-*).
+#   plan    admins only; resolves the release (default: the newest release-*) and
+#           the side: `inactive` is the main side the traffic switch does not name,
+#           read from public DNS now (deploy-side.sh --resolve-side). Every later
+#           job uses that resolved side, so issuance is aimed at the side that is
+#           then deployed; if traffic moves while the run waits for approval,
+#           deploy-side.sh refuses the side as live.
 #   acme    calls dns-switch.yml with `acme <side>`, so the new side's ingress can
 #           answer its ACME challenge on first boot. Waits for approval under
 #           dns-<target>, which holds the Cloudflare token for the switch records.
@@ -49,10 +54,11 @@ on:
         type: choice
         options: [staging, mainnet]
       side:
-        description: "Side to create (must not be live, and its old CVM must be deleted)"
+        description: "Side to create: inactive = the main side traffic is not on (its old CVM must be deleted)"
         required: true
         type: choice
-        options: [a, b, c]
+        default: inactive
+        options: [inactive, a, b, c]
       release:
         description: "Release tag (release-YYYY.MM.DD.N), or latest"
         required: false
@@ -85,11 +91,29 @@ jobs:
       contents: read # releases, and the implicit metadata read the permission lookup needs
     outputs:
       tag: ${{ steps.plan.outputs.tag }}
+      side: ${{ steps.side.outputs.side }}
     steps:
-      - id: plan
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Public DNS only (the delegation zone's own nameserver), and the checked-in
+      # env file for DOMAIN and the zone: no secret is in this job.
+      - id: side
+        name: Resolve the side
         env:
           TARGET: ${{ inputs.target }}
           SIDE: ${{ inputs.side }}
+        run: |
+          set -euo pipefail
+          ./deploy/phala/deploy-side.sh "$SIDE" --env-file "deploy/phala/env/${TARGET}.env" \
+            --resolve-side >> "$GITHUB_OUTPUT"
+
+      - id: plan
+        env:
+          TARGET: ${{ inputs.target }}
+          SIDE: ${{ steps.side.outputs.side }}
+          ASKED_SIDE: ${{ inputs.side }}
           RELEASE: ${{ inputs.release }}
           DRY_RUN: ${{ inputs.dry_run }}
           ACTOR: ${{ github.actor }}
@@ -124,7 +148,7 @@ jobs:
             || fail "release ${tag} has no docker-compose.release.yml"
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
           {
-            echo "### Phala deploy: side \`$SIDE\` on $TARGET"
+            echo "### Phala deploy: side \`$SIDE\` on $TARGET (asked: \`$ASKED_SIDE\`)"
             echo
             echo "| | |"
             echo "|---|---|"
@@ -150,7 +174,7 @@ jobs:
     with:
       target: ${{ inputs.target }}
       command: acme
-      side: ${{ inputs.side }}
+      side: ${{ needs.plan.outputs.side }}
       dry_run: ${{ inputs.dry_run }}
 
   deploy:
@@ -217,7 +241,7 @@ jobs:
           # (none today). Unset is empty, and empty adds nothing.
           CVM_SECRET_ENV: ${{ secrets.CVM_SECRET_ENV }}
           TARGET: ${{ inputs.target }}
-          SIDE: ${{ inputs.side }}
+          SIDE: ${{ needs.plan.outputs.side }}
           TAG: ${{ needs.plan.outputs.tag }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
@@ -263,7 +287,7 @@ jobs:
       - name: Next step
         if: ${{ !inputs.dry_run }}
         env:
-          SIDE: ${{ inputs.side }}
+          SIDE: ${{ needs.plan.outputs.side }}
           TARGET: ${{ inputs.target }}
         run: |
           {
