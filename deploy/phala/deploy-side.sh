@@ -31,10 +31,15 @@
 # After creating it waits, all against the side directly and never the served name:
 #   1. the side's ingress publishes _dstack-app-address.<DOMAIN>.<side>.<DZ> with
 #      the NEW app_id (the old CVM's record stays until then);
-#   2. the serving CNAME it publishes, <DOMAIN>.<side>.<DZ>, names the cluster this
-#      side is configured for, _.<base> — a side in the wrong cluster is silent
-#      under blue/green until the cutover fails (blue-green.md, "Where
-#      GATEWAY_DOMAIN does and does not matter"), so this is checked, not eyeballed;
+#   2. the serving CNAME it publishes, <DOMAIN>.<side>.<DZ>, is `_.<base>`: the
+#      cluster the platform booted it in (DSTACK_GATEWAY_DOMAIN), which is what
+#      the side's cluster IS from here on — the probes below and switch.sh both
+#      read it (blue-green.md, "Where each side's cluster comes from"). A value
+#      that is not one hostname behind one `_.` stops the run. A cluster other
+#      than PLATFORM_BASE[_COLD], or than the live side's, is reported, not
+#      refused: the node is what is pinned, and the platform decides which
+#      cluster a node's new CVMs join (2026-11: prod5's moved from
+#      dstack-pha-prod5 to dstack-pha1-prod5 while the running ones stayed);
 #   3. https://<app_id>-443s.<base> serves a certificate valid for DOMAIN and
 #      answers /readyz 200 — the same gate `switch` applies before a cutover, so a
 #      side that passes here will not be refused there for readiness;
@@ -86,8 +91,8 @@
 #   DOMAIN               served hostname (required — no default, so a staging run
 #                        cannot fall through to mainnet's)
 #   DELEGATION_ZONE      base delegation zone        (default: integratenetwork.work)
-#   PLATFORM_BASE        main cluster, sides a and b (required for a and b)
-#   PLATFORM_BASE_COLD   cold standby's cluster      (required for c)
+#   PLATFORM_BASE        cluster a and b are expected in (optional: only compared
+#   PLATFORM_BASE_COLD   cluster c is expected in     against what the side publishes)
 #   CVM_NAME_PREFIX      CVM name is <prefix>-<side> (required)
 #   PHALA_INSTANCE_TYPE  e.g. tdx.4xlarge            (required: the shape is fixed at
 #                        create time and GOMEMLIMIT depends on it — README, "CVM shape")
@@ -175,7 +180,8 @@ usage() {
   exit "${1:-0}"
 }
 
-side_base() { case "$1" in a|b) echo "$PLATFORM_BASE" ;; c) echo "$PLATFORM_BASE_COLD" ;; esac; }
+expected_base() { case "$1" in a|b) echo "$PLATFORM_BASE" ;; c) echo "$PLATFORM_BASE_COLD" ;; esac; }
+expected_var()  { case "$1" in a|b) echo PLATFORM_BASE ;; c) echo PLATFORM_BASE_COLD ;; esac; }
 side_node() { case "$1" in a|b) echo "${PHALA_NODE_ID:-}" ;; c) echo "${PHALA_NODE_ID_COLD:-}" ;; esac; }
 addr_target() { echo "_dstack-app-address.${DOMAIN}.$1.${DELEGATION_ZONE}"; }
 acme_target() { echo "_acme-challenge.${DOMAIN}.$1.${DELEGATION_ZONE}"; }
@@ -183,6 +189,17 @@ acme_target() { echo "_acme-challenge.${DOMAIN}.$1.${DELEGATION_ZONE}"; }
 # Strip the CLI's `app_` prefix and lowercase, so ids from the CLI, DNS and the
 # identity route compare equal.
 norm_app_id() { local a="${1#app_}"; printf '%s' "${a,,}"; }
+
+# The cluster in a side's serving CNAME, `_.<base>` -> <base>; "" for anything
+# else, a doubled `_._.` prefix included. Same rule as switch.sh, which reads the
+# same record to find the side.
+published_base_of() {
+  local b="${1%.}"
+  case "$b" in _.?*) b="${b#_.}" ;; *) return 0 ;; esac
+  if [[ "$b" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]; then
+    echo "$b"
+  fi
+}
 
 # ---------------------------------------------------------------------------
 # DNS — asked of the delegation zone's own nameserver, not a recursive resolver:
@@ -327,18 +344,28 @@ check_published() {
     echo "${DOMAIN}.${SIDE}.${DELEGATION_ZONE} not published yet"
     return 1
   fi
-  # Published but wrong is not going to fix itself: stop waiting.
-  [ "$alias" = "_.${BASE}" ] || stop "side ${SIDE} published ${DOMAIN}.${SIDE}.${DELEGATION_ZONE} -> ${alias}, want _.${BASE}: it is running in another cluster, or the platform exported a doubled _. prefix (blue-green.md, \"Where GATEWAY_DOMAIN does and does not matter\"). Delete it, and set PHALA_NODE_ID to a node in ${BASE}."
+  # Published but malformed is not going to fix itself: stop waiting. Which
+  # cluster it names is reported after the wait, not judged here.
+  [ -n "$(published_base_of "$alias")" ] || stop "side ${SIDE} published ${DOMAIN}.${SIDE}.${DELEGATION_ZONE} -> ${alias}, which is not _.<cluster>: the platform exported a doubled _. prefix, or no gateway domain at all (README, \"Serving domain\"). Nothing can route this side; delete it."
 }
 
+# The side's cluster as it publishes it now. Read afresh on every poll of
+# check_ready rather than once: the TXT that check_published waits for and this
+# CNAME are two writes, and until the new ingress makes the second, the record can
+# still hold the deleted CVM's cluster.
+side_base_now() { published_base_of "$(dns CNAME "${DOMAIN}.${SIDE}.${DELEGATION_ZONE}")"; }
+
 check_ready() {
-  local code
-  side_cert_ok "$HOST" || { echo "no valid certificate for ${DOMAIN} at ${HOST} yet"; return 1; }
-  code="$(http_status "https://${HOST}/readyz")"
+  local code base host
+  base="$(side_base_now)"
+  [ -n "$base" ] || stop "side ${SIDE}'s serving CNAME is no longer _.<cluster>"
+  host="${APP_ID}-443s.${base}"
+  side_cert_ok "$host" || { echo "no valid certificate for ${DOMAIN} at ${host} yet"; return 1; }
+  code="$(http_status "https://${host}/readyz")"
   case "$code" in
     2*) return 0 ;;
-    404) stop "${HOST}/readyz answered 404: this build predates /readyz, or the -443s route reaches something else" ;;
-    *) echo "/readyz answered ${code}"; return 1 ;;
+    404) stop "${host}/readyz answered 404: this build predates /readyz, or the -443s route reaches something else" ;;
+    *) echo "/readyz answered ${code} at ${host}"; return 1 ;;
   esac
 }
 
@@ -420,8 +447,7 @@ done
 [ -f "$COMPOSE" ] || die "compose file not found: $COMPOSE"
 COMPOSE="$(cd -- "$(dirname -- "$COMPOSE")" && pwd)/$(basename -- "$COMPOSE")"
 
-BASE="$(side_base "$SIDE")"
-[ -n "$BASE" ] || die "side ${SIDE} has no cluster: set $([ "$SIDE" = c ] && echo PLATFORM_BASE_COLD || echo PLATFORM_BASE)"
+EXPECTED="$(expected_base "$SIDE")"
 NODE="$(side_node "$SIDE")"
 # Pinned, always: a side the platform places elsewhere is caught only after it
 # boots and has spent a certificate. And by name: the API refuses a node id, the
@@ -456,7 +482,7 @@ acme="$(which_side "$acme_tgt" acme)"
 old_addr="$(dns TXT "$(addr_target "$SIDE")")"
 old_app="$(norm_app_id "${old_addr%%:*}")"
 
-info "side ${SIDE} (${NAME}) in ${BASE}; traffic -> ${live:-none}, issuance -> ${acme:-none}"
+info "side ${SIDE} (${NAME}) on node ${NODE}${EXPECTED:+, expected in ${EXPECTED}}; traffic -> ${live:-none}, issuance -> ${acme:-none}"
 [ "$live" = "?" ] && die "the traffic switch points at an unrecognized target (${live_tgt}); resolve it with switch.sh status first"
 [ "$live" = "$SIDE" ] && die "side ${SIDE} is live: deploy the other side, or switch away first"
 
@@ -507,14 +533,28 @@ APP_ID="$(norm_app_id "$APP_ID")"
 [[ "$APP_ID" =~ ^[0-9a-f]{40}$ ]] || die "could not read an app_id from provision.cjs's output:
 ${out}"
 [ "$APP_ID" != "$old_app" ] || die "the new CVM has the old app_id ${APP_ID}: that is an upgrade, not a new side"
-HOST="${APP_ID}-443s.${BASE}"
 info "created ${NAME}: app_id ${APP_ID}"
 
 # --- wait ----------------------------------------------------------------------
 wait_for "$WAIT_PUBLISH" check_published "side ${SIDE}'s records"
-info "published: $(addr_target "$SIDE") -> ${APP_ID}, ${DOMAIN}.${SIDE}.${DELEGATION_ZONE} -> _.${BASE}"
-wait_for "$WAIT_READY" check_ready "https://${HOST}/readyz"
+info "published: $(addr_target "$SIDE") -> ${APP_ID}, ${DOMAIN}.${SIDE}.${DELEGATION_ZONE} -> _.$(side_base_now)"
+wait_for "$WAIT_READY" check_ready "the side's /readyz"
+# The side's cluster, as it publishes it once it serves there: what switch.sh
+# will read, and where the checks below go.
+BASE="$(side_base_now)"
+HOST="${APP_ID}-443s.${BASE}"
 info "ready: https://${HOST}/readyz"
+if [ -n "$EXPECTED" ] && [ "$BASE" != "$EXPECTED" ]; then
+  warn "side ${SIDE} runs in ${BASE}, not $(expected_var "$SIDE")=${EXPECTED}: the platform put node ${NODE}'s new CVM there."
+  warn "  switch.sh follows the side, so nothing breaks; update $(expected_var "$SIDE") if the move is permanent."
+fi
+if [ "$live" = a ] || [ "$live" = b ] || [ "$live" = c ]; then
+  live_base="$(published_base_of "$(dns CNAME "${DOMAIN}.${live}.${DELEGATION_ZONE}")")"
+  if [ -n "$live_base" ] && [ "$live_base" != "$BASE" ]; then
+    warn "the live side ${live} runs in ${live_base} and side ${SIDE} in ${BASE}: \`switch.sh switch ${SIDE}\` moves the"
+    warn "  serving alias across clusters, and clients holding the old one fail for up to its TTL (blue-green.md, \"Cross-cluster fallback\")."
+  fi
+fi
 wait_for "$WAIT_IDENTITY" check_identity "/v1/gateway/identity"
 IDENTITY="$(identity)"
 if [ -n "$RELEASE" ]; then

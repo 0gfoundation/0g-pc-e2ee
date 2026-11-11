@@ -11,6 +11,11 @@
 #   deploy.args        written by the fake `node provision.cjs`: one argument per line
 #   deploy.env         written by it too: the env file it was handed
 #   cluster            the cluster a created CVM lands in (in1.phala.network if absent)
+#   published          if present, the serving CNAME the ingress writes instead of
+#                      `_.<cluster>` (a malformed one, say)
+#   cname_lag          if present, N: the ingress writes the TXT at once but its
+#                      serving CNAME only after N more lookups of it, so until then
+#                      the record still holds whatever the old CVM left there
 #   readyz             the status /readyz answers (200 if absent)
 #   release            the tag /v1/gateway/identity reports as matched_release
 #   cert_bad           if present, the side serves no valid certificate
@@ -46,6 +51,10 @@ args=()
 for a in "$@"; do case "$a" in +short|@*) ;; *) args+=("$a") ;; esac; done
 if [ "${args[0]}" = NS ]; then echo "ns1.fake-dns.test."; exit 0; fi
 f="$FAKE_DIR/dns/${args[0]}/${args[1]}"
+if [ -f "$f.next" ]; then   # a write the ingress has not made yet (cname_lag)
+  n="$(cat "$f.lag")"
+  if [ "$n" -le 0 ]; then mv "$f.next" "$f"; rm -f "$f.lag"; else echo $((n - 1)) >"$f.lag"; fi
+fi
 [ -f "$f" ] || exit 0
 case "${args[0]}" in
   TXT)   printf '"%s"\n' "$(cat "$f")" ;;
@@ -91,7 +100,12 @@ dz="$(sed -n "s/^DELEGATION_ZONE='\(.*\)'$/\1/p" "$env")"
 dom="$(sed -n "s/^DOMAIN='\(.*\)'$/\1/p" "$env")"
 mkdir -p "$S/dns/TXT" "$S/dns/CNAME"
 echo "${app}:443" >"$S/dns/TXT/_dstack-app-address.${dom}.${dz}"
-echo "_.$(cat "$S/cluster" 2>/dev/null || echo in1.phala.network)" >"$S/dns/CNAME/${dom}.${dz}"
+cname="$(cat "$S/published" 2>/dev/null || echo "_.$(cat "$S/cluster" 2>/dev/null || echo in1.phala.network)")"
+if [ -f "$S/cname_lag" ]; then
+  echo "$cname" >"$S/dns/CNAME/${dom}.${dz}.next"; cp "$S/cname_lag" "$S/dns/CNAME/${dom}.${dz}.lag"
+else
+  echo "$cname" >"$S/dns/CNAME/${dom}.${dz}"
+fi
 printf '{\n  "success": true,\n  "vm_uuid": "u-1",\n  "name": "%s",\n  "app_id": "%s"\n}\n' "$name" "$app"
 FAKE_NODE
 
@@ -229,7 +243,7 @@ run b --compose "$WORK/floating.yml" --yes
 expect_err "refuses a compose with a floating gateway tag" "not pinned by digest"
 
 fresh; run c --compose "$COMPOSE" --yes
-expect_err "refuses side c without a cold cluster" "set PLATFORM_BASE_COLD"
+expect_err "side c needs its own node; no cluster is configured or needed" "side c has no node: set PHALA_NODE_ID_COLD"
 
 fresh; EXTRA_ENV=(CVM_ENV_ZG_GATEWAY_NETWORK=testnet CVM_ENV_DNS_SETUP_MODE=wait)
 run b --compose "$COMPOSE" --yes
@@ -311,10 +325,39 @@ fresh; EXTRA_ENV=(PHALA_NODE_ID=)
 run b --compose "$COMPOSE" --dry-run
 expect_err "refuses an unpinned node" "side b has no node"
 
+# The node is pinned; the cluster is the platform's to pick, and the side's is
+# whatever it publishes (Phala moved prod5's new CVMs to another cluster in 2026-11).
 fresh; echo in2.phala.network >"$S/cluster"
 run b --compose "$COMPOSE" --yes
-expect_err "fails at once when the side lands in another cluster" "want _.${BASE}"
-check_not "…without waiting out the timeout" err_has "gave up after"
+expect_rc "a side that lands in another cluster than PLATFORM_BASE is followed there" 0
+check "…its url names the cluster it published" [ "$OUT" = $'app_id='"$NEW_APP"$'\nurl=https://'"$NEW_APP"'-443s.in2.phala.network' ]
+check "…with a warning naming both" err_has "side b runs in in2.phala.network, not PLATFORM_BASE=${BASE}"
+
+fresh; echo in2.phala.network >"$S/cluster"
+EXTRA_ENV=(PLATFORM_BASE=)
+run b --compose "$COMPOSE" --release release-2026.10.28.1 --yes
+expect_rc "needs no PLATFORM_BASE at all" 0
+check_not "…and then has nothing to warn about the expected cluster" err_has "not PLATFORM_BASE"
+
+fresh; record CNAME "${DOMAIN}.a.${DZ}" "_.${BASE}"; echo in2.phala.network >"$S/cluster"
+run b --compose "$COMPOSE" --yes
+expect_rc "a side in another cluster than the live one deploys" 0
+check "…and says the cutover will move the serving alias" err_has "the live side a runs in ${BASE} and side b in in2.phala.network"
+fresh; record CNAME "${DOMAIN}.a.${DZ}" "_.${BASE}"
+run b --compose "$COMPOSE" --yes
+check_not "a side in the live side's cluster gets no such warning" err_has "the live side a runs in"
+
+fresh; echo "_._.in2.phala.network" >"$S/published"
+run b --compose "$COMPOSE" --yes
+expect_err "a doubled _._. prefix stops the run" "which is not _.<cluster>"
+check_not "…at once, without waiting out the timeout" err_has "gave up after"
+
+# The deleted CVM's serving CNAME, still naming the old cluster, while the new
+# ingress has written its TXT but not yet its CNAME.
+fresh; record CNAME "${DOMAIN}.b.${DZ}" "_.${BASE}"; echo in2.phala.network >"$S/cluster"; echo 2 >"$S/cname_lag"
+run b --compose "$COMPOSE" --yes
+expect_rc "a CNAME that lags the TXT is re-read until it names the new cluster" 0
+check "…and the side is found there" [ "$OUT" = $'app_id='"$NEW_APP"$'\nurl=https://'"$NEW_APP"'-443s.in2.phala.network' ]
 
 fresh; echo 503 >"$S/readyz"
 run b --compose "$COMPOSE" --yes

@@ -103,10 +103,12 @@ CNAME names. Routing only — TLS terminates in this CVM and the gateway passes 
 through at L4 — and a host bent on denying service can simply not run the CVM.
 
 **Check the published record after the first deploy**, against the cluster the
-platform reports in the CVM's `kms_info`:
+platform reports for the CVM (`phala cvms get <app_id> --json`). Under blue/green
+`deploy-side.sh` checks the form for you, and the scripts then take the side's
+cluster from this record (blue-green.md, "Where each side's cluster comes from"):
 
 ```
-kms_info.gateway_app_url    https://gateway.dstack-pha-prod5.phala.network
+gateway.base_domain         dstack-pha-prod5.phala.network
 <DOMAIN>.<DELEGATION_ZONE>  CNAME → _.dstack-pha-prod5.phala.network      ✅
                             CNAME → _._.dstack-pha-prod5.phala.network    ❌ doubled prefix
                             CNAME → _.dstack-pha-in2.phala.network        ❌ wrong cluster

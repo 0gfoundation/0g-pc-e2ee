@@ -241,6 +241,16 @@ cold() {
 # The state a completed move onto c leaves.
 on_c() { cold; point "$ADDR_SWITCH" "$(addr_side c)"; point "$ACME_SWITCH" "$(acme_side c)"; point "$ALIAS" "gw.${BB}"; }
 health() { echo "$*" >>"$S/health"; }
+# The serving CNAME a side's own ingress publishes, naming its cluster as `_.<base>`
+# (what DSTACK_GATEWAY_DOMAIN told it at boot). `pub b prod5.phala.network` also moves
+# appb there, so the fake gateways agree with what the side says.
+pub() { # side base [raw content]
+  local app="app$1"
+  echo "$2" >"$S/cluster.$app"
+  jq --arg n "${DOMAIN}.$1.${DZ}" --arg c "${3:-_.$2}" \
+    'map(select(.name!=$n)) + [{id:("p"+$n),type:"CNAME",name:$n,content:$c}]' "$S/records.json" >"$S/r.tmp" \
+    && mv "$S/r.tmp" "$S/records.json"
+}
 
 # run [VAR=val …] -- switch.sh args…   → sets OUT and RC
 run() {
@@ -685,6 +695,79 @@ t "acme: can lend issuance to the cold standby"
 cold
 run -- acme c --yes
 expect_rc 0 && expect_cname "$ACME_SWITCH" "$(acme_side c)" && expect_cname "$ADDR_SWITCH" "$(addr_side a)" && ok
+
+# --- each side's cluster is the one it publishes ---------------------------------
+# Phala moved new CVMs on prod5 to another cluster (dstack-pha-prod5 ->
+# dstack-pha1-prod5) while the old ones stayed put, so a and b can sit in two
+# clusters with nothing in the config having changed. NB is that second cluster.
+NB=pha1.phala.network
+
+t "status: a side's published cluster wins over PLATFORM_BASE, with a warning"
+pub a "$BASE"; pub b "$NB"
+run PLATFORM_BASE=$BASE -- status
+expect_rc 0 && expect_out "cluster=${NB}" && expect_out "ready : OK   https://appb-443s.${NB}/readyz" \
+  && expect_out "side b publishes cluster ${NB}, but PLATFORM_BASE=${BASE}; using ${NB}" \
+  && expect_no_out "side a publishes" && expect_no_out "split state" && expect_no_writes && ok
+
+t "switch: needs no PLATFORM_BASE when both sides publish their cluster"
+pub a "$BASE"; pub b "$BASE"
+run -- switch b --yes
+expect_rc 0 && expect_cname "$ADDR_SWITCH" "$(addr_side b)" && expect_probed "appb-443s.${BASE}/readyz" \
+  && expect_no_out "cross-cluster" && expect_no_out "publishes cluster" && ok
+
+t "switch: a and b in different clusters — probes b on its own, moves the alias with it"
+pub a "$BASE"; pub b "$NB"
+run PLATFORM_BASE=$BASE -- switch b --yes
+expect_rc 0 && expect_probed "appb-443s.${NB}/readyz" \
+  && expect_out "cross-cluster: the serving alias moves gw.${BASE} -> gw.${NB}" \
+  && expect_writes "PUT ${ACME_SWITCH} CNAME $(acme_side b)" "PUT ${ADDR_SWITCH} CNAME $(addr_side b)" "PUT ${ALIAS} CNAME gw.${NB}" \
+  && expect_out "now served by b (cert changed)" && ok
+
+t "rollback: across clusters, returns the alias to the other side's cluster"
+pub a "$BASE"; pub b "$NB"
+point "$ADDR_SWITCH" "$(addr_side b)"; point "$ACME_SWITCH" "$(acme_side b)"; point "$ALIAS" "gw.${NB}"
+run PLATFORM_BASE=$BASE -- rollback --yes
+expect_rc 0 && expect_out "rolling back: b -> a" && expect_probed "appa-443s.${BASE}/readyz" \
+  && expect_cname "$ADDR_SWITCH" "$(addr_side a)" && expect_cname "$ALIAS" "gw.${BASE}" \
+  && [ "$(grep -c "side b publishes cluster" <<<"$OUT")" = 1 ] && ok
+
+t "switch: across clusters, a failed verify restores the alias to the old side's cluster"
+pub a "$BASE"; pub b "$NB"; health "public:appb /healthz 500"
+run PLATFORM_BASE=$BASE -- switch b --yes
+expect_fail && expect_out "AUTO-ROLLBACK" && expect_cname "$ADDR_SWITCH" "$(addr_side a)" \
+  && expect_cname "$ALIAS" "gw.${BASE}" && ok
+
+t "switch: a side published in another cluster than the alias is not a split state"
+pub a "$NB"; point "$ALIAS" "gw.${NB}"
+run PLATFORM_BASE=$BASE -- switch b --yes
+expect_rc 0 && expect_no_out "not reachable now" \
+  && expect_out "cross-cluster: the serving alias moves gw.${NB} -> gw.${BASE}" && expect_cname "$ALIAS" "gw.${BASE}" && ok
+
+t "status: a live side that moved cluster under an unchanged alias is a split state"
+pub a "$NB"
+run PLATFORM_BASE=$BASE -- status
+expect_rc 0 && expect_out "split state: the serving alias ${ALIAS} -> gw.${BASE}, but side a runs on gw.${NB}" && ok
+
+t "a doubled _._. prefix is not followed: the configured cluster is used"
+pub b "$BASE" "_._.${NB}"
+run PLATFORM_BASE=$BASE -- switch b --yes --no-verify
+expect_rc 0 && expect_probed "appb-443s.${BASE}/readyz" && expect_no_out "${NB}" && ok
+
+t "a malformed published value with no PLATFORM_BASE is refused, not followed"
+pub b "$NB" "gateway.${NB}"
+run -- switch b --yes
+expect_fail && expect_out "no cluster known for side b" && expect_out "set PLATFORM_BASE" \
+  && expect_not_probed && expect_no_writes && ok
+
+t "setup: names the cluster side a publishes, with no PLATFORM_BASE"
+pub a "$NB"; drop "$ALIAS"
+run -- setup --yes
+expect_rc 0 && expect_cname "$ALIAS" "gw.${NB}" && ok
+
+t "status: reads each side's published cluster once"
+pub a "$BASE"; pub b "$BASE"
+run PLATFORM_BASE=$BASE -- status
+expect_rc 0 && expect_reads "${DOMAIN}.a.${DZ}" 1 && expect_reads "${DOMAIN}.b.${DZ}" 1 && ok
 
 t "env file: values load, the real environment wins"
 echo "PLATFORM_BASE=prod5.phala.network" >"$S/env"

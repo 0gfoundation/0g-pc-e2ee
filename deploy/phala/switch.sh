@@ -33,16 +33,19 @@
 #     <DOMAIN>.<DZ>                      CNAME -> gw.<live side's cluster>                            <-- serving alias
 #
 #   delegation zone <DZ> — PER-SIDE records, written by each CVM's dstack-ingress:
-#     a side (DELEGATION_ZONE=a.<DZ>):  _dstack-app-address.<DOMAIN>.a.<DZ> TXT = <app_id_a>:443
-#     b side (DELEGATION_ZONE=b.<DZ>):  _dstack-app-address.<DOMAIN>.b.<DZ> TXT = <app_id_b>:443
-#     c side (DELEGATION_ZONE=c.<DZ>):  _dstack-app-address.<DOMAIN>.c.<DZ> TXT = <app_id_c>:443
+#     a side (DELEGATION_ZONE=a.<DZ>):  _dstack-app-address.<DOMAIN>.a.<DZ> TXT   = <app_id_a>:443
+#                                       <DOMAIN>.a.<DZ>                     CNAME = _.<a's cluster>
+#     b side, c side: the same two records under .b. and .c.
 #
-# a and b are the main pair, in the main cluster (PLATFORM_BASE); releases flip
-# between them. c is an optional cold standby in another cluster
-# (PLATFORM_BASE_COLD), used only if the main cluster is lost (or in a drill).
-# So `switch a|b` repoints the two switch-layer CNAMEs at the chosen side's
-# per-side records; moving onto or off c also repoints the serving alias at that
-# side's cluster, which within the main pair is a no-op. dstack-ingress on the
+# a and b are the main pair; releases flip between them. c is an optional cold
+# standby, used only if the main pair is lost (or in a drill). A side's CLUSTER is
+# read from the CNAME its own ingress publishes — the platform injects it into the
+# CVM at boot, so it names the cluster the CVM actually runs in — and falls back
+# to PLATFORM_BASE (a, b) / PLATFORM_BASE_COLD (c) only while a side publishes
+# none. So `switch` repoints the two switch-layer CNAMEs at the chosen side's
+# per-side records and, when that side runs in another cluster than the live one,
+# the serving alias too; a and b need not share a cluster (blue-green.md, "Where
+# each side's cluster comes from"). dstack-ingress on the
 # Cloudflare provider resolves the longest parent zone it can access, so
 # a.<DZ>/b.<DZ>/c.<DZ> need NOT be real Cloudflare zones — one token scoped to
 # <DZ> covers them.
@@ -88,12 +91,13 @@
 #   CF_ZONE          delegation zone name           (default: integratenetwork.work)
 #   DOMAIN           served hostname                (default: router-api.0g.ai)
 #   DELEGATION_ZONE  base delegation zone           (default: same as CF_ZONE)
-#   PLATFORM_BASE    dstack platform base domain    (e.g. in1.phala.network) — the main
-#                    cluster, where a and b run. Required by setup, switch, failover
-#                    and rollback.
-#   PLATFORM_BASE_COLD  the cold standby's cluster  (unset = no cold standby) — where
-#                    side c runs. Required by any command that moves traffic onto or
-#                    off c. A side's cluster is where its pre-switch probe goes
+#   PLATFORM_BASE    dstack platform base domain    (e.g. in1.phala.network) — the
+#                    cluster a and b are EXPECTED in. Optional: a side's cluster is
+#                    what it publishes (above); this is used only for a side that
+#                    publishes none (`setup` before the first deploy), and `status`
+#                    warns when a side publishes something else.
+#   PLATFORM_BASE_COLD  the same, for the cold standby c (unset = no cold standby).
+#                    A side's cluster is where its pre-switch probe goes
 #                    (<app_id>-443s.<base>) and what the serving alias names
 #                    (gw.<base>) while it is live. A leading `_.` or `gw.` is
 #                    accepted on both.
@@ -215,7 +219,23 @@ other_side() { case "$(side_name "$1")" in a) echo b;; b) echo a;; c) return 1;;
 # through the wildcard; `gw` is one nothing else claims. `_.` is still READ as a
 # gateway hop, so an alias written before the change is not a split state; `setup`
 # or the next `switch` rewrites it.
-side_base() { case "$(side_name "$1")" in a|b) echo "$PLATFORM_BASE" ;; c) echo "$PLATFORM_BASE_COLD" ;; esac; }
+#
+# Which cluster: the one the side PUBLISHES (side_published_base), else the
+# configured fallback. Published wins because it cannot be stale in the way a
+# config file can — the platform injects DSTACK_GATEWAY_DOMAIN into the CVM at
+# boot and its ingress writes it out — and because the platform has moved new
+# CVMs on the same node to another cluster before (2026-11, prod5:
+# dstack-pha-prod5 -> dstack-pha1-prod5), which a value typed into an env file
+# cannot follow. A wrong published value is still caught before it moves
+# traffic: gate 2 probes <app_id>-443s.<that base>, which only that cluster's
+# gateway routes.
+side_configured_base() { case "$(side_name "$1")" in a|b) echo "$PLATFORM_BASE" ;; c) echo "$PLATFORM_BASE_COLD" ;; esac; }
+side_configured_var()  { case "$(side_name "$1")" in a|b) echo PLATFORM_BASE ;; c) echo PLATFORM_BASE_COLD ;; esac; }
+side_base() {
+  local b; b="$(side_published_base "$1")"
+  [ -n "$b" ] || b="$(side_configured_base "$1")"
+  echo "$b"
+}
 side_gateway() { local b; b="$(side_base "$1")" || return 1; [ -n "$b" ] && echo "gw.${b}"; }
 # The cluster a serving-alias value names, or "" if it is not a gateway hop.
 gateway_base() { case "$1" in gw.?*) echo "${1#gw.}" ;; _.?*) echo "${1#_.}" ;; esac; }
@@ -227,6 +247,7 @@ gateway_base() { case "$1" in gw.?*) echo "${1#gw.}" ;; _.?*) echo "${1#_.}" ;; 
 # (e.g. move_switches), where that non-zero status does trip set -e.
 addr_target() { local l; l="$(side_label "$1")" || return 1; echo "${TXT_PREFIX}.${DOMAIN}.${l}.${DELEGATION_ZONE}"; }
 acme_target() { local l; l="$(side_label "$1")" || return 1; echo "_acme-challenge.${DOMAIN}.${l}.${DELEGATION_ZONE}"; }
+base_target() { local l; l="$(side_label "$1")" || return 1; echo "${DOMAIN}.${l}.${DELEGATION_ZONE}"; }
 
 # ---------------------------------------------------------------------------
 # Cloudflare API
@@ -334,20 +355,63 @@ which_side() { # current-target
 # directly, not in `$(...)`, for the cache to reach the caller; side_app_addr
 # still works uncached if it was not.
 SIDE_ADDRS_LOADED=0 SIDE_ADDR_a="" SIDE_ADDR_b="" SIDE_ADDR_c=""
+SIDE_BASE_a="" SIDE_BASE_b="" SIDE_BASE_c=""
 read_side_app_addr() { # a|b|c
   cf_records_at "$(addr_target "$1")" \
     | awk -F'\t' '$2=="TXT"{print $3; exit}' | sed 's/^"//; s/"$//'
+}
+# The cluster a side publishes: the serving CNAME its dstack-ingress writes at
+# <DOMAIN>.<label>.<DZ>, `_.<base>`, from the platform-injected
+# DSTACK_GATEWAY_DOMAIN. Bare base, or "" when the side publishes none or the
+# value is not one hostname behind exactly one `_.` — a doubled `_._.` prefix
+# (README, "Serving domain") is refused here, not followed.
+read_side_published_base() { # a|b|c
+  local v
+  v="$(cf_records_at "$(base_target "$1")" | awk -F'\t' '$2=="CNAME"{print $3; exit}')"
+  published_base_of "$v"
+}
+published_base_of() { # `_.<base>` -> <base>, anything else -> ""
+  local b="${1%.}"
+  case "$b" in _.?*) b="${b#_.}" ;; *) return 0 ;; esac
+  if [[ "$b" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]; then
+    echo "$b"
+  fi
 }
 load_side_addrs() {
   [ "$SIDE_ADDRS_LOADED" = 1 ] && return 0
   SIDE_ADDR_a="$(read_side_app_addr a)"
   SIDE_ADDR_b="$(read_side_app_addr b)"
   SIDE_ADDR_c="$(read_side_app_addr c)"
+  SIDE_BASE_a="$(read_side_published_base a)"
+  SIDE_BASE_b="$(read_side_published_base b)"
+  SIDE_BASE_c="$(read_side_published_base c)"
   SIDE_ADDRS_LOADED=1
 }
 side_app_addr() { # a|b|c
   if [ "$SIDE_ADDRS_LOADED" != 1 ]; then read_side_app_addr "$1"; return; fi
   case "$(side_name "$1")" in a) echo "$SIDE_ADDR_a" ;; b) echo "$SIDE_ADDR_b" ;; c) echo "$SIDE_ADDR_c" ;; esac
+}
+side_published_base() { # a|b|c
+  if [ "$SIDE_ADDRS_LOADED" != 1 ]; then read_side_published_base "$1"; return; fi
+  case "$(side_name "$1")" in a) echo "$SIDE_BASE_a" ;; b) echo "$SIDE_BASE_b" ;; c) echo "$SIDE_BASE_c" ;; esac
+}
+# Say so when a side runs somewhere other than the configured cluster. Not an
+# error: the published value is what is used, and the platform moving a node's
+# CVMs to another cluster is exactly the case it exists for. The config is then
+# stale and wants updating, or the side was meant to land elsewhere.
+DRIFT_WARNED=" "
+warn_base_drift() { # side…
+  local x pub cfg
+  for x in "$@"; do
+    [ -n "$x" ] || continue
+    [[ "$DRIFT_WARNED" == *" $x "* ]] && continue
+    DRIFT_WARNED+="$x "
+    pub="$(side_published_base "$x")"; cfg="$(side_configured_base "$x")"
+    if [ -n "$pub" ] && [ -n "$cfg" ] && [ "$pub" != "$cfg" ]; then
+      warn "side ${x} publishes cluster ${pub}, but $(side_configured_var "$x")=${cfg}; using ${pub}, where its CVM runs."
+      warn "  Update $(side_configured_var "$x") if that move is permanent."
+    fi
+  done
 }
 # The cold standby is optional: a deployment without one configures no cluster
 # for it and publishes nothing under its label.
@@ -458,14 +522,13 @@ confirm() {
 # target's builds its pre-switch probe (gate 2) and is what the serving alias
 # moves to, and the live side's is what a rollback moves the alias back to.
 need_bases() { # side…
-  [ -n "$PLATFORM_BASE" ] ||
-    die "set PLATFORM_BASE (<cluster>.phala.network): the main cluster. It builds the pre-switch probe and the serving alias."
   local x
   for x in "$@"; do
-    if [ "$x" = c ] && [ -z "$PLATFORM_BASE_COLD" ]; then
-      die "set PLATFORM_BASE_COLD (<cluster>.phala.network): the cluster the cold standby c runs in."
-    fi
+    [ -n "$x" ] || continue
+    [ -n "$(side_base "$x")" ] ||
+      die "no cluster known for side ${x}: it publishes none at $(base_target "$x") (is its CVM up?), and $(side_configured_var "$x") is unset. Deploy the side, or set $(side_configured_var "$x") (<cluster>.phala.network)."
   done
+  warn_base_drift "$@"
 }
 
 # "" if the serving alias sends traffic to side $1's cluster, else a one-line
@@ -483,6 +546,7 @@ alias_mismatch() { # side alias-now
 # ---------------------------------------------------------------------------
 cmd_status() {
   resolve_zone_id
+  load_side_addrs
   local addr_now acme_now addr_side acme_side
   addr_now="$(current_cname "$ADDR_SWITCH")"
   acme_now="$(current_cname "$ACME_SWITCH")"
@@ -525,7 +589,6 @@ cmd_status() {
   printf '   -> %s  [%s]\n\n' "${acme_now:-<unset>}" "${acme_side:-none}"
 
   local s end rc sides="a b" ready
-  load_side_addrs
   cold_configured && sides="a b c"
   for s in $sides; do
     if [ "$s" = c ]; then
@@ -565,6 +628,8 @@ cmd_status() {
     esac
   done
   warn_if_same_app_id
+  # shellcheck disable=SC2086  # $sides is a word list
+  warn_base_drift $sides
   printf '\n'
 
   if public_health_ok; then
@@ -598,7 +663,7 @@ move_switches() { # target-side  [--acme-only]
   put_cname "$ACME_SWITCH" "$tgt_acme"
   if [ "$acme_only" != "--acme-only" ]; then
     local gw; gw="$(side_gateway "$target" || true)"
-    [ -n "$gw" ] || die "no cluster known for side ${target} (PLATFORM_BASE unset?)"
+    [ -n "$gw" ] || die "no cluster known for side ${target}: it publishes none and $(side_configured_var "$target") is unset"
     put_cname "$ADDR_SWITCH" "$tgt_addr"
     put_cname "$SERVING_ALIAS" "$gw"
   fi
@@ -619,7 +684,7 @@ gate_target() { # target-side
 
   # Gate 2: verify the TARGET side can actually SERVE before we send it any
   # traffic — /readyz, not /healthz (see platform_probe_url). Prefer an explicit
-  # --probe-url; otherwise probe the target's own app-id endpoint on PLATFORM_BASE,
+  # --probe-url; otherwise probe the target's own app-id endpoint on its cluster,
   # which reaches it directly regardless of where traffic currently points.
   #
   # The window (PROBE_RETRIES x PROBE_INTERVAL, ~5min by default) is sized to a COLD
@@ -630,7 +695,7 @@ gate_target() { # target-side
   # finished proving it can serve anyone.
   local probe="$PROBE_URL"
   [ -z "$probe" ] && probe="$(platform_probe_url "$target")"
-  [ -n "$probe" ] || die "no probe URL for side ${target} (PLATFORM_BASE unset?)"
+  [ -n "$probe" ] || die "no probe URL for side ${target}: no cluster known for it"
   info "probing target side ${target} directly: $probe"
   info "  (up to ${PROBE_RETRIES} attempts ${PROBE_INTERVAL}s apart — a cold side must finish its first warmer sweep)"
   local pi probe_ok=0 status fell_back=0
@@ -823,6 +888,7 @@ cmd_switch() {
   [ -n "${1:-}" ] || die "usage: $0 switch <a|b|c>"
   local target; target="$(side_name "$1")"
   resolve_zone_id
+  load_side_addrs
 
   local cur_target cur_side
   cur_target="$(current_cname "$ADDR_SWITCH")"
@@ -871,6 +937,7 @@ cmd_failover() {
   [ -n "${1:-}" ] || die "usage: $0 failover <a|b|c>"
   local target; target="$(side_name "$1")"
   resolve_zone_id
+  load_side_addrs
   need_bases "$target"
 
   local cur_target cur_side
@@ -891,6 +958,7 @@ cmd_failover() {
 
 cmd_rollback() {
   resolve_zone_id
+  load_side_addrs
   # Stateless by design: within the main pair, "roll back" is just "switch to the
   # other one", and which side is live is read from the shared switch record — not
   # a local file. So every operator, on any machine, computes the same target and
@@ -943,10 +1011,11 @@ cmd_acme() {
 
 cmd_setup() { # [side]
   resolve_zone_id
+  load_side_addrs
   local cur; cur="$(current_cname "$SERVING_ALIAS")"
   local live; live="$(which_side "$(current_cname "$ADDR_SWITCH")")"
   # Which side's cluster the alias should name: the one asked for, else the live
-  # side's, else the main cluster (a and b share it).
+  # side's, else a's (published, or PLATFORM_BASE before a has deployed).
   local side="${1:-}"
   if [ -n "$side" ]; then side="$(side_name "$side")"
   elif [ "$live" = a ] || [ "$live" = b ] || [ "$live" = c ]; then side="$live"
@@ -956,11 +1025,9 @@ cmd_setup() { # [side]
   if [ -z "$gateway" ]; then
     # Show where the alias points today, so the cluster can be read off it.
     [ -n "$cur" ] && info "serving alias ${SERVING_ALIAS} currently -> ${cur}"
-    if [ "$side" = c ]; then
-      die "set PLATFORM_BASE_COLD (<cluster>.phala.network, read off c's kms_info.gateway_app_url)"
-    fi
-    die "set PLATFORM_BASE (<cluster>.phala.network, read off a CVM's kms_info.gateway_app_url)"
+    die "side ${side} publishes no cluster at $(base_target "$side") yet: set $(side_configured_var "$side") (<cluster>.phala.network, the gateway.base_domain \`phala cvms get <app_id> --json\` reports)"
   fi
+  warn_base_drift "$side"
   # Pointing the alias away from the live side's cluster takes the service down:
   # that cluster's gateway cannot route the live app_id. Moving traffic across
   # clusters is `switch`/`failover`, which move the alias and the traffic switch
@@ -1024,7 +1091,7 @@ if [ -f "$SECRETS_ENV" ]; then load_env_file "$SECRETS_ENV"; fi
 CF_ZONE="${CF_ZONE:-integratenetwork.work}"
 DOMAIN="${DOMAIN:-router-api.0g.ai}"
 DELEGATION_ZONE="${DELEGATION_ZONE:-$CF_ZONE}"
-PLATFORM_BASE="${PLATFORM_BASE:-}"     # dstack platform base domain (e.g. in1.phala.network) for per-side app-id probes
+PLATFORM_BASE="${PLATFORM_BASE:-}"     # fallback cluster for a and b while they publish none (side_base)
 # Normalise to the BARE base once, here, because platform_probe_url interpolates
 # this value straight into `<app_id>-443s.${PLATFORM_BASE}` and a `_.` in it makes
 # an unresolvable host — a failure that only shows up as gate 2 timing out for
