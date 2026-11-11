@@ -718,6 +718,7 @@ fi
 if [ "$live" = a ] || [ "$live" = b ] || [ "$live" = c ]; then
   live_base="$(published_base_of "$(dns CNAME "${DOMAIN}.${live}.${DELEGATION_ZONE}")")"
   if [ -n "$live_base" ] && [ "$live_base" != "$BASE" ]; then
+    # "serving alias across clusters": phala-deploy.yml looks for these words.
     warn "the live side ${live} runs in ${live_base} and side ${SIDE} in ${BASE}: \`switch.sh switch ${SIDE}\` moves the"
     warn "  serving alias across clusters, and clients holding the old one fail for up to its TTL (blue-green.md, \"Cross-cluster fallback\")."
   fi

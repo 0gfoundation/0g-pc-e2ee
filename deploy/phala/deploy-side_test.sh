@@ -513,6 +513,8 @@ fresh; record CNAME "${DOMAIN}.a.${DZ}" "_.${BASE}"; echo in2.phala.network >"$S
 run b --compose "$COMPOSE" --yes
 expect_rc "a side in another cluster than the live one deploys" 0
 check "…and says the cutover will move the serving alias" err_has "the live side a runs in ${BASE} and side b in in2.phala.network"
+# phala-deploy.yml greps for this phrase to flag the switch as cross-cluster.
+check "…in the words the deploy workflow looks for" err_has "serving alias across clusters"
 fresh; record CNAME "${DOMAIN}.a.${DZ}" "_.${BASE}"
 run b --compose "$COMPOSE" --yes
 check_not "a side in the live side's cluster gets no such warning" err_has "the live side a runs in"

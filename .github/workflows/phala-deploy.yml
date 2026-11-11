@@ -2,9 +2,10 @@ name: Phala deploy
 
 # Creates one blue/green side of the gateway as a NEW Phala Cloud app from a
 # published release, and waits until it can serve: deploy/phala/deploy-side.sh, run
-# from a runner. It moves no traffic — cutting over stays a separate run of the
-# "DNS switch" workflow (`switch <side>`). blue-green.md, "Deploying a side from
-# GitHub Actions", has the setup.
+# from a runner. With `switch` ticked it then cuts traffic over to it, through the
+# "DNS switch" workflow (`switch <side>`) under its own approval; otherwise that
+# stays a separate run. blue-green.md, "Deploying a side from GitHub Actions", has
+# the setup.
 #
 #   plan    admins only; resolves the release (default: the newest release-*) and
 #           the side: `inactive` is the main side the traffic switch does not name,
@@ -21,6 +22,13 @@ name: Phala deploy
 #           has deploy-side.sh delete the side's previous CVM (--replace) just
 #           before creating the new one — only that CVM, and only after every
 #           other check has passed.
+#   switch  only with `switch` ticked, not on a dry run, and only after deploy
+#           (and its smoke test) succeeded: dns-switch.yml with `switch <side>`,
+#           waiting for its own approval under dns-<target> — the point to look at
+#           the deploy's summary first, which says when the switch crosses
+#           clusters. switch.sh gates the side again (published app-address,
+#           /readyz, a trusted certificate) and rolls itself back, issuance
+#           included, if the cutover does not verify.
 #   acme-restore
 #           only when deploy fails or is cancelled after acme moved: dns-switch.yml
 #           with `acme live`, handing issuance back to the side serving traffic.
@@ -69,6 +77,11 @@ on:
         required: false
         type: string
         default: latest
+      switch:
+        description: "Then switch traffic to it (DNS switch, its own approval under dns-<target>)"
+        required: false
+        type: boolean
+        default: false
       replace:
         description: "Delete the side's previous CVM first (only that one; refused if it is ambiguous)"
         required: false
@@ -125,6 +138,7 @@ jobs:
           SIDE: ${{ steps.side.outputs.side }}
           ASKED_SIDE: ${{ inputs.side }}
           REPLACE: ${{ inputs.replace }}
+          SWITCH: ${{ inputs.switch }}
           RELEASE: ${{ inputs.release }}
           DRY_RUN: ${{ inputs.dry_run }}
           ACTOR: ${{ github.actor }}
@@ -167,7 +181,14 @@ jobs:
             echo "| commit | \`$(cut -f1 <<<"$assets")\` |"
             echo "| dry run | $DRY_RUN |"
             echo "| replace | $REPLACE$([ "$REPLACE" = true ] && echo " — deletes side \`$SIDE\`'s previous CVM before creating") |"
-            echo "| environments | \`dns-${TARGET}\` (acme), \`deploy-${TARGET}\` (create) |"
+            if [ "$SWITCH" = true ] && [ "$DRY_RUN" = true ]; then
+              echo "| switch | requested, but not on a dry run: nothing is created to switch to |"
+            elif [ "$SWITCH" = true ]; then
+              echo "| switch | yes — after a successful deploy, \`switch $SIDE\` under \`dns-${TARGET}\` (its own approval) |"
+            else
+              echo "| switch | no — cut over yourself with **DNS switch** afterwards |"
+            fi
+            echo "| environments | \`dns-${TARGET}\` (acme$([ "$SWITCH" = true ] && echo ', switch')), \`deploy-${TARGET}\` (create) |"
             echo "| triggered by | @$ACTOR |"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -295,6 +316,14 @@ jobs:
           rc=0
           { ./deploy/phala/deploy-side.sh "${args[@]}" 2>&1 >&3 | tee deploy.log >&2; } 3> result.txt || rc=$?
           cat result.txt >> "$GITHUB_OUTPUT"
+          # deploy-side.sh says when the new side is in another cluster than the
+          # live one: the cutover then moves the serving alias and has a short
+          # window. Raised as an annotation, which the run page shows above the
+          # pending switch approval, and kept as an output for the summary below.
+          if grep -q 'serving alias across clusters' deploy.log; then
+            echo "cross_cluster=true" >> "$GITHUB_OUTPUT"
+            echo "::warning title=Cross-cluster switch::side ${SIDE} runs in another cluster than the live side: switching to it moves the serving alias, and clients holding the old one can fail for up to its TTL (60 s). blue-green.md, Cross-cluster fallback."
+          fi
           {
             echo '```'
             cat deploy.log
@@ -331,11 +360,41 @@ jobs:
         env:
           SIDE: ${{ needs.plan.outputs.side }}
           TARGET: ${{ inputs.target }}
+          SWITCH: ${{ inputs.switch }}
+          CROSS: ${{ steps.deploy.outputs.cross_cluster }}
         run: |
           {
             echo
-            echo "Side \`$SIDE\` is ready. Cut over with **DNS switch** → \`$TARGET\`, \`switch\`, side \`$SIDE\`."
+            if [ "$SWITCH" = true ]; then
+              echo "Side \`$SIDE\` is ready. The **switch** job now waits for approval under \`dns-${TARGET}\` to cut traffic over to it."
+            else
+              echo "Side \`$SIDE\` is ready. Cut over with **DNS switch** → \`$TARGET\`, \`switch\`, side \`$SIDE\`."
+            fi
+            if [ "$CROSS" = true ]; then
+              echo
+              echo "> ⚠️ **Cross-cluster switch.** Side \`$SIDE\` runs in another cluster than the live side, so the cutover moves the serving alias: clients still holding the old one can fail for up to its TTL (60 s). Prefer a quiet time (blue-green.md, *Cross-cluster fallback*)."
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # The cutover, when asked for: only after the side deployed and passed its
+  # smoke test, and under its own approval, so whoever approves can read the
+  # deploy's summary first. Its failures need no handling here: switch.sh refuses
+  # a side that fails its gates before writing anything, and a cutover that does
+  # not verify is rolled back by switch.sh itself, issuance included. Not part of
+  # acme-restore's condition: a failed switch leaves issuance where switch.sh put
+  # it, with the live side.
+  switch:
+    needs: [plan, deploy]
+    if: ${{ inputs.switch && !inputs.dry_run }}
+    permissions:
+      contents: read
+    uses: ./.github/workflows/dns-switch.yml
+    secrets: inherit
+    with:
+      target: ${{ inputs.target }}
+      command: switch
+      side: ${{ needs.plan.outputs.side }}
+      dry_run: false
 
   # Without this, a deploy refused at its preflight (the side still has a CVM, say)
   # or failing later leaves issuance on a side that serves nothing, and the live
