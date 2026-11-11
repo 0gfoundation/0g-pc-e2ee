@@ -293,10 +293,9 @@ jobs:
           CVM_ENV_ZG_GATEWAY_ALLOWED_ORIGINS: ${{ secrets.ZG_GATEWAY_ALLOWED_ORIGINS }}
           # The HMAC key the gateway signs X-0G-Client-IP with (hex, >= 32 bytes),
           # the same value as the router's client-ip-hmac-keys secret. A secret for
-          # the obvious reason. Optional until the router believes the header:
-          # unset is empty, and an empty key sends no header. Once the router's
-          # features_client_ip_header is on, list it in CVM_REQUIRED_KEYS so a
-          # deploy without it fails instead of putting every user back in one bucket.
+          # the obvious reason. Required by both env files (CVM_REQUIRED_KEYS): the
+          # router believes the header on both targets, so a deploy without it
+          # fails instead of putting every user back in one bucket.
           CVM_ENV_ZG_GATEWAY_CLIENT_IP_KEY: ${{ secrets.ZG_GATEWAY_CLIENT_IP_KEY }}
           # Optional: KEY=VALUE lines for the CVM that stay out of the repository
           # (none today). Unset is empty, and empty adds nothing.

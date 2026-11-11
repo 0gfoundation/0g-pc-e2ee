@@ -901,13 +901,13 @@ X-0G-Client-IP-Sig: hex(HMAC-SHA256(key, "0g-client-ip/v1\n" + ip + "\n" + ts))
   rotated: add the new key to the router, switch the gateway, then drop the old key.
 - Requires `-proxy-protocol` (the gateway refuses to start otherwise: without it every
   request would be signed as dstack-ingress's address). Off when the key is empty.
-- **Make it required once the router uses it.** While the router's
-  `features_client_ip_header` is off, the key is optional, and a deploy without it
-  just sends no header. After the flag is on, and above all once
-  `rate_limit_auth_ip_rpm` is, a deploy that loses the key fails silently: every user
-  falls back into the gateway's one bucket and is locked out together. At that point,
-  add `ZG_GATEWAY_CLIENT_IP_KEY` to `CVM_REQUIRED_KEYS` in `env/<target>.env`, so a
-  missing secret stops the deploy.
+- **Required.** The router's `features_client_ip_header` is on for staging and
+  mainnet, so a deploy that lost the key would fail silently: every user would fall
+  back into the gateway's one bucket and, once `rate_limit_auth_ip_rpm` is on, be
+  locked out together. `ZG_GATEWAY_CLIENT_IP_KEY` is therefore in `CVM_REQUIRED_KEYS`
+  in both `env/*.env`: a missing secret stops the deploy. A target whose router does
+  not use the header (a testnet, a self-hosted router) can leave it out of its own
+  env file, and the gateway then sends nothing.
 
 **Rollout.** All four settings are measured (`compose_hash`), so they land as one new
 side under blue/green. Check on the new side, before the switch:
