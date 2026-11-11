@@ -101,6 +101,8 @@
 #                    (<app_id>-443s.<base>) and what the serving alias names
 #                    (gw.<base>) while it is live. A leading `_.` or `gw.` is
 #                    accepted on both.
+#   PLATFORM_BASE_SUFFIX  domains a PUBLISHED cluster may be under, space-separated
+#                    (default: phala.network); anything else is ignored, not followed
 #   SIDE_A_LABEL     sub-zone label for side a      (default: a)
 #   SIDE_B_LABEL     sub-zone label for side b      (default: b)
 #   SIDE_C_LABEL     sub-zone label for side c      (default: c)
@@ -227,8 +229,9 @@ other_side() { case "$(side_name "$1")" in a) echo b;; b) echo a;; c) return 1;;
 # CVMs on the same node to another cluster before (2026-11, prod5:
 # dstack-pha-prod5 -> dstack-pha1-prod5), which a value typed into an env file
 # cannot follow. A wrong published value is still caught before it moves
-# traffic: gate 2 probes <app_id>-443s.<that base>, which only that cluster's
-# gateway routes.
+# traffic: it must be under PLATFORM_BASE_SUFFIX (read_side_published_base), and
+# gate 3 requires the side to present a trusted certificate for DOMAIN at
+# <app_id>-443s.<that base>, which only its own ingress, in that cluster, can.
 side_configured_base() { case "$(side_name "$1")" in a|b) echo "$PLATFORM_BASE" ;; c) echo "$PLATFORM_BASE_COLD" ;; esac; }
 side_configured_var()  { case "$(side_name "$1")" in a|b) echo PLATFORM_BASE ;; c) echo PLATFORM_BASE_COLD ;; esac; }
 side_base() {
@@ -365,6 +368,12 @@ read_side_app_addr() { # a|b|c
 # DSTACK_GATEWAY_DOMAIN. Bare base, or "" when the side publishes none or the
 # value is not one hostname behind exactly one `_.` — a doubled `_._.` prefix
 # (README, "Serving domain") is refused here, not followed.
+#
+# And only a host under PLATFORM_BASE_SUFFIX (phala.network): the value comes from
+# /dstack/user_config, which is not measured, so the HOST can set it, and it ends
+# up in the serving alias every client resolves. Confined to the platform's own
+# domain, the worst a wrong value does is name a cluster that cannot route the
+# app — which gate 2 refuses — rather than send router-api.0g.ai anywhere at all.
 read_side_published_base() { # a|b|c
   local v
   v="$(cf_records_at "$(base_target "$1")" | awk -F'\t' '$2=="CNAME"{print $3; exit}')"
@@ -373,9 +382,11 @@ read_side_published_base() { # a|b|c
 published_base_of() { # `_.<base>` -> <base>, anything else -> ""
   local b="${1%.}"
   case "$b" in _.?*) b="${b#_.}" ;; *) return 0 ;; esac
-  if [[ "$b" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]; then
-    echo "$b"
-  fi
+  [[ "$b" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]] || return 0
+  local sfx
+  for sfx in $PLATFORM_BASE_SUFFIX; do
+    if [[ "${b,,}" == *".${sfx,,}" ]]; then echo "$b"; return 0; fi
+  done
 }
 load_side_addrs() {
   [ "$SIDE_ADDRS_LOADED" = 1 ] && return 0
@@ -507,6 +518,23 @@ side_cert_expiry() { # a|b
   [ -n "$end" ] || return 2
   echo "$end"
   openssl x509 -noout -checkend $((CERT_WARN_DAYS * 86400)) <<<"$pem" >/dev/null 2>&1 || return 1
+}
+
+# 0 if side $1, reached on its own cluster (`<app_id>-443s.<base>`), presents a
+# certificate for DOMAIN that chains to a trusted CA. This is what makes the
+# cluster a side PUBLISHES safe to write into the serving alias: a readiness
+# probe is any 2xx, which anything can answer, but only the side's own ingress
+# holds a trusted certificate for DOMAIN (its key is generated in the CVM, and
+# the CAA record pins issuance to that ingress's ACME account). The SNI is the
+# probe host, so the gateway routes it by app_id; the name verified is DOMAIN.
+side_cert_verified() { # a|b|c
+  local base addr host pem
+  base="$(side_base "$1")"; addr="$(side_app_addr "$1")"
+  [ -n "$base" ] && [ -n "$addr" ] || return 1
+  host="${addr%%:*}-443s.${base}"
+  pem="$(echo | openssl s_client -servername "$host" -connect "${host}:443" \
+    -verify_hostname "$DOMAIN" -verify_return_error 2>/dev/null || true)"
+  openssl x509 -noout -checkend 0 <<<"$pem" >/dev/null 2>&1
 }
 
 confirm() {
@@ -670,7 +698,8 @@ move_switches() { # target-side  [--acme-only]
 }
 
 # Refuse (die) unless side $1 can take traffic: gate 1 — it publishes an
-# app-address — and gate 2 — it answers its readiness probe.
+# app-address — gate 2 — it answers its readiness probe — and gate 3 — it holds a
+# trusted certificate for DOMAIN on the cluster the serving alias will name.
 gate_target() { # target-side
   local target="$1"
   load_side_addrs
@@ -738,6 +767,14 @@ gate_target() { # target-side
   done
   [ "$probe_ok" = 1 ] || die "target-side probe failed after ${PROBE_RETRIES} attempts ($probe) — refusing to switch"
   info "target-side probe OK"
+
+  # Gate 3: the cluster about to go into the serving alias really hosts this
+  # side — it serves a trusted certificate for DOMAIN there. Checked on the
+  # side's own <app_id>-443s.<base> even with --probe-url, because that base, not
+  # the probe URL, is what the alias is written from.
+  side_cert_verified "$target" \
+    || die "side ${target} does not present a trusted certificate for ${DOMAIN} at $(side_app_addr "$target" | cut -d: -f1)-443s.$(side_base "$target") — refusing to point ${DOMAIN} at that cluster"
+  info "side ${target} serves a trusted certificate for ${DOMAIN} on $(side_base "$target")"
 }
 
 # Wait for the public endpoint to be served by side $1. Returns 0 once verified,
@@ -886,6 +923,7 @@ cutover() { # target-side previous-side rollback|stay
 # is not up.
 cmd_switch() {
   [ -n "${1:-}" ] || die "usage: $0 switch <a|b|c>"
+  need openssl
   local target; target="$(side_name "$1")"
   resolve_zone_id
   load_side_addrs
@@ -935,6 +973,7 @@ cmd_switch() {
 # and 2 — failing over to a side that cannot serve helps no one.
 cmd_failover() {
   [ -n "${1:-}" ] || die "usage: $0 failover <a|b|c>"
+  need openssl
   local target; target="$(side_name "$1")"
   resolve_zone_id
   load_side_addrs
@@ -1010,6 +1049,7 @@ cmd_acme() {
 }
 
 cmd_setup() { # [side]
+  need openssl
   resolve_zone_id
   load_side_addrs
   local cur; cur="$(current_cname "$SERVING_ALIAS")"
@@ -1028,6 +1068,11 @@ cmd_setup() { # [side]
     die "side ${side} publishes no cluster at $(base_target "$side") yet: set $(side_configured_var "$side") (<cluster>.phala.network, the gateway.base_domain \`phala cvms get <app_id> --json\` reports)"
   fi
   warn_base_drift "$side"
+  # A side that has deployed must prove the cluster is its own, as gate 3 does
+  # before a switch; before any deploy, the value is the operator's PLATFORM_BASE.
+  if [ -n "$(side_app_addr "$side")" ] && ! side_cert_verified "$side"; then
+    die "side ${side} does not present a trusted certificate for ${DOMAIN} on ${gateway#gw.}; refusing to point the serving alias there"
+  fi
   # Pointing the alias away from the live side's cluster takes the service down:
   # that cluster's gateway cannot route the live app_id. Moving traffic across
   # clusters is `switch`/`failover`, which move the alias and the traffic switch
@@ -1101,6 +1146,9 @@ PLATFORM_BASE="${PLATFORM_BASE:-}"     # fallback cluster for a and b while they
 PLATFORM_BASE="${PLATFORM_BASE#_.}"; PLATFORM_BASE="${PLATFORM_BASE#gw.}"
 # The cold standby's cluster (side c). Empty = no cold standby.
 PLATFORM_BASE_COLD="${PLATFORM_BASE_COLD:-}"; PLATFORM_BASE_COLD="${PLATFORM_BASE_COLD#_.}"; PLATFORM_BASE_COLD="${PLATFORM_BASE_COLD#gw.}"
+# Where a side's published cluster may be (read_side_published_base): space-separated
+# domain suffixes. Widen it only for a platform domain you trust as much.
+PLATFORM_BASE_SUFFIX="${PLATFORM_BASE_SUFFIX:-phala.network}"
 SIDE_A_LABEL="${SIDE_A_LABEL:-a}"
 SIDE_B_LABEL="${SIDE_B_LABEL:-b}"
 SIDE_C_LABEL="${SIDE_C_LABEL:-c}"

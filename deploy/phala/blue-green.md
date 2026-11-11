@@ -343,16 +343,30 @@ a and b may sit in different clusters: a switch between them then moves the serv
 alias as a switch onto c does, with the same short window
 ([Cross-cluster fallback](#cross-cluster-fallback)), and `rollback` moves it back.
 
-Why it is safe to trust. The value comes from `DSTACK_GATEWAY_DOMAIN`, which the
-platform injects at boot (from `/dstack/user_config`, which is not measured, so the
-host could change it — README, "Serving domain" — but a host can deny service
-anyway), and only something holding the delegation zone's token can rewrite the
-record — the same token that can already rewrite the traffic switch. And a wrong
-value cannot move traffic: gate 2 probes `<app_id>-443s.<that cluster>`, which only
-the gateway of the cluster the side really runs in will route, so `switch` refuses
-before writing anything. A deleted side's record stays behind with its old cluster;
-that is harmless for the same reason, and `deploy-side.sh` re-reads it on every poll
-until the new CVM's ingress has rewritten it.
+Why it is safe to use. The value is **not trusted as such**: it comes from
+`DSTACK_GATEWAY_DOMAIN`, which the platform injects at boot from
+`/dstack/user_config` — not measured, so the **host can set it** (README, "Serving
+domain") — and it ends up in the serving alias every client resolves. Taken at its
+word, that would let a host point `<DOMAIN>` at any name it likes on the next
+`switch`, where before it could at most deny service. Two checks stop that:
+
+- **Only a host under `PLATFORM_BASE_SUFFIX`** (default `phala.network`) is accepted.
+  Anything else is ignored — `switch.sh` falls back to `PLATFORM_BASE`, or refuses —
+  and `deploy-side.sh` stops. So the worst value left is another Phala cluster.
+- **Gate 3: a trusted certificate for `<DOMAIN>` on that cluster.** Before any write,
+  `switch`, `failover` and `setup` require `<app_id>-443s.<that cluster>` to present a
+  certificate for `<DOMAIN>` that chains to a trusted CA (`openssl s_client
+  -verify_hostname <DOMAIN> -verify_return_error`; `deploy-side.sh` checks the same).
+  A readiness probe alone is not enough — any 2xx passes it — but only the side's own
+  ingress holds such a certificate: its key is generated in the CVM, the CAA record
+  pins issuance to its ACME account, and the gateway routes `<app_id>-443s.` only to
+  that app in its own cluster. Checked on the cluster the alias would name, even when
+  `--probe-url` overrides the readiness probe. Consequence: a side serving a
+  staging-CA certificate (`ACME_STAGING=true`) cannot be switched to.
+
+A deleted side's record stays behind with its old cluster; that is harmless for the
+same reasons, and `deploy-side.sh` re-reads it on every poll until the new CVM's
+ingress has rewritten it.
 
 ## One-time setup
 
@@ -492,7 +506,12 @@ switch to the production compose only once it works.
    whether its process is up — so a side that cannot verify any provider never
    receives traffic while the live side is still serving from a warm cache. See
    [Health-checking the standby](#health-checking-the-standby-side);
-4. repoints the traffic + issuance switches at b;
+   **gate 3** — then requires b to present a certificate for `router-api.0g.ai`
+   that chains to a trusted CA, at `<app_id>-443s.<b's cluster>`: the proof that
+   the cluster about to go into the serving alias is really b's
+   ([Where each side's cluster comes from](#where-each-sides-cluster-comes-from));
+4. repoints the traffic + issuance switches at b (and the serving alias, if b runs
+   in another cluster than the live side);
 5. **confirms the cutover actually took effect, cache-proof.** It polls
    `https://router-api.0g.ai/healthz` **and** the served TLS cert fingerprint:
    success needs `/healthz` OK **and** the cert to have changed to b's. Because the

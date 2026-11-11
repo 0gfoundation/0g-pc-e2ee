@@ -22,6 +22,8 @@
 #   readyz             the status /readyz answers (200 if absent)
 #   release            the tag /v1/gateway/identity reports as matched_release
 #   cert_bad           if present, the side serves no valid certificate
+#   untrusted          if present, its certificate does not verify (self-signed, say):
+#                      `s_client -verify_return_error` fails on it
 #
 # `node provision.cjs` stands in for the new CVM's ingress too: it publishes the side's
 # app-address TXT and serving CNAME at once, as a booted ingress would.
@@ -142,9 +144,12 @@ cat >"$WORK/bin/openssl" <<'FAKE_OPENSSL'
 #!/usr/bin/env bash
 set -euo pipefail
 case "$1" in
-  s_client) cat >/dev/null; echo "-----BEGIN CERTIFICATE-----" ;;
-  x509)
+  s_client)
     cat >/dev/null
+    for a in "$@"; do [ "$a" = -verify_return_error ] && [ -f "$FAKE_DIR/untrusted" ] && exit 1; done
+    echo "-----BEGIN CERTIFICATE-----" ;;
+  x509)
+    [ -n "$(cat)" ] || exit 1   # no certificate on stdin, as real openssl would fail
     [ -f "$FAKE_DIR/cert_bad" ] && exit 1
     prev=""
     for a in "$@"; do
@@ -383,6 +388,14 @@ check "…and the side is found there" [ "$OUT" = $'app_id='"$NEW_APP"$'\nurl=ht
 fresh; echo 503 >"$S/readyz"
 run b --compose "$COMPOSE" --yes
 expect_err "fails when /readyz never answers 200" "/readyz answered 503"
+
+fresh; touch "$S/untrusted"
+run b --compose "$COMPOSE" --yes
+expect_err "fails when the side's certificate does not chain to a trusted CA" "no valid certificate"
+
+fresh; echo "_.attacker.example" >"$S/published"
+run b --compose "$COMPOSE" --yes
+expect_err "a published cluster outside PLATFORM_BASE_SUFFIX stops the run" "under phala.network"
 
 fresh; touch "$S/cert_bad"
 run b --compose "$COMPOSE" --yes
