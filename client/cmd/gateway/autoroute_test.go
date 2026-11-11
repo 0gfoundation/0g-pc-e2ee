@@ -2,16 +2,19 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/clientip"
 	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
@@ -100,11 +103,15 @@ func autoGateway(t *testing.T, f *fakeAutoRouter) *httptest.Server {
 	return catalogGateway(t, f.server(t), entryPolicy{sealModels: mustSealModels(t, sealedModel)})
 }
 
+// postAuto posts body to the gateway. Unless headers say otherwise, the caller
+// sends X-0G-Encrypted-Transit: preferred, which lets a classifier outside
+// -seal-models (autoGateway's) classify in the clear.
 func postAuto(t *testing.T, gwURL, body string, headers map[string]string) (*http.Response, string) {
 	t.Helper()
 	req, _ := http.NewRequest(http.MethodPost, gwURL+endpoint.Chat.Path, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer sk-user-key")
+	req.Header.Set(openaiproxy.HeaderEncryptedTransit, "preferred")
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
@@ -254,6 +261,72 @@ func TestAutoRequiredTransitDoesNotClassify(t *testing.T) {
 	}
 }
 
+// A classifier outside -seal-models is used only when the caller's own header
+// allows cleartext: without one, nothing is sent (no precheck either) and the
+// task is general.
+func TestAutoCleartextClassifierNeedsCallerConsent(t *testing.T) {
+	f := &fakeAutoRouter{task: "math", chosen: sealedModel}
+	gw := autoGateway(t, f)
+	resp, _ := postAuto(t, gw.URL, autoBody, map[string]string{openaiproxy.HeaderEncryptedTransit: ""})
+	if p, d, s := f.counts(); p != 0 || d != 0 || s != 1 {
+		t.Fatalf("prechecks/decisions/selects = %d/%d/%d, want 0/0/1", p, d, s)
+	}
+	if resp.Header.Get(openaiproxy.HeaderAutoTask) != autoGeneral || resp.Header.Get(openaiproxy.HeaderAutoClassifierE2EE) != "" {
+		t.Errorf("headers = %v", resp.Header)
+	}
+	// "off" consents.
+	resp, _ = postAuto(t, gw.URL, autoBody, map[string]string{openaiproxy.HeaderEncryptedTransit: "off"})
+	if _, d, _ := f.counts(); d != 1 || resp.Header.Get(openaiproxy.HeaderAutoClassifierE2EE) != openaiproxy.E2EEValueNone {
+		t.Errorf("with off: decisions = %d, classifier header %q", d, resp.Header.Get(openaiproxy.HeaderAutoClassifierE2EE))
+	}
+}
+
+// The auto layer's own preview calls carry the signed client address, like
+// every other router-bound request.
+func TestAutoPreviewsCarryTheSignedClientIP(t *testing.T) {
+	f := &fakeAutoRouter{task: "math", chosen: "x"}
+	router := f.server(t)
+	var mu sync.Mutex
+	var previews []http.Header
+	inner := router.Config.Handler
+	router.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/routing/preview" {
+			mu.Lock()
+			previews = append(previews, r.Header.Clone())
+			mu.Unlock()
+		}
+		inner.ServeHTTP(w, r)
+	})
+	signer, err := clientip.NewSigner(testClientIPKey, mustURL(t, router.URL))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := withClientIP(signer, newHandler(allSealedClients(), mustURL(t, router.URL), testOrigins(), "", "",
+		noInFlightCap, nil, nil, nil, discardLogger(), withEntryPolicy(entryPolicy{sealModels: mustSealModels(t, sealedModel)})))
+	req := httptest.NewRequest(http.MethodPost, endpoint.Chat.Path, strings.NewReader(autoBody))
+	req.RemoteAddr = "203.0.113.7:51000"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer sk-user-key")
+	req.Header.Set(openaiproxy.HeaderEncryptedTransit, "preferred")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(previews) != 2 {
+		t.Fatalf("router got %d previews, want the precheck and the model choice", len(previews))
+	}
+	key, _ := hex.DecodeString(testClientIPKey)
+	for i, got := range previews {
+		ts, _ := strconv.ParseInt(got.Get(clientip.HeaderTs), 10, 64)
+		if got.Get(clientip.HeaderIP) != "203.0.113.7" || got.Get(clientip.HeaderSig) != clientip.Sign(key, "203.0.113.7", ts) {
+			t.Errorf("preview %d: client IP headers %q / %q", i, got.Get(clientip.HeaderIP), got.Get(clientip.HeaderSig))
+		}
+	}
+}
+
 // The caller's own X-0G-Encrypted-Transit: required keeps the opening from
 // going out in the clear, even when the router's precheck does not report it.
 func TestAutoCallerRequiredDoesNotClassifyInClear(t *testing.T) {
@@ -308,6 +381,7 @@ func TestAutoCancelledClassificationIsNotCached(t *testing.T) {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, gw.URL+endpoint.Chat.Path, strings.NewReader(autoBody))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer sk-user-key")
+	req.Header.Set(openaiproxy.HeaderEncryptedTransit, "preferred")
 	if resp, err := http.DefaultClient.Do(req); err == nil {
 		resp.Body.Close()
 	}
