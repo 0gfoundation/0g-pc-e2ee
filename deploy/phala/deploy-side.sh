@@ -79,6 +79,13 @@
 #   ./deploy-side.sh b --env-file env/mainnet.env --compose docker-compose.release.yml \
 #       --release release-2026.10.28.1        # secrets in ./secrets.env, or exported
 #   ./deploy-side.sh b --env-file … --compose … --dry-run   # preflight only
+#   ./deploy-side.sh inactive --env-file … --compose … --yes  # whichever main side
+#                                                            # traffic is not on
+#   ./deploy-side.sh inactive --env-file … --resolve-side    # just print side=<a|b>
+#
+# The side: a, b or c, or `inactive` — the main side the traffic switch does not
+# name, read from DNS when the script runs (b while a is live, and so on). Refused
+# while c is live or nothing is: name the side then.
 #
 # Flags:
 #   --compose PATH   the release's docker-compose.release.yml (required)
@@ -86,6 +93,8 @@
 #   --dry-run        run the preflight and print what would be created
 #   --yes            do not prompt for confirmation
 #   --env-file PATH  load config from PATH instead of ./deploy.env next to this script
+#   --resolve-side   print side=<a|b|c> (resolving `inactive`) and exit; needs no
+#                    secrets and no --compose
 #
 # Config (env or env file; the real environment wins over the file):
 #   DOMAIN               served hostname (required — no default, so a staging run
@@ -129,6 +138,7 @@ COMPOSE=""
 RELEASE=""
 ENV_FILE=""
 SIDE=""
+RESOLVE_SIDE=0
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -221,6 +231,24 @@ dns() { # type name -> first answer, trailing dot and TXT quotes stripped
   v="$(dig +short @"$AUTH_NS" "$1" "$2" 2>/dev/null | head -n1 || true)"
   v="${v%.}"; v="${v#\"}"; v="${v%\"}"
   printf '%s' "$v"
+}
+
+# `inactive` -> the main side the traffic switch does NOT point at, read now from
+# the delegation zone: a when b is live, b when a is. Anything else is refused, not
+# guessed: with c live (a failover), which main side to rebuild is the operator's
+# call, as it is for switch.sh rollback; with nothing live there is no "other".
+resolve_inactive_side() {
+  local tgt live
+  tgt="$(dns CNAME "_dstack-app-address.${DOMAIN}.${DELEGATION_ZONE}")"
+  live="$(which_side "$tgt" addr)"
+  case "$live" in
+    a) SIDE=b ;;
+    b) SIDE=a ;;
+    c) die "the cold standby c is live, so neither main side is the inactive one: name the side (a or b)" ;;
+    "") die "the traffic switch points at no side, so none is inactive: name the side" ;;
+    *) die "the traffic switch points at an unrecognized target (${tgt}): resolve it with switch.sh status, or name the side" ;;
+  esac
+  info "inactive side: ${SIDE} (traffic -> ${live})"
 }
 
 # Which side a switch-layer CNAME target names: a|b|c, "" if unset, "?" if neither.
@@ -416,6 +444,7 @@ while [ $# -gt 0 ]; do
     --release=*)  RELEASE="${1#*=}" ;;
     --env-file)   ENV_FILE="${2:?--env-file needs a path}"; shift ;;
     --env-file=*) ENV_FILE="${1#*=}" ;;
+    --resolve-side) RESOLVE_SIDE=1 ;;
     -h|--help)    usage 0 ;;
     -*)           die "unknown flag: $1 (try --help)" ;;
     *)            POSITIONAL+=("$1") ;;
@@ -424,8 +453,8 @@ while [ $# -gt 0 ]; do
 done
 [ "${#POSITIONAL[@]}" -eq 1 ] || usage 1
 case "${POSITIONAL[0]}" in
-  a|b|c) SIDE="${POSITIONAL[0]}" ;;
-  *) die "unknown side '${POSITIONAL[0]}' (want: a|b|c)" ;;
+  a|b|c|inactive) SIDE="${POSITIONAL[0]}" ;;
+  *) die "unknown side '${POSITIONAL[0]}' (want: a|b|c|inactive)" ;;
 esac
 
 if [ -n "$ENV_FILE" ]; then
@@ -455,6 +484,14 @@ for v in DOMAIN DELEGATION_ZONE PLATFORM_BASE PLATFORM_BASE_COLD CVM_NAME_PREFIX
 done
 [ "${#placeholders[@]}" -eq 0 ] || die "still CHANGEME in the config: ${placeholders[*]}"
 : "${DOMAIN:?set DOMAIN (the served hostname)}"
+if [ "$SIDE" = inactive ]; then
+  need dig
+  resolve_ns
+  resolve_inactive_side
+fi
+# Only which side, for a caller that has to know it before the deploy (the
+# workflow aims issuance at it first). Needs DOMAIN and DNS, no secrets.
+if [ "$RESOLVE_SIDE" = 1 ]; then printf 'side=%s\n' "$SIDE"; exit 0; fi
 : "${CVM_NAME_PREFIX:?set CVM_NAME_PREFIX (the CVM is named <prefix>-<side>)}"
 : "${PHALA_INSTANCE_TYPE:?set PHALA_INSTANCE_TYPE (README, \"CVM shape\")}"
 : "${CLOUDFLARE_API_TOKEN:?set CLOUDFLARE_API_TOKEN (the token the CVM uses, scoped to ${DELEGATION_ZONE})}"

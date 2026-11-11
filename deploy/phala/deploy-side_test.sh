@@ -225,6 +225,43 @@ not_created "dry run"
 check "dry run shows the pinned node" err_has "--node test7"
 check_not "dry run prints no secret value" grep -q 'cf-secret\|p#ss' <<<"$ERR$OUT"
 
+# `inactive`: the main side traffic is not on, read from DNS.
+fresh; run inactive --compose "$COMPOSE" --dry-run
+expect_rc "inactive resolves to the side traffic is not on" 0
+check "…which is b while a is live" err_has "inactive side: b (traffic -> a)"
+check "…and the run is for b" err_has "side b (gw-mainnet-b)"
+fresh; record CNAME "_dstack-app-address.${DOMAIN}.${DZ}" "_dstack-app-address.${DOMAIN}.b.${DZ}"
+record CNAME "_acme-challenge.${DOMAIN}.${DZ}" "_acme-challenge.${DOMAIN}.a.${DZ}"
+echo "[{\"appId\": \"app_${OLD_B}\", \"cvmName\": \"gw-mainnet-b\", \"status\": \"running\"}]" >"$S/cvms.json"
+run inactive --compose "$COMPOSE" --yes
+expect_rc "…and a while b is live, through a real create" 0
+check "…naming the CVM after a" grep -qx gw-mainnet-a "$S/deploy.args"
+fresh; record CNAME "_dstack-app-address.${DOMAIN}.${DZ}" "_dstack-app-address.${DOMAIN}.c.${DZ}"
+run inactive --compose "$COMPOSE" --yes
+expect_err "inactive is refused while the cold standby is live" "the cold standby c is live"
+not_created "inactive with c live"
+fresh; rm "$S/dns/CNAME/_dstack-app-address.${DOMAIN}.${DZ}"
+run inactive --compose "$COMPOSE" --yes
+expect_err "inactive is refused when nothing is live" "points at no side"
+fresh; record CNAME "_dstack-app-address.${DOMAIN}.${DZ}" "elsewhere.example"
+run inactive --compose "$COMPOSE" --yes
+expect_err "inactive is refused on an unrecognized traffic switch" "unrecognized target"
+fresh; run d --compose "$COMPOSE" --yes
+expect_err "an unknown side is refused" "want: a|b|c|inactive"
+
+# --resolve-side: which side, with nothing but DOMAIN and DNS — no secrets, no compose.
+fresh; RC=0
+OUT="$(env -i PATH="$WORK/bin:$PATH" HOME="$WORK" SECRETS_ENV=/nonexistent FAKE_DIR="$S" \
+  DOMAIN="$DOMAIN" DELEGATION_ZONE="$DZ" bash "$DEPLOY" inactive --resolve-side 2>"$WORK/err")" || RC=$?
+ERR="$(cat "$WORK/err")"
+expect_rc "--resolve-side needs no secrets and no compose" 0
+check "…and prints side=b on stdout" [ "$OUT" = side=b ]
+not_created "--resolve-side"
+fresh; RC=0
+OUT="$(env -i PATH="$WORK/bin:$PATH" HOME="$WORK" SECRETS_ENV=/nonexistent FAKE_DIR="$S" \
+  DOMAIN="$DOMAIN" DELEGATION_ZONE="$DZ" bash "$DEPLOY" c --resolve-side 2>"$WORK/err")" || RC=$?
+check "--resolve-side passes a named side through" [ "$RC:$OUT" = 0:side=c ]
+
 fresh; run a --compose "$COMPOSE" --yes
 expect_err "refuses the live side" "side a is live"
 not_created "live side"
