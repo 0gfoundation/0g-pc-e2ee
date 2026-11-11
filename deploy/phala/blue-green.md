@@ -115,7 +115,8 @@ Step 4 may wait until the next release — keeping a around makes `rollback`
 instant — but `deploy-side.sh` refuses to create a side whose previous CVM still
 exists, so it has to be gone before that side is deployed again.
 
-Step 3 checks side b's **readiness** (on `PLATFORM_BASE`, which `switch` requires)
+Step 3 checks side b's **readiness** (on the cluster b publishes — see
+[Where each side's cluster comes from](#where-each-sides-cluster-comes-from))
 before the flip — can it actually serve, not just is it listening — so a b that
 cannot verify any provider is rejected instead of briefly taking traffic. Allow it
 time: a cold side must finish its first warmer sweep, which is why the probe window
@@ -266,8 +267,9 @@ and identically on both sides** (see the `app_id` note above), toggled by value.
 ### Where `GATEWAY_DOMAIN` does and does not matter
 
 The last line of each side's block in ③ is the one to understand, because it is
-the only place a side's `GATEWAY_DOMAIN` value goes — and here **nothing reads
-it**.
+the only place a side's `GATEWAY_DOMAIN` value goes — and here **no resolver reads
+it**. (The scripts do, since 2026-11: it is how they learn a side's cluster — see
+[Where each side's cluster comes from](#where-each-sides-cluster-comes-from).)
 
 Upstream dstack-ingress's delegation mode assumes the served name is aliased to
 `<DOMAIN>.<DELEGATION_ZONE>` and that *the container owns that hop*, so it writes
@@ -304,27 +306,53 @@ Note `switch.sh status` is no help here: it prints ②'s serving alias, which is
 hand-set and unaffected. The record to look at is the side's own, in ③ —
 
 ```sh
-# the platform's own answer for which cluster this CVM is in, from its info dump:
-#   kms_info.gateway_app_url = https://gateway.<cluster>.phala.network
+# the platform's own answer for which cluster this CVM is in:
+#   phala cvms get <app_id> --json   ->   "gateway": {"base_domain": "<cluster>.phala.network", …}
 
 # what that side's ingress actually published:
 dig +short CNAME router-api.0g.ai.a.integratenetwork.work
 ```
 
-— and it must read exactly `_.<cluster>.phala.network`. Two ways it can be wrong
-*and stay silent*: another cluster, or `_._.<cluster>.phala.network` if the
-platform ever exports the `_.` form itself. Both are silent for all the reasons
-above, so this is an eyeball check with no fallback. (A platform exporting
+— and it must read exactly `_.<cluster>.phala.network`. `deploy-side.sh` checks
+the form, and stops on `_._.<cluster>.phala.network`, which is what a platform
+exporting the `_.` form itself would produce. Which cluster it names is no longer
+something to check against a list: it is the side's cluster, by definition (next
+section). (A platform exporting
 *nothing* is the loud case instead: the ingress tries to write a bare `_.`, the
 provider rejects it, and that container crash-loops with the reason in its log
 while the gateway keeps serving. The `docker-compose.yml` comment on that line has
 why it is deliberately unguarded.)
 
-Across clusters this record is still not read. `switch.sh` writes the serving
-alias from `PLATFORM_BASE` / `PLATFORM_BASE_COLD` instead, and a wrong value there is caught
-before anything is written: the per-side probe
-(`<app_id>-443s.<that side's base>`) only answers if the side really runs in the
-cluster configured for it. See [Cross-cluster fallback](#cross-cluster-fallback).
+### Where each side's cluster comes from
+
+From the side itself: the `_.<cluster>` its ingress publishes at
+`<DOMAIN>.<side>.<DZ>`, above. Both scripts read it there — `deploy-side.sh` to
+probe the new side, `switch.sh` for gate 2's probe host and for the
+`gw.<cluster>` it writes into the serving alias. `PLATFORM_BASE` /
+`PLATFORM_BASE_COLD` are only a fallback for a side that publishes nothing yet
+(`setup` before the first deploy), and an expectation: both scripts warn when a
+side publishes something else, and use what it publishes.
+
+Why not the config. The node is what an operator chooses (`PHALA_NODE_ID`); the
+cluster a node's new CVMs join is the platform's choice, and it changes. In 2026-11
+Phala put new CVMs on `prod5` behind `dstack-pha1-prod5.phala.network` (and a
+different KMS) during maintenance, while the CVMs already running there stayed on
+`dstack-pha-prod5.phala.network`. With the cluster in the env file, a deploy failed
+outright, and a fixed config could not describe a and b at once. Read from the side,
+a and b may sit in different clusters: a switch between them then moves the serving
+alias as a switch onto c does, with the same short window
+([Cross-cluster fallback](#cross-cluster-fallback)), and `rollback` moves it back.
+
+Why it is safe to trust. The value comes from `DSTACK_GATEWAY_DOMAIN`, which the
+platform injects at boot (from `/dstack/user_config`, which is not measured, so the
+host could change it — README, "Serving domain" — but a host can deny service
+anyway), and only something holding the delegation zone's token can rewrite the
+record — the same token that can already rewrite the traffic switch. And a wrong
+value cannot move traffic: gate 2 probes `<app_id>-443s.<that cluster>`, which only
+the gateway of the cluster the side really runs in will route, so `switch` refuses
+before writing anything. A deleted side's record stays behind with its old cluster;
+that is harmless for the same reason, and `deploy-side.sh` re-reads it on every poll
+until the new CVM's ingress has rewritten it.
 
 ## One-time setup
 
@@ -341,31 +369,30 @@ cp deploy/phala/switch.env.example deploy/phala/switch.env
 
 Or supply it via the environment instead (`CF_API_TOKEN=... ./switch.sh …`); the
 real environment overrides `switch.env`, and `--env-file PATH` points elsewhere.
-Also set `PLATFORM_BASE` (e.g. `in1.phala.network`) in `switch.env` — `setup`,
-`switch`, `failover` and `rollback` refuse to run without it. It is the **one place
-the cluster is named on the operator side**: `setup` writes the serving alias from
-it, and `switch` builds the per-side pre-switch probe from it
-([Health-checking the standby](#health-checking-the-standby-side)) and refuses if
-the live alias names a different cluster, so the alias and the probe cannot drift
-apart. (A cold standby in another cluster adds `PLATFORM_BASE_COLD` — see
-[Cross-cluster fallback](#cross-cluster-fallback).) Read `<cluster>` off a CVM's
-`kms_info.gateway_app_url` (`https://gateway.<cluster>.phala.network`) rather than
-from memory.
+Also set `PLATFORM_BASE` (e.g. `in1.phala.network`) in `switch.env`: the cluster
+a and b are expected in. Once a side has deployed, `switch.sh` uses the cluster
+that side publishes instead ([Where each side's cluster comes from](#where-each-sides-cluster-comes-from)),
+so this is needed only before the first deploy — for `setup` — and otherwise only
+makes `status` warn when a side runs somewhere else. (A cold standby adds
+`PLATFORM_BASE_COLD` — see [Cross-cluster fallback](#cross-cluster-fallback).)
+Read `<cluster>` off a CVM — `gateway.base_domain` in `phala cvms get <app_id> --json`
+— rather than from memory.
 
 1. **Serving alias (once).** The one record you create by hand in the delegation
    zone: `router-api.0g.ai.integratenetwork.work` CNAME → the cluster's dstack
    gateway, `gw.<cluster>.phala.network` (not `_.`: see above). This is the hop that carries traffic (②
    above), and it is the operator's to set — the CVMs no longer take a cluster
    value from you at all. With both sides in one cluster it never changes, and one
-   static value serves both. `switch.sh setup` writes it from `PLATFORM_BASE`:
+   static value serves both. `switch.sh setup` writes it from the live side's (else
+   a's) published cluster, or `PLATFORM_BASE` before any side has published one:
 
    ```sh
-   ./switch.sh setup            # serving alias -> gw.${PLATFORM_BASE}
+   ./switch.sh setup            # serving alias -> gw.<cluster>
    ```
 
-   `status` warns if the live alias later drifts from the live side's cluster. Without
-   `PLATFORM_BASE`, `setup` refuses and prints whatever the alias currently points
-   at, so you can read the cluster off it.
+   `status` warns if the live alias later drifts from the live side's cluster. With
+   neither, `setup` refuses and prints whatever the alias currently points at, so
+   you can read the cluster off it.
 
    Everything else in `integratenetwork.work` is automatic: the two switch records
    (`_dstack-app-address.…` and `_acme-challenge.…`) are created and flipped by
@@ -458,7 +485,7 @@ switch to the production compose only once it works.
 2. **gate 1** — reads side b's published `app_id` from the delegation zone;
    aborts if b has not published one (its CVM is not up);
 3. **gate 2** — probes side b's **readiness** (`/readyz`) **directly** before
-   sending it any traffic (at `<app_id>-443s.<PLATFORM_BASE>`, or an explicit
+   sending it any traffic (at `<app_id>-443s.<b's cluster>`, or an explicit
    `--probe-url`),
    retrying up to `PROBE_RETRIES` times `PROBE_INTERVAL` apart; refuses to switch
    if b never becomes ready. This asks whether b can actually *serve* — not merely
@@ -613,10 +640,10 @@ app_id and the release. A side that fails is left running for inspection.
    |---|---|
    | `DOMAIN` | served hostname (required; no default) |
    | `DELEGATION_ZONE`, `CF_ZONE` | base delegation zone; a side's is `<side>.<DELEGATION_ZONE>` |
-   | `PLATFORM_BASE`, `PLATFORM_BASE_COLD` | the clusters, as for `switch.sh` |
+   | `PLATFORM_BASE`, `PLATFORM_BASE_COLD` | optional: the clusters the sides are expected in. The side's cluster is the one it publishes; a different one is reported, not refused ([Where each side's cluster comes from](#where-each-sides-cluster-comes-from)) |
    | `CVM_NAME_PREFIX` | CVMs are named `<prefix>-<side>`: `pc-gateway-mainnet-b` |
    | `PHALA_INSTANCE_TYPE` | the shape ([README](./README.md#cvm-shape--and-the-one-setting-that-depends-on-it)) |
-   | `PHALA_NODE_ID`, `PHALA_NODE_ID_COLD` | required: the node, by its **name** (NAME in `phala nodes ls`, e.g. `prod5`), so a side lands in its cluster rather than being caught after it boots elsewhere. Since 2026-11 the API takes only the name, in `node`, and refuses `node_id` / `teepod_id` (the HashID `node_aOwADKBd` and the number alike); phala CLI 1.1.22 can send only a numeric `node_id` — which is why the CVM is created by [`provision.cjs`](./provision.cjs), the CLI's two API calls with `node` set by name |
+   | `PHALA_NODE_ID`, `PHALA_NODE_ID_COLD` | required: the node, by its **name** (NAME in `phala nodes ls`, e.g. `prod5`). It is what decides the cluster, though the platform decides which cluster a node's new CVMs join. Since 2026-11 the API takes only the name, in `node`, and refuses `node_id` / `teepod_id` (the HashID `node_aOwADKBd` and the number alike); phala CLI 1.1.22 can send only a numeric `node_id` — which is why the CVM is created by [`provision.cjs`](./provision.cjs), the CLI's two API calls with `node` set by name |
    | `PHALA_OS_IMAGE` | optional: pin the OS image |
    | `ZG_PROM_ENV` | the metrics `env` label: `staging` / `mainnet` |
    | `CVM_REQUIRED_KEYS` | optional: CVM keys that must be set — staging lists `ZG_GATEWAY_ROUTER_URL`, so losing that line (or, for a key from `CVM_SECRET_ENV`, the secret) stops the deploy instead of the production default taking over |
@@ -702,15 +729,17 @@ answer, so publishing two values does not help either.
    and b ([One-time setup](#one-time-setup), step 2). Lend it issuance first so it
    can get its certificate: `./switch.sh acme c`, wait for it to issue,
    `./switch.sh acme live`.
-2. Name its cluster in `switch.env`, read off **c's** CVM (`kms_info.gateway_app_url`):
+2. Optionally name its expected cluster in `switch.env`; `switch.sh` uses the one c
+   publishes either way, and warns when they differ:
 
    ```sh
    PLATFORM_BASE=in1.phala.network            # main cluster: a and b
    PLATFORM_BASE_COLD=<other>.phala.network   # cold cluster: c
    ```
 
-   A wrong value is caught before anything is written: the per-side probe cannot
-   reach an `app_id` on a cluster it does not run in, so gate 2 refuses.
+   A wrong value — published or configured — is caught before anything is written:
+   the per-side probe cannot reach an `app_id` on a cluster it does not run in, so
+   gate 2 refuses.
 3. `./switch.sh status` now lists c with its cluster, readiness and certificate.
 
 What `status` cannot show is that a real connection to `<DOMAIN>` works end to
@@ -865,14 +894,14 @@ To fall back to the weaker liveness-only gate, point `--probe-url` at `/healthz`
 *standby* before cutover needs a way to reach it directly. The dstack platform
 gives you one, and it works alongside the custom domain:
 
-> **`https://<app_id>-443s.<PLATFORM_BASE>/readyz`** reaches a specific side
+> **`https://<app_id>-443s.<cluster>/readyz`** reaches a specific side
 > directly. The `-443s` form is TLS **passthrough** to that CVM's ingress on 443,
 > and the gateway routes it by the **app_id in the hostname** — independent of the
 > custom domain's `_dstack-app-address` — so it hits the standby even though no
 > traffic points at it yet. (Validated on `in1.phala.network`.)
 
-`switch.sh` builds this URL from `PLATFORM_BASE` (e.g. `in1.phala.network`,
-required) and the target side's published `app_id`, and probes it
+`switch.sh` builds this URL from the target side's published cluster (e.g.
+`in1.phala.network`; `PLATFORM_BASE` if it publishes none) and `app_id`, and probes it
 automatically before every switch, refusing to cut over unless the standby reports
 ready (retrying `PROBE_RETRIES` times, `PROBE_INTERVAL` apart). `./switch.sh status`
 prints each side's probe URL. An explicit `--probe-url` overrides it — including to
@@ -989,9 +1018,11 @@ Two consequences for testing it:
   clusters has a short outage window — see
   [Cross-cluster fallback](#cross-cluster-fallback). `setup` refuses to point the
   alias away from the live side's cluster; move traffic with `switch`/`failover`.
-- **`switch`/`failover`/`rollback` need `PLATFORM_BASE`**, and `PLATFORM_BASE_COLD`
-  for any move onto or off c, to probe the target — see
-  [Health-checking the standby](#health-checking-the-standby-side).
+- **`switch`/`failover`/`rollback` need each side's cluster**, to probe the target —
+  the one it publishes, or `PLATFORM_BASE` / `PLATFORM_BASE_COLD` for a side that
+  publishes none. See [Where each side's cluster comes from](#where-each-sides-cluster-comes-from).
+- **A switch between a and b can cross clusters** when the platform has put them in
+  different ones, and then has the same short window as a move onto c.
 - **Cutover latency** is the switch-layer `TTL` (default 60 s) plus the dstack
   gateway's cache of `_dstack-app-address`, which follows the record's TTL
   (**observed ~30 s** on `in1.phala.network`; **~90 s** on
