@@ -13,6 +13,9 @@
 #   cluster            the cluster a created CVM lands in (in1.phala.network if absent)
 #   published          if present, the serving CNAME the ingress writes instead of
 #                      `_.<cluster>` (a malformed one, say)
+#   cname_blank        if present, lookup numbers (one per line, counted per name
+#                      from 1) at which the nameserver gives no answer for a CNAME
+#                      that exists: a timed-out query, or one mid-rewrite
 #   cname_lag          if present, N: the ingress writes the TXT at once but its
 #                      serving CNAME only after N more lookups of it, so until then
 #                      the record still holds whatever the old CVM left there
@@ -56,6 +59,10 @@ if [ -f "$f.next" ]; then   # a write the ingress has not made yet (cname_lag)
   if [ "$n" -le 0 ]; then mv "$f.next" "$f"; rm -f "$f.lag"; else echo $((n - 1)) >"$f.lag"; fi
 fi
 [ -f "$f" ] || exit 0
+if [ "${args[0]}" = CNAME ] && [ -f "$FAKE_DIR/cname_blank" ]; then
+  c="$f.count"; n=$(( $(cat "$c" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$c"
+  grep -qx "$n" "$FAKE_DIR/cname_blank" && exit 0
+fi
 case "${args[0]}" in
   TXT)   printf '"%s"\n' "$(cat "$f")" ;;
   CNAME) printf '%s.\n' "$(cat "$f")" ;;
@@ -346,6 +353,20 @@ check "…and says the cutover will move the serving alias" err_has "the live si
 fresh; record CNAME "${DOMAIN}.a.${DZ}" "_.${BASE}"
 run b --compose "$COMPOSE" --yes
 check_not "a side in the live side's cluster gets no such warning" err_has "the live side a runs in"
+
+# Lookup 1 is check_published's; 2 and 3 are check_ready's first two polls.
+fresh; echo in2.phala.network >"$S/cluster"; printf '2\n3\n' >"$S/cname_blank"
+run b --compose "$COMPOSE" --yes
+expect_rc "a CNAME lookup that returns nothing while waiting for /readyz is retried, not fatal" 0
+check "…and the url names the cluster the side was found ready on" \
+  [ "$OUT" = $'app_id='"$NEW_APP"$'\nurl=https://'"$NEW_APP"'-443s.in2.phala.network' ]
+# Every lookup after the one check_ready succeeded on comes back empty: the
+# result must be the cluster it probed, not a re-read.
+fresh; echo in2.phala.network >"$S/cluster"; printf '%s\n' $(seq 3 50) >"$S/cname_blank"
+run b --compose "$COMPOSE" --yes
+expect_rc "the cluster is the one check_ready probed, not a lookup after it" 0
+check "…so a failed lookup afterwards cannot leave a broken url" \
+  [ "$OUT" = $'app_id='"$NEW_APP"$'\nurl=https://'"$NEW_APP"'-443s.in2.phala.network' ]
 
 fresh; echo "_._.in2.phala.network" >"$S/published"
 run b --compose "$COMPOSE" --yes
