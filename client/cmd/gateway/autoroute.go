@@ -21,6 +21,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/clientip"
 	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
@@ -44,22 +45,38 @@ import (
 // The opening (classifierSystemBytes + classifierUserBytes, truncated) goes to
 // the classifier at POST /v1/decisions through this gateway's own dispatch, so
 // it is sealed exactly when a caller's request naming the classifier would be:
-// when the classifier is in -seal-models, unless the caller's own
-// X-0G-Encrypted-Transit lets that path forward in the clear. When it crosses
-// the router in the clear, the response says so (X-0G-Auto-Classifier-E2EE:
-// none; otherwise sealed). It is
-// sent once per conversation — the task is cached by credential and opening,
-// and later turns share the opening — and not at all when the request could
-// not use auto anyway (a precheck preview runs first) or the caller pinned a
-// provider. With the classifier not sealed and the effective
-// encrypted_transit "required", nothing is sent either; the task is "general".
+// when the classifier is in -seal-models.
+//
+// The opening crosses the router in the clear only when the caller's own
+// X-0G-Encrypted-Transit allows it with "off" or "preferred": a sealed
+// classification falls back to the clear on those, and a classifier outside
+// -seal-models is used only for such callers. For anyone else that
+// classifier is not called; the task is "general" and nothing is sent. Whenever the
+// opening has gone out, the response says how (X-0G-Auto-Classifier-E2EE:
+// sealed or none).
+//
+// It is sent once per conversation — the task is cached by credential and
+// opening, and later turns share the opening — and not at all when the
+// request could not use auto anyway (a precheck preview runs first) or the
+// caller pinned a provider.
+//
+// The cache keeps a conversation on one task within one gateway instance and
+// one credential, for the cache TTL. A conversation can still change model:
+// on another instance, after a credential change (a refreshed JWT), when its
+// entry expires or is evicted (a cached failure after autoFailureTTL), when a
+// turn that was not classified (pinned provider, no consent to cleartext) is
+// followed by one that is, or when the router's ranking for the task changes
+// (the model is chosen again every turn).
 //
 // The classification is a normal inference request on the caller's own
 // credential: the router authenticates and bills it, applies the caller's
 // rules to it, and the caller pays for it.
 //
 // Enabled whenever -seal-models is a list (the only configuration that has
-// models to choose between sealed and not); the router's features.auto_routing
+// models to choose between sealed and not). A list that seals the chat
+// surface whole (chatbot:*) sends chat requests to the sealed path before the
+// auto layer sees them, so "0g/auto" does not work there; the router's
+// features.auto_routing
 // decides whether it does anything (the precheck answers 404 or 400 when off).
 
 const (
@@ -87,8 +104,9 @@ const (
 	autoCacheEntries = 10000
 	autoCacheTTL     = 24 * time.Hour
 	// autoFailureTTL is how long a failed classification is remembered as
-	// "general": long enough that a conversation does not switch model
-	// mid-way when the classifier comes back, short enough to retry soon.
+	// "general": long enough that a conversation does not switch model on
+	// every turn while the classifier is failing, short enough to retry soon.
+	// (Within one instance; see "The classification" above.)
 	autoFailureTTL = time.Hour
 
 	maxAutoControlBody = 1 << 20
@@ -214,6 +232,9 @@ func (a *autoRouter) resolve(w http.ResponseWriter, r *http.Request, body []byte
 	case pinsProvider(r.Header, req):
 		// The pin is for the main model; the classifier cannot be sent there,
 		// and sending the opening anywhere else goes against the pin.
+	case !a.classifierSealed && !callerAllowsClear(r):
+		// The classification would cross the router in the clear, and only
+		// the caller's own header may allow that.
 	default:
 		key := a.cacheKey(cred, opening.input())
 		if t, clear, hit := a.cache.get(key); hit {
@@ -235,9 +256,7 @@ func (a *autoRouter) resolve(w http.ResponseWriter, r *http.Request, body []byte
 			relayRouterError(w, status, rbody, rh)
 			return nil, "", false
 		}
-		required := strings.EqualFold(pre.EncryptedTransit, "required") ||
-			strings.EqualFold(strings.TrimSpace(r.Header.Get(openaiproxy.HeaderEncryptedTransit)), "required")
-		if required && !a.classifierSealed {
+		if strings.EqualFold(pre.EncryptedTransit, "required") && !a.classifierSealed {
 			// The opening may not leave in the clear at all.
 			break
 		}
@@ -301,6 +320,16 @@ func (a *autoRouter) resolve(w http.ResponseWriter, r *http.Request, body []byte
 	w.Header().Set(openaiproxy.HeaderAutoModel, model)
 	a.logger.Debug("auto routing", "task", task, "model", model, "classified", classified, "classified_in_clear", inClear)
 	return out, model, true
+}
+
+// callerAllowsClear reports whether the caller's own X-0G-Encrypted-Transit
+// allows a cleartext request: off or preferred.
+func callerAllowsClear(r *http.Request) bool {
+	switch strings.ToLower(strings.TrimSpace(r.Header.Get(openaiproxy.HeaderEncryptedTransit))) {
+	case "off", "preferred":
+		return true
+	}
+	return false
 }
 
 // classifierE2EE is X-0G-Auto-Classifier-E2EE for a classified conversation.
@@ -708,6 +737,7 @@ func (a *autoRouter) post(ctx context.Context, url, cred string, h http.Header, 
 	if cred != "" {
 		req.Header.Set("Authorization", cred)
 	}
+	clientip.Stamp(req) // router-bound: sign the client address
 	resp, err := a.client.Do(req)
 	if err != nil {
 		return 0, nil, nil, err
