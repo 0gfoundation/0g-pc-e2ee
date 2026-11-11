@@ -20,6 +20,8 @@
 #   cert.<app>     days of validity left on that app's cert (80 if absent)
 #   untrusted.<app>  if present, that app's cert does not chain to a trusted CA, or
 #                  is not for DOMAIN: `s_client -verify_return_error` fails on it
+#   tlsflaky.<app> if present, N: that many verified handshakes to the app fail
+#                  first (a TLS hiccup), then they succeed
 #
 # Routing follows dstack. A connection to the public name goes to the cluster the
 # serving alias names (`gw.<base>`, or the old `_.<base>`); that cluster's gateway follows the traffic
@@ -190,6 +192,10 @@ case "${1:-}" in
     app="$(app_for_host "$host")"
     [ -n "$app" ] || exit 1
     [ "$verify" = 1 ] && [ -f "$S/untrusted.$app" ] && exit 1
+    if [ "$verify" = 1 ] && [ -f "$S/tlsflaky.$app" ]; then
+      n="$(cat "$S/tlsflaky.$app")"
+      if [ "$n" -gt 0 ]; then echo $((n - 1)) >"$S/tlsflaky.$app"; exit 1; fi
+    fi
     echo "CERT $app" ;;
   x509)
     read -r _ app || exit 1
@@ -265,7 +271,7 @@ run() {
   set +e
   OUT="$(env -i PATH="$WORK/bin:$PATH" HOME="$WORK" SECRETS_ENV=/nonexistent \
     FAKE_DIR="$S" FAKE_DOMAIN="$DOMAIN" FAKE_ADDR_SWITCH="$ADDR_SWITCH" FAKE_ALIAS="$ALIAS" \
-    CF_API_TOKEN=test PROBE_RETRIES=3 PROBE_INTERVAL=0 VERIFY_RETRIES=3 VERIFY_INTERVAL=0 \
+    CF_API_TOKEN=test PROBE_RETRIES=3 PROBE_INTERVAL=0 VERIFY_RETRIES=3 VERIFY_INTERVAL=0 CERT_INTERVAL=0 \
     "${envs[@]}" bash "$SWITCH" --env-file "$S/env" "$@" 2>&1)"
   RC=$?
   # shellcheck disable=SC2001  # a regex, not a fixed string
@@ -800,6 +806,17 @@ expect_fail && expect_out "does not present a trusted certificate" && expect_no_
 
 t "gate 3: failover is refused as well"
 pub b "$NB"; touch "$S/untrusted.appb"
+run PLATFORM_BASE=$BASE -- failover b --yes
+expect_fail && expect_out "does not present a trusted certificate" && expect_no_writes && ok
+
+t "gate 3: a TLS hiccup is retried, not fatal"
+pub b "$NB"; echo 2 >"$S/tlsflaky.appb"
+run PLATFORM_BASE=$BASE -- failover b --yes
+expect_rc 0 && expect_out "certificate check 1/3" && expect_out "certificate check 2/3" \
+  && expect_cname "$ADDR_SWITCH" "$(addr_side b)" && ok
+
+t "gate 3: gives up after CERT_RETRIES"
+pub b "$NB"; echo 3 >"$S/tlsflaky.appb"
 run PLATFORM_BASE=$BASE -- failover b --yes
 expect_fail && expect_out "does not present a trusted certificate" && expect_no_writes && ok
 
