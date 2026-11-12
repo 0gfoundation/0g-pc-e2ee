@@ -34,6 +34,7 @@ type fakeAutoRouter struct {
 	task           string // the classifier's answer
 	decisionDelay  time.Duration
 	chosen         string // auto.model on the model-choice preview
+	selectTransit  string // encrypted_transit on the model-choice preview
 
 	prechecks, decisions, selects int
 	decisionHeaders               http.Header
@@ -65,7 +66,7 @@ func (f *fakeAutoRouter) server(t *testing.T) *httptest.Server {
 			}
 			f.selects++
 			f.selectReq = body
-			_, _ = io.WriteString(w, `{"providers":[{"address":"0xp"}],"auto":{"enabled":true,"task":"x","model":"`+f.chosen+`"}}`)
+			_, _ = io.WriteString(w, `{"providers":[{"address":"0xp"}],"auto":{"enabled":true,"task":"x","model":"`+f.chosen+`"},"encrypted_transit":"`+f.selectTransit+`"}`)
 		case "/v1/decisions":
 			f.decisions++
 			if d := f.decisionDelay; d > 0 {
@@ -338,6 +339,66 @@ func TestAutoCallerRequiredDoesNotClassifyInClear(t *testing.T) {
 	}
 	if resp.Header.Get(openaiproxy.HeaderAutoTask) != autoGeneral {
 		t.Errorf("task = %q, want general", resp.Header.Get(openaiproxy.HeaderAutoTask))
+	}
+}
+
+// The router picks the model, and so whether dispatch seals the request. Under
+// encrypted_transit=required — the caller's header, or the router's merged
+// value — a model this gateway does not seal is refused before anything is
+// forwarded; otherwise "0g/auto" promises no encryption and it goes through.
+func TestAutoRequiredRefusesUnsealedChosenModel(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		header        string // the caller's X-0G-Encrypted-Transit ("" = absent)
+		selectTransit string // the model-choice preview's encrypted_transit
+		chosen        string
+		wantRefused   bool
+	}{
+		{"caller required, unsealed", "required", "", "deepseek-v4-pro", true},
+		{"caller required (any case), unsealed", " Required ", "", "deepseek-v4-pro", true},
+		{"router required, no header, unsealed", "", "required", "deepseek-v4-pro", true},
+		{"router required, caller preferred, unsealed", "preferred", "Required", "deepseek-v4-pro", true},
+		{"caller required, sealed", "required", "required", sealedModel, false},
+		{"no header, unsealed", "", "", "deepseek-v4-pro", false},
+		{"preferred, unsealed", "preferred", "preferred", "deepseek-v4-pro", false},
+		{"off, unsealed", "off", "off", "deepseek-v4-pro", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeAutoRouter{task: "math", chosen: tc.chosen, selectTransit: tc.selectTransit}
+			gw := autoGateway(t, f)
+			resp, body := postAuto(t, gw.URL, autoBody, map[string]string{openaiproxy.HeaderEncryptedTransit: tc.header})
+			if _, _, s := f.counts(); s != 1 {
+				t.Fatalf("selects = %d, want 1", s)
+			}
+			if tc.wantRefused {
+				if resp.StatusCode != http.StatusBadGateway {
+					t.Fatalf("status = %d (%s), want 502", resp.StatusCode, body)
+				}
+				if len(f.chatBodies) != 0 {
+					t.Errorf("the conversation reached the router in the clear under required: %v", f.chatBodies)
+				}
+				if got := resp.Header.Get(openaiproxy.HeaderAutoModel); got != "" {
+					t.Errorf("%s = %q on a refused request", openaiproxy.HeaderAutoModel, got)
+				}
+				return
+			}
+			// The sealed path has no live router behind this test's clients (as
+			// in TestAutoChosenSealedModelIsSealed), so only a cleartext pass is
+			// expected to answer 200; either way the auto layer let it through.
+			if tc.chosen != sealedModel && resp.StatusCode != http.StatusOK {
+				t.Fatalf("status = %d (%s), want 200", resp.StatusCode, body)
+			}
+			if got := resp.Header.Get(openaiproxy.HeaderAutoModel); got != tc.chosen {
+				t.Errorf("%s = %q, want %q", openaiproxy.HeaderAutoModel, got, tc.chosen)
+			}
+			wantClear := 0
+			if tc.chosen != sealedModel {
+				wantClear = 1
+			}
+			if len(f.chatBodies) != wantClear {
+				t.Errorf("router got %d cleartext chat requests, want %d", len(f.chatBodies), wantClear)
+			}
+		})
 	}
 }
 
