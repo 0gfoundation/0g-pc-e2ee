@@ -77,10 +77,10 @@ func newRouterProxy(target *url.URL, logger *slog.Logger) *httputil.ReverseProxy
 			// would hand the untrusted router our internal hostname, and an
 			// X-Forwarded-For the router has no way to tell from a client's own.
 			pr.SetURL(target)
-			// The one client fact the router IS told: the client's address, signed so
-			// the router can tell it from a forgery (clientip). Stamp also drops any
-			// X-0G-Client-IP set the client sent, which ReverseProxy would otherwise
-			// copy through with every other inbound header.
+			// The client's address, signed so the router can tell it from a forgery,
+			// and the client program's name next to it (clientip). Stamp also drops
+			// any X-0G-Client-IP set or X-0G-Client the client sent, which
+			// ReverseProxy would otherwise copy through with every other inbound header.
 			clientip.Stamp(pr.Out)
 		},
 		ModifyResponse: func(resp *http.Response) error {

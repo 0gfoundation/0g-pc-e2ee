@@ -22,6 +22,13 @@
 // the TEE, by way of dstack-ingress. It is good enough to rate-limit and block on;
 // it is not something the attestation vouches for.
 //
+// Alongside the address the gateway names the program the client used
+// (X-0G-Client: claude-code, codex, ..., see client.go), classified here from the
+// User-Agent and attribution headers so the raw User-Agent never leaves the CVM.
+// It travels only with a signed address, so the router believes it exactly when
+// the signature verifies: the client cannot reach the key, and every caller-sent
+// copy is dropped first.
+//
 // Where it goes. Only to the router: Stamp signs a request only when its target is
 // the router host the Signer was built with, so a provider's broker — a third party
 // — never receives a client's address, whichever call site Stamp is used at. And
@@ -100,14 +107,18 @@ type ctxKey struct{}
 type state struct {
 	signer *Signer
 	ip     string
+	client string // Classify's verdict, "" when not recorded (WithClient alone)
 }
 
-// Middleware records the client's address for the request, for Stamp to sign. The
+// Middleware records the client's address for the request, for Stamp to sign, and
+// the program it used (Classify over its User-Agent, X-Title and HTTP-Referer). The
 // address is the host of r.RemoteAddr, which under -proxy-protocol is the client's;
 // a loopback or unparseable peer (the -health probe, a local run) records nothing.
 func (s *Signer) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		next.ServeHTTP(w, r.WithContext(s.WithClient(r.Context(), r.RemoteAddr)))
+		ctx := s.WithClient(r.Context(), r.RemoteAddr)
+		ctx = WithClientName(ctx, Classify(r.Header.Get("User-Agent"), r.Header.Get("X-Title"), r.Header.Get("HTTP-Referer")))
+		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
@@ -121,19 +132,33 @@ func (s *Signer) WithClient(ctx context.Context, remoteAddr string) context.Cont
 	return context.WithValue(ctx, ctxKey{}, state{signer: s, ip: ip})
 }
 
-// Strip removes the three headers. Every header a client sends in the X-0G-*
-// namespace is otherwise forwarded to the router, and these are not the client's
-// to set; the router would reject a forged set anyway, but it should never see one
-// from us.
+// WithClientName returns ctx with name recorded as the client's program, for
+// Stamp to send as X-0G-Client. It records nothing unless ctx already carries an
+// address (WithClient): the name rides only with a signed address.
+func WithClientName(ctx context.Context, name string) context.Context {
+	st, ok := ctx.Value(ctxKey{}).(state)
+	if !ok {
+		return ctx
+	}
+	st.client = name
+	return context.WithValue(ctx, ctxKey{}, st)
+}
+
+// Strip removes the three address headers and X-0G-Client. Every header a client
+// sends in the X-0G-* namespace is otherwise forwarded to the router, and these
+// are not the client's to set; the router would reject a forged address anyway,
+// but it should never see one from us, and an X-0G-Client left in place would
+// ride next to our signature as if we had set it.
 func Strip(h http.Header) {
 	h.Del(HeaderIP)
 	h.Del(HeaderTs)
 	h.Del(HeaderSig)
+	h.Del(HeaderClient)
 }
 
 // Stamp strips any client-supplied copies of the headers from req and, when the
 // request's context carries an address (Middleware) and req targets the router,
-// sets a freshly signed set. Safe to call on any outbound request: one bound
+// sets a freshly signed set, and X-0G-Client when a name was recorded. Safe to call on any outbound request: one bound
 // elsewhere, or made outside a client request, is only stripped.
 func Stamp(req *http.Request) {
 	Strip(req.Header)
@@ -145,6 +170,9 @@ func Stamp(req *http.Request) {
 	req.Header.Set(HeaderIP, st.ip)
 	req.Header.Set(HeaderTs, strconv.FormatInt(ts, 10))
 	req.Header.Set(HeaderSig, Sign(st.signer.key, st.ip, ts))
+	if st.client != "" {
+		req.Header.Set(HeaderClient, st.client)
+	}
 }
 
 // clientAddr returns the canonical text of remoteAddr's IP, or "" for a loopback

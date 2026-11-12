@@ -908,6 +908,16 @@ X-0G-Client-IP-Sig: hex(HMAC-SHA256(key, "0g-client-ip/v1\n" + ip + "\n" + ts))
   in both `env/*.env`: a missing secret stops the deploy. A target whose router does
   not use the header (a testnet, a self-hosted router) can leave it out of its own
   env file, and the gateway then sends nothing.
+- **Which client (`X-0G-Client`).** Next to a signed address the gateway also sends
+  the name of the program the caller used — `claude-code`, `codex`, `opencode`,
+  `cline`, ..., `other` when no rule matches, `unknown` with no User-Agent — for the
+  router's usage attribution. It is classified inside the CVM from the User-Agent,
+  `X-Title` and `HTTP-Referer` (`client/clientip/client.go`, the same rules as the
+  router's, held in step by a shared vector file); the raw User-Agent is not
+  forwarded, since its version, OS and runtime together fingerprint a user. A
+  caller-sent `X-0G-Client` is dropped first, and the router takes the header only
+  on a request whose address signature verifies, so it cannot be forged from either
+  side. Without the key nothing is signed and the name is not sent either.
 
 **Rollout.** All four settings are measured (`compose_hash`), so they land as one new
 side under blue/green. Check on the new side, before the switch:
