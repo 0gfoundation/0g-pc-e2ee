@@ -158,8 +158,9 @@ func Strip(h http.Header) {
 
 // Stamp strips any client-supplied copies of the headers from req and, when the
 // request's context carries an address (Middleware) and req targets the router,
-// sets a freshly signed set, and X-0G-Client when a name was recorded. Safe to call on any outbound request: one bound
-// elsewhere, or made outside a client request, is only stripped.
+// sets a freshly signed set, plus X-0G-Client when a name was recorded. Safe to
+// call on any outbound request: one bound elsewhere, or made outside a client
+// request, is only stripped.
 func Stamp(req *http.Request) {
 	Strip(req.Header)
 	st, ok := req.Context().Value(ctxKey{}).(state)
