@@ -40,6 +40,12 @@ import (
 // forwards it in the clear otherwise. The router never sees "0g/auto" on an
 // inference request.
 //
+// The router is not trusted, and here it picks the model — so it would also
+// pick whether the request is sealed. Under encrypted_transit=required (the
+// caller's header, or the router's merged value) a chosen model this gateway
+// does not seal is refused, not forwarded. Without it, "0g/auto" promises no
+// encryption and the chosen model is dispatched as any request naming it.
+//
 // # The classification
 //
 // The opening (classifierSystemBytes + classifierUserBytes, truncated) goes to
@@ -170,7 +176,11 @@ type autoRouter struct {
 	// decide serves the classification: the gateway's model dispatch, which
 	// seals it or forwards it in the clear as it would a caller's request.
 	// Set by dispatchAuto.
-	decide   http.Handler
+	decide http.Handler
+	// seals reports whether the dispatch seals a model (sealModels.seals). The
+	// chosen model comes from the router, which is not trusted: under
+	// encrypted_transit=required it must be one this gateway seals.
+	seals    func(model string) bool
 	sealable []string
 	cache    *autoTaskCache
 	logger   *slog.Logger
@@ -194,6 +204,7 @@ func newAutoRouter(routerTarget *url.URL, s sealModels, classifier string, logge
 		client:           &http.Client{Transport: core.NewPooledTransport()},
 		classifier:       classifier,
 		classifierSealed: s.seals(classifier) || s.surfaces[endpoint.Decisions.Path] != "",
+		seals:            s.seals,
 		sealable:         sealable,
 		cache:            newAutoTaskCache(autoCacheEntries),
 		logger:           logger,
@@ -311,6 +322,19 @@ func (a *autoRouter) resolve(w http.ResponseWriter, r *http.Request, body []byte
 		return nil, "", false
 	}
 	model = sel.Auto.Model
+	// The router chose the model, and with it whether dispatch seals this
+	// request or forwards it in the clear. Under encrypted_transit=required —
+	// the caller's own header, or the router's merged value, which can only be
+	// stricter — a model this gateway does not seal is refused here: the
+	// cleartext path forwards the conversation to the router as it is, and the
+	// router's own check would come after it already had it.
+	if transitRequired(r, sel.EncryptedTransit) && !a.seals(model) {
+		fail()
+		a.logger.Warn("auto routing chose a model that is not sealed under encrypted_transit=required", "model", model)
+		openaiproxy.WriteError(w, http.StatusBadGateway, "gateway",
+			"route preview chose a model that cannot be sent end-to-end encrypted, and encrypted_transit is required")
+		return nil, "", false
+	}
 	out, err = setModel(body, model)
 	if err != nil {
 		fail()
@@ -330,6 +354,14 @@ func callerAllowsClear(r *http.Request) bool {
 		return true
 	}
 	return false
+}
+
+// transitRequired reports whether encrypted_transit is required for r: by the
+// caller's own X-0G-Encrypted-Transit, or by the router's merged value (which
+// may only make it stricter, so it is honoured but never relaxes anything).
+func transitRequired(r *http.Request, routerTransit string) bool {
+	return strings.EqualFold(strings.TrimSpace(r.Header.Get(openaiproxy.HeaderEncryptedTransit)), "required") ||
+		strings.EqualFold(strings.TrimSpace(routerTransit), "required")
 }
 
 // classifierE2EE is X-0G-Auto-Classifier-E2EE for a classified conversation.
