@@ -25,8 +25,9 @@ const (
 // together. Adding a family is safe; renaming one splits its history in two.
 
 // clientTitleRules recognise coding tools built on a generic SDK by the
-// OpenRouter-style app-attribution headers they send: X-Title (a prefix of the
-// lowercased value, so "Decline Tracker" is not Cline) and HTTP-Referer (the
+// OpenRouter-style app-attribution headers they send: X-Title (a word-boundary
+// prefix of the lowercased value, so "Decline Tracker" is not Cline and
+// "Crushon AI" is not Crush) and HTTP-Referer (the
 // tool's own domain). Checked before the User-Agent: Cline and Kilo send an
 // OpenAI-SDK UA.
 var clientTitleRules = []struct {
@@ -121,12 +122,25 @@ func Classify(userAgent, appTitle, referer string) string {
 			return r.client
 		}
 		for _, p := range r.titlePrefixes {
-			if title != "" && strings.HasPrefix(title, p) {
+			if title != "" && hasTitlePrefix(title, p) {
 				return r.client
 			}
 		}
 	}
 	return classifyUA(strings.ToLower(strings.TrimSpace(userAgent)))
+}
+
+// hasTitlePrefix reports whether the lowercased title starts with p at a word
+// boundary: "Crush" and "Crush CLI" are crush, "Crushon AI" is not.
+func hasTitlePrefix(title, p string) bool {
+	if !strings.HasPrefix(title, p) {
+		return false
+	}
+	if len(title) == len(p) {
+		return true
+	}
+	c := title[len(p)]
+	return !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9')
 }
 
 func classifyUA(ua string) string {
