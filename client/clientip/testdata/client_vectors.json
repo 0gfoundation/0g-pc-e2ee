@@ -490,6 +490,34 @@
       "title": "0gpc",
       "referer": "https://pc.0g.ai",
       "client": "openai-sdk"
+    },
+    {
+      "name": "a title prefix must end at a word boundary",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "Crushon AI",
+      "referer": "",
+      "client": "openai-sdk"
+    },
+    {
+      "name": "another app whose name starts with a tool's",
+      "user_agent": "OpenAI/Python 2.8.1",
+      "title": "GooseAI",
+      "referer": "",
+      "client": "openai-sdk"
+    },
+    {
+      "name": "a tool title with a suffix",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "Crush CLI",
+      "referer": "",
+      "client": "crush"
+    },
+    {
+      "name": "a tool title followed by punctuation",
+      "user_agent": "",
+      "title": "Z Code@electron",
+      "referer": "",
+      "client": "zcode"
     }
   ]
 }
