@@ -40,6 +40,22 @@ var clientTitleRules = []struct {
 	{[]string{"opencode"}, "opencode.ai", "opencode"},
 	{[]string{"z code", "zcode"}, "zcode.z.ai", "zcode"},
 	{[]string{"openclaw"}, "openclaw.ai", "openclaw"},
+	{[]string{"cherry studio"}, "cherry-ai.com", "cherry-studio"},
+	{[]string{"hermes agent"}, "hermes-agent.nousresearch.com", "hermes"},
+	{[]string{"crush"}, "charm.land", "crush"},
+	{[]string{"litellm"}, "litellm.ai", "litellm"},
+	{[]string{"anythingllm"}, "anythingllm.com", "anythingllm"},
+	{[]string{"lobehub", "lobechat"}, "lobehub.com", "lobehub"},
+	// Tools that send only their SDK's default User-Agent to a custom endpoint:
+	// recognised only once an integration we ship sends this X-Title (C-2).
+	{[]string{"langflow"}, "langflow.org", "langflow"},
+	{[]string{"n8n"}, "n8n.io", "n8n"},
+	{[]string{"continue"}, "continue.dev", "continue"},
+	{[]string{"dify"}, "dify.ai", "dify"},
+	{[]string{"librechat"}, "librechat.ai", "librechat"},
+	{[]string{"open webui", "openwebui", "open-webui"}, "openwebui.com", "open-webui"},
+	{[]string{"goose"}, "goose-docs.ai", "goose"},
+	{[]string{"tabby"}, "tabbyml.com", "tabby"},
 }
 
 // clientUARules match the lowercased User-Agent, first hit wins, so a specific
@@ -56,11 +72,22 @@ var clientUARules = []struct {
 	{true, "pi (", "pi"}, // pi <= 1.4: "pi (win32 10.0.26200; x64)"
 	{true, "pi/", "pi"},  // pi 1.5: "pi/1.5.0 (win32; bun/1.4.4; x64)"
 	{true, "deepseek-harness/", "deepseek-harness"},
+	{true, "kilo-code/", "kilo"},              // "Kilo-Code/7.8.27 ai-sdk/provider-utils/4.0.33 runtime/bun/1.4.4": before ai-sdk/
+	{true, "roocode/", "roo"},                 // "RooCode/3.54.0"
+	{true, "charm-crush/", "crush"},           // "Charm-Crush/<v> (https://charm.land/crush)"
+	{true, "hermes-cli/", "hermes"},           // model list / connectivity calls; chat sends the OpenAI SDK UA
+	{false, "litellm/", "litellm"},            // "litellm/1.106.2", "<partner>_litellm/<v>"
+	{true, "magpie", "magpie"},                // "magpie/0.1.3161", or bare "magpie"
+	{true, "lobehub/", "lobehub"},             // "lobehub/2.2.17"
+	{true, "anythingllm/", "anythingllm"},     // "AnythingLLM/<v>"
+	{true, "trustedrouter/", "trustedrouter"}, // a reseller gateway: "TrustedRouter/1.0"
+	{false, "cherrystudio/", "cherry-studio"}, // Electron UA "... CherryStudio/1.9.12 ...": before mozilla/
 	{true, "0g-pc-qa/", "0g-internal"},
 	{true, "zgh/", "0g-internal"},
 	{true, "claude0g-probe", "0g-internal"},
 	{true, "langchain", "langchain"},
 	{false, "ai-sdk/", "ai-sdk"},
+	{false, "ai-sdk-provider-utils/", "ai-sdk"}, // newer: "ai-sdk-openai-compatible/3.0.78 ai-sdk-provider-utils/5.0.68 node.js/24"
 	{true, "openai/", "openai-sdk"},
 	{true, "asyncopenai/", "openai-sdk"},
 	{true, "anthropic/", "anthropic-sdk"},
@@ -110,7 +137,11 @@ func classifyUA(ua string) string {
 		return "node-http"
 	case strings.HasPrefix(ua, "claude-cli/"):
 		// Claude Code and the Claude Agent SDK share the claude-cli UA; the SDK
-		// adds "agent-sdk/<version>" in the parenthesised suffix.
+		// adds "agent-sdk/<version>" in the parenthesised suffix, and an app
+		// embedding the SDK may name itself there ("client-app/cherry-studio/2.1.7").
+		if strings.Contains(ua, "client-app/cherry-studio") {
+			return "cherry-studio"
+		}
 		if strings.Contains(ua, "agent-sdk/") {
 			return "claude-agent-sdk"
 		}

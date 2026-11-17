@@ -1,5 +1,5 @@
 {
-  "_comment": "Shared by 0g-router backend/internal/service/testdata/client_vectors.json and 0g-pc-e2ee client/clientip/testdata/client_vectors.json. Keep the two files byte-identical: both sides' tests classify every vector and must agree. User-Agents are real mainnet values (2026-11-11).",
+  "_comment": "Shared by 0g-router backend/internal/service/testdata/client_vectors.json and 0g-pc-e2ee client/clientip/testdata/client_vectors.json. Keep the two files byte-identical: both sides' tests classify every vector and must agree. User-Agents are real mainnet values (2026-11-11, 2026-11-17) unless the name says \"(source)\": those come from the tool's own code, for tools mainnet had no traffic from yet.",
   "vectors": [
     {
       "name": "no UA on a key",
@@ -287,6 +287,209 @@
       "title": "Decline Tracker",
       "referer": "",
       "client": "curl"
+    },
+    {
+      "name": "litellm (mainnet 2026-11-17)",
+      "user_agent": "litellm/1.106.2",
+      "title": "",
+      "referer": "",
+      "client": "litellm"
+    },
+    {
+      "name": "litellm with a partner prefix (source)",
+      "user_agent": "databricks_litellm/1.80.0",
+      "title": "",
+      "referer": "",
+      "client": "litellm"
+    },
+    {
+      "name": "crush (source)",
+      "user_agent": "Charm-Crush/0.18.0 (https://charm.land/crush)",
+      "title": "",
+      "referer": "",
+      "client": "crush"
+    },
+    {
+      "name": "crush by title over its library UA (source)",
+      "user_agent": "Charm-Fantasy/0.4.0 (https://charm.land/fantasy)",
+      "title": "Crush",
+      "referer": "https://charm.land",
+      "client": "crush"
+    },
+    {
+      "name": "the fantasy library alone is not crush",
+      "user_agent": "Charm-Fantasy/0.4.0 (https://charm.land/fantasy)",
+      "title": "",
+      "referer": "",
+      "client": "other"
+    },
+    {
+      "name": "hermes cli (mainnet 2026-11-17)",
+      "user_agent": "hermes-cli/0.22.5",
+      "title": "",
+      "referer": "",
+      "client": "hermes"
+    },
+    {
+      "name": "hermes chat via openai sdk (source)",
+      "user_agent": "OpenAI/Python 2.8.1",
+      "title": "Hermes Agent",
+      "referer": "https://hermes-agent.nousresearch.com",
+      "client": "hermes"
+    },
+    {
+      "name": "a hermes eval title is not the agent",
+      "user_agent": "OpenAI/Python 2.8.1",
+      "title": "hermes compaction eval",
+      "referer": "https://github.com/NousResearch/hermes-agent",
+      "client": "openai-sdk"
+    },
+    {
+      "name": "magpie (mainnet 2026-11-17)",
+      "user_agent": "magpie/0.1.3161",
+      "title": "",
+      "referer": "",
+      "client": "magpie"
+    },
+    {
+      "name": "bare magpie (mainnet 2026-11-17)",
+      "user_agent": "magpie",
+      "title": "",
+      "referer": "",
+      "client": "magpie"
+    },
+    {
+      "name": "lobehub (mainnet 2026-11-17)",
+      "user_agent": "lobehub/2.2.17",
+      "title": "",
+      "referer": "",
+      "client": "lobehub"
+    },
+    {
+      "name": "anythingllm (source)",
+      "user_agent": "AnythingLLM/1.9.0",
+      "title": "",
+      "referer": "",
+      "client": "anythingllm"
+    },
+    {
+      "name": "cherry studio electron (mainnet 2026-11-17)",
+      "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) CherryStudio/1.9.12 Chrome/146.0.7680.188 Electron/41.2.1 Safari/537.36",
+      "title": "",
+      "referer": "",
+      "client": "cherry-studio"
+    },
+    {
+      "name": "cherry studio agent mode (mainnet 2026-11-17)",
+      "user_agent": "claude-cli/2.1.284 (external, sdk-ts, agent-sdk/0.3.284, client-app/cherry-studio/2.1.7)",
+      "title": "",
+      "referer": "",
+      "client": "cherry-studio"
+    },
+    {
+      "name": "cherry studio by title (source)",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "Cherry Studio",
+      "referer": "https://cherry-ai.com",
+      "client": "cherry-studio"
+    },
+    {
+      "name": "kilo by its own UA (mainnet 2026-11-17)",
+      "user_agent": "Kilo-Code/7.8.27 ai-sdk/provider-utils/4.0.33 runtime/bun/1.4.4",
+      "title": "",
+      "referer": "",
+      "client": "kilo"
+    },
+    {
+      "name": "roo by its own UA (mainnet 2026-11-17)",
+      "user_agent": "RooCode/3.54.0",
+      "title": "",
+      "referer": "",
+      "client": "roo"
+    },
+    {
+      "name": "a UA that merely starts like roo (mainnet 2026-11-17)",
+      "user_agent": "RootEvidence/1.0",
+      "title": "",
+      "referer": "",
+      "client": "other"
+    },
+    {
+      "name": "vercel ai sdk, newer UA (mainnet 2026-11-17)",
+      "user_agent": "ai-sdk-openai-compatible/3.0.78 ai-sdk-provider-utils/5.0.68 node.js/24",
+      "title": "",
+      "referer": "",
+      "client": "ai-sdk"
+    },
+    {
+      "name": "trustedrouter (mainnet 2026-11-17)",
+      "user_agent": "TrustedRouter/1.0",
+      "title": "",
+      "referer": "",
+      "client": "trustedrouter"
+    },
+    {
+      "name": "langflow by title",
+      "user_agent": "OpenAI/Python 2.8.1",
+      "title": "Langflow",
+      "referer": "https://pc.0g.ai",
+      "client": "langflow"
+    },
+    {
+      "name": "n8n by title",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "n8n",
+      "referer": "https://pc.0g.ai",
+      "client": "n8n"
+    },
+    {
+      "name": "continue by title",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "Continue",
+      "referer": "https://pc.0g.ai",
+      "client": "continue"
+    },
+    {
+      "name": "dify by title",
+      "user_agent": "python-requests/2.32.3",
+      "title": "Dify",
+      "referer": "https://pc.0g.ai",
+      "client": "dify"
+    },
+    {
+      "name": "librechat by title",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "LibreChat",
+      "referer": "https://pc.0g.ai",
+      "client": "librechat"
+    },
+    {
+      "name": "open webui by title",
+      "user_agent": "Python/3.11 aiohttp/3.12.15",
+      "title": "Open WebUI",
+      "referer": "https://pc.0g.ai",
+      "client": "open-webui"
+    },
+    {
+      "name": "goose by title, no UA",
+      "user_agent": "",
+      "title": "Goose",
+      "referer": "https://pc.0g.ai",
+      "client": "goose"
+    },
+    {
+      "name": "tabby by title, no UA",
+      "user_agent": "",
+      "title": "Tabby",
+      "referer": "https://pc.0g.ai",
+      "client": "tabby"
+    },
+    {
+      "name": "our own referer alone names no tool",
+      "user_agent": "OpenAI/Python 2.8.1",
+      "title": "0gpc",
+      "referer": "https://pc.0g.ai",
+      "client": "openai-sdk"
     }
   ]
 }
