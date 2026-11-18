@@ -2,7 +2,7 @@ module github.com/0gfoundation/0g-pc-e2ee/client
 
 go 1.27.0
 
-toolchain go1.27.3
+toolchain go1.27.4
 
 // Sigstore's verifier, for broker release provenance (provenance/): the gateway and the
 // sidecar judge the broker build a provider runs (evidence.CheckRuntime), and pcverify
