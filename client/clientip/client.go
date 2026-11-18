@@ -25,38 +25,41 @@ const (
 // together. Adding a family is safe; renaming one splits its history in two.
 
 // clientTitleRules recognise coding tools built on a generic SDK by the
-// OpenRouter-style app-attribution headers they send: X-Title (a word-boundary
-// prefix of the lowercased value, so "Decline Tracker" is not Cline and
-// "Crushon AI" is not Crush) and HTTP-Referer (the
-// tool's own domain). Checked before the User-Agent: Cline and Kilo send an
-// OpenAI-SDK UA.
+// OpenRouter-style app-attribution headers they send: X-Title (matched as a
+// word-boundary prefix of the lowercased value, so "Decline Tracker" is not
+// Cline and "Crushon AI" is not Crush; or, for exactTitle rules, as the whole
+// lowercased value) and HTTP-Referer (matched on the tool's own domain).
+// Checked before the User-Agent: Cline and Kilo send an OpenAI-SDK UA.
 var clientTitleRules = []struct {
 	titlePrefixes []string
 	refererDomain string
 	client        string
+	exactTitle    bool // titlePrefixes must equal the whole title, not prefix it
 }{
-	{[]string{"cline"}, "cline.bot", "cline"},
-	{[]string{"kilo code", "kilocode"}, "kilocode.ai", "kilo"},
-	{[]string{"roo code", "roocode", "roo-code"}, "roocode.com", "roo"},
-	{[]string{"opencode"}, "opencode.ai", "opencode"},
-	{[]string{"z code", "zcode"}, "zcode.z.ai", "zcode"},
-	{[]string{"openclaw"}, "openclaw.ai", "openclaw"},
-	{[]string{"cherry studio"}, "cherry-ai.com", "cherry-studio"},
-	{[]string{"hermes agent"}, "hermes-agent.nousresearch.com", "hermes"},
-	{[]string{"crush"}, "charm.land", "crush"},
-	{[]string{"litellm"}, "litellm.ai", "litellm"},
-	{[]string{"anythingllm"}, "anythingllm.com", "anythingllm"},
-	{[]string{"lobehub", "lobechat"}, "lobehub.com", "lobehub"},
+	{[]string{"cline"}, "cline.bot", "cline", false},
+	{[]string{"kilo code", "kilocode"}, "kilocode.ai", "kilo", false},
+	{[]string{"roo code", "roocode", "roo-code"}, "roocode.com", "roo", false},
+	{[]string{"opencode"}, "opencode.ai", "opencode", false},
+	{[]string{"z code", "zcode"}, "zcode.z.ai", "zcode", false},
+	{[]string{"openclaw"}, "openclaw.ai", "openclaw", false},
+	{[]string{"cherry studio"}, "cherry-ai.com", "cherry-studio", false},
+	{[]string{"hermes agent"}, "hermes-agent.nousresearch.com", "hermes", false},
+	{[]string{"crush"}, "charm.land", "crush", false},
+	{[]string{"litellm"}, "litellm.ai", "litellm", false},
+	{[]string{"anythingllm"}, "anythingllm.com", "anythingllm", false},
+	{[]string{"lobehub", "lobechat"}, "lobehub.com", "lobehub", false},
 	// Tools that send only their SDK's default User-Agent to a custom endpoint:
 	// recognised only once an integration we ship sends this X-Title (C-2).
-	{[]string{"langflow"}, "langflow.org", "langflow"},
-	{[]string{"n8n"}, "n8n.io", "n8n"},
-	{[]string{"continue"}, "continue.dev", "continue"},
-	{[]string{"dify"}, "dify.ai", "dify"},
-	{[]string{"librechat"}, "librechat.ai", "librechat"},
-	{[]string{"open webui", "openwebui", "open-webui"}, "openwebui.com", "open-webui"},
-	{[]string{"goose"}, "goose-docs.ai", "goose"},
-	{[]string{"tabby"}, "tabbyml.com", "tabby"},
+	// We choose those titles, so a common-word name matches the whole title
+	// only: "Continue Learning App" is not Continue, "Goose Tracker" not Goose.
+	{[]string{"langflow"}, "langflow.org", "langflow", false},
+	{[]string{"n8n"}, "n8n.io", "n8n", true},
+	{[]string{"continue"}, "continue.dev", "continue", true},
+	{[]string{"dify"}, "dify.ai", "dify", true},
+	{[]string{"librechat"}, "librechat.ai", "librechat", false},
+	{[]string{"open webui", "openwebui", "open-webui"}, "openwebui.com", "open-webui", false},
+	{[]string{"goose"}, "goose-docs.ai", "goose", true},
+	{[]string{"tabby"}, "tabbyml.com", "tabby", true},
 }
 
 // clientUARules match the lowercased User-Agent, first hit wins, so a specific
@@ -78,7 +81,7 @@ var clientUARules = []struct {
 	{true, "charm-crush/", "crush"},           // "Charm-Crush/<v> (https://charm.land/crush)"
 	{true, "hermes-cli/", "hermes"},           // model list / connectivity calls; chat sends the OpenAI SDK UA
 	{false, "litellm/", "litellm"},            // "litellm/1.106.2", "<partner>_litellm/<v>"
-	{true, "magpie", "magpie"},                // "magpie/0.1.3161", or bare "magpie"
+	{true, "magpie/", "magpie"},               // "magpie/0.1.3161"; bare "magpie" is in classifyUA
 	{true, "lobehub/", "lobehub"},             // "lobehub/2.2.17"
 	{true, "anythingllm/", "anythingllm"},     // "AnythingLLM/<v>"
 	{true, "trustedrouter/", "trustedrouter"}, // a reseller gateway: "TrustedRouter/1.0"
@@ -122,7 +125,7 @@ func Classify(userAgent, appTitle, referer string) string {
 			return r.client
 		}
 		for _, p := range r.titlePrefixes {
-			if title != "" && hasTitlePrefix(title, p) {
+			if title != "" && (title == p || !r.exactTitle && hasTitlePrefix(title, p)) {
 				return r.client
 			}
 		}
@@ -149,6 +152,8 @@ func classifyUA(ua string) string {
 		return ClientUnknown
 	case ua == "node": // the bare Node.js default, no version
 		return "node-http"
+	case ua == "magpie": // magpie's bare UA; "magpiebot/2.0" is not magpie
+		return "magpie"
 	case strings.HasPrefix(ua, "claude-cli/"):
 		// Claude Code and the Claude Agent SDK share the claude-cli UA; the SDK
 		// adds "agent-sdk/<version>" in the parenthesised suffix, and an app

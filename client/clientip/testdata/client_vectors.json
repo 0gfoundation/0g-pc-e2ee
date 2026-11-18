@@ -518,6 +518,34 @@
       "title": "Z Code@electron",
       "referer": "",
       "client": "zcode"
+    },
+    {
+      "name": "an app title that starts with an X-Title-only tool's name",
+      "user_agent": "OpenAI/Python 2.8.1",
+      "title": "Continue Learning App",
+      "referer": "",
+      "client": "openai-sdk"
+    },
+    {
+      "name": "another common-word title that is not the tool",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "Goose Tracker",
+      "referer": "",
+      "client": "openai-sdk"
+    },
+    {
+      "name": "an X-Title-only tool's exact title, any case and padding",
+      "user_agent": "",
+      "title": "  DIFY ",
+      "referer": "",
+      "client": "dify"
+    },
+    {
+      "name": "a UA that starts with magpie but is not magpie",
+      "user_agent": "magpiebot/2.0",
+      "title": "",
+      "referer": "",
+      "client": "other"
     }
   ]
 }
