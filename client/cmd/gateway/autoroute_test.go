@@ -644,6 +644,15 @@ func TestSealingFor(t *testing.T) {
 		`{"attachments":[{"file_id":"f1"}]}`:          "avoid",
 		`{"tools":[{"type":"0g:web_search"}]}`:        "avoid",
 		`{"tools":[{"type":"openrouter:web_fetch"}]}`: "avoid",
+		// Inline file parts: the router cannot read them once sealed.
+		`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"file","file":{"filename":"a.pdf","file_data":"data:application/pdf;base64,AA=="}}]}]}`: "avoid",
+		`{"messages":[{"role":"user","content":[{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"AA=="}}]}]}`:                            "avoid",
+		`{"messages":[{"role":"user","content":[{"type":"input_file","filename":"a.pdf","file_data":"data:application/pdf;base64,AA=="}]}]}`:                                "avoid",
+		`{"messages":[{"role":"user","content":[{"type":"tool_result","content":[{"type":"document","source":{}}]}]}]}`:                                                     "avoid",
+		`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}]}`:                      "any",
+		`{"messages":[{"role":"user","content":"read file a.pdf"}]}`:                                                                                                        "any",
+		// A file part in a tool call's arguments is not one.
+		`{"messages":[{"role":"assistant","content":[{"type":"tool_use","input":{"type":"file"}}]}]}`: "any",
 	} {
 		var req wire.Request
 		_ = json.Unmarshal([]byte(body), &req)
