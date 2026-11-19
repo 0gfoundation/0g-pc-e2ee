@@ -15,6 +15,7 @@ import (
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
 	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
+	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 )
 
 // Per-model seal routing: seal the models this deployment can actually seal, and
@@ -325,6 +326,9 @@ func (s sealModels) dispatchAuto(sealed, cleartext http.Handler, auto *autoRoute
 				return
 			}
 			buf, model = out, chosen
+			// The model is routing's choice now, not the caller's: a refusal
+			// downstream must not suggest "0g/auto" back to it.
+			r = openaiproxy.MarkAutoRouted(r)
 			r.Body = io.NopCloser(bytes.NewReader(buf))
 			r.ContentLength = int64(len(buf))
 			r.Header.Set("Content-Length", strconv.Itoa(len(buf)))

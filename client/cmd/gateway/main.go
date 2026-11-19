@@ -1035,8 +1035,8 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 		openaiproxy.AsyncJobPoll(routerTarget, &http.Client{Transport: core.NewPooledTransport()}))
 	// "0g/auto" (autoroute.go) runs here, inside both guards for the same
 	// reason the dispatcher does: it reads the body.
-	gated.Handle("/", policy.sealModels.dispatchAuto(sealed, passthrough,
-		newAutoRouter(routerTarget, policy.sealModels, policy.autoClassifier, logger)))
+	auto := newAutoRouter(routerTarget, policy.sealModels, policy.autoClassifier, logger)
+	gated.Handle("/", policy.sealModels.dispatchAuto(sealed, passthrough, auto))
 	// The body-read bound sits INSIDE the cap, so its clock starts when a slot is
 	// held — the slot is what a trickled body would otherwise keep — and outside
 	// everything that reads the body, the model dispatcher included.
@@ -1125,7 +1125,13 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 		if c := clients[ep.Path]; c != nil {
 			// WithCleartext: an async submit asking for url format goes to the
 			// router in the clear rather than being refused (see the option).
-			openaiproxy.Register(sealed, ep, c, openaiproxy.WithCleartext(passthrough))
+			opts := []openaiproxy.Option{openaiproxy.WithCleartext(passthrough)}
+			if auto != nil {
+				// Only then may a refusal suggest "0g/auto": with every model
+				// sealed, the name reaches the sealed path like any other.
+				opts = append(opts, openaiproxy.WithAutoRouting())
+			}
+			openaiproxy.Register(sealed, ep, c, opts...)
 			mux.Handle("POST "+ep.Path, sealedGate)
 			// ...and the surface's own TRAILING-SLASH form, which belongs to the sealed
 			// POST and not to the subtree however much it looks like the latter.
