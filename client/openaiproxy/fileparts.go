@@ -72,6 +72,21 @@ func filePartIn(raw json.RawMessage, inMessage bool) bool {
 // file part gets (refuseFilePart), for a client to tell it apart.
 const ErrCodeSealedFilePart = "sealed_request_file_part"
 
+// WithSealedFilePartRefusal makes Register refuse a sealed request carrying a
+// file part before anything is resolved (refuseFilePart), rather than seal it
+// and send it as is.
+//
+// Opt-in, because it rests on a fact about the deployment, not the code: that
+// no model this proxy seals reads files (THE PRECONDITION, at refuseFilePart).
+// The gateway seals the models in its seal list, and TestSealedModelsReadNoFiles
+// (cmd/gateway) pins every deployed list to models checked for that; it passes
+// this. The sidecar seals EVERY model, about which nothing is known, so it does
+// not: a model there whose endpoint declares "file" gets the file part sealed
+// and forwarded, as before.
+func WithSealedFilePartRefusal() Option {
+	return func(o *options) { o.refuseFileParts = true }
+}
+
 // WithAutoRouting tells Register that its caller routes a model named
 // "0g/auto" itself (the gateway, when it seals some models and not others), so
 // a refusal may suggest it. Without it the name would reach this handler and be
@@ -105,18 +120,26 @@ func autoRouted(r *http.Request) bool {
 // model reads files: the router hands a file part through untouched to an
 // endpoint whose input modalities declare "file" (router pkg/inference
 // file_parts.go), and such a provider could serve this request sealed. Today
-// none does — TestSealedModelsReadNoFiles (cmd/gateway) keeps the deployed seal
-// lists to models checked for that. When one is sealed that reads files, this
-// check moves after the resolve and asks the candidate's declared modalities
-// instead, and the refusal applies only when none of them declares "file".
+// none the gateway seals does — TestSealedModelsReadNoFiles (cmd/gateway) keeps
+// the deployed seal lists to models checked for that — and only the gateway
+// turns this on (WithSealedFilePartRefusal). When a model is sealed that reads
+// files, this check moves after the resolve and asks the candidate's declared
+// modalities instead, and the refusal applies only when none of them declares
+// "file".
+//
+// Not for preferred (Register skips it): such a request goes out in the clear
+// when no provider of its model can be sealed to (transitFallback), and the
+// router then reads the file into text, which works. Refusing it up front
+// would turn that into a 400.
 //
 // The message offers only what can work for this caller:
 //   - "0g/auto", where the caller of Register routes it (WithAutoRouting) and
 //     this request did not already come that way (MarkAutoRouted);
 //   - the off header, where there is a cleartext path and the caller did not
-//     itself just ask for required. It may still be refused, with 403
-//     encrypted_transit_mismatch, if the account or API key requires
-//     encryption, which this proxy cannot see before the preview; it says so.
+//     itself just ask for required (preferred never gets here). It may still
+//     be refused, with 403 encrypted_transit_mismatch, if the account or API
+//     key requires encryption, which this proxy cannot see before the
+//     preview; it says so.
 func (o options) refuseFilePart(w http.ResponseWriter, r *http.Request) {
 	ways := []string{"remove the file or paste its text"}
 	if o.autoRouting && !autoRouted(r) {

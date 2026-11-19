@@ -100,6 +100,9 @@ func fileRefusal(t *testing.T, what string, rec *httptest.ResponseRecorder) stri
 // cleartextOpt stands for WithCleartext(the recorder) in serveFile's opts.
 var cleartextOpt Option
 
+// gatewayOpts are the options the gateway registers its sealed surfaces with.
+var gatewayOpts = []Option{cleartextOpt, WithSealedFilePartRefusal(), WithAutoRouting()}
+
 // A sealed request carrying a file part gets a 400 naming the reason, before
 // anything is resolved, sealed or sent — whatever the surface and the header.
 func TestRegister_RefusesSealedFilePart(t *testing.T) {
@@ -107,10 +110,10 @@ func TestRegister_RefusesSealedFilePart(t *testing.T) {
 		ep   endpoint.Endpoint
 		body string
 	}{{endpoint.Chat, pdfChat}, {endpoint.Chat, pdfChatStream}, {endpoint.Anthropic, pdfAnthropic}} {
-		for _, callerHeader := range []string{"", core.TransitRequired, core.TransitPreferred} {
+		for _, callerHeader := range []string{"", core.TransitRequired} {
 			what := tc.ep.Path + " " + callerHeader
 			res := &transitResolver{transit: core.TransitRequired}
-			rec, ct := serveFile(t, tc.ep, res, []Option{cleartextOpt, WithAutoRouting()}, callerHeader, tc.body, false)
+			rec, ct := serveFile(t, tc.ep, res, gatewayOpts, callerHeader, tc.body, false)
 			fileRefusal(t, what, rec)
 			if res.resolved || res.previewed || ct.hit {
 				t.Errorf("%s: resolved %v, previewed %v, cleartext %v; want nothing sent", what, res.resolved, res.previewed, ct.hit)
@@ -129,21 +132,19 @@ func TestRegister_SealedFilePartHints(t *testing.T) {
 		autoRouted   bool
 		want, not    []string
 	}{
-		{"gateway, no header", []Option{cleartextOpt, WithAutoRouting()}, "", false,
+		{"gateway, no header", gatewayOpts, "", false,
 			[]string{auto, off, "unless your account or API key requires encryption"}, nil},
-		{"gateway, preferred", []Option{cleartextOpt, WithAutoRouting()}, core.TransitPreferred, false,
-			[]string{auto, off}, nil},
 		// The caller just asked for encryption: do not suggest giving it up.
-		{"gateway, caller required", []Option{cleartextOpt, WithAutoRouting()}, core.TransitRequired, false,
+		{"gateway, caller required", gatewayOpts, core.TransitRequired, false,
 			[]string{auto}, []string{off}},
 		// It came through "0g/auto": suggesting it again goes in a circle.
-		{"gateway, auto-routed", []Option{cleartextOpt, WithAutoRouting()}, "", true,
+		{"gateway, auto-routed", gatewayOpts, "", true,
 			[]string{off}, []string{auto}},
 		// A gateway sealing every model does not route "0g/auto".
-		{"seal-all gateway", []Option{cleartextOpt}, "", false,
+		{"seal-all gateway", []Option{cleartextOpt, WithSealedFilePartRefusal()}, "", false,
 			[]string{off}, []string{auto}},
-		// The sidecar has neither a cleartext path nor auto routing.
-		{"sidecar", nil, "", false,
+		// Opted in with no cleartext path: nothing to offer but the file.
+		{"no cleartext path", []Option{WithSealedFilePartRefusal()}, "", false,
 			nil, []string{auto, off, HeaderEncryptedTransit}},
 	} {
 		res := &transitResolver{transit: core.TransitRequired}
@@ -158,6 +159,39 @@ func TestRegister_SealedFilePartHints(t *testing.T) {
 			if strings.Contains(msg, n) {
 				t.Errorf("%s: message %q offers %q, which cannot work here", tc.name, msg, n)
 			}
+		}
+	}
+}
+
+// preferred is not refused: with no provider to seal to it goes out in the
+// clear, file and all, as it did before the refusal existed — the router then
+// reads the file into text.
+func TestRegister_FilePartPreferredStillDowngrades(t *testing.T) {
+	res := &transitResolver{transit: ""}
+	rec, ct := serveFile(t, endpoint.Chat, res, gatewayOpts, core.TransitPreferred, pdfChat, false)
+	if strings.Contains(rec.Body.String(), ErrCodeSealedFilePart) {
+		t.Fatalf("preferred was refused: %s", rec.Body)
+	}
+	if !res.resolved || !ct.hit || ct.body != pdfChat {
+		t.Errorf("resolved %v, cleartext %v, body intact %v; want the no_encrypted_provider downgrade", res.resolved, ct.hit, ct.body == pdfChat)
+	}
+	if got := rec.Header().Get(HeaderEncryptedTransitReason); got != reasonNoEncryptedProvider {
+		t.Errorf("reason = %q, want %q", got, reasonNoEncryptedProvider)
+	}
+}
+
+// Without WithSealedFilePartRefusal — the sidecar, which seals every model —
+// a file part is sealed and sent as before: a model there may read files.
+func TestRegister_FilePartWithoutOptionIsSealed(t *testing.T) {
+	for name, opts := range map[string][]Option{
+		"sidecar":                    nil,
+		"cleartext path, no refusal": {cleartextOpt, WithAutoRouting()},
+	} {
+		res := &transitResolver{transit: core.TransitRequired}
+		rec, ct := serveFile(t, endpoint.Chat, res, opts, "", pdfChat, false)
+		if strings.Contains(rec.Body.String(), ErrCodeSealedFilePart) || !res.resolved || ct.hit {
+			t.Errorf("%s: refused %v, resolved %v, cleartext %v; want it taken down the sealed path",
+				name, strings.Contains(rec.Body.String(), ErrCodeSealedFilePart), res.resolved, ct.hit)
 		}
 	}
 }
