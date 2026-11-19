@@ -350,6 +350,12 @@ func Register(mux *http.ServeMux, ep endpoint.Endpoint, c *core.Client, opts ...
 				"field \"stream\" is not supported for POST %s: the response is a single JSON object", ep.Path))
 			return
 		}
+		// A file part cannot be served sealed; say so here rather than let the
+		// provider's own validation error come back (refuseFilePart).
+		if HasFilePart(req) {
+			o.refuseFilePart(w)
+			return
+		}
 		if ep.PreSeal != nil {
 			if req, err = ep.PreSeal(req); err != nil {
 				writeGatewayError(w, http.StatusBadRequest, err.Error())

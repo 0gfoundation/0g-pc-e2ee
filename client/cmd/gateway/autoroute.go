@@ -508,64 +508,6 @@ func mediaIn(raw json.RawMessage) []string {
 	return out
 }
 
-// filePartTypes are the inline file content parts the router reads into text
-// for an endpoint that does not declare "file" (router pkg/inference
-// file_parts.go): OpenAI chat, Responses, Anthropic.
-var filePartTypes = map[string]bool{"file": true, "input_file": true, "document": true}
-
-// hasFilePart reports whether a request attaches a file (a PDF, say) as a
-// content part, found where the router's DetectFileParts finds one. Sealed,
-// such a part reaches the upstream as sent, since the router cannot read it to
-// turn it into text, and no sealed model reads files itself: 0gm answers it
-// with a 400 from vLLM.
-//
-// Unlike mediaIn this does not recurse: it decides whether the request may be
-// sealed at all, so it must not see more than the router does. A document
-// nested inside another block (the page a server tool fetched, e.g.
-// web_fetch_tool_result in a Claude Code history) is tool output the router
-// forwards as sent, and counting it would cost the rest of the conversation
-// its sealing.
-func hasFilePart(req wire.Request) bool {
-	for _, key := range []string{"messages", "input"} {
-		var items []map[string]json.RawMessage
-		if json.Unmarshal(req[key], &items) != nil {
-			continue
-		}
-		for _, item := range items {
-			if filePartIn(item["content"], true) {
-				return true
-			}
-			var typ string
-			_ = json.Unmarshal(item["type"], &typ)
-			if (typ == "function_call_output" || typ == "custom_tool_call_output") && filePartIn(item["output"], false) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// filePartIn reports whether a part list holds a file part, or, in a message's
-// own list, an Anthropic tool_result whose part list does (a tool_result cannot
-// hold another). Other blocks are not looked into.
-func filePartIn(raw json.RawMessage, inMessage bool) bool {
-	var parts []map[string]json.RawMessage
-	if json.Unmarshal(raw, &parts) != nil {
-		return false
-	}
-	for _, part := range parts {
-		var typ string
-		_ = json.Unmarshal(part["type"], &typ)
-		if filePartTypes[typ] {
-			return true
-		}
-		if typ == "tool_result" && inMessage && filePartIn(part["content"], false) {
-			return true
-		}
-	}
-	return false
-}
-
 // truncateUTF8 cuts s to at most n bytes on a character boundary.
 func truncateUTF8(s string, n int) string {
 	if len(s) <= n {
@@ -598,7 +540,7 @@ func sealingFor(req wire.Request, size int) string {
 	if size > openaiproxy.MaxRequestBytes {
 		return "avoid"
 	}
-	if hasFilePart(req) {
+	if openaiproxy.HasFilePart(req) {
 		return "avoid"
 	}
 	var plugins []struct {
