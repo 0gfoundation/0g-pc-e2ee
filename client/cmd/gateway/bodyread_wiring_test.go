@@ -28,24 +28,43 @@ func TestGatewayBodyRead_FreesTheSlotATrickledBodyHolds(t *testing.T) {
 	defer router.Close()
 	client := core.NewWithResolver(route.New(router.URL))
 	gw := httptest.NewServer(newHandler(sealedClients(client, nil), mustURL(t, router.URL), testOrigins(), "", "",
-		1, nil, nil, nil, discardLogger(), withEntryPolicy(entryPolicy{bodyReadTimeout: 300 * time.Millisecond})))
+		1, nil, nil, nil, discardLogger(), withEntryPolicy(entryPolicy{bodyReadTimeout: 2 * time.Second})))
 	defer gw.Close()
 
 	// Headers promising 100 bytes, then two of them, then nothing. The credential
 	// is any string: the gate checks shape, which is what makes this free.
-	conn, err := net.Dial("tcp", strings.TrimPrefix(gw.URL, "http://"))
-	if err != nil {
-		t.Fatal(err)
+	trickle := func() (net.Conn, *bufio.Reader) {
+		conn, err := net.Dial("tcp", strings.TrimPrefix(gw.URL, "http://"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprint(conn, "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer anything\r\n"+
+			"Content-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"")
+		return conn, bufio.NewReader(conn)
 	}
-	defer conn.Close()
-	fmt.Fprint(conn, "POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer anything\r\n"+
-		"Content-Type: application/json\r\nContent-Length: 100\r\n\r\n{\"")
+	conn, br := trickle()
+	defer func() { conn.Close() }()
 
 	// While it trickles, it holds the only slot.
-	deadline := time.Now().Add(5 * time.Second)
+	//
+	// Unless a probe got there first. A probe takes the slot too, for as long as the
+	// router takes to refuse it — ~600ms on a CPU-starved CI runner — and a trickled
+	// request arriving inside that is shed with a 503 and never holds anything; every
+	// probe after it then passes and the loop ran out its deadline (CI, 2026-11-19).
+	// So when a probe gets through, look for an answer already waiting on the trickled
+	// connection: if there is one, that request is finished, and a fresh one is sent.
+	// The bound is 2s, not 300ms, for the same runner: a probe has to land inside it.
+	deadline := time.Now().Add(15 * time.Second)
 	for {
 		if got := post(t, gw, "Bearer sk-second"); got == http.StatusServiceUnavailable {
 			break
+		}
+		_ = conn.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+		_, peekErr := br.Peek(1)
+		_ = conn.SetReadDeadline(time.Time{})
+		if peekErr == nil { // answered already: shed, or its bound ran out between probes
+			conn.Close()
+			conn, br = trickle()
 		}
 		if time.Now().After(deadline) {
 			t.Fatal("the trickled request never held the slot")
@@ -54,7 +73,7 @@ func TestGatewayBodyRead_FreesTheSlotATrickledBodyHolds(t *testing.T) {
 	}
 
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	resp, err := http.ReadResponse(br, nil)
 	if err != nil {
 		t.Fatalf("the trickled request got no answer: %v — the bound did not reach the connection", err)
 	}
