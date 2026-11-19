@@ -651,6 +651,14 @@ func TestSealingFor(t *testing.T) {
 		`{"messages":[{"role":"user","content":[{"type":"tool_result","content":[{"type":"document","source":{}}]}]}]}`:                                                     "avoid",
 		`{"messages":[{"role":"user","content":[{"type":"text","text":"hi"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA=="}}]}]}`:                      "any",
 		`{"messages":[{"role":"user","content":"read file a.pdf"}]}`:                                                                                                        "any",
+		// Responses: an input item's content, and a tool call's output.
+		`{"input":[{"role":"user","content":[{"type":"input_file","filename":"a.pdf","file_data":"data:application/pdf;base64,AA=="}]}]}`: "avoid",
+		`{"input":[{"type":"function_call_output","output":[{"type":"input_file","file_data":"data:application/pdf;base64,AA=="}]}]}`:     "avoid",
+		// A document a server tool fetched is tool output, forwarded as sent
+		// (router collectPartList): it must not unseal the conversation.
+		`{"messages":[{"role":"assistant","content":[{"type":"web_fetch_tool_result","content":{"type":"web_fetch_result","content":{"type":"document","source":{}}}}]}]}`: "any",
+		// A tool_result holds no tool_result.
+		`{"messages":[{"role":"user","content":[{"type":"tool_result","content":[{"type":"tool_result","content":[{"type":"document","source":{}}]}]}]}]}`: "any",
 		// A file part in a tool call's arguments is not one.
 		`{"messages":[{"role":"assistant","content":[{"type":"tool_use","input":{"type":"file"}}]}]}`: "any",
 	} {
