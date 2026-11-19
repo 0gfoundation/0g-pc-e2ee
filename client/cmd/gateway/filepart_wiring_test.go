@@ -26,6 +26,11 @@ func filePartBody(model string) string {
 	return strings.Replace(filePartBodyFor, "%q", string(b), 1)
 }
 
+// noTransit overrides postAuto's default X-0G-Encrypted-Transit: preferred,
+// which the refusal skips (preferred may yet go out in the clear). Without the
+// header "0g/auto" does not classify, but still chooses the model.
+var noTransit = map[string]string{openaiproxy.HeaderEncryptedTransit: ""}
+
 // refusalMessage fails unless resp is the file-part 400, and returns its message.
 func refusalMessage(t *testing.T, resp *http.Response, body string) string {
 	t.Helper()
@@ -43,7 +48,7 @@ func refusalMessage(t *testing.T, resp *http.Response, body string) string {
 // it can use it.
 func TestFilePartNamedSealedModelOffersAuto(t *testing.T) {
 	f := &fakeAutoRouter{}
-	resp, body := postAuto(t, autoGateway(t, f).URL, filePartBody(sealedModel), nil)
+	resp, body := postAuto(t, autoGateway(t, f).URL, filePartBody(sealedModel), noTransit)
 	if msg := refusalMessage(t, resp, body); !strings.Contains(msg, `"0g/auto"`) {
 		t.Errorf("message %q does not offer 0g/auto", msg)
 	}
@@ -56,7 +61,7 @@ func TestFilePartNamedSealedModelOffersAuto(t *testing.T) {
 // sealable ones, say) is refused without suggesting "0g/auto" again.
 func TestFilePartAutoChosenSealedDoesNotOfferAuto(t *testing.T) {
 	f := &fakeAutoRouter{task: "x", chosen: sealedModel}
-	resp, body := postAuto(t, autoGateway(t, f).URL, filePartBody("0g/auto"), nil)
+	resp, body := postAuto(t, autoGateway(t, f).URL, filePartBody("0g/auto"), noTransit)
 	if msg := refusalMessage(t, resp, body); strings.Contains(msg, "0g/auto") {
 		t.Errorf("an auto-routed request was told to use 0g/auto: %q", msg)
 	}
@@ -67,10 +72,12 @@ func TestFilePartAutoChosenSealedDoesNotOfferAuto(t *testing.T) {
 
 // A gateway that seals every model does not route "0g/auto", so it must not
 // offer it.
+//
+// (preferred skips the refusal: openaiproxy TestRegister_FilePartPreferredStillDowngrades.)
 func TestFilePartSealAllDoesNotOfferAuto(t *testing.T) {
 	f := &fakeAutoRouter{}
 	gw := catalogGateway(t, f.server(t), entryPolicy{sealModels: mustSealModels(t, "*")})
-	resp, body := postAuto(t, gw.URL, filePartBody(sealedModel), nil)
+	resp, body := postAuto(t, gw.URL, filePartBody(sealedModel), noTransit)
 	if msg := refusalMessage(t, resp, body); strings.Contains(msg, "0g/auto") {
 		t.Errorf("a seal-all gateway offered 0g/auto: %q", msg)
 	}

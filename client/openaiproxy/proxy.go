@@ -181,6 +181,9 @@ type options struct {
 	// autoRouting: a model named "0g/auto" is routed by the caller of Register
 	// (the gateway), not sealed as named; see WithAutoRouting.
 	autoRouting bool
+	// refuseFileParts: refuse a sealed request carrying a file part up front;
+	// see WithSealedFilePartRefusal.
+	refuseFileParts bool
 }
 
 // WithVerboseUpstreamErrors makes the proxy append the raw upstream response
@@ -354,8 +357,10 @@ func Register(mux *http.ServeMux, ep endpoint.Endpoint, c *core.Client, opts ...
 			return
 		}
 		// A file part cannot be served sealed; say so here rather than let the
-		// provider's own validation error come back (refuseFilePart).
-		if HasFilePart(req) {
+		// provider's own validation error come back (refuseFilePart). Only
+		// where the caller of Register asked for it, and not for preferred,
+		// which may yet go out in the clear (transitFallback).
+		if o.refuseFileParts && callerTransit(r) != core.TransitPreferred && HasFilePart(req) {
 			o.refuseFilePart(w, r)
 			return
 		}

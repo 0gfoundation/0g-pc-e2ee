@@ -1125,7 +1125,9 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 		if c := clients[ep.Path]; c != nil {
 			// WithCleartext: an async submit asking for url format goes to the
 			// router in the clear rather than being refused (see the option).
-			opts := []openaiproxy.Option{openaiproxy.WithCleartext(passthrough)}
+			// The file-part refusal rests on this gateway's seal lists, which
+			// TestSealedModelsReadNoFiles pins; the sidecar does not take it.
+			opts := []openaiproxy.Option{openaiproxy.WithCleartext(passthrough), openaiproxy.WithSealedFilePartRefusal()}
 			if auto != nil {
 				// Only then may a refusal suggest "0g/auto": with every model
 				// sealed, the name reaches the sealed path like any other.
