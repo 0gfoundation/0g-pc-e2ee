@@ -1,9 +1,12 @@
 package openaiproxy
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 
+	"github.com/0gfoundation/0g-pc-e2ee/client/core"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
 
@@ -69,6 +72,27 @@ func filePartIn(raw json.RawMessage, inMessage bool) bool {
 // file part gets (refuseFilePart), for a client to tell it apart.
 const ErrCodeSealedFilePart = "sealed_request_file_part"
 
+// WithAutoRouting tells Register that its caller routes a model named
+// "0g/auto" itself (the gateway, when it seals some models and not others), so
+// a refusal may suggest it. Without it the name would reach this handler and be
+// refused the same way, and the suggestion would send the caller in a circle.
+func WithAutoRouting() Option {
+	return func(o *options) { o.autoRouting = true }
+}
+
+type autoRoutedKey struct{}
+
+// MarkAutoRouted marks r as having come through "0g/auto": the model it names
+// is the one that routing chose, so a refusal must not suggest "0g/auto".
+func MarkAutoRouted(r *http.Request) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), autoRoutedKey{}, true))
+}
+
+func autoRouted(r *http.Request) bool {
+	v, _ := r.Context().Value(autoRoutedKey{}).(bool)
+	return v
+}
+
 // refuseFilePart answers a request that would be sealed but carries a file
 // part, before anything is resolved, sealed or sent. Otherwise it would reach
 // the provider as sent and come back as vLLM's own validation error, which
@@ -76,17 +100,41 @@ const ErrCodeSealedFilePart = "sealed_request_file_part"
 // this gateway seals, and only the caller's own header may give that up — it
 // already did, before this point, when it says off.
 //
-// The hints name only what this proxy can do: without a cleartext path (the
-// sidecar) neither the off header nor another model would change anything.
-func (o options) refuseFilePart(w http.ResponseWriter) {
-	msg := "This model is served end-to-end encrypted, and an encrypted request cannot carry a file " +
-		"(a PDF or other document): files are read into text outside the enclave. Remove the file or paste its text"
-	if o.cleartext != nil {
-		msg += `, use model "0g/auto", or send the header ` + HeaderEncryptedTransit +
-			": off to send this request unencrypted"
+// THE PRECONDITION. This refuses by the request alone, before the route is
+// resolved, so it cannot see the provider. That is right only while no sealed
+// model reads files: the router hands a file part through untouched to an
+// endpoint whose input modalities declare "file" (router pkg/inference
+// file_parts.go), and such a provider could serve this request sealed. Today
+// none does — TestSealedModelsReadNoFiles (cmd/gateway) keeps the deployed seal
+// lists to models checked for that. When one is sealed that reads files, this
+// check moves after the resolve and asks the candidate's declared modalities
+// instead, and the refusal applies only when none of them declares "file".
+//
+// The message offers only what can work for this caller:
+//   - "0g/auto", where the caller of Register routes it (WithAutoRouting) and
+//     this request did not already come that way (MarkAutoRouted);
+//   - the off header, where there is a cleartext path and the caller did not
+//     itself just ask for required. It may still be refused, with 403
+//     encrypted_transit_mismatch, if the account or API key requires
+//     encryption, which this proxy cannot see before the preview; it says so.
+func (o options) refuseFilePart(w http.ResponseWriter, r *http.Request) {
+	ways := []string{"remove the file or paste its text"}
+	if o.autoRouting && !autoRouted(r) {
+		ways = append(ways, `use model "0g/auto"`)
 	}
+	if o.cleartext != nil && callerTransit(r) != core.TransitRequired {
+		ways = append(ways, "send the header "+HeaderEncryptedTransit+
+			": off to send this request unencrypted (unless your account or API key requires encryption)")
+	}
+	todo := ways[0]
+	if n := len(ways); n > 1 {
+		todo = strings.Join(ways[:n-1], ", ") + ", or " + ways[n-1]
+	}
+	msg := "This model is served end-to-end encrypted, and an encrypted request cannot carry a file " +
+		"(a PDF or other document): files are read into text outside the enclave. " +
+		strings.ToUpper(todo[:1]) + todo[1:] + "."
 	writeErrorObject(w, http.StatusBadRequest, map[string]any{
-		"error": map[string]any{"message": msg + ".", "type": "gateway_error", "code": ErrCodeSealedFilePart},
+		"error": map[string]any{"message": msg, "type": "gateway_error", "code": ErrCodeSealedFilePart},
 		"_0g":   map[string]any{"source": "gateway"},
 	})
 }

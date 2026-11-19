@@ -178,6 +178,9 @@ type options struct {
 	// WithCleartext. nil refuses such a request instead, and seals a request
 	// whose encrypted_transit is off.
 	cleartext http.Handler
+	// autoRouting: a model named "0g/auto" is routed by the caller of Register
+	// (the gateway), not sealed as named; see WithAutoRouting.
+	autoRouting bool
 }
 
 // WithVerboseUpstreamErrors makes the proxy append the raw upstream response
@@ -353,7 +356,7 @@ func Register(mux *http.ServeMux, ep endpoint.Endpoint, c *core.Client, opts ...
 		// A file part cannot be served sealed; say so here rather than let the
 		// provider's own validation error come back (refuseFilePart).
 		if HasFilePart(req) {
-			o.refuseFilePart(w)
+			o.refuseFilePart(w, r)
 			return
 		}
 		if ep.PreSeal != nil {
