@@ -214,6 +214,7 @@ fresh() {
 }
 
 # Extra assignments for the next run (CVM_ENV_* keys, overrides); fresh clears them.
+# They come after the WAIT_*/POLL_INTERVAL defaults, so a test can override those.
 EXTRA_ENV=()
 
 OUT="" ERR="" RC=0
@@ -224,7 +225,7 @@ run() { # args…
     CVM_NAME_PREFIX=gw-mainnet PHALA_INSTANCE_TYPE=tdx.4xlarge PHALA_NODE_ID=test7 \
     CLOUDFLARE_API_TOKEN=cf-secret ZG_PROM_ENV=mainnet ZG_PROM_REMOTE_WRITE_URL=https://prom.test/w \
     ZG_PROM_REMOTE_WRITE_USERNAME=gw ZG_PROM_REMOTE_WRITE_PASSWORD='p#ss word' \
-    "${EXTRA_ENV[@]}" POLL_INTERVAL=0 WAIT_PUBLISH=1 WAIT_READY=1 WAIT_IDENTITY=1 WAIT_DELETE=1 \
+    POLL_INTERVAL=0 WAIT_PUBLISH=1 WAIT_READY=1 WAIT_IDENTITY=1 WAIT_DELETE=1 "${EXTRA_ENV[@]}" \
     bash "$DEPLOY" "$@" 2>"$WORK/err")" || RC=$?
   ERR="$(cat "$WORK/err")"
 }
@@ -520,7 +521,13 @@ run b --compose "$COMPOSE" --yes
 check_not "a side in the live side's cluster gets no such warning" err_has "the live side a runs in"
 
 # Lookup 1 is check_published's; 2 and 3 are check_ready's first two polls.
+#
+# WAIT_READY=30, not the run's 1: this one needs three polls of check_ready. The
+# deadline is in whole seconds ($SECONDS), so with 1 it expires at the next tick,
+# which on a busy CI runner can fall before the third poll (it did, 2026-11-19).
+# Success returns at once, so the headroom costs nothing on a pass.
 fresh; echo in2.phala.network >"$S/cluster"; printf '2\n3\n' >"$S/cname_blank"
+EXTRA_ENV=(WAIT_READY=30)
 run b --compose "$COMPOSE" --yes
 expect_rc "a CNAME lookup that returns nothing while waiting for /readyz is retried, not fatal" 0
 check "…and the url names the cluster the side was found ready on" \
@@ -540,7 +547,10 @@ check_not "…at once, without waiting out the timeout" err_has "gave up after"
 
 # The deleted CVM's serving CNAME, still naming the old cluster, while the new
 # ingress has written its TXT but not yet its CNAME.
+# Needs several polls of check_ready, so it gets the same headroom as above (failed
+# on CI 2026-11-17 with "gave up after 1s").
 fresh; record CNAME "${DOMAIN}.b.${DZ}" "_.${BASE}"; echo in2.phala.network >"$S/cluster"; echo 2 >"$S/cname_lag"
+EXTRA_ENV=(WAIT_READY=30)
 run b --compose "$COMPOSE" --yes
 expect_rc "a CNAME that lags the TXT is re-read until it names the new cluster" 0
 check "…and the side is found there" [ "$OUT" = $'app_id='"$NEW_APP"$'\nurl=https://'"$NEW_APP"'-443s.in2.phala.network' ]
