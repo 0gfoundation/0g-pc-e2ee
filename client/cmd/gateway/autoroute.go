@@ -508,6 +508,40 @@ func mediaIn(raw json.RawMessage) []string {
 	return out
 }
 
+// filePartTypes are the inline file content parts the router reads into text
+// for an endpoint that does not declare "file" (router pkg/inference
+// file_parts.go): OpenAI chat, Responses, Anthropic.
+var filePartTypes = map[string]bool{"file": true, "input_file": true, "document": true}
+
+// hasFilePart reports whether messages carry an inline file part (a PDF, say),
+// looking into nested content as mediaIn does. Sealed, such a part reaches the
+// upstream as sent, since the router cannot read it to turn it into text, and
+// no sealed model reads files itself: 0gm answers it with a 400 from vLLM.
+func hasFilePart(raw json.RawMessage) bool {
+	var v any
+	if json.Unmarshal(raw, &v) != nil {
+		return false
+	}
+	var scan func(any) bool
+	scan = func(v any) bool {
+		switch t := v.(type) {
+		case []any:
+			for _, e := range t {
+				if scan(e) {
+					return true
+				}
+			}
+		case map[string]any:
+			if typ, _ := t["type"].(string); filePartTypes[typ] {
+				return true
+			}
+			return scan(t["content"])
+		}
+		return false
+	}
+	return scan(v)
+}
+
 // truncateUTF8 cuts s to at most n bytes on a character boundary.
 func truncateUTF8(s string, n int) string {
 	if len(s) <= n {
@@ -534,9 +568,13 @@ func pinsProvider(h http.Header, req wire.Request) bool {
 // sealingFor is "avoid" when the request could not be sent sealed: it uses a
 // feature the router refuses on a sealed request (router
 // SealedPromptInjectionConflict: features that work by inserting into the
-// prompt), or it is over the sealed path's size cap.
+// prompt), it carries an inline file part, or it is over the sealed path's
+// size cap.
 func sealingFor(req wire.Request, size int) string {
 	if size > openaiproxy.MaxRequestBytes {
+		return "avoid"
+	}
+	if hasFilePart(req["messages"]) {
 		return "avoid"
 	}
 	var plugins []struct {
