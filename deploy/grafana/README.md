@@ -69,9 +69,9 @@ screen:
    chose over the selected range, and the rate by chosen model, by classified
    task and by result. `model="none"` is a request that failed before a model
    was chosen; `task="general"` one that was not classified. `model="other"`
-   appearing means more than 64 distinct models were seen since the gateway
-   started, which the ranking does not produce: look at what the router is
-   answering.
+   appearing means more than 128 distinct models were seen since the gateway
+   started, more than the whole chat catalog: look at what the router is
+   answering, or raise `maxAutoModelLabels` if the catalog has grown past it.
 4. **Route preview — the uncached control plane**: retried-preview ratio, failure
    rate, calls by outcome, preview latency p50/p99, attempts by result, and
    suppressed retries. This row exists because preview is the only outbound

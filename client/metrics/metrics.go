@@ -798,10 +798,13 @@ func EncryptedTransitDecision(outcome, policy, reason string) {
 	transitDecisions.WithLabelValues(outcome, policy, reason).Inc()
 }
 
-// maxAutoModelLabels caps the distinct model values auto_routed_total keeps.
-// The router ranks at most ten models per task, out of the chat models 0G
-// lists, so real traffic stays well under it.
-const maxAutoModelLabels = 64
+// maxAutoModelLabels caps the distinct model values auto_routed_total keeps
+// over the life of the process. The router only chooses among the chat models
+// 0G lists — 111 in November 2026, 27 of them in one ranking — but the ranking
+// is re-fetched weekly, so a long-lived gateway sees its versions add up. The
+// cap sits above the whole chat catalog, so "other" means the router answered
+// something that is not one of them, or the catalog outgrew it.
+const maxAutoModelLabels = 128
 
 var autoModelLabels = struct {
 	sync.Mutex
