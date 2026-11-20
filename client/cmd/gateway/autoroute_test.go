@@ -16,6 +16,7 @@ import (
 
 	"github.com/0gfoundation/0g-pc-e2ee/client/clientip"
 	"github.com/0gfoundation/0g-pc-e2ee/client/endpoint"
+	"github.com/0gfoundation/0g-pc-e2ee/client/metrics"
 	"github.com/0gfoundation/0g-pc-e2ee/client/openaiproxy"
 	"github.com/0gfoundation/0g-pc-e2ee/protocol/wire"
 )
@@ -711,5 +712,43 @@ func TestIsAccountRefusal(t *testing.T) {
 		if got := isAccountRefusal(tc.status, []byte(tc.body)); got != tc.want {
 			t.Errorf("isAccountRefusal(%d, %s) = %v, want %v", tc.status, tc.body, got, tc.want)
 		}
+	}
+}
+
+// Every auto request is counted once with the task, the chosen model and the
+// result; one that fails before a model is chosen counts as model "none".
+func TestAutoRoutedMetric(t *testing.T) {
+	// Read from the exposition, as the scraper does.
+	counter := func(task, model, result string) float64 {
+		rec := httptest.NewRecorder()
+		metrics.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+		series := `zg_gateway_auto_routed_total{model="` + model + `",result="` + result + `",task="` + task + `"} `
+		for _, line := range strings.Split(rec.Body.String(), "\n") {
+			if v, ok := strings.CutPrefix(line, series); ok {
+				f, _ := strconv.ParseFloat(v, 64)
+				return f
+			}
+		}
+		return 0
+	}
+
+	f := &fakeAutoRouter{task: "translation", chosen: "metric-test-model"}
+	gw := autoGateway(t, f)
+	before := counter("translation", "metric-test-model", "ok")
+	if resp, _ := postAuto(t, gw.URL, autoBody, nil); resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if d := counter("translation", "metric-test-model", "ok") - before; d != 1 {
+		t.Errorf("auto_routed_total{translation,metric-test-model,ok} delta = %v, want 1", d)
+	}
+
+	refused := &fakeAutoRouter{precheckStatus: http.StatusForbidden, precheckBody: `{"error":{"code":"trust_mode_mismatch"}}`}
+	gw = autoGateway(t, refused)
+	before = counter("none", "none", "client_error")
+	if resp, _ := postAuto(t, gw.URL, autoBody, nil); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if d := counter("none", "none", "client_error") - before; d != 1 {
+		t.Errorf("auto_routed_total{none,none,client_error} delta = %v, want 1", d)
 	}
 }

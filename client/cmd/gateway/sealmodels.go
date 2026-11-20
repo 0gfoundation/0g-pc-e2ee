@@ -321,11 +321,18 @@ func (s sealModels) dispatchAuto(sealed, cleartext http.Handler, auto *autoRoute
 
 		model, reason := modelOf(buf, r.Header.Get("Content-Type"), err, len(buf))
 		if auto != nil && reason == "" && isAutoRequest(r, model) {
+			// Counted once the request is over, whichever path ends it.
+			rec := &autoOutcome{ResponseWriter: w, status: http.StatusOK}
+			w = rec
+			defer func() {
+				metrics.AutoRouted(autoTaskLabel(rec.Header().Get(openaiproxy.HeaderAutoTask)), rec.model, rec.status)
+			}()
 			out, chosen, ok := auto.resolve(w, r, buf)
 			if !ok {
 				return
 			}
 			buf, model = out, chosen
+			rec.model = chosen
 			// The model is routing's choice now, not the caller's: a refusal
 			// downstream must not suggest "0g/auto" back to it.
 			r = openaiproxy.MarkAutoRouted(r)
