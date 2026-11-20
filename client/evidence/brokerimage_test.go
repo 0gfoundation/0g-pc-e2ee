@@ -136,6 +136,30 @@ func TestBuiltinBrokerImages_PinsTheAudited065TwoPass(t *testing.T) {
 		"3d9910a33a26a769c5146dea31bea0d2924a7746ad09e121dabe709eddd5c647716f4d89279e0e24d8dbb93f9cdb605b")
 }
 
+// dstack-nvidia-0.5.15's registers, pinned on the same terms. Computed with dstack-mr
+// from the published meta-dstack v0.5.15 release, single-pass, by two dstack-mr builds
+// that agree and that both reproduce the 0.5.12 entry. Firmware, kernel and initrd all
+// changed since 0.5.12, so nothing here is anchored to a live quote yet.
+func TestBuiltinBrokerImages_PinsTheAuditedNvidia0515(t *testing.T) {
+	requirePinned(t,
+		"dstack-nvidia-0.5.15",
+		"3bb7d262416f47db06855d7b7cf7d380538747206014b3c0adcddfef9b7c4ef2",
+		"e107136c99ae1745ab299e9462927890b7b1c984d5ef53fa5830584ad4246db663fdf96563b913e9e2471906b26f7aae",
+		"786417fa26b5d90d1289025506055e511ff09fd608f4727bb3cf159279a52af23117b6248024d0b186aceabebf6f86ec",
+		"41800152afda682372d33b484e357002e2b179f64b7882e0f0529ad2373ad93898a3b4d3ffb9a433f406b986d4f4f291")
+}
+
+// dstack-nvidia-0.5.15 again, for two-pass hosts such as dstack-pha-prod5. Same image
+// as the single-pass pin above; only MRTD differs.
+func TestBuiltinBrokerImages_PinsTheAuditedNvidia0515TwoPass(t *testing.T) {
+	requirePinned(t,
+		"dstack-nvidia-0.5.15",
+		"3bb7d262416f47db06855d7b7cf7d380538747206014b3c0adcddfef9b7c4ef2",
+		"20038376b145055508e1a8538a864857e8180f989ea8aac4954d432c494872aa48e6946b381fe6bb28d8b9e703ed65d3",
+		"786417fa26b5d90d1289025506055e511ff09fd608f4727bb3cf159279a52af23117b6248024d0b186aceabebf6f86ec",
+		"41800152afda682372d33b484e357002e2b179f64b7882e0f0529ad2373ad93898a3b4d3ffb9a433f406b986d4f4f291")
+}
+
 // dstack-nvidia-0.5.12's registers, pinned on the same terms. Computed with dstack-mr
 // from the published meta-dstack v0.5.12 release, single-pass. MRTD and RTMR1 equal a
 // live quote from a CVM on the base dstack-0.5.12 image (same firmware and kernel);
