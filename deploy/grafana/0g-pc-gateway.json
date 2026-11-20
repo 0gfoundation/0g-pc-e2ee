@@ -1253,7 +1253,7 @@
           "sort": "desc"
         }
       },
-      "description": "Rate of \"0g/auto\" chat requests by the model the router chose. \"none\": no model was chosen; \"other\": past the gateway's 64-model label cap."
+      "description": "Rate of \"0g/auto\" chat requests by the model the router chose. \"none\": no model was chosen; \"other\": past the gateway's 128-model label cap."
     },
     {
       "id": 403,
