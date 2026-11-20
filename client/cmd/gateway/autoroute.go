@@ -708,6 +708,46 @@ func isAutoTaskCategory(t string) bool {
 	return false
 }
 
+// autoTaskLabel bounds the task for metrics.AutoRouted: a classifier tag or
+// "general" as resolve set it, "none" when it set none (it failed first).
+func autoTaskLabel(t string) string {
+	if t == autoGeneral || isAutoTaskCategory(t) {
+		return t
+	}
+	return "none"
+}
+
+// autoOutcome records, for metrics.AutoRouted, the status written for an auto
+// request and the model it was dispatched as. It passes Flush through for
+// streams, and Unwrap for http.ResponseController.
+type autoOutcome struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+	model       string
+}
+
+func (o *autoOutcome) WriteHeader(code int) {
+	if !o.wroteHeader && code >= 200 {
+		o.status, o.wroteHeader = code, true
+	}
+	o.ResponseWriter.WriteHeader(code)
+}
+
+func (o *autoOutcome) Write(b []byte) (int, error) {
+	o.wroteHeader = true
+	return o.ResponseWriter.Write(b)
+}
+
+func (o *autoOutcome) Flush() {
+	o.wroteHeader = true
+	if f, ok := o.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (o *autoOutcome) Unwrap() http.ResponseWriter { return o.ResponseWriter }
+
 // isAccountRefusal reports whether the router refused the account rather
 // than the classifier: by error code where the status alone does not say.
 func isAccountRefusal(status int, body []byte) bool {

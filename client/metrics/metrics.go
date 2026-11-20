@@ -14,7 +14,10 @@
 // openaiproxy.LogRequests keeps for the access log. Every label defined here is
 // low-cardinality and content-free: route templates, HTTP methods, status codes,
 // and fixed outcome enums. A provider address, endpoint URL, request id, model
-// name, or any other caller-supplied value must NEVER become a label value.
+// name, or any other caller-supplied value must NEVER become a label value. The
+// two model labels that exist are bounded where they are declared: the seal
+// gate's to the configured allowlist, auto routing's to a capped set of the
+// router's own answers (see autoRouted).
 //
 // Which CVM produced a series is deliberately NOT decided here. It is a TARGET
 // label, applied by the scraper from the file_sd document cmd/cvmid writes (see
@@ -34,6 +37,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -163,6 +167,33 @@ var (
 		Help: "Inference requests by seal decision (sealed|passthrough) and reason, " +
 			"with the model bucketed to the configured allowlist or \"other\".",
 	}, []string{"model", "decision", "reason"})
+	// Auto routing (cmd/gateway/autoroute.go): one per chat request naming
+	// "0g/auto", by the task it was classified as, the model the router chose
+	// for it, and how the request ended. This is the selected-model
+	// distribution: sum by (model), or by (task, model) to see the ranking at work.
+	//
+	// task is the classifier's tag (a fixed set of 29), "general" when the
+	// request was not classified, or "none" when it failed before a task was
+	// settled. model is the router's choice, "none" when none was chosen
+	// (the preview refused, or the gateway refused the choice), "other" past
+	// the cap. Neither is caller-supplied, and neither tells the operator
+	// anything the router does not already get per request: the task rides the
+	// model-choice preview in the clear, and the router picks the model. The
+	// router is not trusted, though, so model is bounded here — a lowercase
+	// id-shaped value, the first maxAutoModelLabels distinct ones by name and
+	// "other" after that — and a misbehaving router cannot mint a series per
+	// request.
+	//
+	// result is the status class of the response this gateway wrote: ok (< 400),
+	// client_error (4xx), server_error (5xx). A stream that fails after its 200
+	// counts as ok; completions_total has that split, by source and stage.
+	autoRouted = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Namespace: namespace, Subsystem: subsystem, Name: "auto_routed_total",
+		Help: "Chat requests naming model \"0g/auto\", by classified task, the model routing chose " +
+			"(\"none\" if none was chosen, \"other\" past the label cap) and result " +
+			"(ok|client_error|server_error, from the response status).",
+	}, []string{"task", "model", "result"})
+
 	// Requests on a sealed surface that went to the router in the clear, or were
 	// refused, because of their encrypted_transit (0g-router #1215, G1) — by the
 	// policy that applied (off | preferred | required | unknown, for a router that
@@ -448,7 +479,7 @@ func init() {
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		httpRequests, httpDuration, httpInFlight, inFlightLimit, requestsShed, bodyReadTimeouts, bodyReadUnbounded,
-		completions, openFailures, verificationFailures, sealDecisions, transitDecisions, unknownTransit,
+		completions, openFailures, verificationFailures, sealDecisions, transitDecisions, unknownTransit, autoRouted,
 		previewAttempts, previewCalls, previewDuration, previewRetrySuppressed,
 		upstreamAttempts, upstreamDuration, streamTTFF, candidateFallbacks, keyRefreshes, walkBudgetExhausted,
 		signatureFetchCalls, signatureFetchDuration,
@@ -765,6 +796,55 @@ func EncryptedTransitDecision(outcome, policy, reason string) {
 		policy = "unknown"
 	}
 	transitDecisions.WithLabelValues(outcome, policy, reason).Inc()
+}
+
+// maxAutoModelLabels caps the distinct model values auto_routed_total keeps.
+// The router ranks at most ten models per task, out of the chat models 0G
+// lists, so real traffic stays well under it.
+const maxAutoModelLabels = 64
+
+var autoModelLabels = struct {
+	sync.Mutex
+	seen map[string]struct{}
+}{seen: map[string]struct{}{}}
+
+// autoModelLabel bounds the router's chosen model to a label value: "none" for
+// no model, the lowercased id while it is id-shaped and among the first
+// maxAutoModelLabels seen, "other" otherwise.
+func autoModelLabel(model string) string {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if m == "" || m == "none" {
+		return "none"
+	}
+	if len(m) > 128 || strings.IndexFunc(m, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || strings.ContainsRune("-_./:@", r))
+	}) >= 0 {
+		return "other"
+	}
+	autoModelLabels.Lock()
+	defer autoModelLabels.Unlock()
+	if _, ok := autoModelLabels.seen[m]; ok {
+		return m
+	}
+	if len(autoModelLabels.seen) >= maxAutoModelLabels {
+		return "other"
+	}
+	autoModelLabels.seen[m] = struct{}{}
+	return m
+}
+
+// AutoRouted counts one "0g/auto" chat request. task must already be bounded by
+// the caller (a classifier tag, "general" or "none"); model is bounded here, see
+// autoRouted. status is the response status the gateway wrote.
+func AutoRouted(task, model string, status int) {
+	result := "ok"
+	switch {
+	case status >= 500:
+		result = "server_error"
+	case status >= 400:
+		result = "client_error"
+	}
+	autoRouted.WithLabelValues(task, autoModelLabel(model), result).Inc()
 }
 
 // UnknownEncryptedTransit counts one route-preview answer whose

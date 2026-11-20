@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -285,5 +286,42 @@ func TestProxyHeaderCounter(t *testing.T) {
 	}
 	if labels := line[strings.Index(line, "{"):strings.Index(line, "}")]; strings.Count(labels, "=") != 1 || !strings.Contains(labels, "result=") {
 		t.Fatalf("unexpected labels %q: only `result` is allowed", labels)
+	}
+}
+
+// AutoRouted maps the status to a result class and bounds the router-chosen
+// model: id-shaped values keep their (lowercased) name, anything else and
+// anything past the cap is "other", and no model is "none".
+func TestAutoRoutedBoundsModel(t *testing.T) {
+	ok := autoRouted.WithLabelValues("math", "deepseek-v4-pro", "ok")
+	bad := autoRouted.WithLabelValues("general", "none", "client_error")
+	srv := autoRouted.WithLabelValues("code:debugging", "glm-5", "server_error")
+	okBefore, badBefore, srvBefore := testutil.ToFloat64(ok), testutil.ToFloat64(bad), testutil.ToFloat64(srv)
+	AutoRouted("math", " DeepSeek-V4-Pro ", 200)
+	AutoRouted("general", "", 429)
+	AutoRouted("code:debugging", "glm-5", 502)
+	if d := testutil.ToFloat64(ok) - okBefore; d != 1 {
+		t.Errorf("ok delta = %v, want 1", d)
+	}
+	if d := testutil.ToFloat64(bad) - badBefore; d != 1 {
+		t.Errorf("client_error delta = %v, want 1", d)
+	}
+	if d := testutil.ToFloat64(srv) - srvBefore; d != 1 {
+		t.Errorf("server_error delta = %v, want 1", d)
+	}
+
+	for _, m := range []string{"has space", "x\ny", "名字", strings.Repeat("a", 129)} {
+		if got := autoModelLabel(m); got != "other" {
+			t.Errorf("autoModelLabel(%q) = %q, want other", m, got)
+		}
+	}
+	for i := 0; i < maxAutoModelLabels+5; i++ {
+		autoModelLabel("cap-test-" + strconv.Itoa(i))
+	}
+	if got := autoModelLabel("one-more-past-the-cap"); got != "other" {
+		t.Errorf("past the cap = %q, want other", got)
+	}
+	if got := autoModelLabel("deepseek-v4-pro"); got != "deepseek-v4-pro" {
+		t.Errorf("a model seen before the cap keeps its label, got %q", got)
 	}
 }
