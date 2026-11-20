@@ -111,6 +111,31 @@ func TestBuiltinBrokerImages_PinsTheAudited061TwoPass(t *testing.T) {
 		"e9000e338f33233e8f51b7fd031e1c158bdcf8572eab041c0bc8eb7fef48b23259a6a556e6c8e2af99999fc39c793179")
 }
 
+// dstack-0.6.5's registers, pinned on the same terms. Computed with dstack-mr at the
+// release commit from the published Dstack-TEE/dstack mkosi-os-v0.6.5 release,
+// single-pass, and equal to what dstack-mr derives from the release's own
+// measurement.tdx.cbor. MRTD is shared with dstack-0.6.1 (identical ovmf.fd);
+// RTMR1/RTMR2 are computed only until a 0.6.5 CVM is quoted.
+func TestBuiltinBrokerImages_PinsTheAudited065(t *testing.T) {
+	requirePinned(t,
+		"dstack-0.6.5",
+		"4771a29e03e93f0e2d5e37174cd8bb1112942c9689deb36b16c5df9e183d8623",
+		"83baf004a06c83f6371d4d9e19c8bb1ead734ba7696e56d6b52271011394a6f24efecc27af3b5c1da41594dbfa706e97",
+		"2f72a4db2f7de90adeabe55607b0c1cf209fc243bc773f5862d1b00d3bb198e835e99d502e90a24005f0d1368dd24f29",
+		"3d9910a33a26a769c5146dea31bea0d2924a7746ad09e121dabe709eddd5c647716f4d89279e0e24d8dbb93f9cdb605b")
+}
+
+// dstack-0.6.5 again, for two-pass hosts such as dstack-pha-prod5. Same image as the
+// single-pass pin above; only MRTD differs.
+func TestBuiltinBrokerImages_PinsTheAudited065TwoPass(t *testing.T) {
+	requirePinned(t,
+		"dstack-0.6.5",
+		"4771a29e03e93f0e2d5e37174cd8bb1112942c9689deb36b16c5df9e183d8623",
+		"2a674327c50218dba880066b349b8d559d749ed68dce33fd651c184a877d084b07a9e583767a7ad5da13ed91deec2b70",
+		"2f72a4db2f7de90adeabe55607b0c1cf209fc243bc773f5862d1b00d3bb198e835e99d502e90a24005f0d1368dd24f29",
+		"3d9910a33a26a769c5146dea31bea0d2924a7746ad09e121dabe709eddd5c647716f4d89279e0e24d8dbb93f9cdb605b")
+}
+
 // dstack-nvidia-0.5.12's registers, pinned on the same terms. Computed with dstack-mr
 // from the published meta-dstack v0.5.12 release, single-pass. MRTD and RTMR1 equal a
 // live quote from a CVM on the base dstack-0.5.12 image (same firmware and kernel);
