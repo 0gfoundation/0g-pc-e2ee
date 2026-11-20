@@ -63,6 +63,53 @@
   ],
   "images": [
     {
+      "name": "dstack-nvidia-0.5.15",
+      "os_image_hash": "3bb7d262416f47db06855d7b7cf7d380538747206014b3c0adcddfef9b7c4ef2",
+      "source": "github.com/Dstack-TEE/meta-dstack releases/download/v0.5.15/dstack-nvidia-0.5.15.tar.gz",
+      "page_add": "single-pass (dstack-mr two_pass_add_pages=false; two_pass_add_pages=true gives 20038376… instead, see the entry below)",
+      "derivation": [
+        "1. Downloaded the production release above. All four sha256sum.txt members",
+        "   passed SHA-256 verification; sha256(sha256sum.txt) equals digest.txt and",
+        "   the os_image_hash above. metadata.json: version 0.5.15, is_dev false,",
+        "   git_revision ee82bd6a4fb5a33cb0cfe52df54b31d665f0488a, equal to the",
+        "   meta-dstack v0.5.15 tag; ovmf_variant pre202505, kernel_header_normalized true.",
+        "2. Computed with dstack-mr from the clean Dstack-TEE/dstack source commit",
+        "   7f143148cc49f4a09799958835d310e050137cb3, using `measure",
+        "   --two-pass-add-pages false --cpu 1 --memory 2G --json metadata.json`.",
+        "   Repeated at 8/32G and 128/1024G: MRTD/RTMR1/RTMR2 identical; RTMR0 alone",
+        "   changes. The same binary reproduces the existing dstack-0.6.1 single-pass",
+        "   entry's MRTD/RTMR1/RTMR2 byte-for-byte. No register was copied from a CVM.",
+        "3. NOT YET CONFIRMED by a live quote. Phala Cloud reports h200-merged-in2c",
+        "   app 7309db96422778bb84ef85ca01a370cf4130014f using this os_image_hash,",
+        "   but its attestation API had no TCB info while it was booting (2026-11-20).",
+        "   That control-plane image identity is not cryptographic quote verification;",
+        "   confirm all three registers against a verified live quote before cutover.",
+        "4. This entry identifies the guest OS boot chain, not a successful NVIDIA",
+        "   per-GPU confidential-compute attestation. It does not establish that the",
+        "   H200 GPUs run in confidential-compute mode."
+      ],
+      "mrtd": "e107136c99ae1745ab299e9462927890b7b1c984d5ef53fa5830584ad4246db663fdf96563b913e9e2471906b26f7aae",
+      "rtmr1": "786417fa26b5d90d1289025506055e511ff09fd608f4727bb3cf159279a52af23117b6248024d0b186aceabebf6f86ec",
+      "rtmr2": "41800152afda682372d33b484e357002e2b179f64b7882e0f0529ad2373ad93898a3b4d3ffb9a433f406b986d4f4f291"
+    },
+    {
+      "name": "dstack-nvidia-0.5.15",
+      "os_image_hash": "3bb7d262416f47db06855d7b7cf7d380538747206014b3c0adcddfef9b7c4ef2",
+      "source": "github.com/Dstack-TEE/meta-dstack releases/download/v0.5.15/dstack-nvidia-0.5.15.tar.gz",
+      "page_add": "two-pass (dstack-mr two_pass_add_pages=true, which is what a host reporting vm_config.qemu_single_pass_add_pages=true yields)",
+      "derivation": [
+        "The SAME production image and artifact checks as the entry above, measured",
+        "with the same dstack-mr binary and --two-pass-add-pages true at 1/2G, 8/32G",
+        "and 128/1024G. MRTD changes with page-add mode only; RTMR1/RTMR2 equal the",
+        "single-pass entry. Computed independently of any deployment.",
+        "NOT YET CONFIRMED by a live quote. This is an OS boot-chain pin only;",
+        "it makes no claim about NVIDIA per-GPU confidential-compute mode."
+      ],
+      "mrtd": "20038376b145055508e1a8538a864857e8180f989ea8aac4954d432c494872aa48e6946b381fe6bb28d8b9e703ed65d3",
+      "rtmr1": "786417fa26b5d90d1289025506055e511ff09fd608f4727bb3cf159279a52af23117b6248024d0b186aceabebf6f86ec",
+      "rtmr2": "41800152afda682372d33b484e357002e2b179f64b7882e0f0529ad2373ad93898a3b4d3ffb9a433f406b986d4f4f291"
+    },
+    {
       "name": "dstack-0.6.5",
       "os_image_hash": "4771a29e03e93f0e2d5e37174cd8bb1112942c9689deb36b16c5df9e183d8623",
       "source": "github.com/Dstack-TEE/dstack releases/download/mkosi-os-v0.6.5/dstack-0.6.5.tar.gz",
