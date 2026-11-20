@@ -1099,13 +1099,326 @@
       }
     },
     {
+      "id": 400,
+      "type": "row",
+      "title": "Auto routing \u2014 model \"0g/auto\"",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 38,
+        "w": 24,
+        "h": 1
+      },
+      "panels": []
+    },
+    {
+      "id": 401,
+      "type": "piechart",
+      "title": "Chosen model share (in range)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Share of auto-routed requests per model the router chose, over the selected time range. Requests that failed before a model was chosen (model=\"none\") are left out; see the result panel for those.",
+      "gridPos": {
+        "x": 0,
+        "y": 39,
+        "w": 6,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (model) (increase(zg_gateway_auto_routed_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\", model!=\"none\"}[$__range]))",
+          "instant": true,
+          "range": false,
+          "refId": "A",
+          "legendFormat": "{{model}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0,
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "pieType": "donut",
+        "displayLabels": [
+          "percent"
+        ],
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "right",
+          "values": [
+            "value",
+            "percent"
+          ]
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      }
+    },
+    {
+      "id": 402,
+      "type": "timeseries",
+      "title": "Auto-routed requests by chosen model",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 39,
+        "w": 6,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (model) (rate(zg_gateway_auto_routed_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval]))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{model}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Rate of \"0g/auto\" chat requests by the model the router chose. \"none\": no model was chosen; \"other\": past the gateway's 64-model label cap."
+    },
+    {
+      "id": 403,
+      "type": "timeseries",
+      "title": "Auto-routed requests by task",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 39,
+        "w": 6,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (task) (rate(zg_gateway_auto_routed_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval]))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{task}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Rate by classified task. \"general\": not classified (no consent to send the opening in the clear, a pinned provider, or the classifier failed); \"none\": failed before a task was settled."
+    },
+    {
+      "id": 404,
+      "type": "timeseries",
+      "title": "Auto-routed requests by result",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 39,
+        "w": 6,
+        "h": 8
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "sum by (result) (rate(zg_gateway_auto_routed_total{service=~\"$service\", env=~\"$env\", instance_id=~\"$instance_id\"}[$__rate_interval]))",
+          "range": true,
+          "refId": "A",
+          "legendFormat": "{{result}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cps",
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 10,
+            "gradientMode": "none",
+            "showPoints": "never",
+            "spanNulls": false,
+            "axisPlacement": "auto",
+            "stacking": {
+              "group": "A",
+              "mode": "normal"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "showLegend": true,
+          "displayMode": "table",
+          "placement": "bottom",
+          "calcs": [
+            "mean",
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "description": "Status class of the response the gateway wrote (ok < 400, client_error 4xx, server_error 5xx). A stream that fails after its 200 counts as ok."
+    },
+    {
       "id": 200,
       "type": "row",
       "title": "Route preview \u2014 the uncached control plane",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 38,
+        "y": 47,
         "w": 24,
         "h": 1
       },
@@ -1121,7 +1434,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 39,
+        "y": 48,
         "w": 5,
         "h": 6
       },
@@ -1188,7 +1501,7 @@
       },
       "gridPos": {
         "x": 5,
-        "y": 39,
+        "y": 48,
         "w": 5,
         "h": 6
       },
@@ -1255,7 +1568,7 @@
       },
       "gridPos": {
         "x": 10,
-        "y": 39,
+        "y": 48,
         "w": 7,
         "h": 6
       },
@@ -1332,7 +1645,7 @@
       },
       "gridPos": {
         "x": 17,
-        "y": 39,
+        "y": 48,
         "w": 7,
         "h": 6
       },
@@ -1420,7 +1733,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 45,
+        "y": 54,
         "w": 12,
         "h": 6
       },
@@ -1497,7 +1810,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 45,
+        "y": 54,
         "w": 12,
         "h": 6
       },
@@ -1571,7 +1884,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 51,
+        "y": 60,
         "w": 24,
         "h": 1
       },
@@ -1587,7 +1900,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 52,
+        "y": 61,
         "w": 5,
         "h": 6
       },
@@ -1654,7 +1967,7 @@
       },
       "gridPos": {
         "x": 5,
-        "y": 52,
+        "y": 61,
         "w": 5,
         "h": 6
       },
@@ -1733,7 +2046,7 @@
       },
       "gridPos": {
         "x": 10,
-        "y": 52,
+        "y": 61,
         "w": 7,
         "h": 6
       },
@@ -1810,7 +2123,7 @@
       },
       "gridPos": {
         "x": 17,
-        "y": 52,
+        "y": 61,
         "w": 7,
         "h": 6
       },
@@ -1898,7 +2211,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 58,
+        "y": 67,
         "w": 8,
         "h": 6
       },
@@ -1986,7 +2299,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 58,
+        "y": 67,
         "w": 8,
         "h": 6
       },
@@ -2074,7 +2387,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 58,
+        "y": 67,
         "w": 8,
         "h": 6
       },
@@ -2151,7 +2464,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 64,
+        "y": 73,
         "w": 8,
         "h": 6
       },
@@ -2236,7 +2549,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 70,
+        "y": 79,
         "w": 24,
         "h": 1
       },
@@ -2252,7 +2565,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 71,
+        "y": 80,
         "w": 6,
         "h": 6
       },
@@ -2319,7 +2632,7 @@
       },
       "gridPos": {
         "x": 6,
-        "y": 71,
+        "y": 80,
         "w": 9,
         "h": 6
       },
@@ -2396,7 +2709,7 @@
       },
       "gridPos": {
         "x": 15,
-        "y": 71,
+        "y": 80,
         "w": 9,
         "h": 6
       },
@@ -2473,7 +2786,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 77,
+        "y": 86,
         "w": 8,
         "h": 8
       },
@@ -2561,7 +2874,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 77,
+        "y": 86,
         "w": 8,
         "h": 8
       },
@@ -2642,7 +2955,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 77,
+        "y": 86,
         "w": 4,
         "h": 8
       },
@@ -2705,7 +3018,7 @@
       },
       "gridPos": {
         "x": 20,
-        "y": 77,
+        "y": 86,
         "w": 4,
         "h": 8
       },
@@ -2765,7 +3078,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 85,
+        "y": 94,
         "w": 24,
         "h": 1
       },
@@ -2781,7 +3094,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 86,
+        "y": 95,
         "w": 4,
         "h": 6
       },
@@ -2844,7 +3157,7 @@
       },
       "gridPos": {
         "x": 4,
-        "y": 86,
+        "y": 95,
         "w": 4,
         "h": 6
       },
@@ -2907,7 +3220,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 86,
+        "y": 95,
         "w": 4,
         "h": 6
       },
@@ -2970,7 +3283,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 86,
+        "y": 95,
         "w": 6,
         "h": 6
       },
@@ -3047,7 +3360,7 @@
       },
       "gridPos": {
         "x": 18,
-        "y": 86,
+        "y": 95,
         "w": 6,
         "h": 6
       },
@@ -3132,7 +3445,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 92,
+        "y": 101,
         "w": 24,
         "h": 1
       },
@@ -3148,7 +3461,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 93,
+        "y": 102,
         "w": 4,
         "h": 6
       },
@@ -3211,7 +3524,7 @@
       },
       "gridPos": {
         "x": 4,
-        "y": 93,
+        "y": 102,
         "w": 4,
         "h": 6
       },
@@ -3274,7 +3587,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 93,
+        "y": 102,
         "w": 6,
         "h": 6
       },
@@ -3351,7 +3664,7 @@
       },
       "gridPos": {
         "x": 14,
-        "y": 93,
+        "y": 102,
         "w": 6,
         "h": 6
       },
@@ -3428,7 +3741,7 @@
       },
       "gridPos": {
         "x": 20,
-        "y": 93,
+        "y": 102,
         "w": 4,
         "h": 6
       },
@@ -3489,7 +3802,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 99,
+        "y": 108,
         "w": 24,
         "h": 1
       },
@@ -3505,7 +3818,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 100,
+        "y": 109,
         "w": 6,
         "h": 6
       },
@@ -3572,7 +3885,7 @@
       },
       "gridPos": {
         "x": 6,
-        "y": 100,
+        "y": 109,
         "w": 9,
         "h": 6
       },
@@ -3660,7 +3973,7 @@
       },
       "gridPos": {
         "x": 15,
-        "y": 100,
+        "y": 109,
         "w": 9,
         "h": 6
       },
@@ -3748,7 +4061,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 106,
+        "y": 115,
         "w": 12,
         "h": 8
       },
@@ -3833,7 +4146,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 114,
+        "y": 123,
         "w": 24,
         "h": 1
       },
@@ -3849,7 +4162,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 115,
+        "y": 124,
         "w": 8,
         "h": 6
       },
@@ -3926,7 +4239,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 115,
+        "y": 124,
         "w": 8,
         "h": 6
       },
@@ -4003,7 +4316,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 115,
+        "y": 124,
         "w": 8,
         "h": 6
       },
