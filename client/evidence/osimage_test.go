@@ -234,3 +234,59 @@ func TestBuiltinOSImages_EntriesAreWellFormed(t *testing.T) {
 		seen[bc] = img.Name
 	}
 }
+
+// dstack-0.6.5, both page-add modes, pinned in the gateway allowlist. 0.6.x ships one
+// TDX image, so these must be exactly the dstack-0.6.5 boot chains in
+// brokerimages.json: the two files were transcribed separately, and a disagreement
+// means one of them is wrong. RTMR1/RTMR2 are computed (dstack-mr at the release
+// commit, and the release's own measurement.tdx.cbor) until a 0.6.5 gateway is quoted.
+func TestBuiltinOSImages_PinsTheAudited065(t *testing.T) {
+	const (
+		name  = "dstack-0.6.5"
+		hash  = "4771a29e03e93f0e2d5e37174cd8bb1112942c9689deb36b16c5df9e183d8623"
+		rtmr1 = "2f72a4db2f7de90adeabe55607b0c1cf209fc243bc773f5862d1b00d3bb198e835e99d502e90a24005f0d1368dd24f29"
+		rtmr2 = "3d9910a33a26a769c5146dea31bea0d2924a7746ad09e121dabe709eddd5c647716f4d89279e0e24d8dbb93f9cdb605b"
+	)
+	mrtds := []string{
+		"83baf004a06c83f6371d4d9e19c8bb1ead734ba7696e56d6b52271011394a6f24efecc27af3b5c1da41594dbfa706e97", // single-pass
+		"2a674327c50218dba880066b349b8d559d749ed68dce33fd651c184a877d084b07a9e583767a7ad5da13ed91deec2b70", // two-pass
+	}
+	gw, err := BuiltinOSImages()
+	if err != nil {
+		t.Fatalf("BuiltinOSImages: %v", err)
+	}
+	br, err := BuiltinBrokerImages()
+	if err != nil {
+		t.Fatalf("BuiltinBrokerImages: %v", err)
+	}
+	find := func(imgs []OSImage, mrtd string) *OSImage {
+		for i := range imgs {
+			if imgs[i].Name == name && hex.EncodeToString(imgs[i].BootChain.MRTD[:]) == mrtd {
+				return &imgs[i]
+			}
+		}
+		return nil
+	}
+	for _, mrtd := range mrtds {
+		got := find(gw, mrtd)
+		if got == nil {
+			t.Fatalf("%s with MRTD %.16s… is not in osimages.json", name, mrtd)
+		}
+		if got.OSImageHash != hash {
+			t.Errorf("MRTD %.16s…: os_image_hash = %s, want %s", mrtd, got.OSImageHash, hash)
+		}
+		if h := hex.EncodeToString(got.BootChain.RTMR1[:]); h != rtmr1 {
+			t.Errorf("MRTD %.16s…: rtmr1 = %s, want %s", mrtd, h, rtmr1)
+		}
+		if h := hex.EncodeToString(got.BootChain.RTMR2[:]); h != rtmr2 {
+			t.Errorf("MRTD %.16s…: rtmr2 = %s, want %s", mrtd, h, rtmr2)
+		}
+		other := find(br, mrtd)
+		if other == nil {
+			t.Fatalf("%s with MRTD %.16s… is in osimages.json but not brokerimages.json", name, mrtd)
+		}
+		if other.BootChain != got.BootChain || other.OSImageHash != got.OSImageHash {
+			t.Errorf("MRTD %.16s…: osimages.json and brokerimages.json disagree on %s", mrtd, name)
+		}
+	}
+}
