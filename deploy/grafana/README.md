@@ -41,7 +41,7 @@ Grafana `dashboards` provider watches). The `uid` is `0g-pc-gateway`.
 
 ## Layout
 
-One dashboard, nine collapsible rows — one service, so cross-metric correlation
+One dashboard, ten collapsible rows — one service, so cross-metric correlation
 (latency vs quote-cache misses, open failures vs a bad provider) stays on one
 screen:
 
@@ -53,7 +53,7 @@ screen:
    "5xx ratio" and "rate by status" panels above, where it reads as a fault the
    gateway committed rather than as the limiter doing its job — subtract this
    series to get faults alone. It is also the panel that confirms or refutes the
-   premise behind `route.retryGate` (row 3): that a router outage becomes
+   premise behind `route.retryGate` (row 4): that a router outage becomes
    gateway-wide shedding, because each retrying request holds its concurrency
    slot for the whole retry ceiling.
    Under it, **refused at the door**: the 503 sheds and the 408 body-read timeouts
@@ -64,7 +64,15 @@ screen:
    deadline could not be set on.
 2. **Completions**: outcome by result, and errors broken down by
    `source`/`stage` (gateway fault vs router/provider).
-3. **Route preview — the uncached control plane**: retried-preview ratio, failure
+3. **Auto routing — model "0g/auto"**: from `zg_gateway_auto_routed_total`, one
+   count per chat request naming "0g/auto". The share of each model the router
+   chose over the selected range, and the rate by chosen model, by classified
+   task and by result. `model="none"` is a request that failed before a model
+   was chosen; `task="general"` one that was not classified. `model="other"`
+   appearing means more than 64 distinct models were seen since the gateway
+   started, which the ranking does not produce: look at what the router is
+   answering.
+4. **Route preview — the uncached control plane**: retried-preview ratio, failure
    rate, calls by outcome, preview latency p50/p99, attempts by result, and
    suppressed retries. This row exists because preview is the only outbound
    dependency on the request path with no cache in
@@ -109,7 +117,7 @@ screen:
      The panel counts the retry ATTEMPTS not made, not the calls affected, so it
      reads as load shed — an upper bound, since the budget might independently have
      declined some of them.
-4. **Data plane — the sealed request to the provider**: upstream failure ratio and
+5. **Data plane — the sealed request to the provider**: upstream failure ratio and
    candidate-fallback rate; attempts by outcome; buffered completion latency;
    stream time-to-first-frame and open duration; the §8 signature fetch and its
    latency. Rows 1–2 measure what this gateway *served*, which is preview +
@@ -205,7 +213,7 @@ screen:
      specific to a histogram: its duration says when the caller left, not how long
      anything took. To ask "how long do doomed attempts take to give up", chart
      `result="failed"`; the panels here deliberately do not.
-5. **Attestation & E2EE**: quote-cache hit ratio, verifications by result, verify
+6. **Attestation & E2EE**: quote-cache hit ratio, verifications by result, verify
    latency, response-signature verification failures by reason (fetch vs
    signature), untrusted-measurement rate, E2EE open failures. Read the
    untrusted-measurement rate against the mode: with `ZG_GATEWAY_ATTEST_ENFORCE` on
@@ -213,7 +221,7 @@ screen:
    verification instead of taking the warn path, so it lands in "verifications by
    result" as an `error`. It is a signal only in warn mode, where it is the baseline
    that says whether enforce can be turned on.
-6. **On-chain grounding (hop 5)**: ready-provider count, chain-RPC lookup-failure
+7. **On-chain grounding (hop 5)**: ready-provider count, chain-RPC lookup-failure
    and signer-mismatch rates, all grounding outcomes, and revalidations. This row
    is what said whether `ZG_GATEWAY_ONCHAIN_ENFORCE` could be turned on — the criterion
    was `lookup_failed` and `mismatch` sitting at zero in warn mode, since every other
@@ -224,22 +232,22 @@ screen:
    and note "Ready providers" uses `min` across the selected replicas, not a sum: one
    replica that can ground nothing is the number that matters, since it is the one
    failing every request.
-7. **Provider checks**: the two judgements of what a provider runs, per quote
+8. **Provider checks**: the two judgements of what a provider runs, per quote
    verification — `runtime_release` (the broker build the CVM's RTMR3 records say it
    runs now, against the broker's signed release policy) and `compose_baseline` (the
    manifest it booted, against the deployment recorded for it) — as `no_match` rates and
    by verdict, and the candidates `ZG_GATEWAY_PROVIDER_ENFORCE` refused, by check. Both
    verdicts are counted once per verification and provider, not per request. With
    enforce off (as deployed) the refusals panel stays empty and this row is the survey
-   enforce is decided on, in the role row 6 played for on-chain enforce: turn it on when
+   enforce is decided on, in the role row 7 played for on-chain enforce: turn it on when
    every provider being routed to reads `pass` in both by-verdict panels. Read `no_match` as the only finding; `no_baseline` (nobody recorded the
    provider), `not_checked` (no runtime image record, or the check is off) and
    `unavailable` (a check that did not run — on a new build, for the seconds its
    provenance is fetched in the background) say nothing against a provider, and on
    today's fleet `no_baseline` is most of what the baseline panel shows.
-8. **Warmer & DCAP collateral**: warmer last-success age (with alert-colored
+9. **Warmer & DCAP collateral**: warmer last-success age (with alert-colored
    thresholds), sweep/provider outcomes, collateral cache + fetch latency.
-9. **Process runtime**: goroutines, resident memory, CPU. These are the panels
+10. **Process runtime**: goroutines, resident memory, CPU. These are the panels
    that are not summed, so they draw one line per replica; the legend is
    `{{instance_id}}` rather than Prometheus' own `instance`, which is the scrape
    address (`gateway:9464`) and therefore the same string in every replica.
