@@ -28,8 +28,10 @@ const (
 // OpenRouter-style app-attribution headers they send: X-Title (matched as a
 // word-boundary prefix of the lowercased value, so "Decline Tracker" is not
 // Cline and "Crushon AI" is not Crush; or, for exactTitle rules, as the whole
-// lowercased value) and HTTP-Referer (matched on the tool's own domain).
-// Checked before the User-Agent: Cline and Kilo send an OpenAI-SDK UA.
+// lowercased value) and HTTP-Referer (matched when the referer's host is the
+// tool's domain or a subdomain of it, so codify.ai is not dify.ai).
+// Checked before the User-Agent: many of these tools send only a generic SDK
+// UA (OpenAI or Vercel AI SDK).
 var clientTitleRules = []struct {
 	titlePrefixes []string
 	refererDomain string
@@ -49,9 +51,10 @@ var clientTitleRules = []struct {
 	{[]string{"anythingllm"}, "anythingllm.com", "anythingllm", false},
 	{[]string{"lobehub", "lobechat"}, "lobehub.com", "lobehub", false},
 	// Tools that send only their SDK's default User-Agent to a custom endpoint:
-	// recognised only once an integration we ship sends this X-Title (C-2).
-	// We choose those titles, so a common-word name matches the whole title
-	// only: "Continue Learning App" is not Continue, "Goose Tracker" not Goose.
+	// recognised by a referer on the tool's own domain if it sends one, else
+	// only once an integration we ship sends this X-Title (C-2). We choose
+	// those titles, so a common-word name matches the whole title only:
+	// "Continue Learning App" is not Continue, "Goose Tracker" not Goose.
 	{[]string{"langflow"}, "langflow.org", "langflow", false},
 	{[]string{"n8n"}, "n8n.io", "n8n", true},
 	{[]string{"continue"}, "continue.dev", "continue", true},
@@ -70,8 +73,8 @@ var clientUARules = []struct {
 	client string
 }{
 	// claude-cli/ is decided in classifyUA (it splits on agent-sdk/).
-	{true, "codex", "codex"}, // codex_cli_rs/, codex_exec/, "Codex Desktop/"
-	{true, "opencode/", "opencode"},
+	{true, "codex", "codex"},        // codex_cli_rs/, codex_exec/, "Codex Desktop/"
+	{true, "opencode/", "opencode"}, // "opencode/1.19.6 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4": before ai-sdk/
 	{true, "zcode/", "zcode"},
 	{true, "pi (", "pi"}, // pi <= 1.4: "pi (win32 10.0.26200; x64)"
 	{true, "pi/", "pi"},  // pi 1.5: "pi/1.5.0 (win32; bun/1.4.4; x64)"
@@ -79,7 +82,9 @@ var clientUARules = []struct {
 	{true, "kilo-code/", "kilo"},              // "Kilo-Code/7.8.27 ai-sdk/provider-utils/4.0.33 runtime/bun/1.4.4": before ai-sdk/
 	{true, "roocode/", "roo"},                 // "RooCode/3.54.0"
 	{true, "charm-crush/", "crush"},           // "Charm-Crush/<v> (https://charm.land/crush)"
-	{true, "hermes-cli/", "hermes"},           // model list / connectivity calls; chat sends the OpenAI SDK UA
+	{true, "hermes-cli/", "hermes"},           // model list / connectivity calls; chat to a custom endpoint sends the OpenAI SDK UA
+	{true, "hermesagent/", "hermes"},          // a Hermes provider plugin's default_headers: "HermesAgent/<v>"
+	{true, "hermes-agent/", "hermes"},         // the same, spelled "Hermes-Agent/<v>" by some plugins
 	{false, "litellm/", "litellm"},            // "litellm/1.106.2", "<partner>_litellm/<v>"
 	{true, "magpie/", "magpie"},               // "magpie/0.1.3161"; bare "magpie" is in classifyUA
 	{true, "lobehub/", "lobehub"},             // "lobehub/2.2.17"
@@ -119,9 +124,9 @@ var clientUARules = []struct {
 // never a gate.
 func Classify(userAgent, appTitle, referer string) string {
 	title := strings.ToLower(strings.TrimSpace(appTitle))
-	ref := strings.ToLower(referer)
+	host := refererHostname(referer)
 	for _, r := range clientTitleRules {
-		if ref != "" && strings.Contains(ref, r.refererDomain) {
+		if host != "" && (host == r.refererDomain || strings.HasSuffix(host, "."+r.refererDomain)) {
 			return r.client
 		}
 		for _, p := range r.titlePrefixes {
@@ -131,6 +136,27 @@ func Classify(userAgent, appTitle, referer string) string {
 		}
 	}
 	return classifyUA(strings.ToLower(strings.TrimSpace(userAgent)))
+}
+
+// refererHostname returns the lowercased host name of an HTTP-Referer value,
+// with or without a scheme, dropping any userinfo, port and trailing dot:
+// "https://App.Dify.ai:443/x" is "app.dify.ai". It is "" when there is none.
+// A bracketed IPv6 host comes out mangled; no rule names one.
+func refererHostname(referer string) string {
+	h := strings.ToLower(strings.TrimSpace(referer))
+	if i := strings.Index(h, "://"); i >= 0 && !strings.ContainsAny(h[:i], "/?#") {
+		h = h[i+3:]
+	}
+	if i := strings.IndexAny(h, "/?#"); i >= 0 {
+		h = h[:i]
+	}
+	if i := strings.LastIndex(h, "@"); i >= 0 {
+		h = h[i+1:]
+	}
+	if i := strings.LastIndex(h, ":"); i >= 0 {
+		h = h[:i]
+	}
+	return strings.TrimSuffix(h, ".")
 }
 
 // hasTitlePrefix reports whether the lowercased title starts with p at a word
