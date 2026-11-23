@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -34,6 +35,87 @@ func TestClassifySharedVectors(t *testing.T) {
 	for _, v := range doc.Vectors {
 		if got := Classify(v.UserAgent, v.Title, v.Referer); got != v.Client {
 			t.Errorf("%s: Classify(%q, %q, %q) = %q, want %q", v.Name, v.UserAgent, v.Title, v.Referer, got, v.Client)
+		}
+	}
+
+	// Every title and referer rule has a vector that only it can decide (the
+	// other header empty, and a UA that does not name the same family), and
+	// every User-Agent rule a vector it is the first to match, so neither copy
+	// of the rules can lose or change one without its own side's vector test
+	// failing (and the shared file then tells the other side what changed).
+	for _, r := range clientTitleRules {
+		for _, p := range r.titlePrefixes {
+			found := false
+			for _, v := range doc.Vectors {
+				if v.Referer == "" && strings.ToLower(strings.TrimSpace(v.Title)) == p && v.Client == r.client && uaFamily(v.UserAgent) != r.client {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("no vector with title %q alone (want %q)", p, r.client)
+			}
+		}
+		found := false
+		for _, v := range doc.Vectors {
+			if v.Title == "" && refererHostname(v.Referer) == r.refererDomain && v.Client == r.client && uaFamily(v.UserAgent) != r.client {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no vector with referer %q alone (want %q)", r.refererDomain, r.client)
+		}
+	}
+}
+
+func TestSharedVectorsCoverEveryUARule(t *testing.T) {
+	raw, err := os.ReadFile("testdata/client_vectors.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Vectors []struct {
+			UserAgent string `json:"user_agent"`
+			Title     string `json:"title"`
+			Referer   string `json:"referer"`
+			Client    string `json:"client"`
+		} `json:"vectors"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	covered := make([]bool, len(clientUARules))
+	for _, v := range doc.Vectors {
+		if v.Title != "" || v.Referer != "" {
+			continue
+		}
+		ua := strings.ToLower(strings.TrimSpace(v.UserAgent))
+		for i, r := range clientUARules {
+			if (r.prefix && strings.HasPrefix(ua, r.needle)) || (!r.prefix && strings.Contains(ua, r.needle)) {
+				covered[i] = covered[i] || v.Client == r.client
+				break
+			}
+		}
+	}
+	for i, r := range clientUARules {
+		if !covered[i] {
+			t.Errorf("no vector is first matched by User-Agent rule %q (want %q)", r.needle, r.client)
+		}
+	}
+}
+
+func TestRefererHostname(t *testing.T) {
+	for in, want := range map[string]string{
+		"":                              "",
+		"https://cline.bot":             "cline.bot",
+		"HTTPS://Cline.Bot:443/x?y#z":   "cline.bot",
+		"charm.land/crush":              "charm.land",
+		"https://user:pw@dify.ai/":      "dify.ai",
+		"https://cline.bot@example.com": "example.com",
+		"https://dify.ai./":             "dify.ai",
+		"charm.land/?u=https://x.com":   "charm.land",
+	} {
+		if got := refererHostname(in); got != want {
+			t.Errorf("refererHostname(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
@@ -117,3 +199,6 @@ func TestClientNameOnlyRidesWithSignature(t *testing.T) {
 		t.Errorf("no middleware: X-0G-Client = %q", v)
 	}
 }
+
+// uaFamily is what the User-Agent alone would say.
+func uaFamily(ua string) string { return classifyUA(strings.ToLower(strings.TrimSpace(ua))) }

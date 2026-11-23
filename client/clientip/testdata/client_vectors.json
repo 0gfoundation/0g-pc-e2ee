@@ -331,7 +331,7 @@
       "client": "hermes"
     },
     {
-      "name": "hermes chat via openai sdk (source)",
+      "name": "hermes by the title and referer its own provider plugins send (source), over an OpenAI SDK UA",
       "user_agent": "OpenAI/Python 2.8.1",
       "title": "Hermes Agent",
       "referer": "https://hermes-agent.nousresearch.com",
@@ -546,6 +546,615 @@
       "title": "",
       "referer": "",
       "client": "other"
+    },
+    {
+      "name": "referer only: cline.bot",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://cline.bot",
+      "client": "cline"
+    },
+    {
+      "name": "referer only: kilocode.ai",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://kilocode.ai/",
+      "client": "kilo"
+    },
+    {
+      "name": "referer only: roocode.com",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://roocode.com",
+      "client": "roo"
+    },
+    {
+      "name": "referer only: zcode.z.ai",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://zcode.z.ai",
+      "client": "zcode"
+    },
+    {
+      "name": "referer only: openclaw.ai",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://openclaw.ai",
+      "client": "openclaw"
+    },
+    {
+      "name": "referer only: cherry-ai.com",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://cherry-ai.com",
+      "client": "cherry-studio"
+    },
+    {
+      "name": "referer only: hermes-agent.nousresearch.com",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://hermes-agent.nousresearch.com",
+      "client": "hermes"
+    },
+    {
+      "name": "referer only: charm.land",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://charm.land",
+      "client": "crush"
+    },
+    {
+      "name": "referer only: litellm.ai",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://litellm.ai",
+      "client": "litellm"
+    },
+    {
+      "name": "referer only: anythingllm.com",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://anythingllm.com",
+      "client": "anythingllm"
+    },
+    {
+      "name": "referer only: lobehub.com",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://lobehub.com",
+      "client": "lobehub"
+    },
+    {
+      "name": "referer only: langflow.org",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://langflow.org",
+      "client": "langflow"
+    },
+    {
+      "name": "referer only: n8n.io",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://n8n.io",
+      "client": "n8n"
+    },
+    {
+      "name": "referer only: continue.dev",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://continue.dev",
+      "client": "continue"
+    },
+    {
+      "name": "referer only: dify.ai",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://dify.ai",
+      "client": "dify"
+    },
+    {
+      "name": "referer only: librechat.ai",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://librechat.ai",
+      "client": "librechat"
+    },
+    {
+      "name": "referer only: openwebui.com",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://openwebui.com",
+      "client": "open-webui"
+    },
+    {
+      "name": "referer only: goose-docs.ai",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://goose-docs.ai",
+      "client": "goose"
+    },
+    {
+      "name": "referer only: tabbyml.com",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://tabbyml.com",
+      "client": "tabby"
+    },
+    {
+      "name": "referer on a subdomain of a tool's domain",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://cloud.dify.ai/apps",
+      "client": "dify"
+    },
+    {
+      "name": "referer in mixed case with a port",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "HTTPS://Cline.Bot:443/",
+      "client": "cline"
+    },
+    {
+      "name": "referer without a scheme",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "charm.land",
+      "client": "crush"
+    },
+    {
+      "name": "referer on another domain that ends like a tool's",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://codify.ai",
+      "client": "openai-sdk"
+    },
+    {
+      "name": "referer whose host only starts with a tool's domain",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://cline.bot.example.com",
+      "client": "openai-sdk"
+    },
+    {
+      "name": "referer naming a tool's domain only in its path",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://example.com/cline.bot",
+      "client": "openai-sdk"
+    },
+    {
+      "name": "referer naming a tool's domain only as userinfo",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://cline.bot@example.com/",
+      "client": "openai-sdk"
+    },
+    {
+      "name": "title only: Cline",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "Cline",
+      "referer": "",
+      "client": "cline"
+    },
+    {
+      "name": "title only: Kilo Code",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "Kilo Code",
+      "referer": "",
+      "client": "kilo"
+    },
+    {
+      "name": "title only: kilocode",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "kilocode",
+      "referer": "",
+      "client": "kilo"
+    },
+    {
+      "name": "title only: RooCode",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "RooCode",
+      "referer": "",
+      "client": "roo"
+    },
+    {
+      "name": "title only: roo-code",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "roo-code",
+      "referer": "",
+      "client": "roo"
+    },
+    {
+      "name": "title only: OpenCode",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "OpenCode",
+      "referer": "",
+      "client": "opencode"
+    },
+    {
+      "name": "title only: ZCode",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "ZCode",
+      "referer": "",
+      "client": "zcode"
+    },
+    {
+      "name": "title only: OpenClaw",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "OpenClaw",
+      "referer": "",
+      "client": "openclaw"
+    },
+    {
+      "name": "title only: Cherry Studio",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "Cherry Studio",
+      "referer": "",
+      "client": "cherry-studio"
+    },
+    {
+      "name": "title only: Hermes Agent",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "Hermes Agent",
+      "referer": "",
+      "client": "hermes"
+    },
+    {
+      "name": "title only: LiteLLM",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "LiteLLM",
+      "referer": "",
+      "client": "litellm"
+    },
+    {
+      "name": "title only: AnythingLLM",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "AnythingLLM",
+      "referer": "",
+      "client": "anythingllm"
+    },
+    {
+      "name": "title only: LobeHub",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "LobeHub",
+      "referer": "",
+      "client": "lobehub"
+    },
+    {
+      "name": "title only: LobeChat",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "LobeChat",
+      "referer": "",
+      "client": "lobehub"
+    },
+    {
+      "name": "title only: OpenWebUI",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "OpenWebUI",
+      "referer": "",
+      "client": "open-webui"
+    },
+    {
+      "name": "title only: open-webui",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "open-webui",
+      "referer": "",
+      "client": "open-webui"
+    },
+    {
+      "name": "an n8n-prefixed app title is not n8n",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "n8n Workflow Helper",
+      "referer": "",
+      "client": "openai-sdk"
+    },
+    {
+      "name": "a dify-prefixed app title is not dify",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "Dify Clone Demo",
+      "referer": "",
+      "client": "openai-sdk"
+    },
+    {
+      "name": "a tabby-prefixed app title is not tabby",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "Tabby Terminal",
+      "referer": "",
+      "client": "openai-sdk"
+    },
+    {
+      "name": "a title prefix followed by a digit is not a word boundary",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "Cline3D",
+      "referer": "",
+      "client": "openai-sdk"
+    },
+    {
+      "name": "ai-sdk/ after an app's own UA token",
+      "user_agent": "MyApp/2.0 ai-sdk/provider-utils/3.0.17 runtime/node.js/22",
+      "title": "",
+      "referer": "",
+      "client": "ai-sdk"
+    },
+    {
+      "name": "title only: Z Code",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "Z Code",
+      "referer": "",
+      "client": "zcode"
+    },
+    {
+      "name": "title only: Crush",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "Crush",
+      "referer": "",
+      "client": "crush"
+    },
+    {
+      "name": "title only: Langflow",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "Langflow",
+      "referer": "",
+      "client": "langflow"
+    },
+    {
+      "name": "title only: n8n",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "n8n",
+      "referer": "",
+      "client": "n8n"
+    },
+    {
+      "name": "title only: Continue",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "Continue",
+      "referer": "",
+      "client": "continue"
+    },
+    {
+      "name": "title only: LibreChat",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "LibreChat",
+      "referer": "",
+      "client": "librechat"
+    },
+    {
+      "name": "title only: Open WebUI",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "Open WebUI",
+      "referer": "",
+      "client": "open-webui"
+    },
+    {
+      "name": "title only: Goose",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "Goose",
+      "referer": "",
+      "client": "goose"
+    },
+    {
+      "name": "title only: Tabby",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "Tabby",
+      "referer": "",
+      "client": "tabby"
+    },
+    {
+      "name": "hermes provider plugin UA (source)",
+      "user_agent": "HermesAgent/0.22.5",
+      "title": "",
+      "referer": "",
+      "client": "hermes"
+    },
+    {
+      "name": "hermes provider plugin UA, hyphenated (source)",
+      "user_agent": "Hermes-Agent/0.22.5",
+      "title": "",
+      "referer": "",
+      "client": "hermes"
+    },
+    {
+      "name": "a UA that starts with hermes but is not the agent",
+      "user_agent": "HermesBot/1.0",
+      "title": "",
+      "referer": "",
+      "client": "other"
+    },
+    {
+      "name": "referer with userinfo before a tool's host",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://user:pw@dify.ai/",
+      "client": "dify"
+    },
+    {
+      "name": "referer with a query right after the host",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://cline.bot?ref=x",
+      "client": "cline"
+    },
+    {
+      "name": "referer with a fragment right after the host",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://cline.bot#x",
+      "client": "cline"
+    },
+    {
+      "name": "referer with surrounding spaces",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "  https://charm.land  ",
+      "client": "crush"
+    },
+    {
+      "name": "node-fetch",
+      "user_agent": "node-fetch/1.0 (+https://github.com/bitinn/node-fetch)",
+      "title": "",
+      "referer": "",
+      "client": "node-http"
+    },
+    {
+      "name": "undici",
+      "user_agent": "undici",
+      "title": "",
+      "referer": "",
+      "client": "node-http"
+    },
+    {
+      "name": "axios",
+      "user_agent": "axios/1.7.2",
+      "title": "",
+      "referer": "",
+      "client": "node-http"
+    },
+    {
+      "name": "okhttp",
+      "user_agent": "okhttp/4.12.0",
+      "title": "",
+      "referer": "",
+      "client": "java-http"
+    },
+    {
+      "name": "wget",
+      "user_agent": "Wget/1.21.4",
+      "title": "",
+      "referer": "",
+      "client": "curl"
+    },
+    {
+      "name": "aiohttp alone",
+      "user_agent": "aiohttp/3.9.5",
+      "title": "",
+      "referer": "",
+      "client": "python-http"
+    },
+    {
+      "name": "our claude0g probe",
+      "user_agent": "claude0g-probe/1.0",
+      "title": "",
+      "referer": "",
+      "client": "0g-internal"
+    },
+    {
+      "name": "title with a suffix: Cline (VS Code)",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "Cline (VS Code)",
+      "referer": "",
+      "client": "cline"
+    },
+    {
+      "name": "title with a suffix: Kilo Code Nightly",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "Kilo Code Nightly",
+      "referer": "",
+      "client": "kilo"
+    },
+    {
+      "name": "title with a suffix: Roo Code Insiders",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "Roo Code Insiders",
+      "referer": "",
+      "client": "roo"
+    },
+    {
+      "name": "title with a suffix: OpenCode Desktop",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "OpenCode Desktop",
+      "referer": "",
+      "client": "opencode"
+    },
+    {
+      "name": "title with a suffix: OpenClaw Gateway",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "OpenClaw Gateway",
+      "referer": "",
+      "client": "openclaw"
+    },
+    {
+      "name": "title with a suffix: Cherry Studio Agent",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "Cherry Studio Agent",
+      "referer": "",
+      "client": "cherry-studio"
+    },
+    {
+      "name": "title with a suffix: Hermes Agent (OpenRouter Everything)",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "Hermes Agent (OpenRouter Everything)",
+      "referer": "",
+      "client": "hermes"
+    },
+    {
+      "name": "title with a suffix: LiteLLM Proxy",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "LiteLLM Proxy",
+      "referer": "",
+      "client": "litellm"
+    },
+    {
+      "name": "title with a suffix: AnythingLLM Desktop",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "AnythingLLM Desktop",
+      "referer": "",
+      "client": "anythingllm"
+    },
+    {
+      "name": "title with a suffix: LobeHub Cloud",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "LobeHub Cloud",
+      "referer": "",
+      "client": "lobehub"
+    },
+    {
+      "name": "title with a suffix: Langflow Agent",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "Langflow Agent",
+      "referer": "",
+      "client": "langflow"
+    },
+    {
+      "name": "title with a suffix: LibreChat Server",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "LibreChat Server",
+      "referer": "",
+      "client": "librechat"
+    },
+    {
+      "name": "title with a suffix: Open WebUI Pipelines",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "Open WebUI Pipelines",
+      "referer": "",
+      "client": "open-webui"
+    },
+    {
+      "name": "referer with @ only in its path",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://example.com/u/@cline.bot",
+      "client": "openai-sdk"
+    },
+    {
+      "name": "referer host with a trailing dot",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "https://dify.ai./",
+      "client": "dify"
+    },
+    {
+      "name": "referer without a scheme whose query holds a URL",
+      "user_agent": "OpenAI/JS 4.96.0",
+      "title": "",
+      "referer": "charm.land/?u=https://example.com",
+      "client": "crush"
+    },
+    {
+      "name": "opencode over ai-sdk, current UA (staging 2026-11-19)",
+      "user_agent": "opencode/1.19.6 ai-sdk/provider-utils/4.0.23 runtime/bun/1.4.4",
+      "title": "",
+      "referer": "",
+      "client": "opencode"
     }
   ]
 }
