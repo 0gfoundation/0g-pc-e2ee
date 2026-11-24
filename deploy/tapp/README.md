@@ -32,11 +32,14 @@ client ──TLS──▶ L4 load balancer (forwards bytes, never decrypts; adds
 |---|---|---|
 | `docker-compose.yml` | yes | three containers: `tls-init`, `haproxy`, `gateway` |
 | `haproxy.cfg` | yes (uploaded because it is mounted) | TLS termination, PROXY v1 → v2, LB health port |
-| `env/<target>.env` → `.env` | yes (uploaded because it is mounted) | compose variables; **no secrets** |
+| `env/<target>.env` → `.env` | yes (uploaded because it is mounted) | compose variables; **no secrets**, so a verifier can recompute its hash |
+| `secrets.env` | yes, as a hash only | the gateway's secrets (`secrets.env.example`); written by the deploy pipeline, never committed |
 | `tls/fullchain.pem` | yes (uploaded because it is mounted) | CA certificate for the app's key; written by the deploy pipeline, not committed |
 
 Every byte of these, comments included, is part of what tapp measures and the TappRegistry
-records. Do not put anything secret in any of them.
+records. tapp publishes a mounted file's hash, not its contents, so secrets may go in
+`secrets.env` and nowhere else; everything else stays public and reproducible. A hash does
+not protect a guessable value: fine for a random HMAC key, weaker for a list of domains.
 
 ## How TLS works here
 
@@ -72,6 +75,7 @@ From this directory, on a claimed node (`claim-config --tls-key-source kms`):
 
 ```bash
 cp env/staging.env .env
+# secrets.env from the secret store, in the format of secrets.env.example
 tapp-cli -s <node> get-app-csr --app-id pc-gateway-staging --domain <name> --out gw.csr
 # sign gw.csr with an ACME client in CSR mode (Let's Encrypt staging first), then:
 mkdir -p tls && cp <issued fullchain> tls/fullchain.pem
@@ -90,15 +94,14 @@ signer>` so the record is replaced (`updateNode`) rather than added (`addNode`).
    are switched off here. They need a tapp adapter in the gateway (`client/dstack`), and
    `docs/verifying-the-gateway.md` / `pcverify` need a tapp path, before this deployment can
    be verified by a third party.
-2. **Secrets.** Two values are secret on Phala and passed through its encrypted environment:
-   `ZG_GATEWAY_CLIENT_IP_KEY` (without it the router puts every gateway user in one
-   rate-limit bucket) and the full `ZG_GATEWAY_ALLOWED_ORIGINS`. Every file here is measured
-   and uploaded, so neither can go in `.env`. Both are empty or defaulted for the PoC; the
-   delivery mechanism is to be settled with the tapp owners.
+2. **`env_file` upload.** `secrets.env` is mounted into `tls-init` so that `start-app`
+   uploads it; the PoC confirms the gateway's `env_file` then finds it next to the compose.
 3. **`tls-init` image.** Not pinned by digest (the registry is not anonymously readable) and
    needs `docker-login` on the node. Pin it, or build it from 0g-tapp
    `docker/tls-init/Dockerfile` and publish it ourselves.
-4. **Certificate renewal.** The certificate is a mounted file, so a renewed one changes the
-   measured mounts. How it reaches a running node (redeploy vs. in-place reload) is to be
-   confirmed in the PoC.
+4. **Certificate renewal.** The certificate is a mounted file, uploaded at `start-app`, so a
+   renewed one (about every 60 days) means a rolling redeploy of every node. Any deployment of
+   the same app id can reuse the live certificate, since the KMS gives them all the same key.
+   If redeploying every 60 days proves too costly, fetch the certificate at runtime instead:
+   it is public and only works with the key inside the TEE.
 5. **Metrics.** No `prometheus-agent` yet.
