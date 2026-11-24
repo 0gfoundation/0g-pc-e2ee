@@ -1,6 +1,11 @@
-# tapp (GCP Intel TDX) deployment for the 0G-PC cloud-TEE gateway. DRAFT for the
-# PoC on pc-gateway-staging; the Phala deployment (deploy/phala/) is unchanged and
-# stays in service alongside this one.
+# tapp deployment for the 0G-PC cloud-TEE gateway. DRAFT, first exercised by a PoC
+# on GCP (Intel TDX, project pc-gateway-staging); the Phala deployment
+# (deploy/phala/) is unchanged and stays in service alongside this one.
+#
+# Cloud-neutral: tapp runs on GCP, Alibaba Cloud and bare metal, and this file
+# assumes none of them. The platform supplies an L4 load balancer that forwards TCP
+# without decrypting it and sends a PROXY header (haproxy.cfg), plus a firewall that
+# keeps everything else off 443. Those live with the infrastructure, not here.
 #
 # The same gateway image as on Phala, behind an HAProxy that terminates TLS inside
 # this CVM. Three containers:
@@ -61,7 +66,7 @@ services:
       gateway:
         condition: service_healthy
     ports:
-      # Reachable only from the GCP load balancer and its health checks; the VPC
+      # Reachable only from the load balancer and its health checks; the platform's
       # firewall enforces that (haproxy.cfg header).
       - "443:8443"
       - "8080:8080"
