@@ -16,9 +16,9 @@
 # Deploy with `tapp-cli start-app -f docker-compose.yml --app-id <id>
 # --register-onchain ...`, from this directory, after `cp env/<target>.env .env`.
 # EVERY byte of this file, and of each file it mounts from here (haproxy.cfg, .env,
-# tls/fullchain.pem), is measured by tapp and committed to on chain. Nothing secret
-# may go in any of them. See README.md "Open items" for the two values that are
-# secret on Phala and have no home here yet.
+# secrets.env, tls/fullchain.pem), is measured by tapp and committed to on chain.
+# Secrets go in secrets.env ONLY: tapp publishes a mounted file's hash, never its
+# contents, and keeping them out of .env leaves .env reproducible by a verifier.
 #
 # Not here yet, compared with deploy/phala (README.md "Open items"):
 #   - no evidence bundle, nonce quote (GET /evidence) or identity file: those read
@@ -50,9 +50,10 @@ services:
       # /run is tmpfs: the key stays in TEE memory and is gone at reboot. Never a
       # named volume (that would put the key on disk).
       - /run/${TAPP_APP_ID}-certs:/certs
-      # Mounted only so start-app uploads .env with the compose; compose reads it for
-      # the ${...} substitutions in this file.
+      # Mounted only so start-app uploads these with the compose. .env feeds the
+      # ${...} substitutions in this file; secrets.env is the gateway's env_file.
       - ./.env:/run/deploy.env:ro
+      - ./secrets.env:/run/secrets.env:ro
 
   haproxy:
     image: haproxy:3.0.12-alpine@sha256:e3229153dd6429fc71f8a9a1f1ccbf8dab6962422d7043c81e84dd6a075e90ee
@@ -87,6 +88,11 @@ services:
     expose:
       - "8443"
       - "9464"
+    # ZG_GATEWAY_CLIENT_IP_KEY and ZG_GATEWAY_ALLOWED_ORIGINS, written by the deploy
+    # pipeline from its secret store (secrets.env.example). Not in `environment:`
+    # below, which would override them.
+    env_file:
+      - ./secrets.env
     healthcheck:
       test: ["CMD", "/usr/local/bin/gateway", "-health"]
       interval: 10s
@@ -96,13 +102,8 @@ services:
     environment:
       - "ZG_GATEWAY_LISTEN=0.0.0.0:8443"
       - "ZG_GATEWAY_PROXY_PROTOCOL=true"
-      # Empty until there is a way to deliver a secret (README.md "Open items"):
-      # without it the router puts every gateway user in one rate-limit bucket.
-      - "ZG_GATEWAY_CLIENT_IP_KEY="
       - "ZG_GATEWAY_METRICS_LISTEN=0.0.0.0:9464"
       - "ZG_GATEWAY_ROUTER_URL=${ZG_GATEWAY_ROUTER_URL:?set ZG_GATEWAY_ROUTER_URL in .env}"
-      # Public default only; the real allowlist is a secret on Phala (same open item).
-      - "ZG_GATEWAY_ALLOWED_ORIGINS=${ZG_GATEWAY_ALLOWED_ORIGINS:-https://0g.ai,https://*.0g.ai}"
       - "ZG_GATEWAY_SEAL_MODELS=${ZG_GATEWAY_SEAL_MODELS-0gm-1.0-35b-a3b}"
       - "ZG_GATEWAY_ATTEST=true"
       - "ZG_GATEWAY_ATTEST_ENFORCE=true"
