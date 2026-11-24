@@ -1,22 +1,29 @@
-# tapp (GCP) deployment — draft for the PoC
+# tapp deployment — draft for the PoC
 
-Runs the [`gateway`](../../client/cmd/gateway) in an Intel TDX Confidential VM on GCP,
-under [0G tapp](https://github.com/0gfoundation/0g-tapp), **alongside** the Phala
-deployment in [`deploy/phala`](../phala), which is unchanged. The infrastructure around it
-(VMs, load balancer, firewall, CI) lives in a private repository; everything here is what
-the attestation measures, so it is public.
+Runs the [`gateway`](../../client/cmd/gateway) in a confidential VM under
+[0G tapp](https://github.com/0gfoundation/0g-tapp), **alongside** the Phala deployment in
+[`deploy/phala`](../phala), which is unchanged. Everything here is what the attestation
+measures, so it is public. The infrastructure around it (VMs, load balancer, firewall, CI)
+lives in a private repository.
 
-Status: **draft**, for a first PoC on the `pc-gateway-staging` GCP project. Not used in
+**Cloud-neutral.** tapp runs on GCP, Alibaba Cloud and bare metal, and these files assume
+none of them. What the platform must supply:
+
+- an **L4 load balancer** that forwards TCP to port 443 without decrypting it and prepends a
+  PROXY header, v1 or v2 (GCP's global TCP proxy load balancer sends v1, many others send v2);
+- a **firewall** that lets only that load balancer reach 443 and 8080.
+
+Status: **draft**. The first PoC runs on GCP (Intel TDX, project `pc-gateway-staging`). Not used in
 production, and not yet verifiable the way the Phala deployment is (see
 [Open items](#open-items)).
 
 ## Shape
 
 ```
-client ──TLS──▶ GCP global TCP proxy LB (L4: forwards bytes, never decrypts; PROXY v1)
+client ──TLS──▶ L4 load balancer (forwards bytes, never decrypts; adds a PROXY header)
                  │
-                 ▼  this CVM (tapp, Intel TDX)
-            haproxy :443 ── TLS ends here, PROXY v1 in ──▶ gateway :8443 (PROXY v2, plaintext)
+                 ▼  this CVM (tapp)
+            haproxy :443 ── TLS ends here, PROXY v1/v2 in ──▶ gateway :8443 (PROXY v2, plaintext)
                  ▲
             tls-init (one-shot): the app's KMS-derived TLS key, over the tapp socket
 ```
@@ -35,7 +42,7 @@ records. Do not put anything secret in any of them.
 
 - `claim-config --tls-key-source kms` makes the TLS key come from the KMS cluster as
   `(app_id, "tls")`: the same on every node of the app and stable across restarts. One CA
-  certificate therefore serves every replica in every region, and a reboot or a GCP host
+  certificate therefore serves every replica in every region, and a reboot or a host
   maintenance does not cost a new certificate (Let's Encrypt allows 5 per week per name).
 - The certificate comes from a CSR the node produces without exposing the key:
   `tapp-cli get-app-csr --app-id <id> --domain <name>`, signed by any ACME client in CSR
@@ -46,12 +53,13 @@ records. Do not put anything secret in any of them.
 ## Client address
 
 The gateway still requires a PROXY v2 header (`ZG_GATEWAY_PROXY_PROTOCOL=true`, unchanged
-from Phala). The GCP proxy load balancer sends v1; haproxy reads it (`accept-proxy`) and
-re-emits v2 (`send-proxy-v2`).
+from Phala). haproxy reads whichever version the load balancer sends (`accept-proxy`) and
+re-emits v2 (`send-proxy-v2`), so the gateway is the same on every platform.
 
-The header is only as trustworthy as the path to port 443: **the VPC firewall must allow 443
-only from the GCP load balancer ranges** (`35.191.0.0/16`, `130.211.0.0/22`). Port 8080 is the
-load balancer's health check (no PROXY header; 200 while the gateway is up, 503 otherwise).
+The header is only as trustworthy as the path to port 443: **the platform's firewall must
+allow 443 only from the load balancer** (on GCP, the ranges `35.191.0.0/16` and
+`130.211.0.0/22`). Port 8080 is the load balancer's health check (no PROXY header; 200 while
+the gateway is up, 503 otherwise).
 
 Checked locally against the pinned haproxy image: a PROXY v1 + TLS connection reaches the
 backend with the client address in a v2 header; a connection without a PROXY header is
