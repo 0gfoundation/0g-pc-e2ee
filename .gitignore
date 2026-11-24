@@ -14,6 +14,11 @@
 # deploy/phala/secrets.env (or switch.env / deploy.env), which stay ignored.
 !/deploy/phala/env/staging.env
 !/deploy/phala/env/mainnet.env
+!/deploy/tapp/env/staging.env
 
 # provision.cjs's dependency, installed by `npm ci` in deploy/phala.
 /deploy/phala/node_modules/
+
+# deploy/tapp: the CA certificate is written by the deploy pipeline before
+# start-app (public, but per-deployment), and .env is a copy of env/<target>.env.
+/deploy/tapp/tls/

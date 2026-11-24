@@ -1,0 +1,121 @@
+# tapp (GCP Intel TDX) deployment for the 0G-PC cloud-TEE gateway. DRAFT for the
+# PoC on pc-gateway-staging; the Phala deployment (deploy/phala/) is unchanged and
+# stays in service alongside this one.
+#
+# The same gateway image as on Phala, behind an HAProxy that terminates TLS inside
+# this CVM. Three containers:
+#   tls-init  one-shot: fetches the app's KMS-derived TLS key over the tapp socket
+#   haproxy   TLS termination (key never leaves the TEE), PROXY v1 -> v2
+#   gateway   unchanged client core; reached only through haproxy
+#
+# Deploy with `tapp-cli start-app -f docker-compose.yml --app-id <id>
+# --register-onchain ...`, from this directory, after `cp env/<target>.env .env`.
+# EVERY byte of this file, and of each file it mounts from here (haproxy.cfg, .env,
+# tls/fullchain.pem), is measured by tapp and committed to on chain. Nothing secret
+# may go in any of them. See README.md "Open items" for the two values that are
+# secret on Phala and have no home here yet.
+#
+# Not here yet, compared with deploy/phala (README.md "Open items"):
+#   - no evidence bundle, nonce quote (GET /evidence) or identity file: those read
+#     dstack's guest agent and need a tapp adapter in the gateway;
+#   - no prometheus-agent.
+
+services:
+  # Fetches this app's TLS key (and a self-signed certificate nobody uses) into
+  # tmpfs, then exits. With tls_key_source=kms (claim-config) the key comes from the
+  # KMS cluster, is the same on every node of the app and survives restarts, which
+  # is what lets one CA certificate serve every replica in every region.
+  tls-init:
+    # TODO pin by digest before anything but the PoC: this container handles the
+    # TLS private key. The image is not anonymously pullable, so the node needs
+    # `tapp-cli docker-login` for us-central1-docker.pkg.dev first, or build it from
+    # 0g-tapp's docker/tls-init/Dockerfile and publish it ourselves.
+    image: us-central1-docker.pkg.dev/g-devops/zg-tapp/tls-init:v0.4.0
+    command:
+      - --server=/run/tapp/tapp.sock
+      - get-app-tls-cert
+      - --app-id=${TAPP_APP_ID:?set TAPP_APP_ID in .env, equal to start-app --app-id}
+      - --out-key=/certs/tls.key
+      - --out-cert=/certs/tls.crt
+    restart: "no"
+    volumes:
+      # The only contact with tapp. Any process holding this socket can read every
+      # app's key material, so no other container mounts it.
+      - /run/tapp/tapp.sock:/run/tapp/tapp.sock
+      # /run is tmpfs: the key stays in TEE memory and is gone at reboot. Never a
+      # named volume (that would put the key on disk).
+      - /run/${TAPP_APP_ID}-certs:/certs
+      # Mounted only so start-app uploads .env with the compose; compose reads it for
+      # the ${...} substitutions in this file.
+      - ./.env:/run/deploy.env:ro
+
+  haproxy:
+    image: haproxy:3.0.12-alpine@sha256:e3229153dd6429fc71f8a9a1f1ccbf8dab6962422d7043c81e84dd6a075e90ee
+    restart: unless-stopped
+    # Root, because tls-init writes the key root-owned and the image's default user
+    # (haproxy) cannot read it.
+    user: "0:0"
+    depends_on:
+      tls-init:
+        condition: service_completed_successfully
+      gateway:
+        condition: service_healthy
+    ports:
+      # Reachable only from the GCP load balancer and its health checks; the VPC
+      # firewall enforces that (haproxy.cfg header).
+      - "443:8443"
+      - "8080:8080"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      # Public: issued by a CA for the CSR from `tapp-cli get-app-csr`, written here
+      # by the deploy pipeline before start-app. Not committed; a verifier gets the
+      # same bytes from the TLS handshake.
+      - ./tls/fullchain.pem:/etc/haproxy/tls/fullchain.pem:ro
+      - /run/${TAPP_APP_ID}-certs:/run/tls:ro
+
+  gateway:
+    # The release workflow substitutes a digest, as for deploy/phala.
+    image: ghcr.io/0gfoundation/0g-pc-e2ee-gateway:latest
+    restart: unless-stopped
+    # No `ports:`: only haproxy can reach 8443, which is what makes the PROXY header
+    # it sends believable.
+    expose:
+      - "8443"
+      - "9464"
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/gateway", "-health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 30s
+    environment:
+      - "ZG_GATEWAY_LISTEN=0.0.0.0:8443"
+      - "ZG_GATEWAY_PROXY_PROTOCOL=true"
+      # Empty until there is a way to deliver a secret (README.md "Open items"):
+      # without it the router puts every gateway user in one rate-limit bucket.
+      - "ZG_GATEWAY_CLIENT_IP_KEY="
+      - "ZG_GATEWAY_METRICS_LISTEN=0.0.0.0:9464"
+      - "ZG_GATEWAY_ROUTER_URL=${ZG_GATEWAY_ROUTER_URL:?set ZG_GATEWAY_ROUTER_URL in .env}"
+      # Public default only; the real allowlist is a secret on Phala (same open item).
+      - "ZG_GATEWAY_ALLOWED_ORIGINS=${ZG_GATEWAY_ALLOWED_ORIGINS:-https://0g.ai,https://*.0g.ai}"
+      - "ZG_GATEWAY_SEAL_MODELS=${ZG_GATEWAY_SEAL_MODELS-0gm-1.0-35b-a3b}"
+      - "ZG_GATEWAY_ATTEST=true"
+      - "ZG_GATEWAY_ATTEST_ENFORCE=true"
+      - "ZG_GATEWAY_ONCHAIN=true"
+      - "ZG_GATEWAY_NETWORK=${ZG_GATEWAY_NETWORK:?set ZG_GATEWAY_NETWORK in .env}"
+      - "ZG_GATEWAY_ONCHAIN_ENFORCE=true"
+      - "ZG_GATEWAY_VERIFY_RESPONSES=true"
+      # Collateral for verifying PROVIDER quotes, unrelated to where the gateway runs.
+      - "ZG_GATEWAY_PCCS_URL=https://pccs.phala.network"
+      - "ZG_GATEWAY_WARM=true"
+      # Set per machine shape: physical RAM less the OS (tapp's root filesystem is a
+      # RAM overlay), haproxy and slack. deploy/phala/README.md "CVM shape".
+      - "GOMEMLIMIT=${GOMEMLIMIT:?set GOMEMLIMIT in .env for this machine shape}"
+      - "ZG_GATEWAY_MAX_INFLIGHT=${ZG_GATEWAY_MAX_INFLIGHT:-}"
+      # dstack-only inputs, off on tapp: no guest-agent socket, no identity file,
+      # no evidence bundle, no quoter, no app-compose file.
+      - "ZG_GATEWAY_DSTACK_SOCKET="
+      - "ZG_GATEWAY_IDENTITY_FILE="
+      - "ZG_GATEWAY_EVIDENCE_DIR="
+      - "ZG_GATEWAY_QUOTER_URL="
+      - "ZG_GATEWAY_APP_COMPOSE_FILE="
