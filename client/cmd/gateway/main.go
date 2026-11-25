@@ -272,6 +272,13 @@ func main() {
 	// see cmd/gateway/Dockerfile), so the compose healthcheck runs THIS instead
 	// of a shell one-liner (deploy/phala/docker-compose.yml). Reusing -listen /
 	// $ZG_GATEWAY_LISTEN keeps the probe and the server on the same port.
+	// Environment variables this deployment cannot run without (see
+	// missingRequiredEnv). Names only, so the list itself can sit in a measured
+	// compose: a verifier sees that the deployment requires its secrets without
+	// seeing them. Empty (the default) requires nothing.
+	requireEnv := flag.String("require-env", proxycli.EnvOr("ZG_GATEWAY_REQUIRE_ENV", ""),
+		"comma-separated environment variable names that must be set and non-empty, or the gateway "+
+			"refuses to start (env ZG_GATEWAY_REQUIRE_ENV)")
 	health := flag.Bool("health", false, "probe GET /healthz on the -listen port and exit 0 (healthy) or 1; starts no server, for container healthchecks")
 	flag.Parse()
 
@@ -290,6 +297,13 @@ func main() {
 	// forms don't drift (see proxycli.NewLogger). dstack/Phala captures stdout as
 	// line records; a later GCP move can swap the handler in one place.
 	logger := proxycli.NewLogger()
+
+	// Before anything else: a deployment that names a variable as required must not
+	// come up without it, healthy and quietly degraded. Names only in the log.
+	if missing := missingRequiredEnv(*requireEnv, os.LookupEnv); len(missing) > 0 {
+		logger.Error("required environment variables are unset or empty", "missing", strings.Join(missing, ","))
+		os.Exit(1)
+	}
 
 	// Learn who this CVM is, before anything else logs. It is attached to the logger
 	// (so EVERY line this process emits — startup, access log, the core's
