@@ -108,12 +108,11 @@ signer>` so the record is replaced (`updateNode`) rather than added (`addNode`).
    be verified by a third party.
 2. **`env_file` upload.** `secrets.env` is mounted into the gateway so that `start-app`
    uploads it; the PoC confirms `env_file` then finds it next to the compose.
-3. **`tls-init` image.** Pinned to the hand-built `v0.4.0` (functionally enough), as an
-   interim: unsigned, not built by CI, in a registry that is not publicly readable, so its
-   digest cannot be traced to source, verifiers cannot pull it, and the node needs
-   `docker-login`. Before mainnet, build it ourselves from 0g-tapp
-   `docker/tls-init/Dockerfile` (pinned base, checksummed tapp-cli) and publish it publicly
-   next to the gateway image.
+3. **`tls-init` image.** Built here: `tls-init/Dockerfile` (base pinned by digest, tapp-cli
+   v0.11.1 release binary checked by `ADD --checksum`, no package manager), published by
+   `.github/workflows/docker.yml` as `ghcr.io/0gfoundation/0g-pc-e2ee-tls-init`. The compose
+   still pins the hand-built `v0.4.0` from 0g-tapp's private registry until that image is
+   published; then pin its digest instead (and make the GHCR package public if it is not).
 4. **Certificate renewal.** The certificate is a mounted file, uploaded at `start-app`, so a
    renewed one (about every 60 days) means a rolling redeploy of every node. Any deployment of
    the same app id can reuse the live certificate, since the KMS gives them all the same key.
