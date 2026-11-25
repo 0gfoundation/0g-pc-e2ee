@@ -1,7 +1,8 @@
 name: Docker
 
-# Build the sidecar and gateway images. On pull requests we build only (to catch
-# breakage); on pushes to main and on version tags we also publish to GHCR.
+# Build the sidecar, gateway and tls-init images. On pull requests we build only (to
+# catch breakage); on pushes to main and on version tags we also publish to GHCR.
+# tls-init is deploy/tapp's key-fetching sidecar (deploy/tapp/tls-init/Dockerfile).
 on:
   push:
     branches: [main]
@@ -21,7 +22,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        service: [sidecar, gateway]
+        include:
+          # Context is the repo root for the Go images: client depends on protocol
+          # via a local `replace`, so both module trees must be in the build context.
+          - service: sidecar
+            file: client/cmd/sidecar/Dockerfile
+            context: .
+          - service: gateway
+            file: client/cmd/gateway/Dockerfile
+            context: .
+          # Downloads a checksummed tapp-cli release binary; needs nothing from here.
+          - service: tls-init
+            file: deploy/tapp/tls-init/Dockerfile
+            context: deploy/tapp/tls-init
     steps:
       - uses: actions/checkout@v4
 
@@ -58,10 +71,8 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          # Context is the repo root: client depends on protocol via a local
-          # `replace`, so both module trees must be in the build context.
-          context: .
-          file: client/cmd/${{ matrix.service }}/Dockerfile
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
