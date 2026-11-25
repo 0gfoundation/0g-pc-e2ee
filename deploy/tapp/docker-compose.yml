@@ -11,8 +11,7 @@
 # this CVM. Three containers:
 #   tls-init  one-shot: fetches the app's KMS-derived TLS key over the tapp socket
 #   haproxy   TLS termination (key never leaves the TEE), PROXY v1 -> v2
-#   gateway   unchanged client core; reached only through haproxy; refuses to start
-#             without its secrets (ZG_GATEWAY_REQUIRE_ENV)
+#   gateway   unchanged client core; reached only through haproxy
 #
 # The one-shot container and restarts: `depends_on` orders only `compose up`, so a
 # container Docker restarts on its own does not rerun them. That is safe here:
@@ -101,7 +100,9 @@ services:
       - "9464"
     # ZG_GATEWAY_CLIENT_IP_KEY and ZG_GATEWAY_ALLOWED_ORIGINS, written by the deploy
     # pipeline from its secret store (secrets.env.example). Not in `environment:`
-    # below, which would override them.
+    # below, which would override them. The gateway starts even when they are empty
+    # (an empty value turns its feature off), so the pipeline refuses to deploy
+    # without them; nothing on the node checks.
     env_file:
       - ./secrets.env
     healthcheck:
@@ -112,12 +113,6 @@ services:
       start_period: 30s
     environment:
       - "ZG_GATEWAY_LISTEN=0.0.0.0:8443"
-      # Refuse to start without these, rather than start healthy with a feature
-      # silently off: without the key the router puts every user in one rate-limit
-      # bucket, without origins browsers are refused. A refused start keeps the
-      # health port at 503 and fails the deploy. Names only; Phala's equivalent is
-      # CVM_REQUIRED_KEYS. Needs a gateway build with -require-env.
-      - "ZG_GATEWAY_REQUIRE_ENV=ZG_GATEWAY_CLIENT_IP_KEY,ZG_GATEWAY_ALLOWED_ORIGINS"
       - "ZG_GATEWAY_PROXY_PROTOCOL=true"
       - "ZG_GATEWAY_METRICS_LISTEN=0.0.0.0:9464"
       - "ZG_GATEWAY_ROUTER_URL=${ZG_GATEWAY_ROUTER_URL:?set ZG_GATEWAY_ROUTER_URL in .env}"
