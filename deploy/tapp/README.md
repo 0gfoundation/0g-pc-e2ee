@@ -31,6 +31,7 @@ client ──TLS──▶ L4 load balancer (forwards bytes, never decrypts; adds
 | File | Measured | What it is |
 |---|---|---|
 | `docker-compose.yml` | yes | three containers: `tls-init`, `haproxy`, `gateway` |
+| `tls-init/Dockerfile` | through the image digest | tls-init, built here and published publicly to GHCR by `docker.yml` |
 | `haproxy.cfg` | yes (uploaded because it is mounted) | TLS termination, PROXY v1 → v2, LB health port |
 | `env/<target>.env` → `.env` | yes (uploaded because it is mounted) | compose variables; **no secrets**, so a verifier can recompute its hash |
 | `secrets.env` | yes, as a hash only | the gateway's secrets (`secrets.env.example`); written by the deploy pipeline, never committed |
@@ -108,14 +109,9 @@ signer>` so the record is replaced (`updateNode`) rather than added (`addNode`).
    be verified by a third party.
 2. **`env_file` upload.** `secrets.env` is mounted into the gateway so that `start-app`
    uploads it; the PoC confirms `env_file` then finds it next to the compose.
-3. **`tls-init` image.** Built here: `tls-init/Dockerfile` (base pinned by digest, tapp-cli
-   v0.11.1 release binary checked by `ADD --checksum`, no package manager), published by
-   `.github/workflows/docker.yml` as `ghcr.io/0gfoundation/0g-pc-e2ee-tls-init`. The compose
-   still pins the hand-built `v0.4.0` from 0g-tapp's private registry until that image is
-   published; then pin its digest instead (and make the GHCR package public if it is not).
-4. **Certificate renewal.** The certificate is a mounted file, uploaded at `start-app`, so a
+3. **Certificate renewal.** The certificate is a mounted file, uploaded at `start-app`, so a
    renewed one (about every 60 days) means a rolling redeploy of every node. Any deployment of
    the same app id can reuse the live certificate, since the KMS gives them all the same key.
    If redeploying every 60 days proves too costly, fetch the certificate at runtime instead:
    it is public and only works with the key inside the TEE.
-5. **Metrics.** No `prometheus-agent` yet.
+4. **Metrics.** No `prometheus-agent` yet.

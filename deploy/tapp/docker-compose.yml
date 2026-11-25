@@ -47,14 +47,12 @@ services:
     # client works against any later tapp-server, and the key source (kms) is the
     # server's setting.
     #
-    # Interim: the hand-built image from 0g-tapp's registry, which is unsigned, not
-    # publicly readable (a verifier cannot pull it; the node needs `tapp-cli
-    # docker-login`), and not traceable to a source. Replaced by our own build,
-    # deploy/tapp/tls-init/Dockerfile (pinned base + checksummed tapp-cli v0.11.1),
-    # published by .github/workflows/docker.yml as
-    # ghcr.io/0gfoundation/0g-pc-e2ee-tls-init: pin that image's digest here once it
-    # has been published.
-    image: us-central1-docker.pkg.dev/g-devops/zg-tapp/tls-init:v0.4.0@sha256:2e27c68dc551c342bd9d52b207e5d5193377750d02cc6241207936ab8033f666
+    # Built here from deploy/tapp/tls-init/Dockerfile (debian-slim by digest +
+    # the tapp-cli v0.11.1 release binary, checked by ADD --checksum) and published
+    # publicly by .github/workflows/docker.yml, so anyone can pull this digest and
+    # audit it. Built from commit 310502d (tag sha-310502d…). On a change to that
+    # Dockerfile, pin the new build's digest here.
+    image: ghcr.io/0gfoundation/0g-pc-e2ee-tls-init@sha256:a146bdf7fb7bd5acad9b909fcfbc3f26c42f36cb43d343684bd8d86c0d5e3fec
     command:
       - --server=/run/tapp/tapp.sock
       - get-app-tls-cert
