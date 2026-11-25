@@ -68,9 +68,18 @@ services:
   haproxy:
     image: haproxy:3.0.12-alpine@sha256:e3229153dd6429fc71f8a9a1f1ccbf8dab6962422d7043c81e84dd6a075e90ee
     restart: unless-stopped
-    # Root, because tls-init writes the key root-owned and the image's default user
-    # (haproxy) cannot read it.
+    # Starts as root only to read the key tls-init wrote root-owned (mode 600);
+    # haproxy.cfg's `user haproxy` / `group haproxy` drop the traffic-handling worker
+    # to uid/gid 99 right after. No capabilities beyond the two that drop needs (it
+    # binds 8443/8080, so no NET_BIND_SERVICE), and no regaining privileges later.
     user: "0:0"
+    cap_drop:
+      - ALL
+    cap_add:
+      - SETUID
+      - SETGID
+    security_opt:
+      - no-new-privileges:true
     depends_on:
       tls-init:
         condition: service_completed_successfully
