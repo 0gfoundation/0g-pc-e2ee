@@ -26,12 +26,11 @@ client ──TLS──▶ L4 load balancer (forwards bytes, never decrypts; adds
             haproxy :443 ── TLS ends here, PROXY v1/v2 in ──▶ gateway :8443 (PROXY v2, plaintext)
                  ▲
             tls-init (one-shot): the app's KMS-derived TLS key, over the tapp socket
-            preflight (one-shot): no gateway without its secrets
 ```
 
 | File | Measured | What it is |
 |---|---|---|
-| `docker-compose.yml` | yes | four containers: `tls-init`, `preflight`, `haproxy`, `gateway` |
+| `docker-compose.yml` | yes | three containers: `tls-init`, `haproxy`, `gateway` |
 | `haproxy.cfg` | yes (uploaded because it is mounted) | TLS termination, PROXY v1 → v2, LB health port |
 | `env/<target>.env` → `.env` | yes (uploaded because it is mounted) | compose variables; **no secrets**, so a verifier can recompute its hash |
 | `secrets.env` | yes, as a hash only | the gateway's secrets (`secrets.env.example`); written by the deploy pipeline, never committed |
@@ -56,15 +55,16 @@ not protect a guessable value: fine for a random HMAC key, weaker for a list of 
 
 ## Secrets and restarts
 
-- `preflight` checks `secrets.env` before the gateway may start: `ZG_GATEWAY_CLIENT_IP_KEY`
-  must be hex of at least 32 bytes, `ZG_GATEWAY_ALLOWED_ORIGINS` non-empty. Without them the
-  gateway would start healthy and degrade silently (one rate-limit bucket for everyone, no
-  browser access); with the check it does not start, the health port stays 503, and the
-  deploy pipeline fails. The equivalent of Phala's `CVM_REQUIRED_KEYS`.
-- `tls-init` and `preflight` run once, at `start-app`. Docker restarting a container on its
-  own does not rerun them, and does not need to: within a boot the key stays in `/run`
-  (tmpfs) and `secrets.env` does not change, and after a VM reboot there is nothing to
-  restart, since tapp recreates Docker's data-root empty at every boot.
+- `ZG_GATEWAY_REQUIRE_ENV` names the gateway's two secrets, and the gateway refuses to
+  start when either is unset or empty (`-require-env`). Without them it would start healthy
+  and degrade silently (one rate-limit bucket for everyone, no browser access); with the
+  check it does not start, the health port stays 503, and the deploy pipeline fails. A
+  malformed key was already refused at startup. The equivalent of Phala's
+  `CVM_REQUIRED_KEYS`.
+- `tls-init` runs once, at `start-app`. Docker restarting a container on its own does not
+  rerun it, and does not need to: within a boot the key stays in `/run` (tmpfs), and after a
+  VM reboot there is nothing to restart, since tapp recreates Docker's data-root empty at
+  every boot.
 
 ## Client address
 
@@ -107,8 +107,9 @@ signer>` so the record is replaced (`updateNode`) rather than added (`addNode`).
    are switched off here. They need a tapp adapter in the gateway (`client/dstack`), and
    `docs/verifying-the-gateway.md` / `pcverify` need a tapp path, before this deployment can
    be verified by a third party.
-2. **`env_file` upload.** `secrets.env` is mounted into `preflight` so that `start-app`
-   uploads it; the PoC confirms `env_file` then finds it next to the compose.
+2. **`env_file` upload.** `secrets.env` is mounted into the gateway so that `start-app`
+   uploads it; the PoC confirms `env_file` then finds it next to the compose. The gateway
+   image must be a build with `-require-env`.
 3. **`tls-init` digest.** It holds the tapp socket, so it is pinned like every other image,
    but the registry is not anonymously readable yet: the compose carries an all-zero digest
    that fails to pull, on purpose, until the real one is filled in. The node also needs
