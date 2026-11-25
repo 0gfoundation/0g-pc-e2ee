@@ -55,12 +55,11 @@ not protect a guessable value: fine for a random HMAC key, weaker for a list of 
 
 ## Secrets and restarts
 
-- `ZG_GATEWAY_REQUIRE_ENV` names the gateway's two secrets, and the gateway refuses to
-  start when either is unset or empty (`-require-env`). Without them it would start healthy
-  and degrade silently (one rate-limit bucket for everyone, no browser access); with the
-  check it does not start, the health port stays 503, and the deploy pipeline fails. A
-  malformed key was already refused at startup. The equivalent of Phala's
-  `CVM_REQUIRED_KEYS`.
+- The gateway starts even when `ZG_GATEWAY_CLIENT_IP_KEY` or `ZG_GATEWAY_ALLOWED_ORIGINS` is
+  empty: an empty value turns its feature off (one rate-limit bucket for everyone, no browser
+  access), and the gateway stays healthy. Nothing on the node checks; the deploy pipeline
+  refuses to write a `secrets.env` without both, the role Phala's `CVM_REQUIRED_KEYS` plays
+  there. A deploy by hand must take the same care. A malformed key is refused at startup.
 - `tls-init` runs once, at `start-app`. Docker restarting a container on its own does not
   rerun it, and does not need to: within a boot the key stays in `/run` (tmpfs), and after a
   VM reboot there is nothing to restart, since tapp recreates Docker's data-root empty at
@@ -108,8 +107,7 @@ signer>` so the record is replaced (`updateNode`) rather than added (`addNode`).
    `docs/verifying-the-gateway.md` / `pcverify` need a tapp path, before this deployment can
    be verified by a third party.
 2. **`env_file` upload.** `secrets.env` is mounted into the gateway so that `start-app`
-   uploads it; the PoC confirms `env_file` then finds it next to the compose. The gateway
-   image must be a build with `-require-env`.
+   uploads it; the PoC confirms `env_file` then finds it next to the compose.
 3. **`tls-init` digest.** It holds the tapp socket, so it is pinned like every other image,
    but the registry is not anonymously readable yet: the compose carries an all-zero digest
    that fails to pull, on purpose, until the real one is filled in. The node also needs
