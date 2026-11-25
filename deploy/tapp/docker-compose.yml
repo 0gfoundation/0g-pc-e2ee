@@ -43,11 +43,18 @@ services:
     # The most privileged container: it holds the tapp socket, through which every
     # app's key material can be read. So it is pinned by digest like everything
     # else: a re-pointed tag must not swap the program while the recorded hash stays
-    # the same. The digest below is a placeholder that FAILS TO PULL on purpose
-    # until the real one is filled in (the registry is not anonymously readable
-    # yet). Better still, build it ourselves from 0g-tapp's docker/tls-init/Dockerfile
-    # (debian-slim + the checksummed tapp-cli release binary) and pin that.
-    image: us-central1-docker.pkg.dev/g-devops/zg-tapp/tls-init:v0.4.0@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    # the same. v0.4.0 is enough: GetAppTlsCert is socket-only and unsigned, so this
+    # client works against any later tapp-server, and the key source (kms) is the
+    # server's setting.
+    #
+    # Interim, for the PoC. This image is built by hand from 0g-tapp's
+    # docker/tls-init/Dockerfile (debian-slim + tapp-cli), unsigned, in a registry
+    # that is not publicly readable: its digest cannot be traced to a source, a
+    # verifier cannot pull it to audit, and the node needs `tapp-cli docker-login`
+    # first. Before mainnet, build it ourselves from that Dockerfile (pinned base,
+    # checksummed tapp-cli release binary), publish it next to the gateway image,
+    # and pin that.
+    image: us-central1-docker.pkg.dev/g-devops/zg-tapp/tls-init:v0.4.0@sha256:2e27c68dc551c342bd9d52b207e5d5193377750d02cc6241207936ab8033f666
     command:
       - --server=/run/tapp/tapp.sock
       - get-app-tls-cert
