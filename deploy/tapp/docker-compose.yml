@@ -8,10 +8,20 @@
 # keeps everything else off 443. Those live with the infrastructure, not here.
 #
 # The same gateway image as on Phala, behind an HAProxy that terminates TLS inside
-# this CVM. Three containers:
-#   tls-init  one-shot: fetches the app's KMS-derived TLS key over the tapp socket
-#   haproxy   TLS termination (key never leaves the TEE), PROXY v1 -> v2
-#   gateway   unchanged client core; reached only through haproxy
+# this CVM. Four containers:
+#   tls-init   one-shot: fetches the app's KMS-derived TLS key over the tapp socket
+#   preflight  one-shot: refuses to let the gateway start without its secrets
+#   haproxy    TLS termination (key never leaves the TEE), PROXY v1 -> v2
+#   gateway    unchanged client core; reached only through haproxy
+#
+# One-shot containers and restarts: `depends_on` orders only `compose up`, so a
+# container Docker restarts on its own does not rerun them. That is safe here:
+# within a boot their results persist (the TLS key stays in /run, which is tmpfs and
+# outlives container and daemon restarts; secrets.env does not change), and a VM
+# reboot leaves nothing to restart, because tapp's Docker data-root is a volume
+# recreated empty at every boot (0g-tapp cvm/README.md, "/data is the runtime
+# volume"). After a reboot only start-app brings the app back, and that runs the
+# one-shots again.
 #
 # Deploy with `tapp-cli start-app -f docker-compose.yml --app-id <id>
 # --register-onchain ...`, from this directory, after `cp env/<target>.env .env`.
@@ -31,11 +41,14 @@ services:
   # KMS cluster, is the same on every node of the app and survives restarts, which
   # is what lets one CA certificate serve every replica in every region.
   tls-init:
-    # TODO pin by digest before anything but the PoC: this container handles the
-    # TLS private key. The image is not anonymously pullable, so the node needs
-    # `tapp-cli docker-login` for us-central1-docker.pkg.dev first, or build it from
-    # 0g-tapp's docker/tls-init/Dockerfile and publish it ourselves.
-    image: us-central1-docker.pkg.dev/g-devops/zg-tapp/tls-init:v0.4.0
+    # The most privileged container: it holds the tapp socket, through which every
+    # app's key material can be read. So it is pinned by digest like everything
+    # else: a re-pointed tag must not swap the program while the recorded hash stays
+    # the same. The digest below is a placeholder that FAILS TO PULL on purpose
+    # until the real one is filled in (the registry is not anonymously readable
+    # yet). Better still, build it ourselves from 0g-tapp's docker/tls-init/Dockerfile
+    # (debian-slim + the checksummed tapp-cli release binary) and pin that.
+    image: us-central1-docker.pkg.dev/g-devops/zg-tapp/tls-init:v0.4.0@sha256:0000000000000000000000000000000000000000000000000000000000000000
     command:
       - --server=/run/tapp/tapp.sock
       - get-app-tls-cert
@@ -50,8 +63,38 @@ services:
       # /run is tmpfs: the key stays in TEE memory and is gone at reboot. Never a
       # named volume (that would put the key on disk).
       - /run/${TAPP_APP_ID}-certs:/certs
-      # Mounted only so start-app uploads these with the compose. .env feeds the
-      # ${...} substitutions in this file; secrets.env is the gateway's env_file.
+      # Nothing else: not .env, not secrets.env. Least privilege for the container
+      # that holds the socket.
+
+  # Checks that the gateway's secrets are there before the gateway may start.
+  # Without ZG_GATEWAY_CLIENT_IP_KEY the router puts every user in one rate-limit
+  # bucket; without ZG_GATEWAY_ALLOWED_ORIGINS browsers are refused. The gateway
+  # would start healthy either way, so nothing would notice. This fails the start
+  # instead: the gateway never comes up, the LB health check stays 503 and the
+  # deploy pipeline (which waits for health) goes red. What Phala's
+  # CVM_REQUIRED_KEYS does there.
+  preflight:
+    image: busybox:1.37.0-musl@sha256:f6a95d611e0a8780fabdb2aec43e31275b2720dfefa3e41b16835bfc42454478
+    restart: "no"
+    env_file:
+      - ./secrets.env
+    command:
+      - sh
+      - -c
+      - |
+        fail=0
+        if ! printf %s "$$ZG_GATEWAY_CLIENT_IP_KEY" | grep -Eq '^[0-9a-fA-F]{64,}$$'; then
+          echo "preflight: ZG_GATEWAY_CLIENT_IP_KEY is missing or not hex of at least 32 bytes" >&2; fail=1
+        fi
+        if [ -z "$$ZG_GATEWAY_ALLOWED_ORIGINS" ]; then
+          echo "preflight: ZG_GATEWAY_ALLOWED_ORIGINS is empty" >&2; fail=1
+        fi
+        [ "$$fail" = 0 ] && echo "preflight: gateway secrets present"
+        exit $$fail
+    volumes:
+      # Mounted so start-app uploads these with the compose: .env feeds the ${...}
+      # substitutions in this file, secrets.env is the env_file above and the
+      # gateway's. Both are measured; secrets.env only as a hash.
       - ./.env:/run/deploy.env:ro
       - ./secrets.env:/run/secrets.env:ro
 
@@ -83,6 +126,9 @@ services:
     # The release workflow substitutes a digest, as for deploy/phala.
     image: ghcr.io/0gfoundation/0g-pc-e2ee-gateway:latest
     restart: unless-stopped
+    depends_on:
+      preflight:
+        condition: service_completed_successfully
     # No `ports:`: only haproxy can reach 8443, which is what makes the PROXY header
     # it sends believable.
     expose:

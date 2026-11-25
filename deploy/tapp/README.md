@@ -26,11 +26,12 @@ client ──TLS──▶ L4 load balancer (forwards bytes, never decrypts; adds
             haproxy :443 ── TLS ends here, PROXY v1/v2 in ──▶ gateway :8443 (PROXY v2, plaintext)
                  ▲
             tls-init (one-shot): the app's KMS-derived TLS key, over the tapp socket
+            preflight (one-shot): no gateway without its secrets
 ```
 
 | File | Measured | What it is |
 |---|---|---|
-| `docker-compose.yml` | yes | three containers: `tls-init`, `haproxy`, `gateway` |
+| `docker-compose.yml` | yes | four containers: `tls-init`, `preflight`, `haproxy`, `gateway` |
 | `haproxy.cfg` | yes (uploaded because it is mounted) | TLS termination, PROXY v1 → v2, LB health port |
 | `env/<target>.env` → `.env` | yes (uploaded because it is mounted) | compose variables; **no secrets**, so a verifier can recompute its hash |
 | `secrets.env` | yes, as a hash only | the gateway's secrets (`secrets.env.example`); written by the deploy pipeline, never committed |
@@ -52,6 +53,18 @@ not protect a guessable value: fine for a random HMAC key, weaker for a list of 
   mode. "Change the name, keep the key" — 0g-tapp `docs/APP_TLS.md`.
 - The key reaches haproxy through `/run/<app-id>-certs`, which is tmpfs: it never touches
   disk.
+
+## Secrets and restarts
+
+- `preflight` checks `secrets.env` before the gateway may start: `ZG_GATEWAY_CLIENT_IP_KEY`
+  must be hex of at least 32 bytes, `ZG_GATEWAY_ALLOWED_ORIGINS` non-empty. Without them the
+  gateway would start healthy and degrade silently (one rate-limit bucket for everyone, no
+  browser access); with the check it does not start, the health port stays 503, and the
+  deploy pipeline fails. The equivalent of Phala's `CVM_REQUIRED_KEYS`.
+- `tls-init` and `preflight` run once, at `start-app`. Docker restarting a container on its
+  own does not rerun them, and does not need to: within a boot the key stays in `/run`
+  (tmpfs) and `secrets.env` does not change, and after a VM reboot there is nothing to
+  restart, since tapp recreates Docker's data-root empty at every boot.
 
 ## Client address
 
@@ -94,11 +107,13 @@ signer>` so the record is replaced (`updateNode`) rather than added (`addNode`).
    are switched off here. They need a tapp adapter in the gateway (`client/dstack`), and
    `docs/verifying-the-gateway.md` / `pcverify` need a tapp path, before this deployment can
    be verified by a third party.
-2. **`env_file` upload.** `secrets.env` is mounted into `tls-init` so that `start-app`
-   uploads it; the PoC confirms the gateway's `env_file` then finds it next to the compose.
-3. **`tls-init` image.** Not pinned by digest (the registry is not anonymously readable) and
-   needs `docker-login` on the node. Pin it, or build it from 0g-tapp
-   `docker/tls-init/Dockerfile` and publish it ourselves.
+2. **`env_file` upload.** `secrets.env` is mounted into `preflight` so that `start-app`
+   uploads it; the PoC confirms `env_file` then finds it next to the compose.
+3. **`tls-init` digest.** It holds the tapp socket, so it is pinned like every other image,
+   but the registry is not anonymously readable yet: the compose carries an all-zero digest
+   that fails to pull, on purpose, until the real one is filled in. The node also needs
+   `docker-login` for that registry. Building it ourselves from 0g-tapp
+   `docker/tls-init/Dockerfile` would remove both dependencies.
 4. **Certificate renewal.** The certificate is a mounted file, uploaded at `start-app`, so a
    renewed one (about every 60 days) means a rolling redeploy of every node. Any deployment of
    the same app id can reuse the live certificate, since the KMS gives them all the same key.
