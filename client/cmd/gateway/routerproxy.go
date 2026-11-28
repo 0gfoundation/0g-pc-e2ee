@@ -119,6 +119,29 @@ func newRouterProxy(target *url.URL, logger *slog.Logger) *httputil.ReverseProxy
 	}
 }
 
+// rejectSourceFileProbes keeps repository metadata and dotenv file requests
+// out of the Router upstream on cleartext passthrough paths.
+func rejectSourceFileProbes(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// URL.Path is already decoded by net/http. Match whole segments so an
+		// ordinary API identifier ending in ".git" can still pass through.
+		for part := range strings.SplitSeq(r.URL.Path, "/") {
+			segment := strings.ToLower(part)
+			switch segment {
+			case ".git", ".git-credentials", ".github", ".gitlab-ci.yml", ".svn", ".hg", ".env":
+			default:
+				if !strings.HasPrefix(segment, ".env.") {
+					continue
+				}
+			}
+			w.Header().Set("Cache-Control", "no-store")
+			http.NotFound(w, r)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // maxKeylessPollBytes bounds how much of a keyless poll answer is read to check
 // it. A cleartext completed image job is the provider's JSON (the router reads
 // the broker's answer through a 32 MiB cap); a larger answer is refused rather
