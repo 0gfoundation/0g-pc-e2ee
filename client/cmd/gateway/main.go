@@ -963,9 +963,9 @@ func newHandler(clients map[string]*core.Client, routerTarget *url.URL, allowedO
 	// cleartext claim is made, and the one that could go stale.
 	sealingOn := policy.sealingOn()
 	routerProxy := newRouterProxy(routerTarget, logger)
-	passthrough := openaiproxy.MarkE2EE(openaiproxy.E2EEValueNone, routerProxy)
+	passthrough := openaiproxy.MarkE2EE(openaiproxy.E2EEValueNone, rejectSourceFileProbes(routerProxy))
 	cachedPassthrough := openaiproxy.MarkE2EE(openaiproxy.E2EEValueNone,
-		policy.newCatalogCache().wrap(routerProxy))
+		rejectSourceFileProbes(policy.newCatalogCache().wrap(routerProxy)))
 	mux := http.NewServeMux()
 	// Mount the sealed inference path behind the gateway's front-door credential
 	// gate. The gate is a cheap presence/shape check (reject missing credentials
